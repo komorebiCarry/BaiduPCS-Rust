@@ -107,12 +107,12 @@ jobs:
           if [ "${{ matrix.archive }}" = "zip" ]; then
             ARCHIVE_PATH="release/${ARTIFACT_NAME}.zip"
             python - <<'PY'
-import os
-import shutil
+              import os
+              import shutil
 
-artifact = os.environ["ARTIFACT_NAME"]
-base_dir = os.path.join("release", artifact)
-shutil.make_archive(os.path.join("release", artifact), "zip", "release", artifact)
+              artifact = os.environ["ARTIFACT_NAME"]
+              base_dir = os.path.join("release", artifact)
+              shutil.make_archive(os.path.join("release", artifact), "zip", "release", artifact)
 PY
           else
             ARCHIVE_PATH="release/${ARTIFACT_NAME}.tar.gz"
