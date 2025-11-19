@@ -1,3 +1,6 @@
+env:
+  GHCR_IMAGE: ghcr.io/komorebicarry/baidupcs-rust
+  DOCKER_IMAGE: komorebicarry/baidupcs-rust
 name: Build Docker Image (Test)
 
 on:
@@ -35,7 +38,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          tags: komorebicarry/baidupcs-rust:test
-          cache-from: type=registry,ref=komorebicarry/baidupcs-rust:buildcache
-          cache-to: type=registry,ref=komorebicarry/baidupcs-rust:buildcache,mode=max
+          tags: ${{ env.DOCKER_IMAGE }}:test
+          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
 
