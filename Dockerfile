@@ -8,7 +8,7 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 
 # 安装前端依赖
-RUN npm ci --only=production
+RUN npm ci
 
 # 复制前端源代码
 COPY frontend/ ./
@@ -17,7 +17,6 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: 后端构建
-FROM rust:1.84-slim AS backend-builder
 FROM rust:1.84-slim AS backend-builder
 
 WORKDIR /app
