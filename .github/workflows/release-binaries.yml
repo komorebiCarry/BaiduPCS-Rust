@@ -1,0 +1,127 @@
+name: Release Multi-Platform Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+            binary: baidu-netdisk-rust
+            use_cross: false
+          - platform: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+            binary: baidu-netdisk-rust
+            use_cross: true
+          - platform: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: zip
+            binary: baidu-netdisk-rust
+            use_cross: false
+          - platform: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: zip
+            binary: baidu-netdisk-rust
+            use_cross: false
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: baidu-netdisk-rust.exe
+            use_cross: false
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: frontend
+
+      - name: Install system dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev zip
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross == 'true'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build backend
+        shell: bash
+        run: |
+          set -e
+          cd backend
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          set -e
+          ARTIFACT_NAME=BaiduPCS-Rust-${GITHUB_REF_NAME}-${{ matrix.platform }}
+          export ARTIFACT_NAME
+          PKG_DIR=release/$ARTIFACT_NAME
+          mkdir -p "$PKG_DIR"
+          BIN_PATH="backend/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          cp "$BIN_PATH" "$PKG_DIR/"
+          chmod +x "$PKG_DIR/${{ matrix.binary }}" || true
+          cp -R frontend/dist "$PKG_DIR/frontend"
+          mkdir -p "$PKG_DIR/config"
+          cp config/app.toml.example "$PKG_DIR/config/app.toml.example"
+          cp README.md "$PKG_DIR/README.md"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            ARCHIVE_PATH="release/${ARTIFACT_NAME}.zip"
+            python - <<'PY'
+import os, shutil
+artifact = os.environ["ARTIFACT_NAME"]
+base_dir = os.path.join("release", artifact)
+shutil.make_archive(os.path.join("release", artifact), "zip", "release", artifact)
+PY
+          else
+            ARCHIVE_PATH="release/${ARTIFACT_NAME}.tar.gz"
+            tar czf "$ARCHIVE_PATH" -C release "$ARTIFACT_NAME"
+          fi
+          echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> $GITHUB_ENV
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

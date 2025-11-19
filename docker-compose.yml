@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  baidu-netdisk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: baidu-netdisk-rust
+    image: baidu-netdisk-rust:latest
+    ports:
+      - "18888:18888"
+    volumes:
+      # 配置文件挂载
+      - ./config:/app/config
+      # 下载目录挂载
+      - ./downloads:/app/downloads
+      # 会话数据挂载
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    restart: unless-stopped
+    networks:
+      - baidu-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18888/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  baidu-network:
+    driver: bridge
+
+volumes:
+  config:
+  downloads:
+  data:
+

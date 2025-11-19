@@ -1,0 +1,59 @@
+[package]
+name = "baidu-netdisk-rust"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+# Web框架
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# HTTP客户端
+reqwest = { version = "0.11", features = ["json", "cookies", "stream"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 加密
+sha1 = "0.10"
+md5 = "0.7"
+hex = "0.4"
+base64 = "0.21"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 时间处理
+chrono = "0.4"
+
+# 二维码
+qrcode = "0.13"
+image = "0.24"
+
+# UUID
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# 配置文件
+toml = "0.8"
+
+# 并发控制
+futures = "0.3"
+async-trait = "0.1"
+
+# URL编码
+urlencoding = "2.1"
+
+[dev-dependencies]
+# 测试工具
+tempfile = "3.8"
