@@ -1,6 +1,5 @@
 # Rust
 /backend/target/
-/backend/Cargo.lock
 **/*.rs.bk
 *.pdb
 
