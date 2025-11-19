@@ -74,7 +74,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross
-        if: matrix.use_cross == 'true'
+        if: matrix.use_cross == true
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build backend
