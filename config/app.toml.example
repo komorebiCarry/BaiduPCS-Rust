@@ -1,0 +1,26 @@
+# 百度网盘 Rust 客户端配置文件
+# Baidu Netdisk Rust Configuration
+
+[server]
+# 服务器监听地址
+host = "0.0.0.0"
+
+# 服务器监听端口
+port = 18888
+
+# CORS 允许的源列表（"*" 表示允许所有源）
+cors_origins = ["*"]
+
+[download]
+# 默认下载目录
+download_dir = "downloads"
+
+# 并发下载分片数（建议: 4-16）
+concurrent_chunks = 8
+
+# 每个分片的大小（单位: MB，建议: 5-20）
+chunk_size_mb = 10
+
+# 下载失败后的最大重试次数
+max_retries = 3
+

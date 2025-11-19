@@ -1,0 +1,32 @@
+{
+  "version": "1.0.0",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "https": true,
+    "cors": {
+      "enabled": true,
+      "origins": ["*"]
+    }
+  },
+  "download": {
+    "dir": "/downloads",
+    "max_concurrent": 10,
+    "chunk_size": 10485760,
+    "max_retries": 3,
+    "timeout": 120,
+    "max_tasks": 10
+  },
+  "auth": {
+    "session_timeout": 86400,
+    "jwt_secret": "请修改为你的密钥"
+  },
+  "logging": {
+    "level": "info",
+    "format": "json",
+    "file": "/config/logs/app.log",
+    "max_size": 104857600,
+    "max_backups": 5
+  }
+}
+

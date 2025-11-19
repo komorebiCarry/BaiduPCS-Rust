@@ -1,0 +1,35 @@
+# Rust
+/backend/target/
+/backend/Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Node.js / Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/frontend/dist-ssr/
+*.local
+
+# 下载文件
+/backend/downloads/
+*.tmp
+
+# 配置文件
+/backend/config.json
+/backend/auth.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log

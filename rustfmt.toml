@@ -1,0 +1,45 @@
+# Rustfmt 配置
+# 代码格式化规则
+
+# 最大行宽
+max_width = 100
+
+# 硬标签宽度
+tab_spaces = 4
+
+# 使用小括号风格
+use_small_heuristics = "Default"
+
+# 导入合并
+imports_granularity = "Crate"
+
+# 导入排序
+group_imports = "StdExternalCrate"
+
+# 函数参数缩进
+fn_args_layout = "Tall"
+
+# 链式调用缩进
+chain_width = 60
+
+# 注释宽度
+comment_width = 80
+
+# 格式化字符串
+format_strings = true
+
+# 格式化宏
+format_macro_matchers = true
+
+# 规范化注释
+normalize_comments = true
+
+# 规范化文档注释
+normalize_doc_attributes = true
+
+# 换行风格
+newline_style = "Auto"
+
+# Edition
+edition = "2021"
+
