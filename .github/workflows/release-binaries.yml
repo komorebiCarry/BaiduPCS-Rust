@@ -95,18 +95,20 @@ jobs:
         run: |
           set -e
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            # cross needs to run from the directory containing Cargo.toml
-            # Docker container mounts the entire workspace, so we cd into backend
+            # 切换到 backend 目录，cross.toml 配置文件在此目录
             cd backend
-            # Verify project first
+            # 验证项目配置
             echo "Verifying Cargo project in backend directory..."
             cargo metadata --format-version 1 > /dev/null || (echo "Failed to get Cargo metadata" && exit 1)
             echo "Cargo metadata verified successfully"
-            # Show current directory for debugging
+            # 显示调试信息
             echo "Current directory: $(pwd)"
             echo "Cargo.toml exists: $(test -f Cargo.toml && echo 'yes' || echo 'no')"
-            # Build with cross from backend directory
-            # cross will mount the current directory into Docker container
+            echo "cross.toml exists: $(test -f cross.toml && echo 'yes' || echo 'no')"
+            # 设置环境变量，禁用警告
+            export CROSS_NO_WARNINGS=0
+            # 使用 cross 构建，从 backend 目录运行
+            # cross.toml 配置文件会确保正确的 Docker 挂载
             echo "Starting cross build from backend directory..."
             cross build --release --target ${{ matrix.target }}
           else

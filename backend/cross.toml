@@ -1,0 +1,7 @@
+# cross 配置文件
+# 用于配置交叉编译环境
+
+[target.aarch64-unknown-linux-gnu]
+# 使用官方 Docker 镜像进行交叉编译
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+
