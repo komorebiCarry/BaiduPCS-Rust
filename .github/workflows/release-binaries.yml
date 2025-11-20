@@ -88,11 +88,11 @@ jobs:
         shell: bash
         run: |
           set -e
+          cd backend
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            # Build with cross from project root using manifest-path
-            cross build --release --target ${{ matrix.target }} --manifest-path backend/Cargo.toml
+            # Build with cross
+            cross build --release --target ${{ matrix.target }}
           else
-            cd backend
             cargo build --release --target ${{ matrix.target }}
           fi
 
@@ -140,9 +140,8 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
           files: ${{ env.ARCHIVE_PATH }}
-          draft: false
-          prerelease: false
+          generate_release_notes: false
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
