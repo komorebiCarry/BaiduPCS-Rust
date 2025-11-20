@@ -8,6 +8,7 @@ on:
 jobs:
   build-and-release:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: linux-x86_64
@@ -23,13 +24,13 @@ jobs:
             binary: baidu-netdisk-rust
             use_cross: true
           - platform: macos-x86_64
-            os: macos-13
+            os: macos-15
             target: x86_64-apple-darwin
             archive: zip
             binary: baidu-netdisk-rust
             use_cross: false
           - platform: macos-arm64
-            os: macos-14
+            os: macos-latest
             target: aarch64-apple-darwin
             archive: zip
             binary: baidu-netdisk-rust
@@ -67,6 +68,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev zip
 
+      - name: Set up Docker Buildx (for cross)
+        if: matrix.use_cross == true
+        uses: docker/setup-buildx-action@v3
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -75,7 +80,9 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross --locked
+          cross --version
 
       - name: Build backend
         shell: bash
