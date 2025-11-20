@@ -95,13 +95,20 @@ jobs:
         run: |
           set -e
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            # Build with cross, specifying the manifest path
-            echo "Verifying Cargo project..."
-            cargo metadata --manifest-path backend/Cargo.toml --format-version 1 > /dev/null || (echo "Failed to get Cargo metadata" && exit 1)
+            # cross needs to run from the directory containing Cargo.toml
+            # Docker container mounts the entire workspace, so we cd into backend
+            cd backend
+            # Verify project first
+            echo "Verifying Cargo project in backend directory..."
+            cargo metadata --format-version 1 > /dev/null || (echo "Failed to get Cargo metadata" && exit 1)
             echo "Cargo metadata verified successfully"
-            # Build with cross, pointing to the backend Cargo.toml
-            echo "Starting cross build..."
-            cross build --release --target ${{ matrix.target }} --manifest-path backend/Cargo.toml
+            # Show current directory for debugging
+            echo "Current directory: $(pwd)"
+            echo "Cargo.toml exists: $(test -f Cargo.toml && echo 'yes' || echo 'no')"
+            # Build with cross from backend directory
+            # cross will mount the current directory into Docker container
+            echo "Starting cross build from backend directory..."
+            cross build --release --target ${{ matrix.target }}
           else
             cd backend
             cargo build --release --target ${{ matrix.target }}
