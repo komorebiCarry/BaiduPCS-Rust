@@ -202,7 +202,7 @@ impl Default for AppConfig {
         
         Self {
             server: ServerConfig {
-                host: "0.0.0.0".to_string(),
+                host: "127.0.0.1".to_string(),
                 port: 18888, // 默认端口改为 18888，与配置文件保持一致
                 cors_origins: vec!["*".to_string()],
             },
