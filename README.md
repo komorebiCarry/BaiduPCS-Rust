@@ -19,6 +19,18 @@
 
 BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第三方客户端，提供简洁的 Web 界面和高效的下载功能。
 
+### 🎯 项目初衷
+
+本项目主要是为了解决以下痛点：
+
+- **NAS 环境下的下载速度问题**：虽然已经是百度网盘会员，但在 NAS 设备上使用官方百度网盘客户端无法实现满速下载，影响使用体验
+- **高性能下载需求**：通过多线程并发下载、断点续传等技术，充分利用会员带宽，实现满速下载
+- **自动备份功能**：支持将本地文件自动备份到百度网盘，实现数据的安全存储和同步
+- **跨平台支持**：支持 Windows、Linux、macOS 等多种平台，方便在不同设备上使用
+- **现代化体验**：提供简洁美观的 Web 界面，支持实时进度显示和任务管理
+
+### 🙏 致谢
+
 本项目参考并受到了以下优秀项目的启发：
 
 - [qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go) - BaiduPCS-Go 的增强版本，提供分享链接/秒传链接转存功能
@@ -283,7 +295,7 @@ BaiduPCS-Rust/
 
 ```toml
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8080
 cors_origins = ["*"]
 
@@ -378,7 +390,6 @@ cargo test
 
 - [qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go) - 本项目的重要参考
 - [GangZhuo/BaiduPCS](https://github.com/GangZhuo/BaiduPCS) - 原始项目灵感来源
-- [iikira/BaiduPCS-Go](https://github.com/iikira/BaiduPCS-Go) - 原版 BaiduPCS-Go
 - [Rust 社区](https://www.rust-lang.org/)
 - [Vue.js 社区](https://vuejs.org/)
 - [Element Plus](https://element-plus.org/)

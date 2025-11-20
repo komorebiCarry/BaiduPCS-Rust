@@ -41,14 +41,14 @@
               <el-form-item label="监听地址" prop="server.host">
                 <el-input
                   v-model="formData.server.host"
-                  placeholder="例如: 0.0.0.0"
+                  placeholder="例如: 127.0.0.1"
                   clearable
                 >
                   <template #prepend>
                     <el-icon><Connection /></el-icon>
                   </template>
                 </el-input>
-                <div class="form-tip">服务器监听的IP地址，0.0.0.0 表示监听所有网卡</div>
+                <div class="form-tip">服务器监听的IP地址</div>
               </el-form-item>
 
               <el-form-item label="监听端口" prop="server.port">

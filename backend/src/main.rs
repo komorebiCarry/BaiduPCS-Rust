@@ -3,6 +3,7 @@ use axum::{
     Router,
 };
 use baidu_netdisk_rust::{server::handlers, AppState};
+use std::path::PathBuf;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -10,6 +11,66 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::info;
+
+/// 智能检测前端资源目录
+/// 按优先级尝试以下路径：
+/// 1. ./frontend/dist - 开发环境标准路径
+/// 2. ./frontend - GitHub Actions 打包路径（dist 内容直接在 frontend 下）
+/// 3. ../frontend/dist - 开发环境，源码目录结构
+/// 4. ../frontend - GitHub Actions 打包路径（上级目录）
+/// 5. /app/frontend/dist - Docker 容器标准路径
+/// 6. /app/frontend - Docker 容器 GitHub 打包路径
+/// 7. ./dist - 备选路径（手动部署）
+/// 8. {exe_dir}/frontend/dist - 相对于可执行文件的路径
+/// 9. {exe_dir}/frontend - 相对于可执行文件的 GitHub 打包路径
+fn detect_frontend_dir() -> PathBuf {
+    let mut candidates = vec![
+        // 1. 开发环境标准路径
+        PathBuf::from("./frontend/dist"),
+        // 2. GitHub Actions 打包路径（dist 内容直接在 frontend 下）
+        PathBuf::from("./frontend"),
+        // 3. 开发环境，源码目录结构
+        PathBuf::from("../frontend/dist"),
+        // 4. GitHub Actions 打包路径（上级目录）
+        PathBuf::from("../frontend"),
+        // 5. Docker 容器标准路径
+        PathBuf::from("/app/frontend/dist"),
+        // 6. Docker 容器 GitHub 打包路径
+        PathBuf::from("/app/frontend"),
+        // 7. 备选路径（手动部署时可能使用）
+        PathBuf::from("./dist"),
+    ];
+
+    // 8-9. 可执行文件所在目录的 frontend/dist 和 frontend
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("frontend/dist"));
+            candidates.push(exe_dir.join("frontend"));
+            candidates.push(exe_dir.join("dist"));
+        }
+    }
+
+    // 按顺序尝试每个候选路径
+    for path in &candidates {
+        if path.exists() && path.is_dir() {
+            // 验证是否包含 index.html（确保是有效的前端构建）
+            if path.join("index.html").exists() {
+                info!("✓ 找到前端资源目录: {:?}", path.canonicalize().unwrap_or(path.clone()));
+                return path.clone();
+            }
+        }
+    }
+
+    // 如果都找不到，返回默认路径并警告
+    let default = PathBuf::from("./frontend/dist");
+    tracing::warn!(
+        "⚠️  未找到前端资源目录，使用默认路径: {:?}\n\
+         尝试过的路径: {:?}\n\
+         请确保前端已构建，或将 frontend/dist 目录放在可执行文件同级目录",
+        default, candidates
+    );
+    default
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -69,9 +130,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/config/reset", post(handlers::reset_to_recommended))
         .with_state(app_state.clone());
 
+    // 自动检测前端资源目录
+    let frontend_dir = detect_frontend_dir();
+    let index_html_path = frontend_dir.join("index.html");
+    
     // 静态文件服务（前端资源）
-    let static_service = ServeDir::new("../frontend/dist")
-        .not_found_service(ServeFile::new("../frontend/dist/index.html"));
+    let static_service = ServeDir::new(&frontend_dir)
+        .not_found_service(ServeFile::new(&index_html_path));
 
     // 构建完整应用
     let app = Router::new()

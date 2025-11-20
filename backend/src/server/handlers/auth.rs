@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
+use std::sync::Arc;
 
 /// 统一API响应格式
 #[derive(Debug, Serialize)]
@@ -81,7 +82,7 @@ pub async fn qrcode_status(
 
     match state.qrcode_auth.poll_status(&params.sign).await {
         Ok(status) => {
-            // 如果登录成功，保存会话
+            // 如果登录成功，保存会话并初始化用户资源
             if let QRCodeStatus::Success { ref user, .. } = status {
                 info!(
                     "检测到登录成功，准备保存会话: UID={}, 用户名={}",
@@ -95,6 +96,40 @@ pub async fn qrcode_status(
                             user.uid,
                             user.bduss.len()
                         );
+                        // 初始化用户资源（网盘客户端和下载管理器）
+                        *state.current_user.write().await = Some(user.clone());
+
+                        // 初始化网盘客户端
+                        let client = match crate::netdisk::NetdiskClient::new(user.clone()) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("初始化网盘客户端失败: {}", e);
+                                return Ok(Json(ApiResponse::success(status)));
+                            }
+                        };
+                        *state.netdisk_client.write().await = Some(client);
+
+                        // 初始化下载管理器
+                        let config = state.config.read().await;
+                        let download_dir = config.download.download_dir.clone();
+                        let max_global_threads = config.download.max_global_threads;
+                        let max_concurrent_tasks = config.download.max_concurrent_tasks;
+                        drop(config);
+
+                        match crate::downloader::DownloadManager::with_config(
+                            user.clone(),
+                            download_dir,
+                            max_global_threads,
+                            max_concurrent_tasks,
+                        ) {
+                            Ok(manager) => {
+                                *state.download_manager.write().await = Some(std::sync::Arc::new(manager));
+                                info!("下载管理器初始化成功");
+                            }
+                            Err(e) => {
+                                error!("初始化下载管理器失败: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("❌ 保存会话失败: {}", e);
