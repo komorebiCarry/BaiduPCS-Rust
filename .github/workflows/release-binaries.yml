@@ -95,16 +95,12 @@ jobs:
         run: |
           set -e
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            # Build with cross from project root using manifest-path
-            # Verify project first from root
-            echo "Verifying Cargo project from root..."
+            # Build with cross, specifying the manifest path
+            echo "Verifying Cargo project..."
             cargo metadata --manifest-path backend/Cargo.toml --format-version 1 > /dev/null || (echo "Failed to get Cargo metadata" && exit 1)
             echo "Cargo metadata verified successfully"
-            # Show current directory and manifest path
-            pwd
-            ls -la backend/Cargo.toml || echo "Cargo.toml not found"
-            # Build with cross from project root
-            echo "Starting cross build from project root..."
+            # Build with cross, pointing to the backend Cargo.toml
+            echo "Starting cross build..."
             cross build --release --target ${{ matrix.target }} --manifest-path backend/Cargo.toml
           else
             cd backend
