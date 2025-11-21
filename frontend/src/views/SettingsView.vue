@@ -41,14 +41,14 @@
               <el-form-item label="监听地址" prop="server.host">
                 <el-input
                   v-model="formData.server.host"
-                  placeholder="例如: 127.0.0.1"
+                  placeholder="例如: 0.0.0.0"
                   clearable
                 >
                   <template #prepend>
                     <el-icon><Connection /></el-icon>
                   </template>
                 </el-input>
-                <div class="form-tip">服务器监听的IP地址</div>
+                <div class="form-tip">服务器监听的IP地址，0.0.0.0 表示监听所有网卡</div>
               </el-form-item>
 
               <el-form-item label="监听端口" prop="server.port">
@@ -118,14 +118,20 @@
               <el-form-item label="下载目录" prop="download.download_dir">
                 <el-input
                   v-model="formData.download.download_dir"
-                  placeholder="例如: downloads"
+                  placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
                   clearable
                 >
                   <template #prepend>
                     <el-icon><Folder /></el-icon>
                   </template>
                 </el-input>
-                <div class="form-tip">文件下载的保存目录，支持相对路径和绝对路径</div>
+                <div class="form-tip">
+                  <div>文件下载的保存目录，必须使用绝对路径</div>
+                  <div style="margin-top: 4px;">
+                    Windows 示例: <code>D:\Downloads</code> 或 <code>C:\Users\YourName\Downloads</code><br/>
+                    Linux/Docker 示例: <code>/app/downloads</code> 或 <code>/home/user/downloads</code>
+                  </div>
+                </div>
               </el-form-item>
 
               <el-form-item label="全局最大线程数" prop="download.max_global_threads">
@@ -304,6 +310,26 @@ const rules = reactive<FormRules<AppConfig>>({
   ],
   'download.download_dir': [
     { required: true, message: '请输入下载目录', trigger: 'blur' },
+    {
+      validator: (rule: any, value: any, callback: any) => {
+        if (!value) {
+          callback(new Error('请输入下载目录'))
+          return
+        }
+        // 检查是否为绝对路径
+        // Windows: 以盘符开头 (如 C:\, D:\) 或 UNC路径 (\\server\share)
+        // Linux/Mac: 以 / 开头
+        const isWindowsAbsolute = /^[A-Za-z]:\\/.test(value) || /^\\\\/.test(value)
+        const isUnixAbsolute = /^\//.test(value)
+
+        if (!isWindowsAbsolute && !isUnixAbsolute) {
+          callback(new Error('请输入绝对路径（Windows: D:\\Downloads, Linux: /app/downloads）'))
+          return
+        }
+        callback()
+      },
+      trigger: 'blur'
+    }
   ],
   'download.max_global_threads': [
     { required: true, message: '请选择全局最大线程数', trigger: 'change' },
@@ -386,9 +412,21 @@ async function handleSave() {
       console.warn('更新推荐配置失败:', error)
     }
   } catch (error: any) {
-    if (error instanceof Error) {
-      ElMessage.error('保存配置失败: ' + error.message)
+    // 提取详细的错误消息
+    let errorMessage = '未知错误'
+
+    if (error.response?.data?.details) {
+      // 后端返回的详细错误信息在 response.data.details 中
+      errorMessage = error.response.data.details
+    } else if (error.response?.data?.message) {
+      // 后端返回的通用错误消息
+      errorMessage = error.response.data.message
+    } else if (error.message) {
+      // axios 默认的错误消息
+      errorMessage = error.message
     }
+
+    ElMessage.error('保存配置失败: ' + errorMessage)
   } finally {
     saving.value = false
   }

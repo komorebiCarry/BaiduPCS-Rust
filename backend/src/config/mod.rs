@@ -1,9 +1,17 @@
 // 配置管理模块
 
+pub mod env_detector;
+pub mod mount_detector;
+pub mod path_validator;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
+
+pub use env_detector::{EnvDetector, EnvInfo, OsType};
+pub use mount_detector::{MountDetector, MountPoint};
+pub use path_validator::{PathValidationResult, PathValidator};
 
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,9 +93,65 @@ pub struct VipRecommendedConfig {
 }
 
 impl DownloadConfig {
-    /// 根据文件大小和 VIP 等级计算最优分片大小（字节）
+    /// 验证下载路径是否为绝对路径
     ///
-    /// 自适应策略：
+    /// # 返回值
+    /// - Ok(()): 路径是绝对路径
+    /// - Err: 路径不是绝对路径或格式无效
+    pub fn validate_download_dir(&self) -> Result<()> {
+        if !self.download_dir.is_absolute() {
+            anyhow::bail!(
+                "下载目录必须是绝对路径，当前值: {:?}\n\
+                 Windows 示例: D:\\Downloads 或 C:\\Users\\YourName\\Downloads\n\
+                 Linux/Docker 示例: /app/downloads 或 /home/user/downloads",
+                self.download_dir
+            );
+        }
+
+        tracing::debug!("✓ 路径格式验证通过（绝对路径）: {:?}", self.download_dir);
+        Ok(())
+    }
+
+    /// 增强路径验证（检查存在性、可写性、挂载点等）
+    ///
+    /// # 返回值
+    /// - Ok(PathValidationResult): 详细的验证结果
+    /// - Err: 验证过程中发生错误
+    pub fn validate_download_dir_enhanced(&self) -> Result<PathValidationResult> {
+        // 首先验证是否为绝对路径
+        self.validate_download_dir()?;
+
+        // 获取环境信息，检测是否在 Docker 中
+        let env_info = EnvDetector::get_env_info();
+
+        // 使用 PathValidator 进行增强验证（带 Docker 检查）
+        let result = PathValidator::validate_with_docker_check(
+            &self.download_dir,
+            env_info.is_docker,
+        );
+
+        Ok(result)
+    }
+
+    /// 确保下载目录存在（不存在则自动创建）
+    ///
+    /// # 返回值
+    /// - Ok(()): 目录存在或创建成功
+    /// - Err: 创建失败
+    pub fn ensure_download_dir_exists(&self) -> Result<()> {
+        // 先验证是否为绝对路径
+        self.validate_download_dir()?;
+
+        // 确保目录存在
+        PathValidator::ensure_directory_exists(&self.download_dir)?;
+
+        tracing::info!("下载目录已准备就绪: {:?}", self.download_dir);
+        Ok(())
+    }
+
+    /// 根据文件大小和 VIP 等级计算最优分片大小(字节)
+    ///
+    /// 自适应策略:
     /// - < 5MB: 256KB
     /// - 5-10MB: 512KB
     /// - 10-50MB: 1MB
@@ -95,12 +159,12 @@ impl DownloadConfig {
     /// - 100-500MB: 4MB
     /// - >= 500MB: 5MB
     ///
-    /// ⚠️ 重要：百度网盘限制单个 Range 请求最大 5MB，超过会返回 403 Forbidden
+    /// ⚠️ 重要:百度网盘限制单个 Range 请求最大 5MB,超过会返回 403 Forbidden
     ///
-    /// 同时根据 VIP 等级限制最大分片大小：
-    /// - 普通用户：最高 4MB
-    /// - 普通会员：最高 5MB
-    /// - SVIP：最高 5MB
+    /// 同时根据 VIP 等级限制最大分片大小:
+    /// - 普通用户:最高 4MB
+    /// - 普通会员:最高 5MB
+    /// - SVIP:最高 5MB
     pub fn calculate_adaptive_chunk_size(file_size_bytes: u64, vip_type: VipType) -> u64 {
         const KB: u64 = 1024;
         const MB: u64 = 1024 * KB;
@@ -199,15 +263,37 @@ impl Default for AppConfig {
     fn default() -> Self {
         // 默认使用 SVIP 配置（用户可以根据自己的 VIP 等级调整）
         let svip_config = DownloadConfig::recommended_for_vip(VipType::Svip);
-        
+
+        // 获取环境信息
+        let env_info = EnvDetector::get_env_info();
+
+        // 获取默认下载目录（绝对路径）
+        // Docker 环境使用 /app/downloads，本地环境使用当前工作目录 + downloads
+        let download_dir = if env_info.is_docker {
+            // Docker 环境
+            PathBuf::from("/app/downloads")
+        } else {
+            // 本地环境：使用当前工作目录 + downloads
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("downloads")
+        };
+
+        tracing::info!(
+            "检测到环境: {} (Docker: {}), 使用默认下载目录: {:?}",
+            env_info.os_type.as_str(),
+            env_info.is_docker,
+            download_dir
+        );
+
         Self {
             server: ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: 18888, // 默认端口改为 18888，与配置文件保持一致
+                host: "0.0.0.0".to_string(),
+                port: 8080,
                 cors_origins: vec!["*".to_string()],
             },
             download: DownloadConfig {
-                download_dir: PathBuf::from("downloads"),
+                download_dir,
                 max_global_threads: svip_config.threads,
                 chunk_size_mb: svip_config.chunk_size,
                 max_concurrent_tasks: svip_config.max_tasks,
@@ -218,6 +304,14 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// 获取当前运行环境信息
+    ///
+    /// # 返回值
+    /// - EnvInfo: 包含 Docker 环境和操作系统类型信息
+    pub fn get_env_info() -> EnvInfo {
+        EnvDetector::get_env_info()
+    }
+
     /// 从文件加载配置
     pub async fn load_from_file(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)
@@ -226,11 +320,52 @@ impl AppConfig {
 
         let config: AppConfig = toml::from_str(&content).context("Failed to parse config file")?;
 
+        // 验证下载路径是否为绝对路径
+        config.download.validate_download_dir()
+            .context("配置文件中的下载路径验证失败")?;
+
         Ok(config)
     }
 
     /// 保存配置到文件
-    pub async fn save_to_file(&self, path: &str) -> Result<()> {
+    ///
+    /// 执行以下步骤：
+    /// 1. 验证下载路径格式（绝对路径）
+    /// 2. 增强验证（存在性、可写性、可用空间）
+    /// 3. 如果路径不存在，报错（要求用户先创建目录）
+    /// 4. 序列化并保存配置文件
+    ///
+    /// # 返回值
+    /// - Ok(PathValidationResult): 保存成功，返回路径验证结果
+    /// - Err: 保存失败
+    pub async fn save_to_file(&self, path: &str) -> Result<PathValidationResult> {
+        // 1. 验证下载路径格式（绝对路径）
+        self.download.validate_download_dir()
+            .context("保存配置失败：下载路径必须是绝对路径")?;
+
+        // 2. 增强验证（存在性、可写性、可用空间）
+        let validation_result = self.download.validate_download_dir_enhanced()
+            .context("保存配置失败：路径验证失败")?;
+
+        // 3. 路径必须存在且有效
+        if !validation_result.exists {
+            anyhow::bail!(
+                "保存配置失败：下载目录不存在。路径: {:?}。请先手动创建该目录，或选择一个已存在的目录",
+                self.download.download_dir
+            );
+        }
+
+        if !validation_result.valid {
+            // 路径存在但验证失败（不可写或其他问题）
+            let details_msg = validation_result.details.as_deref().unwrap_or("无详细信息");
+            anyhow::bail!(
+                "保存配置失败：{}。详情: {}",
+                validation_result.message,
+                details_msg
+            );
+        }
+
+        // 4. 序列化并保存配置文件
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
 
         // 确保父目录存在
@@ -244,7 +379,9 @@ impl AppConfig {
             .await
             .context("Failed to write config file")?;
 
-        Ok(())
+        tracing::info!("✓ 配置已保存: {}", path);
+
+        Ok(validation_result)
     }
 
     /// 加载或创建默认配置
@@ -257,6 +394,22 @@ impl AppConfig {
             Err(e) => {
                 tracing::warn!("配置文件加载失败，使用默认配置: {}", e);
                 let default_config = Self::default();
+
+                // 首次启动：自动创建默认下载目录
+                if !default_config.download.download_dir.exists() {
+                    if let Err(e) = std::fs::create_dir_all(&default_config.download.download_dir) {
+                        tracing::error!(
+                            "无法创建默认下载目录 {:?}: {}",
+                            default_config.download.download_dir,
+                            e
+                        );
+                    } else {
+                        tracing::info!(
+                            "✓ 已创建默认下载目录: {:?}",
+                            default_config.download.download_dir
+                        );
+                    }
+                }
 
                 // 尝试保存默认配置
                 if let Err(e) = default_config.save_to_file(path).await {
@@ -308,20 +461,20 @@ mod tests {
         // 测试会员推荐配置
         let vip = DownloadConfig::recommended_for_vip(VipType::Vip);
         assert_eq!(vip.threads, 5);
-        assert_eq!(vip.chunk_size, 16);
+        assert_eq!(vip.chunk_size, 4);
         assert_eq!(vip.max_tasks, 3);
 
         // 测试 SVIP 推荐配置
         let svip = DownloadConfig::recommended_for_vip(VipType::Svip);
         assert_eq!(svip.threads, 10);
-        assert_eq!(svip.chunk_size, 32);
+        assert_eq!(svip.chunk_size, 5);
         assert_eq!(svip.max_tasks, 5);
     }
 
     #[test]
     fn test_config_validation() {
         let mut config = DownloadConfig {
-            download_dir: PathBuf::from("downloads"),
+            download_dir: std::env::current_dir().unwrap().join("downloads"),
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
@@ -340,5 +493,54 @@ mod tests {
         config.max_global_threads = 30;
         let result = config.validate_for_vip(VipType::Svip);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_path_validation() {
+        // 测试绝对路径验证（使用当前目录，确保跨平台兼容）
+        let absolute_path = std::env::current_dir().unwrap().join("downloads");
+        let absolute_config = DownloadConfig {
+            download_dir: absolute_path,
+            max_global_threads: 5,
+            chunk_size_mb: 10,
+            max_concurrent_tasks: 2,
+            max_retries: 3,
+        };
+        assert!(absolute_config.validate_download_dir().is_ok());
+
+        // 测试相对路径验证（应该失败）
+        let relative_config = DownloadConfig {
+            download_dir: PathBuf::from("downloads"),
+            max_global_threads: 5,
+            chunk_size_mb: 10,
+            max_concurrent_tasks: 2,
+            max_retries: 3,
+        };
+        assert!(relative_config.validate_download_dir().is_err());
+
+        // 测试平台特定的绝对路径
+        #[cfg(target_os = "windows")]
+        {
+            let windows_config = DownloadConfig {
+                download_dir: PathBuf::from("D:\\Downloads"),
+                max_global_threads: 5,
+                chunk_size_mb: 10,
+                max_concurrent_tasks: 2,
+                max_retries: 3,
+            };
+            assert!(windows_config.validate_download_dir().is_ok());
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let unix_config = DownloadConfig {
+                download_dir: PathBuf::from("/app/downloads"),
+                max_global_threads: 5,
+                chunk_size_mb: 10,
+                max_concurrent_tasks: 2,
+                max_retries: 3,
+            };
+            assert!(unix_config.validate_download_dir().is_ok());
+        }
     }
 }

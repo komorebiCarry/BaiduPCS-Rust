@@ -39,9 +39,10 @@ impl DownloadManager {
         max_global_threads: usize,
         max_concurrent_tasks: usize,
     ) -> Result<Self> {
-        // 确保下载目录存在
+        // 确保下载目录存在（路径验证已在配置保存时完成）
         if !download_dir.exists() {
             std::fs::create_dir_all(&download_dir).context("创建下载目录失败")?;
+            info!("✓ 下载目录已创建: {:?}", download_dir);
         }
 
         // 创建全局线程池
@@ -51,8 +52,8 @@ impl DownloadManager {
         let chunk_scheduler = ChunkScheduler::new(global_semaphore.clone(), max_concurrent_tasks);
 
         info!(
-            "创建下载管理器: 全局线程数={}, 最大同时下载数={} (分片大小自适应)",
-            max_global_threads, max_concurrent_tasks
+            "创建下载管理器: 下载目录={:?}, 全局线程数={}, 最大同时下载数={} (分片大小自适应)",
+            download_dir, max_global_threads, max_concurrent_tasks
         );
 
         let engine = Arc::new(DownloadEngine::new(user_auth));
@@ -390,6 +391,11 @@ mod tests {
         UserAuth {
             uid: 123456789,
             username: "test_user".to_string(),
+            nickname: Some("测试用户".to_string()),
+            avatar_url: Some("https://example.com/avatar.jpg".to_string()),
+            vip_type: Some(2), // SVIP
+            total_space: Some(2 * 1024 * 1024 * 1024 * 1024), // 2TB
+            used_space: Some(500 * 1024 * 1024 * 1024), // 500GB
             bduss: "mock_bduss".to_string(),
             stoken: Some("mock_stoken".to_string()),
             ptoken: Some("mock_ptoken".to_string()),
