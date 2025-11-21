@@ -24,15 +24,12 @@ impl MountDetector {
     /// # 返回值
     /// - Vec<MountPoint>: 用户挂载的路径列表
     pub fn get_mount_points() -> Vec<MountPoint> {
-        let mounts = Vec::new();
-
-        // 只在 Linux 系统上尝试读取 /proc/mounts
         #[cfg(target_os = "linux")]
         {
             use std::collections::HashSet;
             use std::fs;
 
-            let mut mounts_linux = Vec::new();
+            let mut mounts_linux: Vec<MountPoint> = Vec::new();
 
             if let Ok(content) = fs::read_to_string("/proc/mounts") {
                 // 系统路径列表（这些路径通常是系统自动挂载的）
@@ -93,7 +90,9 @@ impl MountDetector {
         }
 
         #[cfg(not(target_os = "linux"))]
-        mounts
+        {
+            Vec::new()
+        }
     }
 
     /// 检测路径是否是挂载点或其子路径
