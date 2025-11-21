@@ -1,6 +1,6 @@
 // 配置管理 API
 
-use crate::config::{AppConfig, DownloadConfig, VipRecommendedConfig, VipType};
+use crate::config::{AppConfig, DownloadConfig, PathValidationResult, VipRecommendedConfig, VipType};
 use crate::server::error::{ApiError, ApiResult};
 use axum::{extract::State, response::Json};
 use serde::Serialize;
@@ -15,6 +15,13 @@ pub struct RecommendedConfigResponse {
     pub vip_name: String,
     pub recommended: VipRecommendedConfig,
     pub warnings: Vec<String>,
+}
+
+/// 配置更新响应
+#[derive(Debug, Serialize)]
+pub struct ConfigUpdateResponse {
+    pub message: String,
+    pub path_validation: PathValidationResult,
 }
 
 /// GET /api/v1/config
@@ -103,7 +110,7 @@ pub async fn reset_to_recommended(
 pub async fn update_config(
     State(app_state): State<crate::server::AppState>,
     Json(new_config): Json<AppConfig>,
-) -> ApiResult<Json<ApiResponse<String>>> {
+) -> ApiResult<Json<ApiResponse<ConfigUpdateResponse>>> {
     info!("更新应用配置");
 
     // 基本验证
@@ -131,8 +138,8 @@ pub async fn update_config(
         // 注意：这里只是警告，不阻止用户设置，因为用户可能有特殊需求
     }
 
-    // 保存到文件
-    new_config
+    // 保存到文件（包含完整的路径验证）
+    let validation_result = new_config
         .save_to_file("config/app.toml")
         .await
         .map_err(ApiError::Internal)?;
@@ -141,7 +148,13 @@ pub async fn update_config(
     *app_state.config.write().await = new_config;
 
     info!("配置更新成功");
-    Ok(Json(ApiResponse::success("配置已更新".to_string())))
+
+    let response = ConfigUpdateResponse {
+        message: "配置已更新".to_string(),
+        path_validation: validation_result,
+    };
+
+    Ok(Json(ApiResponse::success(response)))
 }
 
 #[cfg(test)]

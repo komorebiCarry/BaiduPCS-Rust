@@ -1092,6 +1092,11 @@ mod tests {
         UserAuth {
             uid: 123456789,
             username: "test_user".to_string(),
+            nickname: Some("测试用户".to_string()),
+            avatar_url: Some("https://example.com/avatar.jpg".to_string()),
+            vip_type: Some(2), // SVIP
+            total_space: Some(2 * 1024 * 1024 * 1024 * 1024), // 2TB
+            used_space: Some(500 * 1024 * 1024 * 1024), // 500GB
             bduss: "mock_bduss".to_string(),
             stoken: Some("mock_stoken".to_string()),
             ptoken: Some("mock_ptoken".to_string()),
@@ -1103,14 +1108,7 @@ mod tests {
     #[test]
     fn test_engine_creation() {
         let user_auth = create_mock_user_auth();
-        let engine = DownloadEngine::new(user_auth, 8);
-        assert_eq!(engine.concurrent_chunks, 8);
-    }
-
-    #[test]
-    fn test_engine_with_default_concurrency() {
-        let user_auth = create_mock_user_auth();
-        let engine = DownloadEngine::with_default_concurrency(user_auth);
-        assert_eq!(engine.concurrent_chunks, DEFAULT_CONCURRENT_CHUNKS);
+        let engine = DownloadEngine::new(user_auth);
+        assert_eq!(engine.vip_type as u32, 2); // SVIP
     }
 }
