@@ -311,7 +311,7 @@ const rules = reactive<FormRules<AppConfig>>({
   'download.download_dir': [
     { required: true, message: '请输入下载目录', trigger: 'blur' },
     {
-      validator: (rule: any, value: any, callback: any) => {
+      validator: (_rule: any, value: any, callback: any) => {
         if (!value) {
           callback(new Error('请输入下载目录'))
           return
