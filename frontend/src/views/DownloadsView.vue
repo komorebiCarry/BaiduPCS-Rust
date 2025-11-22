@@ -316,8 +316,8 @@ async function handleDelete(taskId: string, status: TaskStatus) {
           type: 'warning',
         }
       )
-      await deleteDownload(taskId, false)
-      ElMessage.success('任务已删除')
+      await deleteDownload(taskId, true)
+      ElMessage.success('任务和文件已删除')
       refreshTasks()
     }
   } catch (error: any) {

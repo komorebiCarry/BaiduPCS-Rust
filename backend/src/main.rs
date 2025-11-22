@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // 自动检测前端资源目录
     let frontend_dir = detect_frontend_dir();
     let index_html_path = frontend_dir.join("index.html");
-    
+
     // 静态文件服务（前端资源）
     let static_service = ServeDir::new(&frontend_dir)
         .not_found_service(ServeFile::new(&index_html_path));

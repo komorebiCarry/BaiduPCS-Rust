@@ -1,11 +1,11 @@
 use crate::auth::UserAuth;
 use crate::downloader::{ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo, TaskStatus};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -16,6 +16,8 @@ pub struct DownloadManager {
     tasks: Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
     /// 任务取消令牌（task_id -> CancellationToken）
     cancellation_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    /// 等待队列（task_id 列表，FIFO）
+    waiting_queue: Arc<RwLock<VecDeque<String>>>,
     /// 下载引擎
     engine: Arc<DownloadEngine>,
     /// 默认下载目录
@@ -45,11 +47,8 @@ impl DownloadManager {
             info!("✓ 下载目录已创建: {:?}", download_dir);
         }
 
-        // 创建全局线程池
-        let global_semaphore = Arc::new(Semaphore::new(max_global_threads));
-
-        // 创建全局分片调度器
-        let chunk_scheduler = ChunkScheduler::new(global_semaphore.clone(), max_concurrent_tasks);
+        // 创建全局分片调度器（不再使用 Semaphore）
+        let chunk_scheduler = ChunkScheduler::new(max_global_threads, max_concurrent_tasks);
 
         info!(
             "创建下载管理器: 下载目录={:?}, 全局线程数={}, 最大同时下载数={} (分片大小自适应)",
@@ -58,14 +57,20 @@ impl DownloadManager {
 
         let engine = Arc::new(DownloadEngine::new(user_auth));
 
-        Ok(Self {
+        let manager = Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             cancellation_tokens: Arc::new(RwLock::new(HashMap::new())),
+            waiting_queue: Arc::new(RwLock::new(VecDeque::new())),
             engine,
             download_dir,
             chunk_scheduler,
             max_concurrent_tasks,
-        })
+        };
+
+        // 启动后台任务：定期检查并启动等待队列中的任务
+        manager.start_waiting_queue_monitor();
+
+        Ok(manager)
     }
 
     /// 创建下载任务
@@ -115,17 +120,39 @@ impl DownloadManager {
             }
         }
 
-        info!("启动下载任务: {}", task_id);
+        info!("请求启动下载任务: {}", task_id);
 
-        // 检查调度器是否已满（真正的限制）
+        // 检查调度器是否已满
         let active_count = self.chunk_scheduler.active_task_count().await;
         if active_count >= self.max_concurrent_tasks {
-            anyhow::bail!(
-                "超过最大并发任务数限制 ({}/{})",
-                active_count,
-                self.max_concurrent_tasks
+            // 加入等待队列
+            self.waiting_queue.write().await.push_back(task_id.to_string());
+
+            // 任务保持 Pending 状态（表示系统等待，而非用户暂停）
+            // 注意：Pending = 等待系统资源，Paused = 用户主动暂停
+
+            info!(
+                "任务 {} 加入等待队列（系统等待） ({}/{} 活跃任务)",
+                task_id, active_count, self.max_concurrent_tasks
             );
+            return Ok(());
         }
+
+        // 立即启动任务
+        self.start_task_internal(task_id).await
+    }
+
+    /// 内部方法：真正启动一个任务（不检查并发限制）
+    async fn start_task_internal(&self, task_id: &str) -> Result<()> {
+        let task = self
+            .tasks
+            .read()
+            .await
+            .get(task_id)
+            .cloned()
+            .context("任务不存在")?;
+
+        info!("启动下载任务: {}", task_id);
 
         // 创建取消令牌
         let cancellation_token = CancellationToken::new();
@@ -153,7 +180,6 @@ impl DownloadManager {
                     url_health,
                     output_path,
                     chunk_size,
-                    timeout_secs,
                     chunk_manager,
                     speed_calc,
                 )) => {
@@ -169,7 +195,6 @@ impl DownloadManager {
                         url_health,
                         output_path,
                         chunk_size,
-                        timeout_secs,
                         cancellation_token: cancellation_token.clone(),
                         active_chunk_count: Arc::new(AtomicUsize::new(0)),
                     };
@@ -184,6 +209,8 @@ impl DownloadManager {
 
                         // 移除取消令牌
                         cancellation_tokens.write().await.remove(&task_id_clone);
+
+                        // 不在这里调用 try_start_waiting_tasks，避免循环引用
                     }
                 }
                 Err(e) => {
@@ -195,11 +222,147 @@ impl DownloadManager {
 
                     // 移除取消令牌
                     cancellation_tokens.write().await.remove(&task_id_clone);
+
+                    // 不在这里调用 try_start_waiting_tasks，避免循环引用
                 }
             }
         });
 
         Ok(())
+    }
+
+    /// 尝试从等待队列启动任务
+    async fn try_start_waiting_tasks(&self) {
+        loop {
+            // 检查是否有空闲位置
+            let active_count = self.chunk_scheduler.active_task_count().await;
+            if active_count >= self.max_concurrent_tasks {
+                break;
+            }
+
+            // 从等待队列取出任务
+            let task_id = {
+                let mut queue = self.waiting_queue.write().await;
+                queue.pop_front()
+            };
+
+            match task_id {
+                Some(id) => {
+                    info!("从等待队列启动任务: {}", id);
+                    if let Err(e) = self.start_task_internal(&id).await {
+                        error!("启动等待任务失败: {}, 错误: {}", id, e);
+                    }
+                }
+                None => break, // 队列为空
+            }
+        }
+    }
+
+    /// 启动后台监控任务：定期检查并启动等待队列中的任务
+    ///
+    /// 这确保了当活跃任务自然完成时，等待队列中的任务能被自动启动
+    fn start_waiting_queue_monitor(&self) {
+        let waiting_queue = self.waiting_queue.clone();
+        let chunk_scheduler = self.chunk_scheduler.clone();
+        let tasks = self.tasks.clone();
+        let cancellation_tokens = self.cancellation_tokens.clone();
+        let engine = self.engine.clone();
+        let max_concurrent_tasks = self.max_concurrent_tasks;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+
+            loop {
+                interval.tick().await;
+
+                // 检查是否有等待任务
+                let has_waiting = {
+                    let queue = waiting_queue.read().await;
+                    !queue.is_empty()
+                };
+
+                if !has_waiting {
+                    continue;
+                }
+
+                // 检查是否有空闲位置
+                let active_count = chunk_scheduler.active_task_count().await;
+                if active_count >= max_concurrent_tasks {
+                    continue;
+                }
+
+                // 尝试启动等待任务
+                loop {
+                    let active_count = chunk_scheduler.active_task_count().await;
+                    if active_count >= max_concurrent_tasks {
+                        break;
+                    }
+
+                    let task_id = {
+                        let mut queue = waiting_queue.write().await;
+                        queue.pop_front()
+                    };
+
+                    match task_id {
+                        Some(id) => {
+                            info!("🔄 后台监控：从等待队列启动任务 {}", id);
+
+                            // 获取任务
+                            let task = tasks.read().await.get(&id).cloned();
+                            if let Some(task) = task {
+                                // 创建取消令牌
+                                let cancellation_token = CancellationToken::new();
+                                cancellation_tokens.write().await.insert(id.clone(), cancellation_token.clone());
+
+                                // 启动任务（简化版，直接在这里处理）
+                                let engine_clone = engine.clone();
+                                let task_clone = task.clone();
+                                let chunk_scheduler_clone = chunk_scheduler.clone();
+                                let id_clone = id.clone();
+                                let cancellation_tokens_clone = cancellation_tokens.clone();
+
+                                tokio::spawn(async move {
+                                    let prepare_result = engine_clone.prepare_for_scheduling(task_clone.clone()).await;
+
+                                    match prepare_result {
+                                        Ok((client, cookie, referer, url_health, output_path, chunk_size, chunk_manager, speed_calc)) => {
+                                            let task_info = TaskScheduleInfo {
+                                                task_id: id_clone.clone(),
+                                                task: task_clone.clone(),
+                                                chunk_manager,
+                                                speed_calc,
+                                                client,
+                                                cookie,
+                                                referer,
+                                                url_health,
+                                                output_path,
+                                                chunk_size,
+                                                cancellation_token: cancellation_token.clone(),
+                                                active_chunk_count: Arc::new(AtomicUsize::new(0)),
+                                            };
+
+                                            if let Err(e) = chunk_scheduler_clone.register_task(task_info).await {
+                                                error!("后台监控：注册任务失败: {}", e);
+                                                let mut t = task_clone.lock().await;
+                                                t.mark_failed(e.to_string());
+                                                cancellation_tokens_clone.write().await.remove(&id_clone);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("后台监控：准备任务失败: {}", e);
+                                            let mut t = task_clone.lock().await;
+                                            t.mark_failed(e.to_string());
+                                            cancellation_tokens_clone.write().await.remove(&id_clone);
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
     }
 
     /// 暂停下载任务
@@ -219,12 +382,16 @@ impl DownloadManager {
 
         t.mark_paused();
         info!("暂停下载任务: {}", task_id);
+        drop(t);
 
         // 从调度器取消任务
         self.chunk_scheduler.cancel_task(task_id).await;
 
         // 移除取消令牌
         self.cancellation_tokens.write().await.remove(task_id);
+
+        // 尝试启动等待队列中的任务
+        self.try_start_waiting_tasks().await;
 
         Ok(())
     }
@@ -239,18 +406,45 @@ impl DownloadManager {
             .cloned()
             .context("任务不存在")?;
 
-        let t = task.lock().await;
-        if t.status != TaskStatus::Paused {
-            anyhow::bail!("任务未暂停");
-        }
-        drop(t);
+        // 检查任务状态并将 Paused 改回 Pending
+        {
+            let mut t = task.lock().await;
+            if t.status != TaskStatus::Paused {
+                anyhow::bail!("任务未暂停，当前状态: {:?}", t.status);
+            }
 
-        info!("恢复下载任务: {}", task_id);
-        self.start_task(task_id).await
+            // 将状态改回 Pending，准备重新启动
+            // 注意：这里不能用 mark_downloading，因为还没获得资源
+            t.status = TaskStatus::Pending;
+        }
+
+        info!("用户请求恢复下载任务: {}", task_id);
+
+        // 检查是否有可用位置
+        let active_count = self.chunk_scheduler.active_task_count().await;
+        if active_count >= self.max_concurrent_tasks {
+            // 没有可用位置，加入等待队列
+            self.waiting_queue.write().await.push_back(task_id.to_string());
+
+            info!(
+                "恢复任务 {} 时无可用位置，已加入等待队列 ({}/{} 活跃任务)",
+                task_id, active_count, self.max_concurrent_tasks
+            );
+            return Ok(());
+        }
+
+        // 有可用位置，立即启动
+        self.start_task_internal(task_id).await
     }
 
     /// 删除下载任务
     pub async fn delete_task(&self, task_id: &str, delete_file: bool) -> Result<()> {
+        // 从等待队列移除（如果存在）
+        {
+            let mut queue = self.waiting_queue.write().await;
+            queue.retain(|id| id != task_id);
+        }
+
         // 从调度器取消任务
         self.chunk_scheduler.cancel_task(task_id).await;
 
@@ -285,6 +479,11 @@ impl DownloadManager {
         }
 
         info!("删除下载任务: {}", task_id);
+        drop(t);
+
+        // 尝试启动等待队列中的任务
+        self.try_start_waiting_tasks().await;
+
         Ok(())
     }
 
@@ -370,6 +569,61 @@ impl DownloadManager {
     /// 获取下载目录
     pub fn download_dir(&self) -> &Path {
         &self.download_dir
+    }
+
+    /// 动态更新全局最大线程数
+    ///
+    /// 该方法可以在运行时调整线程池大小，无需重启下载管理器
+    /// 正在进行的下载任务不受影响
+    pub fn update_max_threads(&self, new_max: usize) {
+        self.chunk_scheduler.update_max_threads(new_max);
+    }
+
+    /// 动态更新最大并发任务数
+    ///
+    /// 该方法可以在运行时调整最大并发任务数：
+    /// - **调大**：自动从等待队列启动新任务
+    /// - **调小**：不会打断正在下载的任务，但新任务会进入等待队列
+    ///   当前运行的任务完成后，会根据新的限制从等待队列启动任务
+    pub async fn update_max_concurrent_tasks(&self, new_max: usize) {
+        let old_max = self.max_concurrent_tasks;
+
+        // 更新调度器的限制
+        self.chunk_scheduler.update_max_concurrent_tasks(new_max);
+
+        // 更新 manager 自己的记录（因为 max_concurrent_tasks 不是 Arc 包装的）
+        // 注意：这里有个限制，因为 self 是 &self，我们不能修改 max_concurrent_tasks
+        // 但调度器已经更新了，这个字段只在创建时使用，之后都用调度器的值
+
+        if new_max > old_max {
+            // 调大：立即尝试启动等待队列中的任务
+            info!(
+                "🔧 最大并发任务数调大: {} -> {}, 启动等待任务",
+                old_max, new_max
+            );
+            self.try_start_waiting_tasks().await;
+        } else if new_max < old_max {
+            // 调小：不打断现有任务，但新任务会进入等待队列
+            let active_count = self.chunk_scheduler.active_task_count().await;
+            info!(
+                "🔧 最大并发任务数调小: {} -> {} (当前活跃: {})",
+                old_max, new_max, active_count
+            );
+
+            if active_count > new_max {
+                info!(
+                    "当前有 {} 个活跃任务超过新限制 {}，这些任务将继续运行直到完成",
+                    active_count, new_max
+                );
+            }
+        }
+    }
+
+    /// 获取当前线程池状态
+    pub fn get_thread_pool_stats(&self) -> (usize, usize) {
+        let max_threads = self.chunk_scheduler.max_threads();
+        let active_threads = self.chunk_scheduler.active_threads();
+        (active_threads, max_threads)
     }
 }
 

@@ -37,9 +37,9 @@ impl MountDetector {
                     "/proc", "/sys", "/dev", "/run", "/tmp", "/var", "/usr", "/bin", "/sbin",
                     "/lib", "/lib64", "/boot", "/root", "/home", "/etc", "/opt",
                 ]
-                .iter()
-                .cloned()
-                .collect();
+                    .iter()
+                    .cloned()
+                    .collect();
 
                 for line in content.lines() {
                     let parts: Vec<&str> = line.split_whitespace().collect();

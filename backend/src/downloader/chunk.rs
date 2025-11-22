@@ -8,8 +8,8 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-/// 默认分片大小: 10MB
-pub const DEFAULT_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+/// 默认分片大小: 5MB
+pub const DEFAULT_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
 
 /// 分片信息
 #[derive(Debug, Clone)]
@@ -20,6 +20,8 @@ pub struct Chunk {
     pub range: Range<u64>,
     /// 是否已完成
     pub completed: bool,
+    /// 是否正在下载（防止重复调度）
+    pub downloading: bool,
     /// 重试次数
     pub retries: u32,
 }
@@ -30,6 +32,7 @@ impl Chunk {
             index,
             range,
             completed: false,
+            downloading: false,
             retries: 0,
         }
     }
@@ -74,13 +77,6 @@ impl Chunk {
             referer
         );
 
-        // 记录 URL 和 Cookie 的前 50 个字符用于调试
-        info!(
-            "[分片线程{}] 分片 #{} 开始请求",
-            chunk_thread_id,
-            self.index
-        );
-
         // 1. 构建 Range 请求（使用动态超时、Cookie 和 Referer）
         let mut request = client.get(url).header("Cookie", cookie).header(
             "Range",
@@ -88,7 +84,7 @@ impl Chunk {
         );
 
         if let Some(referer_val) = referer {
-            info!(
+            debug!(
                 "[分片线程{}] 分片 #{} 添加 Referer 请求头",
                 chunk_thread_id,
                 self.index
@@ -118,9 +114,11 @@ impl Chunk {
             .await
             .context("文件定位失败")?;
 
-        // 3. 流式读取并写入文件，实时更新进度
+        // 3. 流式读取并写入文件，批量更新进度（减少锁竞争）
         let mut stream = resp.bytes_stream();
         let mut total_bytes_downloaded = 0u64;
+        let mut pending_progress = 0u64; // 累积的待更新字节数
+        const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
 
         while let Some(chunk_result) = stream.next().await {
             let chunk_data = chunk_result.context("读取数据流失败")?;
@@ -132,18 +130,18 @@ impl Chunk {
                 .context("写入文件失败")?;
 
             total_bytes_downloaded += chunk_len;
+            pending_progress += chunk_len;
 
-            // 🔥 实时更新进度（每读取一块数据就更新）
-            progress_callback(chunk_len);
+            // 🔥 批量更新进度：累积到阈值或下载完成时才回调（大幅减少锁竞争）
+            if pending_progress >= PROGRESS_UPDATE_THRESHOLD || total_bytes_downloaded >= self.size() {
+                progress_callback(pending_progress);
+                pending_progress = 0;
+            }
+        }
 
-            debug!(
-                "[分片线程{}] 分片 #{} 进度: {}/{} bytes ({:.1}%)",
-                chunk_thread_id,
-                self.index,
-                total_bytes_downloaded,
-                self.size(),
-                (total_bytes_downloaded as f64 / self.size() as f64) * 100.0
-            );
+        // 确保剩余的进度被更新
+        if pending_progress > 0 {
+            progress_callback(pending_progress);
         }
 
         // 4. 刷新文件缓冲
@@ -261,6 +259,21 @@ impl ChunkManager {
     pub fn mark_completed(&mut self, index: usize) {
         if let Some(chunk) = self.chunks.get_mut(index) {
             chunk.completed = true;
+            chunk.downloading = false; // 完成后清除下载标记
+        }
+    }
+
+    /// 标记分片正在下载（防止重复调度）
+    pub fn mark_downloading(&mut self, index: usize) {
+        if let Some(chunk) = self.chunks.get_mut(index) {
+            chunk.downloading = true;
+        }
+    }
+
+    /// 取消分片下载标记（下载失败时调用）
+    pub fn unmark_downloading(&mut self, index: usize) {
+        if let Some(chunk) = self.chunks.get_mut(index) {
+            chunk.downloading = false;
         }
     }
 
@@ -268,6 +281,7 @@ impl ChunkManager {
     pub fn reset(&mut self) {
         for chunk in &mut self.chunks {
             chunk.completed = false;
+            chunk.downloading = false;
             chunk.retries = 0;
         }
     }

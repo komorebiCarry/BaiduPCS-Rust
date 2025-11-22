@@ -25,15 +25,28 @@ const URL_FAILURE_THRESHOLD: u32 = 5;
 pub struct UrlHealthManager {
     /// 可用的链接列表（索引 -> URL）
     available_urls: Vec<String>,
+    /// URL速度映射（URL -> 探测速度KB/s）
+    url_speeds: HashMap<String, f64>,
     /// 链接失败计数（URL -> 失败次数）
     failure_counts: HashMap<String, u32>,
 }
 
 impl UrlHealthManager {
     /// 创建新的 URL 健康管理器
-    pub fn new(urls: Vec<String>) -> Self {
+    ///
+    /// # 参数
+    /// * `urls` - URL列表
+    /// * `speeds` - 对应的探测速度列表（KB/s）
+    pub fn new(urls: Vec<String>, speeds: Vec<f64>) -> Self {
+        // 构建速度映射
+        let mut url_speeds = HashMap::new();
+        for (url, speed) in urls.iter().zip(speeds.iter()) {
+            url_speeds.insert(url.clone(), *speed);
+        }
+
         Self {
             available_urls: urls,
+            url_speeds,
             failure_counts: HashMap::new(),
         }
     }
@@ -83,6 +96,43 @@ impl UrlHealthManager {
                 debug!("链接 {} 下载成功，失败计数减少至: {}", url, *count);
             }
         }
+    }
+
+    /// 根据URL和分片大小计算动态超时时间（秒）
+    ///
+    /// 基于探测速度计算，公式：
+    /// timeout = (chunk_size_kb / speed_kbps) × safety_factor
+    ///
+    /// # 参数
+    /// * `url` - 下载链接
+    /// * `chunk_size` - 分片大小（字节）
+    ///
+    /// # 返回
+    /// 超时时间（秒），范围在 [10, 180] 之间
+    pub fn calculate_timeout(&self, url: &str, chunk_size: u64) -> u64 {
+        const SAFETY_FACTOR: f64 = 1.5; // 安全系数：1.5倍理论时间
+        const MIN_TIMEOUT: u64 = 10;    // 最小10秒
+        const MAX_TIMEOUT: u64 = 120;   // 最大2分钟
+
+        // 获取该URL的探测速度
+        if let Some(&speed_kbps) = self.url_speeds.get(url) {
+            if speed_kbps > 0.0 {
+                // 转换分片大小为KB
+                let chunk_size_kb = chunk_size as f64 / 1024.0;
+
+                // 计算理论时间（秒）
+                let theoretical_time = chunk_size_kb / speed_kbps;
+
+                // 应用安全系数
+                let timeout = (theoretical_time * SAFETY_FACTOR) as u64;
+
+                // 限制在合理范围内
+                return timeout.max(MIN_TIMEOUT).min(MAX_TIMEOUT);
+            }
+        }
+
+        // 如果没有速度信息，使用默认超时
+        30
     }
 }
 
@@ -136,11 +186,17 @@ impl DownloadEngine {
         Client::builder()
             .user_agent(pan_ua)
             .timeout(std::time::Duration::from_secs(120)) // 2分钟超时
-            .pool_max_idle_per_host(100) // MaxIdleConns: 100
+            .pool_max_idle_per_host(200) // 增大连接池：100 -> 200
             .pool_idle_timeout(std::time::Duration::from_secs(90)) // IdleConnTimeout: 90s
             .tcp_keepalive(std::time::Duration::from_secs(60)) // TCP Keep-Alive
+            .tcp_nodelay(true) // 启用 TCP_NODELAY，减少延迟
             .redirect(reqwest::redirect::Policy::limited(10)) // 最多 10 次重定向
-            .http1_only()
+            // HTTP/2 极致优化：大幅增加窗口以消除慢启动影响
+            .http2_adaptive_window(true) // 启用HTTP/2自适应窗口
+            .http2_initial_stream_window_size(Some(1024 * 1024 * 2)) // 2MB初始流窗口（默认65KB）
+            .http2_initial_connection_window_size(Some(1024 * 1024 * 4)) // 4MB初始连接窗口（默认65KB）
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(20)) // HTTP/2 keep-alive超时
             .build()
             .expect("Failed to build download HTTP client")
     }
@@ -183,7 +239,6 @@ impl DownloadEngine {
         Arc<Mutex<UrlHealthManager>>,      // URL 健康管理器
         PathBuf,                           // 本地路径
         u64,                               // 分片大小
-        u64,                               // 超时时间（秒）
         Arc<Mutex<ChunkManager>>,          // 分片管理器
         Arc<Mutex<SpeedCalculator>>,       // 速度计算器
     )> {
@@ -236,6 +291,7 @@ impl DownloadEngine {
         // 4. 探测所有下载链接，过滤出可用的链接
         info!("开始探测 {} 个下载链接...", all_urls.len());
         let mut valid_urls = Vec::new();
+        let mut url_speeds = Vec::new(); // 记录每个链接的速度
         let mut referer: Option<String> = None;
 
         for (i, url) in all_urls.iter().enumerate() {
@@ -243,9 +299,10 @@ impl DownloadEngine {
                 .probe_download_link_with_client(&download_client, url, total_size)
                 .await
             {
-                Ok(ref_url) => {
-                    info!("✓ 链接 #{} 探测成功", i);
+                Ok((ref_url, speed)) => {
+                    info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", i, speed);
                     valid_urls.push(url.clone());
+                    url_speeds.push(speed);
 
                     // 保存第一个成功链接的 Referer
                     if referer.is_none() {
@@ -269,8 +326,51 @@ impl DownloadEngine {
             all_urls.len()
         );
 
-        // 5. 创建 URL 健康管理器
-        let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls)));
+        // 🔥 淘汰慢速链接
+        if url_speeds.len() > 1 {
+            let avg_speed: f64 = url_speeds.iter().sum::<f64>() / url_speeds.len() as f64;
+            let threshold = avg_speed * 0.75; // 提高阈值，淘汰更多慢速链接
+
+            info!(
+                "链接速度分析: 平均速度 {:.2} KB/s, 淘汰阈值 {:.2} KB/s",
+                avg_speed, threshold
+            );
+
+            let mut filtered_urls = Vec::new();
+            let mut filtered_speeds = Vec::new();
+            for (idx, (url, speed)) in valid_urls.iter().zip(url_speeds.iter()).enumerate() {
+                if *speed >= threshold {
+                    filtered_urls.push(url.clone());
+                    filtered_speeds.push(*speed);
+                    info!("✓ 保留链接 #{}: {:.2} KB/s", idx, speed);
+                } else {
+                    warn!("✗ 淘汰慢速链接 #{}: {:.2} KB/s (低于阈值 {:.2} KB/s)",
+                          idx, speed, threshold);
+                }
+            }
+
+            if filtered_urls.is_empty() {
+                warn!("所有链接都被淘汰，保留速度最快的链接");
+                if let Some((idx, _)) = url_speeds.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()) {
+                    filtered_urls.push(valid_urls[idx].clone());
+                    filtered_speeds.push(url_speeds[idx]);
+                }
+            }
+
+            info!(
+                "链接过滤完成: 保留 {}/{} 个高速链接",
+                filtered_urls.len(),
+                valid_urls.len()
+            );
+
+            valid_urls = filtered_urls;
+            url_speeds = filtered_speeds;
+        }
+
+        // 5. 创建 URL 健康管理器（传递speeds）
+        let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls, url_speeds)));
 
         // 6. 创建本地文件
         self.prepare_file(&local_path, total_size)
@@ -289,10 +389,7 @@ impl DownloadEngine {
             t.mark_downloading();
         }
 
-        // 10. 计算超时时间
-        let timeout_secs = Self::calculate_timeout_secs(chunk_size);
-
-        // 11. 生成 Cookie
+        // 10. 生成 Cookie
         let cookie = format!("BDUSS={}", self.netdisk_client.bduss());
 
         info!("任务准备完成，等待调度器调度");
@@ -304,7 +401,6 @@ impl DownloadEngine {
             url_health,
             local_path,
             chunk_size,
-            timeout_secs,
             chunk_manager,
             speed_calc,
         ))
@@ -433,6 +529,7 @@ impl DownloadEngine {
         // 2. 探测所有下载链接，过滤出可用的链接
         info!("开始探测 {} 个下载链接...", download_urls.len());
         let mut valid_urls = Vec::new();
+        let mut url_speeds = Vec::new();
         let mut referer: Option<String> = None;
 
         for (i, url) in download_urls.iter().enumerate() {
@@ -446,9 +543,10 @@ impl DownloadEngine {
                 .probe_download_link_with_client(&download_client, url, total_size)
                 .await
             {
-                Ok(ref_url) => {
-                    info!("✓ 链接 #{} 探测成功", i);
+                Ok((ref_url, speed)) => {
+                    info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", i, speed);
                     valid_urls.push(url.clone());
+                    url_speeds.push(speed);
 
                     // 保存第一个成功链接的 Referer
                     if referer.is_none() {
@@ -472,8 +570,51 @@ impl DownloadEngine {
             download_urls.len()
         );
 
-        // 3. 创建 URL 健康管理器
-        let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls)));
+        // 🔥 淘汰慢速链接
+        if url_speeds.len() > 1 {
+            let avg_speed: f64 = url_speeds.iter().sum::<f64>() / url_speeds.len() as f64;
+            let threshold = avg_speed * 0.75; // 提高阈值，淘汰更多慢速链接
+
+            info!(
+                "链接速度分析: 平均速度 {:.2} KB/s, 淘汰阈值 {:.2} KB/s",
+                avg_speed, threshold
+            );
+
+            let mut filtered_urls = Vec::new();
+            let mut filtered_speeds = Vec::new();
+            for (idx, (url, speed)) in valid_urls.iter().zip(url_speeds.iter()).enumerate() {
+                if *speed >= threshold {
+                    filtered_urls.push(url.clone());
+                    filtered_speeds.push(*speed);
+                    info!("✓ 保留链接 #{}: {:.2} KB/s", idx, speed);
+                } else {
+                    warn!("✗ 淘汰慢速链接 #{}: {:.2} KB/s (低于阈值 {:.2} KB/s)",
+                          idx, speed, threshold);
+                }
+            }
+
+            if filtered_urls.is_empty() {
+                warn!("所有链接都被淘汰，保留速度最快的链接");
+                if let Some((idx, _)) = url_speeds.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()) {
+                    filtered_urls.push(valid_urls[idx].clone());
+                    filtered_speeds.push(url_speeds[idx]);
+                }
+            }
+
+            info!(
+                "链接过滤完成: 保留 {}/{} 个高速链接",
+                filtered_urls.len(),
+                valid_urls.len()
+            );
+
+            valid_urls = filtered_urls;
+            url_speeds = filtered_speeds;
+        }
+
+        // 3. 创建 URL 健康管理器（传递speeds）
+        let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls, url_speeds)));
 
         // 4. 创建本地文件
         self.prepare_file(local_path, total_size)
@@ -524,6 +665,7 @@ impl DownloadEngine {
     /// 2. 服务器是否支持 Range 请求
     /// 3. 文件大小是否匹配
     /// 4. 是否有重定向或其他问题
+    /// 5. 测量链接速度（用于淘汰慢速链接）
     ///
     /// # 参数
     /// * `client` - 复用的 HTTP 客户端（确保与后续分片下载使用同一个 client）
@@ -531,16 +673,16 @@ impl DownloadEngine {
     /// * `expected_size` - 预期文件大小
     ///
     /// # 返回值
-    /// 返回用于后续 Range 请求的 Referer：
-    /// - 如果有重定向：返回原始 URL
-    /// - 如果无重定向：返回 None（不设置 Referer）
+    /// 返回 (Referer, 下载速度KB/s)：
+    /// - Referer: 如果有重定向返回原始URL，否则返回None
+    /// - 速度: 探测阶段的下载速度（KB/s），用于评估链接质量
     async fn probe_download_link_with_client(
         &self,
         client: &Client,
         url: &str,
         expected_size: u64,
-    ) -> Result<Option<String>> {
-        const PROBE_SIZE: u64 = 32 * 1024; // 32KB
+    ) -> Result<(Option<String>, f64)> {
+        const PROBE_SIZE: u64 = 256 * 1024; // 256KB (增大测试块以获得更准确的速度测量)
 
         let probe_end = if expected_size > 0 {
             (PROBE_SIZE - 1).min(expected_size - 1)
@@ -553,6 +695,9 @@ impl DownloadEngine {
             probe_end,
             probe_end + 1
         );
+
+        // 记录开始时间
+        let start_time = std::time::Instant::now();
 
         // 使用传入的复用 client（与后续分片下载使用同一个 client）
         let bduss = self.netdisk_client.bduss();
@@ -632,12 +777,23 @@ impl DownloadEngine {
 
         // 读取探测数据（但不保存，只是为了验证连接）
         let probe_data = response.bytes().await.context("读取探测数据失败")?;
+
+        // 计算下载速度
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let speed_kbps = if elapsed > 0.0 {
+            (probe_data.len() as f64) / 1024.0 / elapsed
+        } else {
+            0.0
+        };
+
         info!(
-            "✅ 探测成功: 收到 {} bytes 数据，链接有效",
-            probe_data.len()
+            "✅ 探测成功: 收到 {} bytes 数据，耗时 {:.2}s，速度 {:.2} KB/s",
+            probe_data.len(),
+            elapsed,
+            speed_kbps
         );
 
-        Ok(referer)
+        Ok((referer, speed_kbps))
     }
 
     /// 格式化文件大小为人类可读格式
@@ -888,7 +1044,7 @@ impl DownloadEngine {
     /// * `chunk_manager` - 分片管理器
     /// * `speed_calc` - 速度计算器
     /// * `task` - 下载任务
-    /// * `timeout_secs` - 超时时间（秒）
+    /// * `chunk_size` - 分片大小（用于动态计算超时）
     /// * `cancellation_token` - 取消令牌（用于中断下载）
     /// * `chunk_thread_id` - 分片线程ID（用于日志）
     pub async fn download_chunk_with_retry(
@@ -901,7 +1057,7 @@ impl DownloadEngine {
         chunk_manager: Arc<Mutex<ChunkManager>>,
         speed_calc: Arc<Mutex<SpeedCalculator>>,
         task: Arc<Mutex<DownloadTask>>,
-        timeout_secs: u64,
+        chunk_size: u64,
         cancellation_token: CancellationToken,
         chunk_thread_id: usize,
     ) -> Result<()> {
@@ -919,7 +1075,7 @@ impl DownloadEngine {
             }
 
             // 检查是否还有可用链接
-            let (available_count, current_url) = {
+            let (available_count, current_url, timeout_secs) = {
                 let health = url_health.lock().await;
                 let count = health.available_count();
                 if count == 0 {
@@ -950,19 +1106,23 @@ impl DownloadEngine {
                     .ok_or_else(|| anyhow::anyhow!("无法获取 URL"))?
                     .clone();
 
-                (count, url)
+                // 🔥 动态计算超时时间（基于探测速度和分片大小）
+                let timeout = health.calculate_timeout(&url, chunk_size);
+
+                (count, url, timeout)
             };
 
             // 记录该链接已尝试
             tried_urls.insert(current_url.clone());
 
             debug!(
-                "[分片线程{}] 分片 #{} 使用链接: {} (可用链接数: {}, 重试次数: {})",
+                "[分片线程{}] 分片 #{} 使用链接: {} (可用链接数: {}, 重试次数: {}, 超时: {}s)",
                 chunk_thread_id,
                 chunk_index,
                 current_url,
                 available_count,
-                retries
+                retries,
+                timeout_secs
             );
 
             // 获取分片信息
