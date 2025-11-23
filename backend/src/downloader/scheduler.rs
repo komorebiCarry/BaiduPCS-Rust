@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -62,6 +62,8 @@ pub struct TaskScheduleInfo {
     pub output_path: PathBuf,
     /// 分片大小
     pub chunk_size: u64,
+    /// 文件总大小（用于探测恢复链接）
+    pub total_size: u64,
 
     // 控制
     /// 取消令牌
@@ -94,6 +96,12 @@ pub struct ChunkScheduler {
     max_concurrent_tasks: Arc<AtomicUsize>,
     /// 调度器是否正在运行
     scheduler_running: Arc<AtomicBool>,
+    /// 预注册计数（正在探测但还未正式注册的任务数）
+    pre_register_count: Arc<AtomicUsize>,
+    /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
+    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    /// 上一轮的任务数（用于检测任务数变化）
+    last_task_count: Arc<AtomicUsize>,
 }
 
 impl ChunkScheduler {
@@ -111,12 +119,25 @@ impl ChunkScheduler {
             thread_id_allocator: Arc::new(ChunkThreadIdAllocator::new(max_global_threads)),
             max_concurrent_tasks: Arc::new(AtomicUsize::new(max_concurrent_tasks)),
             scheduler_running: Arc::new(AtomicBool::new(false)),
+            pre_register_count: Arc::new(AtomicUsize::new(0)),
+            task_completed_tx: Arc::new(RwLock::new(None)),
+            last_task_count: Arc::new(AtomicUsize::new(0)),
         };
 
         // 启动全局调度循环
         scheduler.start_scheduling();
 
         scheduler
+    }
+
+    /// 设置任务完成通知发送器
+    ///
+    /// FolderDownloadManager 调用此方法设置 channel sender，
+    /// 当文件夹子任务完成时会发送 group_id 到 channel
+    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<String>) {
+        let mut sender = self.task_completed_tx.write().await;
+        *sender = Some(tx);
+        info!("任务完成通知 channel 已设置");
     }
 
     /// 动态更新最大全局线程数
@@ -149,17 +170,86 @@ impl ChunkScheduler {
         self.active_chunk_count.load(Ordering::SeqCst)
     }
 
+    /// 预注册任务（在 spawn 探测前调用）
+    ///
+    /// 返回 true 表示预注册成功，可以开始探测
+    /// 返回 false 表示已达并发上限，不应启动探测
+    /// 预注册上限 = max_concurrent_tasks，避免探测占用下载带宽
+    pub async fn pre_register(&self) -> bool {
+        let max_tasks = self.max_concurrent_tasks.load(Ordering::SeqCst);
+        // 预注册上限 = max_tasks，不允许额外探测任务（避免探测占用下载带宽）
+        let pre_register_limit = max_tasks;
+        let registered_count = self.active_tasks.read().await.len();
+
+        loop {
+            let current_pre = self.pre_register_count.load(Ordering::SeqCst);
+            let total = registered_count + current_pre;
+
+            // 检查总数（已注册 + 预注册）是否超过预注册上限
+            if total >= pre_register_limit {
+                info!(
+                    "预注册失败：总数已达上限 (已注册:{} + 预注册:{} = {} >= {})",
+                    registered_count, current_pre, total, pre_register_limit
+                );
+                return false;
+            }
+
+            // CAS 操作，确保原子性
+            match self.pre_register_count.compare_exchange(
+                current_pre,
+                current_pre + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    info!(
+                        "预注册成功：已注册:{} + 预注册:{} -> {} (上限: {})",
+                        registered_count, current_pre, current_pre + 1, pre_register_limit
+                    );
+                    return true;
+                }
+                Err(_) => {
+                    // CAS 失败，重试
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// 获取预注册余量（还能预注册多少个任务）
+    pub async fn pre_register_available(&self) -> usize {
+        let max_tasks = self.max_concurrent_tasks.load(Ordering::SeqCst);
+        let pre_register_limit = max_tasks;
+        let registered_count = self.active_tasks.read().await.len();
+        let current_pre = self.pre_register_count.load(Ordering::SeqCst);
+        let total = registered_count + current_pre;
+        pre_register_limit.saturating_sub(total)
+    }
+
+    /// 取消预注册（探测失败或被取消时调用）
+    pub fn cancel_pre_register(&self) {
+        let old = self.pre_register_count.fetch_sub(1, Ordering::SeqCst);
+        info!("取消预注册：预注册数 {} -> {}", old, old.saturating_sub(1));
+    }
+
+    /// 获取预注册计数
+    pub fn pre_register_count(&self) -> usize {
+        self.pre_register_count.load(Ordering::SeqCst)
+    }
+
     /// 注册任务到调度器
     ///
-    /// 如果当前活跃任务数已达上限，返回错误
+    /// 注册成功后会自动减少预注册计数
+    /// 如果当前活跃任务数已达上限，返回错误（此时调用者需要调用 cancel_pre_register）
     pub async fn register_task(&self, task_info: TaskScheduleInfo) -> Result<()> {
         let task_id = task_info.task_id.clone();
         let max_tasks = self.max_concurrent_tasks.load(Ordering::SeqCst);
 
-        // 检查是否超过最大并发任务数
+        // 检查是否超过最大并发任务数（双重检查，理论上预注册已确保）
         {
             let tasks = self.active_tasks.read().await;
             if tasks.len() >= max_tasks {
+                // 注意：调用者需要调用 cancel_pre_register()
                 anyhow::bail!(
                     "超过最大并发任务数限制 ({}/{})",
                     tasks.len(),
@@ -171,7 +261,12 @@ impl ChunkScheduler {
         // 添加到活跃任务列表
         self.active_tasks.write().await.insert(task_id.clone(), task_info);
 
-        info!("任务 {} 已注册到调度器", task_id);
+        // 注册成功，减少预注册计数
+        let old_pre = self.pre_register_count.fetch_sub(1, Ordering::SeqCst);
+        info!(
+            "任务 {} 已注册到调度器 (预注册数: {} -> {})",
+            task_id, old_pre, old_pre.saturating_sub(1)
+        );
         Ok(())
     }
 
@@ -183,9 +278,11 @@ impl ChunkScheduler {
         }
     }
 
-    /// 获取活跃任务数量
+    /// 获取活跃任务数量（包括已注册和预注册的任务）
     pub async fn active_task_count(&self) -> usize {
-        self.active_tasks.read().await.len()
+        let registered = self.active_tasks.read().await.len();
+        let pre_registered = self.pre_register_count.load(Ordering::SeqCst);
+        registered + pre_registered
     }
 
     /// 启动全局调度循环
@@ -206,6 +303,8 @@ impl ChunkScheduler {
         let active_chunk_count = self.active_chunk_count.clone();
         let thread_id_allocator = self.thread_id_allocator.clone();
         let scheduler_running = self.scheduler_running.clone();
+        let task_completed_tx = self.task_completed_tx.clone();
+        let last_task_count = self.last_task_count.clone();
 
         // 标记调度器正在运行
         scheduler_running.store(true, Ordering::SeqCst);
@@ -216,11 +315,36 @@ impl ChunkScheduler {
             let mut round_robin_counter: usize = 0;
 
             while scheduler_running.load(Ordering::SeqCst) {
-                // 获取所有活跃任务 ID
+                // 获取所有活跃任务 ID（排序确保顺序稳定，保证 round-robin 公平性）
                 let task_ids: Vec<String> = {
                     let tasks = active_tasks.read().await;
-                    tasks.keys().cloned().collect()
+                    let mut ids: Vec<String> = tasks.keys().cloned().collect();
+                    ids.sort();
+                    ids
                 };
+
+                let current_task_count = task_ids.len();
+
+                // 🔥 检测任务数增加，触发速度窗口重置
+                {
+                    let last_count = last_task_count.load(Ordering::SeqCst);
+                    if current_task_count > last_count && last_count > 0 {
+                        info!(
+                            "🔄 检测到任务数增加: {} -> {}, 重置所有链接速度窗口（带宽重新分配）",
+                            last_count, current_task_count
+                        );
+
+                        // 遍历所有任务，重置速度窗口
+                        let tasks = active_tasks.read().await;
+                        for task_info in tasks.values() {
+                            let mut health = task_info.url_health.lock().await;
+                            health.reset_speed_windows();
+                        }
+                    }
+
+                    // 更新任务数记录
+                    last_task_count.store(current_task_count, Ordering::SeqCst);
+                }
 
                 if task_ids.is_empty() {
                     // 没有活跃任务，等待
@@ -333,10 +457,23 @@ impl ChunkScheduler {
                                 info!("任务 {} 所有分片完成，从调度器移除", task_id);
                                 active_tasks.write().await.remove(task_id);
 
-                                // 标记任务完成
-                                {
+                                // 标记任务完成，并获取 group_id
+                                let group_id = {
                                     let mut t = task_info.task.lock().await;
                                     t.mark_completed();
+                                    t.group_id.clone()
+                                };
+
+                                // 如果是文件夹子任务，通知补充新任务
+                                if let Some(gid) = group_id {
+                                    let tx_guard = task_completed_tx.read().await;
+                                    if let Some(tx) = tx_guard.as_ref() {
+                                        if let Err(e) = tx.send(gid.clone()) {
+                                            error!("发送任务完成通知失败: {}", e);
+                                        } else {
+                                            debug!("已发送任务完成通知: group_id={}", gid);
+                                        }
+                                    }
                                 }
                             }
 
@@ -401,10 +538,11 @@ impl ChunkScheduler {
                 task_info.speed_calc.clone(),
                 task_info.task.clone(),
                 task_info.chunk_size,
+                task_info.total_size,
                 task_info.cancellation_token.clone(),
                 chunk_thread_id, // 传递分片线程ID
             )
-            .await;
+                .await;
 
             // 释放全局活跃分片计数
             global_active_count.fetch_sub(1, Ordering::SeqCst);

@@ -142,7 +142,9 @@ impl DownloadManager {
         self.start_task_internal(task_id).await
     }
 
-    /// 内部方法：真正启动一个任务（不检查并发限制）
+    /// 内部方法：真正启动一个任务
+    ///
+    /// 该方法会先预注册，预注册成功后才启动探测
     async fn start_task_internal(&self, task_id: &str) -> Result<()> {
         let task = self
             .tasks
@@ -152,7 +154,18 @@ impl DownloadManager {
             .cloned()
             .context("任务不存在")?;
 
-        info!("启动下载任务: {}", task_id);
+        // 预注册：在 spawn 前占位，防止并发超限
+        if !self.chunk_scheduler.pre_register().await {
+            // 预注册失败，加入等待队列
+            self.waiting_queue.write().await.push_back(task_id.to_string());
+            info!(
+                "任务 {} 预注册失败，加入等待队列",
+                task_id
+            );
+            return Ok(());
+        }
+
+        info!("启动下载任务: {} (已预注册)", task_id);
 
         // 创建取消令牌
         let cancellation_token = CancellationToken::new();
@@ -170,19 +183,32 @@ impl DownloadManager {
 
         tokio::spawn(async move {
             // 准备任务
-            let prepare_result = engine.prepare_for_scheduling(task_clone.clone()).await;
+            let prepare_result = engine.prepare_for_scheduling(task_clone.clone(), cancellation_token.clone()).await;
+
+            // 探测完成后，先检查是否被取消
+            if cancellation_token.is_cancelled() {
+                info!("任务 {} 在探测完成后发现已被取消，取消预注册", task_id_clone);
+                chunk_scheduler.cancel_pre_register();
+                return;
+            }
 
             match prepare_result {
                 Ok((
-                    client,
-                    cookie,
-                    referer,
-                    url_health,
-                    output_path,
-                    chunk_size,
-                    chunk_manager,
-                    speed_calc,
-                )) => {
+                       client,
+                       cookie,
+                       referer,
+                       url_health,
+                       output_path,
+                       chunk_size,
+                       chunk_manager,
+                       speed_calc,
+                   )) => {
+                    // 获取文件总大小（用于探测恢复链接）
+                    let total_size = {
+                        let t = task_clone.lock().await;
+                        t.total_size
+                    };
+
                     // 创建任务调度信息
                     let task_info = TaskScheduleInfo {
                         task_id: task_id_clone.clone(),
@@ -195,13 +221,17 @@ impl DownloadManager {
                         url_health,
                         output_path,
                         chunk_size,
+                        total_size,
                         cancellation_token: cancellation_token.clone(),
                         active_chunk_count: Arc::new(AtomicUsize::new(0)),
                     };
 
-                    // 注册到调度器
+                    // 注册到调度器（成功会自动减少预注册计数）
                     if let Err(e) = chunk_scheduler.register_task(task_info).await {
                         error!("注册任务到调度器失败: {}", e);
+
+                        // 注册失败，需要取消预注册
+                        chunk_scheduler.cancel_pre_register();
 
                         // 标记任务失败
                         let mut t = task_clone.lock().await;
@@ -215,6 +245,9 @@ impl DownloadManager {
                 }
                 Err(e) => {
                     error!("准备任务失败: {}", e);
+
+                    // 探测失败，取消预注册
+                    chunk_scheduler.cancel_pre_register();
 
                     // 标记任务失败
                     let mut t = task_clone.lock().await;
@@ -293,8 +326,8 @@ impl DownloadManager {
 
                 // 尝试启动等待任务
                 loop {
-                    let active_count = chunk_scheduler.active_task_count().await;
-                    if active_count >= max_concurrent_tasks {
+                    // 先预注册，成功才继续
+                    if !chunk_scheduler.pre_register().await {
                         break;
                     }
 
@@ -305,7 +338,7 @@ impl DownloadManager {
 
                     match task_id {
                         Some(id) => {
-                            info!("🔄 后台监控：从等待队列启动任务 {}", id);
+                            info!("🔄 后台监控：从等待队列启动任务 {} (已预注册)", id);
 
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
@@ -322,10 +355,23 @@ impl DownloadManager {
                                 let cancellation_tokens_clone = cancellation_tokens.clone();
 
                                 tokio::spawn(async move {
-                                    let prepare_result = engine_clone.prepare_for_scheduling(task_clone.clone()).await;
+                                    let prepare_result = engine_clone.prepare_for_scheduling(task_clone.clone(), cancellation_token.clone()).await;
+
+                                    // 探测完成后，先检查是否被取消
+                                    if cancellation_token.is_cancelled() {
+                                        info!("后台监控:任务 {} 在探测完成后发现已被取消，取消预注册", id_clone);
+                                        chunk_scheduler_clone.cancel_pre_register();
+                                        return;
+                                    }
 
                                     match prepare_result {
                                         Ok((client, cookie, referer, url_health, output_path, chunk_size, chunk_manager, speed_calc)) => {
+                                            // 获取文件总大小
+                                            let total_size = {
+                                                let t = task_clone.lock().await;
+                                                t.total_size
+                                            };
+
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
                                                 task: task_clone.clone(),
@@ -337,12 +383,16 @@ impl DownloadManager {
                                                 url_health,
                                                 output_path,
                                                 chunk_size,
+                                                total_size,
                                                 cancellation_token: cancellation_token.clone(),
                                                 active_chunk_count: Arc::new(AtomicUsize::new(0)),
                                             };
 
+                                            // 注册成功会自动减少预注册计数
                                             if let Err(e) = chunk_scheduler_clone.register_task(task_info).await {
                                                 error!("后台监控：注册任务失败: {}", e);
+                                                // 注册失败，取消预注册
+                                                chunk_scheduler_clone.cancel_pre_register();
                                                 let mut t = task_clone.lock().await;
                                                 t.mark_failed(e.to_string());
                                                 cancellation_tokens_clone.write().await.remove(&id_clone);
@@ -350,15 +400,24 @@ impl DownloadManager {
                                         }
                                         Err(e) => {
                                             error!("后台监控：准备任务失败: {}", e);
+                                            // 探测失败，取消预注册
+                                            chunk_scheduler_clone.cancel_pre_register();
                                             let mut t = task_clone.lock().await;
                                             t.mark_failed(e.to_string());
                                             cancellation_tokens_clone.write().await.remove(&id_clone);
                                         }
                                     }
                                 });
+                            } else {
+                                // 任务不存在，取消预注册
+                                chunk_scheduler.cancel_pre_register();
                             }
                         }
-                        None => break,
+                        None => {
+                            // 队列为空，取消预注册
+                            chunk_scheduler.cancel_pre_register();
+                            break;
+                        }
                     }
                 }
             }
@@ -438,6 +497,41 @@ impl DownloadManager {
     }
 
     /// 删除下载任务
+    /// 取消任务但不删除（仅触发取消令牌，用于文件夹删除时先停止所有任务）
+    pub async fn cancel_task_without_delete(&self, task_id: &str) {
+        // 从等待队列移除（如果存在）
+        {
+            let mut queue = self.waiting_queue.write().await;
+            queue.retain(|id| id != task_id);
+        }
+
+        // 🔥 立即更新任务状态为 Paused（表示已停止）
+        // 这样 folder_manager 就不会等待30秒超时
+        {
+            let tasks = self.tasks.read().await;
+            if let Some(task) = tasks.get(task_id) {
+                let mut t = task.lock().await;
+                if t.status == TaskStatus::Downloading || t.status == TaskStatus::Pending {
+                    t.mark_paused(); // 立即标记为暂停
+                    info!("任务 {} 状态已更新为 Paused（取消中）", task_id);
+                }
+            }
+        }
+
+        // 从调度器取消任务（已注册的任务）
+        self.chunk_scheduler.cancel_task(task_id).await;
+
+        // 触发取消令牌（通知正在下载的任务停止）
+        {
+            let tokens = self.cancellation_tokens.read().await;
+            if let Some(token) = tokens.get(task_id) {
+                token.cancel();
+            }
+        }
+
+        info!("任务 {} 已触发取消令牌", task_id);
+    }
+
     pub async fn delete_task(&self, task_id: &str, delete_file: bool) -> Result<()> {
         // 从等待队列移除（如果存在）
         {
@@ -445,10 +539,17 @@ impl DownloadManager {
             queue.retain(|id| id != task_id);
         }
 
-        // 从调度器取消任务
+        // 从调度器取消任务（已注册的任务）
         self.chunk_scheduler.cancel_task(task_id).await;
 
-        // 移除取消令牌
+        // 先触发取消令牌（通知正在探测的任务停止），再移除
+        // 注意：必须先 cancel 再 remove，否则探测中的任务检测不到取消
+        {
+            let tokens = self.cancellation_tokens.read().await;
+            if let Some(token) = tokens.get(task_id) {
+                token.cancel();
+            }
+        }
         self.cancellation_tokens.write().await.remove(task_id);
 
         // 等待一小段时间让下载任务有机会清理
@@ -579,6 +680,11 @@ impl DownloadManager {
         self.chunk_scheduler.update_max_threads(new_max);
     }
 
+    /// 获取预注册余量（还能预注册多少个任务）
+    pub async fn pre_register_available(&self) -> usize {
+        self.chunk_scheduler.pre_register_available().await
+    }
+
     /// 动态更新最大并发任务数
     ///
     /// 该方法可以在运行时调整最大并发任务数：
@@ -624,6 +730,41 @@ impl DownloadManager {
         let max_threads = self.chunk_scheduler.max_threads();
         let active_threads = self.chunk_scheduler.active_threads();
         (active_threads, max_threads)
+    }
+
+    /// 设置任务完成通知发送器（用于文件夹下载补充任务）
+    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.chunk_scheduler.set_task_completed_sender(tx).await;
+    }
+
+    /// 根据 group_id 获取任务列表
+    pub async fn get_tasks_by_group(&self, group_id: &str) -> Vec<DownloadTask> {
+        let tasks = self.tasks.read().await;
+        let mut result = Vec::new();
+
+        for task_arc in tasks.values() {
+            let task = task_arc.lock().await;
+            if task.group_id.as_deref() == Some(group_id) {
+                result.push(task.clone());
+            }
+        }
+
+        result
+    }
+
+    /// 添加任务（由 FolderDownloadManager 调用）
+    pub async fn add_task(&self, task: DownloadTask) -> Result<String> {
+        let task_id = task.id.clone();
+
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.insert(task_id.clone(), Arc::new(Mutex::new(task)));
+        }
+
+        // 启动任务
+        self.start_task(&task_id).await?;
+
+        Ok(task_id)
     }
 }
 

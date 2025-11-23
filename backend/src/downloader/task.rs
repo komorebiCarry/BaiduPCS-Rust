@@ -45,6 +45,17 @@ pub struct DownloadTask {
     pub completed_at: Option<i64>,
     /// 错误信息
     pub error: Option<String>,
+
+    // === 文件夹下载相关字段 ===
+    /// 文件夹下载组ID，单文件下载时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// 文件夹根路径，如 "/电影"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_root: Option<String>,
+    /// 相对于根文件夹的路径，如 "科幻片/星际穿越.mp4"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
 }
 
 impl DownloadTask {
@@ -62,7 +73,28 @@ impl DownloadTask {
             started_at: None,
             completed_at: None,
             error: None,
+            // 文件夹下载字段默认为 None
+            group_id: None,
+            group_root: None,
+            relative_path: None,
         }
+    }
+
+    /// 创建带文件夹组信息的任务
+    pub fn new_with_group(
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        total_size: u64,
+        group_id: String,
+        group_root: String,
+        relative_path: String,
+    ) -> Self {
+        let mut task = Self::new(fs_id, remote_path, local_path, total_size);
+        task.group_id = Some(group_id);
+        task.group_root = Some(group_root);
+        task.relative_path = Some(relative_path);
+        task
     }
 
     /// 计算进度百分比
