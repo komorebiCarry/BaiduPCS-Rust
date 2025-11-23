@@ -27,7 +27,11 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   // 开始轮询二维码状态
-  function startPolling(onSuccess: () => void, onError: (error: any) => void) {
+  function startPolling(
+      onSuccess: () => void,
+      onError: (error: any) => void,
+      onScanned?: () => void
+  ) {
     if (isPolling.value || !qrcode.value) return
 
     isPolling.value = true
@@ -69,6 +73,7 @@ export const useAuthStore = defineStore('auth', () => {
           case 'scanned':
             // 已扫码，等待确认
             console.log('已扫码，等待确认...')
+            onScanned?.()
             break
           case 'waiting':
             // 等待扫码

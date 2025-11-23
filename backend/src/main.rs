@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         // 下载API
         .route("/downloads", post(handlers::create_download))
         .route("/downloads", get(handlers::get_all_downloads))
+        .route("/downloads/all", get(handlers::get_all_downloads_mixed))  // 新增：统一接口
         .route("/downloads/:id", get(handlers::get_download))
         .route("/downloads/:id/pause", post(handlers::pause_download))
         .route("/downloads/:id/resume", post(handlers::resume_download))
@@ -123,6 +124,13 @@ async fn main() -> anyhow::Result<()> {
             delete(handlers::clear_completed),
         )
         .route("/downloads/clear/failed", delete(handlers::clear_failed))
+        // 文件夹下载API
+        .route("/downloads/folder", post(handlers::create_folder_download))
+        .route("/downloads/folders", get(handlers::get_all_folder_downloads))
+        .route("/downloads/folder/:id", get(handlers::get_folder_download))
+        .route("/downloads/folder/:id/pause", post(handlers::pause_folder_download))
+        .route("/downloads/folder/:id/resume", post(handlers::resume_folder_download))
+        .route("/downloads/folder/:id", delete(handlers::cancel_folder_download))
         // 配置API
         .route("/config", get(handlers::get_config))
         .route("/config", put(handlers::update_config))
