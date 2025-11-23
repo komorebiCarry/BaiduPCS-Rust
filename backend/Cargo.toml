@@ -51,6 +51,7 @@ toml = "0.8"
 # 并发控制
 futures = "0.3"
 async-trait = "0.1"
+async-recursion = "1.0"
 
 # URL编码
 urlencoding = "2.1"

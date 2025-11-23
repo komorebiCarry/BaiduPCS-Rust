@@ -2,7 +2,7 @@
 
 use crate::auth::{QRCodeAuth, SessionManager, UserAuth};
 use crate::config::AppConfig;
-use crate::downloader::DownloadManager;
+use crate::downloader::{DownloadManager, FolderDownloadManager};
 use crate::netdisk::NetdiskClient;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -20,6 +20,8 @@ pub struct AppState {
     pub netdisk_client: Arc<RwLock<Option<NetdiskClient>>>,
     /// 下载管理器（使用 Arc 避免被意外克隆）
     pub download_manager: Arc<RwLock<Option<Arc<DownloadManager>>>>,
+    /// 文件夹下载管理器
+    pub folder_download_manager: Arc<FolderDownloadManager>,
     /// 应用配置
     pub config: Arc<RwLock<AppConfig>>,
 }
@@ -30,12 +32,18 @@ impl AppState {
         // 加载配置
         let config = AppConfig::load_or_default("config/app.toml").await;
 
+        // 创建文件夹下载管理器
+        let folder_download_manager = Arc::new(FolderDownloadManager::new(
+            config.download.download_dir.clone().into(),
+        ));
+
         Ok(Self {
             qrcode_auth: Arc::new(QRCodeAuth::new()?),
             session_manager: Arc::new(Mutex::new(SessionManager::default())),
             current_user: Arc::new(RwLock::new(None)),
             netdisk_client: Arc::new(RwLock::new(None)),
             download_manager: Arc::new(RwLock::new(None)),
+            folder_download_manager,
             config: Arc::new(RwLock::new(config)),
         })
     }
@@ -48,6 +56,7 @@ impl AppState {
 
             // 初始化网盘客户端
             let client = NetdiskClient::new(user_auth.clone())?;
+            let client_arc = Arc::new(client.clone());
             *self.netdisk_client.write().await = Some(client);
 
             // 初始化下载管理器（从配置读取参数）
@@ -63,7 +72,16 @@ impl AppState {
                 max_global_threads,
                 max_concurrent_tasks,
             )?;
-            *self.download_manager.write().await = Some(Arc::new(manager));
+            let manager_arc = Arc::new(manager);
+            *self.download_manager.write().await = Some(Arc::clone(&manager_arc));
+
+            // 设置文件夹下载管理器的依赖
+            self.folder_download_manager
+                .set_download_manager(Arc::clone(&manager_arc))
+                .await;
+            self.folder_download_manager
+                .set_netdisk_client(client_arc)
+                .await;
         }
         Ok(())
     }

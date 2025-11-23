@@ -4,8 +4,10 @@ pub mod auth;
 pub mod config;
 pub mod download;
 pub mod file;
+pub mod folder_download;
 
 pub use auth::*;
 pub use config::*;
 pub use download::*;
 pub use file::*;
+pub use folder_download::*;
