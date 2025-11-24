@@ -13,5 +13,5 @@ pub use folder::{FolderDownload, FolderStatus, PendingFile};
 pub use folder_manager::FolderDownloadManager;
 pub use manager::DownloadManager;
 pub use progress::SpeedCalculator;
-pub use scheduler::{ChunkScheduler, TaskScheduleInfo};
+pub use scheduler::{ChunkScheduler, TaskScheduleInfo, calculate_task_max_chunks};
 pub use task::{DownloadTask, TaskStatus};

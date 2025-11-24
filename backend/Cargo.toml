@@ -52,6 +52,7 @@ toml = "0.8"
 futures = "0.3"
 async-trait = "0.1"
 async-recursion = "1.0"
+dashmap = "5.5"
 
 # URL编码
 urlencoding = "2.1"

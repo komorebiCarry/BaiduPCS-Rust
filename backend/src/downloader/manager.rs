@@ -1,5 +1,5 @@
 use crate::auth::UserAuth;
-use crate::downloader::{ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo, TaskStatus};
+use crate::downloader::{ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo, TaskStatus, calculate_task_max_chunks};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -210,6 +210,12 @@ impl DownloadManager {
                     };
 
                     // 创建任务调度信息
+                    let max_concurrent_chunks = calculate_task_max_chunks(total_size);
+                    info!(
+                        "任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
+                        task_id_clone, total_size, max_concurrent_chunks
+                    );
+
                     let task_info = TaskScheduleInfo {
                         task_id: task_id_clone.clone(),
                         task: task_clone.clone(),
@@ -224,6 +230,7 @@ impl DownloadManager {
                         total_size,
                         cancellation_token: cancellation_token.clone(),
                         active_chunk_count: Arc::new(AtomicUsize::new(0)),
+                        max_concurrent_chunks,
                     };
 
                     // 注册到调度器（成功会自动减少预注册计数）
@@ -372,6 +379,12 @@ impl DownloadManager {
                                                 t.total_size
                                             };
 
+                                            let max_concurrent_chunks = calculate_task_max_chunks(total_size);
+                                            info!(
+                                                "后台任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
+                                                id_clone, total_size, max_concurrent_chunks
+                                            );
+
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
                                                 task: task_clone.clone(),
@@ -386,6 +399,7 @@ impl DownloadManager {
                                                 total_size,
                                                 cancellation_token: cancellation_token.clone(),
                                                 active_chunk_count: Arc::new(AtomicUsize::new(0)),
+                                                max_concurrent_chunks,
                                             };
 
                                             // 注册成功会自动减少预注册计数
