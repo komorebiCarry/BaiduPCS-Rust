@@ -25,8 +25,18 @@ pub struct UserAuth {
     pub stoken: Option<String>,
     /// PTOKEN凭证
     pub ptoken: Option<String>,
+    /// BAIDUID (首次访问百度时生成,必须保存)
+    pub baiduid: Option<String>,
+    /// PASSID (登录会话相关)
+    pub passid: Option<String>,
     /// 完整Cookie字符串
     pub cookies: Option<String>,
+    /// PANPSC (预热后获取的会话令牌)
+    pub panpsc: Option<String>,
+    /// csrfToken (预热后获取的 CSRF 令牌)
+    pub csrf_token: Option<String>,
+    /// bdstoken (预热后获取的 bdstoken)
+    pub bdstoken: Option<String>,
     /// 登录时间戳
     pub login_time: i64,
 }
@@ -45,7 +55,12 @@ impl UserAuth {
             bduss,
             stoken: None,
             ptoken: None,
+            baiduid: None,
+            passid: None,
             cookies: None,
+            panpsc: None,
+            csrf_token: None,
+            bdstoken: None,
             login_time: chrono::Utc::now().timestamp(),
         }
     }
@@ -72,7 +87,12 @@ impl UserAuth {
             bduss,
             stoken: None,
             ptoken: None,
+            baiduid: None,
+            passid: None,
             cookies: None,
+            panpsc: None,
+            csrf_token: None,
+            bdstoken: None,
             login_time: chrono::Utc::now().timestamp(),
         }
     }

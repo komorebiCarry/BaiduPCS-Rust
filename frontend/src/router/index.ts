@@ -31,6 +31,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '下载管理' }
       },
       {
+        path: '/uploads',
+        name: 'Uploads',
+        component: () => import('@/views/UploadsView.vue'),
+        meta: { title: '上传管理' }
+      },
+      {
         path: '/settings',
         name: 'Settings',
         component: () => import('@/views/SettingsView.vue'),

@@ -19,6 +19,12 @@ pub mod netdisk;
 // 下载引擎模块
 pub mod downloader;
 
+// 上传引擎模块
+pub mod uploader;
+
+// 本地文件系统浏览模块
+pub mod filesystem;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;
@@ -26,3 +32,7 @@ pub use downloader::{DownloadManager, DownloadTask, TaskStatus};
 pub use netdisk::{FileItem, NetdiskClient};
 pub use server::AppState;
 pub use sign::{generate_devuid, LocateSign};
+pub use uploader::{
+    PcsServerHealthManager, RapidUploadChecker, RapidUploadHash, UploadEngine, UploadManager,
+    UploadTask, UploadTaskStatus,
+};

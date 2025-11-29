@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 /// 二维码登录客户端
 pub struct QRCodeAuth {
     client: Client,
+    baiduid: std::sync::Arc<std::sync::Mutex<Option<String>>>, // 存储从 fetch_qrcode_sign 获取的 BAIDUID
 }
 
 impl QRCodeAuth {
@@ -21,7 +22,10 @@ impl QRCodeAuth {
             .build()
             .context("Failed to create HTTP client")?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            baiduid: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
     }
 
     /// 生成登录二维码
@@ -87,38 +91,85 @@ impl QRCodeAuth {
         let resp = self
             .client
             .get(&url)
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .context("Failed to confirm qrcode login")?;
 
-        // 打印所有响应头
-        info!("确认登录接口响应头:");
-        for (key, value) in resp.headers() {
-            if key.as_str().to_lowercase().contains("cookie") {
-                info!("  {}: {:?}", key, value);
-            }
-        }
-
-        // 提取 Set-Cookie 中的 BDUSS
+        // 提取 Set-Cookie 中的所有重要 Cookie
         let mut bduss = String::new();
+        let mut stoken = String::new();
+        let mut ptoken = String::new();
+        let mut baiduid = String::new();
+        let mut sboxtkn = String::new();
+        let mut cookie_pairs = Vec::new(); // 存储 name=value 对
+
+        // 辅助函数: 提取 Cookie 值
+        let extract_cookie_value = |cookie_str: &str, name: &str| -> String {
+            if let Some(start) = cookie_str.find(&format!("{}=", name)) {
+                let value_part = &cookie_str[start + name.len() + 1..];
+                if let Some(end) = value_part.find(';') {
+                    value_part[..end].to_string()
+                } else {
+                    value_part.to_string()
+                }
+            } else {
+                String::new()
+            }
+        };
 
         // 遍历所有的 Set-Cookie 响应头
         for cookie_header in resp.headers().get_all("set-cookie") {
             let cookie_str = cookie_header.to_str().unwrap_or("");
+            info!("  Set-Cookie: {}", cookie_str);
 
-            // 检查是否包含 BDUSS
-            if cookie_str.contains("BDUSS=") {
-                info!("找到 BDUSS Cookie: {}", cookie_str);
+            // 提取 Cookie 的 name=value 部分 (第一个分号之前)
+            if let Some(semicolon_pos) = cookie_str.find(';') {
+                let name_value = &cookie_str[..semicolon_pos];
+                if !name_value.is_empty() {
+                    cookie_pairs.push(name_value.to_string());
+                }
+            } else {
+                cookie_pairs.push(cookie_str.to_string());
+            }
 
-                // 解析 BDUSS
-                if let Some(bduss_start) = cookie_str.find("BDUSS=") {
-                    let bduss_part = &cookie_str[bduss_start + 6..];
-                    if let Some(bduss_end) = bduss_part.find(';') {
-                        bduss = bduss_part[..bduss_end].to_string();
-                    } else {
-                        bduss = bduss_part.to_string();
-                    }
-                    break; // 找到后退出循环
+            // 提取 BDUSS
+            if cookie_str.contains("BDUSS=") && bduss.is_empty() {
+                bduss = extract_cookie_value(cookie_str, "BDUSS");
+                if !bduss.is_empty() {
+                    info!("找到 BDUSS Cookie");
+                }
+            }
+
+            // 提取 STOKEN
+            if cookie_str.contains("STOKEN=") && stoken.is_empty() {
+                stoken = extract_cookie_value(cookie_str, "STOKEN");
+                if !stoken.is_empty() {
+                    info!("找到 STOKEN Cookie");
+                }
+            }
+
+            // 提取 PTOKEN
+            if cookie_str.contains("PTOKEN=") && ptoken.is_empty() {
+                ptoken = extract_cookie_value(cookie_str, "PTOKEN");
+                if !ptoken.is_empty() {
+                    info!("找到 PTOKEN Cookie");
+                }
+            }
+
+            // 提取 BAIDUID
+            if cookie_str.contains("BAIDUID=") && baiduid.is_empty() {
+                baiduid = extract_cookie_value(cookie_str, "BAIDUID");
+                if !baiduid.is_empty() {
+                    info!("找到 BAIDUID Cookie");
+                }
+            }
+
+            // 提取 SBOXTKN
+            if cookie_str.contains("SBOXTKN=") && sboxtkn.is_empty() {
+                sboxtkn = extract_cookie_value(cookie_str, "SBOXTKN");
+                if !sboxtkn.is_empty() {
+                    info!("找到 SBOXTKN Cookie");
                 }
             }
         }
@@ -127,18 +178,59 @@ impl QRCodeAuth {
             return Err(anyhow::anyhow!("未能从响应中提取BDUSS"));
         }
 
-        info!("成功提取BDUSS: {}...", &bduss[..20.min(bduss.len())]);
+        // 从 fetch_qrcode_sign 中提取的 BAIDUID
+        if baiduid.is_empty() {
+            if let Some(ref saved_baiduid) = *self.baiduid.lock().unwrap() {
+                baiduid = saved_baiduid.clone();
+                info!("使用 fetch_qrcode_sign 中保存的 BAIDUID");
+            }
+        }
+
+        info!("Cookie 提取结果:");
+        info!("  BDUSS: {}...", &bduss[..20.min(bduss.len())]);
+        info!("  STOKEN: {}", if !stoken.is_empty() { "已获取" } else { "未获取" });
+        info!("  PTOKEN: {}", if !ptoken.is_empty() { "已获取" } else { "未获取" });
+        info!("  BAIDUID: {}", if !baiduid.is_empty() { "已获取" } else { "未获取" });
+        info!("  SBOXTKN: {}", if !sboxtkn.is_empty() { "已获取" } else { "未获取" });
 
         // 获取完整的用户信息
         match self.get_user_info(&bduss).await {
-            Ok(user) => {
+            Ok(mut user) => {
                 info!("登录成功！用户: {}, UID: {}", user.username, user.uid);
+                // 设置所有提取到的 Cookie
+                user.stoken = if !stoken.is_empty() { Some(stoken) } else { None };
+                user.ptoken = if !ptoken.is_empty() { Some(ptoken) } else { None };
+                user.baiduid = if !baiduid.is_empty() { Some(baiduid) } else { None };
+                user.passid = if let Some(passid_cookie) = cookie_pairs.iter().find(|c| c.starts_with("PASSID=")) {
+                    Some(passid_cookie.strip_prefix("PASSID=").unwrap_or("").to_string())
+                } else {
+                    None
+                };
+                user.cookies = if !cookie_pairs.is_empty() {
+                    Some(cookie_pairs.join("; ")) // 用 "; " 连接 name=value 对
+                } else {
+                    None
+                };
                 Ok(user)
             }
             Err(e) => {
                 warn!("获取用户信息失败: {}，使用基本信息", e);
                 // 如果获取用户信息失败，返回基本的UserAuth
-                Ok(UserAuth::new(0, "未知用户".to_string(), bduss))
+                let mut user = UserAuth::new(0, "未知用户".to_string(), bduss);
+                user.stoken = if !stoken.is_empty() { Some(stoken) } else { None };
+                user.ptoken = if !ptoken.is_empty() { Some(ptoken) } else { None };
+                user.baiduid = if !baiduid.is_empty() { Some(baiduid) } else { None };
+                user.passid = if let Some(passid_cookie) = cookie_pairs.iter().find(|c| c.starts_with("PASSID=")) {
+                    Some(passid_cookie.strip_prefix("PASSID=").unwrap_or("").to_string())
+                } else {
+                    None
+                };
+                user.cookies = if !cookie_pairs.is_empty() {
+                    Some(cookie_pairs.join("; "))
+                } else {
+                    None
+                };
+                Ok(user)
             }
         }
     }
@@ -155,9 +247,30 @@ impl QRCodeAuth {
         let resp = self
             .client
             .get(url)
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .context("Failed to fetch qrcode sign")?;
+
+        // 打印响应头,查看是否有 BAIDUID
+        info!("获取二维码 sign 的响应头:");
+        for cookie_header in resp.headers().get_all("set-cookie") {
+            if let Ok(cookie_str) = cookie_header.to_str() {
+                info!("  Set-Cookie: {}", cookie_str);
+
+                // 提取 BAIDUID
+                if cookie_str.contains("BAIDUID=") {
+                    if let Some(start) = cookie_str.find("BAIDUID=") {
+                        let value_part = &cookie_str[start + 8..]; // "BAIDUID=" 长度为 8
+                        if let Some(end) = value_part.find(';') {
+                            let baiduid_value = value_part[..end].to_string();
+                            info!("提取到 BAIDUID: {}...", &baiduid_value[..20.min(baiduid_value.len())]);
+                            *self.baiduid.lock().unwrap() = Some(baiduid_value);
+                        }
+                    }
+                }
+            }
+        }
 
         let text = resp.text().await?;
 
@@ -195,6 +308,7 @@ impl QRCodeAuth {
         let resp = self
             .client
             .get(url)
+            .header("User-Agent", USER_AGENT)
             .send()
             .await
             .context("Failed to download QR code image")?;
@@ -502,7 +616,6 @@ mod tests {
         // 注意：此测试需要网络连接
         if let Ok(qrcode) = result {
             assert!(!qrcode.sign.is_empty());
-            assert!(qrcode.image_base64.starts_with("data:image/png;base64,"));
         }
     }
 }

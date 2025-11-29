@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .with_level(true)
         .init();
 
-    info!("Baidu Netdisk Rust v1.0.0 启动中...");
+    info!("Baidu Netdisk Rust v1.3.0 启动中...");
 
     // 创建应用状态
     let app_state = AppState::new().await?;
@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         // 文件API
         .route("/files", get(handlers::get_file_list))
         .route("/files/download", get(handlers::get_download_url))
+        .route("/files/folder", post(handlers::create_folder))
         // 下载API
         .route("/downloads", post(handlers::create_download))
         .route("/downloads", get(handlers::get_all_downloads))
@@ -131,6 +132,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/downloads/folder/:id/pause", post(handlers::pause_folder_download))
         .route("/downloads/folder/:id/resume", post(handlers::resume_folder_download))
         .route("/downloads/folder/:id", delete(handlers::cancel_folder_download))
+        // 上传API
+        .route("/uploads", post(handlers::create_upload))
+        .route("/uploads", get(handlers::get_all_uploads))
+        .route("/uploads/:id", get(handlers::get_upload))
+        .route("/uploads/:id/pause", post(handlers::pause_upload))
+        .route("/uploads/:id/resume", post(handlers::resume_upload))
+        .route("/uploads/:id", delete(handlers::delete_upload))
+        .route("/uploads/folder", post(handlers::create_folder_upload))
+        .route("/uploads/batch", post(handlers::create_batch_upload))
+        .route("/uploads/clear/completed", post(handlers::clear_completed_uploads))
+        .route("/uploads/clear/failed", post(handlers::clear_failed_uploads))
+        // 本地文件系统API
+        .route("/fs/list", get(handlers::list_directory))
+        .route("/fs/goto", get(handlers::goto_path))
+        .route("/fs/validate", get(handlers::validate_path))
+        .route("/fs/roots", get(handlers::get_roots))
         // 配置API
         .route("/config", get(handlers::get_config))
         .route("/config", put(handlers::update_config))

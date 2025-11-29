@@ -49,7 +49,7 @@ pub async fn get_recommended_config(
         VipType::Vip => "普通会员",
         VipType::Svip => "超级会员",
     }
-    .to_string();
+        .to_string();
 
     // 获取推荐配置
     let recommended = DownloadConfig::recommended_for_vip(vip_type);
@@ -113,6 +113,21 @@ pub async fn reset_to_recommended(
     }
     drop(manager_guard);
 
+    // 🔧 动态更新上传管理器配置
+    let upload_manager_guard = app_state.upload_manager.read().await;
+    if let Some(upload_manager) = upload_manager_guard.as_ref() {
+        upload_manager.update_max_threads(config.upload.max_global_threads);
+        upload_manager.update_max_concurrent_tasks(config.upload.max_concurrent_tasks);
+        upload_manager.update_max_retries(config.upload.max_retries);
+        info!(
+            "✓ 上传管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 最大重试={}",
+            config.upload.max_global_threads,
+            config.upload.max_concurrent_tasks,
+            config.upload.max_retries
+        );
+    }
+    drop(upload_manager_guard);
+
     info!("已恢复为推荐配置: VIP类型={:?}", vip_type);
     Ok(Json(ApiResponse::success("已恢复为推荐配置".to_string())))
 }
@@ -172,6 +187,23 @@ pub async fn update_config(
         info!("下载管理器未初始化，配置将在下次登录时生效");
     }
     drop(manager_guard);
+
+    // 🔧 动态更新上传管理器配置（无需重启，不影响正在进行的任务）
+    let upload_manager_guard = app_state.upload_manager.read().await;
+    if let Some(upload_manager) = upload_manager_guard.as_ref() {
+        upload_manager.update_max_threads(new_config.upload.max_global_threads);
+        upload_manager.update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks);
+        upload_manager.update_max_retries(new_config.upload.max_retries);
+        info!(
+            "✓ 上传管理器配置已动态更新: 线程数={}, 最大任务数={}, 最大重试={}",
+            new_config.upload.max_global_threads,
+            new_config.upload.max_concurrent_tasks,
+            new_config.upload.max_retries
+        );
+    } else {
+        info!("上传管理器未初始化，配置将在下次登录时生效");
+    }
+    drop(upload_manager_guard);
 
     info!("配置更新成功");
 
