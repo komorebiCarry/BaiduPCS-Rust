@@ -12,11 +12,11 @@
       </div>
 
       <el-menu
-        :default-active="activeMenu"
-        :collapse="isCollapse"
-        :collapse-transition="false"
-        class="sidebar-menu"
-        router
+          :default-active="activeMenu"
+          :collapse="isCollapse"
+          :collapse-transition="false"
+          class="sidebar-menu"
+          router
       >
         <el-menu-item index="/files">
           <el-icon><Files /></el-icon>
@@ -28,6 +28,11 @@
           <template #title>下载管理</template>
         </el-menu-item>
 
+        <el-menu-item index="/uploads">
+          <el-icon><Upload /></el-icon>
+          <template #title>上传管理</template>
+        </el-menu-item>
+
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
           <template #title>系统设置</template>
@@ -36,9 +41,9 @@
 
       <div class="sidebar-footer">
         <el-button
-          :icon="isCollapse ? Expand : Fold"
-          circle
-          @click="toggleCollapse"
+            :icon="isCollapse ? Expand : Fold"
+            circle
+            @click="toggleCollapse"
         />
       </div>
     </el-aside>
@@ -97,6 +102,7 @@ import {
   FolderOpened,
   Files,
   Download,
+  Upload,
   Setting,
   User,
   CaretBottom,
@@ -121,6 +127,7 @@ const pageTitle = computed(() => {
   const titles: Record<string, string> = {
     '/files': '文件管理',
     '/downloads': '下载管理',
+    '/uploads': '上传管理',
     '/settings': '系统设置',
   }
   return titles[route.path] || '百度网盘'
@@ -158,12 +165,12 @@ async function handleCommand(command: string) {
 
 // 监听路由变化，自动折叠侧边栏（移动端）
 watch(
-  () => route.path,
-  () => {
-    if (window.innerWidth < 768) {
-      isCollapse.value = true
+    () => route.path,
+    () => {
+      if (window.innerWidth < 768) {
+        isCollapse.value = true
+      }
     }
-  }
 )
 </script>
 

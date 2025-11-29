@@ -17,10 +17,45 @@
           {{ part }}
         </el-breadcrumb-item>
       </el-breadcrumb>
-      <el-button type="primary" @click="refreshFileList">
-        刷新
-      </el-button>
+      <div class="toolbar-buttons">
+        <el-button type="primary" @click="showCreateFolderDialog">
+          <el-icon><FolderAdd /></el-icon>
+          新建文件夹
+        </el-button>
+        <el-dropdown @command="handleUploadCommand" style="margin: 0 12px;">
+          <el-button type="success">
+            <el-icon><Upload /></el-icon>
+            上传
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="uploadFile">
+                <el-icon><Document /></el-icon>
+                上传文件
+              </el-dropdown-item>
+              <el-dropdown-item command="uploadFolder">
+                <el-icon><Folder /></el-icon>
+                上传文件夹
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <el-button type="primary" @click="refreshFileList">
+          <el-icon><Refresh /></el-icon>
+          刷新
+        </el-button>
+      </div>
     </div>
+
+    <!-- FilePicker 文件选择器弹窗 -->
+    <FilePickerModal
+        v-model="showFilePicker"
+        :select-type="uploadType"
+        :title="uploadType === 'file' ? '选择上传文件' : '选择上传文件夹'"
+        :confirm-text="uploadType === 'file' ? '上传文件' : '上传文件夹'"
+        @select="handleFilePickerSelect"
+    />
 
     <!-- 文件列表 -->
     <div class="file-list">
@@ -84,20 +119,66 @@
       <!-- 空状态 -->
       <el-empty v-if="!loading && fileList.length === 0" description="当前目录为空"/>
     </div>
+
+    <!-- 创建文件夹对话框 -->
+    <el-dialog
+        v-model="createFolderDialogVisible"
+        title="新建文件夹"
+        width="500px"
+        @close="handleDialogClose"
+    >
+      <el-form :model="createFolderForm" label-width="80px">
+        <el-form-item label="文件夹名">
+          <el-input
+              v-model="createFolderForm.folderName"
+              placeholder="请输入文件夹名称"
+              @keyup.enter="handleCreateFolder"
+              autofocus
+          />
+        </el-form-item>
+        <el-form-item label="当前路径">
+          <el-text>{{ currentDir }}</el-text>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="createFolderDialogVisible = false">取消</el-button>
+          <el-button
+              type="primary"
+              :loading="creatingFolder"
+              @click="handleCreateFolder"
+          >
+            创建
+          </el-button>
+        </span>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import {ref, onMounted, computed} from 'vue'
 import {ElMessage} from 'element-plus'
-import {getFileList, formatFileSize, formatTime, type FileItem} from '@/api/file'
+import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
 import {createDownload, createFolderDownload} from '@/api/download'
+import {createUpload, createFolderUpload} from '@/api/upload'
+import {FilePickerModal} from '@/components/FilePicker'
+import type {FileEntry} from '@/api/filesystem'
 
 // 状态
 const loading = ref(false)
 const fileList = ref<FileItem[]>([])
 const currentDir = ref('/')
 const downloadingFolders = ref<Set<string>>(new Set())
+const createFolderDialogVisible = ref(false)
+const creatingFolder = ref(false)
+const createFolderForm = ref({
+  folderName: ''
+})
+
+// FilePicker 状态
+const showFilePicker = ref(false)
+const uploadType = ref<'file' | 'directory'>('file')
 
 // 路径分割
 const pathParts = computed(() => {
@@ -195,6 +276,107 @@ async function handleDownloadFolder(folder: FileItem) {
   }
 }
 
+// 上传命令处理 - 打开 FilePicker 弹窗
+function handleUploadCommand(command: string) {
+  if (command === 'uploadFile') {
+    uploadType.value = 'file'
+    showFilePicker.value = true
+  } else if (command === 'uploadFolder') {
+    uploadType.value = 'directory'
+    showFilePicker.value = true
+  }
+}
+
+// 处理 FilePicker 选择结果
+async function handleFilePickerSelect(entry: FileEntry) {
+  try {
+    if (entry.entryType === 'file') {
+      // 单文件上传
+      const remotePath = currentDir.value === '/'
+          ? `/${entry.name}`
+          : `${currentDir.value}/${entry.name}`
+
+      await createUpload({
+        local_path: entry.path,
+        remote_path: remotePath,
+      })
+
+      ElMessage.success('已添加上传任务')
+    } else {
+      // 文件夹上传
+      const remoteFolderPath = currentDir.value === '/'
+          ? `/${entry.name}`
+          : `${currentDir.value}/${entry.name}`
+
+      await createFolderUpload({
+        local_folder: entry.path,
+        remote_folder: remoteFolderPath,
+      })
+
+      ElMessage.success('已添加文件夹上传任务')
+    }
+
+  } catch (error: any) {
+    ElMessage.error(error.message || '创建上传任务失败')
+    console.error('创建上传任务失败:', error)
+  }
+}
+
+// 显示创建文件夹对话框
+function showCreateFolderDialog() {
+  createFolderDialogVisible.value = true
+  createFolderForm.value.folderName = ''
+}
+
+// 对话框关闭时重置表单
+function handleDialogClose() {
+  createFolderForm.value.folderName = ''
+  creatingFolder.value = false
+}
+
+// 创建文件夹
+async function handleCreateFolder() {
+  const folderName = createFolderForm.value.folderName.trim()
+
+  // 验证文件夹名
+  if (!folderName) {
+    ElMessage.warning('请输入文件夹名称')
+    return
+  }
+
+  // 验证文件夹名不能包含特殊字符
+  if (/[<>:"/\\|?*]/.test(folderName)) {
+    ElMessage.warning('文件夹名称不能包含特殊字符: < > : " / \\ | ? *')
+    return
+  }
+
+  creatingFolder.value = true
+
+  try {
+    // 构建完整路径
+    const fullPath = currentDir.value === '/'
+        ? `/${folderName}`
+        : `${currentDir.value}/${folderName}`
+
+    // 调用创建文件夹 API
+    await createFolder(fullPath)
+
+    ElMessage.success('文件夹创建成功')
+
+    // 关闭对话框
+    createFolderDialogVisible.value = false
+
+    // 刷新文件列表
+    await loadFiles(currentDir.value)
+
+  } catch (error: any) {
+    ElMessage.error(error.message || '创建文件夹失败')
+    console.error('创建文件夹失败:', error)
+  } finally {
+    creatingFolder.value = false
+  }
+}
+
 // 组件挂载时加载根目录
 onMounted(() => {
   loadFiles('/')
@@ -203,7 +385,7 @@ onMounted(() => {
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
@@ -233,6 +415,11 @@ export {Folder, Document, Refresh, HomeFilled} from '@element-plus/icons-vue'
         color: #409eff;
       }
     }
+  }
+
+  .toolbar-buttons {
+    display: flex;
+    gap: 12px;
   }
 }
 

@@ -1,6 +1,6 @@
 // 文件API处理器
 
-use crate::netdisk::{FileItem, NetdiskClient};
+use crate::netdisk::FileItem;
 use crate::server::handlers::ApiResponse;
 use crate::server::AppState;
 use axum::{
@@ -59,32 +59,12 @@ pub async fn get_file_list(
 ) -> Result<Json<ApiResponse<FileListData>>, StatusCode> {
     info!("API: 获取文件列表 dir={}, page={}", params.dir, params.page);
 
-    // 获取当前会话
-    let mut session = state.session_manager.lock().await;
-    let user_auth = match session.get_session().await {
-        Ok(Some(auth)) => auth,
-        Ok(None) => {
-            return Ok(Json(ApiResponse::error(401, "未登录".to_string())));
-        }
-        Err(e) => {
-            error!("获取会话失败: {}", e);
-            return Ok(Json(ApiResponse::error(
-                500,
-                format!("获取会话失败: {}", e),
-            )));
-        }
-    };
-    drop(session);
-
-    // 创建网盘客户端
-    let client = match NetdiskClient::new(user_auth) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("创建网盘客户端失败: {}", e);
-            return Ok(Json(ApiResponse::error(
-                500,
-                format!("创建客户端失败: {}", e),
-            )));
+    // 使用单例网盘客户端
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
         }
     };
 
@@ -144,32 +124,12 @@ pub async fn get_download_url(
         params.fs_id, params.path
     );
 
-    // 获取当前会话
-    let mut session = state.session_manager.lock().await;
-    let user_auth = match session.get_session().await {
-        Ok(Some(auth)) => auth,
-        Ok(None) => {
-            return Ok(Json(ApiResponse::error(401, "未登录".to_string())));
-        }
-        Err(e) => {
-            error!("获取会话失败: {}", e);
-            return Ok(Json(ApiResponse::error(
-                500,
-                format!("获取会话失败: {}", e),
-            )));
-        }
-    };
-    drop(session);
-
-    // 创建网盘客户端
-    let client = match NetdiskClient::new(user_auth) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("创建网盘客户端失败: {}", e);
-            return Ok(Json(ApiResponse::error(
-                500,
-                format!("创建客户端失败: {}", e),
-            )));
+    // 使用单例网盘客户端
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
         }
     };
 
@@ -189,6 +149,72 @@ pub async fn get_download_url(
             Ok(Json(ApiResponse::error(
                 500,
                 format!("获取下载链接失败: {}", e),
+            )))
+        }
+    }
+}
+
+/// 创建文件夹请求体
+#[derive(Debug, Deserialize)]
+pub struct CreateFolderRequest {
+    /// 文件夹路径（必须以 / 开头）
+    pub path: String,
+}
+
+/// 创建文件夹响应数据
+#[derive(Debug, Serialize)]
+pub struct CreateFolderData {
+    /// 文件服务器ID
+    pub fs_id: u64,
+    /// 文件夹路径
+    pub path: String,
+    /// 是否是目录
+    pub isdir: i32,
+}
+
+/// 创建文件夹
+///
+/// POST /api/v1/files/folder
+/// Body: { "path": "/apps/test/新建文件夹" }
+pub async fn create_folder(
+    State(state): State<AppState>,
+    Json(request): Json<CreateFolderRequest>,
+) -> Result<Json<ApiResponse<CreateFolderData>>, StatusCode> {
+    info!("API: 创建文件夹 path={}", request.path);
+
+    // 验证路径格式
+    if !request.path.starts_with('/') {
+        return Ok(Json(ApiResponse::error(
+            400,
+            "路径必须以 / 开头".to_string(),
+        )));
+    }
+
+    // 使用单例网盘客户端
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+        }
+    };
+
+    // 创建文件夹
+    match client.create_folder(&request.path).await {
+        Ok(response) => {
+            let data = CreateFolderData {
+                fs_id: response.fs_id,
+                path: response.path,
+                isdir: response.isdir,
+            };
+            info!("成功创建文件夹: fs_id={}", data.fs_id);
+            Ok(Json(ApiResponse::success(data)))
+        }
+        Err(e) => {
+            error!("创建文件夹失败: {}", e);
+            Ok(Json(ApiResponse::error(
+                500,
+                format!("创建文件夹失败: {}", e),
             )))
         }
     }

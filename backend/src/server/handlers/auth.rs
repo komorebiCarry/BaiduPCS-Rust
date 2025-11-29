@@ -2,6 +2,7 @@
 
 use crate::auth::{QRCode, QRCodeStatus};
 use crate::server::AppState;
+use crate::uploader::UploadManager;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -89,61 +90,94 @@ pub async fn qrcode_status(
                     user.uid, user.username
                 );
                 let mut session = state.session_manager.lock().await;
-                match session.save_session(user).await {
-                    Ok(_) => {
-                        info!(
-                            "✅ 会话保存成功: UID={}, BDUSS长度={}",
-                            user.uid,
-                            user.bduss.len()
-                        );
-                        // 初始化用户资源（网盘客户端和下载管理器）
-                        *state.current_user.write().await = Some(user.clone());
 
-                        // 初始化网盘客户端
-                        let client = match crate::netdisk::NetdiskClient::new(user.clone()) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!("初始化网盘客户端失败: {}", e);
-                                return Ok(Json(ApiResponse::success(status)));
-                            }
-                        };
-                        let client_arc = Arc::new(client.clone());
-                        *state.netdisk_client.write().await = Some(client);
+                // 先保存基本会话信息
+                if let Err(e) = session.save_session(user).await {
+                    error!("❌ 保存会话失败: {}", e);
+                    return Ok(Json(ApiResponse::success(status)));
+                }
 
-                        // 初始化下载管理器
-                        let config = state.config.read().await;
-                        let download_dir = config.download.download_dir.clone();
-                        let max_global_threads = config.download.max_global_threads;
-                        let max_concurrent_tasks = config.download.max_concurrent_tasks;
-                        drop(config);
+                info!(
+                    "✅ 会话保存成功: UID={}, BDUSS长度={}",
+                    user.uid,
+                    user.bduss.len()
+                );
 
-                        match crate::downloader::DownloadManager::with_config(
-                            user.clone(),
-                            download_dir,
-                            max_global_threads,
-                            max_concurrent_tasks,
-                        ) {
-                            Ok(manager) => {
-                                let manager_arc = Arc::new(manager);
-                                *state.download_manager.write().await = Some(Arc::clone(&manager_arc));
+                // 初始化用户资源（网盘客户端和下载管理器）
+                *state.current_user.write().await = Some(user.clone());
 
-                                // 设置文件夹下载管理器的依赖
-                                state.folder_download_manager
-                                    .set_download_manager(Arc::clone(&manager_arc))
-                                    .await;
-                                state.folder_download_manager
-                                    .set_netdisk_client(client_arc)
-                                    .await;
+                // 初始化网盘客户端
+                let client = match crate::netdisk::NetdiskClient::new(user.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("初始化网盘客户端失败: {}", e);
+                        return Ok(Json(ApiResponse::success(status)));
+                    }
+                };
 
-                                info!("✅ 下载管理器初始化成功");
-                            }
-                            Err(e) => {
-                                error!("❌ 初始化下载管理器失败: {}", e);
-                            }
+                // 执行预热并保存预热 Cookie
+                info!("登录成功,开始预热会话...");
+                let mut updated_user = user.clone();
+                match client.warmup_and_get_cookies().await {
+                    Ok((panpsc, csrf_token, bdstoken, stoken)) => {
+                        info!("预热成功,保存预热 Cookie 到 session.json");
+                        updated_user.panpsc = panpsc;
+                        updated_user.csrf_token = csrf_token;
+                        updated_user.bdstoken = bdstoken;
+                        // 预热时下发的 STOKEN 优先于登录时获取的
+                        if stoken.is_some() {
+                            updated_user.stoken = stoken;
+                        }
+
+                        // 更新内存和持久化
+                        *state.current_user.write().await = Some(updated_user.clone());
+                        if let Err(e) = session.save_session(&updated_user).await {
+                            error!("保存预热 Cookie 失败: {}", e);
                         }
                     }
                     Err(e) => {
-                        error!("❌ 保存会话失败: {}", e);
+                        warn!("预热失败(继续使用未预热的客户端): {}", e);
+                    }
+                }
+
+                let client_arc = Arc::new(client.clone());
+                *state.netdisk_client.write().await = Some(client.clone());
+
+                // 初始化下载管理器
+                let config = state.config.read().await;
+                let download_dir = config.download.download_dir.clone();
+                let max_global_threads = config.download.max_global_threads;
+                let max_concurrent_tasks = config.download.max_concurrent_tasks;
+                drop(config);
+
+                match crate::downloader::DownloadManager::with_config(
+                    updated_user.clone(),
+                    download_dir,
+                    max_global_threads,
+                    max_concurrent_tasks,
+                ) {
+                    Ok(manager) => {
+                        let manager_arc = Arc::new(manager);
+                        *state.download_manager.write().await = Some(Arc::clone(&manager_arc));
+
+                        // 设置文件夹下载管理器的依赖
+                        state.folder_download_manager
+                            .set_download_manager(Arc::clone(&manager_arc))
+                            .await;
+                        state.folder_download_manager
+                            .set_netdisk_client(client_arc)
+                            .await;
+
+                        info!("✅ 下载管理器初始化成功");
+
+                        // 初始化上传管理器
+                        let upload_manager = UploadManager::new(client, &updated_user);
+                        let upload_manager_arc = Arc::new(upload_manager);
+                        *state.upload_manager.write().await = Some(upload_manager_arc);
+                        info!("✅ 上传管理器初始化成功");
+                    }
+                    Err(e) => {
+                        error!("❌ 初始化下载管理器失败: {}", e);
                     }
                 }
             }

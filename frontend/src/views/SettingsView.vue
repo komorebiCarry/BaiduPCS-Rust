@@ -20,12 +20,12 @@
       <el-main>
         <el-skeleton :loading="loading" :rows="8" animated>
           <el-form
-            v-if="formData"
-            ref="formRef"
-            :model="formData"
-            :rules="rules"
-            label-width="140px"
-            label-position="left"
+              v-if="formData"
+              ref="formRef"
+              :model="formData"
+              :rules="rules"
+              label-width="140px"
+              label-position="left"
           >
             <!-- 服务器配置 -->
             <el-card class="setting-card" shadow="hover">
@@ -40,9 +40,9 @@
 
               <el-form-item label="监听地址" prop="server.host">
                 <el-input
-                  v-model="formData.server.host"
-                  placeholder="例如: 127.0.0.1"
-                  clearable
+                    v-model="formData.server.host"
+                    placeholder="例如: 127.0.0.1"
+                    clearable
                 >
                   <template #prepend>
                     <el-icon><Connection /></el-icon>
@@ -53,12 +53,12 @@
 
               <el-form-item label="监听端口" prop="server.port">
                 <el-input-number
-                  v-model="formData.server.port"
-                  :min="1"
-                  :max="65535"
-                  :step="1"
-                  controls-position="right"
-                  style="width: 100%"
+                    v-model="formData.server.port"
+                    :min="1"
+                    :max="65535"
+                    :step="1"
+                    controls-position="right"
+                    style="width: 100%"
                 />
                 <div class="form-tip">服务器监听的端口号，修改后需要重启服务器</div>
               </el-form-item>
@@ -77,11 +77,11 @@
 
               <!-- VIP 等级信息 -->
               <el-alert
-                v-if="recommended"
-                :title="`您的会员等级: ${recommended.vip_name}`"
-                type="info"
-                :closable="false"
-                style="margin-bottom: 20px"
+                  v-if="recommended"
+                  :title="`您的会员等级: ${recommended.vip_name}`"
+                  type="info"
+                  :closable="false"
+                  style="margin-bottom: 20px"
               >
                 <template #default>
                   <div class="vip-info">
@@ -103,10 +103,10 @@
 
               <!-- 警告提示 -->
               <el-alert
-                v-if="recommended && recommended.warnings && recommended.warnings.length > 0"
-                type="warning"
-                :closable="false"
-                style="margin-bottom: 20px"
+                  v-if="recommended && recommended.warnings && recommended.warnings.length > 0"
+                  type="warning"
+                  :closable="false"
+                  style="margin-bottom: 20px"
               >
                 <template #default>
                   <div v-for="(warning, index) in recommended.warnings" :key="index">
@@ -117,9 +117,9 @@
 
               <el-form-item label="下载目录" prop="download.download_dir">
                 <el-input
-                  v-model="formData.download.download_dir"
-                  placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
-                  clearable
+                    v-model="formData.download.download_dir"
+                    placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
+                    clearable
                 >
                   <template #prepend>
                     <el-icon><Folder /></el-icon>
@@ -136,13 +136,13 @@
 
               <el-form-item label="全局最大线程数" prop="download.max_global_threads">
                 <el-slider
-                  v-model="formData.download.max_global_threads"
-                  :min="1"
-                  :max="20"
-                  :step="1"
-                  :marks="threadMarks"
-                  show-stops
-                  style="width: calc(100% - 20px); margin-right: 20px"
+                    v-model="formData.download.max_global_threads"
+                    :min="1"
+                    :max="20"
+                    :step="1"
+                    :marks="threadMarks"
+                    show-stops
+                    style="width: calc(100% - 20px); margin-right: 20px"
                 />
                 <div class="value-display">
                   当前: {{ formData.download.max_global_threads }} 个
@@ -161,13 +161,13 @@
 
               <el-form-item label="最大同时下载数" prop="download.max_concurrent_tasks">
                 <el-slider
-                  v-model="formData.download.max_concurrent_tasks"
-                  :min="1"
-                  :max="10"
-                  :step="1"
-                  :marks="taskMarks"
-                  show-stops
-                  style="width: calc(100% - 20px); margin-right: 20px"
+                    v-model="formData.download.max_concurrent_tasks"
+                    :min="1"
+                    :max="10"
+                    :step="1"
+                    :marks="taskMarks"
+                    show-stops
+                    style="width: calc(100% - 20px); margin-right: 20px"
                 />
                 <div class="value-display">
                   当前: {{ formData.download.max_concurrent_tasks }} 个
@@ -182,10 +182,10 @@
 
               <!-- 分片大小说明（自适应，不可配置） -->
               <el-alert
-                title="智能分片大小"
-                type="success"
-                :closable="false"
-                style="margin-bottom: 20px"
+                  title="智能分片大小"
+                  type="success"
+                  :closable="false"
+                  style="margin-bottom: 20px"
               >
                 <template #default>
                   <div style="line-height: 1.8">
@@ -202,15 +202,106 @@
 
               <el-form-item label="最大重试次数" prop="download.max_retries">
                 <el-input-number
-                  v-model="formData.download.max_retries"
-                  :min="0"
-                  :max="10"
-                  :step="1"
-                  controls-position="right"
-                  style="width: 100%"
+                    v-model="formData.download.max_retries"
+                    :min="0"
+                    :max="10"
+                    :step="1"
+                    controls-position="right"
+                    style="width: 100%"
                 />
                 <div class="form-tip">下载分片失败后的重试次数，0 表示不重试</div>
               </el-form-item>
+            </el-card>
+
+            <!-- 上传配置 -->
+            <el-card class="setting-card" shadow="hover">
+              <template #header>
+                <div class="card-header">
+                  <el-icon :size="20" color="#e6a23c">
+                    <Upload />
+                  </el-icon>
+                  <span>上传配置</span>
+                </div>
+              </template>
+
+              <el-form-item label="全局最大线程数" prop="upload.max_global_threads">
+                <el-slider
+                    v-model="formData.upload.max_global_threads"
+                    :min="1"
+                    :max="20"
+                    :step="1"
+                    :marks="threadMarks"
+                    show-stops
+                    style="width: calc(100% - 20px); margin-right: 20px"
+                />
+                <div class="value-display">
+                  当前: {{ formData.upload.max_global_threads }} 个
+                </div>
+                <div class="form-tip">
+                  <el-icon><InfoFilled /></el-icon>
+                  所有上传任务共享的线程池大小
+                </div>
+              </el-form-item>
+
+              <el-form-item label="最大同时上传数" prop="upload.max_concurrent_tasks">
+                <el-slider
+                    v-model="formData.upload.max_concurrent_tasks"
+                    :min="1"
+                    :max="10"
+                    :step="1"
+                    :marks="taskMarks"
+                    show-stops
+                    style="width: calc(100% - 20px); margin-right: 20px"
+                />
+                <div class="value-display">
+                  当前: {{ formData.upload.max_concurrent_tasks }} 个
+                </div>
+                <div class="form-tip">
+                  可以同时进行上传的文件数量上限
+                </div>
+              </el-form-item>
+
+              <el-form-item label="最大重试次数" prop="upload.max_retries">
+                <el-input-number
+                    v-model="formData.upload.max_retries"
+                    :min="0"
+                    :max="10"
+                    :step="1"
+                    controls-position="right"
+                    style="width: 100%"
+                />
+                <div class="form-tip">上传分片失败后的重试次数，0 表示不重试</div>
+              </el-form-item>
+
+              <el-form-item label="跳过隐藏文件" prop="upload.skip_hidden_files">
+                <el-switch
+                    v-model="formData.upload.skip_hidden_files"
+                    active-text="跳过"
+                    inactive-text="不跳过"
+                />
+                <div class="form-tip">
+                  上传文件夹时是否跳过以"."开头的隐藏文件/文件夹（如 .git、.DS_Store 等）
+                </div>
+              </el-form-item>
+
+              <!-- 分片大小说明（自适应，不可配置） -->
+              <el-alert
+                  title="智能分片大小（自动适配）"
+                  type="success"
+                  :closable="false"
+              >
+                <template #default>
+                  <div style="line-height: 1.8">
+                    系统会根据文件大小和您的VIP等级自动选择最优分片大小：<br/>
+                    • 普通用户：固定 4MB 分片<br/>
+                    • 普通会员：智能选择 4-16MB 分片<br/>
+                    • 超级会员：智能选择 4-32MB 分片<br/>
+                    <br/>
+                    <strong>⚠️ 重要说明：</strong><br/>
+                    • 上传时的实际分片大小（4-32MB）用于提升传输效率<br/>
+                  </div>
+                </template>
+              </el-alert>
             </el-card>
 
             <!-- 关于信息 -->
@@ -231,7 +322,7 @@
                 </div>
                 <div class="about-item">
                   <span class="label">版本:</span>
-                  <span class="value">v1.0.0</span>
+                  <span class="value">v1.3.0</span>
                 </div>
                 <div class="about-item">
                   <span class="label">后端技术:</span>
@@ -266,6 +357,7 @@ import {
   Monitor,
   Connection,
   Download,
+  Upload,
   Folder,
   InfoFilled,
   User,
@@ -343,6 +435,18 @@ const rules = reactive<FormRules<AppConfig>>({
     { required: true, message: '请输入最大重试次数', trigger: 'blur' },
     { type: 'number', min: 0, max: 10, message: '重试次数范围: 0-10', trigger: 'blur' },
   ],
+  'upload.max_global_threads': [
+    { required: true, message: '请选择上传全局最大线程数', trigger: 'change' },
+    { type: 'number', min: 1, max: 20, message: '线程数范围: 1-20', trigger: 'change' },
+  ],
+  'upload.max_concurrent_tasks': [
+    { required: true, message: '请选择最大同时上传数', trigger: 'change' },
+    { type: 'number', min: 1, max: 10, message: '同时上传数范围: 1-10', trigger: 'change' },
+  ],
+  'upload.max_retries': [
+    { required: true, message: '请输入最大重试次数', trigger: 'blur' },
+    { type: 'number', min: 0, max: 10, message: '重试次数范围: 0-10', trigger: 'blur' },
+  ],
 })
 
 // 加载配置
@@ -351,7 +455,7 @@ async function loadConfig() {
   try {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
-    
+
     // 同时加载推荐配置
     try {
       recommended.value = await getRecommendedConfig()
@@ -369,19 +473,19 @@ async function loadConfig() {
 async function handleReset() {
   try {
     await ElMessageBox.confirm(
-      '确定要恢复为推荐配置吗？这将根据您的VIP等级应用最佳配置。',
-      '提示',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        '确定要恢复为推荐配置吗？这将根据您的VIP等级应用最佳配置。',
+        '提示',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
-    
+
     resetting.value = true
     await resetToRecommended()
     ElMessage.success('已恢复为推荐配置')
-    
+
     // 重新加载配置
     await loadConfig()
   } catch (error: any) {
@@ -404,7 +508,7 @@ async function handleSave() {
     saving.value = true
     await configStore.saveConfig(formData.value)
     ElMessage.success('配置已保存')
-    
+
     // 重新加载推荐配置以更新警告
     try {
       recommended.value = await getRecommendedConfig()

@@ -20,6 +20,12 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// 下载配置
     pub download: DownloadConfig,
+    /// 上传配置
+    #[serde(default)]
+    pub upload: UploadConfig,
+    /// 文件系统配置
+    #[serde(default)]
+    pub filesystem: FilesystemConfig,
 }
 
 /// 服务器配置
@@ -46,6 +52,57 @@ pub struct DownloadConfig {
     pub max_concurrent_tasks: usize,
     /// 最大重试次数
     pub max_retries: u32,
+}
+
+/// 上传配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadConfig {
+    /// 全局最大线程数（所有上传任务共享）
+    pub max_global_threads: usize,
+    /// 分片大小 (MB)，范围 4-32MB
+    pub chunk_size_mb: u64,
+    /// 最大同时上传文件数
+    pub max_concurrent_tasks: usize,
+    /// 最大重试次数
+    pub max_retries: u32,
+    /// 上传文件夹时是否跳过隐藏文件（以.开头的文件/文件夹）
+    pub skip_hidden_files: bool,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            max_global_threads: 10,
+            chunk_size_mb: 4,           // 百度网盘上传分片最小 4MB
+            max_concurrent_tasks: 5,
+            max_retries: 3,
+            skip_hidden_files: false,   // 默认不跳过隐藏文件
+        }
+    }
+}
+
+/// 文件系统配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesystemConfig {
+    /// 允许访问的路径白名单（空表示允许所有）
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    /// 是否显示隐藏文件
+    #[serde(default)]
+    pub show_hidden: bool,
+    /// 是否跟随符号链接
+    #[serde(default)]
+    pub follow_symlinks: bool,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            allowed_paths: vec![],
+            show_hidden: false,
+            follow_symlinks: false,
+        }
+    }
 }
 
 /// VIP 类型
@@ -226,7 +283,7 @@ impl DownloadConfig {
     /// 验证配置是否安全
     pub fn validate_for_vip(&self, vip_type: VipType) -> Result<(), String> {
         let recommended = Self::recommended_for_vip(vip_type);
-        
+
         // 警告：普通用户超过推荐线程数
         if vip_type == VipType::Normal && self.max_global_threads > recommended.threads {
             return Err(format!(
@@ -288,8 +345,8 @@ impl Default for AppConfig {
 
         Self {
             server: ServerConfig {
-                host: "0.0.0.0".to_string(),
-                port: 8080,
+                host: "127.0.0.1".to_string(),
+                port: 18888,
                 cors_origins: vec!["*".to_string()],
             },
             download: DownloadConfig {
@@ -299,6 +356,8 @@ impl Default for AppConfig {
                 max_concurrent_tasks: svip_config.max_tasks,
                 max_retries: 3,
             },
+            upload: UploadConfig::default(),
+            filesystem: FilesystemConfig::default(),
         }
     }
 }
@@ -430,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_config() {
         let config = AppConfig::default();
-        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.port, 18888); // 默认端口 18888
         assert_eq!(config.download.max_global_threads, 10); // SVIP 默认
     }
 

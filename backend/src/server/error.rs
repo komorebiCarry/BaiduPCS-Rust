@@ -15,6 +15,8 @@ pub enum ApiError {
     Internal(anyhow::Error),
     /// 未授权
     Unauthorized(String),
+    /// Token 过期或无效（需要重新登录）
+    TokenExpired(String),
     /// 未找到
     NotFound(String),
     /// 请求参数错误
@@ -28,6 +30,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::Internal(e) => write!(f, "Internal error: {}", e),
             ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
+            ApiError::TokenExpired(msg) => write!(f, "Token expired: {}", msg),
             ApiError::NotFound(msg) => write!(f, "Not found: {}", msg),
             ApiError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
             ApiError::Conflict(msg) => write!(f, "Conflict: {}", msg),
@@ -60,6 +63,10 @@ impl IntoResponse for ApiError {
             }
             ApiError::Unauthorized(msg) => {
                 tracing::warn!("Unauthorized: {}", msg);
+                (StatusCode::UNAUTHORIZED, 401, msg, None)
+            }
+            ApiError::TokenExpired(msg) => {
+                tracing::warn!("Token expired: {}", msg);
                 (StatusCode::UNAUTHORIZED, 401, msg, None)
             }
             ApiError::NotFound(msg) => {
