@@ -336,16 +336,24 @@ impl Default for AppConfig {
                 .join("downloads")
         };
 
+        // Docker 环境使用 0.0.0.0 以便从宿主机访问，本地环境使用 127.0.0.1
+        let host = if env_info.is_docker {
+            "0.0.0.0".to_string()
+        } else {
+            "127.0.0.1".to_string()
+        };
+
         tracing::info!(
-            "检测到环境: {} (Docker: {}), 使用默认下载目录: {:?}",
+            "检测到环境: {} (Docker: {}), 使用默认下载目录: {:?}, 服务器监听地址: {}",
             env_info.os_type.as_str(),
             env_info.is_docker,
-            download_dir
+            download_dir,
+            host
         );
 
         Self {
             server: ServerConfig {
-                host: "127.0.0.1".to_string(),
+                host,
                 port: 18888,
                 cors_origins: vec!["*".to_string()],
             },
