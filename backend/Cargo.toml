@@ -56,6 +56,7 @@ dashmap = "5.5"
 
 # URL编码
 urlencoding = "2.1"
+regex = "1.12.2"
 
 [dev-dependencies]
 # 测试工具

@@ -33,6 +33,11 @@
           <template #title>上传管理</template>
         </el-menu-item>
 
+        <el-menu-item index="/transfers">
+          <el-icon><Share /></el-icon>
+          <template #title>转存管理</template>
+        </el-menu-item>
+
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
           <template #title>系统设置</template>
@@ -109,6 +114,7 @@ import {
   SwitchButton,
   Expand,
   Fold,
+  Share,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -128,6 +134,7 @@ const pageTitle = computed(() => {
     '/files': '文件管理',
     '/downloads': '下载管理',
     '/uploads': '上传管理',
+    '/transfers': '转存管理',
     '/settings': '系统设置',
   }
   return titles[route.path] || '百度网盘'

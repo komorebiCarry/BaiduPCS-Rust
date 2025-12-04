@@ -111,6 +111,59 @@ export async function clearFailed(): Promise<number> {
   return apiClient.delete('/downloads/clear/failed')
 }
 
+// ============================================
+// 批量下载相关类型和函数
+// ============================================
+
+/// 批量下载项
+export interface BatchDownloadItem {
+  /// 文件系统ID
+  fs_id: number
+  /// 远程路径
+  path: string
+  /// 文件/文件夹名称
+  name: string
+  /// 是否为目录
+  is_dir: boolean
+  /// 文件大小（文件夹为 undefined 或 0）
+  size?: number
+}
+
+/// 批量下载请求
+export interface CreateBatchDownloadRequest {
+  /// 下载项列表
+  items: BatchDownloadItem[]
+  /// 本地下载目录
+  target_dir: string
+}
+
+/// 批量下载错误项
+export interface BatchDownloadError {
+  /// 文件/文件夹路径
+  path: string
+  /// 失败原因
+  reason: string
+}
+
+/// 批量下载响应
+export interface BatchDownloadResponse {
+  /// 成功创建的单文件任务ID列表
+  task_ids: string[]
+  /// 成功创建的文件夹任务ID列表
+  folder_task_ids: string[]
+  /// 失败的项
+  failed: BatchDownloadError[]
+}
+
+/**
+ * 批量下载文件/文件夹
+ * @param req 批量下载请求
+ * @returns 批量下载响应
+ */
+export async function createBatchDownload(req: CreateBatchDownloadRequest): Promise<BatchDownloadResponse> {
+  return apiClient.post('/downloads/batch', req)
+}
+
 /**
  * 计算下载进度百分比
  */

@@ -1,14 +1,21 @@
 <template>
   <tr
-    class="file-item"
-    :class="{
+      class="file-item"
+      :class="{
       'is-selected': selected,
       'is-disabled': disabled,
       'is-directory': entry.entryType === 'directory'
     }"
-    @click="emit('click', entry)"
-    @dblclick="emit('dblclick', entry)"
+      @click="emit('click', entry)"
+      @dblclick="emit('dblclick', entry)"
   >
+    <td v-if="showCheckbox" class="col-checkbox" @click.stop>
+      <el-checkbox
+          :model-value="selected"
+          :disabled="disabled"
+          @change="emit('checkbox-change', entry)"
+      />
+    </td>
     <td class="col-name">
       <div class="name-content">
         <el-icon class="file-icon" :class="iconClass">
@@ -40,11 +47,13 @@ const props = defineProps<{
   entry: FileEntry
   selected: boolean
   disabled: boolean
+  showCheckbox?: boolean
 }>()
 
 const emit = defineEmits<{
   'click': [entry: FileEntry]
   'dblclick': [entry: FileEntry]
+  'checkbox-change': [entry: FileEntry]
 }>()
 
 // 图标组件
@@ -160,7 +169,7 @@ function formatSize(bytes: number | null): string {
 <style scoped>
 .file-item {
   cursor: pointer;
-  transition: background-color 0.1s;
+  transition: background-color 0.15s ease;
 }
 
 .file-item:hover {
@@ -188,6 +197,21 @@ function formatSize(bytes: number | null): string {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.col-checkbox {
+  width: 40px;
+  text-align: center;
+  padding: 8px 4px !important;
+}
+
+.col-checkbox :deep(.el-checkbox) {
+  height: 20px;
+}
+
+.col-checkbox :deep(.el-checkbox__input) {
+  display: flex;
+  align-items: center;
 }
 
 .col-name {

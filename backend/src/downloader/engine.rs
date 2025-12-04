@@ -1,14 +1,17 @@
 use crate::auth::UserAuth;
+use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
 use crate::netdisk::NetdiskClient;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use futures::future::join_all;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -65,10 +68,16 @@ fn calculate_backoff_delay(retry_count: u32) -> u64 {
 /// - EWMA（α=0.85）：用于 timeout 计算和长期统计
 ///
 /// 🔥 并发优化：使用 DashMap + AtomicU64，消除 Mutex 瓶颈
+/// 🔥 CDN刷新支持：通过 additional_urls 支持动态添加新链接
 #[derive(Debug, Clone)]
 pub struct UrlHealthManager {
     /// 所有链接列表（包括已淘汰的）- 不可变，无需同步
     all_urls: Vec<String>,
+
+    /// 🔥 新增：动态添加的链接（刷新时获取的新链接）
+    /// 使用 DashMap 支持并发安全的动态添加
+    /// value: 是否已初始化
+    additional_urls: Arc<DashMap<String, bool>>,
 
     // 🔥 HashMap → DashMap（无锁并发）
     /// 链接权重（URL -> 权重，>0可用，=0不可用）
@@ -141,6 +150,7 @@ impl UrlHealthManager {
 
         Self {
             all_urls: urls,
+            additional_urls: Arc::new(DashMap::new()),  // 🔥 新增：动态链接存储
             weights,
             url_speeds,
             url_scores,
@@ -154,9 +164,18 @@ impl UrlHealthManager {
         }
     }
 
-    /// 获取可用的链接数量（权重>0的链接）
+    /// 获取可用的链接数量（权重>0的链接，包括原始和动态添加的）
     pub fn available_count(&self) -> usize {
-        self.weights.iter().filter(|entry| *entry.value() > 0).count()
+        let original_count = self.weights.iter().filter(|entry| *entry.value() > 0).count();
+
+        // 计算动态添加链接中可用的数量
+        let additional_count = self.additional_urls.iter()
+            .filter(|entry| {
+                self.weights.get(entry.key()).map(|w| *w > 0).unwrap_or(false)
+            })
+            .count();
+
+        original_count + additional_count
     }
 
     /// 根据索引获取可用链接（跳过权重=0的链接）
@@ -179,6 +198,7 @@ impl UrlHealthManager {
     /// 🔥 混合加权选择：权重 = 速度 × (score/100)
     ///
     /// 高速链接自动获得更多分片，性能提升 +10-33%（速度差异大时）
+    /// 🔥 已支持动态添加的链接
     ///
     /// # 参数
     /// * `chunk_index` - 分片索引，用于加权轮询
@@ -186,8 +206,8 @@ impl UrlHealthManager {
     /// # 返回
     /// 选中的 URL（克隆），如果无可用链接则返回 None
     pub fn get_url_hybrid(&self, chunk_index: usize) -> Option<String> {
-        // 1. 获取所有可用链接及其综合权重
-        let available: Vec<(String, f64)> = self.all_urls
+        // 1. 获取所有可用链接及其综合权重（包括原始和动态添加的）
+        let mut available: Vec<(String, f64)> = self.all_urls
             .iter()
             .filter_map(|url| {
                 let weight = self.weights.get(url).map(|w| *w)?;
@@ -213,6 +233,27 @@ impl UrlHealthManager {
                 Some((url.clone(), combined_weight))
             })
             .collect();
+
+        // 🔥 添加动态链接
+        for entry in self.additional_urls.iter() {
+            let url = entry.key();
+            let weight = self.weights.get(url).map(|w| *w).unwrap_or(0);
+            if weight == 0 {
+                continue;
+            }
+
+            let speed = self.url_avg_speeds.get(url).map(|v| *v)
+                .or_else(|| self.url_speeds.get(url).map(|v| *v))
+                .unwrap_or(0.0);
+            if speed <= 0.0 {
+                continue;
+            }
+
+            let score = self.url_scores.get(url).map(|s| *s).unwrap_or(50);
+            let combined_weight = speed * (score as f64 / 100.0);
+
+            available.push((url.clone(), combined_weight));
+        }
 
         if available.is_empty() {
             return None;
@@ -655,6 +696,58 @@ impl UrlHealthManager {
         // 如果速度<=0，使用默认超时
         60
     }
+
+    /// 🔥 添加刷新获取的新链接
+    ///
+    /// CDN链接刷新机制的核心方法，用于动态添加新链接
+    ///
+    /// # 参数
+    /// * `new_urls` - 新链接列表
+    /// * `new_speeds` - 对应的探测速度 (KB/s)
+    pub fn add_refreshed_urls(&self, new_urls: Vec<String>, new_speeds: Vec<f64>) {
+        for (url, speed) in new_urls.iter().zip(new_speeds.iter()) {
+            // 检查是否已存在（在原始列表或已添加列表中）
+            if self.all_urls.contains(url) || self.additional_urls.contains_key(url) {
+                // 更新速度
+                self.url_speeds.insert(url.clone(), *speed);
+                debug!("更新已存在链接速度: {} ({:.2} KB/s)", url, speed);
+                continue;
+            }
+
+            // 新链接：初始化所有状态（与 new() 方法完全一致）
+            self.additional_urls.insert(url.clone(), true);
+            self.weights.insert(url.clone(), 1);
+            self.url_speeds.insert(url.clone(), *speed);
+            self.url_avg_speeds.insert(url.clone(), *speed);
+            self.url_sample_counts.insert(url.clone(), 0);
+            self.url_scores.insert(url.clone(), 50);
+            self.cooldown_secs.insert(url.clone(), 10);
+            // ⚠️ 修复问题2：使用 with_capacity(50) 与 new() 保持一致
+            // 虽然 new() 中未显式使用 with_capacity，但保持一致性更安全
+            self.url_recent_speeds.insert(url.clone(), StdMutex::new(VecDeque::with_capacity(50)));
+
+            info!("🔗 添加新下载链接: {} (速度: {:.2} KB/s)", url, speed);
+        }
+    }
+
+    /// 🔥 获取所有可用链接（包括原始和刷新添加的）
+    ///
+    /// # 返回
+    /// 所有可用链接列表（权重 > 0）
+    pub fn all_available_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self.all_urls.iter()
+            .filter(|u| self.weights.get(*u).map(|w| *w > 0).unwrap_or(false))
+            .cloned()
+            .collect();
+
+        for entry in self.additional_urls.iter() {
+            if self.weights.get(entry.key()).map(|w| *w > 0).unwrap_or(false) {
+                urls.push(entry.key().clone());
+            }
+        }
+
+        urls
+    }
 }
 
 /// 下载引擎
@@ -813,29 +906,58 @@ impl DownloadEngine {
         // 3. 创建用于下载的专用 HTTP 客户端
         let download_client = self.create_download_client();
 
-        // 4. 探测所有下载链接，过滤出可用的链接
-        info!("开始探测 {} 个下载链接...", all_urls.len());
+        // 4. 🔥 并行探测所有下载链接，过滤出可用的链接
+        // 使用分批并行，每批最多 10 个，一般情况下可以一次性并行探测所有链接
+        info!("开始并行探测 {} 个下载链接（每批10个）...", all_urls.len());
         let mut valid_urls = Vec::new();
-        let mut url_speeds = Vec::new(); // 记录每个链接的速度
+        let mut url_speeds = Vec::new();
         let mut referer: Option<String> = None;
 
-        for (i, url) in all_urls.iter().enumerate() {
-            match self
-                .probe_download_link_with_client(&download_client, url, total_size)
-                .await
-            {
-                Ok((ref_url, speed)) => {
-                    info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", i, speed);
-                    valid_urls.push(url.clone());
-                    url_speeds.push(speed);
+        // 预先获取 bduss，避免在 async 闭包中借用 self
+        let bduss = self.netdisk_client.bduss().to_string();
 
-                    // 保存第一个成功链接的 Referer
-                    if referer.is_none() {
-                        referer = ref_url;
+        const BATCH_SIZE: usize = 10; // 每批并行探测的链接数
+
+        for batch_start in (0..all_urls.len()).step_by(BATCH_SIZE) {
+            let batch_end = std::cmp::min(batch_start + BATCH_SIZE, all_urls.len());
+            let batch_urls = &all_urls[batch_start..batch_end];
+
+            // 创建并行探测任务
+            let probe_futures: Vec<_> = batch_urls
+                .iter()
+                .enumerate()
+                .map(|(batch_idx, url)| {
+                    let client = download_client.clone();
+                    let url = url.clone();
+                    let bduss = bduss.clone();
+                    let total_size = total_size;
+                    let global_idx = batch_start + batch_idx;
+                    async move {
+                        let result = Self::probe_download_link_parallel(&client, &bduss, &url, total_size).await;
+                        (global_idx, url, result)
                     }
-                }
-                Err(e) => {
-                    warn!("✗ 链接 #{} 探测失败: {}", i, e);
+                })
+                .collect();
+
+            // 并行执行本批次的探测
+            let batch_results = join_all(probe_futures).await;
+
+            // 处理探测结果
+            for (idx, url, result) in batch_results {
+                match result {
+                    Ok((ref_url, speed)) => {
+                        info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", idx, speed);
+                        valid_urls.push(url);
+                        url_speeds.push(speed);
+
+                        // 保存第一个成功链接的 Referer
+                        if referer.is_none() {
+                            referer = ref_url;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("✗ 链接 #{} 探测失败: {}", idx, e);
+                    }
                 }
             }
         }
@@ -1048,7 +1170,7 @@ impl DownloadEngine {
         &self,
         task: Arc<Mutex<DownloadTask>>,
         global_semaphore: Arc<Semaphore>,
-        _remote_path: &str, // 保留参数以保持接口一致性，但当前未使用
+        remote_path: &str, // 用于 CDN 链接刷新
         download_urls: &[String],
         total_size: u64,
         chunk_size: u64,
@@ -1156,6 +1278,23 @@ impl DownloadEngine {
 
         // 3. 创建 URL 健康管理器（传递speeds）
         let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls, url_speeds)));
+
+        // 3.1 创建刷新协调器（防止并发刷新）
+        let refresh_coordinator = Arc::new(RefreshCoordinator::new(RefreshCoordinatorConfig::default()));
+
+        // 3.2 启动定时刷新循环（10分钟间隔）
+        // 使用 Arc 包装 self 以便在 spawn 的任务中使用
+        let engine_arc = Arc::new(self.clone());
+        let _periodic_refresh_handle = Self::start_periodic_refresh(
+            engine_arc,
+            remote_path.to_string(),
+            total_size,
+            url_health.clone(),
+            download_client.clone(),
+            refresh_coordinator.clone(),
+            cancellation_token.clone(),
+            10, // 10分钟刷新间隔
+        );
 
         // 4. 创建本地文件（内部会加锁检查取消状态）
         self.prepare_file(local_path, total_size, &cancellation_token)
@@ -1301,7 +1440,7 @@ impl DownloadEngine {
         url: &str,
         expected_size: u64,
     ) -> Result<(Option<String>, f64)> {
-        const PROBE_SIZE: u64 = 256 * 1024; // 256KB (增大测试块以获得更准确的速度测量)
+        const PROBE_SIZE: u64 = 64 * 1024; // 64KB (缩小探测块以加快探测速度)
 
         let probe_end = if expected_size > 0 {
             (PROBE_SIZE - 1).min(expected_size - 1)
@@ -1325,6 +1464,7 @@ impl DownloadEngine {
             .get(url)
             .header("Cookie", format!("BDUSS={}", bduss))
             .header("Range", format!("bytes=0-{}", probe_end))
+            .timeout(std::time::Duration::from_secs(5)) // 探测超时5秒
             .send()
             .await
             .context("发送探测请求失败")?;
@@ -1415,6 +1555,82 @@ impl DownloadEngine {
         Ok((referer, speed_kbps))
     }
 
+    /// 🔥 用于并行探测的静态方法
+    ///
+    /// 与 probe_download_link_with_client 功能相同，但不需要 &self
+    /// 用于 prepare_for_scheduling 中的并行探测
+    async fn probe_download_link_parallel(
+        client: &Client,
+        bduss: &str,
+        url: &str,
+        expected_size: u64,
+    ) -> Result<(Option<String>, f64)> {
+        const PROBE_SIZE: u64 = 64 * 1024; // 64KB
+
+        let probe_end = if expected_size > 0 {
+            (PROBE_SIZE - 1).min(expected_size - 1)
+        } else {
+            PROBE_SIZE - 1
+        };
+
+        debug!(
+            "🔍 探测下载链接: Range 0-{} ({} bytes)",
+            probe_end,
+            probe_end + 1
+        );
+
+        let start_time = std::time::Instant::now();
+
+        let response = client
+            .get(url)
+            .header("Cookie", format!("BDUSS={}", bduss))
+            .header("Range", format!("bytes=0-{}", probe_end))
+            .timeout(std::time::Duration::from_secs(5)) // 探测超时5秒
+            .send()
+            .await
+            .context("发送探测请求失败")?;
+
+        let status = response.status();
+        debug!("📡 探测响应状态: {}", status);
+
+        if status != reqwest::StatusCode::PARTIAL_CONTENT && status != reqwest::StatusCode::OK {
+            anyhow::bail!(
+                "探测失败: 服务器返回异常状态码 {} (期望 206 或 200)",
+                status
+            );
+        }
+
+        // 获取最终的 URL（如果有重定向，这将是重定向后的 URL）
+        let final_url = response.url().to_string();
+
+        // 如果 URL 发生了变化（有重定向），使用原始 URL 作为 Referer
+        let referer = if final_url != url {
+            Some(url.to_string())
+        } else {
+            None
+        };
+
+        // 读取探测数据
+        let probe_data = response.bytes().await.context("读取探测数据失败")?;
+
+        // 计算下载速度
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let speed_kbps = if elapsed > 0.0 {
+            (probe_data.len() as f64) / 1024.0 / elapsed
+        } else {
+            0.0
+        };
+
+        debug!(
+            "✅ 探测成功: 收到 {} bytes 数据，耗时 {:.2}s，速度 {:.2} KB/s",
+            probe_data.len(),
+            elapsed,
+            speed_kbps
+        );
+
+        Ok((referer, speed_kbps))
+    }
+
     /// 用于恢复链接的简化探测函数（静态方法）
     ///
     /// 与 probe_download_link_with_client 类似，但不需要 self，只返回速度
@@ -1425,7 +1641,7 @@ impl DownloadEngine {
         url: &str,
         expected_size: u64,
     ) -> Result<f64> {
-        const PROBE_SIZE: u64 = 256 * 1024; // 256KB
+        const PROBE_SIZE: u64 = 64 * 1024; // 64KB
 
         let probe_end = if expected_size > 0 {
             (PROBE_SIZE - 1).min(expected_size - 1)
@@ -1441,7 +1657,7 @@ impl DownloadEngine {
             .get(url)
             .header("Cookie", cookie)
             .header("Range", format!("bytes=0-{}", probe_end))
-            .timeout(std::time::Duration::from_secs(30)) // 探测超时30秒
+            .timeout(std::time::Duration::from_secs(5)) // 探测超时5秒
             .send()
             .await
             .context("恢复探测请求失败")?;
@@ -1468,6 +1684,437 @@ impl DownloadEngine {
         );
 
         Ok(speed_kbps)
+    }
+
+    // ========================================
+    // CDN 链接刷新机制 - 阶段二
+    // ========================================
+
+    /// 刷新下载链接
+    ///
+    /// ⚠️ 修复问题1：使用 join_all 并行探测所有链接，避免串行阻塞
+    ///
+    /// # 流程
+    /// 1. 重新调用 get_locate_download_url 获取新链接
+    /// 2. **并行**探测每个新链接（使用 futures::future::join_all）
+    /// 3. 筛选高速链接（中位数 × 0.6 阈值）
+    /// 4. 添加到 UrlHealthManager
+    ///
+    /// # 参数
+    /// * `remote_path` - 远程文件路径
+    /// * `total_size` - 文件总大小
+    /// * `url_health` - URL 健康管理器
+    /// * `download_client` - HTTP 客户端
+    ///
+    /// # 返回
+    /// 成功添加的新链接数量
+    pub async fn refresh_download_links(
+        &self,
+        remote_path: &str,
+        total_size: u64,
+        url_health: &Arc<Mutex<UrlHealthManager>>,
+        download_client: &Client,
+    ) -> Result<usize> {
+        info!("🔄 开始刷新下载链接: {}", remote_path);
+
+        // 1. 获取新链接
+        let all_urls = self
+            .netdisk_client
+            .get_locate_download_url(remote_path)
+            .await
+            .context("刷新时获取下载链接失败")?;
+
+        if all_urls.is_empty() {
+            warn!("刷新链接: 获取到空列表，跳过");
+            return Ok(0);
+        }
+
+        info!(
+            "刷新链接: 获取到 {} 个链接，开始并行探测",
+            all_urls.len()
+        );
+
+        // 2. ⚠️ 并行探测所有链接（修复问题1）
+        let bduss = self.netdisk_client.bduss().to_string();
+        let cookie = format!("BDUSS={}", bduss);
+
+        let probe_futures: Vec<_> = all_urls
+            .iter()
+            .enumerate()
+            .map(|(i, url)| {
+                let client = download_client.clone();
+                let url = url.clone();
+                let cookie = cookie.clone();
+                async move {
+                    let result =
+                        Self::probe_for_restore(&client, &cookie, &url, total_size).await;
+                    (i, url, result)
+                }
+            })
+            .collect();
+
+        // 并行执行所有探测
+        let probe_results = join_all(probe_futures).await;
+
+        // 3. 收集探测成功的链接
+        let mut valid_urls = Vec::new();
+        let mut url_speeds = Vec::new();
+
+        for (i, url, result) in probe_results {
+            match result {
+                Ok(speed) => {
+                    info!("✓ 刷新链接 #{} 探测成功，速度: {:.2} KB/s", i, speed);
+                    valid_urls.push(url);
+                    url_speeds.push(speed);
+                }
+                Err(e) => {
+                    warn!("✗ 刷新链接 #{} 探测失败: {}", i, e);
+                }
+            }
+        }
+
+        if valid_urls.is_empty() {
+            warn!("所有刷新链接探测失败，保留现有链接");
+            return Ok(0);
+        }
+
+        info!(
+            "并行探测完成: {}/{} 个链接可用",
+            valid_urls.len(),
+            all_urls.len()
+        );
+
+        // 4. 筛选高速链接（复用现有逻辑）
+        let (filtered_urls, filtered_speeds) = Self::filter_fast_urls(valid_urls, url_speeds);
+
+        // 5. 添加到健康管理器
+        let added_count = filtered_urls.len();
+        {
+            let health = url_health.lock().await;
+            health.add_refreshed_urls(filtered_urls, filtered_speeds);
+            info!(
+                "🔗 链接刷新完成，新增/更新 {} 个链接，当前可用: {}",
+                added_count,
+                health.available_count()
+            );
+        }
+
+        Ok(added_count)
+    }
+
+    /// 筛选高速链接（中位数 × 0.6 阈值）
+    ///
+    /// 复用 prepare_for_scheduling 中的筛选逻辑
+    ///
+    /// # 参数
+    /// * `valid_urls` - 有效的 URL 列表
+    /// * `url_speeds` - 对应的速度列表（KB/s）
+    ///
+    /// # 返回
+    /// (筛选后的 URL 列表, 筛选后的速度列表)
+    fn filter_fast_urls(valid_urls: Vec<String>, url_speeds: Vec<f64>) -> (Vec<String>, Vec<f64>) {
+        if url_speeds.len() <= 1 {
+            return (valid_urls, url_speeds);
+        }
+
+        // 计算中位数
+        let mut sorted_speeds = url_speeds.clone();
+        sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = sorted_speeds.len() / 2;
+        let median_speed = if sorted_speeds.len() % 2 == 0 {
+            (sorted_speeds[mid - 1] + sorted_speeds[mid]) / 2.0
+        } else {
+            sorted_speeds[mid]
+        };
+        let threshold = median_speed * 0.6;
+
+        info!(
+            "刷新链接速度分析: 中位数 {:.2} KB/s, 淘汰阈值 {:.2} KB/s",
+            median_speed, threshold
+        );
+
+        let mut filtered_urls = Vec::new();
+        let mut filtered_speeds = Vec::new();
+
+        for (url, speed) in valid_urls.iter().zip(url_speeds.iter()) {
+            if *speed >= threshold {
+                filtered_urls.push(url.clone());
+                filtered_speeds.push(*speed);
+            } else {
+                debug!("淘汰刷新慢速链接: {:.2} KB/s", speed);
+            }
+        }
+
+        // 确保至少保留一个链接
+        if filtered_urls.is_empty() {
+            if let Some((idx, _)) = url_speeds
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                filtered_urls.push(valid_urls[idx].clone());
+                filtered_speeds.push(url_speeds[idx]);
+                info!(
+                    "所有刷新链接被淘汰，保留最快链接: {:.2} KB/s",
+                    url_speeds[idx]
+                );
+            }
+        }
+
+        (filtered_urls, filtered_speeds)
+    }
+
+    /// 启动定时刷新循环
+    ///
+    /// 在下载过程中定期刷新 CDN 链接，防止链接过期
+    ///
+    /// # 参数
+    /// * `engine` - 下载引擎（Arc 包装）
+    /// * `remote_path` - 远程文件路径
+    /// * `total_size` - 文件总大小
+    /// * `url_health` - URL 健康管理器
+    /// * `download_client` - HTTP 客户端
+    /// * `refresh_coordinator` - 刷新协调器（防止并发刷新）
+    /// * `cancellation_token` - 取消令牌
+    /// * `refresh_interval_minutes` - 刷新间隔（分钟）
+    ///
+    /// # 返回
+    /// tokio task handle
+    pub fn start_periodic_refresh(
+        engine: Arc<DownloadEngine>,
+        remote_path: String,
+        total_size: u64,
+        url_health: Arc<Mutex<UrlHealthManager>>,
+        download_client: Client,
+        refresh_coordinator: Arc<RefreshCoordinator>,
+        cancellation_token: CancellationToken,
+        refresh_interval_minutes: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(refresh_interval_minutes * 60);
+            let mut timer = tokio::time::interval(interval);
+
+            // 跳过第一次立即触发
+            timer.tick().await;
+
+            info!(
+                "⏰ 定时刷新循环已启动: 每 {} 分钟刷新一次",
+                refresh_interval_minutes
+            );
+
+            loop {
+                timer.tick().await;
+
+                if cancellation_token.is_cancelled() {
+                    info!("定时刷新循环: 任务已取消，退出");
+                    break;
+                }
+
+                // 尝试获取刷新锁（使用 force_acquire，因为定时器已保证间隔）
+                if let Some(_guard) = refresh_coordinator.force_acquire() {
+                    info!("⏰ 定时刷新: 开始刷新下载链接");
+
+                    match engine
+                        .refresh_download_links(
+                            &remote_path,
+                            total_size,
+                            &url_health,
+                            &download_client,
+                        )
+                        .await
+                    {
+                        Ok(count) => {
+                            info!("⏰ 定时刷新完成: 新增/更新 {} 个链接", count);
+                        }
+                        Err(e) => {
+                            error!("⏰ 定时刷新失败: {}", e);
+                        }
+                    }
+                } else {
+                    debug!("定时刷新: 跳过（另一个刷新正在进行）");
+                }
+            }
+
+            info!("定时刷新循环已结束");
+        })
+    }
+
+    /// 启动速度异常检测循环
+    ///
+    /// ⚠️ 修复问题3：使用全局总速度而非单任务速度
+    /// 当多任务下载时，新任务加入会分流带宽，单任务速度下降是正常的
+    /// 使用全局速度更准确反映整体网络状况
+    ///
+    /// # 参数
+    /// * `engine` - 下载引擎（Arc 包装）
+    /// * `remote_path` - 远程文件路径
+    /// * `total_size` - 文件总大小
+    /// * `url_health` - URL 健康管理器
+    /// * `chunk_scheduler` - 分片调度器（用于获取全局速度）
+    /// * `download_client` - HTTP 客户端
+    /// * `refresh_coordinator` - 刷新协调器（防止并发刷新）
+    /// * `cancellation_token` - 取消令牌
+    /// * `config` - 速度异常检测配置
+    ///
+    /// # 返回
+    /// tokio task handle
+    pub fn start_speed_anomaly_detection(
+        engine: Arc<DownloadEngine>,
+        remote_path: String,
+        total_size: u64,
+        url_health: Arc<Mutex<UrlHealthManager>>,
+        chunk_scheduler: Arc<crate::downloader::ChunkScheduler>,
+        download_client: Client,
+        refresh_coordinator: Arc<RefreshCoordinator>,
+        cancellation_token: CancellationToken,
+        config: crate::common::SpeedAnomalyConfig,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let detector = crate::common::SpeedAnomalyDetector::new(config.clone());
+            let check_interval = Duration::from_secs(config.check_interval_secs);
+            let mut timer = tokio::time::interval(check_interval);
+
+            info!(
+                "📈 速度异常检测循环已启动: 检查间隔 {}秒, 基线建立时间 {}秒",
+                config.check_interval_secs, config.baseline_establish_secs
+            );
+
+            loop {
+                timer.tick().await;
+
+                if cancellation_token.is_cancelled() {
+                    debug!("速度异常检测: 任务已取消，退出");
+                    break;
+                }
+
+                // ⚠️ 修复问题3：获取全局总速度（所有活跃任务速度之和）
+                // 而非单个 SpeedCalculator 的速度
+                let global_speed = chunk_scheduler.get_global_speed().await;
+
+                // 检测异常
+                if detector.check(global_speed) {
+                    if let Some(_guard) = refresh_coordinator.try_acquire() {
+                        info!("⚠️ 全局速度异常下降，触发链接刷新");
+
+                        match engine
+                            .refresh_download_links(
+                                &remote_path,
+                                total_size,
+                                &url_health,
+                                &download_client,
+                            )
+                            .await
+                        {
+                            Ok(count) => {
+                                info!("📈 速度异常触发刷新完成: 新增/更新 {} 个链接", count);
+                            }
+                            Err(e) => {
+                                error!("📈 速度异常触发刷新失败: {}", e);
+                            }
+                        }
+                    } else {
+                        debug!("速度异常检测: 跳过刷新（另一个刷新正在进行）");
+                    }
+                }
+            }
+
+            info!("速度异常检测循环已结束");
+        })
+    }
+
+    /// 启动线程停滞检测循环
+    ///
+    /// ⚠️ 修复问题4：使用 get_valid_task_speed_values() 过滤掉无效任务
+    /// 避免将刚启动的任务（progress=0）或已完成的任务（progress=total）误判为停滞
+    ///
+    /// 核心逻辑：
+    /// 1. 每5秒检查一次所有活跃任务的速度
+    /// 2. 统计速度低于阈值（默认 10KB/s）的任务数量
+    /// 3. 当停滞任务比例超过阈值（默认 80%）时，触发链接刷新
+    ///
+    /// # 参数
+    /// * `engine` - 下载引擎（Arc 包装）
+    /// * `remote_path` - 远程文件路径
+    /// * `total_size` - 文件总大小
+    /// * `url_health` - URL 健康管理器
+    /// * `download_client` - HTTP 客户端
+    /// * `chunk_scheduler` - 分片调度器（用于获取任务速度）
+    /// * `refresh_coordinator` - 刷新协调器（防止并发刷新）
+    /// * `cancellation_token` - 取消令牌
+    /// * `config` - 线程停滞检测配置
+    ///
+    /// # 返回
+    /// tokio task handle
+    pub fn start_stagnation_detection(
+        engine: Arc<DownloadEngine>,
+        remote_path: String,
+        total_size: u64,
+        url_health: Arc<Mutex<UrlHealthManager>>,
+        download_client: Client,
+        chunk_scheduler: Arc<crate::downloader::ChunkScheduler>,
+        refresh_coordinator: Arc<RefreshCoordinator>,
+        cancellation_token: CancellationToken,
+        config: crate::common::StagnationConfig,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let detector = crate::common::ThreadStagnationDetector::new(config.clone());
+            let check_interval = Duration::from_secs(5); // 每5秒检查一次
+            let mut timer = tokio::time::interval(check_interval);
+
+            // 启动延迟：等待配置的延迟时间后再开始检测
+            // 这样可以避免任务刚启动时因为速度还没上来而误判
+            tokio::time::sleep(Duration::from_secs(config.startup_delay_secs)).await;
+
+            info!(
+                "🔍 线程停滞检测循环已启动: 停滞阈值 {} KB/s, 停滞比例 {:.0}%, 最小线程数 {}",
+                config.near_zero_threshold_kbps,
+                config.stagnation_ratio * 100.0,
+                config.min_threads
+            );
+
+            loop {
+                timer.tick().await;
+
+                if cancellation_token.is_cancelled() {
+                    debug!("线程停滞检测: 任务已取消，退出");
+                    break;
+                }
+
+                // ⚠️ 修复问题4：使用过滤后的任务速度
+                // 只包含已开始且未完成的任务，排除：
+                // - 刚启动的任务（progress = 0）
+                // - 已完成但未移除的任务（progress = total）
+                let task_speeds = chunk_scheduler.get_valid_task_speed_values().await;
+
+                // 检测停滞
+                if detector.check(&task_speeds) {
+                    if let Some(_guard) = refresh_coordinator.try_acquire() {
+                        info!("⚠️ 线程大面积停滞，触发链接刷新");
+
+                        match engine
+                            .refresh_download_links(
+                                &remote_path,
+                                total_size,
+                                &url_health,
+                                &download_client,
+                            )
+                            .await
+                        {
+                            Ok(count) => {
+                                info!("🔍 线程停滞触发刷新完成: 新增/更新 {} 个链接", count);
+                            }
+                            Err(e) => {
+                                error!("🔍 线程停滞触发刷新失败: {}", e);
+                            }
+                        }
+                    } else {
+                        debug!("线程停滞检测: 跳过刷新（另一个刷新正在进行）");
+                    }
+                }
+            }
+
+            info!("线程停滞检测循环已结束");
+        })
     }
 
     /// 格式化文件大小为人类可读格式

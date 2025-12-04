@@ -25,6 +25,12 @@ pub mod uploader;
 // 本地文件系统浏览模块
 pub mod filesystem;
 
+// 转存模块
+pub mod transfer;
+
+// 🔥 公共模块（CDN刷新检测机制等）
+pub mod common;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;
@@ -35,4 +41,17 @@ pub use sign::{generate_devuid, LocateSign};
 pub use uploader::{
     PcsServerHealthManager, RapidUploadChecker, RapidUploadHash, UploadEngine, UploadManager,
     UploadTask, UploadTaskStatus,
+};
+
+// 导出转存相关类型
+pub use transfer::{
+    TransferManager, TransferStatus, TransferTask, ShareLink, SharePageInfo,
+    SharedFileInfo, TransferError, TransferResult,
+};
+
+// 🔥 导出CDN刷新相关类型
+pub use common::{
+    RefreshCoordinator, RefreshCoordinatorConfig,
+    SpeedAnomalyDetector, SpeedAnomalyConfig,
+    ThreadStagnationDetector, StagnationConfig,
 };

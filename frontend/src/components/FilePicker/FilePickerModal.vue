@@ -1,51 +1,56 @@
 <template>
   <el-dialog
-    v-model="visible"
-    :title="title"
-    width="800px"
-    :close-on-click-modal="false"
-    @open="handleOpen"
-    @close="handleClose"
+      v-model="visible"
+      :title="title"
+      width="800px"
+      :close-on-click-modal="false"
+      @open="handleOpen"
+      @close="handleClose"
   >
     <!-- 导航栏 -->
     <NavigatorBar
-      :current-path="store.currentPath"
-      :can-go-back="store.canGoBack"
-      :can-go-forward="store.canGoForward"
-      :can-go-up="!store.isRoot"
-      @navigate="handleNavigate"
-      @back="store.goBack"
-      @forward="store.goForward"
-      @up="store.goToParent"
-      @refresh="store.refresh"
+        :current-path="store.currentPath"
+        :can-go-back="store.canGoBack"
+        :can-go-forward="store.canGoForward"
+        :can-go-up="!store.isRoot"
+        @navigate="handleNavigate"
+        @back="store.goBack"
+        @forward="store.goForward"
+        @up="store.goToParent"
+        @refresh="store.refresh"
     />
 
     <!-- 内容区 -->
     <div class="content-area" v-loading="store.loading">
       <ErrorState
-        v-if="store.error"
-        :message="store.error"
-        @retry="store.refresh"
+          v-if="store.error"
+          :message="store.error"
+          @retry="store.refresh"
       />
       <EmptyState
-        v-else-if="!store.loading && store.entries.length === 0"
+          v-else-if="!store.loading && store.entries.length === 0"
       />
       <FileList
-        v-else
-        :entries="store.entries"
-        :selection="store.selection"
-        :select-type="selectType"
-        @select="handleSelect"
-        @open="handleOpen2"
+          v-else
+          :entries="store.entries"
+          :selection="store.selection"
+          :multi-selection="store.multiSelection"
+          :select-type="effectiveSelectType"
+          :multiple="isMultiSelectMode"
+          @select="handleSelect"
+          @open="handleOpen2"
+          @toggle-select="handleToggleSelect"
+          @select-all="handleSelectAll"
+          @clear-selection="handleClearSelection"
       />
     </div>
 
     <!-- 分页加载更多 -->
     <div v-if="store.hasMore" class="load-more">
       <el-button
-        text
-        :loading="store.loading"
-        @click="store.loadMore"
+          text
+          :loading="store.loading"
+          @click="store.loadMore"
       >
         加载更多 ({{ store.entries.length }}/{{ store.total }})
       </el-button>
@@ -54,31 +59,66 @@
     <!-- 底部操作栏 -->
     <template #footer>
       <div class="footer-bar">
-        <span class="selected-info">
-          <template v-if="store.selection">
-            已选择: {{ store.selection.name }}
-          </template>
-          <template v-else>
-            未选择
-          </template>
-        </span>
-        <div class="actions">
-          <el-button @click="handleClose">取消</el-button>
-          <el-button
-            type="primary"
-            :disabled="!canConfirm"
-            @click="handleConfirm"
-          >
-            {{ confirmText }}
-          </el-button>
-        </div>
+        <!-- 上传模式 -->
+        <template v-if="mode === 'upload'">
+          <span class="selected-info">
+            <template v-if="isMultiSelectMode && store.multiSelection.length > 0">
+              已选择: {{ store.multiSelection.length }} 个文件/文件夹
+            </template>
+            <template v-else-if="store.selection">
+              已选择: {{ store.selection.name }}
+            </template>
+            <template v-else>
+              未选择
+            </template>
+          </span>
+          <div class="actions">
+            <el-button @click="handleClose">取消</el-button>
+            <el-button
+                type="primary"
+                :disabled="!canConfirmUpload"
+                @click="handleConfirm"
+            >
+              {{ confirmText }}{{ isMultiSelectMode && store.multiSelection.length > 1 ? ` (${store.multiSelection.length})` : '' }}
+            </el-button>
+          </div>
+        </template>
+
+        <!-- 下载模式 -->
+        <template v-else>
+          <div class="download-info">
+            <div class="download-path">
+              <span class="label">下载到:</span>
+              <span class="path" :title="currentDownloadPath">{{ currentDownloadPath || '请选择目录' }}</span>
+            </div>
+            <el-checkbox v-model="setAsDefault" class="set-default-checkbox">
+              设为默认下载目录
+            </el-checkbox>
+          </div>
+          <div class="actions">
+            <el-button @click="handleClose">取消</el-button>
+            <el-button
+                v-if="showUseDefaultButton"
+                @click="handleUseDefault"
+            >
+              默认路径下载
+            </el-button>
+            <el-button
+                type="primary"
+                :disabled="!canConfirm"
+                @click="handleConfirm"
+            >
+              下载
+            </el-button>
+          </div>
+        </template>
       </div>
     </template>
   </el-dialog>
 </template>
 
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, watch, ref } from 'vue'
 import { useFilePickerStore } from '@/stores/filepicker'
 import type { FileEntry } from '@/api/filesystem'
 import NavigatorBar from './NavigatorBar.vue'
@@ -91,18 +131,55 @@ const props = withDefaults(defineProps<{
   selectType?: 'file' | 'directory' | 'both'
   title?: string
   confirmText?: string
+  mode?: 'upload' | 'download'
+  initialPath?: string
+  defaultDownloadDir?: string
+  multiple?: boolean  // 是否支持多选（上传模式默认 true）
 }>(), {
   selectType: 'both',
   title: '选择文件',
   confirmText: '确定',
+  mode: 'upload',
+  multiple: true,
 })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
   'select': [entry: FileEntry]
+  'select-multiple': [entries: FileEntry[]]  // 多选确认事件
+  'confirm-download': [payload: { path: string, setAsDefault: boolean }]
+  'use-default': []
 }>()
 
 const store = useFilePickerStore()
+
+// 下载模式状态
+const setAsDefault = ref(false)
+
+// 是否启用多选模式（上传模式 + multiple 为 true）
+const isMultiSelectMode = computed(() => {
+  return props.mode === 'upload' && props.multiple
+})
+
+// 下载模式下实际使用的 selectType（强制为 directory）
+const effectiveSelectType = computed(() => {
+  return props.mode === 'download' ? 'directory' : props.selectType
+})
+
+// 下载模式下的当前选中路径（用于底部显示）
+const currentDownloadPath = computed(() => {
+  // 优先使用选中的目录
+  if (store.selection && store.selection.entryType === 'directory') {
+    return store.selection.path
+  }
+  // 否则使用当前浏览的目录
+  return store.currentPath
+})
+
+// 是否显示默认路径下载按钮
+const showUseDefaultButton = computed(() => {
+  return props.mode === 'download' && props.defaultDownloadDir
+})
 
 // 对话框可见性
 const visible = computed({
@@ -110,8 +187,23 @@ const visible = computed({
   set: (val) => emit('update:modelValue', val),
 })
 
-// 是否可确认
+// 是否可确认（下载模式）
 const canConfirm = computed(() => {
+  if (props.mode === 'download') {
+    // 下载模式：只要有当前路径就可以确认
+    return !!currentDownloadPath.value
+  }
+  return false
+})
+
+// 是否可确认上传（上传模式）
+const canConfirmUpload = computed(() => {
+  if (isMultiSelectMode.value) {
+    // 多选模式：有选中的文件/文件夹
+    return store.multiSelection.length > 0
+  }
+
+  // 单选模式：原有逻辑
   if (!store.selection) return false
 
   if (props.selectType === 'file' && store.selection.entryType !== 'file') {
@@ -127,7 +219,25 @@ const canConfirm = computed(() => {
 // 对话框打开
 function handleOpen() {
   store.reset()
-  store.loadDirectory('')
+  setAsDefault.value = false
+
+  // 根据模式确定初始路径
+  if (props.mode === 'download') {
+    // 下载模式：优先使用 initialPath，其次 defaultDownloadDir
+    const initialPath = props.initialPath || props.defaultDownloadDir || ''
+    if (initialPath) {
+      store.jumpToPath(initialPath)
+    } else {
+      store.loadDirectory('')
+    }
+  } else {
+    // 上传模式：使用 initialPath 或空路径
+    if (props.initialPath) {
+      store.jumpToPath(props.initialPath)
+    } else {
+      store.loadDirectory('')
+    }
+  }
 }
 
 // 对话框关闭
@@ -167,10 +277,46 @@ function handleOpen2(entry: FileEntry) {
 
 // 确认选择
 function handleConfirm() {
-  if (store.selection && canConfirm.value) {
-    emit('select', store.selection)
-    visible.value = false
+  if (props.mode === 'download') {
+    // 下载模式：发射 confirm-download 事件
+    const downloadPath = currentDownloadPath.value
+    if (downloadPath) {
+      emit('confirm-download', { path: downloadPath, setAsDefault: setAsDefault.value })
+      visible.value = false
+    }
+  } else {
+    // 上传模式
+    if (isMultiSelectMode.value && store.multiSelection.length > 0) {
+      // 多选模式：发射 select-multiple 事件
+      emit('select-multiple', [...store.multiSelection])
+      visible.value = false
+    } else if (store.selection && canConfirmUpload.value) {
+      // 单选模式：原有逻辑
+      emit('select', store.selection)
+      visible.value = false
+    }
   }
+}
+
+// 使用默认路径下载
+function handleUseDefault() {
+  emit('use-default')
+  visible.value = false
+}
+
+// 多选：切换选中
+function handleToggleSelect(entry: FileEntry) {
+  store.toggleMultiSelect(entry)
+}
+
+// 多选：全选
+function handleSelectAll() {
+  store.selectAll(effectiveSelectType.value)
+}
+
+// 多选：清除选择
+function handleClearSelection() {
+  store.clearMultiSelection()
 }
 
 // 监听 selectType 变化，清除不合适的选择
@@ -219,5 +365,36 @@ watch(() => props.selectType, () => {
 .actions {
   display: flex;
   gap: 8px;
+}
+
+/* 下载模式样式 */
+.download-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 450px;
+}
+
+.download-path {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.download-path .label {
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
+}
+
+.download-path .path {
+  color: var(--el-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.set-default-checkbox {
+  font-size: 13px;
 }
 </style>

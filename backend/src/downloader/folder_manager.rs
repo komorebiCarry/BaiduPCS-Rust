@@ -135,10 +135,34 @@ impl FolderDownloadManager {
                 };
 
                 let (files, local_root, group_root) = files_to_create;
+                let total_files = files.len();
                 let mut created_count = 0u64;
 
                 // 创建任务
                 for file_to_create in files {
+                    // ✅ 创建任务前再次检查状态，防止竞态条件
+                    // 场景：取出文件后、创建任务前，pause_folder 可能已更新状态
+                    {
+                        let folders_guard = folders.read().await;
+                        if let Some(folder) = folders_guard.get(&group_id) {
+                            if folder.status == FolderStatus::Paused
+                                || folder.status == FolderStatus::Cancelled
+                                || folder.status == FolderStatus::Failed
+                            {
+                                info!(
+                                    "文件夹 {} 状态已变为 {:?}，放弃创建剩余 {} 个任务",
+                                    group_id,
+                                    folder.status,
+                                    total_files - created_count as usize
+                                );
+                                break;
+                            }
+                        } else {
+                            // 文件夹已被删除
+                            break;
+                        }
+                    }
+
                     let local_path = local_root.join(&file_to_create.relative_path);
 
                     // 确保目录存在
@@ -213,6 +237,34 @@ impl FolderDownloadManager {
         let local_root = download_dir.join(folder_name);
         drop(download_dir);
 
+        self.create_folder_download_internal(remote_path, local_root).await
+    }
+
+    /// 创建文件夹下载任务（指定下载目录）
+    ///
+    /// 用于批量下载时支持自定义下载目录
+    pub async fn create_folder_download_with_dir(
+        &self,
+        remote_path: String,
+        target_dir: &std::path::Path,
+    ) -> Result<String> {
+        // 计算本地路径（使用文件夹名称）
+        let folder_name = remote_path
+            .trim_end_matches('/')
+            .split('/')
+            .last()
+            .unwrap_or("download");
+        let local_root = target_dir.join(folder_name);
+
+        self.create_folder_download_internal(remote_path, local_root).await
+    }
+
+    /// 内部方法：创建文件夹下载任务
+    async fn create_folder_download_internal(
+        &self,
+        remote_path: String,
+        local_root: PathBuf,
+    ) -> Result<String> {
         let folder = FolderDownload::new(remote_path.clone(), local_root);
         let folder_id = folder.id.clone();
 
@@ -446,6 +498,16 @@ impl FolderDownloadManager {
     pub async fn pause_folder(&self, folder_id: &str) -> Result<()> {
         info!("暂停文件夹下载: {}", folder_id);
 
+        // 🔥 关键：先更新文件夹状态为 Paused，阻止 task_completed_listener 创建新任务
+        // 这必须在暂停任务之前执行，避免竞态条件
+        {
+            let mut folders = self.folders.write().await;
+            if let Some(folder) = folders.get_mut(folder_id) {
+                folder.mark_paused();
+                info!("文件夹 {} 状态已标记为暂停", folder.name);
+            }
+        }
+
         // 触发取消令牌，停止扫描
         {
             let tokens = self.cancellation_tokens.read().await;
@@ -461,23 +523,18 @@ impl FolderDownloadManager {
                 .ok_or_else(|| anyhow!("下载管理器未初始化"))?
         };
 
-        // 暂停所有相关任务
-        let tasks = download_manager.get_tasks_by_group(folder_id).await;
-        for task in tasks {
-            if task.status == TaskStatus::Downloading || task.status == TaskStatus::Pending {
-                let _ = download_manager.pause_task(&task.id).await;
-            }
-        }
+        // 🔥 关键改进：使用 cancel_tasks_by_group 取消所有子任务
+        // 这会：
+        // 1. 从等待队列移除该文件夹的任务
+        // 2. 触发所有子任务的取消令牌（包括正在探测中的任务！）
+        // 3. 从调度器取消已注册的任务
+        // 4. 更新任务状态为 Paused
+        //
+        // 之前的问题：只调用 pause_task，但 pause_task 只能处理 Downloading 状态的任务
+        // 正在探测中的任务（Pending 状态）不会被暂停，探测完成后仍会注册到调度器
+        download_manager.cancel_tasks_by_group(folder_id).await;
 
-        // 更新文件夹状态
-        {
-            let mut folders = self.folders.write().await;
-            if let Some(folder) = folders.get_mut(folder_id) {
-                folder.mark_paused();
-                info!("文件夹 {} 已暂停", folder.name);
-            }
-        }
-
+        info!("文件夹 {} 暂停完成", folder_id);
         Ok(())
     }
 
@@ -709,8 +766,29 @@ impl FolderDownloadManager {
         );
 
         // 批量创建任务
-        let mut created_count = 0;
+        let mut created_count = 0u64;
         for pending_file in files_to_create {
+            // ✅ 创建任务前再次检查状态，防止竞态条件
+            // 场景：取出文件后、创建任务前，pause_folder 可能已更新状态
+            {
+                let folders_guard = self.folders.read().await;
+                if let Some(folder) = folders_guard.get(folder_id) {
+                    if folder.status == FolderStatus::Paused
+                        || folder.status == FolderStatus::Cancelled
+                        || folder.status == FolderStatus::Failed
+                    {
+                        info!(
+                            "文件夹 {} 状态已变为 {:?}，放弃创建剩余任务",
+                            folder_id, folder.status
+                        );
+                        break;
+                    }
+                } else {
+                    // 文件夹已被删除
+                    break;
+                }
+            }
+
             let local_path = local_root.join(&pending_file.relative_path);
 
             // 确保目录存在

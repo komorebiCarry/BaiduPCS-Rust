@@ -135,6 +135,8 @@ pub struct ChunkScheduler {
     pre_register_count: Arc<AtomicUsize>,
     /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
     task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    /// 🔥 等待队列触发器（任务完成时通知 DownloadManager 启动等待任务）
+    waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     /// 上一轮的任务数（用于检测任务数变化）
     last_task_count: Arc<AtomicUsize>,
 }
@@ -156,6 +158,7 @@ impl ChunkScheduler {
             scheduler_running: Arc::new(AtomicBool::new(false)),
             pre_register_count: Arc::new(AtomicUsize::new(0)),
             task_completed_tx: Arc::new(RwLock::new(None)),
+            waiting_queue_trigger: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
         };
 
@@ -173,6 +176,16 @@ impl ChunkScheduler {
         let mut sender = self.task_completed_tx.write().await;
         *sender = Some(tx);
         info!("任务完成通知 channel 已设置");
+    }
+
+    /// 🔥 设置等待队列触发器
+    ///
+    /// DownloadManager 调用此方法设置 channel sender，
+    /// 当任务完成时会发送信号通知立即启动等待队列中的任务（0延迟）
+    pub async fn set_waiting_queue_trigger(&self, tx: mpsc::UnboundedSender<()>) {
+        let mut trigger = self.waiting_queue_trigger.write().await;
+        *trigger = Some(tx);
+        info!("等待队列触发器已设置（0延迟启动）");
     }
 
     /// 动态更新最大全局线程数
@@ -339,6 +352,7 @@ impl ChunkScheduler {
         let slot_pool = self.slot_pool.clone();
         let scheduler_running = self.scheduler_running.clone();
         let task_completed_tx = self.task_completed_tx.clone();
+        let waiting_queue_trigger = self.waiting_queue_trigger.clone();
         let last_task_count = self.last_task_count.clone();
 
         // 标记调度器正在运行
@@ -524,6 +538,15 @@ impl ChunkScheduler {
                                         }
                                     }
                                 }
+
+                                // 🔥 触发等待队列检查（0延迟启动新任务）
+                                {
+                                    let trigger_guard = waiting_queue_trigger.read().await;
+                                    if let Some(trigger) = trigger_guard.as_ref() {
+                                        let _ = trigger.send(()); // 忽略发送失败（receiver 可能已关闭）
+                                        debug!("已触发等待队列检查");
+                                    }
+                                }
                             }
 
                             consecutive_empty_rounds += 1;
@@ -636,6 +659,71 @@ impl ChunkScheduler {
     pub fn stop(&self) {
         self.scheduler_running.store(false, Ordering::SeqCst);
         info!("调度器停止信号已发送");
+    }
+
+    /// 🔥 获取所有活跃任务的当前速度
+    ///
+    /// CDN链接刷新机制使用，用于速度异常检测
+    ///
+    /// # 返回
+    /// Vec<(task_id, speed_bytes_per_sec)>
+    pub async fn get_active_task_speeds(&self) -> Vec<(String, u64)> {
+        let tasks = self.active_tasks.read().await;
+        let mut speeds = Vec::with_capacity(tasks.len());
+
+        for (task_id, task_info) in tasks.iter() {
+            let speed = {
+                let calc = task_info.speed_calc.lock().await;
+                calc.speed()
+            };
+            speeds.push((task_id.clone(), speed));
+        }
+
+        speeds
+    }
+
+    /// 🔥 获取所有活跃任务的速度（仅速度值）
+    ///
+    /// ⚠️ 修复问题4：过滤掉未开始和已完成的任务，避免停滞误判
+    ///
+    /// # 返回
+    /// 只包含有效任务的速度列表（已开始且未完成的任务）
+    pub async fn get_valid_task_speed_values(&self) -> Vec<u64> {
+        let tasks = self.active_tasks.read().await;
+        let mut speeds = Vec::new();
+
+        for task_info in tasks.values() {
+            // 获取任务进度
+            let (progress_bytes, total_bytes) = {
+                let task = task_info.task.lock().await;
+                (task.downloaded_size, task_info.total_size)
+            };
+
+            // 过滤：只包含已开始且未完成的任务
+            // progress > 0: 已经开始下载
+            // progress < total: 尚未完成
+            if progress_bytes > 0 && progress_bytes < total_bytes {
+                let speed = {
+                    let calc = task_info.speed_calc.lock().await;
+                    calc.speed()
+                };
+                speeds.push(speed);
+            }
+        }
+
+        speeds
+    }
+
+    /// 🔥 获取全局总速度（所有活跃任务速度之和）
+    ///
+    /// ⚠️ 修复问题3：速度异常检测应使用全局总速度，而非单任务速度
+    /// 当多任务下载时，新任务加入会分流带宽，单任务速度下降是正常的
+    /// 使用全局速度更准确反映整体网络状况
+    ///
+    /// # 返回
+    /// 全局总速度（字节/秒）
+    pub async fn get_global_speed(&self) -> u64 {
+        self.get_valid_task_speed_values().await.iter().sum()
     }
 }
 

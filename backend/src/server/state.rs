@@ -5,6 +5,7 @@ use crate::config::AppConfig;
 use crate::downloader::{DownloadManager, FolderDownloadManager};
 use crate::netdisk::NetdiskClient;
 use crate::uploader::UploadManager;
+use crate::transfer::TransferManager;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -25,6 +26,8 @@ pub struct AppState {
     pub folder_download_manager: Arc<FolderDownloadManager>,
     /// 上传管理器
     pub upload_manager: Arc<RwLock<Option<Arc<UploadManager>>>>,
+    /// 转存管理器
+    pub transfer_manager: Arc<RwLock<Option<Arc<TransferManager>>>>,
     /// 应用配置
     pub config: Arc<RwLock<AppConfig>>,
 }
@@ -48,6 +51,7 @@ impl AppState {
             download_manager: Arc::new(RwLock::new(None)),
             folder_download_manager,
             upload_manager: Arc::new(RwLock::new(None)),
+            transfer_manager: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(config)),
         })
     }
@@ -121,11 +125,29 @@ impl AppState {
             // 初始化上传管理器（从配置读取参数）
             let config = self.config.read().await;
             let upload_config = config.upload.clone();
+            let transfer_config = config.transfer.clone();
             drop(config);
 
-            let upload_manager = UploadManager::new_with_config(client, &user_auth, &upload_config);
+            let upload_manager = UploadManager::new_with_config(client.clone(), &user_auth, &upload_config);
             let upload_manager_arc = Arc::new(upload_manager);
             *self.upload_manager.write().await = Some(upload_manager_arc);
+
+            // 初始化转存管理器
+            let transfer_manager = TransferManager::new(
+                Arc::new(client),
+                transfer_config,
+                Arc::clone(&self.config),
+            );
+            let transfer_manager_arc = Arc::new(transfer_manager);
+
+            // 设置下载管理器（用于自动下载功能）
+            transfer_manager_arc.set_download_manager(Arc::clone(&manager_arc)).await;
+
+            // 设置文件夹下载管理器（用于自动下载文件夹）
+            transfer_manager_arc.set_folder_download_manager(Arc::clone(&self.folder_download_manager)).await;
+
+            *self.transfer_manager.write().await = Some(transfer_manager_arc);
+            tracing::info!("转存管理器初始化完成");
         }
         Ok(())
     }

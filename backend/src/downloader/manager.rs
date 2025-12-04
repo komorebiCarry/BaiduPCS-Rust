@@ -1,4 +1,5 @@
 use crate::auth::UserAuth;
+use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, StagnationConfig};
 use crate::downloader::{ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo, TaskStatus, calculate_task_max_chunks};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -70,6 +71,9 @@ impl DownloadManager {
         // 启动后台任务：定期检查并启动等待队列中的任务
         manager.start_waiting_queue_monitor();
 
+        // 🔥 设置任务完成触发器（0延迟启动等待任务）
+        manager.setup_waiting_queue_trigger();
+
         Ok(manager)
     }
 
@@ -85,10 +89,47 @@ impl DownloadManager {
         let local_path = download_dir.join(&filename);
         drop(download_dir);
 
+        self.create_task_internal(fs_id, remote_path, local_path, total_size).await
+    }
+
+    /// 创建下载任务（指定下载目录）
+    ///
+    /// 用于批量下载时支持自定义下载目录
+    pub async fn create_task_with_dir(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        filename: String,
+        total_size: u64,
+        target_dir: &std::path::Path,
+    ) -> Result<String> {
+        let local_path = target_dir.join(&filename);
+        self.create_task_internal(fs_id, remote_path, local_path, total_size).await
+    }
+
+    /// 内部方法：创建下载任务
+    async fn create_task_internal(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        total_size: u64,
+    ) -> Result<String> {
+        // 确保目标目录存在
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).context("创建下载目录失败")?;
+            }
+        }
+
         // 检查文件是否已存在
         if local_path.exists() {
             warn!("文件已存在: {:?}，将覆盖", local_path);
         }
+
+        let filename = local_path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let task = DownloadTask::new(fs_id, remote_path, local_path, total_size);
         let task_id = task.id.clone();
@@ -205,10 +246,10 @@ impl DownloadManager {
                        chunk_manager,
                        speed_calc,
                    )) => {
-                    // 获取文件总大小（用于探测恢复链接）
-                    let total_size = {
+                    // 获取文件总大小和远程路径（用于探测恢复链接和速度异常检测）
+                    let (total_size, remote_path) = {
                         let t = task_clone.lock().await;
-                        t.total_size
+                        (t.total_size, t.remote_path.clone())
                     };
 
                     // 创建任务调度信息
@@ -217,6 +258,12 @@ impl DownloadManager {
                         "任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
                         task_id_clone, total_size, max_concurrent_chunks
                     );
+
+                    // 为速度异常检测保存需要的引用
+                    let url_health_for_detection = url_health.clone();
+                    let client_for_detection = client.clone();
+                    let cancellation_token_for_detection = cancellation_token.clone();
+                    let chunk_scheduler_for_detection = chunk_scheduler.clone();
 
                     let task_info = TaskScheduleInfo {
                         task_id: task_id_clone.clone(),
@@ -236,20 +283,59 @@ impl DownloadManager {
                     };
 
                     // 注册到调度器（成功会自动减少预注册计数）
-                    if let Err(e) = chunk_scheduler.register_task(task_info).await {
-                        error!("注册任务到调度器失败: {}", e);
+                    match chunk_scheduler.register_task(task_info).await {
+                        Ok(()) => {
+                            // 注册成功，启动速度异常检测循环和线程停滞检测循环
+                            info!("任务 {} 注册成功，启动CDN链接检测", task_id_clone);
 
-                        // 注册失败，需要取消预注册
-                        chunk_scheduler.cancel_pre_register();
+                            // 创建刷新协调器（每个任务独立一个，防止并发刷新）
+                            let refresh_coordinator = Arc::new(RefreshCoordinator::new(
+                                RefreshCoordinatorConfig::default()
+                            ));
 
-                        // 标记任务失败
-                        let mut t = task_clone.lock().await;
-                        t.mark_failed(e.to_string());
+                            // 启动速度异常检测循环
+                            let _speed_anomaly_handle = DownloadEngine::start_speed_anomaly_detection(
+                                engine.clone(),
+                                remote_path.clone(),
+                                total_size,
+                                url_health_for_detection.clone(),
+                                Arc::new(chunk_scheduler_for_detection.clone()),
+                                client_for_detection.clone(),
+                                refresh_coordinator.clone(),
+                                cancellation_token_for_detection.clone(),
+                                SpeedAnomalyConfig::default(),
+                            );
 
-                        // 移除取消令牌
-                        cancellation_tokens.write().await.remove(&task_id_clone);
+                            // 启动线程停滞检测循环
+                            let _stagnation_handle = DownloadEngine::start_stagnation_detection(
+                                engine.clone(),
+                                remote_path,
+                                total_size,
+                                url_health_for_detection,
+                                client_for_detection,
+                                Arc::new(chunk_scheduler_for_detection),
+                                refresh_coordinator,
+                                cancellation_token_for_detection,
+                                StagnationConfig::default(),
+                            );
 
-                        // 不在这里调用 try_start_waiting_tasks，避免循环引用
+                            info!("📈 任务 {} CDN链接检测已启动（速度异常+线程停滞）", task_id_clone);
+                        }
+                        Err(e) => {
+                            error!("注册任务到调度器失败: {}", e);
+
+                            // 注册失败，需要取消预注册
+                            chunk_scheduler.cancel_pre_register();
+
+                            // 标记任务失败
+                            let mut t = task_clone.lock().await;
+                            t.mark_failed(e.to_string());
+
+                            // 移除取消令牌
+                            cancellation_tokens.write().await.remove(&task_id_clone);
+
+                            // 不在这里调用 try_start_waiting_tasks，避免循环引用
+                        }
                     }
                 }
                 Err(e) => {
@@ -312,7 +398,9 @@ impl DownloadManager {
         let max_concurrent_tasks = self.max_concurrent_tasks;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
+            // 🔥 优化：缩短检查间隔从3秒到1秒，减少等待时间
+            // 注意：有了0延迟触发器后，这里主要作为保底机制
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
             loop {
                 interval.tick().await;
@@ -375,10 +463,10 @@ impl DownloadManager {
 
                                     match prepare_result {
                                         Ok((client, cookie, referer, url_health, output_path, chunk_size, chunk_manager, speed_calc)) => {
-                                            // 获取文件总大小
-                                            let total_size = {
+                                            // 获取文件总大小和远程路径
+                                            let (total_size, remote_path) = {
                                                 let t = task_clone.lock().await;
-                                                t.total_size
+                                                (t.total_size, t.remote_path.clone())
                                             };
 
                                             let max_concurrent_chunks = calculate_task_max_chunks(total_size);
@@ -386,6 +474,12 @@ impl DownloadManager {
                                                 "后台任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
                                                 id_clone, total_size, max_concurrent_chunks
                                             );
+
+                                            // 为速度异常检测保存需要的引用
+                                            let url_health_for_detection = url_health.clone();
+                                            let client_for_detection = client.clone();
+                                            let cancellation_token_for_detection = cancellation_token.clone();
+                                            let chunk_scheduler_for_detection = chunk_scheduler_clone.clone();
 
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
@@ -405,18 +499,241 @@ impl DownloadManager {
                                             };
 
                                             // 注册成功会自动减少预注册计数
-                                            if let Err(e) = chunk_scheduler_clone.register_task(task_info).await {
-                                                error!("后台监控：注册任务失败: {}", e);
-                                                // 注册失败，取消预注册
-                                                chunk_scheduler_clone.cancel_pre_register();
-                                                let mut t = task_clone.lock().await;
-                                                t.mark_failed(e.to_string());
-                                                cancellation_tokens_clone.write().await.remove(&id_clone);
+                                            match chunk_scheduler_clone.register_task(task_info).await {
+                                                Ok(()) => {
+                                                    // 注册成功，启动速度异常检测循环和线程停滞检测循环
+                                                    info!("后台任务 {} 注册成功，启动CDN链接检测", id_clone);
+
+                                                    // 创建刷新协调器
+                                                    let refresh_coordinator = Arc::new(RefreshCoordinator::new(
+                                                        RefreshCoordinatorConfig::default()
+                                                    ));
+
+                                                    // 启动速度异常检测循环
+                                                    let _speed_anomaly_handle = DownloadEngine::start_speed_anomaly_detection(
+                                                        engine_clone.clone(),
+                                                        remote_path.clone(),
+                                                        total_size,
+                                                        url_health_for_detection.clone(),
+                                                        Arc::new(chunk_scheduler_for_detection.clone()),
+                                                        client_for_detection.clone(),
+                                                        refresh_coordinator.clone(),
+                                                        cancellation_token_for_detection.clone(),
+                                                        SpeedAnomalyConfig::default(),
+                                                    );
+
+                                                    // 启动线程停滞检测循环
+                                                    let _stagnation_handle = DownloadEngine::start_stagnation_detection(
+                                                        engine_clone.clone(),
+                                                        remote_path,
+                                                        total_size,
+                                                        url_health_for_detection,
+                                                        client_for_detection,
+                                                        Arc::new(chunk_scheduler_for_detection),
+                                                        refresh_coordinator,
+                                                        cancellation_token_for_detection,
+                                                        StagnationConfig::default(),
+                                                    );
+
+                                                    info!("📈 后台任务 {} CDN链接检测已启动（速度异常+线程停滞）", id_clone);
+                                                }
+                                                Err(e) => {
+                                                    error!("后台监控：注册任务失败: {}", e);
+                                                    // 注册失败，取消预注册
+                                                    chunk_scheduler_clone.cancel_pre_register();
+                                                    let mut t = task_clone.lock().await;
+                                                    t.mark_failed(e.to_string());
+                                                    cancellation_tokens_clone.write().await.remove(&id_clone);
+                                                }
                                             }
                                         }
                                         Err(e) => {
                                             error!("后台监控：准备任务失败: {}", e);
                                             // 探测失败，取消预注册
+                                            chunk_scheduler_clone.cancel_pre_register();
+                                            let mut t = task_clone.lock().await;
+                                            t.mark_failed(e.to_string());
+                                            cancellation_tokens_clone.write().await.remove(&id_clone);
+                                        }
+                                    }
+                                });
+                            } else {
+                                // 任务不存在，取消预注册
+                                chunk_scheduler.cancel_pre_register();
+                            }
+                        }
+                        None => {
+                            // 队列为空，取消预注册
+                            chunk_scheduler.cancel_pre_register();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 🔥 设置任务完成触发器（0延迟启动等待任务）
+    ///
+    /// 当调度器检测到任务完成时，会通过 channel 发送信号，
+    /// 这里的监听循环会立即响应并启动等待队列中的任务
+    fn setup_waiting_queue_trigger(&self) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        // 设置触发器到调度器
+        let chunk_scheduler = self.chunk_scheduler.clone();
+        tokio::spawn(async move {
+            chunk_scheduler.set_waiting_queue_trigger(tx).await;
+        });
+
+        // 启动监听循环
+        let waiting_queue = self.waiting_queue.clone();
+        let chunk_scheduler = self.chunk_scheduler.clone();
+        let tasks = self.tasks.clone();
+        let cancellation_tokens = self.cancellation_tokens.clone();
+        let engine = self.engine.clone();
+        let max_concurrent_tasks = self.max_concurrent_tasks;
+
+        tokio::spawn(async move {
+            while let Some(()) = rx.recv().await {
+                // 收到任务完成信号，立即检查并启动等待任务
+                // 检查是否有等待任务
+                let has_waiting = {
+                    let queue = waiting_queue.read().await;
+                    !queue.is_empty()
+                };
+
+                if !has_waiting {
+                    continue;
+                }
+
+                // 检查是否有空闲位置
+                let active_count = chunk_scheduler.active_task_count().await;
+                if active_count >= max_concurrent_tasks {
+                    continue;
+                }
+
+                info!("⚡ 收到任务完成信号，立即启动等待任务");
+
+                // 尝试启动等待任务（与 start_waiting_queue_monitor 逻辑相同）
+                loop {
+                    // 先预注册，成功才继续
+                    if !chunk_scheduler.pre_register().await {
+                        break;
+                    }
+
+                    let task_id = {
+                        let mut queue = waiting_queue.write().await;
+                        queue.pop_front()
+                    };
+
+                    match task_id {
+                        Some(id) => {
+                            info!("⚡ 0延迟启动：从等待队列启动任务 {} (已预注册)", id);
+
+                            // 获取任务
+                            let task = tasks.read().await.get(&id).cloned();
+                            if let Some(task) = task {
+                                // 创建取消令牌
+                                let cancellation_token = CancellationToken::new();
+                                cancellation_tokens.write().await.insert(id.clone(), cancellation_token.clone());
+
+                                // 启动任务
+                                let engine_clone = engine.clone();
+                                let task_clone = task.clone();
+                                let chunk_scheduler_clone = chunk_scheduler.clone();
+                                let id_clone = id.clone();
+                                let cancellation_tokens_clone = cancellation_tokens.clone();
+
+                                tokio::spawn(async move {
+                                    let prepare_result = engine_clone.prepare_for_scheduling(task_clone.clone(), cancellation_token.clone()).await;
+
+                                    if cancellation_token.is_cancelled() {
+                                        info!("0延迟启动: 任务 {} 在探测完成后发现已被取消，取消预注册", id_clone);
+                                        chunk_scheduler_clone.cancel_pre_register();
+                                        return;
+                                    }
+
+                                    match prepare_result {
+                                        Ok((client, cookie, referer, url_health, output_path, chunk_size, chunk_manager, speed_calc)) => {
+                                            let (total_size, remote_path) = {
+                                                let t = task_clone.lock().await;
+                                                (t.total_size, t.remote_path.clone())
+                                            };
+
+                                            let max_concurrent_chunks = calculate_task_max_chunks(total_size);
+                                            info!(
+                                                "0延迟任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
+                                                id_clone, total_size, max_concurrent_chunks
+                                            );
+
+                                            let url_health_for_detection = url_health.clone();
+                                            let client_for_detection = client.clone();
+                                            let cancellation_token_for_detection = cancellation_token.clone();
+                                            let chunk_scheduler_for_detection = chunk_scheduler_clone.clone();
+
+                                            let task_info = TaskScheduleInfo {
+                                                task_id: id_clone.clone(),
+                                                task: task_clone.clone(),
+                                                chunk_manager,
+                                                speed_calc,
+                                                client,
+                                                cookie,
+                                                referer,
+                                                url_health,
+                                                output_path,
+                                                chunk_size,
+                                                total_size,
+                                                cancellation_token: cancellation_token.clone(),
+                                                active_chunk_count: Arc::new(AtomicUsize::new(0)),
+                                                max_concurrent_chunks,
+                                            };
+
+                                            match chunk_scheduler_clone.register_task(task_info).await {
+                                                Ok(()) => {
+                                                    info!("0延迟任务 {} 注册成功，启动CDN链接检测", id_clone);
+
+                                                    let refresh_coordinator = Arc::new(RefreshCoordinator::new(
+                                                        RefreshCoordinatorConfig::default()
+                                                    ));
+
+                                                    let _speed_anomaly_handle = DownloadEngine::start_speed_anomaly_detection(
+                                                        engine_clone.clone(),
+                                                        remote_path.clone(),
+                                                        total_size,
+                                                        url_health_for_detection.clone(),
+                                                        Arc::new(chunk_scheduler_for_detection.clone()),
+                                                        client_for_detection.clone(),
+                                                        refresh_coordinator.clone(),
+                                                        cancellation_token_for_detection.clone(),
+                                                        SpeedAnomalyConfig::default(),
+                                                    );
+
+                                                    let _stagnation_handle = DownloadEngine::start_stagnation_detection(
+                                                        engine_clone.clone(),
+                                                        remote_path,
+                                                        total_size,
+                                                        url_health_for_detection,
+                                                        client_for_detection,
+                                                        Arc::new(chunk_scheduler_for_detection),
+                                                        refresh_coordinator,
+                                                        cancellation_token_for_detection,
+                                                        StagnationConfig::default(),
+                                                    );
+
+                                                    info!("📈 0延迟任务 {} CDN链接检测已启动", id_clone);
+                                                }
+                                                Err(e) => {
+                                                    error!("0延迟启动：注册任务失败: {}", e);
+                                                    chunk_scheduler_clone.cancel_pre_register();
+                                                    let mut t = task_clone.lock().await;
+                                                    t.mark_failed(e.to_string());
+                                                    cancellation_tokens_clone.write().await.remove(&id_clone);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("0延迟启动：准备任务失败: {}", e);
                                             chunk_scheduler_clone.cancel_pre_register();
                                             let mut t = task_clone.lock().await;
                                             t.mark_failed(e.to_string());
@@ -790,6 +1107,105 @@ impl DownloadManager {
         }
 
         result
+    }
+
+    /// 从等待队列中移除指定 group 的所有任务
+    ///
+    /// 用于文件夹暂停时，防止暂停活跃任务后触发从等待队列启动新任务
+    pub async fn remove_waiting_tasks_by_group(&self, group_id: &str) -> usize {
+        let mut waiting_queue = self.waiting_queue.write().await;
+        let tasks = self.tasks.read().await;
+
+        let original_len = waiting_queue.len();
+
+        // 保留不属于该 group 的任务
+        let mut new_queue = VecDeque::new();
+        for task_id in waiting_queue.drain(..) {
+            let should_keep = if let Some(task_arc) = tasks.get(&task_id) {
+                let task = task_arc.lock().await;
+                task.group_id.as_deref() != Some(group_id)
+            } else {
+                true // 任务不存在，保留 ID（后续会自然处理）
+            };
+
+            if should_keep {
+                new_queue.push_back(task_id);
+            }
+        }
+
+        let removed_count = original_len - new_queue.len();
+        *waiting_queue = new_queue;
+
+        if removed_count > 0 {
+            info!(
+                "从等待队列移除了 {} 个属于文件夹 {} 的任务",
+                removed_count, group_id
+            );
+        }
+
+        removed_count
+    }
+
+    /// 取消指定 group 的所有任务（包括正在探测中的任务）
+    ///
+    /// 用于文件夹暂停时，取消所有子任务：
+    /// - 从等待队列移除
+    /// - 触发取消令牌（让正在探测的任务知道应该停止）
+    /// - 从调度器取消（已注册的任务）
+    /// - 更新任务状态为 Paused
+    ///
+    /// 注意：此方法不会删除任务，只是暂停它们
+    pub async fn cancel_tasks_by_group(&self, group_id: &str) {
+        // 1. 从等待队列移除
+        self.remove_waiting_tasks_by_group(group_id).await;
+
+        // 2. 获取该 group 的所有任务 ID
+        let task_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .iter()
+                .filter_map(|(id, task_arc)| {
+                    // 使用 try_lock 避免死锁
+                    if let Ok(task) = task_arc.try_lock() {
+                        if task.group_id.as_deref() == Some(group_id) {
+                            return Some(id.clone());
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        info!(
+            "取消文件夹 {} 的 {} 个任务（包括探测中的）",
+            group_id,
+            task_ids.len()
+        );
+
+        // 3. 对每个任务：触发取消令牌 + 从调度器取消 + 更新状态
+        for task_id in &task_ids {
+            // 触发取消令牌（让正在探测的任务知道应该停止）
+            {
+                let tokens = self.cancellation_tokens.read().await;
+                if let Some(token) = tokens.get(task_id) {
+                    token.cancel();
+                }
+            }
+
+            // 从调度器取消（已注册的任务）
+            self.chunk_scheduler.cancel_task(task_id).await;
+
+            // 更新任务状态为 Paused
+            {
+                let tasks = self.tasks.read().await;
+                if let Some(task_arc) = tasks.get(task_id) {
+                    let mut task = task_arc.lock().await;
+                    if task.status == TaskStatus::Downloading || task.status == TaskStatus::Pending {
+                        task.mark_paused();
+                    }
+                }
+            }
+        }
     }
 
     /// 添加任务（由 FolderDownloadManager 调用）

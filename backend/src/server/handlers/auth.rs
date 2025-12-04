@@ -81,6 +81,45 @@ pub async fn qrcode_status(
 ) -> Result<Json<ApiResponse<QRCodeStatus>>, StatusCode> {
     info!("API: 查询扫码状态: sign={}", params.sign);
 
+    // 防呆：检查是否已有有效的持久化会话
+    {
+        let mut session = state.session_manager.lock().await;
+        if let Ok(Some(user)) = session.get_session().await {
+            info!("检测到已有持久化会话: UID={}, 验证 BDUSS 有效性...", user.uid);
+
+            match state.qrcode_auth.verify_bduss(&user.bduss).await {
+                Ok(true) => {
+                    info!("✅ BDUSS 仍然有效，直接返回登录成功状态");
+
+                    // 确保客户端已初始化
+                    let client_initialized = state.netdisk_client.read().await.is_some();
+                    if !client_initialized {
+                        info!("🔄 客户端未初始化，开始初始化用户资源...");
+                        drop(session); // 释放锁避免死锁
+                        if let Err(e) = state.load_initial_session().await {
+                            error!("❌ 初始化用户资源失败: {}", e);
+                        } else {
+                            info!("✅ 用户资源初始化成功");
+                        }
+                    }
+
+                    // 直接返回 Success 状态，token 使用 BDUSS
+                    return Ok(Json(ApiResponse::success(QRCodeStatus::Success {
+                        user: user.clone(),
+                        token: user.bduss.clone(),
+                    })));
+                }
+                Ok(false) => {
+                    warn!("⚠️ 持久化的 BDUSS 已失效，清除会话，继续扫码流程");
+                    let _ = session.clear_session().await;
+                }
+                Err(e) => {
+                    warn!("⚠️ BDUSS 验证出错: {}，继续扫码流程", e);
+                }
+            }
+        }
+    }
+
     match state.qrcode_auth.poll_status(&params.sign).await {
         Ok(status) => {
             // 如果登录成功，保存会话并初始化用户资源
@@ -211,8 +250,25 @@ pub async fn get_current_user(
             // 验证 BDUSS 是否仍然有效
             match state.qrcode_auth.verify_bduss(&user.bduss).await {
                 Ok(true) => {
-                    // BDUSS 有效
+                    // BDUSS 有效，检查客户端是否已初始化
                     info!("BDUSS 验证通过");
+
+                    // 检查网盘客户端是否已初始化
+                    let client_initialized = state.netdisk_client.read().await.is_some();
+                    if !client_initialized {
+                        info!("🔄 检测到客户端未初始化，开始初始化用户资源...");
+                        // 释放 session 锁，避免死锁
+                        drop(session);
+
+                        // 调用初始化逻辑
+                        if let Err(e) = state.load_initial_session().await {
+                            error!("❌ 初始化用户资源失败: {}", e);
+                            // 初始化失败不影响返回用户信息
+                        } else {
+                            info!("✅ 用户资源初始化成功");
+                        }
+                    }
+
                     Ok(Json(ApiResponse::success(user)))
                 }
                 Ok(false) => {

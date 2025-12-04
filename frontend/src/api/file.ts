@@ -32,6 +32,7 @@ export interface FileListData {
   dir: string
   page: number
   total: number
+  has_more: boolean
 }
 
 export interface DownloadUrlData {
@@ -51,7 +52,7 @@ export interface CreateFolderData {
 export async function getFileList(
     dir: string = '/',
     page: number = 1,
-    pageSize: number = 100
+    pageSize: number = 50
 ): Promise<FileListData> {
   const response = await apiClient.get<ApiResponse<FileListData>>('/files', {
     params: { dir, page, page_size: pageSize }

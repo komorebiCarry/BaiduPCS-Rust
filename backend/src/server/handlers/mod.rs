@@ -7,6 +7,7 @@ pub mod file;
 pub mod filesystem;
 pub mod folder_download;
 pub mod upload;
+pub mod transfer;
 
 pub use auth::*;
 pub use config::*;
@@ -16,3 +17,4 @@ pub use file::*;
 pub use filesystem::{list_directory, goto_path, validate_path, get_roots};
 pub use folder_download::*;
 pub use upload::*;
+pub use transfer::*;

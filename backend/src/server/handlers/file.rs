@@ -34,7 +34,7 @@ fn default_page() -> u32 {
 }
 
 fn default_page_size() -> u32 {
-    100
+    50
 }
 
 /// 文件列表响应
@@ -46,8 +46,10 @@ pub struct FileListData {
     pub dir: String,
     /// 页码
     pub page: u32,
-    /// 总数量
+    /// 当前页数量
     pub total: usize,
+    /// 是否还有更多数据
+    pub has_more: bool,
 }
 
 /// 获取文件列表
@@ -75,13 +77,16 @@ pub async fn get_file_list(
     {
         Ok(file_list) => {
             let total = file_list.list.len();
+            // 判断是否还有更多数据：如果返回的数量等于请求的 page_size，说明可能还有更多
+            let has_more = total >= params.page_size as usize;
             let data = FileListData {
                 list: file_list.list,
                 dir: params.dir.clone(),
                 page: params.page,
                 total,
+                has_more,
             };
-            info!("成功获取 {} 个文件/文件夹", total);
+            info!("成功获取 {} 个文件/文件夹, has_more={}", total, has_more);
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {

@@ -1,7 +1,7 @@
 // 网盘客户端实现
 
-use crate::auth::constants::{BAIDU_APP_ID, CLIENT_TYPE, API_USER_INFO, USER_AGENT};
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
+use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
 use crate::netdisk::{
     CreateFileResponse, FileListResponse, LocateDownloadResponse, PrecreateResponse,
@@ -10,9 +10,9 @@ use crate::netdisk::{
 use crate::sign::LocateSign;
 use anyhow::{Context, Result};
 use reqwest::cookie::CookieStore;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart;
 use reqwest::Client;
-use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -117,7 +117,9 @@ impl NetdiskClient {
         let bdstoken = std::sync::Arc::new(Mutex::new(user_auth.bdstoken.clone()));
         let web_session_ready = std::sync::Arc::new(Mutex::new(
             // 如果已有预热 Cookie,标记为已预热
-            user_auth.panpsc.is_some() && user_auth.csrf_token.is_some() && user_auth.bdstoken.is_some()
+            user_auth.panpsc.is_some()
+                && user_auth.csrf_token.is_some()
+                && user_auth.bdstoken.is_some(),
         ));
 
         Ok(Self {
@@ -232,10 +234,7 @@ impl NetdiskClient {
                                 .unwrap_or_else(|| "<missing>".to_string())
                         );
                     } else {
-                        debug!(
-                            "{}: 请求头快照 -> UA={}, Referer={}",
-                            step, ua, referer
-                        );
+                        debug!("{}: 请求头快照 -> UA={}, Referer={}", step, ua, referer);
                     }
                     debug!("{}: 最终请求 URL = {}", step, url);
                 }
@@ -380,14 +379,11 @@ impl NetdiskClient {
         info!("步骤 1/4：访问 /disk/home");
         let home_url = "https://pan.baidu.com/disk/home";
         self.debug_print_cookies("步骤 1/4 前 Cookie 状态");
-        // 步骤 1: 使用简单的 User-Agent（与 BaiduPCS-Go 一致）
-        // BaiduPCS-Go 使用 "Mozilla/5.0"，我们使用类似的简单 UA
+
         let simple_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
         let _body1 = exec_request(
             client,
-            client
-                .get(home_url)
-                .header("User-Agent", simple_ua),
+            client.get(home_url).header("User-Agent", simple_ua),
             "步骤 1/4 (/disk/home)",
             &self.panpsc_cookie,
         )
@@ -514,7 +510,14 @@ impl NetdiskClient {
     ///
     /// 包含重试机制：最多 3 次，间隔指数退避（1秒、3秒、5秒）
     /// 预热前会先验证 BDUSS 是否有效，重试前会恢复被清空的 Cookie
-    pub async fn warmup_and_get_cookies(&self) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>)> {
+    pub async fn warmup_and_get_cookies(
+        &self,
+    ) -> Result<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAYS: [u64; 3] = [1, 3, 5]; // 指数退避：1秒、3秒、5秒
 
@@ -576,17 +579,18 @@ impl NetdiskClient {
                         }
                     }
 
-                    info!("预热完成,提取到 Cookie: PANPSC={}, csrfToken={}, bdstoken={}, STOKEN={}",
-                        panpsc.is_some(), csrf_token.is_some(), bdstoken.is_some(), stoken.is_some());
+                    info!(
+                        "预热完成,提取到 Cookie: PANPSC={}, csrfToken={}, bdstoken={}, STOKEN={}",
+                        panpsc.is_some(),
+                        csrf_token.is_some(),
+                        bdstoken.is_some(),
+                        stoken.is_some()
+                    );
 
                     return Ok((panpsc, csrf_token, bdstoken, stoken));
                 }
                 Err(e) => {
-                    warn!(
-                        "预热第 {} 次尝试失败: {}",
-                        attempt + 1,
-                        e
-                    );
+                    warn!("预热第 {} 次尝试失败: {}", attempt + 1, e);
                     last_error = Some(e);
                 }
             }
@@ -970,9 +974,8 @@ impl NetdiskClient {
         block_list: &str,
         upload_id: &str,
         file_size: u64,
-        is_dir: &str
+        is_dir: &str,
     ) -> Result<RapidUploadResponse> {
-
         let url = "https://pan.baidu.com/api/create";
 
         let response = self
@@ -1055,7 +1058,10 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取上传服务器响应失败")?;
 
-        debug!("locate_upload 响应: status={}, body={}", status, response_text);
+        debug!(
+            "locate_upload 响应: status={}, body={}",
+            status, response_text
+        );
 
         let locate_response: crate::netdisk::LocateUploadResponse =
             serde_json::from_str(&response_text).context("解析上传服务器响应失败")?;
@@ -1069,7 +1075,10 @@ impl NetdiskClient {
         }
 
         let servers = locate_response.server_hosts();
-        info!("获取到上传服务器: {:?} (有效期: {}秒)", servers, locate_response.expire);
+        info!(
+            "获取到上传服务器: {:?} (有效期: {}秒)",
+            servers, locate_response.expire
+        );
 
         Ok(servers)
     }
@@ -1214,8 +1223,8 @@ impl NetdiskClient {
             part_seq, status, response_text
         );
 
-        let chunk_response: UploadChunkResponse =
-            serde_json::from_str(&response_text).with_context(|| {
+        let chunk_response: UploadChunkResponse = serde_json::from_str(&response_text)
+            .with_context(|| {
                 format!(
                     "解析上传分片响应失败: status={}, body={}",
                     status, response_text
@@ -1386,12 +1395,14 @@ impl NetdiskClient {
     /// # 返回
     /// 创建文件夹响应
     pub async fn create_folder(&self, remote_path: &str) -> Result<CreateFileResponse> {
-        // 获取锁
-        let token_guard = self.bdstoken.lock().await;
-
-        if token_guard.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-            return Err(anyhow::anyhow!("bdstoken 尚未获取，请尝试重新登录"));
-        }
+        // 获取 bdstoken（只获取一次锁，立即克隆并释放，避免死锁）
+        let bdstoken = {
+            let token_guard = self.bdstoken.lock().await;
+            match token_guard.as_ref() {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => return Err(anyhow::anyhow!("bdstoken 尚未获取，请尝试重新登录")),
+            }
+        };
 
         info!("创建文件夹: path={}", remote_path);
 
@@ -1407,18 +1418,12 @@ impl NetdiskClient {
             .build()?;
 
         // 使用 Web 端 API (与 Baidu 网页端保持一致)
-        let mut url = format!(
-            "https://pan.baidu.com/api/create?a=commit&clienttype=0&app_id={}&web=1",
+        let url = format!(
+            "https://pan.baidu.com/api/create?a=commit&clienttype=0&app_id={}&web=1&bdstoken={}",
             BAIDU_APP_ID,
+            urlencoding::encode(&bdstoken),
         );
-
-        if let Some(token) = self.bdstoken.lock().await.clone() {
-            info!("创建文件夹: 使用 bdstoken 参数");
-            url.push_str("&bdstoken=");
-            url.push_str(&urlencoding::encode(&token));
-        } else {
-            return Err(anyhow::anyhow!("bdstoken 尚未获取，请尝试重新登录"));
-        }
+        info!("创建文件夹: 使用 bdstoken 参数");
 
         debug!("创建文件夹 URL: {}", url);
 
@@ -1435,11 +1440,7 @@ impl NetdiskClient {
         let response = pan_client
             .post(&url)
             .headers(headers)
-            .form(&[
-                ("path", remote_path),
-                ("isdir", "1"),
-                ("block_list", "[]"),
-            ])
+            .form(&[("path", remote_path), ("isdir", "1"), ("block_list", "[]")])
             .send()
             .await
             .context("创建文件夹请求失败")?;
@@ -1504,6 +1505,577 @@ impl NetdiskClient {
 
         Ok(create_response)
     }
+
+    // =====================================================
+    // 分享链接转存相关 API
+    // =====================================================
+
+    /// 解析分享链接，提取 short_key
+    ///
+    /// 支持格式：
+    /// - https://pan.baidu.com/s/1abcDEFg
+    /// - https://pan.baidu.com/s/1abcDEFg?pwd=xxxx
+    /// - https://pan.baidu.com/share/init?surl=abcDEFg
+    ///
+    /// # 返回
+    /// ShareLink 结构体，包含 short_key 和可能的密码
+    pub fn parse_share_link(&self, url: &str) -> Result<crate::transfer::ShareLink> {
+        use regex::Regex;
+
+        let url = url.trim();
+
+        // 检查是否为百度网盘链接
+        if !url.contains("pan.baidu.com") && !url.contains("baidu.com/s/") {
+            anyhow::bail!("无效的分享链接：不是百度网盘链接");
+        }
+
+        let mut short_key: Option<String> = None;
+        let mut password: Option<String> = None;
+
+        // 尝试匹配 /s/{key} 格式
+        // 例如: https://pan.baidu.com/s/1abcDEFg
+        let re_s = Regex::new(r"/s/([a-zA-Z0-9_-]+)")?;
+        if let Some(caps) = re_s.captures(url) {
+            if let Some(key) = caps.get(1) {
+                short_key = Some(key.as_str().to_string());
+            }
+        }
+
+        // 尝试匹配 /share/init?surl={key} 格式
+        // 例如: https://pan.baidu.com/share/init?surl=abcDEFg
+        if short_key.is_none() {
+            let re_surl = Regex::new(r"[?&]surl=([a-zA-Z0-9_-]+)")?;
+            if let Some(caps) = re_surl.captures(url) {
+                if let Some(key) = caps.get(1) {
+                    // surl 格式需要加 "1" 前缀
+                    short_key = Some(format!("1{}", key.as_str()));
+                }
+            }
+        }
+
+        // 提取密码
+        // 格式: ?pwd=xxxx 或 &pwd=xxxx
+        let re_pwd = Regex::new(r"[?&]pwd=([a-zA-Z0-9]{4})")?;
+        if let Some(caps) = re_pwd.captures(url) {
+            if let Some(pwd) = caps.get(1) {
+                password = Some(pwd.as_str().to_string());
+            }
+        }
+
+        match short_key {
+            Some(key) => {
+                info!(
+                    "解析分享链接成功: short_key={}, has_password={}",
+                    key,
+                    password.is_some()
+                );
+                Ok(crate::transfer::ShareLink {
+                    short_key: key,
+                    raw_url: url.to_string(),
+                    password,
+                })
+            }
+            None => {
+                anyhow::bail!("无法从链接中提取分享 ID")
+            }
+        }
+    }
+
+    /// 访问分享页面，获取分享信息
+    ///
+    /// # 参数
+    /// * `short_key` - 分享短链 ID（如 "1abcDEFg"）
+    /// * `first` - 是否为首次访问（影响 Referer）
+    ///
+    /// # 返回
+    /// SharePageInfo 或错误（需要密码/分享失效/页面不存在）
+    pub async fn access_share_page(
+        &self,
+        short_key: &str,
+        password: &Option<String>,
+        first: bool,
+    ) -> Result<crate::transfer::SharePageInfo> {
+        use regex::Regex;
+
+        let share_link = format!("https://pan.baidu.com/s/{}", short_key);
+        let referer = if first {
+            "https://pan.baidu.com/disk/home".to_string()
+        } else {
+            format!("https://pan.baidu.com/share/init?surl={}", &short_key[1..])
+        };
+
+        info!("访问分享页面: {}", share_link);
+
+        let response = self
+            .client
+            .get(&share_link)
+            .header("User-Agent", WEB_USER_AGENT)
+            .header("Referer", &referer)
+            .send()
+            .await
+            .context("访问分享页面失败")?;
+
+        let status = response.status();
+        let body = response.text().await.context("读取分享页面失败")?;
+
+        debug!("分享页面响应: status={}, body_len={}", status, body.len());
+
+        // 检测页面状态
+        if body.contains("platform-non-found") {
+            anyhow::bail!("分享已失效");
+        }
+        if body.contains("error-404") {
+            anyhow::bail!("分享不存在");
+        }
+
+        // 检测是否需要密码
+        // 如果页面包含密码输入框或验证逻辑，说明需要密码
+        let need_password = body.contains("请输入提取码")
+            || body.contains("accesscode")
+            || body.contains("verify-form");
+
+        // 从页面 JS 中提取分享信息（即使需要密码，这些信息可能仍然存在）
+        // 匹配模式: {... "loginstate":... }
+        let re = Regex::new(r"\{[^{}]*loginstate[^{}]*\}")?;
+
+        // 尝试更宽松的匹配
+        let re_loose = Regex::new(r#""shareid"\s*:\s*(\d+)"#)?;
+        let re_uk = Regex::new(r#""uk"\s*:\s*(\d+)"#)?;
+        let re_share_uk = Regex::new(r#""share_uk"\s*:\s*"?(\d+)"?"#)?;
+        let re_bdstoken = Regex::new(r#""bdstoken"\s*:\s*"([^"]+)""#)?;
+
+        // 辅助函数：安全地从 JSON Value 提取字符串或数字
+        fn extract_json_value(value: &serde_json::Value) -> Option<String> {
+            match value {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        }
+
+        // 尝试完整匹配
+        if let Some(caps) = re.find(&body) {
+            let json_str = caps.as_str();
+            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                // 安全提取字段，统一处理字符串和数字类型
+                let shareid = extract_json_value(&json["shareid"]).unwrap_or_default();
+                let uk = extract_json_value(&json["uk"]).unwrap_or_default();
+                let share_uk = extract_json_value(&json["share_uk"]).unwrap_or_default();
+                let bdstoken = extract_json_value(&json["bdstoken"]).unwrap_or_default();
+
+                if !shareid.is_empty() {
+                    info!("从 JSON 提取分享信息: shareid={}, uk={}", shareid, uk);
+                    return Ok(crate::transfer::SharePageInfo {
+                        shareid,
+                        uk,
+                        share_uk,
+                        bdstoken,
+                    });
+                }
+            }
+        }
+
+        // 使用宽松匹配提取各个字段
+        let shareid = re_loose
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        let uk = re_uk
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        let share_uk = re_share_uk
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| uk.clone());
+
+        let bdstoken = re_bdstoken
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        let _password = password
+            .as_deref()
+            .map(|s| s.trim())
+            .unwrap_or("")
+            .is_empty();
+        if shareid.is_empty() {
+            // 尝试检测是否需要登录
+            if body.contains("passport.baidu.com") || body.contains("请登录") {
+                anyhow::bail!("请先登录百度账号");
+            }
+            // 如果需要密码且无法提取分享信息，提示需要密码
+            if need_password && _password {
+                anyhow::bail!("需要密码");
+            }
+            anyhow::bail!("无法提取分享信息，请确认链接有效");
+        }
+
+        // 检测到需要密码时，返回错误让调用方处理
+        if need_password && _password {
+            anyhow::bail!("需要密码");
+        }
+
+        info!("提取分享信息成功: shareid={}, uk={}", shareid, uk);
+
+        Ok(crate::transfer::SharePageInfo {
+            shareid,
+            uk,
+            share_uk,
+            bdstoken,
+        })
+    }
+
+    /// 校验提取码
+    ///
+    /// # 参数
+    /// * `shareid` - 分享 ID
+    /// * `share_uk` - 分享者 UK
+    /// * `bdstoken` - CSRF 令牌
+    /// * `password` - 提取码
+    /// * `referer` - 来源页面
+    ///
+    /// # 返回
+    /// 成功返回 randsk，失败返回错误
+    pub async fn verify_share_password(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        password: &str,
+        referer: &str,
+    ) -> Result<String> {
+        info!("验证提取码: shareid={}", shareid);
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let url = format!(
+            "https://pan.baidu.com/share/verify?shareid={}&uk={}&t={}&clienttype=1",
+            shareid, share_uk, timestamp
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", referer)
+            .header(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            )
+            .form(&[
+                ("pwd", password),
+                ("vcode", ""),
+                ("vcode_str", ""),
+                ("bdstoken", bdstoken),
+            ])
+            .send()
+            .await
+            .context("验证提取码请求失败")?;
+
+        let response_text = response.text().await.context("读取验证响应失败")?;
+        debug!("验证提取码响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析验证响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+
+        if errno == 0 {
+            let randsk = json["randsk"].as_str().unwrap_or_default().to_string();
+            info!(
+                "提取码验证成功，获取到randsk: {}...",
+                &randsk[..randsk.len().min(20)]
+            );
+
+            // 将 randsk 保存到 Cookie 中
+            // 这样后续的转存请求可以从 Cookie 中读取 randsk
+            let cookie_url = "https://pan.baidu.com"
+                .parse::<reqwest::Url>()
+                .context("解析 Cookie URL 失败")?;
+            let randsk_cookie = format!("randsk={}; Domain=.baidu.com; Path=/", randsk);
+            self.cookie_jar.add_cookie_str(&randsk_cookie, &cookie_url);
+            info!("✅ 已将 randsk 保存到 Cookie");
+
+            // 验证Cookie是否成功保存
+            if let Some(cookies) = self.cookie_jar.cookies(&cookie_url) {
+                let cookie_str = cookies.to_str().unwrap_or("");
+                if cookie_str.contains("randsk=") {
+                    info!("✅ 验证：Cookie中已包含randsk");
+                } else {
+                    warn!("❌ 警告：Cookie中未找到randsk，可能保存失败");
+                }
+            }
+
+            Ok(randsk)
+        } else if errno == -9 {
+            anyhow::bail!("提取码错误")
+        } else {
+            anyhow::bail!("验证失败: errno={}", errno)
+        }
+    }
+
+    /// 列出分享中的文件
+    ///
+    /// # 参数
+    /// * `short_key` - 分享短链 ID
+    /// * `shareid` - 分享 ID
+    /// * `share_uk` - 分享者 UK
+    /// * `bdstoken` - CSRF 令牌
+    /// * `sekey` - 验证后的密钥（URL 编码的 randsk，可选）
+    ///
+    /// # 返回
+    /// 分享文件列表
+    pub async fn list_share_files(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        bdstoken: &str,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        info!("获取分享文件列表: shareid={}", shareid);
+
+        // short_key 包含 '1'（如 "1abcDEFg"），需要去掉第一个字符
+        let shorturl = if short_key.starts_with('1') && short_key.len() > 1 {
+            &short_key[1..]
+        } else {
+            short_key
+        };
+
+        let url = format!(
+            "https://pan.baidu.com/share/list?\
+             shorturl={}&bdstoken={}&\
+             root=1&web=5&app_id={}&channel=chunlei",
+            shorturl, BAIDU_APP_ID, bdstoken
+        );
+
+        let referer = format!("https://pan.baidu.com/s/{}", short_key);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", &referer)
+            .send()
+            .await
+            .context("获取分享文件列表失败")?;
+
+        let response_text = response.text().await.context("读取文件列表响应失败")?;
+        debug!("文件列表响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析文件列表响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+        if errno != 0 {
+            // 提取错误消息
+            let errmsg = json["errmsg"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| match errno {
+                    132 => "您的帐号可能存在安全风险，为了确保为您本人操作，请先进行安全验证"
+                        .to_string(),
+                    -7 => "该分享已删除或已取消".to_string(),
+                    -9 => "文件不存在".to_string(),
+                    -12 => "访问密码错误".to_string(),
+                    -19 => "需要输入验证码".to_string(),
+                    -62 => "可能需要输入验证码".to_string(),
+                    8001 => "已触发验证，请稍后再试".to_string(),
+                    _ => format!("未知错误，错误码: {}", errno),
+                });
+
+            anyhow::bail!("获取文件列表失败: errno={}, errmsg={}", errno, errmsg);
+        }
+
+        let list = json["list"].as_array().context("文件列表格式错误")?;
+
+        let mut files = Vec::new();
+        for item in list {
+            // fs_id 可能是字符串或数字，需要同时支持两种格式
+            let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
+                id_str.parse::<u64>().unwrap_or(0)
+            } else {
+                item["fs_id"].as_u64().unwrap_or(0)
+            };
+
+            let is_dir = if let Some(n) = item["isdir"].as_i64() {
+                n == 1
+            } else if let Some(s) = item["isdir"].as_str() {
+                s == "1"
+            } else {
+                false
+            };
+            let path = item["path"].as_str().unwrap_or_default().to_string();
+            let size = if let Some(n) = item["size"].as_u64() {
+                n
+            } else if let Some(s) = item["size"].as_str() {
+                s.parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            };
+            let name = item["server_filename"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+
+            info!(
+                "解析文件: fs_id={}, name={}, is_dir={}",
+                fs_id, name, is_dir
+            );
+
+            files.push(crate::transfer::SharedFileInfo {
+                fs_id,
+                is_dir,
+                path,
+                size,
+                name,
+            });
+        }
+
+        Ok(files)
+    }
+
+    /// 执行转存
+    ///
+    /// # 参数
+    /// * `shareid` - 分享 ID
+    /// * `share_uk` - 分享者 UK
+    /// * `bdstoken` - CSRF 令牌
+    /// * `fs_ids` - 要转存的文件 fs_id 列表
+    /// * `target_path` - 目标路径
+    /// * `referer` - 来源页面
+    /// * `sekey` - 验证后的密钥（URL 编码的 randsk，可选）
+    ///
+    /// # 返回
+    /// 转存结果
+    pub async fn transfer_share_files(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        fs_ids: &[u64],
+        target_path: &str,
+        referer: &str,
+    ) -> Result<crate::transfer::TransferResult> {
+        // 构建转存URL
+        let url = format!(
+            "https://pan.baidu.com/share/transfer?\
+             shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+            shareid, share_uk, bdstoken, BAIDU_APP_ID
+        );
+
+        // 构建 fs_id 列表
+        let fsidlist = format!(
+            "[{}]",
+            fs_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", referer)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+            .send()
+            .await
+            .context("转存请求失败")?;
+
+        let response_text = response.text().await.context("读取转存响应失败")?;
+        info!("转存响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析转存响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+
+        if errno == 0 {
+            // 提取转存后的路径
+            let extra_list = json["extra"]["list"].as_array();
+            let mut transferred_paths = Vec::new();
+            let mut transferred_fs_ids = Vec::new();
+
+            if let Some(list) = extra_list {
+                for item in list {
+                    if let Some(path) = item["to"].as_str() {
+                        transferred_paths.push(path.to_string());
+                    }
+                    if let Some(fsid) = item["to_fs_id"].as_u64() {
+                        transferred_fs_ids.push(fsid);
+                    }
+                }
+            }
+
+            Ok(crate::transfer::TransferResult {
+                success: true,
+                transferred_paths,
+                error: None,
+                transferred_fs_ids,
+            })
+        } else if errno == 12 {
+            // 部分错误
+            let info_list = json["info"].as_array();
+            if let Some(list) = info_list {
+                if let Some(first) = list.first() {
+                    let inner_errno = first["errno"].as_i64().unwrap_or(0);
+                    if inner_errno == -30 {
+                        let path = first["path"].as_str().unwrap_or_default();
+                        let filename = std::path::Path::new(path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string());
+                        return Ok(crate::transfer::TransferResult {
+                            success: false,
+                            transferred_paths: vec![],
+                            error: Some(format!("同名文件已存在: {}", filename)),
+                            transferred_fs_ids: vec![],
+                        });
+                    }
+                }
+            }
+
+            // 检查转存数量限制
+            let target_file_nums = json["target_file_nums"].as_u64().unwrap_or(0);
+            let target_file_nums_limit = json["target_file_nums_limit"].as_u64().unwrap_or(0);
+            if target_file_nums > target_file_nums_limit {
+                return Ok(crate::transfer::TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    error: Some(format!(
+                        "转存文件数 {} 超过上限 {}",
+                        target_file_nums, target_file_nums_limit
+                    )),
+                    transferred_fs_ids: vec![],
+                });
+            }
+
+            Ok(crate::transfer::TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            })
+        } else if errno == 4 {
+            Ok(crate::transfer::TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                error: Some("文件重复".to_string()),
+                transferred_fs_ids: vec![],
+            })
+        } else {
+            Ok(crate::transfer::TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1531,5 +2103,54 @@ mod tests {
         let ua = NetdiskClient::default_mobile_user_agent();
         assert!(ua.contains("netdisk"));
         assert!(ua.contains("android"));
+    }
+
+    #[test]
+    fn test_parse_share_link_s_format() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试 /s/{key} 格式
+        let result = client.parse_share_link("https://pan.baidu.com/s/1abcDEFg");
+        assert!(result.is_ok());
+        let share_link = result.unwrap();
+        assert_eq!(share_link.short_key, "1abcDEFg");
+        assert!(share_link.password.is_none());
+    }
+
+    #[test]
+    fn test_parse_share_link_with_password() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试带密码的链接
+        let result = client.parse_share_link("https://pan.baidu.com/s/1abcDEFg?pwd=a1b2");
+        assert!(result.is_ok());
+        let share_link = result.unwrap();
+        assert_eq!(share_link.short_key, "1abcDEFg");
+        assert_eq!(share_link.password, Some("a1b2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_share_link_surl_format() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试 /share/init?surl={key} 格式
+        let result = client.parse_share_link("https://pan.baidu.com/share/init?surl=abcDEFg");
+        assert!(result.is_ok());
+        let share_link = result.unwrap();
+        // surl 格式需要加 "1" 前缀
+        assert_eq!(share_link.short_key, "1abcDEFg");
+    }
+
+    #[test]
+    fn test_parse_share_link_invalid() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试无效链接
+        let result = client.parse_share_link("https://google.com/file");
+        assert!(result.is_err());
     }
 }

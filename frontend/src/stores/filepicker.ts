@@ -8,6 +8,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
   const currentPath = ref<string>('')
   const entries = ref<FileEntry[]>([])
   const selection = ref<FileEntry | null>(null)
+  const multiSelection = ref<FileEntry[]>([])  // 多选状态
   const viewMode = ref<'grid' | 'list'>('list')
   const sortField = ref<SortField>('name')
   const sortOrder = ref<SortOrder>('asc')
@@ -64,6 +65,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
 
       // 清除选择
       selection.value = null
+      multiSelection.value = []
 
       // 历史记录管理
       if (pushHistory && currentPath.value !== path) {
@@ -186,6 +188,35 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     selection.value = entry
   }
 
+  // 多选：切换条目选中状态
+  function toggleMultiSelect(entry: FileEntry) {
+    const index = multiSelection.value.findIndex(e => e.id === entry.id)
+    if (index >= 0) {
+      multiSelection.value.splice(index, 1)
+    } else {
+      multiSelection.value.push(entry)
+    }
+  }
+
+  // 多选：检查条目是否被选中
+  function isMultiSelected(entry: FileEntry): boolean {
+    return multiSelection.value.some(e => e.id === entry.id)
+  }
+
+  // 多选：全选当前目录可选条目
+  function selectAll(selectType: 'file' | 'directory' | 'both' = 'both') {
+    multiSelection.value = entries.value.filter(entry => {
+      if (selectType === 'file') return entry.entryType === 'file'
+      if (selectType === 'directory') return entry.entryType === 'directory'
+      return true
+    })
+  }
+
+  // 多选：清除所有选择
+  function clearMultiSelection() {
+    multiSelection.value = []
+  }
+
   // 打开条目（双击）
   function openEntry(entry: FileEntry) {
     if (entry.entryType === 'directory') {
@@ -215,6 +246,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     currentPath.value = ''
     entries.value = []
     selection.value = null
+    multiSelection.value = []
     historyStack.value = []
     forwardStack.value = []
     loading.value = false
@@ -230,6 +262,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     currentPath,
     entries,
     selection,
+    multiSelection,
     viewMode,
     sortField,
     sortOrder,
@@ -258,6 +291,10 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     goToParent,
     jumpToPath,
     selectEntry,
+    toggleMultiSelect,
+    isMultiSelected,
+    selectAll,
+    clearMultiSelection,
     openEntry,
     changeSort,
     changeViewMode,

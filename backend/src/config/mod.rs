@@ -23,6 +23,9 @@ pub struct AppConfig {
     /// 上传配置
     #[serde(default)]
     pub upload: UploadConfig,
+    /// 转存配置
+    #[serde(default)]
+    pub transfer: TransferConfig,
     /// 文件系统配置
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -44,6 +47,15 @@ pub struct ServerConfig {
 pub struct DownloadConfig {
     /// 默认下载目录
     pub download_dir: PathBuf,
+    /// 用户设置的默认目录（用于"设置为默认"功能）
+    #[serde(default)]
+    pub default_directory: Option<PathBuf>,
+    /// 最近使用的下载目录
+    #[serde(default)]
+    pub recent_directory: Option<PathBuf>,
+    /// 每次下载时是否询问保存位置
+    #[serde(default = "default_ask_each_time")]
+    pub ask_each_time: bool,
     /// 全局最大线程数（所有下载任务共享）
     pub max_global_threads: usize,
     /// 分片大小 (MB)
@@ -52,6 +64,122 @@ pub struct DownloadConfig {
     pub max_concurrent_tasks: usize,
     /// 最大重试次数
     pub max_retries: u32,
+    /// CDN刷新配置
+    #[serde(default)]
+    pub cdn_refresh: CdnRefreshConfig,
+}
+
+/// CDN链接刷新配置
+///
+/// 用于配置三层检测机制的参数：
+/// 1. 定时刷新：每隔固定时间强制刷新CDN链接
+/// 2. 速度异常检测：检测全局速度异常下降时触发刷新
+/// 3. 线程停滞检测：检测大面积线程停滞时触发刷新
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdnRefreshConfig {
+    /// 是否启用CDN刷新功能
+    #[serde(default = "default_cdn_refresh_enabled")]
+    pub enabled: bool,
+
+    /// 定时刷新间隔（分钟），默认10分钟
+    #[serde(default = "default_refresh_interval_minutes")]
+    pub refresh_interval_minutes: u64,
+
+    /// 最小刷新间隔（秒），防止频繁刷新，默认30秒
+    #[serde(default = "default_min_refresh_interval_secs")]
+    pub min_refresh_interval_secs: u64,
+
+    /// 速度下降阈值（百分比），下降超过此比例触发刷新，默认50%
+    #[serde(default = "default_speed_drop_threshold_percent")]
+    pub speed_drop_threshold_percent: u64,
+
+    /// 速度下降持续时长（秒），持续超过此时间触发刷新，默认10秒
+    #[serde(default = "default_speed_drop_duration_secs")]
+    pub speed_drop_duration_secs: u64,
+
+    /// 基线建立时间（秒），任务开始后多久建立速度基线，默认30秒
+    #[serde(default = "default_baseline_establish_secs")]
+    pub baseline_establish_secs: u64,
+
+    /// 线程停滞阈值（KB/s），速度低于此值视为停滞，默认10 KB/s
+    #[serde(default = "default_stagnation_threshold_kbps")]
+    pub stagnation_threshold_kbps: u64,
+
+    /// 线程停滞比例（百分比），超过此比例触发刷新，默认80%
+    #[serde(default = "default_stagnation_ratio_percent")]
+    pub stagnation_ratio_percent: u64,
+
+    /// 最小检测线程数，少于此数不进行停滞检测，默认3
+    #[serde(default = "default_min_threads_for_detection")]
+    pub min_threads_for_detection: usize,
+
+    /// 启动延迟（秒），任务开始后多久开始停滞检测，默认10秒
+    #[serde(default = "default_startup_delay_secs")]
+    pub startup_delay_secs: u64,
+}
+
+// CDN刷新配置默认值函数
+fn default_cdn_refresh_enabled() -> bool { true }
+fn default_refresh_interval_minutes() -> u64 { 10 }
+fn default_min_refresh_interval_secs() -> u64 { 30 }
+fn default_speed_drop_threshold_percent() -> u64 { 50 }
+fn default_speed_drop_duration_secs() -> u64 { 10 }
+fn default_baseline_establish_secs() -> u64 { 30 }
+fn default_stagnation_threshold_kbps() -> u64 { 10 }
+fn default_stagnation_ratio_percent() -> u64 { 80 }
+fn default_min_threads_for_detection() -> usize { 3 }
+fn default_startup_delay_secs() -> u64 { 10 }
+
+impl Default for CdnRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            refresh_interval_minutes: 10,
+            min_refresh_interval_secs: 30,
+            speed_drop_threshold_percent: 50,
+            speed_drop_duration_secs: 10,
+            baseline_establish_secs: 30,
+            stagnation_threshold_kbps: 10,
+            stagnation_ratio_percent: 80,
+            min_threads_for_detection: 3,
+            startup_delay_secs: 10,
+        }
+    }
+}
+
+impl CdnRefreshConfig {
+    /// 转换为速度异常检测器配置
+    pub fn to_speed_anomaly_config(&self) -> crate::common::SpeedAnomalyConfig {
+        crate::common::SpeedAnomalyConfig {
+            baseline_establish_secs: self.baseline_establish_secs,
+            speed_drop_threshold: self.speed_drop_threshold_percent as f64 / 100.0,
+            duration_threshold_secs: self.speed_drop_duration_secs,
+            check_interval_secs: 5, // 固定5秒检查一次
+            min_baseline_speed: 100 * 1024, // 最小基线速度 100KB/s
+        }
+    }
+
+    /// 转换为线程停滞检测器配置
+    pub fn to_stagnation_config(&self) -> crate::common::StagnationConfig {
+        crate::common::StagnationConfig {
+            near_zero_threshold_kbps: self.stagnation_threshold_kbps,
+            stagnation_ratio: self.stagnation_ratio_percent as f64 / 100.0,
+            min_threads: self.min_threads_for_detection,
+            startup_delay_secs: self.startup_delay_secs,
+        }
+    }
+
+    /// 转换为刷新协调器配置
+    pub fn to_refresh_coordinator_config(&self) -> crate::common::RefreshCoordinatorConfig {
+        crate::common::RefreshCoordinatorConfig {
+            min_refresh_interval_secs: self.min_refresh_interval_secs,
+        }
+    }
+}
+
+/// 默认每次询问保存位置
+fn default_ask_each_time() -> bool {
+    true
 }
 
 /// 上传配置
@@ -67,6 +195,9 @@ pub struct UploadConfig {
     pub max_retries: u32,
     /// 上传文件夹时是否跳过隐藏文件（以.开头的文件/文件夹）
     pub skip_hidden_files: bool,
+    /// 最近使用的上传源目录
+    #[serde(default)]
+    pub recent_directory: Option<PathBuf>,
 }
 
 impl Default for UploadConfig {
@@ -77,6 +208,38 @@ impl Default for UploadConfig {
             max_concurrent_tasks: 5,
             max_retries: 3,
             skip_hidden_files: false,   // 默认不跳过隐藏文件
+            recent_directory: None,     // 默认无最近目录
+        }
+    }
+}
+
+/// 转存配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferConfig {
+    /// 转存后默认行为：transfer_only / transfer_and_download
+    #[serde(default = "default_transfer_behavior")]
+    pub default_behavior: String,
+
+    /// 最近使用的网盘目录 fs_id（转存目标位置）
+    #[serde(default)]
+    pub recent_save_fs_id: Option<u64>,
+
+    /// 最近使用的网盘目录路径（与 fs_id 对应）
+    #[serde(default)]
+    pub recent_save_path: Option<String>,
+}
+
+/// 默认转存行为：仅转存
+fn default_transfer_behavior() -> String {
+    "transfer_only".to_string()
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            default_behavior: default_transfer_behavior(),
+            recent_save_fs_id: None,
+            recent_save_path: None,
         }
     }
 }
@@ -359,12 +522,17 @@ impl Default for AppConfig {
             },
             download: DownloadConfig {
                 download_dir,
+                default_directory: None,
+                recent_directory: None,
+                ask_each_time: true,
                 max_global_threads: svip_config.threads,
                 chunk_size_mb: svip_config.chunk_size,
                 max_concurrent_tasks: svip_config.max_tasks,
                 max_retries: 3,
+                cdn_refresh: CdnRefreshConfig::default(),
             },
             upload: UploadConfig::default(),
+            transfer: TransferConfig::default(),
             filesystem: FilesystemConfig::default(),
         }
     }
@@ -542,10 +710,14 @@ mod tests {
     fn test_config_validation() {
         let mut config = DownloadConfig {
             download_dir: std::env::current_dir().unwrap().join("downloads"),
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
             max_retries: 3,
+            cdn_refresh: CdnRefreshConfig::default(),
         };
 
         // 普通用户：5个线程应该触发警告
@@ -568,20 +740,28 @@ mod tests {
         let absolute_path = std::env::current_dir().unwrap().join("downloads");
         let absolute_config = DownloadConfig {
             download_dir: absolute_path,
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
             max_retries: 3,
+            cdn_refresh: CdnRefreshConfig::default(),
         };
         assert!(absolute_config.validate_download_dir().is_ok());
 
         // 测试相对路径验证（应该失败）
         let relative_config = DownloadConfig {
             download_dir: PathBuf::from("downloads"),
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
             max_global_threads: 5,
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
             max_retries: 3,
+            cdn_refresh: CdnRefreshConfig::default(),
         };
         assert!(relative_config.validate_download_dir().is_err());
 
@@ -590,10 +770,14 @@ mod tests {
         {
             let windows_config = DownloadConfig {
                 download_dir: PathBuf::from("D:\\Downloads"),
+                default_directory: None,
+                recent_directory: None,
+                ask_each_time: true,
                 max_global_threads: 5,
                 chunk_size_mb: 10,
                 max_concurrent_tasks: 2,
                 max_retries: 3,
+                cdn_refresh: CdnRefreshConfig::default(),
             };
             assert!(windows_config.validate_download_dir().is_ok());
         }
@@ -602,12 +786,139 @@ mod tests {
         {
             let unix_config = DownloadConfig {
                 download_dir: PathBuf::from("/app/downloads"),
+                default_directory: None,
+                recent_directory: None,
+                ask_each_time: true,
                 max_global_threads: 5,
                 chunk_size_mb: 10,
                 max_concurrent_tasks: 2,
                 max_retries: 3,
+                cdn_refresh: CdnRefreshConfig::default(),
             };
             assert!(unix_config.validate_download_dir().is_ok());
         }
+    }
+
+    #[test]
+    fn test_cdn_refresh_config_default() {
+        let config = CdnRefreshConfig::default();
+
+        // 验证默认值
+        assert!(config.enabled);
+        assert_eq!(config.refresh_interval_minutes, 10);
+        assert_eq!(config.min_refresh_interval_secs, 30);
+        assert_eq!(config.speed_drop_threshold_percent, 50);
+        assert_eq!(config.speed_drop_duration_secs, 10);
+        assert_eq!(config.baseline_establish_secs, 30);
+        assert_eq!(config.stagnation_threshold_kbps, 10);
+        assert_eq!(config.stagnation_ratio_percent, 80);
+        assert_eq!(config.min_threads_for_detection, 3);
+        assert_eq!(config.startup_delay_secs, 10);
+    }
+
+    #[test]
+    fn test_cdn_refresh_config_to_speed_anomaly() {
+        let config = CdnRefreshConfig {
+            speed_drop_threshold_percent: 60,
+            speed_drop_duration_secs: 15,
+            baseline_establish_secs: 45,
+            ..Default::default()
+        };
+
+        let speed_config = config.to_speed_anomaly_config();
+
+        assert_eq!(speed_config.speed_drop_threshold, 0.6); // 60% -> 0.6
+        assert_eq!(speed_config.duration_threshold_secs, 15);
+        assert_eq!(speed_config.baseline_establish_secs, 45);
+        assert_eq!(speed_config.check_interval_secs, 5); // 固定值
+        assert_eq!(speed_config.min_baseline_speed, 100 * 1024); // 100 KB/s
+    }
+
+    #[test]
+    fn test_cdn_refresh_config_to_stagnation() {
+        let config = CdnRefreshConfig {
+            stagnation_threshold_kbps: 20,
+            stagnation_ratio_percent: 70,
+            min_threads_for_detection: 5,
+            startup_delay_secs: 20,
+            ..Default::default()
+        };
+
+        let stag_config = config.to_stagnation_config();
+
+        assert_eq!(stag_config.near_zero_threshold_kbps, 20);
+        assert_eq!(stag_config.stagnation_ratio, 0.7); // 70% -> 0.7
+        assert_eq!(stag_config.min_threads, 5);
+        assert_eq!(stag_config.startup_delay_secs, 20);
+    }
+
+    #[test]
+    fn test_cdn_refresh_config_to_coordinator() {
+        let config = CdnRefreshConfig {
+            min_refresh_interval_secs: 60,
+            ..Default::default()
+        };
+
+        let coord_config = config.to_refresh_coordinator_config();
+
+        assert_eq!(coord_config.min_refresh_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_cdn_refresh_config_serialization() {
+        // 测试序列化和反序列化
+        let config = CdnRefreshConfig {
+            enabled: false,
+            refresh_interval_minutes: 5,
+            min_refresh_interval_secs: 20,
+            speed_drop_threshold_percent: 40,
+            speed_drop_duration_secs: 8,
+            baseline_establish_secs: 20,
+            stagnation_threshold_kbps: 5,
+            stagnation_ratio_percent: 90,
+            min_threads_for_detection: 2,
+            startup_delay_secs: 5,
+        };
+
+        // 序列化为 TOML
+        let toml_str = toml::to_string(&config).unwrap();
+
+        // 反序列化
+        let deserialized: CdnRefreshConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(deserialized.enabled, false);
+        assert_eq!(deserialized.refresh_interval_minutes, 5);
+        assert_eq!(deserialized.min_refresh_interval_secs, 20);
+        assert_eq!(deserialized.speed_drop_threshold_percent, 40);
+        assert_eq!(deserialized.speed_drop_duration_secs, 8);
+        assert_eq!(deserialized.baseline_establish_secs, 20);
+        assert_eq!(deserialized.stagnation_threshold_kbps, 5);
+        assert_eq!(deserialized.stagnation_ratio_percent, 90);
+        assert_eq!(deserialized.min_threads_for_detection, 2);
+        assert_eq!(deserialized.startup_delay_secs, 5);
+    }
+
+    #[test]
+    fn test_download_config_with_cdn_refresh() {
+        // 测试 DownloadConfig 包含 cdn_refresh 的序列化/反序列化
+        let download_config = DownloadConfig {
+            download_dir: std::env::current_dir().unwrap().join("downloads"),
+            default_directory: None,
+            recent_directory: None,
+            ask_each_time: true,
+            max_global_threads: 10,
+            chunk_size_mb: 5,
+            max_concurrent_tasks: 5,
+            max_retries: 3,
+            cdn_refresh: CdnRefreshConfig {
+                enabled: false,
+                refresh_interval_minutes: 15,
+                ..Default::default()
+            },
+        };
+
+        // 验证 cdn_refresh 配置被正确包含
+        assert_eq!(download_config.cdn_refresh.enabled, false);
+        assert_eq!(download_config.cdn_refresh.refresh_interval_minutes, 15);
     }
 }
