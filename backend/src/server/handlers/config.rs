@@ -392,13 +392,14 @@ pub async fn get_transfer_config(
         let config = app_state.config.read().await;
         let t = &config.transfer;
 
-        (t.default_behavior.clone(), t.recent_save_fs_id, t.recent_save_path.clone())
+        (
+            t.default_behavior.clone(),
+            t.recent_save_fs_id,
+            t.recent_save_path.clone(),
+        )
     };
 
-    let path_str = recent_save_path
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    let path_str = recent_save_path.as_ref().map(|s| s.as_str()).unwrap_or("");
 
     if path_str.is_empty() || path_str == "/" {
         return Ok(Json(ApiResponse::success(TransferConfigResponse {

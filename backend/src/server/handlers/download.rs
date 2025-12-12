@@ -118,6 +118,34 @@ pub async fn get_all_downloads(
     Ok(Json(ApiResponse::success(tasks)))
 }
 
+/// GET /api/v1/downloads/active
+/// 🔥 获取活跃的下载任务（用于降级轮询）
+pub async fn get_active_downloads(
+    State(app_state): State<AppState>,
+) -> Result<Json<ApiResponse<Vec<DownloadTask>>>, StatusCode> {
+    let download_manager = app_state
+        .download_manager
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let tasks: Vec<DownloadTask> = download_manager
+        .get_all_tasks()
+        .await
+        .into_iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                crate::downloader::TaskStatus::Downloading
+                    | crate::downloader::TaskStatus::Pending
+            )
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::success(tasks)))
+}
+
 /// GET /api/v1/downloads/:id
 /// 获取指定下载任务
 pub async fn get_download(
@@ -150,7 +178,8 @@ pub async fn pause_download(
         .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    match download_manager.pause_task(&task_id).await {
+    // 正常暂停场景，skip_try_start_waiting=false，允许启动等待队列任务
+    match download_manager.pause_task(&task_id, false).await {
         Ok(_) => {
             info!("暂停下载任务成功: {}", task_id);
             Ok(Json(ApiResponse::success("Task paused".to_string())))
@@ -324,7 +353,13 @@ pub async fn create_batch_download(
             let file_size = item.size.unwrap_or(0);
 
             match download_manager
-                .create_task_with_dir(item.fs_id, item.path.clone(), item.name.clone(), file_size, &target_dir)
+                .create_task_with_dir(
+                    item.fs_id,
+                    item.path.clone(),
+                    item.name.clone(),
+                    file_size,
+                    &target_dir,
+                )
                 .await
             {
                 Ok(task_id) => {

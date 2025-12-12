@@ -7,5 +7,5 @@ mod speed_anomaly_detector;
 mod thread_stagnation_detector;
 
 pub use refresh_coordinator::{RefreshCoordinator, RefreshCoordinatorConfig, RefreshGuard};
-pub use speed_anomaly_detector::{SpeedAnomalyDetector, SpeedAnomalyConfig};
-pub use thread_stagnation_detector::{ThreadStagnationDetector, StagnationConfig};
+pub use speed_anomaly_detector::{SpeedAnomalyConfig, SpeedAnomalyDetector};
+pub use thread_stagnation_detector::{StagnationConfig, ThreadStagnationDetector};

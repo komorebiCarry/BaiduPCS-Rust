@@ -2,10 +2,11 @@
   <el-dialog
       v-model="visible"
       :title="title"
-      width="800px"
+      :width="isMobile ? '95%' : '800px'"
       :close-on-click-modal="false"
       @open="handleOpen"
       @close="handleClose"
+      :class="{ 'is-mobile': isMobile }"
   >
     <!-- 导航栏 -->
     <NavigatorBar
@@ -120,11 +121,15 @@
 <script setup lang="ts">
 import { computed, watch, ref } from 'vue'
 import { useFilePickerStore } from '@/stores/filepicker'
+import { useIsMobile } from '@/utils/responsive'
 import type { FileEntry } from '@/api/filesystem'
 import NavigatorBar from './NavigatorBar.vue'
 import FileList from './FileList.vue'
 import EmptyState from './EmptyState.vue'
 import ErrorState from './ErrorState.vue'
+
+// 响应式检测
+const isMobile = useIsMobile()
 
 const props = withDefaults(defineProps<{
   modelValue: boolean
@@ -341,6 +346,12 @@ watch(() => props.selectType, () => {
   margin-top: 12px;
 }
 
+/* 移动端内容区域自适应高度 */
+.is-mobile .content-area {
+  height: 50vh;
+  max-height: 60vh;
+}
+
 .load-more {
   text-align: center;
   padding: 8px;
@@ -396,5 +407,50 @@ watch(() => props.selectType, () => {
 
 .set-default-checkbox {
   font-size: 13px;
+}
+
+/* =====================
+   移动端样式适配
+   ===================== */
+@media (max-width: 767px) {
+  .footer-bar {
+    flex-direction: column;
+    gap: 12px;
+    align-items: stretch;
+  }
+
+  .download-info {
+    max-width: 100%;
+  }
+
+  .actions {
+    width: 100%;
+    flex-direction: column;
+    gap: 8px; /* 确保按钮间距一致 */
+    display: flex; /* 确保是 flex 容器 */
+    align-items: stretch; /* 按钮拉伸到全宽 */
+
+    .el-button {
+      width: 100%;
+      margin: 0; /* 移除可能的 margin */
+      flex-shrink: 0; /* 防止按钮被压缩 */
+    }
+  }
+
+  .selected-info {
+    max-width: 100%;
+    text-align: center;
+  }
+
+  .download-path {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .download-path .path {
+    word-break: break-all;
+    white-space: normal;
+  }
 }
 </style>

@@ -1,5 +1,5 @@
 <template>
-  <div class="login-container">
+  <div class="login-container" :class="{ 'is-mobile': isMobile, 'tips-expanded': !tipsCollapsed }">
     <!-- 右上角小贴士 -->
     <div class="tips-card" :class="{ collapsed: tipsCollapsed }">
       <div class="tips-header" @click="tipsCollapsed = !tipsCollapsed">
@@ -147,7 +147,7 @@
       <!-- 底部信息 -->
       <div class="footer">
         <p>基于 Rust + Axum + Vue 3 构建</p>
-        <p class="version">v1.3.0</p>
+        <p class="version">v1.0.0</p>
       </div>
     </div>
   </div>
@@ -158,6 +158,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
+import { useIsMobile } from '@/utils/responsive'
 import {
   FolderOpened,
   Loading,
@@ -174,6 +175,9 @@ import {
 const router = useRouter()
 const authStore = useAuthStore()
 
+// 响应式检测
+const isMobile = useIsMobile()
+
 // 状态
 const loading = ref(false)
 const error = ref('')
@@ -181,7 +185,8 @@ const qrcode = computed(() => authStore.qrcode)
 const isScanned = ref(false)
 const isExpired = ref(false)
 const countdown = ref(120)
-const tipsCollapsed = ref(false) // 贴士折叠状态
+// 贴士折叠状态：移动端默认折叠，桌面端默认展开
+const tipsCollapsed = ref(isMobile.value)
 
 // 计算二维码URL
 const qrcodeUrl = computed(() => {
@@ -432,13 +437,228 @@ onUnmounted(() => {
   }
 }
 
-/* 小屏幕适配 */
+/* 移动端适配 */
 @media (max-width: 768px) {
+  .login-container {
+    padding: 16px;
+    align-items: flex-start;
+    padding-top: 40px;
+    padding-bottom: 100px; /* 为底部小贴士留出空间（折叠状态） */
+  }
+
+  /* 小贴士展开时，增加底部内边距 */
+  .login-container.tips-expanded {
+    padding-bottom: 60vh; /* 展开时预留更多空间，避免遮挡 */
+  }
+
   .tips-card {
-    top: 10px;
-    right: 10px;
-    width: 280px;
+    position: fixed;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    border-radius: 16px 16px 0 0;
     font-size: 12px;
+    max-height: 55vh;
+    z-index: 100;
+    box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
+
+    &.collapsed {
+      width: 100%;
+      max-height: auto;
+    }
+
+    .tips-header {
+      /* 添加提示，让用户知道可以点击展开 */
+      &::after {
+        content: '（点击查看提示）';
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.8);
+        margin-left: 4px;
+      }
+    }
+
+    &:not(.collapsed) .tips-header::after {
+      content: '（点击收起）';
+    }
+
+    .tips-content {
+      max-height: 45vh;
+      overflow-y: auto;
+    }
+  }
+
+  .login-card {
+    padding: 24px 20px;
+    border-radius: 12px;
+    margin: 0;
+    width: 100%;
+    max-width: 100%;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+  }
+
+  .header {
+    margin-bottom: 24px;
+
+    .logo {
+      margin-bottom: 12px;
+    }
+
+    h1 {
+      font-size: 20px;
+      line-height: 1.3;
+    }
+
+    .subtitle {
+      font-size: 11px;
+    }
+  }
+
+  .qrcode-section {
+    min-height: 280px;
+  }
+
+  .qrcode-image {
+    width: 200px;
+    height: 200px;
+    padding: 12px;
+    margin-bottom: 16px;
+
+    .expired-mask,
+    .scanned-mask {
+      p {
+        font-size: 14px;
+        margin: 12px 0 16px 0;
+      }
+
+      .success-text {
+        font-size: 16px;
+      }
+
+      .hint-text {
+        font-size: 13px;
+      }
+    }
+  }
+
+  .loading {
+    p {
+      font-size: 13px;
+    }
+  }
+
+  .error-state {
+    .error-text {
+      font-size: 13px;
+      padding: 0 16px;
+    }
+  }
+
+  .scan-tips {
+    margin-bottom: 12px;
+
+    .tip-item {
+      padding: 10px;
+      font-size: 12px;
+
+      &.success {
+        padding: 12px;
+
+        .success-header {
+          .success-title {
+            font-size: 14px;
+          }
+        }
+
+        .important-notes {
+          .note-item {
+            padding: 8px 10px;
+            font-size: 12px;
+            gap: 6px;
+          }
+        }
+      }
+    }
+  }
+
+  .countdown {
+    font-size: 12px;
+  }
+
+  .footer {
+    margin-top: 24px;
+    font-size: 11px;
+
+    p {
+      margin: 2px 0;
+    }
+
+    .version {
+      font-size: 11px;
+    }
+  }
+}
+
+/* 小屏幕（手机横屏）适配 */
+@media (max-width: 768px) and (max-height: 600px) {
+  .login-container {
+    padding-top: 20px;
+    padding-bottom: 60px;
+  }
+
+  .login-card {
+    padding: 20px 16px;
+  }
+
+  .header {
+    margin-bottom: 16px;
+  }
+
+  .qrcode-section {
+    min-height: 200px;
+  }
+
+  .qrcode-image {
+    width: 160px;
+    height: 160px;
+    padding: 8px;
+  }
+
+  .footer {
+    margin-top: 16px;
+  }
+}
+
+/* 超小屏幕（手机竖屏小尺寸）适配 */
+@media (max-width: 375px) {
+  .login-card {
+    padding: 20px 16px;
+  }
+
+  .header {
+    h1 {
+      font-size: 18px;
+    }
+  }
+
+  .qrcode-image {
+    width: 180px;
+    height: 180px;
+  }
+
+  .scan-tips {
+    .tip-item {
+      font-size: 11px;
+
+      &.success {
+        .important-notes {
+          .note-item {
+            font-size: 11px;
+          }
+        }
+      }
+    }
   }
 }
 

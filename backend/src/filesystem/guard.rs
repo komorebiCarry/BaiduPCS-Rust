@@ -52,8 +52,7 @@ impl PathGuard {
     pub fn normalize(&self, path: &str) -> Result<PathBuf, FsError> {
         // 检查是否包含可疑的穿越序列
         if self.contains_traversal(path) {
-            return Err(FsError::new(FsErrorCode::PathTraversalDetected)
-                .with_path(path));
+            return Err(FsError::new(FsErrorCode::PathTraversalDetected).with_path(path));
         }
 
         let path_buf = PathBuf::from(path);
@@ -81,15 +80,13 @@ impl PathGuard {
             Ok(canonical) => {
                 // 检查白名单
                 if !self.is_allowed(&canonical) {
-                    return Err(FsError::new(FsErrorCode::PathNotAllowed)
-                        .with_path(path));
+                    return Err(FsError::new(FsErrorCode::PathNotAllowed).with_path(path));
                 }
                 Ok(canonical)
             }
             Err(_) => {
                 // 路径不存在或无法访问
-                Err(FsError::new(FsErrorCode::DirectoryNotFound)
-                    .with_path(path))
+                Err(FsError::new(FsErrorCode::DirectoryNotFound).with_path(path))
             }
         }
     }
@@ -144,8 +141,8 @@ impl PathGuard {
         // 检查常见的穿越模式
         let patterns = [
             "..",
-            "%2e%2e",  // URL 编码
-            "%252e%252e",  // 双重 URL 编码
+            "%2e%2e",     // URL 编码
+            "%252e%252e", // 双重 URL 编码
         ];
 
         let path_lower = path.to_lowercase();

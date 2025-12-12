@@ -189,7 +189,12 @@ impl UploadTask {
     }
 
     /// 设置秒传哈希值
-    pub fn set_rapid_hash(&mut self, content_md5: String, slice_md5: String, content_crc32: Option<String>) {
+    pub fn set_rapid_hash(
+        &mut self,
+        content_md5: String,
+        slice_md5: String,
+        content_crc32: Option<String>,
+    ) {
         self.content_md5 = Some(content_md5);
         self.slice_md5 = Some(slice_md5);
         self.content_crc32 = content_crc32;
@@ -216,11 +221,7 @@ mod tests {
 
     #[test]
     fn test_progress_calculation() {
-        let mut task = UploadTask::new(
-            PathBuf::from("./test"),
-            "/test".to_string(),
-            1000,
-        );
+        let mut task = UploadTask::new(PathBuf::from("./test"), "/test".to_string(), 1000);
 
         task.uploaded_size = 250;
         assert_eq!(task.progress(), 25.0);
@@ -234,11 +235,7 @@ mod tests {
 
     #[test]
     fn test_eta_calculation() {
-        let mut task = UploadTask::new(
-            PathBuf::from("./test"),
-            "/test".to_string(),
-            1000,
-        );
+        let mut task = UploadTask::new(PathBuf::from("./test"), "/test".to_string(), 1000);
 
         task.uploaded_size = 200;
         task.speed = 100; // 100 bytes/s
@@ -250,11 +247,7 @@ mod tests {
 
     #[test]
     fn test_status_transitions() {
-        let mut task = UploadTask::new(
-            PathBuf::from("./test"),
-            "/test".to_string(),
-            1000,
-        );
+        let mut task = UploadTask::new(PathBuf::from("./test"), "/test".to_string(), 1000);
 
         task.mark_checking_rapid();
         assert_eq!(task.status, UploadTaskStatus::CheckingRapid);
@@ -278,11 +271,7 @@ mod tests {
 
     #[test]
     fn test_rapid_upload_success() {
-        let mut task = UploadTask::new(
-            PathBuf::from("./test"),
-            "/test".to_string(),
-            1000,
-        );
+        let mut task = UploadTask::new(PathBuf::from("./test"), "/test".to_string(), 1000);
 
         task.set_rapid_hash(
             "abc123".to_string(),

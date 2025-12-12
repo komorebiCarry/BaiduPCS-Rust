@@ -11,9 +11,10 @@
 // - 检测任务数变化，重置服务器速度窗口
 
 use crate::netdisk::{NetdiskClient, UploadErrorKind};
-use crate::uploader::{
-    PcsServerHealthManager, UploadChunk, UploadChunkManager, UploadTask,
-};
+use crate::persistence::PersistenceManager;
+use crate::server::events::{ProgressThrottler, TaskEvent, UploadEvent};
+use crate::server::websocket::WebSocketManager;
+use crate::uploader::{PcsServerHealthManager, UploadChunk, UploadChunkManager, UploadTask};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -146,6 +147,18 @@ pub struct UploadTaskScheduleInfo {
     pub last_speed_time: Arc<Mutex<std::time::Instant>>,
     /// 上次速度计算时的字节数
     pub last_speed_bytes: Arc<AtomicU64>,
+
+    // 🔥 持久化支持
+    /// 持久化管理器引用（可选）
+    pub persistence_manager: Option<Arc<Mutex<PersistenceManager>>>,
+
+    // 🔥 WebSocket 管理器支持
+    /// WebSocket 管理器引用
+    pub ws_manager: Option<Arc<WebSocketManager>>,
+
+    // 🔥 进度事件节流器（200ms 间隔，避免事件风暴）
+    /// 任务级进度节流器，多个分片共享
+    pub progress_throttler: Arc<ProgressThrottler>,
 }
 
 // =====================================================
@@ -186,11 +199,19 @@ pub struct UploadChunkScheduler {
 impl UploadChunkScheduler {
     /// 创建新的调度器（使用默认重试次数）
     pub fn new(max_global_threads: usize, max_concurrent_tasks: usize) -> Self {
-        Self::new_with_config(max_global_threads, max_concurrent_tasks, DEFAULT_MAX_RETRIES)
+        Self::new_with_config(
+            max_global_threads,
+            max_concurrent_tasks,
+            DEFAULT_MAX_RETRIES,
+        )
     }
 
     /// 创建新的调度器（完整配置）
-    pub fn new_with_config(max_global_threads: usize, max_concurrent_tasks: usize, max_retries: u32) -> Self {
+    pub fn new_with_config(
+        max_global_threads: usize,
+        max_concurrent_tasks: usize,
+        max_retries: u32,
+    ) -> Self {
         info!(
             "创建全局上传分片调度器: 全局线程数={}, 最大并发任务数={}, 最大重试次数={}",
             max_global_threads, max_concurrent_tasks, max_retries
@@ -225,28 +246,19 @@ impl UploadChunkScheduler {
     /// 动态更新最大全局线程数
     pub fn update_max_threads(&self, new_max: usize) {
         let old_max = self.max_global_threads.swap(new_max, Ordering::SeqCst);
-        info!(
-            "🔧 动态调整上传全局最大线程数: {} -> {}",
-            old_max, new_max
-        );
+        info!("🔧 动态调整上传全局最大线程数: {} -> {}", old_max, new_max);
     }
 
     /// 动态更新最大并发任务数
     pub fn update_max_concurrent_tasks(&self, new_max: usize) {
         let old_max = self.max_concurrent_tasks.swap(new_max, Ordering::SeqCst);
-        info!(
-            "🔧 动态调整上传最大并发任务数: {} -> {}",
-            old_max, new_max
-        );
+        info!("🔧 动态调整上传最大并发任务数: {} -> {}", old_max, new_max);
     }
 
     /// 动态更新最大重试次数
     pub fn update_max_retries(&self, new_max: u32) {
         let old_max = self.max_retries.swap(new_max as usize, Ordering::SeqCst);
-        info!(
-            "🔧 动态调整上传最大重试次数: {} -> {}",
-            old_max, new_max
-        );
+        info!("🔧 动态调整上传最大重试次数: {} -> {}", old_max, new_max);
     }
 
     /// 获取当前最大线程数
@@ -294,7 +306,10 @@ impl UploadChunkScheduler {
                 Ok(_) => {
                     info!(
                         "上传预注册成功：已注册:{} + 预注册:{} -> {} (上限: {})",
-                        registered_count, current_pre, current_pre + 1, pre_register_limit
+                        registered_count,
+                        current_pre,
+                        current_pre + 1,
+                        pre_register_limit
                     );
                     return true;
                 }
@@ -316,7 +331,11 @@ impl UploadChunkScheduler {
     /// 取消预注册
     pub fn cancel_pre_register(&self) {
         let old = self.pre_register_count.fetch_sub(1, Ordering::SeqCst);
-        info!("取消上传预注册：预注册数 {} -> {}", old, old.saturating_sub(1));
+        info!(
+            "取消上传预注册：预注册数 {} -> {}",
+            old,
+            old.saturating_sub(1)
+        );
     }
 
     /// 获取预注册计数
@@ -335,22 +354,23 @@ impl UploadChunkScheduler {
         {
             let tasks = self.active_tasks.read().await;
             if tasks.len() >= max_tasks {
-                anyhow::bail!(
-                    "超过上传最大并发任务数限制 ({}/{})",
-                    tasks.len(),
-                    max_tasks
-                );
+                anyhow::bail!("超过上传最大并发任务数限制 ({}/{})", tasks.len(), max_tasks);
             }
         }
 
         // 添加到活跃任务列表
-        self.active_tasks.write().await.insert(task_id.clone(), task_info);
+        self.active_tasks
+            .write()
+            .await
+            .insert(task_id.clone(), task_info);
 
         // 注册成功，减少预注册计数
         let old_pre = self.pre_register_count.fetch_sub(1, Ordering::SeqCst);
         info!(
             "上传任务 {} 已注册到调度器 (预注册数: {} -> {})",
-            task_id, old_pre, old_pre.saturating_sub(1)
+            task_id,
+            old_pre,
+            old_pre.saturating_sub(1)
         );
         Ok(())
     }
@@ -538,24 +558,29 @@ impl UploadChunkScheduler {
                             if task_info.active_chunk_count.load(Ordering::SeqCst) == 0 {
                                 // 所有分片完成，尝试调用 create_file 合并分片
                                 // 使用 compare_exchange 确保只有一处能执行合并
-                                if task_info.is_merging.compare_exchange(
-                                    false,
-                                    true,
-                                    Ordering::SeqCst,
-                                    Ordering::SeqCst,
-                                ).is_ok() {
+                                if task_info
+                                    .is_merging
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                                {
                                     info!(
                                         "上传任务 {} 所有分片完成，开始合并分片 (调度循环触发)",
                                         task_id
                                     );
 
-                                    let create_result = task_info.client
+                                    let create_result = task_info
+                                        .client
                                         .create_file(
                                             &task_info.remote_path,
                                             &task_info.block_list,
                                             &task_info.upload_id,
                                             task_info.total_size,
-                                            "0"
+                                            "0",
                                         )
                                         .await;
 
@@ -564,7 +589,25 @@ impl UploadChunkScheduler {
                                     match create_result {
                                         Ok(response) => {
                                             if response.is_success() {
-                                                info!("上传任务 {} 合并分片成功，从调度器移除", task_id);
+                                                info!(
+                                                    "上传任务 {} 合并分片成功，从调度器移除",
+                                                    task_id
+                                                );
+
+                                                // 🔥 清理持久化文件（任务完成）
+                                                if let Some(ref pm) = task_info.persistence_manager
+                                                {
+                                                    if let Err(e) =
+                                                        pm.lock().await.on_task_completed(task_id)
+                                                    {
+                                                        error!("清理上传任务持久化文件失败: {}", e);
+                                                    } else {
+                                                        debug!(
+                                                            "上传任务 {} 持久化文件已清理",
+                                                            task_id
+                                                        );
+                                                    }
+                                                }
 
                                                 // 标记任务完成
                                                 let group_id = {
@@ -578,7 +621,10 @@ impl UploadChunkScheduler {
                                                     let tx_guard = task_completed_tx.read().await;
                                                     if let Some(tx) = tx_guard.as_ref() {
                                                         if let Err(e) = tx.send(gid.clone()) {
-                                                            error!("发送上传任务完成通知失败: {}", e);
+                                                            error!(
+                                                                "发送上传任务完成通知失败: {}",
+                                                                e
+                                                            );
                                                         } else {
                                                             debug!("已发送上传任务完成通知: group_id={}", gid);
                                                         }
@@ -604,10 +650,7 @@ impl UploadChunkScheduler {
                                         }
                                     }
                                 } else {
-                                    debug!(
-                                        "上传任务 {} 合并分片已由其他位置触发，跳过",
-                                        task_id
-                                    );
+                                    debug!("上传任务 {} 合并分片已由其他位置触发，跳过", task_id);
                                 }
                             }
 
@@ -655,7 +698,7 @@ impl UploadChunkScheduler {
                 slot_id,
                 max_retries.load(Ordering::SeqCst) as u32,
             )
-            .await;
+                .await;
 
             // 释放全局活跃计数
             global_active_count.fetch_sub(1, Ordering::SeqCst);
@@ -669,9 +712,15 @@ impl UploadChunkScheduler {
             // 处理上传结果
             if let Err(e) = result {
                 if task_info.cancellation_token.is_cancelled() {
-                    info!("[上传线程{}] 分片 #{} 因任务取消而失败", slot_id, chunk_index);
+                    info!(
+                        "[上传线程{}] 分片 #{} 因任务取消而失败",
+                        slot_id, chunk_index
+                    );
                 } else {
-                    error!("[上传线程{}] 分片 #{} 上传失败: {}", slot_id, chunk_index, e);
+                    error!(
+                        "[上传线程{}] 分片 #{} 上传失败: {}",
+                        slot_id, chunk_index, e
+                    );
 
                     // 取消上传标记
                     {
@@ -682,9 +731,28 @@ impl UploadChunkScheduler {
                     }
 
                     // 标记任务失败
+                    let error_msg = e.to_string();
                     {
                         let mut t = task_info.task.lock().await;
-                        t.mark_failed(e.to_string());
+                        t.mark_failed(error_msg.clone());
+                    }
+
+                    // 🔥 发布任务失败事件
+                    if let Some(ref ws_manager) = task_info.ws_manager {
+                        ws_manager.send_if_subscribed(
+                            TaskEvent::Upload(UploadEvent::Failed {
+                                task_id: task_id.clone(),
+                                error: error_msg.clone(),
+                            }),
+                            None,
+                        );
+                    }
+
+                    // 🔥 更新持久化错误信息
+                    if let Some(ref pm) = task_info.persistence_manager {
+                        if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
+                            warn!("更新上传任务错误信息失败: {}", e);
+                        }
                     }
 
                     // 从调度器移除任务
@@ -700,25 +768,25 @@ impl UploadChunkScheduler {
 
                 if all_completed && task_info.active_chunk_count.load(Ordering::SeqCst) == 0 {
                     // 使用 compare_exchange 确保只有一处能执行合并
-                    if task_info.is_merging.compare_exchange(
-                        false,
-                        true,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    ).is_ok() {
+                    if task_info
+                        .is_merging
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
                         info!(
                             "上传任务 {} 所有分片上传完成，开始合并分片 (回调触发)",
                             task_id
                         );
 
                         // 调用 create_file 合并分片
-                        let create_result = task_info.client
+                        let create_result = task_info
+                            .client
                             .create_file(
                                 &task_info.remote_path,
                                 &task_info.block_list,
                                 &task_info.upload_id,
                                 task_info.total_size,
-                                "0"
+                                "0",
                             )
                             .await;
 
@@ -730,12 +798,34 @@ impl UploadChunkScheduler {
                                 if response.is_success() {
                                     info!("上传任务 {} 合并分片成功，文件创建完成", task_id);
 
+                                    // 🔥 清理持久化文件（任务完成）
+                                    if let Some(ref pm) = task_info.persistence_manager {
+                                        if let Err(e) = pm.lock().await.on_task_completed(&task_id)
+                                        {
+                                            error!("清理上传任务持久化文件失败: {}", e);
+                                        } else {
+                                            debug!("上传任务 {} 持久化文件已清理", task_id);
+                                        }
+                                    }
+
                                     // 标记完成并通知
                                     let group_id = {
                                         let mut t = task_info.task.lock().await;
                                         t.mark_completed();
                                         t.group_id.clone()
                                     };
+
+                                    // 🔥 发布任务完成事件
+                                    if let Some(ref ws_manager) = task_info.ws_manager {
+                                        ws_manager.send_if_subscribed(
+                                            TaskEvent::Upload(UploadEvent::Completed {
+                                                task_id: task_id.clone(),
+                                                completed_at: chrono::Utc::now().timestamp_millis(),
+                                                is_rapid_upload: false,
+                                            }),
+                                            None,
+                                        );
+                                    }
 
                                     if let Some(gid) = group_id {
                                         let tx_guard = task_completed_tx.read().await;
@@ -751,7 +841,26 @@ impl UploadChunkScheduler {
                                     error!("上传任务 {} {}", task_id, err_msg);
 
                                     let mut t = task_info.task.lock().await;
-                                    t.mark_failed(err_msg);
+                                    t.mark_failed(err_msg.clone());
+                                    drop(t);
+
+                                    // 🔥 发布任务失败事件
+                                    if let Some(ref ws_manager) = task_info.ws_manager {
+                                        ws_manager.send_if_subscribed(
+                                            TaskEvent::Upload(UploadEvent::Failed {
+                                                task_id: task_id.clone(),
+                                                error: err_msg.clone(),
+                                            }),
+                                            None,
+                                        );
+                                    }
+
+                                    // 🔥 更新持久化错误信息
+                                    if let Some(ref pm) = task_info.persistence_manager {
+                                        if let Err(e) = pm.lock().await.update_task_error(&task_id, err_msg) {
+                                            warn!("更新上传任务错误信息失败: {}", e);
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -759,14 +868,30 @@ impl UploadChunkScheduler {
                                 error!("上传任务 {} {}", task_id, err_msg);
 
                                 let mut t = task_info.task.lock().await;
-                                t.mark_failed(err_msg);
+                                t.mark_failed(err_msg.clone());
+                                drop(t);
+
+                                // 🔥 发布任务失败事件
+                                if let Some(ref ws_manager) = task_info.ws_manager {
+                                    ws_manager.send_if_subscribed(
+                                        TaskEvent::Upload(UploadEvent::Failed {
+                                            task_id: task_id.clone(),
+                                            error: err_msg.clone(),
+                                        }),
+                                        None,
+                                    );
+                                }
+
+                                // 🔥 更新持久化错误信息
+                                if let Some(ref pm) = task_info.persistence_manager {
+                                    if let Err(e) = pm.lock().await.update_task_error(&task_id, err_msg) {
+                                        warn!("更新上传任务错误信息失败: {}", e);
+                                    }
+                                }
                             }
                         }
                     } else {
-                        debug!(
-                            "上传任务 {} 合并分片已由其他位置触发，跳过 (回调)",
-                            task_id
-                        );
+                        debug!("上传任务 {} 合并分片已由其他位置触发，跳过 (回调)", task_id);
                     }
                 }
             }
@@ -784,7 +909,11 @@ impl UploadChunkScheduler {
 
         debug!(
             "[上传线程{}] 分片 #{} 开始上传 (范围: {}-{}, 大小: {} bytes)",
-            slot_id, chunk.index, chunk.range.start, chunk.range.end - 1, chunk_size
+            slot_id,
+            chunk.index,
+            chunk.range.start,
+            chunk.range.end - 1,
+            chunk_size
         );
 
         // 读取分片数据
@@ -821,7 +950,9 @@ impl UploadChunkScheduler {
                     // 记录速度
                     let elapsed_ms = start_time.elapsed().as_millis() as u64;
                     if elapsed_ms > 0 {
-                        task_info.server_health.record_chunk_speed(&server, chunk_size, elapsed_ms);
+                        task_info
+                            .server_health
+                            .record_chunk_speed(&server, chunk_size, elapsed_ms);
                     }
 
                     // 更新已上传字节数
@@ -836,6 +967,19 @@ impl UploadChunkScheduler {
                         cm.mark_completed(chunk.index, Some(response.md5.clone()));
                         (cm.completed_count(), cm.chunk_count())
                     };
+
+                    // 🔥 持久化回调：记录分片完成（带 MD5）
+                    if let Some(ref pm) = task_info.persistence_manager {
+                        pm.lock().await.on_chunk_completed_with_md5(
+                            &task_info.task_id,
+                            chunk.index,
+                            response.md5.clone(),
+                        );
+                        debug!(
+                            "[上传线程{}] 分片 #{} 已记录到持久化管理器",
+                            slot_id, chunk.index
+                        );
+                    }
 
                     // 计算速度
                     let speed = {
@@ -869,11 +1013,48 @@ impl UploadChunkScheduler {
                         if speed > 0 {
                             t.speed = speed;
                         }
+                        // 🔥 发布带节流的进度事件（每 200ms 最多发布一次）
+                        if let Some(ref ws_manager) = task_info.ws_manager {
+                            // 使用节流器控制发布频率
+                            let should_emit = task_info.progress_throttler.should_emit();
+
+                            if should_emit {
+                                let total_size = task_info.total_size;
+                                let progress = if total_size > 0 {
+                                    ( t.uploaded_size  as f64 / total_size as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                let (completed_chunks, total_chunks) = {
+                                    let manager = task_info.chunk_manager.lock().await;
+                                    (manager.completed_count(), manager.chunk_count())
+                                };
+
+                                ws_manager.send_if_subscribed(
+                                    TaskEvent::Upload(UploadEvent::Progress {
+                                        task_id: t.id.clone(),
+                                        uploaded_size: t.uploaded_size,
+                                        total_size,
+                                        speed,
+                                        progress,
+                                        completed_chunks,
+                                        total_chunks,
+                                    }),
+                                    None,
+                                );
+                            }
+                        }
+
                     }
 
                     info!(
                         "[上传线程{}] ✓ 分片 #{} 上传成功 ({}/{} 完成, 速度: {} KB/s)",
-                        slot_id, chunk.index, completed_chunks, total_chunks, speed / 1024
+                        slot_id,
+                        chunk.index,
+                        completed_chunks,
+                        total_chunks,
+                        speed / 1024
                     );
 
                     return Ok(response.md5);
@@ -893,7 +1074,12 @@ impl UploadChunkScheduler {
                         let backoff_ms = calculate_backoff_delay(retry, &error_kind);
                         warn!(
                             "[上传线程{}] 分片 #{} 上传失败，等待 {}ms 后重试 ({}/{}): {}",
-                            slot_id, chunk.index, backoff_ms, retry + 1, max_retries, e
+                            slot_id,
+                            chunk.index,
+                            backoff_ms,
+                            retry + 1,
+                            max_retries,
+                            e
                         );
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     }
@@ -946,7 +1132,7 @@ async fn read_chunk_data(local_path: &std::path::Path, chunk: &UploadChunk) -> R
 
         Ok(buffer)
     })
-    .await?
+        .await?
 }
 
 /// 错误分类
@@ -1014,7 +1200,10 @@ mod tests {
         assert_eq!(calculate_backoff_delay(10, &UploadErrorKind::Network), 5000);
 
         // 限流错误
-        assert_eq!(calculate_backoff_delay(0, &UploadErrorKind::RateLimited), 10000);
+        assert_eq!(
+            calculate_backoff_delay(0, &UploadErrorKind::RateLimited),
+            10000
+        );
     }
 
     #[tokio::test]

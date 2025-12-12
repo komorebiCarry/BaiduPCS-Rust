@@ -127,9 +127,7 @@ impl RapidUploadChecker {
     ///
     /// # 返回
     /// 每个文件的检查结果
-    pub async fn batch_calculate_hash(
-        paths: Vec<std::path::PathBuf>,
-    ) -> Vec<RapidCheckResult> {
+    pub async fn batch_calculate_hash(paths: Vec<std::path::PathBuf>) -> Vec<RapidCheckResult> {
         info!(
             "开始批量计算秒传哈希: {} 个文件 (顺序处理，无并发)",
             paths.len()

@@ -1,28 +1,41 @@
 <template>
-  <div class="transfers-container">
+  <div class="transfers-container" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
       <div class="header-left">
-        <h2>转存管理</h2>
+        <h2 v-if="!isMobile">转存管理</h2>
         <el-tag :type="activeCountType" size="large">
           {{ activeCount }} 个任务进行中
         </el-tag>
       </div>
       <div class="header-right">
-        <el-button type="primary" @click="showTransferDialog = true">
-          <el-icon><Share /></el-icon>
-          新建转存
-        </el-button>
-        <el-button @click="refreshTasks">
-          <el-icon><Refresh /></el-icon>
-          刷新
-        </el-button>
-        <el-button @click="handleClearCompleted" :disabled="completedCount === 0">
-          清除已完成 ({{ completedCount }})
-        </el-button>
-        <el-button @click="handleClearFailed" :disabled="failedCount === 0" type="danger" plain>
-          清除失败 ({{ failedCount }})
-        </el-button>
+        <template v-if="!isMobile">
+          <el-button type="primary" @click="showTransferDialog = true">
+            <el-icon><Share /></el-icon>
+            新建转存
+          </el-button>
+          <el-button @click="refreshTasks">
+            <el-icon><Refresh /></el-icon>
+            刷新
+          </el-button>
+          <el-button @click="handleClearCompleted" :disabled="completedCount === 0">
+            清除已完成 ({{ completedCount }})
+          </el-button>
+          <el-button @click="handleClearFailed" :disabled="failedCount === 0" type="danger" plain>
+            清除失败 ({{ failedCount }})
+          </el-button>
+        </template>
+        <template v-else>
+          <el-button type="primary" circle @click="showTransferDialog = true">
+            <el-icon><Share /></el-icon>
+          </el-button>
+          <el-button circle @click="refreshTasks">
+            <el-icon><Refresh /></el-icon>
+          </el-button>
+          <el-button circle @click="handleClearCompleted" :disabled="completedCount === 0">
+            <el-icon><Delete /></el-icon>
+          </el-button>
+        </template>
       </div>
     </div>
 
@@ -37,11 +50,11 @@
 
       <div v-else class="task-list">
         <el-card
-          v-for="task in tasks"
-          :key="task.id"
-          class="task-card"
-          :class="{ 'task-active': isActiveStatus(task.status) }"
-          shadow="hover"
+            v-for="task in tasks"
+            :key="task.id"
+            class="task-card"
+            :class="{ 'task-active': isActiveStatus(task.status) }"
+            shadow="hover"
         >
           <!-- 任务信息 -->
           <div class="task-header">
@@ -66,19 +79,19 @@
             <!-- 操作按钮 -->
             <div class="task-actions">
               <el-button
-                v-if="!isTerminalStatus(task.status)"
-                size="small"
-                type="danger"
-                @click="handleCancel(task)"
+                  v-if="!isTerminalStatus(task.status)"
+                  size="small"
+                  type="danger"
+                  @click="handleCancel(task)"
               >
                 <el-icon><CircleClose /></el-icon>
                 取消
               </el-button>
               <el-button
-                size="small"
-                type="danger"
-                plain
-                @click="handleDelete(task)"
+                  size="small"
+                  type="danger"
+                  plain
+                  @click="handleDelete(task)"
               >
                 <el-icon><Delete /></el-icon>
                 删除
@@ -89,9 +102,9 @@
           <!-- 进度条 -->
           <div class="task-progress" v-if="task.total_count > 0">
             <el-progress
-              :percentage="calculateTransferProgress(task)"
-              :status="getProgressStatus(task.status)"
-              :stroke-width="8"
+                :percentage="calculateTransferProgress(task)"
+                :status="getProgressStatus(task.status)"
+                :stroke-width="8"
             >
               <template #default="{ percentage }">
                 <span class="progress-text">{{ percentage.toFixed(1) }}%</span>
@@ -113,7 +126,19 @@
             </div>
             <div class="stat-item" v-if="task.download_task_ids.length > 0">
               <span class="stat-label">下载任务:</span>
-              <span class="stat-value">{{ task.download_task_ids.length }} 个</span>
+              <span class="stat-value">
+                {{ task.download_task_ids.length }} 个
+                <el-button
+                    size="small"
+                    type="primary"
+                    link
+                    @click="goToDownloadTask(task.download_task_ids[0])"
+                    style="margin-left: 8px"
+                >
+                  <el-icon><Document /></el-icon>
+                  查看下载
+                </el-button>
+              </span>
             </div>
             <div class="stat-item">
               <span class="stat-label">创建时间:</span>
@@ -130,9 +155,9 @@
             <el-collapse-item :title="`文件列表 (${task.file_list.length} 个)`" name="files">
               <div class="file-list">
                 <div
-                  v-for="file in task.file_list"
-                  :key="file.fs_id"
-                  class="file-item"
+                    v-for="file in task.file_list"
+                    :key="file.fs_id"
+                    class="file-item"
                 >
                   <el-icon>
                     <Folder v-if="file.is_dir" />
@@ -152,8 +177,8 @@
 
     <!-- 新建转存对话框 -->
     <TransferDialog
-      v-model="showTransferDialog"
-      @success="handleTransferSuccess"
+        v-model="showTransferDialog"
+        @success="handleTransferSuccess"
     />
   </div>
 </template>
@@ -169,6 +194,8 @@ import {
   Folder,
   Document,
 } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
+import { useIsMobile } from '@/utils/responsive'
 import {
   getAllTransfers,
   deleteTransfer,
@@ -183,6 +210,15 @@ import {
 } from '@/api/transfer'
 import { formatFileSize } from '@/api/file'
 import TransferDialog from '@/components/TransferDialog.vue'
+// 🔥 WebSocket 相关导入
+import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
+import type { TransferEvent } from '@/types/events'
+
+// 路由
+const router = useRouter()
+
+// 响应式检测
+const isMobile = useIsMobile()
 
 // 状态
 const loading = ref(false)
@@ -191,6 +227,11 @@ const showTransferDialog = ref(false)
 
 // 自动刷新定时器
 let refreshTimer: number | null = null
+// 🔥 WebSocket 事件订阅清理函数
+let unsubscribeTransfer: (() => void) | null = null
+let unsubscribeConnectionState: (() => void) | null = null
+// 🔥 WebSocket 连接状态
+const wsConnected = ref(false)
 
 // 是否为活跃状态
 function isActiveStatus(status: TransferStatus): boolean {
@@ -199,6 +240,11 @@ function isActiveStatus(status: TransferStatus): boolean {
 
 // 获取任务显示名称（优先显示文件名）
 function getTaskDisplayName(task: TransferTask): string {
+  // 🔥 优先使用后端返回的 file_name 字段（历史任务也能正确显示）
+  if (task.file_name) {
+    return task.file_name
+  }
+
   if (task.file_list.length === 0) {
     // 还没有获取到文件列表，显示简短链接
     const match = task.share_url.match(/\/s\/([a-zA-Z0-9_-]+)/)
@@ -229,13 +275,13 @@ const activeCount = computed(() => {
 
 const completedCount = computed(() => {
   return tasks.value.filter(task =>
-    task.status === 'completed' || task.status === 'transferred'
+      task.status === 'completed' || task.status === 'transferred'
   ).length
 })
 
 const failedCount = computed(() => {
   return tasks.value.filter(task =>
-    task.status === 'transfer_failed' || task.status === 'download_failed'
+      task.status === 'transfer_failed' || task.status === 'download_failed'
   ).length
 })
 
@@ -271,16 +317,27 @@ async function refreshTasks() {
 
 // 更新自动刷新状态
 function updateAutoRefresh() {
+  // 🔥 如果 WebSocket 已连接，不使用轮询（由 WebSocket 推送更新）
+  if (wsConnected.value) {
+    if (refreshTimer) {
+      console.log('[TransfersView] WebSocket 已连接，停止轮询')
+      clearInterval(refreshTimer)
+      refreshTimer = null
+    }
+    return
+  }
+
+  // 🔥 WebSocket 未连接时，回退到轮询模式
   if (hasActiveTasks.value) {
     if (!refreshTimer) {
-      console.log('启动转存任务自动刷新')
+      console.log('[TransfersView] WebSocket 未连接，启动轮询模式，活跃任务数:', activeCount.value)
       refreshTimer = window.setInterval(() => {
         refreshTasks()
-      }, 2000) // 每2秒刷新
+      }, 2000)
     }
   } else {
     if (refreshTimer) {
-      console.log('停止转存任务自动刷新')
+      console.log('[TransfersView] 停止轮询，当前任务数:', tasks.value.length)
       clearInterval(refreshTimer)
       refreshTimer = null
     }
@@ -291,13 +348,13 @@ function updateAutoRefresh() {
 async function handleCancel(task: TransferTask) {
   try {
     await ElMessageBox.confirm(
-      '确定要取消此转存任务吗？',
-      '取消确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        '确定要取消此转存任务吗？',
+        '取消确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await cancelTransfer(task.id)
@@ -315,13 +372,13 @@ async function handleCancel(task: TransferTask) {
 async function handleDelete(task: TransferTask) {
   try {
     await ElMessageBox.confirm(
-      '确定要删除此转存任务吗？',
-      '删除确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        '确定要删除此转存任务吗？',
+        '删除确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await deleteTransfer(task.id)
@@ -339,18 +396,18 @@ async function handleDelete(task: TransferTask) {
 async function handleClearCompleted() {
   try {
     await ElMessageBox.confirm(
-      `确定要清除所有已完成的转存任务吗？（共${completedCount.value}个）`,
-      '批量清除',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要清除所有已完成的转存任务吗？（共${completedCount.value}个）`,
+        '批量清除',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     // 逐个删除已完成的任务
     const completedTasks = tasks.value.filter(task =>
-      task.status === 'completed' || task.status === 'transferred'
+        task.status === 'completed' || task.status === 'transferred'
     )
 
     let successCount = 0
@@ -376,18 +433,18 @@ async function handleClearCompleted() {
 async function handleClearFailed() {
   try {
     await ElMessageBox.confirm(
-      `确定要清除所有失败的转存任务吗？（共${failedCount.value}个）`,
-      '批量清除',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要清除所有失败的转存任务吗？（共${failedCount.value}个）`,
+        '批量清除',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     // 逐个删除失败的任务
     const failedTasks = tasks.value.filter(task =>
-      task.status === 'transfer_failed' || task.status === 'download_failed'
+        task.status === 'transfer_failed' || task.status === 'download_failed'
     )
 
     let successCount = 0
@@ -415,9 +472,92 @@ function handleTransferSuccess(taskId: string) {
   refreshTasks()
 }
 
+// 🔥 跳转到关联的下载任务
+function goToDownloadTask(downloadTaskId: string) {
+  router.push({
+    name: 'Downloads',
+    query: { highlight: downloadTaskId }
+  })
+}
+
+// 🔥 处理转存事件
+function handleTransferEvent(event: TransferEvent) {
+  console.log('[TransfersView] 收到转存事件:', event.event_type, event.task_id)
+
+  switch (event.event_type) {
+    case 'created':
+      // 新任务创建，刷新列表
+      refreshTasks()
+      break
+    case 'status_changed':
+      // 状态变更
+      const statusIdx = tasks.value.findIndex(t => t.id === event.task_id)
+      if (statusIdx !== -1) {
+        tasks.value[statusIdx].status = event.new_status as TransferStatus
+      }
+      break
+    case 'completed':
+    case 'failed':
+      // 完成或失败，刷新列表
+      refreshTasks()
+      break
+    case 'deleted':
+      // 任务删除
+      tasks.value = tasks.value.filter(t => t.id !== event.task_id)
+      break
+  }
+}
+
+// 🔥 设置 WebSocket 订阅
+function setupWebSocketSubscriptions() {
+  const wsClient = getWebSocketClient()
+
+  // 🔥 订阅服务端转存事件
+  wsClient.subscribe(['transfer:*'])
+
+  unsubscribeTransfer = wsClient.onTransferEvent(handleTransferEvent)
+
+  unsubscribeConnectionState = wsClient.onConnectionStateChange((state: ConnectionState) => {
+    const wasConnected = wsConnected.value
+    wsConnected.value = state === 'connected'
+
+    console.log('[TransfersView] WebSocket 状态变化:', state, ', 是否连接:', wsConnected.value)
+
+    // 🔥 任何状态变化都检查轮询策略（包括 connecting 状态）
+    updateAutoRefresh()
+
+    // 🔥 WebSocket 重新连接成功时，刷新一次获取最新数据
+    if (!wasConnected && wsConnected.value) {
+      refreshTasks()
+    }
+  })
+
+  connectWebSocket()
+  console.log('[TransfersView] WebSocket 订阅已设置')
+}
+
+// 🔥 清理 WebSocket 订阅
+function cleanupWebSocketSubscriptions() {
+  const wsClient = getWebSocketClient()
+
+  // 🔥 取消服务端订阅
+  wsClient.unsubscribe(['transfer:*'])
+
+  if (unsubscribeTransfer) {
+    unsubscribeTransfer()
+    unsubscribeTransfer = null
+  }
+  if (unsubscribeConnectionState) {
+    unsubscribeConnectionState()
+    unsubscribeConnectionState = null
+  }
+  console.log('[TransfersView] WebSocket 订阅已清理')
+}
+
 // 组件挂载
 onMounted(() => {
   refreshTasks()
+  setupWebSocketSubscriptions()
 })
 
 // 组件卸载
@@ -426,6 +566,7 @@ onUnmounted(() => {
     clearInterval(refreshTimer)
     refreshTimer = null
   }
+  cleanupWebSocketSubscriptions()
 })
 </script>
 
@@ -627,5 +768,66 @@ onUnmounted(() => {
 
 :deep(.el-progress__text) {
   font-size: 12px !important;
+}
+
+// =====================
+// 移动端样式
+// =====================
+.is-mobile {
+  // 移动端高度适配（减去顶部栏60px和底部导航栏56px）
+  height: calc(100vh - 60px - 56px);
+
+  .toolbar {
+    padding: 12px 16px;
+
+    .header-left {
+      gap: 12px;
+    }
+  }
+
+  .task-container {
+    padding: 12px;
+  }
+
+  .task-list {
+    gap: 10px;
+  }
+
+  .task-header {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .task-actions {
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+
+  .task-title {
+    flex-wrap: wrap;
+
+    .share-url {
+      font-size: 14px;
+      max-width: 100%;
+    }
+  }
+
+  .task-path {
+    padding-left: 0;
+  }
+
+  .task-stats {
+    gap: 12px;
+
+    .stat-item {
+      font-size: 12px;
+    }
+  }
+
+  .file-collapse {
+    :deep(.el-collapse-item__header) {
+      font-size: 12px;
+    }
+  }
 }
 </style>

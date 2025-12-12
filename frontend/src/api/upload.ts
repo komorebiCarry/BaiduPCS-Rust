@@ -1,26 +1,5 @@
-import axios from 'axios'
-import { ElMessage } from 'element-plus'
-
-const apiClient = axios.create({
-  baseURL: '/api/v1',
-  timeout: 30000,
-})
-
-// 响应拦截器
-apiClient.interceptors.response.use(
-  (response) => {
-    const { code, message } = response.data
-    if (code !== 0) {
-      ElMessage.error(message || '请求失败')
-      return Promise.reject(new Error(message || '请求失败'))
-    }
-    return response.data.data
-  },
-  (error) => {
-    ElMessage.error(error.response?.data?.message || error.message || '网络错误')
-    return Promise.reject(error)
-  }
-)
+import { apiClient } from './client'
+import { formatFileSize as sharedFormatFileSize, formatSpeed as sharedFormatSpeed, formatETA as sharedFormatETA, extractFilename as sharedExtractFilename } from './utils'
 
 /// 任务状态
 export type UploadTaskStatus = 'pending' | 'uploading' | 'paused' | 'completed' | 'failed'
@@ -148,22 +127,11 @@ export function calculateProgress(task: UploadTask): number {
   return (task.uploaded_size / task.total_size) * 100
 }
 
-/**
- * 格式化文件大小
- */
-export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return '0 B'
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`
-}
-
-/**
- * 格式化速度
- */
-export function formatSpeed(bytesPerSec: number): string {
-  return `${formatFileSize(bytesPerSec)}/s`
-}
+// 重新导出共享工具函数，保持向后兼容
+export const formatFileSize = sharedFormatFileSize
+export const formatSpeed = sharedFormatSpeed
+export const formatETA = sharedFormatETA
+export const extractFilename = sharedExtractFilename
 
 /**
  * 计算剩余时间（秒）
@@ -174,27 +142,6 @@ export function calculateETA(task: UploadTask): number | null {
   }
   const remaining = task.total_size - task.uploaded_size
   return Math.floor(remaining / task.speed)
-}
-
-/**
- * 格式化剩余时间
- */
-export function formatETA(seconds: number | null): string {
-  if (seconds === null || seconds === 0) {
-    return '即将完成'
-  }
-
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  const secs = seconds % 60
-
-  if (hours > 0) {
-    return `${hours}小时${minutes}分钟`
-  } else if (minutes > 0) {
-    return `${minutes}分钟${secs}秒`
-  } else {
-    return `${secs}秒`
-  }
 }
 
 /**
@@ -225,10 +172,3 @@ export function getStatusType(status: UploadTaskStatus): 'success' | 'warning' |
   return typeMap[status] || 'info'
 }
 
-/**
- * 从文件名中提取文件名（去除路径）
- */
-export function extractFilename(path: string): string {
-  const parts = path.replace(/\\/g, '/').split('/')
-  return parts[parts.length - 1] || path
-}

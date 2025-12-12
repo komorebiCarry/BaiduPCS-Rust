@@ -1,14 +1,15 @@
 <template>
-  <div class="uploads-container">
+  <div class="uploads-container" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
-        <div class="header-left">
-          <h2>上传管理</h2>
-          <el-tag :type="activeCountType" size="large">
-            {{ activeCount }} 个任务进行中
-          </el-tag>
-        </div>
-        <div class="header-right">
+      <div class="header-left">
+        <h2 v-if="!isMobile">上传管理</h2>
+        <el-tag :type="activeCountType" size="large">
+          {{ activeCount }} 个任务进行中
+        </el-tag>
+      </div>
+      <div class="header-right">
+        <template v-if="!isMobile">
           <el-button @click="refreshTasks">
             <el-icon><Refresh /></el-icon>
             刷新
@@ -19,130 +20,139 @@
           <el-button @click="handleClearFailed" :disabled="failedCount === 0" type="danger" plain>
             清除失败 ({{ failedCount }})
           </el-button>
-        </div>
+        </template>
+        <template v-else>
+          <el-button circle @click="refreshTasks">
+            <el-icon><Refresh /></el-icon>
+          </el-button>
+          <el-button circle @click="handleClearCompleted" :disabled="completedCount === 0">
+            <el-icon><Delete /></el-icon>
+          </el-button>
+        </template>
+      </div>
     </div>
 
     <!-- 上传任务列表 -->
     <div class="task-container">
-        <el-empty v-if="!loading && uploadItems.length === 0" description="暂无上传任务">
-          <template #image>
-            <el-icon :size="80" color="#909399"><Upload /></el-icon>
-          </template>
-          <template #description>
-            <p>暂无上传任务</p>
-            <p style="font-size: 12px; color: #909399;">
-              前往「文件管理」页面点击"上传"按钮
-            </p>
-          </template>
-        </el-empty>
+      <el-empty v-if="!loading && uploadItems.length === 0" description="暂无上传任务">
+        <template #image>
+          <el-icon :size="80" color="#909399"><Upload /></el-icon>
+        </template>
+        <template #description>
+          <p>暂无上传任务</p>
+          <p style="font-size: 12px; color: #909399;">
+            前往「文件管理」页面点击"上传"按钮
+          </p>
+        </template>
+      </el-empty>
 
-        <div v-else class="task-list">
-          <el-card
+      <div v-else class="task-list">
+        <el-card
             v-for="item in uploadItems"
             :key="item.id"
             class="task-card"
             :class="{ 'task-active': item.status === 'uploading' }"
             shadow="hover"
-          >
-            <!-- 任务信息 -->
-            <div class="task-header">
-              <div class="task-info">
-                <div class="task-title">
-                  <el-icon :size="20" class="file-icon">
-                    <Upload />
-                  </el-icon>
-                  <span class="filename">{{ getFilename(item.local_path) }}</span>
-                  <el-tag :type="getStatusType(item.status)" size="small">
-                    {{ getStatusText(item.status) }}
-                  </el-tag>
-                  <!-- 秒传标识 -->
-                  <el-tag v-if="item.is_rapid_upload && item.status === 'completed'" type="success" size="small">
-                    <el-icon><CircleCheck /></el-icon>
-                    秒传
-                  </el-tag>
-                </div>
-                <div class="task-path">
-                  本地: {{ item.local_path }} → 网盘: {{ item.remote_path }}
-                </div>
+        >
+          <!-- 任务信息 -->
+          <div class="task-header">
+            <div class="task-info">
+              <div class="task-title">
+                <el-icon :size="20" class="file-icon">
+                  <Upload />
+                </el-icon>
+                <span class="filename">{{ getFilename(item.local_path) }}</span>
+                <el-tag :type="getStatusType(item.status)" size="small">
+                  {{ getStatusText(item.status) }}
+                </el-tag>
+                <!-- 秒传标识 -->
+                <el-tag v-if="item.is_rapid_upload && item.status === 'completed'" type="success" size="small">
+                  <el-icon><CircleCheck /></el-icon>
+                  秒传
+                </el-tag>
               </div>
+              <div class="task-path">
+                本地: {{ item.local_path }} → 网盘: {{ item.remote_path }}
+              </div>
+            </div>
 
-              <!-- 操作按钮 -->
-              <div class="task-actions">
-                <el-button
+            <!-- 操作按钮 -->
+            <div class="task-actions">
+              <el-button
                   v-if="item.status === 'uploading'"
                   size="small"
                   @click="handlePause(item)"
-                >
-                  <el-icon><VideoPause /></el-icon>
-                  暂停
-                </el-button>
-                <el-button
+              >
+                <el-icon><VideoPause /></el-icon>
+                暂停
+              </el-button>
+              <el-button
                   v-if="item.status === 'paused'"
                   size="small"
                   type="primary"
                   @click="handleResume(item)"
-                >
-                  <el-icon><VideoPlay /></el-icon>
-                  继续
-                </el-button>
-                <el-button
+              >
+                <el-icon><VideoPlay /></el-icon>
+                继续
+              </el-button>
+              <el-button
                   v-if="item.status === 'failed'"
                   size="small"
                   type="warning"
                   @click="handleResume(item)"
-                >
-                  <el-icon><RefreshRight /></el-icon>
-                  重试
-                </el-button>
-                <el-button
+              >
+                <el-icon><RefreshRight /></el-icon>
+                重试
+              </el-button>
+              <el-button
                   size="small"
                   type="danger"
                   @click="handleDelete(item)"
-                >
-                  <el-icon><Delete /></el-icon>
-                  删除
-                </el-button>
-              </div>
+              >
+                <el-icon><Delete /></el-icon>
+                删除
+              </el-button>
             </div>
+          </div>
 
-            <!-- 进度条 -->
-            <div class="task-progress">
-              <el-progress
+          <!-- 进度条 -->
+          <div class="task-progress">
+            <el-progress
                 :percentage="calculateProgress(item)"
                 :status="getProgressStatus(item.status)"
                 :stroke-width="8"
-              >
-                <template #default="{ percentage }">
-                  <span class="progress-text">{{ percentage.toFixed(1) }}%</span>
-                </template>
-              </el-progress>
-            </div>
+            >
+              <template #default="{ percentage }">
+                <span class="progress-text">{{ percentage.toFixed(1) }}%</span>
+              </template>
+            </el-progress>
+          </div>
 
-            <!-- 上传统计 -->
-            <div class="task-stats">
-              <div class="stat-item">
-                <span class="stat-label">已上传:</span>
-                <span class="stat-value">{{ formatFileSize(item.uploaded_size) }}</span>
-              </div>
-              <div class="stat-item">
-                <span class="stat-label">总大小:</span>
-                <span class="stat-value">{{ formatFileSize(item.total_size) }}</span>
-              </div>
-              <div class="stat-item" v-if="item.status === 'uploading'">
-                <span class="stat-label">速度:</span>
-                <span class="stat-value speed">{{ formatSpeed(item.speed) }}</span>
-              </div>
-              <div class="stat-item" v-if="item.status === 'uploading'">
-                <span class="stat-label">剩余时间:</span>
-                <span class="stat-value">{{ formatETA(calculateETA(item)) }}</span>
-              </div>
-              <div class="stat-item" v-if="item.error">
-                <span class="stat-label error">错误:</span>
-                <span class="stat-value error">{{ item.error }}</span>
-              </div>
+          <!-- 上传统计 -->
+          <div class="task-stats">
+            <div class="stat-item">
+              <span class="stat-label">已上传:</span>
+              <span class="stat-value">{{ formatFileSize(item.uploaded_size) }}</span>
             </div>
-          </el-card>
-        </div>
+            <div class="stat-item">
+              <span class="stat-label">总大小:</span>
+              <span class="stat-value">{{ formatFileSize(item.total_size) }}</span>
+            </div>
+            <div class="stat-item" v-if="item.status === 'uploading'">
+              <span class="stat-label">速度:</span>
+              <span class="stat-value speed">{{ formatSpeed(item.speed) }}</span>
+            </div>
+            <div class="stat-item" v-if="item.status === 'uploading'">
+              <span class="stat-label">剩余时间:</span>
+              <span class="stat-value">{{ formatETA(calculateETA(item)) }}</span>
+            </div>
+            <div class="stat-item" v-if="item.error">
+              <span class="stat-label error">错误:</span>
+              <span class="stat-value error">{{ item.error }}</span>
+            </div>
+          </div>
+        </el-card>
+      </div>
     </div>
   </div>
 </template>
@@ -177,6 +187,13 @@ import {
   CircleCheck,
   RefreshRight,
 } from '@element-plus/icons-vue'
+import {useIsMobile} from '@/utils/responsive'
+// 🔥 WebSocket 相关导入
+import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
+import type { UploadEvent } from '@/types/events'
+
+// 响应式检测
+const isMobile = useIsMobile()
 
 // 状态
 const loading = ref(false)
@@ -184,11 +201,16 @@ const uploadItems = ref<UploadTask[]>([])
 
 // 自动刷新定时器
 let refreshTimer: number | null = null
+// 🔥 WebSocket 事件订阅清理函数
+let unsubscribeUpload: (() => void) | null = null
+let unsubscribeConnectionState: (() => void) | null = null
+// 🔥 WebSocket 连接状态
+const wsConnected = ref(false)
 
 // 是否有活跃任务（需要实时刷新）
 const hasActiveTasks = computed(() => {
   return uploadItems.value.some(item =>
-    item.status === 'uploading' || item.status === 'pending'
+      item.status === 'uploading' || item.status === 'pending'
   )
 })
 
@@ -247,18 +269,27 @@ async function refreshTasks() {
 
 // 更新自动刷新状态
 function updateAutoRefresh() {
-  // 如果有活跃任务，启动或保持定时刷新
+  // 🔥 如果 WebSocket 已连接，不使用轮询（由 WebSocket 推送更新）
+  if (wsConnected.value) {
+    if (refreshTimer) {
+      console.log('[UploadsView] WebSocket 已连接，停止轮询')
+      clearInterval(refreshTimer)
+      refreshTimer = null
+    }
+    return
+  }
+
+  // 🔥 WebSocket 未连接时，回退到轮询模式
   if (hasActiveTasks.value) {
     if (!refreshTimer) {
-      console.log('启动自动刷新定时器，活跃任务数:', activeCount.value)
+      console.log('[UploadsView] WebSocket 未连接，启动轮询模式，活跃任务数:', activeCount.value)
       refreshTimer = window.setInterval(() => {
         refreshTasks()
-      }, 1000) // 上传每秒刷新一次
+      }, 1000)
     }
   } else {
-    // 没有活跃任务时，停止定时刷新
     if (refreshTimer) {
-      console.log('停止自动刷新定时器，当前任务数:', uploadItems.value.length)
+      console.log('[UploadsView] 停止轮询，当前任务数:', uploadItems.value.length)
       clearInterval(refreshTimer)
       refreshTimer = null
     }
@@ -291,13 +322,13 @@ async function handleResume(item: UploadTask) {
 async function handleDelete(item: UploadTask) {
   try {
     await ElMessageBox.confirm(
-      '确定要删除此上传任务吗？',
-      '删除确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        '确定要删除此上传任务吗？',
+        '删除确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await deleteUpload(item.id)
@@ -314,13 +345,13 @@ async function handleDelete(item: UploadTask) {
 async function handleClearCompleted() {
   try {
     await ElMessageBox.confirm(
-      `确定要清除所有已完成的任务吗？（共${completedCount.value}个）`,
-      '批量清除',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要清除所有已完成的任务吗？（共${completedCount.value}个）`,
+        '批量清除',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
     const count = await clearCompleted()
     ElMessage.success(`已清除 ${count} 个任务`)
@@ -336,13 +367,13 @@ async function handleClearCompleted() {
 async function handleClearFailed() {
   try {
     await ElMessageBox.confirm(
-      `确定要清除所有失败的任务吗？（共${failedCount.value}个）`,
-      '批量清除',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要清除所有失败的任务吗？（共${failedCount.value}个）`,
+        '批量清除',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
     const count = await clearFailed()
     ElMessage.success(`已清除 ${count} 个任务`)
@@ -354,9 +385,115 @@ async function handleClearFailed() {
   }
 }
 
+// 🔥 处理上传事件
+function handleUploadEvent(event: UploadEvent) {
+  console.log('[UploadsView] 收到上传事件:', event.event_type, event.task_id)
+
+  switch (event.event_type) {
+    case 'created':
+      // 新任务创建，刷新列表
+      refreshTasks()
+      break
+    case 'progress':
+      // 进度更新
+      const progressIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
+      if (progressIdx !== -1) {
+        uploadItems.value[progressIdx].uploaded_size = event.uploaded_size
+        uploadItems.value[progressIdx].total_size = event.total_size
+        uploadItems.value[progressIdx].speed = event.speed
+        if (event.completed_chunks !== undefined) {
+          uploadItems.value[progressIdx].completed_chunks = event.completed_chunks
+        }
+        if (event.total_chunks !== undefined) {
+          uploadItems.value[progressIdx].total_chunks = event.total_chunks
+        }
+      }
+      break
+    case 'status_changed':
+      // 状态变更
+      const statusIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
+      if (statusIdx !== -1) {
+        uploadItems.value[statusIdx].status = event.new_status as UploadTaskStatus
+      }
+      break
+    case 'completed':
+    case 'failed':
+      // 完成或失败，刷新列表获取最终状态
+      refreshTasks()
+      break
+    case 'paused':
+      // 任务暂停，直接更新状态
+      const pausedIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
+      if (pausedIdx !== -1) {
+        uploadItems.value[pausedIdx].status = 'paused'
+        uploadItems.value[pausedIdx].speed = 0
+      }
+      break
+    case 'resumed':
+      // 任务恢复，直接更新状态为 uploading
+      const resumedIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
+      if (resumedIdx !== -1) {
+        // 🔥 设为 uploading 而不是 pending，这样 UI 会显示速度和剩余时间
+        // 后续的 progress 事件会更新实际的速度值
+        uploadItems.value[resumedIdx].status = 'uploading'
+      }
+      break
+    case 'deleted':
+      uploadItems.value = uploadItems.value.filter(t => t.id !== event.task_id)
+      break
+  }
+}
+
+// 🔥 设置 WebSocket 订阅
+function setupWebSocketSubscriptions() {
+  const wsClient = getWebSocketClient()
+
+  // 🔥 订阅服务端上传事件
+  wsClient.subscribe(['upload:*'])
+
+  unsubscribeUpload = wsClient.onUploadEvent(handleUploadEvent)
+
+  unsubscribeConnectionState = wsClient.onConnectionStateChange((state: ConnectionState) => {
+    const wasConnected = wsConnected.value
+    wsConnected.value = state === 'connected'
+
+    console.log('[UploadsView] WebSocket 状态变化:', state, ', 是否连接:', wsConnected.value)
+
+    // 🔥 任何状态变化都检查轮询策略（包括 connecting 状态）
+    updateAutoRefresh()
+
+    // 🔥 WebSocket 重新连接成功时，刷新一次获取最新数据
+    if (!wasConnected && wsConnected.value) {
+      refreshTasks()
+    }
+  })
+
+  connectWebSocket()
+  console.log('[UploadsView] WebSocket 订阅已设置')
+}
+
+// 🔥 清理 WebSocket 订阅
+function cleanupWebSocketSubscriptions() {
+  const wsClient = getWebSocketClient()
+
+  // 🔥 取消服务端订阅
+  wsClient.unsubscribe(['upload:*'])
+
+  if (unsubscribeUpload) {
+    unsubscribeUpload()
+    unsubscribeUpload = null
+  }
+  if (unsubscribeConnectionState) {
+    unsubscribeConnectionState()
+    unsubscribeConnectionState = null
+  }
+  console.log('[UploadsView] WebSocket 订阅已清理')
+}
+
 // 组件挂载时加载任务列表
 onMounted(() => {
   refreshTasks()
+  setupWebSocketSubscriptions()
 })
 
 // 组件卸载时清除定时器
@@ -365,6 +502,7 @@ onUnmounted(() => {
     clearInterval(refreshTimer)
     refreshTimer = null
   }
+  cleanupWebSocketSubscriptions()
 })
 </script>
 
@@ -523,5 +661,62 @@ onUnmounted(() => {
 
 :deep(.el-progress__text) {
   font-size: 12px !important;
+}
+
+// =====================
+// 移动端样式
+// =====================
+.is-mobile {
+  // 移动端高度适配（减去顶部栏60px和底部导航栏56px）
+  height: calc(100vh - 60px - 56px);
+
+  .toolbar {
+    padding: 12px 16px;
+
+    .header-left {
+      gap: 12px;
+    }
+  }
+
+  .task-container {
+    padding: 12px;
+  }
+
+  .task-list {
+    gap: 10px;
+  }
+
+  .task-header {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .task-actions {
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+
+  .task-title {
+    flex-wrap: wrap;
+
+    .filename {
+      font-size: 14px;
+      max-width: 100%;
+    }
+  }
+
+  .task-path {
+    padding-left: 0;
+    word-break: break-all;
+    white-space: normal;
+  }
+
+  .task-stats {
+    gap: 12px;
+
+    .stat-item {
+      font-size: 12px;
+    }
+  }
 }
 </style>

@@ -1,6 +1,7 @@
 //! 文件夹下载数据结构
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -73,6 +74,22 @@ pub struct FolderDownload {
     pub completed_at: Option<i64>,
     /// 错误信息
     pub error: Option<String>,
+    /// 🔥 关联的转存任务 ID（如果此文件夹下载任务由转存任务自动创建）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_task_id: Option<String>,
+
+    // === 🔥 新增：任务位借调机制相关字段 ===
+    /// 固定任务位ID（文件夹主任务位）
+    #[serde(skip)]
+    pub fixed_slot_id: Option<usize>,
+
+    /// 借调任务位ID列表（用于子任务并行）
+    #[serde(skip)]
+    pub borrowed_slot_ids: Vec<usize>,
+
+    /// 正在使用借调位的子任务ID映射（task_id -> slot_id）
+    #[serde(skip)]
+    pub borrowed_subtask_map: HashMap<String, usize>,
 }
 
 impl FolderDownload {
@@ -103,6 +120,11 @@ impl FolderDownload {
             started_at: None,
             completed_at: None,
             error: None,
+            transfer_task_id: None,
+            // 任务位借调机制字段初始化
+            fixed_slot_id: None,
+            borrowed_slot_ids: Vec::new(),
+            borrowed_subtask_map: HashMap::new(),
         }
     }
 

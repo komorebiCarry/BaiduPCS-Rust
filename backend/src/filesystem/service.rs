@@ -33,18 +33,16 @@ impl FilesystemService {
 
         // 检查是否为目录
         if !path.is_dir() {
-            return Err(FsError::new(FsErrorCode::NotADirectory)
-                .with_path(req.path.clone()));
+            return Err(FsError::new(FsErrorCode::NotADirectory).with_path(req.path.clone()));
         }
 
         // 读取目录
-        let read_dir = fs::read_dir(&path)
-            .map_err(|e| {
-                tracing::error!("读取目录失败: {:?}, 错误: {}", path, e);
-                FsError::new(FsErrorCode::DirectoryReadFailed)
-                    .with_path(path.to_string_lossy().to_string())
-                    .with_message(format!("读取目录失败: {}", e))
-            })?;
+        let read_dir = fs::read_dir(&path).map_err(|e| {
+            tracing::error!("读取目录失败: {:?}, 错误: {}", path, e);
+            FsError::new(FsErrorCode::DirectoryReadFailed)
+                .with_path(path.to_string_lossy().to_string())
+                .with_message(format!("读取目录失败: {}", e))
+        })?;
 
         // 收集并过滤条目
         let mut entries: Vec<FileEntry> = read_dir
@@ -78,20 +76,23 @@ impl FilesystemService {
             .collect();
 
         // 计算父目录
-        let parent_path = path.parent().map(|p| {
-            #[cfg(target_os = "windows")]
-            {
-                // Windows 上，如果父目录是驱动器根目录的父目录，返回 None
-                if p.as_os_str().is_empty() {
-                    return None;
+        let parent_path = path
+            .parent()
+            .map(|p| {
+                #[cfg(target_os = "windows")]
+                {
+                    // Windows 上，如果父目录是驱动器根目录的父目录，返回 None
+                    if p.as_os_str().is_empty() {
+                        return None;
+                    }
+                    Some(p.to_string_lossy().to_string())
                 }
-                Some(p.to_string_lossy().to_string())
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                Some(p.to_string_lossy().to_string())
-            }
-        }).flatten();
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Some(p.to_string_lossy().to_string())
+                }
+            })
+            .flatten();
 
         Ok(ListResponse {
             entries: paginated,
@@ -303,8 +304,7 @@ impl FilesystemService {
         let root = PathBuf::from("/");
 
         if !root.exists() {
-            return Err(FsError::new(FsErrorCode::DirectoryNotFound)
-                .with_path("/"));
+            return Err(FsError::new(FsErrorCode::DirectoryNotFound).with_path("/"));
         }
 
         let metadata = fs::metadata(&root)
@@ -369,9 +369,10 @@ impl FilesystemService {
     /// 创建挂载点条目
     #[cfg(not(target_os = "windows"))]
     fn create_mount_entry(&self, path: &PathBuf, display_name: &str) -> Result<FileEntry, FsError> {
-        let metadata = fs::metadata(path)
-            .map_err(|_| FsError::new(FsErrorCode::DirectoryReadFailed)
-                .with_path(path.to_string_lossy().to_string()))?;
+        let metadata = fs::metadata(path).map_err(|_| {
+            FsError::new(FsErrorCode::DirectoryReadFailed)
+                .with_path(path.to_string_lossy().to_string())
+        })?;
 
         let created_at = metadata
             .created()
@@ -400,9 +401,10 @@ impl FilesystemService {
     /// 将 DirEntry 转换为 FileEntry
     fn to_file_entry(&self, entry: &DirEntry) -> Result<FileEntry, FsError> {
         let path = entry.path();
-        let metadata = entry.metadata()
-            .map_err(|_| FsError::new(FsErrorCode::PermissionDenied)
-                .with_path(path.to_string_lossy().to_string()))?;
+        let metadata = entry.metadata().map_err(|_| {
+            FsError::new(FsErrorCode::PermissionDenied)
+                .with_path(path.to_string_lossy().to_string())
+        })?;
 
         let name = entry.file_name().to_string_lossy().to_string();
 

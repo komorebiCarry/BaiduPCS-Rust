@@ -56,6 +56,20 @@ pub struct DownloadTask {
     /// 相对于根文件夹的路径，如 "科幻片/星际穿越.mp4"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relative_path: Option<String>,
+
+    // === 🔥 新增：跨任务跳转相关字段 ===
+    /// 关联的转存任务 ID（如果此下载任务由转存任务自动创建）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_task_id: Option<String>,
+
+    // === 🔥 新增：任务位借调机制相关字段 ===
+    /// 占用的槽位ID
+    #[serde(skip)]
+    pub slot_id: Option<usize>,
+
+    /// 是否使用借调位（而非固定位）
+    #[serde(skip)]
+    pub is_borrowed_slot: bool,
 }
 
 impl DownloadTask {
@@ -77,7 +91,17 @@ impl DownloadTask {
             group_id: None,
             group_root: None,
             relative_path: None,
+            // 转存任务关联字段默认为 None
+            transfer_task_id: None,
+            // 任务位借调机制字段初始化
+            slot_id: None,
+            is_borrowed_slot: false,
         }
+    }
+
+    /// 设置关联的转存任务 ID
+    pub fn set_transfer_task_id(&mut self, transfer_task_id: String) {
+        self.transfer_task_id = Some(transfer_task_id);
     }
 
     /// 创建带文件夹组信息的任务

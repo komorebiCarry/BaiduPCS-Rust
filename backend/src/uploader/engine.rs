@@ -111,7 +111,15 @@ impl UploadEngine {
         cancel_token: CancellationToken,
         vip_type: VipType,
     ) -> Self {
-        Self::with_max_retries(client, task, chunk_manager, server_health, cancel_token, vip_type, DEFAULT_MAX_RETRIES)
+        Self::with_max_retries(
+            client,
+            task,
+            chunk_manager,
+            server_health,
+            cancel_token,
+            vip_type,
+            DEFAULT_MAX_RETRIES,
+        )
     }
 
     /// 创建新的上传引擎（指定重试次数）
@@ -182,8 +190,12 @@ impl UploadEngine {
         }
 
         // 1. 计算 block_list（分片 MD5 数组，分片大小根据 VIP 等级动态计算）
-        info!("计算 block_list: {:?}, vip_type={:?}", local_path, self.vip_type);
-        let block_list = RapidUploadChecker::calculate_block_list(&local_path, self.vip_type).await?;
+        info!(
+            "计算 block_list: {:?}, vip_type={:?}",
+            local_path, self.vip_type
+        );
+        let block_list =
+            RapidUploadChecker::calculate_block_list(&local_path, self.vip_type).await?;
         info!("block_list 计算完成: {}", block_list);
 
         // 检查取消
@@ -210,7 +222,13 @@ impl UploadEngine {
 
         // 3. 执行普通分片上传
         self.task.lock().await.mark_uploading();
-        self.upload_with_chunks(&local_path, &remote_path, total_size, &block_list, &upload_id)
+        self.upload_with_chunks(
+            &local_path,
+            &remote_path,
+            total_size,
+            &block_list,
+            &upload_id,
+        )
             .await?;
 
         // 4. 标记完成
@@ -230,7 +248,7 @@ impl UploadEngine {
         remote_path: &str,
         total_size: u64,
         block_list: &str,
-        upload_id: &str
+        upload_id: &str,
     ) -> Result<()> {
         // 计算并发数（根据文件大小自适应）
         let max_concurrent = calculate_upload_task_max_chunks(total_size);
@@ -248,7 +266,8 @@ impl UploadEngine {
             block_list,
             upload_id,
             max_concurrent,
-        ).await?;
+        )
+            .await?;
 
         // 创建文件（合并分片）
         // ⚠️ 重要: create_file 也需要 block_list (4MB分片MD5),和上传的分片MD5无关
@@ -346,7 +365,8 @@ impl UploadEngine {
 
                             // 等待一个任务完成
                             if let Some(result) = join_set.join_next().await {
-                                self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await?;
+                                self.handle_chunk_result(result, &chunk_md5s, &active_chunks)
+                                    .await?;
                             }
 
                             // 重新获取分片
@@ -389,7 +409,8 @@ impl UploadEngine {
                             last_speed_time,
                             last_speed_bytes,
                             max_retries,
-                        ).await;
+                        )
+                            .await;
 
                         // 减少活跃分片计数
                         active_chunks_clone.fetch_sub(1, Ordering::SeqCst);
@@ -408,13 +429,15 @@ impl UploadEngine {
 
             // 非阻塞检查是否有任务完成
             while let Some(result) = join_set.try_join_next() {
-                self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await?;
+                self.handle_chunk_result(result, &chunk_md5s, &active_chunks)
+                    .await?;
             }
         }
 
         // 等待所有剩余任务完成
         while let Some(result) = join_set.join_next().await {
-            self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await?;
+            self.handle_chunk_result(result, &chunk_md5s, &active_chunks)
+                .await?;
         }
 
         info!("[并发上传] 所有 {} 个分片上传完成", chunk_count);
@@ -463,8 +486,8 @@ async fn read_chunk_data_standalone(local_path: &Path, chunk: &UploadChunk) -> R
     let size = (chunk.range.end - chunk.range.start) as usize;
 
     tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&local_path)
-            .context(format!("无法打开文件: {:?}", local_path))?;
+        let mut file =
+            std::fs::File::open(&local_path).context(format!("无法打开文件: {:?}", local_path))?;
         file.seek(SeekFrom::Start(start))?;
 
         let mut buffer = vec![0u8; size];
@@ -472,7 +495,7 @@ async fn read_chunk_data_standalone(local_path: &Path, chunk: &UploadChunk) -> R
 
         Ok(buffer)
     })
-    .await?
+        .await?
 }
 
 /// 错误分类（独立函数）
@@ -568,7 +591,13 @@ async fn upload_single_chunk(
         // 上传分片
         let start_time = std::time::Instant::now();
         match client
-            .upload_chunk(remote_path, upload_id, chunk.index, chunk_data.clone(), Some(&server))
+            .upload_chunk(
+                remote_path,
+                upload_id,
+                chunk.index,
+                chunk_data.clone(),
+                Some(&server),
+            )
             .await
         {
             Ok(response) => {
@@ -579,7 +608,8 @@ async fn upload_single_chunk(
                 }
 
                 // 更新已上传字节数（原子操作）
-                let new_uploaded = uploaded_bytes.fetch_add(chunk_size, Ordering::SeqCst) + chunk_size;
+                let new_uploaded =
+                    uploaded_bytes.fetch_add(chunk_size, Ordering::SeqCst) + chunk_size;
 
                 // 标记分片完成
                 let (completed_chunks, total_chunks) = {
@@ -708,26 +738,11 @@ mod tests {
     #[test]
     fn test_calculate_backoff_delay() {
         // 普通错误的退避延迟
-        assert_eq!(
-            calculate_backoff_delay(0, &UploadErrorKind::Network),
-            100
-        );
-        assert_eq!(
-            calculate_backoff_delay(1, &UploadErrorKind::Network),
-            200
-        );
-        assert_eq!(
-            calculate_backoff_delay(2, &UploadErrorKind::Network),
-            400
-        );
-        assert_eq!(
-            calculate_backoff_delay(3, &UploadErrorKind::Network),
-            800
-        );
-        assert_eq!(
-            calculate_backoff_delay(10, &UploadErrorKind::Network),
-            5000
-        ); // 超过最大值
+        assert_eq!(calculate_backoff_delay(0, &UploadErrorKind::Network), 100);
+        assert_eq!(calculate_backoff_delay(1, &UploadErrorKind::Network), 200);
+        assert_eq!(calculate_backoff_delay(2, &UploadErrorKind::Network), 400);
+        assert_eq!(calculate_backoff_delay(3, &UploadErrorKind::Network), 800);
+        assert_eq!(calculate_backoff_delay(10, &UploadErrorKind::Network), 5000); // 超过最大值
 
         // 限流错误使用更长的等待时间
         assert_eq!(

@@ -1,5 +1,5 @@
 <template>
-  <div class="files-container">
+  <div class="files-container" :class="{ 'is-mobile': isMobile }">
     <!-- 面包屑导航 -->
     <div class="breadcrumb-bar">
       <el-breadcrumb separator="/">
@@ -7,7 +7,7 @@
           <el-icon>
             <HomeFilled/>
           </el-icon>
-          根目录
+          <span v-if="!isMobile">根目录</span>
         </el-breadcrumb-item>
         <el-breadcrumb-item
             v-for="(part, index) in pathParts"
@@ -17,8 +17,9 @@
           {{ part }}
         </el-breadcrumb-item>
       </el-breadcrumb>
-      <div class="toolbar-buttons">
-        <!-- 批量下载按钮 -->
+
+      <!-- PC端工具栏 -->
+      <div v-if="!isMobile" class="toolbar-buttons">
         <el-button
             v-if="selectedFiles.length > 0"
             type="warning"
@@ -45,6 +46,31 @@
           刷新
         </el-button>
       </div>
+
+      <!-- 移动端工具栏（图标按钮） -->
+      <div v-else class="toolbar-buttons-mobile">
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="warning"
+            circle
+            :loading="batchDownloading"
+            @click="handleBatchDownload"
+        >
+          <el-icon><Download /></el-icon>
+        </el-button>
+        <el-button type="primary" circle @click="showCreateFolderDialog">
+          <el-icon><FolderAdd /></el-icon>
+        </el-button>
+        <el-button type="success" circle @click="showFilePicker = true">
+          <el-icon><Upload /></el-icon>
+        </el-button>
+        <el-button type="warning" circle @click="showTransferDialog = true">
+          <el-icon><Share /></el-icon>
+        </el-button>
+        <el-button type="primary" circle @click="refreshFileList">
+          <el-icon><Refresh /></el-icon>
+        </el-button>
+      </div>
     </div>
 
     <!-- FilePicker 文件选择器弹窗 -->
@@ -61,7 +87,9 @@
 
     <!-- 文件列表 -->
     <div class="file-list" ref="fileListRef" @scroll="handleScroll">
+      <!-- PC端表格视图 -->
       <el-table
+          v-if="!isMobile"
           v-loading="loading"
           :data="fileList"
           style="width: 100%"
@@ -119,6 +147,44 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <!-- 移动端卡片视图 -->
+      <div v-else class="mobile-file-list" v-loading="loading">
+        <div
+            v-for="item in fileList"
+            :key="item.fs_id"
+            class="mobile-file-card"
+            :class="{ 'is-folder': item.isdir === 1 }"
+            @click="handleRowClick(item)"
+        >
+          <div class="file-card-main">
+            <el-icon :size="36" class="file-card-icon" :color="item.isdir === 1 ? '#e6a23c' : '#409eff'">
+              <Folder v-if="item.isdir === 1"/>
+              <Document v-else/>
+            </el-icon>
+            <div class="file-card-info">
+              <div class="file-card-name">{{ item.server_filename }}</div>
+              <div class="file-card-meta">
+                <span v-if="item.isdir === 0">{{ formatFileSize(item.size) }}</span>
+                <span v-else>文件夹</span>
+                <span class="meta-divider">·</span>
+                <span>{{ formatTime(item.server_mtime) }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="file-card-action">
+            <el-button
+                type="primary"
+                size="small"
+                circle
+                :loading="item.isdir === 1 && downloadingFolders.has(item.path)"
+                @click.stop="item.isdir === 1 ? handleDownloadFolder(item) : handleDownload(item)"
+            >
+              <el-icon><Download /></el-icon>
+            </el-button>
+          </div>
+        </div>
+      </div>
 
       <!-- 加载更多提示 -->
       <div v-if="loadingMore" class="loading-more">
@@ -192,12 +258,16 @@
 import {ref, onMounted, computed} from 'vue'
 import {ElMessage} from 'element-plus'
 import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
+import {useIsMobile} from '@/utils/responsive'
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem} from '@/api/download'
 import {createUpload, createFolderUpload} from '@/api/upload'
 import {getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig, type UploadConfig} from '@/api/config'
 import {FilePickerModal} from '@/components/FilePicker'
 import TransferDialog from '@/components/TransferDialog.vue'
 import type {FileEntry} from '@/api/filesystem'
+
+// 响应式检测
+const isMobile = useIsMobile()
 
 // 下载配置状态
 const downloadConfig = ref<DownloadConfig | null>(null)
@@ -810,22 +880,19 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   padding: 16px 20px;
   border-bottom: 1px solid #e0e0e0;
   background: white;
+  gap: 12px;
 
-  .el-breadcrumb {
-    font-size: 14px;
-
-    :deep(.el-breadcrumb__item) {
-      cursor: pointer;
-
-      &:hover {
-        color: #409eff;
-      }
-    }
-  }
 
   .toolbar-buttons {
     display: flex;
     gap: 12px;
+    flex-shrink: 0;
+  }
+
+  .toolbar-buttons-mobile {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
   }
 }
 
@@ -878,6 +945,107 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
 :deep(.el-table__row) {
   &:hover .file-name {
     color: #409eff;
+  }
+}
+
+// =====================
+// 移动端样式
+// =====================
+.is-mobile {
+  // 移动端高度适配（减去顶部栏60px和底部导航栏56px）
+  height: calc(100vh - 60px - 56px);
+
+  .breadcrumb-bar {
+    padding: 12px 16px;
+    flex-wrap: wrap;
+  }
+
+  .file-list {
+    padding: 12px;
+  }
+}
+
+// 移动端卡片列表
+.mobile-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mobile-file-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #f9f9f9;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+
+  // 触摸反馈
+  &:active {
+    background: #f0f0f0;
+    transform: scale(0.98);
+  }
+
+  &.is-folder {
+    background: #fffbf0;
+
+    &:active {
+      background: #fff3d9;
+    }
+  }
+
+  .file-card-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .file-card-icon {
+    flex-shrink: 0;
+  }
+
+  .file-card-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .file-card-name {
+    font-size: 15px;
+    font-weight: 500;
+    color: #333;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 4px;
+  }
+
+  .file-card-meta {
+    font-size: 12px;
+    color: #909399;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+
+    .meta-divider {
+      color: #dcdfe6;
+    }
+  }
+
+  .file-card-action {
+    flex-shrink: 0;
+    margin-left: 12px;
+  }
+}
+
+// 移动端对话框适配
+@media (max-width: 767px) {
+  :deep(.el-dialog) {
+    width: 92% !important;
+    margin: 5vh auto !important;
   }
 }
 </style>

@@ -1,6 +1,7 @@
 // 文件API封装
 
 import axios from 'axios'
+import { formatFileSize as sharedFormatFileSize, formatTimestamp } from './utils'
 
 const apiClient = axios.create({
   baseURL: '/api/v1',
@@ -95,24 +96,7 @@ export async function createFolder(path: string): Promise<CreateFolderData> {
   return response.data.data
 }
 
-/**
- * 格式化文件大小
- */
-export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return '0 B'
-
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-
-  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i]
-}
-
-/**
- * 格式化时间
- */
-export function formatTime(timestamp: number): string {
-  const date = new Date(timestamp * 1000)
-  return date.toLocaleString('zh-CN')
-}
+// 重新导出共享工具函数，保持向后兼容
+export const formatFileSize = sharedFormatFileSize
+export const formatTime = formatTimestamp
 

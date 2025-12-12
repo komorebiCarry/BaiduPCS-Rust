@@ -109,8 +109,7 @@ impl MountDetector {
 
         mount_points.iter().any(|mount| {
             // 完全匹配或者是挂载点的子路径
-            mount.path == path_str.as_ref()
-                || path_str.starts_with(&format!("{}/", mount.path))
+            mount.path == path_str.as_ref() || path_str.starts_with(&format!("{}/", mount.path))
         })
     }
 
@@ -126,7 +125,9 @@ impl MountDetector {
         let mount_points = Self::get_mount_points();
         let path_str = path.to_string_lossy();
 
-        mount_points.iter().any(|mount| mount.path == path_str.as_ref())
+        mount_points
+            .iter()
+            .any(|mount| mount.path == path_str.as_ref())
     }
 
     /// 查找路径所在的挂载点
@@ -145,8 +146,7 @@ impl MountDetector {
         mount_points
             .into_iter()
             .filter(|mount| {
-                mount.path == path_str.as_ref()
-                    || path_str.starts_with(&format!("{}/", mount.path))
+                mount.path == path_str.as_ref() || path_str.starts_with(&format!("{}/", mount.path))
             })
             .max_by_key(|mount| mount.path.len())
     }

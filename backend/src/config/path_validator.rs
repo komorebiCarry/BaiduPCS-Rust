@@ -86,7 +86,10 @@ impl PathValidator {
         if !path.exists() {
             return PathValidationResult::failure(
                 "路径不存在".to_string(),
-                Some(format!("路径 {:?} 不存在，请确保路径正确或先创建该目录", path)),
+                Some(format!(
+                    "路径 {:?} 不存在，请确保路径正确或先创建该目录",
+                    path
+                )),
             );
         }
 
@@ -134,10 +137,7 @@ impl PathValidator {
                 "⚠️ Docker 环境检测到路径 {:?} 不是挂载点，数据可能无法持久化",
                 path
             );
-            tracing::warn!(
-                "建议使用 docker run -v /host/path:{:?} 挂载外部目录",
-                path
-            );
+            tracing::warn!("建议使用 docker run -v /host/path:{:?} 挂载外部目录", path);
         }
 
         // 验证通过
@@ -201,8 +201,7 @@ impl PathValidator {
     /// - Err: 创建失败
     pub fn ensure_directory_exists(path: &Path) -> Result<()> {
         if !path.exists() {
-            fs::create_dir_all(path)
-                .with_context(|| format!("无法创建目录: {:?}", path))?;
+            fs::create_dir_all(path).with_context(|| format!("无法创建目录: {:?}", path))?;
             tracing::info!("自动创建下载目录: {:?}", path);
         }
         Ok(())
@@ -260,10 +259,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path();
 
-        assert!(
-            PathValidator::check_writable(path),
-            "临时目录应该可写"
-        );
+        assert!(PathValidator::check_writable(path), "临时目录应该可写");
     }
 
     #[test]

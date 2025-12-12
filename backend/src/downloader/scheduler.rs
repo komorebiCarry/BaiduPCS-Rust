@@ -1,4 +1,9 @@
-use crate::downloader::{ChunkManager, DownloadEngine, DownloadTask, SpeedCalculator, UrlHealthManager};
+use crate::downloader::{
+    ChunkManager, DownloadEngine, DownloadTask, SpeedCalculator, UrlHealthManager,
+};
+use crate::persistence::PersistenceManager;
+use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
+use crate::server::websocket::WebSocketManager;
 use anyhow::Result;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -7,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// 🔥 根据文件大小计算单任务最大并发分片数
 ///
@@ -20,11 +25,11 @@ use tracing::{debug, error, info};
 /// 最大并发分片数
 pub fn calculate_task_max_chunks(file_size: u64) -> usize {
     match file_size {
-        0..=10_000_000 => 1,                    // <10MB: 单线程最好
-        10_000_001..=100_000_000 => 3,          // 10MB ~ 100MB: 稍微并发
-        100_000_001..=1_000_000_000 => 6,       // 100MB ~ 1GB: 并发6个
-        1_000_000_001..=5_000_000_000 => 10,    // 1GB ~ 5GB: 10线程
-        _ => 15,                                // >5GB: 15线程
+        0..=10_000_000 => 1,                 // <10MB: 单线程最好
+        10_000_001..=100_000_000 => 3,       // 10MB ~ 100MB: 稍微并发
+        100_000_001..=1_000_000_000 => 6,    // 100MB ~ 1GB: 并发6个
+        1_000_000_001..=5_000_000_000 => 10, // 1GB ~ 5GB: 10线程
+        _ => 15,                             // >5GB: 15线程
     }
 }
 
@@ -107,6 +112,30 @@ pub struct TaskScheduleInfo {
     // 🔥 任务级并发控制
     /// 单任务最大并发分片数（根据文件大小自动计算）
     pub max_concurrent_chunks: usize,
+
+    // 🔥 持久化支持
+    /// 持久化管理器引用（可选）
+    pub persistence_manager: Option<Arc<Mutex<PersistenceManager>>>,
+
+    // 🔥 WebSocket 管理器支持
+    /// WebSocket 管理器引用
+    pub ws_manager: Option<Arc<WebSocketManager>>,
+
+    // 🔥 进度事件节流器（200ms 间隔，避免事件风暴）
+    /// 任务级进度节流器，多个分片共享
+    pub progress_throttler: Arc<ProgressThrottler>,
+
+    // 🔥 文件夹进度通知发送器（由子任务进度变化触发）
+    /// 可选，仅文件夹子任务需要
+    pub folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
+
+    // 🔥 任务位借调机制相关字段
+    /// 占用的槽位ID（可选）
+    pub slot_id: Option<usize>,
+    /// 是否使用借调位（而非固定位）
+    pub is_borrowed_slot: bool,
+    /// 任务位池引用（用于释放槽位）
+    pub task_slot_pool: Option<Arc<crate::downloader::task_slot_pool::TaskSlotPool>>,
 }
 
 /// 全局分片调度器
@@ -131,8 +160,6 @@ pub struct ChunkScheduler {
     max_concurrent_tasks: Arc<AtomicUsize>,
     /// 调度器是否正在运行
     scheduler_running: Arc<AtomicBool>,
-    /// 预注册计数（正在探测但还未正式注册的任务数）
-    pre_register_count: Arc<AtomicUsize>,
     /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
     task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
     /// 🔥 等待队列触发器（任务完成时通知 DownloadManager 启动等待任务）
@@ -156,7 +183,6 @@ impl ChunkScheduler {
             slot_pool: Arc::new(ChunkSlotPool::new(max_global_threads)),
             max_concurrent_tasks: Arc::new(AtomicUsize::new(max_concurrent_tasks)),
             scheduler_running: Arc::new(AtomicBool::new(false)),
-            pre_register_count: Arc::new(AtomicUsize::new(0)),
             task_completed_tx: Arc::new(RwLock::new(None)),
             waiting_queue_trigger: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
@@ -193,19 +219,13 @@ impl ChunkScheduler {
     /// 该方法可以在运行时调整线程池大小，无需重启下载管理器
     pub fn update_max_threads(&self, new_max: usize) {
         let old_max = self.max_global_threads.swap(new_max, Ordering::SeqCst);
-        info!(
-            "🔧 动态调整全局最大线程数: {} -> {}",
-            old_max, new_max
-        );
+        info!("🔧 动态调整全局最大线程数: {} -> {}", old_max, new_max);
     }
 
     /// 动态更新最大并发任务数
     pub fn update_max_concurrent_tasks(&self, new_max: usize) {
         let old_max = self.max_concurrent_tasks.swap(new_max, Ordering::SeqCst);
-        info!(
-            "🔧 动态调整最大并发任务数: {} -> {}",
-            old_max, new_max
-        );
+        info!("🔧 动态调整最大并发任务数: {} -> {}", old_max, new_max);
     }
 
     /// 获取当前最大线程数
@@ -218,102 +238,23 @@ impl ChunkScheduler {
         self.active_chunk_count.load(Ordering::SeqCst)
     }
 
-    /// 预注册任务（在 spawn 探测前调用）
-    ///
-    /// 返回 true 表示预注册成功，可以开始探测
-    /// 返回 false 表示已达并发上限，不应启动探测
-    /// 预注册上限 = max_concurrent_tasks，避免探测占用下载带宽
-    pub async fn pre_register(&self) -> bool {
-        let max_tasks = self.max_concurrent_tasks.load(Ordering::SeqCst);
-        // 预注册上限 = max_tasks，不允许额外探测任务（避免探测占用下载带宽）
-        let pre_register_limit = max_tasks;
-        let registered_count = self.active_tasks.read().await.len();
-
-        loop {
-            let current_pre = self.pre_register_count.load(Ordering::SeqCst);
-            let total = registered_count + current_pre;
-
-            // 检查总数（已注册 + 预注册）是否超过预注册上限
-            if total >= pre_register_limit {
-                info!(
-                    "预注册失败：总数已达上限 (已注册:{} + 预注册:{} = {} >= {})",
-                    registered_count, current_pre, total, pre_register_limit
-                );
-                return false;
-            }
-
-            // CAS 操作，确保原子性
-            match self.pre_register_count.compare_exchange(
-                current_pre,
-                current_pre + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    info!(
-                        "预注册成功：已注册:{} + 预注册:{} -> {} (上限: {})",
-                        registered_count, current_pre, current_pre + 1, pre_register_limit
-                    );
-                    return true;
-                }
-                Err(_) => {
-                    // CAS 失败，重试
-                    continue;
-                }
-            }
-        }
-    }
-
-    /// 获取预注册余量（还能预注册多少个任务）
-    pub async fn pre_register_available(&self) -> usize {
-        let max_tasks = self.max_concurrent_tasks.load(Ordering::SeqCst);
-        let pre_register_limit = max_tasks;
-        let registered_count = self.active_tasks.read().await.len();
-        let current_pre = self.pre_register_count.load(Ordering::SeqCst);
-        let total = registered_count + current_pre;
-        pre_register_limit.saturating_sub(total)
-    }
-
-    /// 取消预注册（探测失败或被取消时调用）
-    pub fn cancel_pre_register(&self) {
-        let old = self.pre_register_count.fetch_sub(1, Ordering::SeqCst);
-        info!("取消预注册：预注册数 {} -> {}", old, old.saturating_sub(1));
-    }
-
-    /// 获取预注册计数
-    pub fn pre_register_count(&self) -> usize {
-        self.pre_register_count.load(Ordering::SeqCst)
-    }
-
     /// 注册任务到调度器
     ///
-    /// 注册成功后会自动减少预注册计数
-    /// 如果当前活跃任务数已达上限，返回错误（此时调用者需要调用 cancel_pre_register）
+    /// 将任务添加到活跃任务列表，不再限制并发数（由任务槽控制）
     pub async fn register_task(&self, task_info: TaskScheduleInfo) -> Result<()> {
         let task_id = task_info.task_id.clone();
-        let max_tasks = self.max_concurrent_tasks.load(Ordering::SeqCst);
 
-        // 检查是否超过最大并发任务数（双重检查，理论上预注册已确保）
-        {
-            let tasks = self.active_tasks.read().await;
-            if tasks.len() >= max_tasks {
-                // 注意：调用者需要调用 cancel_pre_register()
-                anyhow::bail!(
-                    "超过最大并发任务数限制 ({}/{})",
-                    tasks.len(),
-                    max_tasks
-                );
-            }
-        }
+        // 添加到活跃任务列表（不再检查并发上限，由任务槽控制）
+        self.active_tasks
+            .write()
+            .await
+            .insert(task_id.clone(), task_info);
 
-        // 添加到活跃任务列表
-        self.active_tasks.write().await.insert(task_id.clone(), task_info);
-
-        // 注册成功，减少预注册计数
-        let old_pre = self.pre_register_count.fetch_sub(1, Ordering::SeqCst);
+        let active_count = self.active_tasks.read().await.len();
         info!(
-            "任务 {} 已注册到调度器 (预注册数: {} -> {})",
-            task_id, old_pre, old_pre.saturating_sub(1)
+            "任务 {} 已注册到调度器 (当前活跃任务数: {})",
+            task_id,
+            active_count
         );
         Ok(())
     }
@@ -326,11 +267,9 @@ impl ChunkScheduler {
         }
     }
 
-    /// 获取活跃任务数量（包括已注册和预注册的任务）
+    /// 获取活跃任务数量（已注册的任务数）
     pub async fn active_task_count(&self) -> usize {
-        let registered = self.active_tasks.read().await.len();
-        let pre_registered = self.pre_register_count.load(Ordering::SeqCst);
-        registered + pre_registered
+        self.active_tasks.read().await.len()
     }
 
     /// 启动全局调度循环
@@ -496,7 +435,11 @@ impl ChunkScheduler {
 
                             debug!(
                                 "调度器选择: 任务 {} 分片 #{} (活跃线程: {}/{}, 本轮已调度: {})",
-                                task_id, chunk_index, new_active, max_threads, scheduled_count + 1
+                                task_id,
+                                chunk_index,
+                                new_active,
+                                max_threads,
+                                scheduled_count + 1
                             );
 
                             Self::spawn_chunk_download(
@@ -520,12 +463,49 @@ impl ChunkScheduler {
                                 info!("任务 {} 所有分片完成，从调度器移除", task_id);
                                 active_tasks.write().await.remove(task_id);
 
+                                // 🔥 修复：取消 cancellation_token，停止速度异常检测和线程停滞检测循环
+                                task_info.cancellation_token.cancel();
+                                debug!("任务 {} 的 cancellation_token 已取消", task_id);
+
                                 // 标记任务完成，并获取 group_id
                                 let group_id = {
                                     let mut t = task_info.task.lock().await;
                                     t.mark_completed();
                                     t.group_id.clone()
                                 };
+
+                                // 🔥 发布任务完成事件
+                                if let Some(ref ws_manager) = task_info.ws_manager {
+                                    ws_manager.send_if_subscribed(
+                                        TaskEvent::Download(DownloadEvent::Completed {
+                                            task_id: task_id.to_string(),
+                                            completed_at: chrono::Utc::now().timestamp_millis(),
+                                            group_id: group_id.clone(),
+                                        }),
+                                        group_id.clone(),
+                                    );
+                                }
+
+                                // 🔥 清理持久化文件（任务完成）
+                                if let Some(ref pm) = task_info.persistence_manager {
+                                    if let Err(e) = pm.lock().await.on_task_completed(task_id) {
+                                        error!("清理任务持久化文件失败: {}", e);
+                                    } else {
+                                        debug!("任务 {} 持久化文件已清理", task_id);
+                                    }
+                                }
+
+                                // 🔥 释放任务槽位（单文件任务释放固定位，借调位由 FolderManager 管理）
+                                if let Some(slot_id) = task_info.slot_id {
+                                    if !task_info.is_borrowed_slot {
+                                        // 单文件任务：释放固定位
+                                        if let Some(ref slot_pool) = task_info.task_slot_pool {
+                                            slot_pool.release_fixed_slot(task_id).await;
+                                            info!("任务 {} 完成，释放固定槽位 {}", task_id, slot_id);
+                                        }
+                                    }
+                                    // 借调位由 FolderManager 管理，这里不释放
+                                }
 
                                 // 如果是文件夹子任务，通知补充新任务
                                 if let Some(gid) = group_id {
@@ -598,7 +578,7 @@ impl ChunkScheduler {
                 slot_id, chunk_index
             );
 
-            // 调用 DownloadEngine 的下载方法
+            // 调用 DownloadEngine 的下载方法（传入事件总线和节流器）
             let result = DownloadEngine::download_chunk_with_retry(
                 chunk_index,
                 task_info.client.clone(),
@@ -613,6 +593,10 @@ impl ChunkScheduler {
                 task_info.total_size,
                 task_info.cancellation_token.clone(),
                 slot_id, // 传递槽位ID
+                task_info.ws_manager.clone(),
+                Some(task_info.progress_throttler.clone()),
+                task_id.clone(),
+                task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
             )
                 .await;
 
@@ -628,28 +612,69 @@ impl ChunkScheduler {
             info!("[分片线程{}] 分片 #{} 释放线程资源", slot_id, chunk_index);
 
             // 处理下载结果
-            if let Err(e) = result {
-                // 检查是否是因为取消而失败
-                if task_info.cancellation_token.is_cancelled() {
-                    info!("[分片线程{}] 分片 #{} 因任务取消而失败", slot_id, chunk_index);
-                } else {
-                    error!("[分片线程{}] 分片 #{} 下载失败: {}", slot_id, chunk_index, e);
-
-                    // 取消下载标记（允许重新调度）
-                    {
-                        let mut manager = task_info.chunk_manager.lock().await;
-                        manager.unmark_downloading(chunk_index);
+            match result {
+                Ok(()) => {
+                    // 🔥 分片下载成功，调用持久化回调
+                    if let Some(ref pm) = task_info.persistence_manager {
+                        pm.lock().await.on_chunk_completed(&task_id, chunk_index);
+                        debug!(
+                            "[分片线程{}] 分片 #{} 已记录到持久化管理器",
+                            slot_id, chunk_index
+                        );
                     }
 
-                    // 标记任务失败
-                    {
-                        let mut t = task_info.task.lock().await;
-                        t.mark_failed(e.to_string());
-                    }
+                    // 注意：进度事件已在流式回调中通过节流器发布，此处不再重复发布
+                }
+                Err(e) => {
+                    // 检查是否是因为取消而失败
+                    if task_info.cancellation_token.is_cancelled() {
+                        info!(
+                            "[分片线程{}] 分片 #{} 因任务取消而失败",
+                            slot_id, chunk_index
+                        );
+                    } else {
+                        error!(
+                            "[分片线程{}] 分片 #{} 下载失败: {}",
+                            slot_id, chunk_index, e
+                        );
 
-                    // 从调度器移除任务
-                    active_tasks.write().await.remove(&task_id);
-                    error!("任务 {} 因分片下载失败已从调度器移除", task_id);
+                        // 取消下载标记（允许重新调度）
+                        {
+                            let mut manager = task_info.chunk_manager.lock().await;
+                            manager.unmark_downloading(chunk_index);
+                        }
+
+                        // 标记任务失败，并获取 group_id
+                        let (error_msg, group_id) = {
+                            let mut t = task_info.task.lock().await;
+                            let err = e.to_string();
+                            t.mark_failed(err.clone());
+                            (err, t.group_id.clone())
+                        };
+
+                        // 🔥 发布任务失败事件
+                        if let Some(ref ws_manager) = task_info.ws_manager {
+                            ws_manager.send_if_subscribed(
+                                TaskEvent::Download(DownloadEvent::Failed {
+                                    task_id: task_id.clone(),
+                                    error: error_msg.clone(),
+                                    group_id: group_id.clone(),
+                                }),
+                                group_id,
+                            );
+                        }
+
+                        // 🔥 更新持久化错误信息
+                        if let Some(ref pm) = task_info.persistence_manager {
+                            if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
+                                warn!("更新下载任务错误信息失败: {}", e);
+                            }
+                        }
+
+                        // 从调度器移除任务
+                        active_tasks.write().await.remove(&task_id);
+                        error!("任务 {} 因分片下载失败已从调度器移除", task_id);
+                    }
                 }
             }
         });
@@ -726,4 +751,3 @@ impl ChunkScheduler {
         self.get_valid_task_speed_values().await.iter().sum()
     }
 }
-

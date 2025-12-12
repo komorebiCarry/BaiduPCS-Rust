@@ -280,17 +280,25 @@ mod tests {
 
     #[test]
     fn test_fs_error() {
-        let err = FsError::new(FsErrorCode::PathNotAllowed)
-            .with_path("/etc/passwd");
+        let err = FsError::new(FsErrorCode::PathNotAllowed).with_path("/etc/passwd");
         assert_eq!(err.code, FsErrorCode::PathNotAllowed);
         assert!(err.path.is_some());
     }
 
     #[test]
     fn test_icon_detection() {
-        assert_eq!(get_icon_for_extension(Path::new("test.jpg")), Some("image".to_string()));
-        assert_eq!(get_icon_for_extension(Path::new("video.mp4")), Some("video".to_string()));
-        assert_eq!(get_icon_for_extension(Path::new("code.rs")), Some("code".to_string()));
+        assert_eq!(
+            get_icon_for_extension(Path::new("test.jpg")),
+            Some("image".to_string())
+        );
+        assert_eq!(
+            get_icon_for_extension(Path::new("video.mp4")),
+            Some("video".to_string())
+        );
+        assert_eq!(
+            get_icon_for_extension(Path::new("code.rs")),
+            Some("code".to_string())
+        );
         assert_eq!(get_icon_for_extension(Path::new("unknown.xyz")), None);
     }
 }

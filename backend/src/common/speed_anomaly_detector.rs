@@ -30,8 +30,8 @@ impl Default for SpeedAnomalyConfig {
     fn default() -> Self {
         Self {
             baseline_establish_secs: 30,
-            speed_drop_threshold: 0.5,      // 下降50%
-            duration_threshold_secs: 10,    // 持续10秒
+            speed_drop_threshold: 0.5,   // 下降50%
+            duration_threshold_secs: 10, // 持续10秒
             check_interval_secs: 5,
             min_baseline_speed: 100 * 1024, // 至少100KB/s
         }
@@ -85,10 +85,7 @@ impl SpeedAnomalyDetector {
                 let baseline = current_speed.max(self.config.min_baseline_speed);
                 self.baseline_speed.store(baseline, Ordering::SeqCst);
                 self.baseline_established.store(1, Ordering::SeqCst);
-                info!(
-                    "📊 基线速度已建立: {:.2} KB/s",
-                    baseline as f64 / 1024.0
-                );
+                info!("📊 基线速度已建立: {:.2} KB/s", baseline as f64 / 1024.0);
             }
             return false; // 基线建立前不检测
         }
@@ -108,10 +105,9 @@ impl SpeedAnomalyDetector {
         // 3. 判断是否超过下降阈值
         if drop_ratio >= self.config.speed_drop_threshold {
             // 累计持续时间
-            let prev_duration = self.slow_duration_secs.fetch_add(
-                self.config.check_interval_secs,
-                Ordering::SeqCst,
-            );
+            let prev_duration = self
+                .slow_duration_secs
+                .fetch_add(self.config.check_interval_secs, Ordering::SeqCst);
             let new_duration = prev_duration + self.config.check_interval_secs;
 
             debug!(

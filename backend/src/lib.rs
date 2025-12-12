@@ -31,6 +31,12 @@ pub mod transfer;
 // 🔥 公共模块（CDN刷新检测机制等）
 pub mod common;
 
+// 🔥 任务持久化模块
+pub mod persistence;
+
+// 🔥 日志系统模块
+pub mod logging;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;
@@ -45,13 +51,16 @@ pub use uploader::{
 
 // 导出转存相关类型
 pub use transfer::{
-    TransferManager, TransferStatus, TransferTask, ShareLink, SharePageInfo,
-    SharedFileInfo, TransferError, TransferResult,
+    ShareLink, SharePageInfo, SharedFileInfo, TransferError, TransferManager, TransferResult,
+    TransferStatus, TransferTask,
 };
 
 // 🔥 导出CDN刷新相关类型
 pub use common::{
-    RefreshCoordinator, RefreshCoordinatorConfig,
-    SpeedAnomalyDetector, SpeedAnomalyConfig,
-    ThreadStagnationDetector, StagnationConfig,
+    RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, SpeedAnomalyDetector,
+    StagnationConfig, ThreadStagnationDetector,
 };
+
+// 🔥 导出持久化相关类型
+pub use config::PersistenceConfig;
+pub use persistence::{TaskMetadata, TaskPersistenceInfo, TaskType, WalRecord};

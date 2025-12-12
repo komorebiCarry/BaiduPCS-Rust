@@ -19,7 +19,16 @@ export default defineConfig({
       },
       '/ws': {
         target: 'ws://localhost:8080',
-        ws: true
+        ws: true,
+        changeOrigin: true,
+        // 去掉 /ws 前缀，转发为 /api/v1/ws
+        rewrite: (path) => path.replace(/^\/ws/, '')
+      },
+      // 兼容直接访问 /api/v1/ws（部分场景可能未走 /ws 前缀）
+      '/api/v1/ws': {
+        target: 'ws://localhost:8080',
+        ws: true,
+        changeOrigin: true
       }
     }
   }

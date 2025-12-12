@@ -1,18 +1,28 @@
 <template>
-  <div class="settings-container">
+  <div class="settings-container" :class="{ 'is-mobile': isMobile }">
     <el-container>
       <!-- 顶部标题 -->
       <el-header height="60px" class="header">
-        <h2>系统设置</h2>
+        <h2 v-if="!isMobile">系统设置</h2>
         <div class="header-actions">
-          <el-button @click="handleReset" :loading="resetting">
-            <el-icon><RefreshLeft /></el-icon>
-            恢复推荐配置
-          </el-button>
-          <el-button type="primary" @click="handleSave" :loading="saving">
-            <el-icon><Check /></el-icon>
-            保存设置
-          </el-button>
+          <template v-if="!isMobile">
+            <el-button @click="handleReset" :loading="resetting">
+              <el-icon><RefreshLeft /></el-icon>
+              恢复推荐配置
+            </el-button>
+            <el-button type="primary" @click="handleSave" :loading="saving">
+              <el-icon><Check /></el-icon>
+              保存设置
+            </el-button>
+          </template>
+          <template v-else>
+            <el-button circle @click="handleReset" :loading="resetting">
+              <el-icon><RefreshLeft /></el-icon>
+            </el-button>
+            <el-button type="primary" circle @click="handleSave" :loading="saving">
+              <el-icon><Check /></el-icon>
+            </el-button>
+          </template>
         </div>
       </el-header>
 
@@ -382,6 +392,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
+import { useIsMobile } from '@/utils/responsive'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended } from '@/api/config'
@@ -401,6 +412,9 @@ import {
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
 
 const configStore = useConfigStore()
+
+// 响应式检测
+const isMobile = useIsMobile()
 
 // 状态
 const loading = ref(false)
@@ -718,5 +732,76 @@ onMounted(() => {
 
 :deep(.el-slider__marks-text) {
   font-size: 11px;
+}
+
+// =====================
+// 移动端样式
+// =====================
+.is-mobile {
+  .header {
+    padding: 0 16px;
+
+    h2 {
+      font-size: 16px;
+    }
+  }
+
+  .el-main {
+    padding: 12px;
+  }
+
+  .setting-card {
+    margin-bottom: 12px;
+
+    :deep(.el-card__body) {
+      padding: 16px;
+    }
+
+    .card-header {
+      font-size: 14px;
+    }
+  }
+
+  // 表单标签垂直布局
+  :deep(.el-form-item) {
+    flex-direction: column;
+    align-items: flex-start;
+
+    .el-form-item__label {
+      width: 100% !important;
+      text-align: left;
+      padding-bottom: 8px;
+    }
+
+    .el-form-item__content {
+      width: 100%;
+    }
+  }
+
+  .form-tip {
+    font-size: 11px;
+  }
+
+  .value-display {
+    font-size: 12px;
+    text-align: left;
+
+    .recommend-hint {
+      display: block;
+      margin-left: 0;
+      margin-top: 4px;
+    }
+  }
+
+  .vip-info {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .about-content .about-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
 }
 </style>

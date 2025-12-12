@@ -9,10 +9,16 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./backend:/app
+      # 配置文件挂载
       - ./config:/app/config
+      # 下载目录挂载
       - ./downloads:/app/downloads
+      # 会话数据挂载
       - ./data:/app/data
+      # 日志目录挂载（新增）
+      - ./logs:/app/logs
+      # WAL 目录挂载（新增）
+      - ./wal:/app/wal
       - backend-cargo-cache:/usr/local/cargo/registry
     environment:
       - RUST_LOG=debug

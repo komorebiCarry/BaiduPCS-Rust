@@ -9,8 +9,8 @@ use axum::{
 use serde::Serialize;
 
 use crate::filesystem::{
-    FilesystemConfig, FilesystemService, FileEntry, FsError, FsErrorCode,
-    GotoRequest, GotoResponse, ListRequest, ListResponse, ValidateRequest, ValidateResponse,
+    FileEntry, FilesystemConfig, FilesystemService, FsError, FsErrorCode, GotoRequest,
+    GotoResponse, ListRequest, ListResponse, ValidateRequest, ValidateResponse,
 };
 use crate::server::state::AppState;
 

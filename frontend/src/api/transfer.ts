@@ -1,26 +1,7 @@
-import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { apiClientWithErrorCode } from './client'
+import { formatTimestampShort } from './utils'
 
-const apiClient = axios.create({
-  baseURL: '/api/v1',
-  timeout: 30000,
-})
-
-// 响应拦截器
-apiClient.interceptors.response.use(
-  (response) => {
-    const { code, message, data } = response.data
-    if (code !== 0) {
-      // 返回完整响应让调用方处理特殊错误码
-      return Promise.reject({ code, message, data })
-    }
-    return response.data.data
-  },
-  (error) => {
-    ElMessage.error(error.response?.data?.message || error.message || '网络错误')
-    return Promise.reject(error)
-  }
-)
+const apiClient = apiClientWithErrorCode
 
 // ============================================
 // 业务错误码
@@ -46,14 +27,14 @@ export const TransferErrorCodes = {
 
 /// 转存任务状态
 export type TransferStatus =
-  | 'queued'
-  | 'checking_share'
-  | 'transferring'
-  | 'transfer_failed'
-  | 'transferred'
-  | 'downloading'
-  | 'download_failed'
-  | 'completed'
+    | 'queued'
+    | 'checking_share'
+    | 'transferring'
+    | 'transfer_failed'
+    | 'transferred'
+    | 'downloading'
+    | 'download_failed'
+    | 'completed'
 
 /// 分享页面信息
 export interface SharePageInfo {
@@ -93,6 +74,8 @@ export interface TransferTask {
   failed_download_ids: string[]
   completed_download_ids: string[]
   download_started_at?: number
+  /** 🔥 新增：转存文件名称（用于展示，从分享文件列表中提取） */
+  file_name?: string
 }
 
 /// 创建转存任务请求
@@ -251,13 +234,4 @@ export function getShortShareUrl(url: string): string {
 /**
  * 格式化时间戳
  */
-export function formatTransferTime(timestamp: number): string {
-  if (!timestamp) return '-'
-  const date = new Date(timestamp * 1000)
-  return date.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
+export const formatTransferTime = formatTimestampShort

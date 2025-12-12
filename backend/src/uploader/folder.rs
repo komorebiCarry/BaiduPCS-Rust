@@ -96,10 +96,7 @@ impl FolderScanner {
         // 检查文件数量限制
         if let Some(max_files) = self.options.max_files {
             if files.len() >= max_files {
-                warn!(
-                    "已达到最大文件数量限制 ({}), 停止扫描",
-                    max_files
-                );
+                warn!("已达到最大文件数量限制 ({}), 停止扫描", max_files);
                 return Ok(());
             }
         }
@@ -109,9 +106,8 @@ impl FolderScanner {
             .with_context(|| format!("读取目录失败: {}", current_path.display()))?;
 
         for entry in entries {
-            let entry = entry.with_context(|| {
-                format!("读取目录条目失败: {}", current_path.display())
-            })?;
+            let entry =
+                entry.with_context(|| format!("读取目录条目失败: {}", current_path.display()))?;
 
             let path = entry.path();
             let file_name = entry.file_name();
@@ -132,7 +128,7 @@ impl FolderScanner {
             } else {
                 std::fs::symlink_metadata(&path)
             }
-            .with_context(|| format!("读取文件元数据失败: {}", path.display()))?;
+                .with_context(|| format!("读取文件元数据失败: {}", path.display()))?;
 
             if metadata.is_dir() {
                 // 递归扫描子目录
@@ -150,11 +146,7 @@ impl FolderScanner {
                 // 检查文件大小限制
                 if let Some(max_size) = self.options.max_file_size {
                     if size > max_size {
-                        warn!(
-                            "跳过超大文件: {} ({})",
-                            path.display(),
-                            format_bytes(size)
-                        );
+                        warn!("跳过超大文件: {} ({})", path.display(), format_bytes(size));
                         continue;
                     }
                 }
@@ -274,8 +266,10 @@ mod tests {
 
         assert!(relative_paths.contains(&"file1.txt"));
         assert!(relative_paths.contains(&"file2.txt"));
-        assert!(relative_paths.contains(&"subdir1/file3.txt") ||
-                relative_paths.contains(&"subdir1\\file3.txt"));
+        assert!(
+            relative_paths.contains(&"subdir1/file3.txt")
+                || relative_paths.contains(&"subdir1\\file3.txt")
+        );
     }
 
     #[test]
@@ -284,10 +278,7 @@ mod tests {
         let result = scanner.scan("/nonexistent/path");
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("扫描路径不存在"));
+        assert!(result.unwrap_err().to_string().contains("扫描路径不存在"));
     }
 
     #[test]
@@ -322,7 +313,11 @@ mod tests {
             println!("  - {:?}", file.relative_path);
         }
 
-        assert!(files.len() <= 3, "应该最多扫描3个文件，实际扫描到 {} 个", files.len());
+        assert!(
+            files.len() <= 3,
+            "应该最多扫描3个文件，实际扫描到 {} 个",
+            files.len()
+        );
     }
 
     #[test]

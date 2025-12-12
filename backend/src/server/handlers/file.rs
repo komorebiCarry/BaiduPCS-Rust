@@ -66,7 +66,10 @@ pub async fn get_file_list(
     let client = match client_lock.as_ref() {
         Some(c) => c,
         None => {
-            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 
@@ -134,7 +137,10 @@ pub async fn get_download_url(
     let client = match client_lock.as_ref() {
         Some(c) => c,
         None => {
-            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 
@@ -200,7 +206,10 @@ pub async fn create_folder(
     let client = match client_lock.as_ref() {
         Some(c) => c,
         None => {
-            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 

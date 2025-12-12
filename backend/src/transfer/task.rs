@@ -1,7 +1,7 @@
 // 转存任务定义
 
-use serde::{Deserialize, Serialize};
 use super::types::{SharePageInfo, SharedFileInfo};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// 转存任务状态
@@ -99,6 +99,11 @@ pub struct TransferTask {
     /// 进入 Downloading 状态的时间戳
     #[serde(default)]
     pub download_started_at: Option<i64>,
+
+    // === 🔥 新增：跨任务跳转相关字段 ===
+    /// 转存文件名称（用于展示，从分享文件列表中提取）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
 }
 
 impl TransferTask {
@@ -132,7 +137,14 @@ impl TransferTask {
             failed_download_ids: Vec::new(),
             completed_download_ids: Vec::new(),
             download_started_at: None,
+            file_name: None,
         }
+    }
+
+    /// 设置文件名称（用于展示）
+    pub fn set_file_name(&mut self, name: String) {
+        self.file_name = Some(name);
+        self.touch();
     }
 
     /// 更新时间戳

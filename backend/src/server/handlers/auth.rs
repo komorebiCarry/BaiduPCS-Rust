@@ -10,8 +10,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
 use std::sync::Arc;
+use tracing::{error, info, warn};
 
 /// 统一API响应格式
 #[derive(Debug, Serialize)]
@@ -85,7 +85,10 @@ pub async fn qrcode_status(
     {
         let mut session = state.session_manager.lock().await;
         if let Ok(Some(user)) = session.get_session().await {
-            info!("检测到已有持久化会话: UID={}, 验证 BDUSS 有效性...", user.uid);
+            info!(
+                "检测到已有持久化会话: UID={}, 验证 BDUSS 有效性...",
+                user.uid
+            );
 
             match state.qrcode_auth.verify_bduss(&user.bduss).await {
                 Ok(true) => {
@@ -200,10 +203,12 @@ pub async fn qrcode_status(
                         *state.download_manager.write().await = Some(Arc::clone(&manager_arc));
 
                         // 设置文件夹下载管理器的依赖
-                        state.folder_download_manager
+                        state
+                            .folder_download_manager
                             .set_download_manager(Arc::clone(&manager_arc))
                             .await;
-                        state.folder_download_manager
+                        state
+                            .folder_download_manager
                             .set_netdisk_client(client_arc)
                             .await;
 

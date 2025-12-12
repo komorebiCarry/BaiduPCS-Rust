@@ -1,26 +1,27 @@
 <template>
   <el-dialog
-    v-model="visible"
-    title="转存分享链接"
-    width="550px"
-    :close-on-click-modal="false"
-    @open="handleOpen"
-    @close="handleClose"
+      v-model="visible"
+      title="转存分享链接"
+      :width="isMobile ? '95%' : '550px'"
+      :close-on-click-modal="false"
+      @open="handleOpen"
+      @close="handleClose"
+      :class="{ 'is-mobile': isMobile }"
   >
     <el-form
-      ref="formRef"
-      :model="form"
-      :rules="rules"
-      label-width="100px"
-      @submit.prevent
+        ref="formRef"
+        :model="form"
+        :rules="rules"
+        label-width="100px"
+        @submit.prevent
     >
       <!-- 分享链接 -->
       <el-form-item label="分享链接" prop="shareUrl">
         <el-input
-          v-model="form.shareUrl"
-          placeholder="请粘贴百度网盘分享链接"
-          clearable
-          @paste="handlePaste"
+            v-model="form.shareUrl"
+            placeholder="请粘贴百度网盘分享链接"
+            clearable
+            @paste="handlePaste"
         >
           <template #prefix>
             <el-icon><Link /></el-icon>
@@ -34,12 +35,12 @@
       <!-- 提取码 -->
       <el-form-item label="提取码" prop="password">
         <el-input
-          v-model="form.password"
-          placeholder="如有提取码请输入（4位）"
-          maxlength="4"
-          show-word-limit
-          clearable
-          :class="{ 'password-error': passwordError }"
+            v-model="form.password"
+            placeholder="如有提取码请输入（4位）"
+            maxlength="4"
+            show-word-limit
+            clearable
+            :class="{ 'password-error': passwordError }"
         >
           <template #prefix>
             <el-icon><Key /></el-icon>
@@ -51,8 +52,8 @@
       <!-- 保存位置 -->
       <el-form-item label="保存到" prop="savePath">
         <NetdiskPathSelector
-          v-model="form.savePath"
-          v-model:fs-id="form.saveFsId"
+            v-model="form.savePath"
+            v-model:fs-id="form.saveFsId"
         />
       </el-form-item>
 
@@ -65,21 +66,21 @@
 
     <!-- 错误提示 -->
     <el-alert
-      v-if="errorMessage"
-      :title="errorMessage"
-      type="error"
-      show-icon
-      :closable="false"
-      class="error-alert"
+        v-if="errorMessage"
+        :title="errorMessage"
+        type="error"
+        show-icon
+        :closable="false"
+        class="error-alert"
     />
 
     <template #footer>
       <div class="dialog-footer">
         <el-button @click="handleClose">取消</el-button>
         <el-button
-          type="primary"
-          :loading="submitting"
-          @click="handleSubmit"
+            type="primary"
+            :loading="submitting"
+            @click="handleSubmit"
         >
           {{ submitting ? '转存中...' : '开始转存' }}
         </el-button>
@@ -89,14 +90,14 @@
 
   <!-- 下载目录选择弹窗 -->
   <FilePickerModal
-    v-model="showDownloadPicker"
-    mode="download"
-    select-type="directory"
-    title="选择下载目录"
-    :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory || downloadConfig?.download_dir"
-    :default-download-dir="downloadConfig?.default_directory || downloadConfig?.download_dir"
-    @confirm-download="handleConfirmDownload"
-    @use-default="handleUseDefaultDownload"
+      v-model="showDownloadPicker"
+      mode="download"
+      select-type="directory"
+      title="选择下载目录"
+      :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory || downloadConfig?.download_dir"
+      :default-download-dir="downloadConfig?.default_directory || downloadConfig?.download_dir"
+      @confirm-download="handleConfirmDownload"
+      @use-default="handleUseDefaultDownload"
   />
 </template>
 
@@ -104,8 +105,12 @@
 import { ref, reactive, watch, computed } from 'vue'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { Link, Key } from '@element-plus/icons-vue'
+import { useIsMobile } from '@/utils/responsive'
 import NetdiskPathSelector from './NetdiskPathSelector.vue'
 import { FilePickerModal } from '@/components/FilePicker'
+
+// 响应式检测
+const isMobile = useIsMobile()
 import {
   createTransfer,
   TransferErrorCodes,
@@ -439,5 +444,34 @@ watch(() => form.password, () => {
   display: flex;
   justify-content: flex-end;
   gap: 12px;
+}
+
+/* =====================
+   移动端样式适配
+   ===================== */
+@media (max-width: 767px) {
+  .is-mobile :deep(.el-form-item__label) {
+    font-size: 14px;
+  }
+
+  .is-mobile :deep(.el-input__inner) {
+    font-size: 15px;
+  }
+
+  .dialog-footer {
+    flex-direction: column;
+
+    .el-button {
+      width: 100%;
+    }
+  }
+
+  .form-tip {
+    font-size: 11px;
+  }
+
+  .switch-tip {
+    font-size: 12px;
+  }
 }
 </style>

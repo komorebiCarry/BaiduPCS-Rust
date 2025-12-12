@@ -86,8 +86,7 @@ impl Chunk {
         if let Some(referer_val) = referer {
             debug!(
                 "[分片线程{}] 分片 #{} 添加 Referer 请求头",
-                chunk_thread_id,
-                self.index
+                chunk_thread_id, self.index
             );
             request = request.header("Referer", referer_val);
         }
@@ -125,15 +124,15 @@ impl Chunk {
             let chunk_len = chunk_data.len() as u64;
 
             // 写入文件
-            file.write_all(&chunk_data)
-                .await
-                .context("写入文件失败")?;
+            file.write_all(&chunk_data).await.context("写入文件失败")?;
 
             total_bytes_downloaded += chunk_len;
             pending_progress += chunk_len;
 
             // 🔥 批量更新进度：累积到阈值或下载完成时才回调（大幅减少锁竞争）
-            if pending_progress >= PROGRESS_UPDATE_THRESHOLD || total_bytes_downloaded >= self.size() {
+            if pending_progress >= PROGRESS_UPDATE_THRESHOLD
+                || total_bytes_downloaded >= self.size()
+            {
                 progress_callback(pending_progress);
                 pending_progress = 0;
             }
@@ -150,9 +149,7 @@ impl Chunk {
         self.completed = true;
         debug!(
             "[分片线程{}] 分片 #{} 下载完成，大小: {} bytes",
-            chunk_thread_id,
-            self.index,
-            total_bytes_downloaded
+            chunk_thread_id, self.index, total_bytes_downloaded
         );
 
         Ok(total_bytes_downloaded)

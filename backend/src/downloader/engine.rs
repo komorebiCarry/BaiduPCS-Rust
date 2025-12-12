@@ -3,6 +3,8 @@ use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
 use crate::netdisk::NetdiskClient;
+use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
+use crate::server::websocket::WebSocketManager;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::future::join_all;
@@ -13,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -150,7 +152,7 @@ impl UrlHealthManager {
 
         Self {
             all_urls: urls,
-            additional_urls: Arc::new(DashMap::new()),  // 🔥 新增：动态链接存储
+            additional_urls: Arc::new(DashMap::new()), // 🔥 新增：动态链接存储
             weights,
             url_speeds,
             url_scores,
@@ -166,12 +168,21 @@ impl UrlHealthManager {
 
     /// 获取可用的链接数量（权重>0的链接，包括原始和动态添加的）
     pub fn available_count(&self) -> usize {
-        let original_count = self.weights.iter().filter(|entry| *entry.value() > 0).count();
+        let original_count = self
+            .weights
+            .iter()
+            .filter(|entry| *entry.value() > 0)
+            .count();
 
         // 计算动态添加链接中可用的数量
-        let additional_count = self.additional_urls.iter()
+        let additional_count = self
+            .additional_urls
+            .iter()
             .filter(|entry| {
-                self.weights.get(entry.key()).map(|w| *w > 0).unwrap_or(false)
+                self.weights
+                    .get(entry.key())
+                    .map(|w| *w > 0)
+                    .unwrap_or(false)
             })
             .count();
 
@@ -180,11 +191,10 @@ impl UrlHealthManager {
 
     /// 根据索引获取可用链接（跳过权重=0的链接）
     pub fn get_url(&self, index: usize) -> Option<&String> {
-        let available: Vec<&String> = self.all_urls
+        let available: Vec<&String> = self
+            .all_urls
             .iter()
-            .filter(|url| {
-                self.weights.get(*url).map(|w| *w > 0).unwrap_or(false)
-            })
+            .filter(|url| self.weights.get(*url).map(|w| *w > 0).unwrap_or(false))
             .collect();
 
         if available.is_empty() {
@@ -207,7 +217,8 @@ impl UrlHealthManager {
     /// 选中的 URL（克隆），如果无可用链接则返回 None
     pub fn get_url_hybrid(&self, chunk_index: usize) -> Option<String> {
         // 1. 获取所有可用链接及其综合权重（包括原始和动态添加的）
-        let mut available: Vec<(String, f64)> = self.all_urls
+        let mut available: Vec<(String, f64)> = self
+            .all_urls
             .iter()
             .filter_map(|url| {
                 let weight = self.weights.get(url).map(|w| *w)?;
@@ -216,7 +227,10 @@ impl UrlHealthManager {
                 }
 
                 // 速度：优先使用 EWMA，兜底使用探测速度
-                let speed = self.url_avg_speeds.get(url).map(|v| *v)
+                let speed = self
+                    .url_avg_speeds
+                    .get(url)
+                    .map(|v| *v)
                     .or_else(|| self.url_speeds.get(url).map(|v| *v))
                     .unwrap_or(0.0);
                 if speed <= 0.0 {
@@ -242,7 +256,10 @@ impl UrlHealthManager {
                 continue;
             }
 
-            let speed = self.url_avg_speeds.get(url).map(|v| *v)
+            let speed = self
+                .url_avg_speeds
+                .get(url)
+                .map(|v| *v)
                 .or_else(|| self.url_speeds.get(url).map(|v| *v))
                 .unwrap_or(0.0);
             if speed <= 0.0 {
@@ -263,7 +280,9 @@ impl UrlHealthManager {
         let total_weight: f64 = available.iter().map(|(_, w)| w).sum();
         if total_weight <= 0.0 {
             // 权重都是0，退回简单轮询
-            return available.get(chunk_index % available.len()).map(|(url, _)| url.clone());
+            return available
+                .get(chunk_index % available.len())
+                .map(|(url, _)| url.clone());
         }
 
         // 使用 chunk_index 计算在权重空间的位置
@@ -296,11 +315,10 @@ impl UrlHealthManager {
         }
 
         // 条件2：找到所有被禁用的链接，按 score 降序排列
-        let mut disabled: Vec<(&String, i32)> = self.all_urls
+        let mut disabled: Vec<(&String, i32)> = self
+            .all_urls
             .iter()
-            .filter(|url| {
-                self.weights.get(*url).map(|w| *w == 0).unwrap_or(true)
-            })
+            .filter(|url| self.weights.get(*url).map(|w| *w == 0).unwrap_or(true))
             .map(|url| {
                 let score = self.url_scores.get(url).map(|s| *s).unwrap_or(0);
                 (url, score)
@@ -346,7 +364,9 @@ impl UrlHealthManager {
         } else {
             // 🔧 修复数据混用：使用该链接的 EWMA，而非 global_avg_speed
             let url_string = url.to_string();
-            self.url_avg_speeds.get(&url_string).map(|v| *v)
+            self.url_avg_speeds
+                .get(&url_string)
+                .map(|v| *v)
                 .or_else(|| self.url_speeds.get(&url_string).map(|v| *v))
                 .unwrap_or(500.0) // 极端情况兜底
         };
@@ -356,12 +376,14 @@ impl UrlHealthManager {
         // 2. 🔥 先用旧窗口计算阈值（在加入新速度之前）
         // 阈值 = 该链接历史窗口median * 0.6
         // 这样可以判断"新速度是否相对历史表现异常"
-        let slow_threshold_opt = self.calculate_window_median(&url_string).map(|window_median| {
-            // 允许速度降低到窗口中位数的60%
-            // 窗口median 10 MB/s → 阈值 6 MB/s
-            // 窗口median 700 KB/s → 阈值 420 KB/s
-            window_median * 0.6
-        });
+        let slow_threshold_opt = self
+            .calculate_window_median(&url_string)
+            .map(|window_median| {
+                // 允许速度降低到窗口中位数的60%
+                // 窗口median 10 MB/s → 阈值 6 MB/s
+                // 窗口median 700 KB/s → 阈值 420 KB/s
+                window_median * 0.6
+            });
 
         // 3. 🔥 判断新速度是否异常（在加入窗口之前）
         // 只有在样本充足时才进行评分，避免前期误判
@@ -388,8 +410,13 @@ impl UrlHealthManager {
                         drop(weight); // 释放锁
 
                         // 设置下次探测时间 (当前时间 + cooldown)
-                        let cooldown = self.cooldown_secs.get(&url_string).map(|v| *v).unwrap_or(10);
-                        let next_time = std::time::Instant::now() + std::time::Duration::from_secs(cooldown);
+                        let cooldown = self
+                            .cooldown_secs
+                            .get(&url_string)
+                            .map(|v| *v)
+                            .unwrap_or(10);
+                        let next_time =
+                            std::time::Instant::now() + std::time::Duration::from_secs(cooldown);
                         self.next_probe_time.insert(url_string.clone(), next_time);
 
                         warn!(
@@ -419,7 +446,8 @@ impl UrlHealthManager {
         {
             // 确保窗口存在
             if !self.url_recent_speeds.contains_key(&url_string) {
-                self.url_recent_speeds.insert(url_string.clone(), StdMutex::new(VecDeque::new()));
+                self.url_recent_speeds
+                    .insert(url_string.clone(), StdMutex::new(VecDeque::new()));
             }
 
             // 获取窗口引用并更新
@@ -437,12 +465,18 @@ impl UrlHealthManager {
 
         // 6. 更新单链接 EWMA 速度（用于 timeout 计算，α=0.85）
         {
-            let mut sample_count_ref = self.url_sample_counts.entry(url_string.clone()).or_insert(0);
+            let mut sample_count_ref = self
+                .url_sample_counts
+                .entry(url_string.clone())
+                .or_insert(0);
             *sample_count_ref += 1;
             let sample_count = *sample_count_ref;
             drop(sample_count_ref);
 
-            let mut avg_ref = self.url_avg_speeds.entry(url_string.clone()).or_insert(speed_kbps);
+            let mut avg_ref = self
+                .url_avg_speeds
+                .entry(url_string.clone())
+                .or_insert(speed_kbps);
             if sample_count == 1 {
                 *avg_ref = speed_kbps;
             } else {
@@ -459,7 +493,8 @@ impl UrlHealthManager {
         } else {
             current_global_avg * 0.9 + speed_kbps * 0.1
         };
-        self.global_avg_speed.store(new_global_avg.to_bits(), Ordering::SeqCst);
+        self.global_avg_speed
+            .store(new_global_avg.to_bits(), Ordering::SeqCst);
 
         speed_kbps
     }
@@ -512,7 +547,8 @@ impl UrlHealthManager {
     /// - None: 样本不足，不应进行评分（前期保护）
     fn calculate_slow_threshold(&self) -> Option<f64> {
         // 计算所有链接的短期窗口 median（只包括样本充足的）
-        let medians: Vec<f64> = self.all_urls
+        let medians: Vec<f64> = self
+            .all_urls
             .iter()
             .filter_map(|url| self.calculate_window_median(url))
             .collect();
@@ -608,7 +644,11 @@ impl UrlHealthManager {
         let url_string = url.to_string();
 
         // 获取当前cooldown
-        let current_cooldown = self.cooldown_secs.get(&url_string).map(|v| *v).unwrap_or(10);
+        let current_cooldown = self
+            .cooldown_secs
+            .get(&url_string)
+            .map(|v| *v)
+            .unwrap_or(10);
 
         // 指数退避: cooldown * 2, 最大40秒
         let new_cooldown = (current_cooldown * 2).min(40);
@@ -650,11 +690,14 @@ impl UrlHealthManager {
         self.url_sample_counts.insert(url_string.clone(), 1);
 
         // 🔥 清空短期速度窗口，让链接重新积累数据
-        self.url_recent_speeds.insert(url_string.clone(), StdMutex::new(VecDeque::new()));
+        self.url_recent_speeds
+            .insert(url_string.clone(), StdMutex::new(VecDeque::new()));
 
         info!(
             "✅ 链接恢复: {} (新速度 {:.2} KB/s, score=50, 当前可用 {} 个链接)",
-            url, new_speed, self.available_count()
+            url,
+            new_speed,
+            self.available_count()
         );
     }
 
@@ -671,11 +714,14 @@ impl UrlHealthManager {
     /// 超时时间（秒），范围在 [30, 180] 之间
     pub fn calculate_timeout(&self, url: &str, chunk_size: u64) -> u64 {
         const SAFETY_FACTOR: f64 = 3.0; // 🔧 提高到3倍，减少超时噪声
-        const MIN_TIMEOUT: u64 = 30;    // 🔧 提高最小值到30秒
-        const MAX_TIMEOUT: u64 = 180;   // 最大3分钟
+        const MIN_TIMEOUT: u64 = 30; // 🔧 提高最小值到30秒
+        const MAX_TIMEOUT: u64 = 180; // 最大3分钟
 
         // 🔧 优先使用 EWMA 速度，兜底使用探测速度
-        let speed_kbps = self.url_avg_speeds.get(url).map(|v| *v)
+        let speed_kbps = self
+            .url_avg_speeds
+            .get(url)
+            .map(|v| *v)
             .or_else(|| self.url_speeds.get(url).map(|v| *v))
             .unwrap_or(500.0); // 保守兜底值
 
@@ -724,7 +770,8 @@ impl UrlHealthManager {
             self.cooldown_secs.insert(url.clone(), 10);
             // ⚠️ 修复问题2：使用 with_capacity(50) 与 new() 保持一致
             // 虽然 new() 中未显式使用 with_capacity，但保持一致性更安全
-            self.url_recent_speeds.insert(url.clone(), StdMutex::new(VecDeque::with_capacity(50)));
+            self.url_recent_speeds
+                .insert(url.clone(), StdMutex::new(VecDeque::with_capacity(50)));
 
             info!("🔗 添加新下载链接: {} (速度: {:.2} KB/s)", url, speed);
         }
@@ -735,13 +782,20 @@ impl UrlHealthManager {
     /// # 返回
     /// 所有可用链接列表（权重 > 0）
     pub fn all_available_urls(&self) -> Vec<String> {
-        let mut urls: Vec<String> = self.all_urls.iter()
+        let mut urls: Vec<String> = self
+            .all_urls
+            .iter()
             .filter(|u| self.weights.get(*u).map(|w| *w > 0).unwrap_or(false))
             .cloned()
             .collect();
 
         for entry in self.additional_urls.iter() {
-            if self.weights.get(entry.key()).map(|w| *w > 0).unwrap_or(false) {
+            if self
+                .weights
+                .get(entry.key())
+                .map(|w| *w > 0)
+                .unwrap_or(false)
+            {
                 urls.push(entry.key().clone());
             }
         }
@@ -851,14 +905,14 @@ impl DownloadEngine {
         task: Arc<Mutex<DownloadTask>>,
         cancellation_token: CancellationToken,
     ) -> Result<(
-        Client,                           // HTTP 客户端
-        String,                            // Cookie
-        Option<String>,                    // Referer 头
-        Arc<Mutex<UrlHealthManager>>,      // URL 健康管理器
-        PathBuf,                           // 本地路径
-        u64,                               // 分片大小
-        Arc<Mutex<ChunkManager>>,          // 分片管理器
-        Arc<Mutex<SpeedCalculator>>,       // 速度计算器
+        Client,                       // HTTP 客户端
+        String,                       // Cookie
+        Option<String>,               // Referer 头
+        Arc<Mutex<UrlHealthManager>>, // URL 健康管理器
+        PathBuf,                      // 本地路径
+        u64,                          // 分片大小
+        Arc<Mutex<ChunkManager>>,     // 分片管理器
+        Arc<Mutex<SpeedCalculator>>,  // 速度计算器
     )> {
         let (fs_id, remote_path, local_path, total_size) = {
             let t = task.lock().await;
@@ -933,7 +987,9 @@ impl DownloadEngine {
                     let total_size = total_size;
                     let global_idx = batch_start + batch_idx;
                     async move {
-                        let result = Self::probe_download_link_parallel(&client, &bduss, &url, total_size).await;
+                        let result =
+                            Self::probe_download_link_parallel(&client, &bduss, &url, total_size)
+                                .await;
                         (global_idx, url, result)
                     }
                 })
@@ -999,16 +1055,20 @@ impl DownloadEngine {
                     filtered_speeds.push(*speed);
                     info!("✓ 保留链接 #{}: {:.2} KB/s", idx, speed);
                 } else {
-                    warn!("✗ 淘汰慢速链接 #{}: {:.2} KB/s (低于阈值 {:.2} KB/s)",
-                          idx, speed, threshold);
+                    warn!(
+                        "✗ 淘汰慢速链接 #{}: {:.2} KB/s (低于阈值 {:.2} KB/s)",
+                        idx, speed, threshold
+                    );
                 }
             }
 
             if filtered_urls.is_empty() {
                 warn!("所有链接都被淘汰，保留速度最快的链接");
-                if let Some((idx, _)) = url_speeds.iter()
+                if let Some((idx, _)) = url_speeds
+                    .iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()) {
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                {
                     filtered_urls.push(valid_urls[idx].clone());
                     filtered_speeds.push(url_speeds[idx]);
                 }
@@ -1251,16 +1311,20 @@ impl DownloadEngine {
                     filtered_speeds.push(*speed);
                     info!("✓ 保留链接 #{}: {:.2} KB/s", idx, speed);
                 } else {
-                    warn!("✗ 淘汰慢速链接 #{}: {:.2} KB/s (低于阈值 {:.2} KB/s)",
-                          idx, speed, threshold);
+                    warn!(
+                        "✗ 淘汰慢速链接 #{}: {:.2} KB/s (低于阈值 {:.2} KB/s)",
+                        idx, speed, threshold
+                    );
                 }
             }
 
             if filtered_urls.is_empty() {
                 warn!("所有链接都被淘汰，保留速度最快的链接");
-                if let Some((idx, _)) = url_speeds.iter()
+                if let Some((idx, _)) = url_speeds
+                    .iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()) {
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                {
                     filtered_urls.push(valid_urls[idx].clone());
                     filtered_speeds.push(url_speeds[idx]);
                 }
@@ -1280,7 +1344,8 @@ impl DownloadEngine {
         let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls, url_speeds)));
 
         // 3.1 创建刷新协调器（防止并发刷新）
-        let refresh_coordinator = Arc::new(RefreshCoordinator::new(RefreshCoordinatorConfig::default()));
+        let refresh_coordinator =
+            Arc::new(RefreshCoordinator::new(RefreshCoordinatorConfig::default()));
 
         // 3.2 启动定时刷新循环（10分钟间隔）
         // 使用 Arc 包装 self 以便在 spawn 的任务中使用
@@ -1354,7 +1419,9 @@ impl DownloadEngine {
                                 &cookie_clone,
                                 &url,
                                 total_size,
-                            ).await {
+                            )
+                                .await
+                            {
                                 Ok(speed) => {
                                     let health = health_clone.lock().await;
                                     let threshold_opt = health.calculate_slow_threshold();
@@ -1649,7 +1716,11 @@ impl DownloadEngine {
             PROBE_SIZE - 1
         };
 
-        debug!("🔍 恢复探测链接: Range 0-{} ({} bytes)", probe_end, probe_end + 1);
+        debug!(
+            "🔍 恢复探测链接: Range 0-{} ({} bytes)",
+            probe_end,
+            probe_end + 1
+        );
 
         let start_time = std::time::Instant::now();
 
@@ -1680,7 +1751,9 @@ impl DownloadEngine {
 
         debug!(
             "✅ 恢复探测成功: 收到 {} bytes，耗时 {:.2}s，速度 {:.2} KB/s",
-            probe_data.len(), elapsed, speed_kbps
+            probe_data.len(),
+            elapsed,
+            speed_kbps
         );
 
         Ok(speed_kbps)
@@ -1729,10 +1802,7 @@ impl DownloadEngine {
             return Ok(0);
         }
 
-        info!(
-            "刷新链接: 获取到 {} 个链接，开始并行探测",
-            all_urls.len()
-        );
+        info!("刷新链接: 获取到 {} 个链接，开始并行探测", all_urls.len());
 
         // 2. ⚠️ 并行探测所有链接（修复问题1）
         let bduss = self.netdisk_client.bduss().to_string();
@@ -1746,8 +1816,7 @@ impl DownloadEngine {
                 let url = url.clone();
                 let cookie = cookie.clone();
                 async move {
-                    let result =
-                        Self::probe_for_restore(&client, &cookie, &url, total_size).await;
+                    let result = Self::probe_for_restore(&client, &cookie, &url, total_size).await;
                     (i, url, result)
                 }
             })
@@ -2145,7 +2214,12 @@ impl DownloadEngine {
     /// 使用 fs_lock 保护"检查取消状态+创建父目录"的原子操作，防止：
     /// 1. 删除文件夹与创建目录的竞态条件
     /// 2. 多个任务重复创建同一目录
-    async fn prepare_file(&self, path: &Path, size: u64, cancellation_token: &CancellationToken) -> Result<()> {
+    async fn prepare_file(
+        &self,
+        path: &Path,
+        size: u64,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
         // 🔒 加锁保护：检查取消状态 + 创建父目录
         {
             let _guard = self.fs_lock.lock().await;
@@ -2288,7 +2362,10 @@ impl DownloadEngine {
                 let permit = match global_semaphore.acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
-                        error!("分片 #{} 获取 semaphore permit 失败（semaphore 可能已关闭）", chunk_index);
+                        error!(
+                            "分片 #{} 获取 semaphore permit 失败（semaphore 可能已关闭）",
+                            chunk_index
+                        );
                         return Err(anyhow::anyhow!("获取线程池资源失败"));
                     }
                 };
@@ -2318,7 +2395,12 @@ impl DownloadEngine {
                     task.clone(),
                     timeout_secs,
                     total_size,
-                    cancellation_token, "usize".parse()?
+                    cancellation_token,
+                    "usize".parse()?,
+                    None, // ws_manager（独立模式不需要）
+                    None, // progress_throttler（独立模式不需要）
+                    String::new(), // task_id（独立模式不需要）
+                    None, // folder_progress_tx（独立模式不需要）
                 )
                     .await;
 
@@ -2340,7 +2422,7 @@ impl DownloadEngine {
         // 等待所有分片完成
         for handle in handles {
             match handle.await {
-                Ok(Ok(_)) => {}, // 分片下载成功
+                Ok(Ok(_)) => {} // 分片下载成功
                 Ok(Err(e)) => {
                     // 分片下载失败，检查是否是因为取消
                     if cancellation_token.is_cancelled() {
@@ -2393,6 +2475,10 @@ impl DownloadEngine {
     /// * `total_size` - 文件总大小（用于探测恢复链接）
     /// * `cancellation_token` - 取消令牌（用于中断下载）
     /// * `chunk_thread_id` - 分片线程ID（用于日志）
+    /// * `ws_manager` - WebSocket 管理器（可选，用于发布进度事件）
+    /// * `progress_throttler` - 进度节流器（可选，200ms 间隔）
+    /// * `task_id` - 任务 ID（用于进度事件）
+    /// * `folder_progress_tx` - 文件夹进度通知发送器（可选，仅文件夹子任务需要）
     pub async fn download_chunk_with_retry(
         chunk_index: usize,
         client: Client,
@@ -2404,9 +2490,13 @@ impl DownloadEngine {
         speed_calc: Arc<Mutex<SpeedCalculator>>,
         task: Arc<Mutex<DownloadTask>>,
         chunk_size: u64,
-        _total_size: u64, // 保留用于未来的健康检查循环
+        total_size: u64,
         cancellation_token: CancellationToken,
         chunk_thread_id: usize,
+        ws_manager: Option<Arc<WebSocketManager>>,
+        progress_throttler: Option<Arc<ProgressThrottler>>,
+        task_id: String,
+        folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<()> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
@@ -2417,7 +2507,10 @@ impl DownloadEngine {
         loop {
             // 检查任务是否已被取消
             if cancellation_token.is_cancelled() {
-                warn!("[分片线程{}] 分片 #{} 下载被取消", chunk_thread_id, chunk_index);
+                warn!(
+                    "[分片线程{}] 分片 #{} 下载被取消",
+                    chunk_thread_id, chunk_index
+                );
                 anyhow::bail!("分片下载已被取消");
             }
 
@@ -2444,7 +2537,8 @@ impl DownloadEngine {
                         warm_url.clone()
                     } else {
                         // 没有 warm 链接，使用加权选择
-                        health.get_url_hybrid(chunk_index)
+                        health
+                            .get_url_hybrid(chunk_index)
                             .or_else(|| {
                                 let url_index = chunk_index % count;
                                 health.get_url(url_index).map(|s| s.clone())
@@ -2457,7 +2551,8 @@ impl DownloadEngine {
                     // 2. 重试时：尝试下一个未尝试过的链接
                     if retries == 0 {
                         // 🔥 使用加权选择，兜底使用简单轮询
-                        health.get_url_hybrid(chunk_index)
+                        health
+                            .get_url_hybrid(chunk_index)
                             .or_else(|| {
                                 let url_index = chunk_index % count;
                                 health.get_url(url_index).map(|s| s.clone())
@@ -2490,12 +2585,7 @@ impl DownloadEngine {
 
             debug!(
                 "[分片线程{}] 分片 #{} 使用链接: {} (可用链接数: {}, 重试次数: {}, 超时: {}s)",
-                chunk_thread_id,
-                chunk_index,
-                current_url,
-                available_count,
-                retries,
-                timeout_secs
+                chunk_thread_id, chunk_index, current_url, available_count, retries, timeout_secs
             );
 
             // 获取分片信息
@@ -2504,27 +2594,68 @@ impl DownloadEngine {
                 manager.chunks_mut()[chunk_index].clone()
             };
 
-            // 创建进度回调闭包（实时更新任务进度和速度）
+            // 创建进度回调闭包（实时更新任务进度和速度，发布带节流的进度事件）
             let task_clone = task.clone();
             let speed_calc_clone = speed_calc.clone();
+            let ws_manager_clone = ws_manager.clone();
+            let throttler_clone = progress_throttler.clone();
+            let task_id_clone = task_id.clone();
+            let total_size_clone = total_size;
+            let folder_progress_tx_clone = folder_progress_tx.clone();
             let progress_callback = move |bytes: u64| {
                 // 使用 tokio::task::block_in_place 在同步闭包中执行异步操作
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        // 更新任务已下载大小
-                        {
+                        // 更新任务已下载大小，并获取 group_id
+                        let (downloaded_size, speed, group_id) = {
                             let mut t = task_clone.lock().await;
                             t.downloaded_size += bytes;
-                        }
+                            let downloaded = t.downloaded_size;
 
-                        // 更新速度计算器
-                        {
+                            // 更新速度计算器
                             let mut calc = speed_calc_clone.lock().await;
                             calc.add_sample(bytes);
-
-                            // 更新任务速度
-                            let mut t = task_clone.lock().await;
                             t.speed = calc.speed();
+
+                            (downloaded, t.speed, t.group_id.clone())
+                        };
+
+                        // 🔧 克隆一个临时变量用于 send
+                        let group_id_for_ws = group_id.clone();
+                        // 🔥 发布带节流的进度事件（每 200ms 最多发布一次）
+                        if let Some(ref ws) = ws_manager_clone {
+                            let should_emit = throttler_clone
+                                .as_ref()
+                                .map(|t| t.should_emit())
+                                .unwrap_or(true);
+
+                            if should_emit {
+                                let progress = if total_size_clone > 0 {
+                                    (downloaded_size as f64 / total_size_clone as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                // 🔥 如果是文件夹子任务（有 group_id），发送到 download:folder:{group_id} 订阅
+                                ws.send_if_subscribed(
+                                    TaskEvent::Download(DownloadEvent::Progress {
+                                        task_id: task_id_clone.clone(),
+                                        downloaded_size,
+                                        total_size: total_size_clone,
+                                        speed,
+                                        progress,
+                                        group_id: group_id.clone(),
+                                    }),
+                                    group_id_for_ws
+                                );
+
+                                // 🔥 如果是文件夹子任务，通知文件夹管理器发送聚合进度
+                                if let Some(ref group_id) = group_id {
+                                    if let Some(ref tx) = folder_progress_tx_clone {
+                                        let _ = tx.send(group_id.clone());
+                                    }
+                                }
+                            }
                         }
                     })
                 });
@@ -2558,7 +2689,8 @@ impl DownloadEngine {
                         let health = url_health.lock().await;
 
                         // 记录分片速度，可能触发链接降权或恢复
-                        let speed = health.record_chunk_speed(&current_url, bytes_downloaded, duration_ms);
+                        let speed =
+                            health.record_chunk_speed(&current_url, bytes_downloaded, duration_ms);
                         debug!(
                             "[分片线程{}] 分片 #{} 速度: {:.2} KB/s (耗时 {}ms)",
                             chunk_thread_id, chunk_index, speed, duration_ms
@@ -2591,11 +2723,13 @@ impl DownloadEngine {
                     if retries >= MAX_RETRIES || tried_urls.len() >= available_count {
                         error!(
                             "[分片线程{}] ✗ 分片 #{} 下载失败，已尝试 {} 个链接，重试 {} 次",
-                            chunk_thread_id, chunk_index, tried_urls.len(), retries
+                            chunk_thread_id,
+                            chunk_index,
+                            tried_urls.len(),
+                            retries
                         );
-                        return Err(last_error.unwrap_or_else(|| {
-                            anyhow::anyhow!("分片 #{} 下载失败", chunk_index)
-                        }));
+                        return Err(last_error
+                            .unwrap_or_else(|| anyhow::anyhow!("分片 #{} 下载失败", chunk_index)));
                     }
 
                     warn!(
@@ -2633,9 +2767,9 @@ mod tests {
             username: "test_user".to_string(),
             nickname: Some("测试用户".to_string()),
             avatar_url: Some("https://example.com/avatar.jpg".to_string()),
-            vip_type: Some(2), // SVIP
+            vip_type: Some(2),                                // SVIP
             total_space: Some(2 * 1024 * 1024 * 1024 * 1024), // 2TB
-            used_space: Some(500 * 1024 * 1024 * 1024), // 500GB
+            used_space: Some(500 * 1024 * 1024 * 1024),       // 500GB
             bduss: "mock_bduss".to_string(),
             stoken: Some("mock_stoken".to_string()),
             ptoken: Some("mock_ptoken".to_string()),

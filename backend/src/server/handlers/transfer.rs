@@ -102,7 +102,6 @@ pub async fn create_transfer(
     State(app_state): State<AppState>,
     Json(req): Json<CreateTransferRequest>,
 ) -> Json<TransferApiResponse<CreateTransferResponse>> {
-
     // 获取转存管理器
     let transfer_manager = {
         let guard = app_state.transfer_manager.read().await;
@@ -193,7 +192,7 @@ pub async fn get_all_transfers(
         guard.clone().ok_or(StatusCode::SERVICE_UNAVAILABLE)?
     };
 
-    let tasks = transfer_manager.get_all_tasks();
+    let tasks = transfer_manager.get_all_tasks().await;
     let total = tasks.len();
 
     Ok(Json(TransferApiResponse::success(TransferListResponse {
@@ -251,7 +250,7 @@ pub async fn delete_transfer(
         }
     };
 
-    match transfer_manager.remove_task(&task_id) {
+    match transfer_manager.remove_task(&task_id).await {
         Ok(()) => {
             info!("转存任务删除成功: {}", task_id);
             Json(TransferApiResponse::success("ok".to_string()))

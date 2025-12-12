@@ -29,6 +29,64 @@ pub struct AppConfig {
     /// 文件系统配置
     #[serde(default)]
     pub filesystem: FilesystemConfig,
+    /// 持久化配置
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
+    /// 🔥 日志配置
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+/// 日志配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// 是否启用日志文件持久化
+    #[serde(default = "default_log_enabled")]
+    pub enabled: bool,
+    /// 日志文件保存目录
+    #[serde(default = "default_log_dir")]
+    pub log_dir: PathBuf,
+    /// 日志保留天数（默认 7 天）
+    #[serde(default = "default_log_retention_days")]
+    pub retention_days: u32,
+    /// 日志级别（默认 info）
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// 单个日志文件最大大小（字节，默认 50MB）
+    #[serde(default = "default_log_max_file_size")]
+    pub max_file_size: u64,
+}
+
+fn default_log_enabled() -> bool {
+    true
+}
+
+fn default_log_dir() -> PathBuf {
+    PathBuf::from("logs")
+}
+
+fn default_log_retention_days() -> u32 {
+    7
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_max_file_size() -> u64 {
+    50 * 1024 * 1024 // 50MB
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_log_enabled(),
+            log_dir: default_log_dir(),
+            retention_days: default_log_retention_days(),
+            level: default_log_level(),
+            max_file_size: default_log_max_file_size(),
+        }
+    }
 }
 
 /// 服务器配置
@@ -119,16 +177,36 @@ pub struct CdnRefreshConfig {
 }
 
 // CDN刷新配置默认值函数
-fn default_cdn_refresh_enabled() -> bool { true }
-fn default_refresh_interval_minutes() -> u64 { 10 }
-fn default_min_refresh_interval_secs() -> u64 { 30 }
-fn default_speed_drop_threshold_percent() -> u64 { 50 }
-fn default_speed_drop_duration_secs() -> u64 { 10 }
-fn default_baseline_establish_secs() -> u64 { 30 }
-fn default_stagnation_threshold_kbps() -> u64 { 10 }
-fn default_stagnation_ratio_percent() -> u64 { 80 }
-fn default_min_threads_for_detection() -> usize { 3 }
-fn default_startup_delay_secs() -> u64 { 10 }
+fn default_cdn_refresh_enabled() -> bool {
+    true
+}
+fn default_refresh_interval_minutes() -> u64 {
+    10
+}
+fn default_min_refresh_interval_secs() -> u64 {
+    30
+}
+fn default_speed_drop_threshold_percent() -> u64 {
+    50
+}
+fn default_speed_drop_duration_secs() -> u64 {
+    10
+}
+fn default_baseline_establish_secs() -> u64 {
+    30
+}
+fn default_stagnation_threshold_kbps() -> u64 {
+    10
+}
+fn default_stagnation_ratio_percent() -> u64 {
+    80
+}
+fn default_min_threads_for_detection() -> usize {
+    3
+}
+fn default_startup_delay_secs() -> u64 {
+    10
+}
 
 impl Default for CdnRefreshConfig {
     fn default() -> Self {
@@ -154,7 +232,7 @@ impl CdnRefreshConfig {
             baseline_establish_secs: self.baseline_establish_secs,
             speed_drop_threshold: self.speed_drop_threshold_percent as f64 / 100.0,
             duration_threshold_secs: self.speed_drop_duration_secs,
-            check_interval_secs: 5, // 固定5秒检查一次
+            check_interval_secs: 5,         // 固定5秒检查一次
             min_baseline_speed: 100 * 1024, // 最小基线速度 100KB/s
         }
     }
@@ -204,11 +282,11 @@ impl Default for UploadConfig {
     fn default() -> Self {
         Self {
             max_global_threads: 10,
-            chunk_size_mb: 4,           // 百度网盘上传分片最小 4MB
+            chunk_size_mb: 4, // 百度网盘上传分片最小 4MB
             max_concurrent_tasks: 5,
             max_retries: 3,
-            skip_hidden_files: false,   // 默认不跳过隐藏文件
-            recent_directory: None,     // 默认无最近目录
+            skip_hidden_files: false, // 默认不跳过隐藏文件
+            recent_directory: None,   // 默认无最近目录
         }
     }
 }
@@ -268,6 +346,87 @@ impl Default for FilesystemConfig {
     }
 }
 
+/// 持久化配置
+///
+/// 用于配置任务持久化和恢复功能：
+/// - WAL (Write-Ahead Log) 日志，记录分片完成进度
+/// - 元数据持久化，记录任务基本信息
+/// - 断点恢复功能
+/// - 历史归档功能
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistenceConfig {
+    /// WAL 文件存储目录（相对于配置文件目录或绝对路径）
+    #[serde(default = "default_wal_dir")]
+    pub wal_dir: String,
+
+    /// WAL 批量刷写间隔（毫秒），默认 200ms
+    #[serde(default = "default_wal_flush_interval_ms")]
+    pub wal_flush_interval_ms: u64,
+
+    /// 启动时是否自动恢复任务
+    #[serde(default = "default_auto_recover_tasks")]
+    pub auto_recover_tasks: bool,
+
+    /// WAL 文件保留天数（超过此天数的未完成任务 WAL 将被清理）
+    #[serde(default = "default_wal_retention_days")]
+    pub wal_retention_days: u64,
+
+    /// 历史归档时间（小时，0-23，默认 2）
+    #[serde(default = "default_history_archive_hour")]
+    pub history_archive_hour: u8,
+
+    /// 历史归档时间（分钟，0-59，默认 0）
+    #[serde(default = "default_history_archive_minute")]
+    pub history_archive_minute: u8,
+
+    /// 历史任务保留天数（超过此天数的历史任务将被清理，默认 30 天）
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u64,
+}
+
+// PersistenceConfig 默认值函数
+fn default_wal_dir() -> String {
+    "wal".to_string()
+}
+
+fn default_wal_flush_interval_ms() -> u64 {
+    200
+}
+
+fn default_auto_recover_tasks() -> bool {
+    true
+}
+
+fn default_wal_retention_days() -> u64 {
+    7
+}
+
+fn default_history_archive_hour() -> u8 {
+    2
+}
+
+fn default_history_archive_minute() -> u8 {
+    0
+}
+
+fn default_history_retention_days() -> u64 {
+    30
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            wal_dir: default_wal_dir(),
+            wal_flush_interval_ms: default_wal_flush_interval_ms(),
+            auto_recover_tasks: default_auto_recover_tasks(),
+            wal_retention_days: default_wal_retention_days(),
+            history_archive_hour: default_history_archive_hour(),
+            history_archive_minute: default_history_archive_minute(),
+            history_retention_days: default_history_retention_days(),
+        }
+    }
+}
+
 /// VIP 类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VipType {
@@ -293,8 +452,8 @@ impl VipType {
     pub fn max_chunk_size_mb(&self) -> u64 {
         match self {
             VipType::Normal => 4, // 普通用户最高 4MB
-            VipType::Vip => 4,   // 普通会员最高 4MB
-            VipType::Svip => 5,  // SVIP 最高 5MB
+            VipType::Vip => 4,    // 普通会员最高 4MB
+            VipType::Svip => 5,   // SVIP 最高 5MB
         }
     }
 }
@@ -345,10 +504,8 @@ impl DownloadConfig {
         let env_info = EnvDetector::get_env_info();
 
         // 使用 PathValidator 进行增强验证（带 Docker 检查）
-        let result = PathValidator::validate_with_docker_check(
-            &self.download_dir,
-            env_info.is_docker,
-        );
+        let result =
+            PathValidator::validate_with_docker_check(&self.download_dir, env_info.is_docker);
 
         Ok(result)
     }
@@ -415,9 +572,9 @@ impl DownloadConfig {
     pub fn recommended_for_vip(vip_type: VipType) -> VipRecommendedConfig {
         match vip_type {
             VipType::Normal => VipRecommendedConfig {
-                threads: 1,           // ⚠️ 普通用户只能1个线程！
-                chunk_size: 4,        // 4MB 分片
-                max_tasks: 1,         // 只能下载1个文件
+                threads: 1,    // ⚠️ 普通用户只能1个线程！
+                chunk_size: 4, // 4MB 分片
+                max_tasks: 1,  // 只能下载1个文件
                 file_size_limit_gb: 4,
             },
             VipType::Vip => VipRecommendedConfig {
@@ -534,6 +691,8 @@ impl Default for AppConfig {
             upload: UploadConfig::default(),
             transfer: TransferConfig::default(),
             filesystem: FilesystemConfig::default(),
+            persistence: PersistenceConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -556,7 +715,9 @@ impl AppConfig {
         let config: AppConfig = toml::from_str(&content).context("Failed to parse config file")?;
 
         // 验证下载路径是否为绝对路径
-        config.download.validate_download_dir()
+        config
+            .download
+            .validate_download_dir()
             .context("配置文件中的下载路径验证失败")?;
 
         Ok(config)
@@ -575,11 +736,14 @@ impl AppConfig {
     /// - Err: 保存失败
     pub async fn save_to_file(&self, path: &str) -> Result<PathValidationResult> {
         // 1. 验证下载路径格式（绝对路径）
-        self.download.validate_download_dir()
+        self.download
+            .validate_download_dir()
             .context("保存配置失败：下载路径必须是绝对路径")?;
 
         // 2. 增强验证（存在性、可写性、可用空间）
-        let validation_result = self.download.validate_download_dir_enhanced()
+        let validation_result = self
+            .download
+            .validate_download_dir_enhanced()
             .context("保存配置失败：路径验证失败")?;
 
         // 3. 路径必须存在且有效

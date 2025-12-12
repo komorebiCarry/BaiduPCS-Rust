@@ -140,10 +140,8 @@ impl PcsServerHealthManager {
                 self.server_sample_counts.insert(server.clone(), 0);
                 self.server_scores.insert(server.clone(), 50);
                 self.cooldown_secs.insert(server.clone(), 10);
-                self.server_recent_speeds.insert(
-                    server.clone(),
-                    StdMutex::new(VecDeque::new()),
-                );
+                self.server_recent_speeds
+                    .insert(server.clone(), StdMutex::new(VecDeque::new()));
                 info!("添加新上传服务器: {}", server);
             }
         }
@@ -151,16 +149,18 @@ impl PcsServerHealthManager {
 
     /// 获取可用的服务器数量（权重>0的服务器）
     pub fn available_count(&self) -> usize {
-        self.weights.iter().filter(|entry| *entry.value() > 0).count()
+        self.weights
+            .iter()
+            .filter(|entry| *entry.value() > 0)
+            .count()
     }
 
     /// 根据索引获取可用服务器（跳过权重=0的服务器）
     pub fn get_server(&self, index: usize) -> Option<&String> {
-        let available: Vec<&String> = self.all_servers
+        let available: Vec<&String> = self
+            .all_servers
             .iter()
-            .filter(|server| {
-                self.weights.get(*server).map(|w| *w > 0).unwrap_or(false)
-            })
+            .filter(|server| self.weights.get(*server).map(|w| *w > 0).unwrap_or(false))
             .collect();
 
         if available.is_empty() {
@@ -182,7 +182,8 @@ impl PcsServerHealthManager {
     /// 选中的服务器 URL（克隆），如果无可用服务器则返回 None
     pub fn get_server_hybrid(&self, chunk_index: usize) -> Option<String> {
         // 1. 获取所有可用服务器及其综合权重
-        let available: Vec<(String, f64)> = self.all_servers
+        let available: Vec<(String, f64)> = self
+            .all_servers
             .iter()
             .filter_map(|server| {
                 let weight = self.weights.get(server).map(|w| *w)?;
@@ -191,7 +192,10 @@ impl PcsServerHealthManager {
                 }
 
                 // 速度：优先使用 EWMA，兜底使用初始速度
-                let speed = self.server_avg_speeds.get(server).map(|v| *v)
+                let speed = self
+                    .server_avg_speeds
+                    .get(server)
+                    .map(|v| *v)
                     .or_else(|| self.server_speeds.get(server).map(|v| *v))
                     .unwrap_or(0.0);
                 if speed <= 0.0 {
@@ -215,7 +219,9 @@ impl PcsServerHealthManager {
         // 2. 加权轮询选择
         let total_weight: f64 = available.iter().map(|(_, w)| w).sum();
         if total_weight <= 0.0 {
-            return available.get(chunk_index % available.len()).map(|(server, _)| server.clone());
+            return available
+                .get(chunk_index % available.len())
+                .map(|(server, _)| server.clone());
         }
 
         let position = (chunk_index as f64 % total_weight).abs();
@@ -246,7 +252,9 @@ impl PcsServerHealthManager {
             (chunk_size as f64) / (duration_ms as f64) * 1000.0 / 1024.0
         } else {
             let server_string = server.to_string();
-            self.server_avg_speeds.get(&server_string).map(|v| *v)
+            self.server_avg_speeds
+                .get(&server_string)
+                .map(|v| *v)
                 .or_else(|| self.server_speeds.get(&server_string).map(|v| *v))
                 .unwrap_or(500.0)
         };
@@ -254,13 +262,16 @@ impl PcsServerHealthManager {
         let server_string = server.to_string();
 
         // 2. 先用旧窗口计算阈值
-        let slow_threshold_opt = self.calculate_window_median(&server_string).map(|window_median| {
-            window_median * 0.6
-        });
+        let slow_threshold_opt = self
+            .calculate_window_median(&server_string)
+            .map(|window_median| window_median * 0.6);
 
         // 3. 判断新速度是否异常
         if let Some(slow_threshold) = slow_threshold_opt {
-            let mut current_score_ref = self.server_scores.entry(server_string.clone()).or_insert(50);
+            let mut current_score_ref = self
+                .server_scores
+                .entry(server_string.clone())
+                .or_insert(50);
             let current_score = *current_score_ref;
             let new_score = if speed_kbps < slow_threshold {
                 (current_score - 2).max(0)
@@ -278,9 +289,15 @@ impl PcsServerHealthManager {
                         *weight = 0;
                         drop(weight);
 
-                        let cooldown = self.cooldown_secs.get(&server_string).map(|v| *v).unwrap_or(10);
-                        let next_time = std::time::Instant::now() + std::time::Duration::from_secs(cooldown);
-                        self.next_probe_time.insert(server_string.clone(), next_time);
+                        let cooldown = self
+                            .cooldown_secs
+                            .get(&server_string)
+                            .map(|v| *v)
+                            .unwrap_or(10);
+                        let next_time =
+                            std::time::Instant::now() + std::time::Duration::from_secs(cooldown);
+                        self.next_probe_time
+                            .insert(server_string.clone(), next_time);
 
                         warn!(
                             "服务器降权: {} (score={}, 速度 {:.2} KB/s < 阈值 {:.2} KB/s, 下次探测: {}秒后)",
@@ -306,7 +323,8 @@ impl PcsServerHealthManager {
         // 5. 更新短期速度窗口
         {
             if !self.server_recent_speeds.contains_key(&server_string) {
-                self.server_recent_speeds.insert(server_string.clone(), StdMutex::new(VecDeque::new()));
+                self.server_recent_speeds
+                    .insert(server_string.clone(), StdMutex::new(VecDeque::new()));
             }
 
             if let Some(window_entry) = self.server_recent_speeds.get(&server_string) {
@@ -321,12 +339,18 @@ impl PcsServerHealthManager {
 
         // 6. 更新 EWMA 速度
         {
-            let mut sample_count_ref = self.server_sample_counts.entry(server_string.clone()).or_insert(0);
+            let mut sample_count_ref = self
+                .server_sample_counts
+                .entry(server_string.clone())
+                .or_insert(0);
             *sample_count_ref += 1;
             let sample_count = *sample_count_ref;
             drop(sample_count_ref);
 
-            let mut avg_ref = self.server_avg_speeds.entry(server_string.clone()).or_insert(speed_kbps);
+            let mut avg_ref = self
+                .server_avg_speeds
+                .entry(server_string.clone())
+                .or_insert(speed_kbps);
             if sample_count == 1 {
                 *avg_ref = speed_kbps;
             } else {
@@ -342,7 +366,8 @@ impl PcsServerHealthManager {
         } else {
             current_global_avg * 0.9 + speed_kbps * 0.1
         };
-        self.global_avg_speed.store(new_global_avg.to_bits(), Ordering::SeqCst);
+        self.global_avg_speed
+            .store(new_global_avg.to_bits(), Ordering::SeqCst);
 
         speed_kbps
     }
@@ -427,12 +452,18 @@ impl PcsServerHealthManager {
     pub fn handle_probe_failure(&self, server: &str) {
         let server_string = server.to_string();
 
-        let current_cooldown = self.cooldown_secs.get(&server_string).map(|v| *v).unwrap_or(10);
+        let current_cooldown = self
+            .cooldown_secs
+            .get(&server_string)
+            .map(|v| *v)
+            .unwrap_or(10);
         let new_cooldown = (current_cooldown * 2).min(40);
-        self.cooldown_secs.insert(server_string.clone(), new_cooldown);
+        self.cooldown_secs
+            .insert(server_string.clone(), new_cooldown);
 
         let next_time = std::time::Instant::now() + std::time::Duration::from_secs(new_cooldown);
-        self.next_probe_time.insert(server_string.clone(), next_time);
+        self.next_probe_time
+            .insert(server_string.clone(), next_time);
 
         warn!(
             "服务器探测失败: {}, cooldown: {}s -> {}s, 下次探测: {}秒后",
@@ -453,13 +484,17 @@ impl PcsServerHealthManager {
         self.next_probe_time.remove(&server_string);
 
         self.server_speeds.insert(server_string.clone(), new_speed);
-        self.server_avg_speeds.insert(server_string.clone(), new_speed);
+        self.server_avg_speeds
+            .insert(server_string.clone(), new_speed);
         self.server_sample_counts.insert(server_string.clone(), 1);
-        self.server_recent_speeds.insert(server_string.clone(), StdMutex::new(VecDeque::new()));
+        self.server_recent_speeds
+            .insert(server_string.clone(), StdMutex::new(VecDeque::new()));
 
         info!(
             "服务器恢复: {} (新速度 {:.2} KB/s, score=50, 当前可用 {} 个服务器)",
-            server, new_speed, self.available_count()
+            server,
+            new_speed,
+            self.available_count()
         );
     }
 
@@ -476,7 +511,10 @@ impl PcsServerHealthManager {
         const MIN_TIMEOUT: u64 = 30;
         const MAX_TIMEOUT: u64 = 180;
 
-        let speed_kbps = self.server_avg_speeds.get(server).map(|v| *v)
+        let speed_kbps = self
+            .server_avg_speeds
+            .get(server)
+            .map(|v| *v)
             .or_else(|| self.server_speeds.get(server).map(|v| *v))
             .unwrap_or(500.0);
 

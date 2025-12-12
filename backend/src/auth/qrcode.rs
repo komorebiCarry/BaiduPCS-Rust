@@ -188,21 +188,68 @@ impl QRCodeAuth {
 
         info!("Cookie 提取结果:");
         info!("  BDUSS: {}...", &bduss[..20.min(bduss.len())]);
-        info!("  STOKEN: {}", if !stoken.is_empty() { "已获取" } else { "未获取" });
-        info!("  PTOKEN: {}", if !ptoken.is_empty() { "已获取" } else { "未获取" });
-        info!("  BAIDUID: {}", if !baiduid.is_empty() { "已获取" } else { "未获取" });
-        info!("  SBOXTKN: {}", if !sboxtkn.is_empty() { "已获取" } else { "未获取" });
+        info!(
+            "  STOKEN: {}",
+            if !stoken.is_empty() {
+                "已获取"
+            } else {
+                "未获取"
+            }
+        );
+        info!(
+            "  PTOKEN: {}",
+            if !ptoken.is_empty() {
+                "已获取"
+            } else {
+                "未获取"
+            }
+        );
+        info!(
+            "  BAIDUID: {}",
+            if !baiduid.is_empty() {
+                "已获取"
+            } else {
+                "未获取"
+            }
+        );
+        info!(
+            "  SBOXTKN: {}",
+            if !sboxtkn.is_empty() {
+                "已获取"
+            } else {
+                "未获取"
+            }
+        );
 
         // 获取完整的用户信息
         match self.get_user_info(&bduss).await {
             Ok(mut user) => {
                 info!("登录成功！用户: {}, UID: {}", user.username, user.uid);
                 // 设置所有提取到的 Cookie
-                user.stoken = if !stoken.is_empty() { Some(stoken) } else { None };
-                user.ptoken = if !ptoken.is_empty() { Some(ptoken) } else { None };
-                user.baiduid = if !baiduid.is_empty() { Some(baiduid) } else { None };
-                user.passid = if let Some(passid_cookie) = cookie_pairs.iter().find(|c| c.starts_with("PASSID=")) {
-                    Some(passid_cookie.strip_prefix("PASSID=").unwrap_or("").to_string())
+                user.stoken = if !stoken.is_empty() {
+                    Some(stoken)
+                } else {
+                    None
+                };
+                user.ptoken = if !ptoken.is_empty() {
+                    Some(ptoken)
+                } else {
+                    None
+                };
+                user.baiduid = if !baiduid.is_empty() {
+                    Some(baiduid)
+                } else {
+                    None
+                };
+                user.passid = if let Some(passid_cookie) =
+                    cookie_pairs.iter().find(|c| c.starts_with("PASSID="))
+                {
+                    Some(
+                        passid_cookie
+                            .strip_prefix("PASSID=")
+                            .unwrap_or("")
+                            .to_string(),
+                    )
                 } else {
                     None
                 };
@@ -217,11 +264,30 @@ impl QRCodeAuth {
                 warn!("获取用户信息失败: {}，使用基本信息", e);
                 // 如果获取用户信息失败，返回基本的UserAuth
                 let mut user = UserAuth::new(0, "未知用户".to_string(), bduss);
-                user.stoken = if !stoken.is_empty() { Some(stoken) } else { None };
-                user.ptoken = if !ptoken.is_empty() { Some(ptoken) } else { None };
-                user.baiduid = if !baiduid.is_empty() { Some(baiduid) } else { None };
-                user.passid = if let Some(passid_cookie) = cookie_pairs.iter().find(|c| c.starts_with("PASSID=")) {
-                    Some(passid_cookie.strip_prefix("PASSID=").unwrap_or("").to_string())
+                user.stoken = if !stoken.is_empty() {
+                    Some(stoken)
+                } else {
+                    None
+                };
+                user.ptoken = if !ptoken.is_empty() {
+                    Some(ptoken)
+                } else {
+                    None
+                };
+                user.baiduid = if !baiduid.is_empty() {
+                    Some(baiduid)
+                } else {
+                    None
+                };
+                user.passid = if let Some(passid_cookie) =
+                    cookie_pairs.iter().find(|c| c.starts_with("PASSID="))
+                {
+                    Some(
+                        passid_cookie
+                            .strip_prefix("PASSID=")
+                            .unwrap_or("")
+                            .to_string(),
+                    )
                 } else {
                     None
                 };
@@ -264,7 +330,10 @@ impl QRCodeAuth {
                         let value_part = &cookie_str[start + 8..]; // "BAIDUID=" 长度为 8
                         if let Some(end) = value_part.find(';') {
                             let baiduid_value = value_part[..end].to_string();
-                            info!("提取到 BAIDUID: {}...", &baiduid_value[..20.min(baiduid_value.len())]);
+                            info!(
+                                "提取到 BAIDUID: {}...",
+                                &baiduid_value[..20.min(baiduid_value.len())]
+                            );
                             *self.baiduid.lock().unwrap() = Some(baiduid_value);
                         }
                     }

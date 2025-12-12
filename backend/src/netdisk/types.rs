@@ -216,7 +216,8 @@ impl LocateUploadResponse {
         // 2. 添加 servers 列表（去重，只保留 https）
         for info in &self.servers {
             if info.server.starts_with("https://") {
-                let host = info.server
+                let host = info
+                    .server
                     .trim_start_matches("https://")
                     .trim_end_matches('/')
                     .to_string();
@@ -229,7 +230,8 @@ impl LocateUploadResponse {
         // 3. 添加备用服务器（去重，只保留 https）
         for info in &self.bak_servers {
             if info.server.starts_with("https://") {
-                let host = info.server
+                let host = info
+                    .server
                     .trim_start_matches("https://")
                     .trim_end_matches('/')
                     .to_string();

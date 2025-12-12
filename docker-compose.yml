@@ -16,6 +16,10 @@ services:
       - ./downloads:/app/downloads
       # 会话数据挂载
       - ./data:/app/data
+      # 日志目录挂载（新增）
+      - ./logs:/app/logs
+      # WAL 目录挂载（新增）
+      - ./wal:/app/wal
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1

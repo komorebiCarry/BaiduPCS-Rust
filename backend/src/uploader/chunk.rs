@@ -146,9 +146,7 @@ impl UploadChunk {
     /// # 返回
     /// 分片数据字节数组
     pub async fn read_data(&self, file_path: &Path) -> Result<Vec<u8>> {
-        let mut file = File::open(file_path)
-            .await
-            .context("打开上传文件失败")?;
+        let mut file = File::open(file_path).await.context("打开上传文件失败")?;
 
         // 定位到分片起始位置
         file.seek(std::io::SeekFrom::Start(self.range.start))
@@ -158,7 +156,8 @@ impl UploadChunk {
         // 读取分片数据
         let chunk_size = self.size() as usize;
         let mut buffer = vec![0u8; chunk_size];
-        let bytes_read = file.read_exact(&mut buffer)
+        let bytes_read = file
+            .read_exact(&mut buffer)
             .await
             .context("读取分片数据失败")?;
 
@@ -253,7 +252,9 @@ impl UploadChunkManager {
 
     /// 获取下一个待上传的分片
     pub fn next_pending(&mut self) -> Option<&mut UploadChunk> {
-        self.chunks.iter_mut().find(|c| !c.completed && !c.uploading)
+        self.chunks
+            .iter_mut()
+            .find(|c| !c.completed && !c.uploading)
     }
 
     /// 获取所有分片
@@ -343,10 +344,7 @@ impl UploadChunkManager {
 
     /// 获取所有分片的 MD5 列表（用于 createfile 接口）
     pub fn get_block_list(&self) -> Vec<String> {
-        self.chunks
-            .iter()
-            .filter_map(|c| c.md5.clone())
-            .collect()
+        self.chunks.iter().filter_map(|c| c.md5.clone()).collect()
     }
 }
 
@@ -380,12 +378,18 @@ mod tests {
         let manager = UploadChunkManager::new(16 * 1024 * 1024, 4 * 1024 * 1024);
         assert_eq!(manager.chunk_count(), 4);
         assert_eq!(manager.chunks[0].range, 0..(4 * 1024 * 1024));
-        assert_eq!(manager.chunks[3].range, (12 * 1024 * 1024)..(16 * 1024 * 1024));
+        assert_eq!(
+            manager.chunks[3].range,
+            (12 * 1024 * 1024)..(16 * 1024 * 1024)
+        );
 
         // 测试不完整分片
         let manager = UploadChunkManager::new(17 * 1024 * 1024, 4 * 1024 * 1024);
         assert_eq!(manager.chunk_count(), 5);
-        assert_eq!(manager.chunks[4].range, (16 * 1024 * 1024)..(17 * 1024 * 1024));
+        assert_eq!(
+            manager.chunks[4].range,
+            (16 * 1024 * 1024)..(17 * 1024 * 1024)
+        );
         assert_eq!(manager.chunks[4].size(), 1024 * 1024);
     }
 

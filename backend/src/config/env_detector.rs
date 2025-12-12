@@ -1,8 +1,8 @@
 // 环境检测模块
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 /// 操作系统类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

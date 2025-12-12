@@ -1,0 +1,189 @@
+/**
+ * 全局移动端样式
+ * 用于覆盖 Element Plus 组件在移动端的样式
+ */
+
+// =====================
+// 断点变量
+// =====================
+$mobile-breakpoint: 767px;
+
+// =====================
+// Element Plus 组件移动端适配
+// =====================
+
+// 对话框适配
+@media (max-width: $mobile-breakpoint) {
+  .el-dialog {
+    width: 92% !important;
+    margin: 5vh auto !important;
+    
+    .el-dialog__header {
+      padding: 16px 20px 12px;
+    }
+    
+    .el-dialog__body {
+      padding: 16px 20px;
+    }
+    
+    .el-dialog__footer {
+      padding: 12px 20px 16px;
+    }
+  }
+
+  // 消息提示框
+  .el-message-box {
+    width: 90% !important;
+    max-width: none !important;
+  }
+
+  // 表单标签垂直布局
+  .el-form--label-left,
+  .el-form--label-right {
+    .el-form-item {
+      flex-direction: column;
+      
+      .el-form-item__label {
+        width: 100% !important;
+        text-align: left !important;
+        padding-right: 0;
+        padding-bottom: 8px;
+      }
+      
+      .el-form-item__content {
+        width: 100%;
+        margin-left: 0 !important;
+      }
+    }
+  }
+
+  // 按钮组
+  .el-button-group {
+    flex-wrap: wrap;
+  }
+
+  // 表格
+  .el-table {
+    font-size: 13px;
+    
+    .el-table__header th {
+      padding: 8px 0;
+    }
+    
+    .el-table__body td {
+      padding: 8px 0;
+    }
+  }
+
+  // 标签页
+  .el-tabs__nav-wrap {
+    overflow-x: auto;
+    
+    .el-tabs__nav {
+      white-space: nowrap;
+    }
+  }
+
+  // 下拉菜单
+  .el-dropdown-menu {
+    max-width: 90vw;
+  }
+
+  // 抽屉
+  .el-drawer {
+    .el-drawer__body {
+      padding: 0;
+    }
+  }
+
+  // 进度条文字
+  .el-progress__text {
+    font-size: 12px !important;
+  }
+
+  // 标签
+  .el-tag {
+    &.el-tag--large {
+      font-size: 12px;
+      padding: 0 8px;
+    }
+  }
+}
+
+// =====================
+// 触摸反馈样式
+// =====================
+@media (max-width: $mobile-breakpoint) {
+  // 可点击元素触摸反馈
+  .touchable,
+  .el-button,
+  .el-menu-item,
+  .el-dropdown-menu__item {
+    transition: opacity 0.15s, transform 0.15s;
+    
+    &:active {
+      opacity: 0.7;
+    }
+  }
+
+  // 卡片点击效果
+  .el-card {
+    transition: transform 0.2s, box-shadow 0.2s;
+    
+    &:active {
+      transform: scale(0.98);
+    }
+  }
+}
+
+// =====================
+// 安全区域适配（刘海屏）
+// =====================
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top);
+  }
+}
+
+// =====================
+// 滚动条优化
+// =====================
+@media (max-width: $mobile-breakpoint) {
+  // 隐藏滚动条但保留滚动功能
+  .hide-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+    
+    &::-webkit-scrollbar {
+      display: none;
+    }
+  }
+}
+
+// =====================
+// 文本截断工具类
+// =====================
+.text-ellipsis {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.text-ellipsis-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+// =====================
+// 触摸区域最小尺寸
+// =====================
+.touch-target {
+  min-width: 44px;
+  min-height: 44px;
+}

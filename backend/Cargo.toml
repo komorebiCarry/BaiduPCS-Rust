@@ -4,14 +4,15 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-# Web框架
-axum = "0.7"
+# Web框架（启用 WebSocket 支持）
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+tokio-tungstenite = "0.21"
 
 # HTTP客户端
 # 使用 rustls-tls 替代 native-tls，避免 OpenSSL 依赖问题（特别是交叉编译）
@@ -29,14 +30,15 @@ base64 = "0.21"
 
 # 日志
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2"
 
 # 错误处理
 anyhow = "1.0"
 thiserror = "1.0"
 
 # 时间处理
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 
 # 二维码
 qrcode = "0.13"
@@ -53,6 +55,10 @@ futures = "0.3"
 async-trait = "0.1"
 async-recursion = "1.0"
 dashmap = "5.5"
+
+# 持久化相关
+bit-set = "0.5"
+parking_lot = "0.12"
 
 # URL编码
 urlencoding = "2.1"

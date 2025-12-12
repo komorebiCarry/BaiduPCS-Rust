@@ -1,26 +1,8 @@
-import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { apiClient } from './client'
+import { formatFileSize, formatSpeed, formatETA, extractFilename } from './utils'
 
-const apiClient = axios.create({
-  baseURL: '/api/v1',
-  timeout: 30000,
-})
-
-// 响应拦截器
-apiClient.interceptors.response.use(
-    (response) => {
-      const { code, message } = response.data
-      if (code !== 0) {
-        ElMessage.error(message || '请求失败')
-        return Promise.reject(new Error(message || '请求失败'))
-      }
-      return response.data.data
-    },
-    (error) => {
-      ElMessage.error(error.response?.data?.message || error.message || '网络错误')
-      return Promise.reject(error)
-    }
-)
+// 重新导出工具函数，保持向后兼容
+export { formatFileSize, formatSpeed, formatETA, extractFilename }
 
 /// 任务状态
 export type TaskStatus = 'pending' | 'downloading' | 'paused' | 'completed' | 'failed'
@@ -43,6 +25,8 @@ export interface DownloadTask {
   group_id?: string
   group_root?: string
   relative_path?: string
+  /** 🔥 新增：关联的转存任务 ID（如果此下载任务由转存任务自动创建） */
+  transfer_task_id?: string
 }
 
 /// 创建下载任务请求
@@ -172,22 +156,6 @@ export function calculateProgress(task: DownloadTask): number {
   return (task.downloaded_size / task.total_size) * 100
 }
 
-/**
- * 格式化文件大小
- */
-export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return '0 B'
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`
-}
-
-/**
- * 格式化速度
- */
-export function formatSpeed(bytesPerSec: number): string {
-  return `${formatFileSize(bytesPerSec)}/s`
-}
 
 /**
  * 计算剩余时间（秒）
@@ -200,26 +168,6 @@ export function calculateETA(task: DownloadTask): number | null {
   return Math.floor(remaining / task.speed)
 }
 
-/**
- * 格式化剩余时间
- */
-export function formatETA(seconds: number | null): string {
-  if (seconds === null || seconds === 0) {
-    return '即将完成'
-  }
-
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  const secs = seconds % 60
-
-  if (hours > 0) {
-    return `${hours}小时${minutes}分钟`
-  } else if (minutes > 0) {
-    return `${minutes}分钟${secs}秒`
-  } else {
-    return `${secs}秒`
-  }
-}
 
 /**
  * 获取状态文本
@@ -570,6 +518,8 @@ export interface DownloadItemFromBackend {
   group_id?: string
   group_root?: string
   relative_path?: string
+  /** 🔥 新增：关联的转存任务 ID（如果此下载任务由转存任务自动创建） */
+  transfer_task_id?: string
   // 文件夹类型的字段（type=folder时）
   name?: string
   remote_root?: string
