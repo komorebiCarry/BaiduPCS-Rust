@@ -2,6 +2,7 @@
 
 use crate::auth::{QRCode, QRCodeStatus};
 use crate::server::AppState;
+use crate::transfer::TransferManager;
 use crate::uploader::UploadManager;
 use axum::{
     extract::{Query, State},
@@ -190,7 +191,12 @@ pub async fn qrcode_status(
                 let download_dir = config.download.download_dir.clone();
                 let max_global_threads = config.download.max_global_threads;
                 let max_concurrent_tasks = config.download.max_concurrent_tasks;
+                let upload_config = config.upload.clone();
+                let transfer_config = config.transfer.clone();
                 drop(config);
+
+                // 获取持久化管理器引用
+                let pm_arc = Arc::clone(&state.persistence_manager);
 
                 match crate::downloader::DownloadManager::with_config(
                     updated_user.clone(),
@@ -198,7 +204,13 @@ pub async fn qrcode_status(
                     max_global_threads,
                     max_concurrent_tasks,
                 ) {
-                    Ok(manager) => {
+                    Ok(mut manager) => {
+                        // 设置持久化管理器
+                        manager.set_persistence_manager(Arc::clone(&pm_arc));
+
+                        // 设置 WebSocket 管理器
+                        manager.set_ws_manager(Arc::clone(&state.ws_manager)).await;
+
                         let manager_arc = Arc::new(manager);
                         *state.download_manager.write().await = Some(Arc::clone(&manager_arc));
 
@@ -212,13 +224,75 @@ pub async fn qrcode_status(
                             .set_netdisk_client(client_arc)
                             .await;
 
+                        // 设置文件夹下载管理器的 WAL 目录
+                        let wal_dir = pm_arc.lock().await.wal_dir().clone();
+                        state.folder_download_manager.set_wal_dir(wal_dir).await;
+
+                        // 设置文件夹下载管理器的 WebSocket 管理器
+                        state
+                            .folder_download_manager
+                            .set_ws_manager(Arc::clone(&state.ws_manager))
+                            .await;
+
+                        // 设置下载管理器对文件夹管理器的引用（用于回收借调槽位）
+                        manager_arc
+                            .set_folder_manager(Arc::clone(&state.folder_download_manager))
+                            .await;
+
                         info!("✅ 下载管理器初始化成功");
 
-                        // 初始化上传管理器
-                        let upload_manager = UploadManager::new(client, &updated_user);
+                        // 初始化上传管理器（使用配置参数）
+                        let upload_manager =
+                            UploadManager::new_with_config(client.clone(), &updated_user, &upload_config);
                         let upload_manager_arc = Arc::new(upload_manager);
-                        *state.upload_manager.write().await = Some(upload_manager_arc);
+
+                        // 设置上传管理器的持久化管理器
+                        upload_manager_arc
+                            .set_persistence_manager(Arc::clone(&pm_arc))
+                            .await;
+
+                        // 设置上传管理器的 WebSocket 管理器
+                        upload_manager_arc
+                            .set_ws_manager(Arc::clone(&state.ws_manager))
+                            .await;
+
+                        *state.upload_manager.write().await = Some(Arc::clone(&upload_manager_arc));
                         info!("✅ 上传管理器初始化成功");
+
+                        // 初始化转存管理器
+                        let transfer_manager = TransferManager::new(
+                            Arc::new(client),
+                            transfer_config,
+                            Arc::clone(&state.config),
+                        );
+                        let transfer_manager_arc = Arc::new(transfer_manager);
+
+                        // 设置下载管理器（用于自动下载功能）
+                        transfer_manager_arc
+                            .set_download_manager(Arc::clone(&manager_arc))
+                            .await;
+
+                        // 设置文件夹下载管理器（用于自动下载文件夹）
+                        transfer_manager_arc
+                            .set_folder_download_manager(Arc::clone(&state.folder_download_manager))
+                            .await;
+
+                        // 设置转存管理器的持久化管理器
+                        transfer_manager_arc
+                            .set_persistence_manager(Arc::clone(&pm_arc))
+                            .await;
+
+                        // 设置转存管理器的 WebSocket 管理器
+                        transfer_manager_arc
+                            .set_ws_manager(Arc::clone(&state.ws_manager))
+                            .await;
+
+                        *state.transfer_manager.write().await = Some(Arc::clone(&transfer_manager_arc));
+                        info!("✅ 转存管理器初始化成功");
+
+                        // 启动 WebSocket 批量发送器
+                        Arc::clone(&state.ws_manager).start_batch_sender();
+                        info!("✅ WebSocket 批量发送器已启动");
                     }
                     Err(e) => {
                         error!("❌ 初始化下载管理器失败: {}", e);

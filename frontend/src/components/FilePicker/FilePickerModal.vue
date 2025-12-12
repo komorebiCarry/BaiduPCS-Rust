@@ -85,6 +85,26 @@
           </div>
         </template>
 
+        <!-- 纯目录选择模式 -->
+        <template v-else-if="mode === 'select-directory'">
+          <div class="download-info">
+            <div class="download-path">
+              <span class="label">已选择:</span>
+              <span class="path" :title="currentDownloadPath">{{ currentDownloadPath || '请选择目录' }}</span>
+            </div>
+          </div>
+          <div class="actions">
+            <el-button @click="handleClose">取消</el-button>
+            <el-button
+                type="primary"
+                :disabled="!canConfirm"
+                @click="handleConfirm"
+            >
+              {{ confirmText }}
+            </el-button>
+          </div>
+        </template>
+
         <!-- 下载模式 -->
         <template v-else>
           <div class="download-info">
@@ -136,7 +156,7 @@ const props = withDefaults(defineProps<{
   selectType?: 'file' | 'directory' | 'both'
   title?: string
   confirmText?: string
-  mode?: 'upload' | 'download'
+  mode?: 'upload' | 'download' | 'select-directory'
   initialPath?: string
   defaultDownloadDir?: string
   multiple?: boolean  // 是否支持多选（上传模式默认 true）
@@ -153,6 +173,7 @@ const emit = defineEmits<{
   'select': [entry: FileEntry]
   'select-multiple': [entries: FileEntry[]]  // 多选确认事件
   'confirm-download': [payload: { path: string, setAsDefault: boolean }]
+  'confirm': [path: string]  // 纯目录选择模式
   'use-default': []
 }>()
 
@@ -166,9 +187,14 @@ const isMultiSelectMode = computed(() => {
   return props.mode === 'upload' && props.multiple
 })
 
+// 是否为目录选择模式（下载或纯目录选择）
+const isDirectoryMode = computed(() => {
+  return props.mode === 'download' || props.mode === 'select-directory'
+})
+
 // 下载模式下实际使用的 selectType（强制为 directory）
 const effectiveSelectType = computed(() => {
-  return props.mode === 'download' ? 'directory' : props.selectType
+  return isDirectoryMode.value ? 'directory' : props.selectType
 })
 
 // 下载模式下的当前选中路径（用于底部显示）
@@ -192,10 +218,10 @@ const visible = computed({
   set: (val) => emit('update:modelValue', val),
 })
 
-// 是否可确认（下载模式）
+// 是否可确认（下载/目录选择模式）
 const canConfirm = computed(() => {
-  if (props.mode === 'download') {
-    // 下载模式：只要有当前路径就可以确认
+  if (isDirectoryMode.value) {
+    // 目录选择模式：只要有当前路径就可以确认
     return !!currentDownloadPath.value
   }
   return false
@@ -287,6 +313,13 @@ function handleConfirm() {
     const downloadPath = currentDownloadPath.value
     if (downloadPath) {
       emit('confirm-download', { path: downloadPath, setAsDefault: setAsDefault.value })
+      visible.value = false
+    }
+  } else if (props.mode === 'select-directory') {
+    // 纯目录选择模式：发射 confirm 事件
+    const selectedPath = currentDownloadPath.value
+    if (selectedPath) {
+      emit('confirm', selectedPath)
       visible.value = false
     }
   } else {

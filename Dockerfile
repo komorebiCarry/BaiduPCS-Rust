@@ -61,7 +61,7 @@ COPY --from=backend-builder /app/target/release/baidu-netdisk-rust /app/baidu-ne
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 
 # 创建必要的目录
-RUN mkdir -p /app/downloads /app/config /app/data
+RUN mkdir -p /app/downloads /app/config /app/data /app/logs /app/wal
 
 # 复制配置文件示例
 COPY config/app.toml.example /app/config/app.toml.example

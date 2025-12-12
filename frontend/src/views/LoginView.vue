@@ -28,16 +28,16 @@
         <div class="tips-section warning">
           <h4>⚠️ 重要提示</h4>
           <ul>
-            <li><strong>确认后，APP 必须保持打开</strong></li>
-            <li>不能关闭或切换到后台</li>
-            <li>等待网页自动跳转（1-3秒）</li>
+            <li><strong>扫码后请保持 APP 打开</strong></li>
+            <li>不要立即在 APP 中点击确认，先稍等片刻</li>
+            <li>等待网页显示“扫码成功”后，再按提示继续操作</li>
           </ul>
         </div>
 
         <div class="tips-section info">
           <p class="small-text">
             <el-icon :size="14"><Warning /></el-icon>
-            如果 APP 关闭，登录会失败。请点击"重新扫码"按钮重试。
+            如果在网页提示成功前关闭 APP，可能导致登录失败。如失败，请点击“重新扫码”重试。
           </p>
         </div>
       </div>

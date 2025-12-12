@@ -126,15 +126,24 @@
               </el-alert>
 
               <el-form-item label="下载目录" prop="download.download_dir">
-                <el-input
-                    v-model="formData.download.download_dir"
-                    placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
-                    clearable
-                >
-                  <template #prepend>
-                    <el-icon><Folder /></el-icon>
-                  </template>
-                </el-input>
+                <div class="input-with-button">
+                  <el-input
+                      v-model="formData.download.download_dir"
+                      placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
+                      clearable
+                  >
+                    <template #prepend>
+                      <el-icon><Folder /></el-icon>
+                    </template>
+                  </el-input>
+                  <el-button
+                      type="primary"
+                      @click="handleSelectDownloadDir"
+                  >
+                    <el-icon><FolderOpened /></el-icon>
+                    <span v-if="!isMobile">浏览</span>
+                  </el-button>
+                </div>
                 <div class="form-tip">
                   <div>文件下载的保存目录，必须使用绝对路径</div>
                   <div style="margin-top: 4px;">
@@ -386,6 +395,16 @@
         </el-skeleton>
       </el-main>
     </el-container>
+
+    <!-- 目录选择器 -->
+    <FilePickerModal
+        v-model="showDirPicker"
+        mode="select-directory"
+        title="选择下载目录"
+        confirm-text="确定"
+        :initial-path="formData?.download?.download_dir"
+        @confirm="handleDirConfirm"
+    />
   </div>
 </template>
 
@@ -396,6 +415,7 @@ import { useIsMobile } from '@/utils/responsive'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended } from '@/api/config'
+import { FilePickerModal } from '@/components/FilePicker'
 import {
   Check,
   RefreshLeft,
@@ -408,6 +428,7 @@ import {
   User,
   Files,
   Share,
+  FolderOpened,
 } from '@element-plus/icons-vue'
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
 
@@ -424,6 +445,7 @@ const formRef = ref<FormInstance>()
 const formData = ref<AppConfig | null>(null)
 const recommended = ref<any>(null)
 const transferBehavior = ref('transfer_only')
+const showDirPicker = ref(false)
 
 // 滑块标记
 const threadMarks = reactive({
@@ -603,6 +625,20 @@ async function handleSave() {
   }
 }
 
+// 选择下载目录
+function handleSelectDownloadDir() {
+  showDirPicker.value = true
+}
+
+// 目录选择确认
+function handleDirConfirm(path: string) {
+  if (formData.value && path) {
+    formData.value.download.download_dir = path
+    ElMessage.success('已选择目录: ' + path)
+  }
+  showDirPicker.value = false
+}
+
 // 组件挂载
 onMounted(() => {
   loadConfig()
@@ -684,6 +720,16 @@ onMounted(() => {
   color: #e6a23c !important;
   font-weight: 600;
   margin-top: 8px;
+}
+
+.input-with-button {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+
+  .el-input {
+    flex: 1;
+  }
 }
 
 .vip-info {
