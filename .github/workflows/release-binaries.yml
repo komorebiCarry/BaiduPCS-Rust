@@ -164,29 +164,49 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build Docker image (amd64)
         uses: docker/build-push-action@v5
-        id: build
+        id: build-amd64
         with:
           context: .
           file: ./Dockerfile
           push: false
-          tags: baidupcs-rust:${{ github.ref_name }}
+          tags: baidupcs-rust:${{ github.ref_name }}-amd64
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/baidupcs-rust-${{ github.ref_name }}.tar
-
-      - name: Compress Docker image
+          outputs: type=docker,dest=/tmp/baidupcs-rust-${{ github.ref_name }}-amd64.tar
+  
+      - name: Compress Docker image (amd64)
         run: |
           cd /tmp
-          gzip baidupcs-rust-${{ github.ref_name }}.tar
-          mv baidupcs-rust-${{ github.ref_name }}.tar.gz baidupcs-rust-${{ github.ref_name }}-docker.tar.gz
-          echo "DOCKER_IMAGE_PATH=/tmp/baidupcs-rust-${{ github.ref_name }}-docker.tar.gz" >> $GITHUB_ENV
+          gzip baidupcs-rust-${{ github.ref_name }}-amd64.tar
+          mv baidupcs-rust-${{ github.ref_name }}-amd64.tar.gz baidupcs-rust-${{ github.ref_name }}-amd64-docker.tar.gz
+          echo "DOCKER_IMAGE_PATH_AMD64=/tmp/baidupcs-rust-${{ github.ref_name }}-amd64-docker.tar.gz" >> $GITHUB_ENV
+
+      - name: Build Docker image (arm64)
+        uses: docker/build-push-action@v5
+        id: build-arm64
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: baidupcs-rust:${{ github.ref_name }}-arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/baidupcs-rust-${{ github.ref_name }}-arm64.tar
+          
+      - name: Compress Docker image (arm64)
+        run: |
+          cd /tmp
+          gzip baidupcs-rust-${{ github.ref_name }}-arm64.tar
+          mv baidupcs-rust-${{ github.ref_name }}-arm64.tar.gz baidupcs-rust-${{ github.ref_name }}-arm64-docker.tar.gz
+          echo "DOCKER_IMAGE_PATH_ARM64=/tmp/baidupcs-rust-${{ github.ref_name }}-arm64-docker.tar.gz" >> $GITHUB_ENV
 
       - name: Upload Docker image to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.DOCKER_IMAGE_PATH }}
+          files: ${{ env.DOCKER_IMAGE_PATH_AMD64 }},${{ env.DOCKER_IMAGE_PATH_ARM64 }}
           generate_release_notes: false
           make_latest: true
         env:
