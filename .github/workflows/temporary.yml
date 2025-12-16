@@ -1,11 +1,11 @@
-name: Rebuild Docker Images (amd64 + arm64)
+name: Rebuild Docker Image (arm64)
 
 on:
   workflow_dispatch:   # 支持手动触发
 
 jobs:
-  build-docker-image:
-    runs-on: ubuntu-latest
+  build-docker-image-arm64:
+    runs-on: [self-hosted, ARM64]   # 原生 ARM64 runner
     permissions:
       contents: write
 
@@ -15,27 +15,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # 构建 amd64 镜像
-      - name: Build Docker image (amd64)
-        uses: docker/build-push-action@v5
-        id: build-amd64
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          tags: baidupcs-rust:${{ github.ref_name }}-amd64
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/baidupcs-rust-${{ github.ref_name }}-amd64.tar
-
-      - name: Compress Docker image (amd64)
-        run: |
-          cd /tmp
-          gzip baidupcs-rust-${{ github.ref_name }}-amd64.tar
-          mv baidupcs-rust-${{ github.ref_name }}-amd64.tar.gz baidupcs-rust-${{ github.ref_name }}-amd64-docker.tar.gz
-          echo "DOCKER_IMAGE_PATH_AMD64=/tmp/baidupcs-rust-${{ github.ref_name }}-amd64-docker.tar.gz" >> $GITHUB_ENV
 
       # 构建 arm64 镜像
       - name: Build Docker image (arm64)
@@ -58,11 +37,11 @@ jobs:
           mv baidupcs-rust-${{ github.ref_name }}-arm64.tar.gz baidupcs-rust-${{ github.ref_name }}-arm64-docker.tar.gz
           echo "DOCKER_IMAGE_PATH_ARM64=/tmp/baidupcs-rust-${{ github.ref_name }}-arm64-docker.tar.gz" >> $GITHUB_ENV
 
-      # 上传两个镜像到已有 Release
-      - name: Upload Docker images to GitHub Release
+      # 上传 arm64 镜像到已有 Release
+      - name: Upload Docker image to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.DOCKER_IMAGE_PATH_AMD64 }},${{ env.DOCKER_IMAGE_PATH_ARM64 }}
+          files: ${{ env.DOCKER_IMAGE_PATH_ARM64 }}
           tag_name: ${{ github.ref_name }}          # 上传到已有 tag
           generate_release_notes: false
           make_latest: false                        # 保持 Release 最新状态不变
