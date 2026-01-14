@@ -357,6 +357,242 @@
               </el-form-item>
             </el-card>
 
+            <!-- 加密设置 -->
+            <el-card class="setting-card" shadow="hover">
+              <template #header>
+                <div class="card-header">
+                  <el-icon :size="20" color="#f56c6c">
+                    <Key />
+                  </el-icon>
+                  <span>加密设置</span>
+                </div>
+              </template>
+              <!-- 免责声明 -->
+              <el-alert
+                  type="error"
+                  :closable="false"
+                  style="margin-bottom: 20px; border-left: 4px solid #f56c6c;"
+              >
+                <template #title>
+                  <div style="font-weight: 600; margin-bottom: 8px;">⚠️ 重要提示</div>
+                  <div style="line-height: 1.8; font-size: 13px;">
+                    本加密功能采用客户端侧加密技术，可在一定程度上保护您的文件隐私，但请注意：
+                    <ul style="margin: 8px 0 0 0; padding-left: 20px; line-height: 1.8;">
+                      <li>加密技术无法提供100%的绝对安全保障，百度官方可能通过其他技术手段检测到加密文件</li>
+                      <li>强烈建议对重要文件进行多重备份，并妥善保管加密密钥</li>
+                      <li>使用前请充分了解相关风险，并自行评估是否适合您的使用场景</li>
+                    </ul>
+                  </div>
+                </template>
+              </el-alert>
+
+              <!-- 加密状态卡片 -->
+              <div class="encryption-status-card">
+                <div class="status-header">
+                  <span class="status-label">加密密钥状态</span>
+                  <el-tag :type="encryptionStatus?.has_key ? 'success' : 'info'" size="small">
+                    {{ encryptionStatus?.has_key ? '已配置' : '未配置' }}
+                  </el-tag>
+                </div>
+                <div v-if="encryptionStatus?.has_key" class="status-detail">
+                  算法: {{ encryptionStatus.algorithm }}<br>
+                  创建时间: {{ encryptionStatus.key_created_at ? formatDate(encryptionStatus.key_created_at) : '-' }}
+                </div>
+              </div>
+
+              <!-- 未配置密钥时显示 -->
+              <div v-if="!encryptionStatus?.has_key" class="encryption-form">
+                <el-form-item label="加密算法">
+                  <el-select v-model="keyAlgorithm" style="width: 100%">
+                    <el-option value="AES-256-GCM" label="AES-256-GCM（推荐）" />
+                    <el-option value="ChaCha20-Poly1305" label="ChaCha20-Poly1305" />
+                  </el-select>
+                </el-form-item>
+                <el-button type="primary" style="width: 100%" @click="handleGenerateKey">
+                  <el-icon><Key /></el-icon>
+                  生成新密钥
+                </el-button>
+                <el-divider>或</el-divider>
+                <el-form-item label="导入密钥">
+                  <el-input v-model="encryptionKey" placeholder="粘贴Base64编码的密钥" />
+                </el-form-item>
+                <el-button style="width: 100%" @click="handleImportKey">
+                  <el-icon><Upload /></el-icon>
+                  导入密钥
+                </el-button>
+              </div>
+
+              <!-- 已配置密钥时显示 -->
+              <div v-else class="encryption-actions">
+                <el-button @click="handleExportKey">
+                  <el-icon><CopyDocument /></el-icon>
+                  导出密钥
+                </el-button>
+                <el-button type="danger" plain @click="handleDeleteKey">
+                  <el-icon><Delete /></el-icon>
+                  删除密钥
+                </el-button>
+              </div>
+
+              <el-alert type="warning" :closable="false" show-icon style="margin-top: 16px">
+                <template #title>
+                  <strong>重要提示：</strong>请妥善保管加密密钥。如果密钥丢失，将无法解密已加密的文件！
+                </template>
+              </el-alert>
+
+              <div class="form-tip" style="margin-top: 12px">
+                加密密钥用于自动备份和上传时的客户端侧加密。配置密钥后，可在创建备份任务或上传文件时选择是否启用加密。
+              </div>
+            </el-card>
+
+            <!-- 自动备份设置 -->
+            <el-card class="setting-card" shadow="hover">
+              <template #header>
+                <div class="card-header">
+                  <el-icon :size="20" color="#67c23a">
+                    <Refresh />
+                  </el-icon>
+                  <span>自动备份设置</span>
+                </div>
+              </template>
+
+              <!-- 前置条件提示 -->
+              <el-alert
+                  v-if="!encryptionStatus?.has_key"
+                  title="需要先配置加密密钥才能使用自动备份功能"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  style="margin-bottom: 16px"
+              />
+
+              <!-- 文件监听能力状态 -->
+              <div class="watch-capability-card" :class="{ 'is-available': watchCapability?.available }">
+                <div class="capability-header">
+                  <span class="capability-label">文件监听能力</span>
+                  <el-tag :type="watchCapability?.available ? 'success' : 'danger'" size="small">
+                    {{ watchCapability?.available ? '可用' : '不可用' }}
+                  </el-tag>
+                </div>
+                <div class="capability-detail">
+                  平台: {{ watchCapability?.platform || '-' }} | 后端: {{ watchCapability?.backend || '-' }}
+                </div>
+                <div v-if="watchCapability?.reason" class="capability-reason">
+                  原因: {{ watchCapability.reason }}
+                </div>
+                <div v-if="watchCapability?.suggestion" class="capability-suggestion">
+                  建议: {{ watchCapability.suggestion }}
+                </div>
+                <div v-if="watchCapability?.warnings?.length" class="capability-warnings">
+                  <div v-for="(warning, index) in watchCapability.warnings" :key="index" class="warning-item">
+                    {{ warning }}
+                  </div>
+                </div>
+              </div>
+
+              <el-divider content-position="left">上传备份触发方式</el-divider>
+
+              <!-- 文件系统监听 -->
+              <el-form-item>
+                <el-checkbox
+                    v-model="triggerConfig.upload_trigger.watch_enabled"
+                    :disabled="!encryptionStatus?.has_key || !watchCapability?.available"
+                    @change="handleTriggerConfigChange"
+                >
+                  启用文件系统监听（实时检测本地文件变化）
+                </el-checkbox>
+              </el-form-item>
+
+              <div v-if="triggerConfig.upload_trigger.watch_enabled" class="nested-config">
+                <el-divider content-position="left" style="margin: 12px 0">
+                  <span style="font-size: 12px; color: #909399">监听兜底设置（防止监听遗漏）</span>
+                </el-divider>
+
+                <!-- 间隔时间兜底 -->
+                <el-form-item>
+                  <el-checkbox
+                      v-model="triggerConfig.upload_trigger.fallback_interval_enabled"
+                      :disabled="!encryptionStatus?.has_key"
+                      @change="handleTriggerConfigChange"
+                  >
+                    启用间隔时间兜底
+                  </el-checkbox>
+                </el-form-item>
+                <el-form-item v-if="triggerConfig.upload_trigger.fallback_interval_enabled" label="间隔时间（分钟）">
+                  <el-input-number
+                      v-model="triggerConfig.upload_trigger.fallback_interval_minutes"
+                      :min="5"
+                      :max="1440"
+                      :step="5"
+                      :disabled="!encryptionStatus?.has_key"
+                      @change="handleTriggerConfigChange"
+                  />
+                  <div class="form-tip">每隔指定时间进行一次增量扫描</div>
+                </el-form-item>
+
+                <!-- 指定时间全量扫描 -->
+                <el-form-item>
+                  <el-checkbox
+                      v-model="triggerConfig.upload_trigger.fallback_scheduled_enabled"
+                      :disabled="!encryptionStatus?.has_key"
+                      @change="handleTriggerConfigChange"
+                  >
+                    启用指定时间全量扫描
+                  </el-checkbox>
+                </el-form-item>
+                <el-form-item v-if="triggerConfig.upload_trigger.fallback_scheduled_enabled" label="扫描时间">
+                  <el-time-picker
+                      v-model="uploadScheduledTime"
+                      format="HH:mm"
+                      :disabled="!encryptionStatus?.has_key"
+                      @change="handleUploadScheduledTimeChange"
+                  />
+                  <div class="form-tip">每天在指定时间进行一次全量扫描</div>
+                </el-form-item>
+              </div>
+
+              <el-divider content-position="left">下载备份触发方式（仅支持轮询）</el-divider>
+
+              <el-form-item label="轮询模式">
+                <el-radio-group
+                    v-model="triggerConfig.download_trigger.poll_mode"
+                    :disabled="!encryptionStatus?.has_key"
+                    @change="handleTriggerConfigChange"
+                >
+                  <el-radio value="interval">间隔轮询</el-radio>
+                  <el-radio value="scheduled">指定时间（推荐）</el-radio>
+                </el-radio-group>
+              </el-form-item>
+
+              <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'interval'" label="轮询间隔（分钟）">
+                <el-input-number
+                    v-model="triggerConfig.download_trigger.poll_interval_minutes"
+                    :min="10"
+                    :max="1440"
+                    :step="10"
+                    :disabled="!encryptionStatus?.has_key"
+                    @change="handleTriggerConfigChange"
+                />
+                <div class="form-tip">每隔指定时间检查云端文件变化</div>
+              </el-form-item>
+
+              <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'scheduled'" label="轮询时间">
+                <el-time-picker
+                    v-model="downloadScheduledTime"
+                    format="HH:mm"
+                    :disabled="!encryptionStatus?.has_key"
+                    @change="handleDownloadScheduledTimeChange"
+                />
+                <div class="form-tip">每天在指定时间检查云端文件变化（推荐凌晨，避免频繁API调用）</div>
+              </el-form-item>
+
+              <el-alert type="info" :closable="false" show-icon style="margin-top: 16px">
+                <template #title>
+                  下载备份不支持文件系统监听，因为百度网盘API不提供目录变化通知接口。建议使用"指定时间"模式，避免频繁调用API导致限速。
+                </template>
+              </el-alert>
+            </el-card>
+
             <!-- 关于信息 -->
             <el-card class="setting-card" shadow="hover">
               <template #header>
@@ -405,6 +641,34 @@
         :initial-path="formData?.download?.download_dir"
         @confirm="handleDirConfirm"
     />
+
+    <!-- 密钥显示对话框 -->
+    <el-dialog v-model="showKeyDialog" title="加密密钥" width="450px" :close-on-click-modal="false">
+      <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 16px">
+        <template #title>请立即备份此密钥到安全的地方！</template>
+      </el-alert>
+      <el-input
+          :model-value="encryptionKey"
+          :type="showKey ? 'text' : 'password'"
+          readonly
+          class="key-input"
+      >
+        <template #suffix>
+          <el-button link @click="showKey = !showKey">
+            <el-icon v-if="!showKey"><View /></el-icon>
+            <el-icon v-else><Hide /></el-icon>
+          </el-button>
+          <el-button link @click="copyToClipboard(encryptionKey)">
+            <el-icon><CopyDocument /></el-icon>
+          </el-button>
+        </template>
+      </el-input>
+      <template #footer>
+        <el-button type="primary" style="width: 100%" @click="showKeyDialog = false; encryptionKey = ''; showKey = false">
+          我已保存密钥
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -429,8 +693,27 @@ import {
   Files,
   Share,
   FolderOpened,
+  Key,
+  CopyDocument,
+  Delete,
+  View,
+  Hide,
+  Refresh,
 } from '@element-plus/icons-vue'
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
+import {
+  getEncryptionStatus,
+  generateEncryptionKey,
+  importEncryptionKey,
+  exportEncryptionKey,
+  deleteEncryptionKey,
+  getWatchCapability,
+  getTriggerConfig,
+  updateTriggerConfig,
+  type EncryptionStatus,
+  type WatchCapability,
+  type GlobalTriggerConfig,
+} from '@/api/autobackup'
 
 const configStore = useConfigStore()
 
@@ -446,6 +729,36 @@ const formData = ref<AppConfig | null>(null)
 const recommended = ref<any>(null)
 const transferBehavior = ref('transfer_only')
 const showDirPicker = ref(false)
+
+// 加密相关状态
+const encryptionStatus = ref<EncryptionStatus | null>(null)
+const encryptionKey = ref('')
+const keyAlgorithm = ref('AES-256-GCM')
+const showKeyDialog = ref(false)
+const showKey = ref(false)
+
+// 自动备份相关状态
+const watchCapability = ref<WatchCapability | null>(null)
+const triggerConfig = ref<GlobalTriggerConfig>({
+  upload_trigger: {
+    watch_enabled: true,
+    watch_debounce_ms: 3000,
+    watch_recursive: true,
+    fallback_interval_enabled: true,
+    fallback_interval_minutes: 30,
+    fallback_scheduled_enabled: true,
+    fallback_scheduled_hour: 2,
+    fallback_scheduled_minute: 0,
+  },
+  download_trigger: {
+    poll_mode: 'scheduled',
+    poll_interval_minutes: 60,
+    poll_scheduled_hour: 2,
+    poll_scheduled_minute: 0,
+  },
+})
+const uploadScheduledTime = ref<Date | null>(null)
+const downloadScheduledTime = ref<Date | null>(null)
 
 // 滑块标记
 const threadMarks = reactive({
@@ -596,6 +909,16 @@ async function handleSave() {
       console.warn('保存转存配置失败:', error)
     }
 
+    // 同时保存自动备份触发配置
+    try {
+      await updateTriggerConfig({
+        upload_trigger: triggerConfig.value.upload_trigger,
+        download_trigger: triggerConfig.value.download_trigger,
+      })
+    } catch (error) {
+      console.warn('保存自动备份触发配置失败:', error)
+    }
+
     ElMessage.success('配置已保存')
 
     // 重新加载推荐配置以更新警告
@@ -639,9 +962,153 @@ function handleDirConfirm(path: string) {
   showDirPicker.value = false
 }
 
+// 加载加密状态
+async function loadEncryptionStatus() {
+  try {
+    encryptionStatus.value = await getEncryptionStatus()
+  } catch (error) {
+    console.warn('获取加密状态失败:', error)
+  }
+}
+
+// 加载文件监听能力
+async function loadWatchCapability() {
+  try {
+    watchCapability.value = await getWatchCapability()
+  } catch (error) {
+    console.warn('获取文件监听能力失败:', error)
+  }
+}
+
+// 加载触发配置
+async function loadTriggerConfig() {
+  try {
+    const config = await getTriggerConfig()
+    triggerConfig.value = config
+
+    // 初始化时间选择器的值
+    uploadScheduledTime.value = new Date()
+    uploadScheduledTime.value.setHours(config.upload_trigger.fallback_scheduled_hour)
+    uploadScheduledTime.value.setMinutes(config.upload_trigger.fallback_scheduled_minute)
+
+    downloadScheduledTime.value = new Date()
+    downloadScheduledTime.value.setHours(config.download_trigger.poll_scheduled_hour)
+    downloadScheduledTime.value.setMinutes(config.download_trigger.poll_scheduled_minute)
+  } catch (error) {
+    console.warn('获取触发配置失败:', error)
+  }
+}
+
+// 处理触发配置变更
+async function handleTriggerConfigChange() {
+  try {
+    await updateTriggerConfig({
+      upload_trigger: triggerConfig.value.upload_trigger,
+      download_trigger: triggerConfig.value.download_trigger,
+    })
+    ElMessage.success('自动备份触发配置已更新')
+  } catch (error: any) {
+    ElMessage.error('更新触发配置失败: ' + (error.message || '未知错误'))
+  }
+}
+
+// 处理上传定时时间变更
+function handleUploadScheduledTimeChange(time: Date | null) {
+  if (time) {
+    triggerConfig.value.upload_trigger.fallback_scheduled_hour = time.getHours()
+    triggerConfig.value.upload_trigger.fallback_scheduled_minute = time.getMinutes()
+    handleTriggerConfigChange()
+  }
+}
+
+// 处理下载定时时间变更
+function handleDownloadScheduledTimeChange(time: Date | null) {
+  if (time) {
+    triggerConfig.value.download_trigger.poll_scheduled_hour = time.getHours()
+    triggerConfig.value.download_trigger.poll_scheduled_minute = time.getMinutes()
+    handleTriggerConfigChange()
+  }
+}
+
+// 生成密钥
+async function handleGenerateKey() {
+  try {
+    const key = await generateEncryptionKey(keyAlgorithm.value)
+    encryptionKey.value = key
+    showKeyDialog.value = true
+    await loadEncryptionStatus()
+    ElMessage.success('密钥生成成功，请妥善保管')
+  } catch (error: any) {
+    ElMessage.error('生成密钥失败: ' + (error.message || '未知错误'))
+  }
+}
+
+// 导入密钥
+async function handleImportKey() {
+  if (!encryptionKey.value) {
+    ElMessage.warning('请输入密钥')
+    return
+  }
+  try {
+    await importEncryptionKey(encryptionKey.value, keyAlgorithm.value)
+    encryptionKey.value = ''
+    await loadEncryptionStatus()
+    ElMessage.success('密钥导入成功')
+  } catch (error: any) {
+    ElMessage.error('导入密钥失败: ' + (error.message || '未知错误'))
+  }
+}
+
+// 导出密钥
+async function handleExportKey() {
+  try {
+    const key = await exportEncryptionKey()
+    encryptionKey.value = key
+    showKeyDialog.value = true
+  } catch (error: any) {
+    ElMessage.error('导出密钥失败: ' + (error.message || '未知错误'))
+  }
+}
+
+// 删除密钥
+async function handleDeleteKey() {
+  try {
+    await ElMessageBox.confirm(
+        '确定要删除加密密钥吗？删除后将无法解密已加密的文件！',
+        '危险操作',
+        {
+          confirmButtonText: '确定删除',
+          cancelButtonText: '取消',
+          type: 'error',
+        }
+    )
+    await deleteEncryptionKey()
+    await loadEncryptionStatus()
+    ElMessage.success('密钥已删除')
+  } catch (error: any) {
+    if (error !== 'cancel') {
+      ElMessage.error('删除密钥失败: ' + (error.message || '未知错误'))
+    }
+  }
+}
+
+// 复制到剪贴板
+function copyToClipboard(text: string) {
+  navigator.clipboard.writeText(text)
+  ElMessage.success('已复制到剪贴板')
+}
+
+// 格式化日期
+function formatDate(dateStr: string): string {
+  return new Date(dateStr).toLocaleString('zh-CN')
+}
+
 // 组件挂载
 onMounted(() => {
   loadConfig()
+  loadEncryptionStatus()
+  loadWatchCapability()
+  loadTriggerConfig()
 })
 </script>
 
@@ -780,6 +1247,108 @@ onMounted(() => {
   font-size: 11px;
 }
 
+// 加密设置样式
+.encryption-status-card {
+  background: #f5f7fa;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+
+  .status-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+
+    .status-label {
+      font-size: 14px;
+      font-weight: 500;
+    }
+  }
+
+  .status-detail {
+    font-size: 13px;
+    color: #909399;
+  }
+}
+
+.encryption-form {
+  margin-top: 16px;
+}
+
+.encryption-actions {
+  margin-top: 16px;
+  display: flex;
+  gap: 12px;
+
+  .el-button {
+    flex: 1;
+  }
+}
+
+.key-input {
+  font-family: monospace;
+}
+
+// 自动备份设置样式
+.watch-capability-card {
+  background: #fef0f0;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  border-left: 4px solid #f56c6c;
+
+  &.is-available {
+    background: #f0f9eb;
+    border-left-color: #67c23a;
+  }
+
+  .capability-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+
+    .capability-label {
+      font-size: 14px;
+      font-weight: 500;
+    }
+  }
+
+  .capability-detail {
+    font-size: 13px;
+    color: #606266;
+  }
+
+  .capability-reason {
+    font-size: 13px;
+    color: #f56c6c;
+    margin-top: 8px;
+  }
+
+  .capability-suggestion {
+    font-size: 13px;
+    color: #e6a23c;
+    margin-top: 4px;
+  }
+
+  .capability-warnings {
+    margin-top: 8px;
+
+    .warning-item {
+      font-size: 12px;
+      color: #e6a23c;
+      padding: 4px 0;
+    }
+  }
+}
+
+.nested-config {
+  margin-left: 24px;
+  padding-left: 16px;
+  border-left: 2px solid #e4e7ed;
+}
+
 // =====================
 // 移动端样式
 // =====================
@@ -848,6 +1417,52 @@ onMounted(() => {
     flex-direction: column;
     align-items: flex-start;
     gap: 4px;
+  }
+
+  // 29.1 加密操作按钮组优化 - 移动端垂直布局全宽按钮
+  .encryption-actions {
+    flex-direction: column;
+    gap: 8px;
+
+    .el-button {
+      width: 100%;
+      margin-left: 0 !important;
+    }
+  }
+
+  // 29.2 嵌套配置减少左边距 - 适配小屏幕
+  .nested-config {
+    margin-left: 8px !important;
+    padding-left: 8px !important;
+  }
+
+  // 29.3 时间选择器和数字输入框优化 - 全宽布局和触摸友好
+  .el-time-picker,
+  :deep(.el-time-picker) {
+    width: 100% !important;
+  }
+
+  .el-input-number,
+  :deep(.el-input-number) {
+    width: 100% !important;
+  }
+
+  // 增加触摸友好的控件大小
+  :deep(.el-input-number__decrease),
+  :deep(.el-input-number__increase) {
+    width: 40px;
+    height: 40px;
+  }
+
+  :deep(.el-input-number .el-input__inner) {
+    height: 40px;
+    line-height: 40px;
+  }
+
+  // 时间选择器触摸优化
+  :deep(.el-time-picker .el-input__inner) {
+    height: 40px;
+    line-height: 40px;
   }
 }
 </style>

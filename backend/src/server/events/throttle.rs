@@ -3,7 +3,7 @@
 //! 用于控制进度事件的发布频率，避免事件风暴
 //! 支持时间间隔节流（建议 200-250）
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 /// 默认节流间隔（毫秒）
@@ -11,14 +11,14 @@ pub const DEFAULT_THROTTLE_INTERVAL_MS: u64 = 200;
 
 /// 进度事件节流器
 ///
-/// 线程安全的时间节流器，使用原子操作避免锁竞争
+/// 线程安全的时间节流器
 /// 典型用法：每次更新进度时调用 `should_emit()`，返回 true 时才发布事件
 #[derive(Debug)]
 pub struct ProgressThrottler {
-    /// 上次发布事件的时间戳（纳秒，使用原子操作）
-    last_emit_nanos: AtomicU64,
-    /// 节流间隔（纳秒）
-    interval_nanos: u64,
+    /// 上次发布事件的时间
+    last_emit: Mutex<Option<Instant>>,
+    /// 节流间隔
+    interval: Duration,
 }
 
 impl ProgressThrottler {
@@ -28,8 +28,8 @@ impl ProgressThrottler {
     /// * `interval` - 最小发布间隔
     pub fn new(interval: Duration) -> Self {
         Self {
-            last_emit_nanos: AtomicU64::new(0),
-            interval_nanos: interval.as_nanos() as u64,
+            last_emit: Mutex::new(None),
+            interval,
         }
     }
 
@@ -47,26 +47,16 @@ impl ProgressThrottler {
     ///
     /// 如果距离上次发布已超过节流间隔，返回 true 并更新时间戳
     /// 否则返回 false
-    ///
-    /// 线程安全：使用 CAS 操作确保原子性
     pub fn should_emit(&self) -> bool {
-        let now_nanos = Self::current_nanos();
-        let last = self.last_emit_nanos.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let mut last = self.last_emit.lock();
 
-        // 检查时间间隔
-        if now_nanos.saturating_sub(last) >= self.interval_nanos {
-            // 使用 CAS 更新时间戳，避免竞态条件
-            match self.last_emit_nanos.compare_exchange_weak(
-                last,
-                now_nanos,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => true,
-                Err(_) => false, // 被其他线程抢先更新，本次不发布
+        match *last {
+            Some(last_time) if now.duration_since(last_time) < self.interval => false,
+            _ => {
+                *last = Some(now);
+                true
             }
-        } else {
-            false
         }
     }
 
@@ -74,25 +64,13 @@ impl ProgressThrottler {
     ///
     /// 不检查时间间隔，直接更新时间戳并返回 true
     pub fn force_emit(&self) -> bool {
-        let now_nanos = Self::current_nanos();
-        self.last_emit_nanos.store(now_nanos, Ordering::Relaxed);
+        *self.last_emit.lock() = Some(Instant::now());
         true
     }
 
     /// 重置节流器状态
     pub fn reset(&self) {
-        self.last_emit_nanos.store(0, Ordering::Relaxed);
-    }
-
-    /// 获取当前时间的纳秒表示
-    ///
-    /// 使用 Instant 避免系统时钟跳变影响
-    fn current_nanos() -> u64 {
-        // 使用 thread_local 存储起始时间，避免每次创建 Instant
-        thread_local! {
-            static START: Instant = Instant::now();
-        }
-        START.with(|start| start.elapsed().as_nanos() as u64)
+        *self.last_emit.lock() = None;
     }
 }
 
@@ -105,8 +83,8 @@ impl Default for ProgressThrottler {
 impl Clone for ProgressThrottler {
     fn clone(&self) -> Self {
         Self {
-            last_emit_nanos: AtomicU64::new(self.last_emit_nanos.load(Ordering::Relaxed)),
-            interval_nanos: self.interval_nanos,
+            last_emit: Mutex::new(*self.last_emit.lock()),
+            interval: self.interval,
         }
     }
 }

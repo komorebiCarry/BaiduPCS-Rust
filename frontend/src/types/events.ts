@@ -13,6 +13,8 @@ export interface DownloadEventCreated {
   local_path: string
   total_size: number
   group_id?: string
+  is_backup?: boolean
+  original_filename?: string
 }
 
 export interface DownloadEventProgress {
@@ -58,15 +60,36 @@ export interface DownloadEventDeleted {
   task_id: string
 }
 
+export interface DownloadEventDecryptProgress {
+  event_type: 'decrypt_progress'
+  task_id: string
+  decrypt_progress: number
+  processed_bytes: number
+  total_bytes: number
+  group_id?: string
+  is_backup?: boolean
+}
+
+export interface DownloadEventDecryptCompleted {
+  event_type: 'decrypt_completed'
+  task_id: string
+  original_size: number
+  decrypted_path: string
+  group_id?: string
+  is_backup?: boolean
+}
+
 export type DownloadEvent =
-  | DownloadEventCreated
-  | DownloadEventProgress
-  | DownloadEventStatusChanged
-  | DownloadEventCompleted
-  | DownloadEventFailed
-  | DownloadEventPaused
-  | DownloadEventResumed
-  | DownloadEventDeleted
+    | DownloadEventCreated
+    | DownloadEventProgress
+    | DownloadEventStatusChanged
+    | DownloadEventCompleted
+    | DownloadEventFailed
+    | DownloadEventPaused
+    | DownloadEventResumed
+    | DownloadEventDeleted
+    | DownloadEventDecryptProgress
+    | DownloadEventDecryptCompleted
 
 // ============ 文件夹事件 ============
 
@@ -131,15 +154,15 @@ export interface FolderEventDeleted {
 }
 
 export type FolderEvent =
-  | FolderEventCreated
-  | FolderEventProgress
-  | FolderEventStatusChanged
-  | FolderEventScanCompleted
-  | FolderEventCompleted
-  | FolderEventFailed
-  | FolderEventPaused
-  | FolderEventResumed
-  | FolderEventDeleted
+    | FolderEventCreated
+    | FolderEventProgress
+    | FolderEventStatusChanged
+    | FolderEventScanCompleted
+    | FolderEventCompleted
+    | FolderEventFailed
+    | FolderEventPaused
+    | FolderEventResumed
+    | FolderEventDeleted
 
 // ============ 上传事件 ============
 
@@ -197,15 +220,199 @@ export interface UploadEventDeleted {
   task_id: string
 }
 
+export interface UploadEventEncryptProgress {
+  event_type: 'encrypt_progress'
+  task_id: string
+  encrypt_progress: number
+  processed_bytes: number
+  total_bytes: number
+  is_backup?: boolean
+}
+
+export interface UploadEventEncryptCompleted {
+  event_type: 'encrypt_completed'
+  task_id: string
+  encrypted_size: number
+  original_size: number
+  is_backup?: boolean
+}
+
 export type UploadEvent =
-  | UploadEventCreated
-  | UploadEventProgress
-  | UploadEventStatusChanged
-  | UploadEventCompleted
-  | UploadEventFailed
-  | UploadEventPaused
-  | UploadEventResumed
-  | UploadEventDeleted
+    | UploadEventCreated
+    | UploadEventProgress
+    | UploadEventStatusChanged
+    | UploadEventCompleted
+    | UploadEventFailed
+    | UploadEventPaused
+    | UploadEventResumed
+    | UploadEventDeleted
+    | UploadEventEncryptProgress
+    | UploadEventEncryptCompleted
+
+// ============ 备份事件 ============
+// 注意：event_type 与后端 BackupEvent 的 serde rename_all = "snake_case" 保持一致
+
+export interface BackupEventCreated {
+  event_type: 'created'
+  task_id: string
+  config_id: string
+  config_name: string
+  direction: string
+  trigger_type: string
+}
+
+export interface BackupEventScanProgress {
+  event_type: 'scan_progress'
+  task_id: string
+  scanned_files: number
+  scanned_dirs: number
+}
+
+export interface BackupEventScanCompleted {
+  event_type: 'scan_completed'
+  task_id: string
+  total_files: number
+  total_bytes: number
+}
+
+export interface BackupEventFileProgress {
+  event_type: 'file_progress'
+  task_id: string
+  file_task_id: string
+  file_name: string
+  transferred_bytes: number
+  total_bytes: number
+  status: string
+}
+
+export interface BackupEventFileStatusChanged {
+  event_type: 'file_status_changed'
+  task_id: string
+  file_task_id: string
+  file_name: string
+  old_status: string
+  new_status: string
+}
+
+export interface BackupEventProgress {
+  event_type: 'progress'
+  task_id: string
+  completed_count: number
+  failed_count: number
+  skipped_count: number
+  total_count: number
+  transferred_bytes: number
+  total_bytes: number
+}
+
+export interface BackupEventStatusChanged {
+  event_type: 'status_changed'
+  task_id: string
+  old_status: string
+  new_status: string
+}
+
+export interface BackupEventCompleted {
+  event_type: 'completed'
+  task_id: string
+  completed_at: number
+  success_count: number
+  failed_count: number
+  skipped_count: number
+}
+
+export interface BackupEventFailed {
+  event_type: 'failed'
+  task_id: string
+  error: string
+}
+
+export interface BackupEventPaused {
+  event_type: 'paused'
+  task_id: string
+}
+
+export interface BackupEventResumed {
+  event_type: 'resumed'
+  task_id: string
+}
+
+export interface BackupEventCancelled {
+  event_type: 'cancelled'
+  task_id: string
+}
+
+export interface BackupEventFileEncrypting {
+  event_type: 'file_encrypting'
+  task_id: string
+  file_task_id: string
+  file_name: string
+}
+
+export interface BackupEventFileEncrypted {
+  event_type: 'file_encrypted'
+  task_id: string
+  file_task_id: string
+  file_name: string
+  encrypted_name: string
+  encrypted_size: number
+}
+
+export interface BackupEventFileDecrypting {
+  event_type: 'file_decrypting'
+  task_id: string
+  file_task_id: string
+  file_name: string
+}
+
+export interface BackupEventFileDecrypted {
+  event_type: 'file_decrypted'
+  task_id: string
+  file_task_id: string
+  file_name: string
+  original_name: string
+  original_size: number
+}
+
+export interface BackupEventFileEncryptProgress {
+  event_type: 'file_encrypt_progress'
+  task_id: string
+  file_task_id: string
+  file_name: string
+  progress: number
+  processed_bytes: number
+  total_bytes: number
+}
+
+export interface BackupEventFileDecryptProgress {
+  event_type: 'file_decrypt_progress'
+  task_id: string
+  file_task_id: string
+  file_name: string
+  progress: number
+  processed_bytes: number
+  total_bytes: number
+}
+
+export type BackupEvent =
+    | BackupEventCreated
+    | BackupEventScanProgress
+    | BackupEventScanCompleted
+    | BackupEventFileProgress
+    | BackupEventFileStatusChanged
+    | BackupEventProgress
+    | BackupEventStatusChanged
+    | BackupEventCompleted
+    | BackupEventFailed
+    | BackupEventPaused
+    | BackupEventResumed
+    | BackupEventCancelled
+    | BackupEventFileEncrypting
+    | BackupEventFileEncrypted
+    | BackupEventFileDecrypting
+    | BackupEventFileDecrypted
+    | BackupEventFileEncryptProgress
+    | BackupEventFileDecryptProgress
 
 // ============ 转存事件 ============
 
@@ -252,12 +459,12 @@ export interface TransferEventDeleted {
 }
 
 export type TransferEvent =
-  | TransferEventCreated
-  | TransferEventProgress
-  | TransferEventStatusChanged
-  | TransferEventCompleted
-  | TransferEventFailed
-  | TransferEventDeleted
+    | TransferEventCreated
+    | TransferEventProgress
+    | TransferEventStatusChanged
+    | TransferEventCompleted
+    | TransferEventFailed
+    | TransferEventDeleted
 
 // ============ 统一任务事件 ============
 
@@ -281,11 +488,17 @@ export interface TaskEventTransfer {
   event: TransferEvent
 }
 
+export interface TaskEventBackup {
+  category: 'backup'
+  event: BackupEvent
+}
+
 export type TaskEvent =
-  | TaskEventDownload
-  | TaskEventFolder
-  | TaskEventUpload
-  | TaskEventTransfer
+    | TaskEventDownload
+    | TaskEventFolder
+    | TaskEventUpload
+    | TaskEventTransfer
+    | TaskEventBackup
 
 // ============ 带时间戳的事件 ============
 
@@ -293,7 +506,7 @@ export interface TimestampedEvent {
   event_id: number
   timestamp: number
   category: string
-  event: DownloadEvent | FolderEvent | UploadEvent | TransferEvent
+  event: DownloadEvent | FolderEvent | UploadEvent | TransferEvent | BackupEvent
 }
 
 // ============ WebSocket 消息类型 ============
@@ -369,11 +582,11 @@ export interface WsServerUnsubscribeSuccess {
 }
 
 export type WsServerMessage =
-  | WsServerPong
-  | WsServerEvent
-  | WsServerEventBatch
-  | WsServerSnapshot
-  | WsServerConnected
-  | WsServerError
-  | WsServerSubscribeSuccess
-  | WsServerUnsubscribeSuccess
+    | WsServerPong
+    | WsServerEvent
+    | WsServerEventBatch
+    | WsServerSnapshot
+    | WsServerConnected
+    | WsServerError
+    | WsServerSubscribeSuccess
+    | WsServerUnsubscribeSuccess

@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:   # 支持手动触发
 
 jobs:
   build-and-release:
@@ -171,17 +172,17 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          tags: baidupcs-rust:${{ github.ref_name }}
+          tags: BaiduPCS-Rust:${{ github.ref_name }}-amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/baidupcs-rust-${{ github.ref_name }}.tar
+          outputs: type=docker,dest=/tmp/BaiduPCS-Rust-${{ github.ref_name }}-amd64.tar
 
       - name: Compress Docker image
         run: |
           cd /tmp
-          gzip baidupcs-rust-${{ github.ref_name }}.tar
-          mv baidupcs-rust-${{ github.ref_name }}.tar.gz baidupcs-rust-${{ github.ref_name }}-docker.tar.gz
-          echo "DOCKER_IMAGE_PATH=/tmp/baidupcs-rust-${{ github.ref_name }}-docker.tar.gz" >> $GITHUB_ENV
+          gzip BaiduPCS-Rust-${{ github.ref_name }}-amd64.tar
+          mv BaiduPCS-Rust-${{ github.ref_name }}-amd64.tar.gz BaiduPCS-Rust-${{ github.ref_name }}-amd64-docker.tar.gz
+          echo "DOCKER_IMAGE_PATH=/tmp/BaiduPCS-Rust-${{ github.ref_name }}-amd64-docker.tar.gz" >> $GITHUB_ENV
 
       - name: Upload Docker image to GitHub Release
         uses: softprops/action-gh-release@v2

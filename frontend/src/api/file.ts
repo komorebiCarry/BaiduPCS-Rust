@@ -26,6 +26,11 @@ export interface FileItem {
   server_mtime: number
   local_ctime: number
   local_mtime: number
+  // 加密文件相关字段
+  is_encrypted: boolean
+  is_encrypted_folder: boolean
+  original_name?: string
+  original_size?: number
 }
 
 export interface FileListData {

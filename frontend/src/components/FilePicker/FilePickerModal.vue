@@ -62,17 +62,24 @@
       <div class="footer-bar">
         <!-- 上传模式 -->
         <template v-if="mode === 'upload'">
-          <span class="selected-info">
-            <template v-if="isMultiSelectMode && store.multiSelection.length > 0">
-              已选择: {{ store.multiSelection.length }} 个文件/文件夹
-            </template>
-            <template v-else-if="store.selection">
-              已选择: {{ store.selection.name }}
-            </template>
-            <template v-else>
-              未选择
-            </template>
-          </span>
+          <div class="upload-info">
+            <span class="selected-info">
+              <template v-if="isMultiSelectMode && store.multiSelection.length > 0">
+                已选择: {{ store.multiSelection.length }} 个文件/文件夹
+              </template>
+              <template v-else-if="store.selection">
+                已选择: {{ store.selection.name }}
+              </template>
+              <template v-else>
+                未选择
+              </template>
+            </span>
+            <div v-if="showEncryption" class="encrypt-switch">
+              <el-icon><Lock /></el-icon>
+              <span>加密上传</span>
+              <el-switch v-model="encryptEnabled" size="small" />
+            </div>
+          </div>
           <div class="actions">
             <el-button @click="handleClose">取消</el-button>
             <el-button
@@ -147,6 +154,7 @@ import NavigatorBar from './NavigatorBar.vue'
 import FileList from './FileList.vue'
 import EmptyState from './EmptyState.vue'
 import ErrorState from './ErrorState.vue'
+import { Lock } from '@element-plus/icons-vue'
 
 // 响应式检测
 const isMobile = useIsMobile()
@@ -160,18 +168,20 @@ const props = withDefaults(defineProps<{
   initialPath?: string
   defaultDownloadDir?: string
   multiple?: boolean  // 是否支持多选（上传模式默认 true）
+  showEncryption?: boolean  // 是否显示加密选项（上传模式）
 }>(), {
   selectType: 'both',
   title: '选择文件',
   confirmText: '确定',
   mode: 'upload',
   multiple: true,
+  showEncryption: false,
 })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  'select': [entry: FileEntry]
-  'select-multiple': [entries: FileEntry[]]  // 多选确认事件
+  'select': [entry: FileEntry, encrypt: boolean]
+  'select-multiple': [entries: FileEntry[], encrypt: boolean]  // 多选确认事件
   'confirm-download': [payload: { path: string, setAsDefault: boolean }]
   'confirm': [path: string]  // 纯目录选择模式
   'use-default': []
@@ -181,6 +191,9 @@ const store = useFilePickerStore()
 
 // 下载模式状态
 const setAsDefault = ref(false)
+
+// 加密状态（上传模式）
+const encryptEnabled = ref(false)
 
 // 是否启用多选模式（上传模式 + multiple 为 true）
 const isMultiSelectMode = computed(() => {
@@ -251,6 +264,7 @@ const canConfirmUpload = computed(() => {
 function handleOpen() {
   store.reset()
   setAsDefault.value = false
+  encryptEnabled.value = false
 
   // 根据模式确定初始路径
   if (props.mode === 'download') {
@@ -326,11 +340,11 @@ function handleConfirm() {
     // 上传模式
     if (isMultiSelectMode.value && store.multiSelection.length > 0) {
       // 多选模式：发射 select-multiple 事件
-      emit('select-multiple', [...store.multiSelection])
+      emit('select-multiple', [...store.multiSelection], encryptEnabled.value)
       visible.value = false
     } else if (store.selection && canConfirmUpload.value) {
       // 单选模式：原有逻辑
-      emit('select', store.selection)
+      emit('select', store.selection, encryptEnabled.value)
       visible.value = false
     }
   }
@@ -397,6 +411,14 @@ watch(() => props.selectType, () => {
   width: 100%;
 }
 
+/* 上传模式信息区 */
+.upload-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 450px;
+}
+
 .selected-info {
   color: var(--el-text-color-secondary);
   font-size: 14px;
@@ -404,6 +426,14 @@ watch(() => props.selectType, () => {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 400px;
+}
+
+.encrypt-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--el-text-color-regular);
 }
 
 .actions {

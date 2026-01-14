@@ -51,7 +51,7 @@
             v-for="item in uploadItems"
             :key="item.id"
             class="task-card"
-            :class="{ 'task-active': item.status === 'uploading' }"
+            :class="{ 'task-active': item.status === 'uploading' || item.status === 'encrypting' }"
             shadow="hover"
         >
           <!-- 任务信息 -->
@@ -69,6 +69,11 @@
                 <el-tag v-if="item.is_rapid_upload && item.status === 'completed'" type="success" size="small">
                   <el-icon><CircleCheck /></el-icon>
                   秒传
+                </el-tag>
+                <!-- 加密标识（已完成的加密任务） -->
+                <el-tag v-if="item.encrypt_enabled && (item.status === 'completed' || item.status === 'rapid_upload_success')" type="info" size="small">
+                  <el-icon><Lock /></el-icon>
+                  已加密
                 </el-tag>
               </div>
               <div class="task-path">
@@ -115,8 +120,25 @@
             </div>
           </div>
 
+          <!-- 加密进度显示 -->
+          <div v-if="item.status === 'encrypting'" class="encrypt-progress">
+            <div class="encrypt-header">
+              <el-icon class="encrypt-icon"><Lock /></el-icon>
+              <span>正在加密文件...</span>
+            </div>
+            <el-progress
+                :percentage="item.encrypt_progress || 0"
+                :stroke-width="6"
+                status="warning"
+            >
+              <template #default="{ percentage }">
+                <span class="progress-text">{{ percentage.toFixed(1) }}%</span>
+              </template>
+            </el-progress>
+          </div>
+
           <!-- 进度条 -->
-          <div class="task-progress">
+          <div class="task-progress" v-if="item.status !== 'encrypting'">
             <el-progress
                 :percentage="calculateProgress(item)"
                 :status="getProgressStatus(item.status)"
@@ -186,6 +208,7 @@ import {
   Delete,
   CircleCheck,
   RefreshRight,
+  Lock,
 } from '@element-plus/icons-vue'
 import {useIsMobile} from '@/utils/responsive'
 // 🔥 WebSocket 相关导入
@@ -210,13 +233,13 @@ const wsConnected = ref(false)
 // 是否有活跃任务（需要实时刷新）
 const hasActiveTasks = computed(() => {
   return uploadItems.value.some(item =>
-      item.status === 'uploading' || item.status === 'pending'
+      item.status === 'uploading' || item.status === 'pending' || item.status === 'encrypting' || item.status === 'checking_rapid'
   )
 })
 
 // 计算属性
 const activeCount = computed(() => {
-  return uploadItems.value.filter(item => item.status === 'uploading').length
+  return uploadItems.value.filter(item => item.status === 'uploading' || item.status === 'encrypting').length
 })
 
 const completedCount = computed(() => {
@@ -240,9 +263,10 @@ function getFilename(path: string): string {
 
 // 获取进度条状态
 function getProgressStatus(status: UploadTaskStatus): 'success' | 'exception' | 'warning' | undefined {
-  if (status === 'completed') return 'success'
+  if (status === 'completed' || status === 'rapid_upload_success') return 'success'
   if (status === 'failed') return 'exception'
   if (status === 'paused') return 'warning'
+  if (status === 'encrypting') return 'warning'
   return undefined
 }
 
@@ -407,6 +431,28 @@ function handleUploadEvent(event: UploadEvent) {
         if (event.total_chunks !== undefined) {
           uploadItems.value[progressIdx].total_chunks = event.total_chunks
         }
+        // 🔥 如果当前是加密状态，收到传输进度后自动切换为上传状态
+        if (uploadItems.value[progressIdx].status === 'encrypting') {
+          uploadItems.value[progressIdx].status = 'uploading'
+        }
+      }
+      break
+    case 'encrypt_progress':
+      // 🔥 加密进度更新
+      const encryptIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
+      if (encryptIdx !== -1) {
+        uploadItems.value[encryptIdx].encrypt_progress = event.encrypt_progress
+        uploadItems.value[encryptIdx].status = 'encrypting'
+      }
+      break
+    case 'encrypt_completed':
+      // 🔥 加密完成
+      const encryptCompletedIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
+      if (encryptCompletedIdx !== -1) {
+        uploadItems.value[encryptCompletedIdx].encrypt_progress = 100
+        uploadItems.value[encryptCompletedIdx].original_size = event.original_size
+        // 🔥 直接更新状态为 uploading，避免依赖 status_changed 事件导致状态不同步
+        uploadItems.value[encryptCompletedIdx].status = 'uploading'
       }
       break
     case 'status_changed':
@@ -661,6 +707,39 @@ onUnmounted(() => {
 
 :deep(.el-progress__text) {
   font-size: 12px !important;
+}
+
+// =====================
+// 加密进度样式
+// =====================
+.encrypt-progress {
+  margin-bottom: 15px;
+  padding: 10px;
+  background: #fdf6ec;
+  border-radius: 4px;
+
+  .encrypt-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: #e6a23c;
+    font-size: 13px;
+
+    .encrypt-icon {
+      animation: pulse 1.5s infinite;
+    }
+  }
+
+  .progress-text {
+    font-size: 12px;
+    font-weight: 500;
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 // =====================

@@ -16,6 +16,9 @@ use super::ApiResponse;
 #[derive(Debug, Deserialize)]
 pub struct CreateFolderDownloadRequest {
     pub path: String,
+    /// 原始文件夹名（如果是加密文件夹，前端传入还原后的名称）
+    #[serde(default)]
+    pub original_name: Option<String>,
 }
 
 /// 删除文件夹下载请求参数
@@ -58,11 +61,11 @@ pub async fn create_folder_download(
     State(app_state): State<AppState>,
     Json(req): Json<CreateFolderDownloadRequest>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    info!("创建文件夹下载: {}", req.path);
+    info!("创建文件夹下载: {}, original_name: {:?}", req.path, req.original_name);
 
     match app_state
         .folder_download_manager
-        .create_folder_download(req.path)
+        .create_folder_download_with_name(req.path, req.original_name)
         .await
     {
         Ok(folder_id) => Ok(Json(ApiResponse::success(folder_id))),

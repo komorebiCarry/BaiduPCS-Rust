@@ -220,10 +220,47 @@ pub struct TaskMetadata {
     /// 错误信息（任务失败时）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_msg: Option<String>,
+
+    // === 自动备份字段 ===
+    /// 是否为备份任务
+    #[serde(default)]
+    pub is_backup: bool,
+
+    /// 关联的备份配置 ID（备份任务时使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_config_id: Option<String>,
+
+    // === 加密相关字段 ===
+    /// 是否启用加密（上传任务）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub encrypt_enabled: bool,
+
+    /// 是否为加密文件（下载任务）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_encrypted: bool,
+
+    /// 加密时使用的密钥版本（上传/下载任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_key_version: Option<u32>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl TaskMetadata {
     /// 创建下载任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `fs_id` - 百度网盘文件 fs_id
+    /// * `remote_path` - 远程文件路径
+    /// * `local_path` - 本地保存路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `is_encrypted` - 是否为加密文件（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
     pub fn new_download(
         task_id: String,
         fs_id: u64,
@@ -232,6 +269,8 @@ impl TaskMetadata {
         file_size: u64,
         chunk_size: u64,
         total_chunks: usize,
+        is_encrypted: Option<bool>,
+        encryption_key_version: Option<u32>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -264,10 +303,91 @@ impl TaskMetadata {
             status: Some(TaskPersistenceStatus::Pending),
             completed_at: None,
             error_msg: None,
+            is_backup: false,
+            backup_config_id: None,
+            // 加密字段
+            encrypt_enabled: false,
+            is_encrypted: is_encrypted.unwrap_or(false),
+            encryption_key_version,
+        }
+    }
+
+    /// 创建下载备份任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `fs_id` - 百度网盘文件 fs_id
+    /// * `remote_path` - 远程文件路径
+    /// * `local_path` - 本地保存路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `backup_config_id` - 备份配置 ID
+    /// * `is_encrypted` - 是否为加密文件（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn new_download_backup(
+        task_id: String,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        backup_config_id: String,
+        is_encrypted: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id,
+            task_type: TaskType::Download,
+            created_at: now,
+            updated_at: now,
+            fs_id: Some(fs_id),
+            transfer_task_id: None,
+            remote_path: Some(remote_path),
+            local_path: Some(local_path),
+            file_size: Some(file_size),
+            chunk_size: Some(chunk_size),
+            total_chunks: Some(total_chunks),
+            source_path: None,
+            target_path: None,
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: None,
+            share_pwd: None,
+            transfer_target_path: None,
+            transfer_status: None,
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: None,
+            transfer_file_name: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: true,
+            backup_config_id: Some(backup_config_id),
+            // 加密字段
+            encrypt_enabled: false,
+            is_encrypted: is_encrypted.unwrap_or(false),
+            encryption_key_version,
         }
     }
 
     /// 创建上传任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `source_path` - 本地源文件路径
+    /// * `target_path` - 远程目标路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `encrypt_enabled` - 是否启用加密（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
     pub fn new_upload(
         task_id: String,
         source_path: PathBuf,
@@ -275,6 +395,8 @@ impl TaskMetadata {
         file_size: u64,
         chunk_size: u64,
         total_chunks: usize,
+        encrypt_enabled: Option<bool>,
+        encryption_key_version: Option<u32>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -307,6 +429,75 @@ impl TaskMetadata {
             status: Some(TaskPersistenceStatus::Pending),
             completed_at: None,
             error_msg: None,
+            is_backup: false,
+            backup_config_id: None,
+            // 加密字段
+            encrypt_enabled: encrypt_enabled.unwrap_or(false),
+            is_encrypted: false,
+            encryption_key_version,
+        }
+    }
+
+    /// 创建上传备份任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `source_path` - 本地源文件路径
+    /// * `target_path` - 远程目标路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `backup_config_id` - 备份配置 ID
+    /// * `encrypt_enabled` - 是否启用加密（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn new_upload_backup(
+        task_id: String,
+        source_path: PathBuf,
+        target_path: String,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        backup_config_id: String,
+        encrypt_enabled: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id,
+            task_type: TaskType::Upload,
+            created_at: now,
+            updated_at: now,
+            fs_id: None,
+            transfer_task_id: None,
+            remote_path: None,
+            local_path: None,
+            file_size: Some(file_size),
+            chunk_size: Some(chunk_size),
+            total_chunks: Some(total_chunks),
+            source_path: Some(source_path),
+            target_path: Some(target_path),
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: None,
+            share_pwd: None,
+            transfer_target_path: None,
+            transfer_status: None,
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: None,
+            transfer_file_name: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: true,
+            backup_config_id: Some(backup_config_id),
+            // 加密字段
+            encrypt_enabled: encrypt_enabled.unwrap_or(false),
+            is_encrypted: false,
+            encryption_key_version,
         }
     }
 
@@ -358,6 +549,12 @@ impl TaskMetadata {
             status: Some(TaskPersistenceStatus::Pending),
             completed_at: None,
             error_msg: None,
+            is_backup: false,
+            backup_config_id: None,
+            // 加密字段
+            encrypt_enabled: false,
+            is_encrypted: false,
+            encryption_key_version: None,
         }
     }
 
@@ -440,6 +637,26 @@ impl TaskMetadata {
     /// 更新任务状态
     pub fn set_status(&mut self, status: TaskPersistenceStatus) {
         self.status = Some(status);
+        self.touch();
+    }
+
+    /// 更新加密信息
+    ///
+    /// # Arguments
+    /// * `encrypt_enabled` - 是否启用加密
+    /// * `key_version` - 加密密钥版本
+    pub fn set_encryption_info(&mut self, encrypt_enabled: bool, key_version: Option<u32>) {
+        self.encrypt_enabled = encrypt_enabled;
+        self.encryption_key_version = key_version;
+        self.touch();
+    }
+
+    /// 设置本地路径（解密完成后更新为解密后的路径）
+    ///
+    /// # Arguments
+    /// * `local_path` - 新的本地路径
+    pub fn set_local_path(&mut self, local_path: PathBuf) {
+        self.local_path = Some(local_path);
         self.touch();
     }
 
@@ -789,6 +1006,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
 
         assert_eq!(metadata.task_type, TaskType::Download);
@@ -805,6 +1024,8 @@ mod tests {
             2 * 1024 * 1024,
             512 * 1024,
             4,
+            None,  // encrypt_enabled
+            None,  // encryption_key_version
         );
 
         assert_eq!(metadata.task_type, TaskType::Upload);

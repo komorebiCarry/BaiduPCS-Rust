@@ -1,4 +1,5 @@
 use crate::auth::UserAuth;
+use crate::autobackup::events::BackupTransferNotification;
 use crate::common::{
     RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, StagnationConfig,
 };
@@ -6,9 +7,9 @@ use crate::downloader::{
     calculate_task_max_chunks, ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo,
     TaskStatus, FolderDownloadManager,
 };
-use crate::downloader::task_slot_pool::TaskSlotPool;
+use crate::task_slot_pool::{TaskSlotPool, TaskPriority};
 use crate::persistence::{
-    DownloadRecoveryInfo, PersistenceManager, TaskMetadata, TaskPersistenceStatus, TaskType,
+    DownloadRecoveryInfo, PersistenceManager, TaskMetadata,
 };
 use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
 use crate::server::websocket::WebSocketManager;
@@ -19,7 +20,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// 下载管理器
 #[derive(Debug)]
@@ -44,10 +45,16 @@ pub struct DownloadManager {
     ws_manager: Arc<RwLock<Option<Arc<WebSocketManager>>>>,
     /// 🔥 文件夹进度通知发送器（由子任务进度变化触发）
     folder_progress_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// 🔥 备份任务统一通知发送器（进度、状态、完成、失败等）
+    backup_notification_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>>>>,
     /// 🔥 任务位池管理器
     task_slot_pool: Arc<TaskSlotPool>,
     /// 🔥 文件夹下载管理器引用（可选，用于回收借调槽位）
     folder_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+    /// 🔥 加密快照管理器（用于查询加密文件映射，获取原始文件名）
+    snapshot_manager: Arc<RwLock<Option<Arc<crate::encryption::snapshot::SnapshotManager>>>>,
+    /// 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+    encryption_config_store: Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
 }
 
 impl DownloadManager {
@@ -90,8 +97,21 @@ impl DownloadManager {
             persistence_manager: None,
             ws_manager: Arc::new(RwLock::new(None)),
             folder_progress_tx: Arc::new(RwLock::new(None)),
-            task_slot_pool: Arc::new(TaskSlotPool::new(max_concurrent_tasks)),
+            backup_notification_tx: Arc::new(RwLock::new(None)),
+            task_slot_pool: {
+                let pool = Arc::new(TaskSlotPool::new(max_concurrent_tasks));
+                // 🔥 启动槽位清理后台任务（托管模式，JoinHandle 会被保存以便 shutdown 时取消）
+                {
+                    let pool_clone = pool.clone();
+                    tokio::spawn(async move {
+                        pool_clone.start_cleanup_task_managed().await;
+                    });
+                }
+                pool
+            },
             folder_manager: Arc::new(RwLock::new(None)),
+            snapshot_manager: Arc::new(RwLock::new(None)),
+            encryption_config_store: Arc::new(RwLock::new(None)),
         };
 
         // 启动后台任务：定期检查并启动等待队列中的任务
@@ -126,6 +146,36 @@ impl DownloadManager {
         guard.clone()
     }
 
+    /// 🔥 设置快照管理器
+    ///
+    /// 由 AppState 在初始化时调用，注入快照管理器用于查询加密文件映射
+    pub async fn set_snapshot_manager(&self, snapshot_manager: Arc<crate::encryption::snapshot::SnapshotManager>) {
+        let mut guard = self.snapshot_manager.write().await;
+        *guard = Some(snapshot_manager);
+        info!("下载管理器已设置快照管理器");
+    }
+
+    /// 🔥 获取快照管理器引用
+    pub async fn get_snapshot_manager(&self) -> Option<Arc<crate::encryption::snapshot::SnapshotManager>> {
+        let guard = self.snapshot_manager.read().await;
+        guard.clone()
+    }
+
+    /// 🔥 设置加密配置存储
+    ///
+    /// 由 AppState 在初始化时调用，注入加密配置存储用于根据 key_version 选择正确的解密密钥
+    pub async fn set_encryption_config_store(&self, config_store: Arc<crate::encryption::EncryptionConfigStore>) {
+        let mut guard = self.encryption_config_store.write().await;
+        *guard = Some(config_store);
+        info!("下载管理器已设置加密配置存储");
+    }
+
+    /// 🔥 获取加密配置存储引用
+    pub async fn get_encryption_config_store(&self) -> Option<Arc<crate::encryption::EncryptionConfigStore>> {
+        let guard = self.encryption_config_store.read().await;
+        guard.clone()
+    }
+
     /// 获取持久化管理器引用
     pub fn persistence_manager(&self) -> Option<&Arc<Mutex<PersistenceManager>>> {
         self.persistence_manager.as_ref()
@@ -138,6 +188,12 @@ impl DownloadManager {
 
     /// 🔥 发布下载事件
     async fn publish_event(&self, event: DownloadEvent) {
+        // 🔥 如果是备份任务，不发送普通的 WebSocket 事件
+        // 备份任务的事件由 AutoBackupManager 统一处理
+        if event.is_backup() {
+            return;
+        }
+
         let ws = self.ws_manager.read().await;
         if let Some(ref ws) = *ws {
             let group_id = event.group_id().map(|s| s.to_string());
@@ -202,11 +258,21 @@ impl DownloadManager {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let task = DownloadTask::new(fs_id, remote_path.clone(), local_path.clone(), total_size);
+        // 🔥 查询映射表获取原始文件名（用于加密文件显示）
+        let original_filename = self.query_original_filename(&filename).await;
+
+        let mut task = DownloadTask::new(fs_id, remote_path.clone(), local_path.clone(), total_size);
+
+        // 🔥 设置原始文件名和加密标记
+        if let Some(ref orig_name) = original_filename {
+            task.original_filename = Some(orig_name.clone());
+            task.is_encrypted = true;
+        }
+
         let task_id = task.id.clone();
         let group_id = task.group_id.clone();
 
-        info!("创建下载任务: id={}, 文件名={}", task_id, filename);
+        info!("创建下载任务: id={}, 文件名={}, 原始文件名={:?}", task_id, filename, original_filename);
 
         let task_arc = Arc::new(Mutex::new(task));
         self.tasks.write().await.insert(task_id.clone(), task_arc);
@@ -219,10 +285,38 @@ impl DownloadManager {
             local_path: local_path.to_string_lossy().to_string(),
             total_size,
             group_id,
+            is_backup: false,
+            original_filename,
         })
             .await;
 
         Ok(task_id)
+    }
+
+    /// 🔥 查询映射表获取原始文件名
+    async fn query_original_filename(&self, encrypted_filename: &str) -> Option<String> {
+        // 检查是否为加密文件名格式
+        if !DownloadTask::detect_encrypted_filename(encrypted_filename) {
+            return None;
+        }
+
+        // 查询映射表
+        let snapshot_manager = self.snapshot_manager.read().await;
+        if let Some(ref mgr) = *snapshot_manager {
+            match mgr.find_by_encrypted_name(encrypted_filename) {
+                Ok(Some(info)) => {
+                    debug!("找到加密文件映射: {} -> {}", encrypted_filename, info.original_name);
+                    return Some(info.original_name);
+                }
+                Ok(None) => {
+                    debug!("未找到加密文件映射: {}", encrypted_filename);
+                }
+                Err(e) => {
+                    warn!("查询加密文件映射失败: {}", e);
+                }
+            }
+        }
+        None
     }
 
     /// 开始下载任务
@@ -265,14 +359,12 @@ impl DownloadManager {
 
             if !has_slot {
                 // 🔥 文件夹子任务没有槽位，不能启动，加入等待队列
+                // 使用优先级方法：文件夹子任务优先级介于普通任务和备份任务之间
                 warn!(
                     "文件夹子任务 {} 没有槽位，无法启动，加入等待队列",
                     task_id
                 );
-                self.waiting_queue
-                    .write()
-                    .await
-                    .push_back(task_id.to_string());
+                self.add_to_waiting_queue_with_task_type(task_id, false, true).await;
                 return Ok(());
             }
 
@@ -281,94 +373,136 @@ impl DownloadManager {
 
         // 🔥 尝试分配固定任务位（文件夹子任务由 FolderManager 管理槽位，这里跳过）
         if !is_folder_task {
-            // 单文件任务需要分配固定任务位
-            let slot_id = self.task_slot_pool.allocate_fixed_slot(task_id, false).await;
+            // 获取任务是否为备份任务
+            let is_backup = {
+                let t = task.lock().await;
+                t.is_backup
+            };
 
-            if let Some(slot_id) = slot_id {
-                // 分配成功，记录槽位信息
-                {
-                    let mut t = task.lock().await;
-                    t.slot_id = Some(slot_id);
-                    t.is_borrowed_slot = false;
+            // 🔥 根据任务类型选择不同的槽位分配策略
+            if is_backup {
+                // 备份任务：只能使用空闲槽位，不能抢占
+                let slot_id = self.task_slot_pool.allocate_backup_slot(task_id).await;
+
+                if let Some(slot_id) = slot_id {
+                    // 分配成功，记录槽位信息
+                    {
+                        let mut t = task.lock().await;
+                        t.slot_id = Some(slot_id);
+                        t.is_borrowed_slot = false;
+                    }
+                    info!("备份任务 {} 获得任务位: slot_id={}", task_id, slot_id);
+                } else {
+                    // 🔥 备份任务无可用槽位，加入等待队列末尾（最低优先级）
+                    self.add_to_waiting_queue_by_priority(task_id, true).await;
+                    info!(
+                        "备份任务 {} 无可用任务位，加入等待队列末尾 (已用槽位: {}/{})",
+                        task_id,
+                        self.task_slot_pool.used_slots().await,
+                        self.max_concurrent_tasks
+                    );
+                    return Ok(());
                 }
-                info!("任务 {} 获得固定任务位: slot_id={}", task_id, slot_id);
             } else {
-                // 🔥 无可用任务位，先尝试回收文件夹的借调槽位
-                let folder_manager = {
-                    let fm = self.folder_manager.read().await;
-                    fm.clone()
-                };
+                // 普通任务：使用带优先级的分配方法，可以抢占备份任务
+                let result = self.task_slot_pool.allocate_fixed_slot_with_priority(
+                    task_id, false, TaskPriority::Normal
+                ).await;
 
-                if let Some(fm) = folder_manager {
-                    // 检查是否有借调槽位可回收
-                    if self.task_slot_pool.find_folder_with_borrowed_slots().await.is_some() {
-                        info!("任务 {} 无可用槽位，尝试回收文件夹借调槽位", task_id);
+                match result {
+                    Some((slot_id, preempted_task_id)) => {
+                        // 分配成功，记录槽位信息
+                        {
+                            let mut t = task.lock().await;
+                            t.slot_id = Some(slot_id);
+                            t.is_borrowed_slot = false;
+                        }
 
-                        // 尝试回收一个借调槽位
-                        if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot().await {
-                            // 回收成功，分配槽位给新任务
-                            // 注意：回收后的槽位已被释放到槽位池，需要重新分配
-                            if let Some(slot_id) = self.task_slot_pool.allocate_fixed_slot(task_id, false).await {
-                                {
-                                    let mut t = task.lock().await;
-                                    t.slot_id = Some(slot_id);
-                                    t.is_borrowed_slot = false;
+                        // 🔥 如果有被抢占的备份任务，需要暂停它并加入等待队列末尾
+                        if let Some(preempted_id) = preempted_task_id {
+                            info!("普通任务 {} 抢占了备份任务 {} 的槽位: slot_id={}", task_id, preempted_id, slot_id);
+                            // 暂停被抢占的备份任务（skip_try_start_waiting=true，避免循环）
+                            if let Err(e) = self.pause_task(&preempted_id, true).await {
+                                warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
+                            }
+                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
+                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                        } else {
+                            info!("普通任务 {} 获得固定任务位: slot_id={}", task_id, slot_id);
+                        }
+                    }
+                    None => {
+                        // 🔥 无可用任务位，先尝试回收文件夹的借调槽位
+                        let folder_manager = {
+                            let fm = self.folder_manager.read().await;
+                            fm.clone()
+                        };
+
+                        if let Some(fm) = folder_manager {
+                            // 检查是否有借调槽位可回收
+                            if self.task_slot_pool.find_folder_with_borrowed_slots().await.is_some() {
+                                info!("普通任务 {} 无可用槽位，尝试回收文件夹借调槽位", task_id);
+
+                                // 尝试回收一个借调槽位
+                                if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot().await {
+                                    // 回收成功，分配槽位给新任务
+                                    if let Some((slot_id, preempted_task_id)) = self.task_slot_pool.allocate_fixed_slot_with_priority(
+                                        task_id, false, TaskPriority::Normal
+                                    ).await {
+                                        {
+                                            let mut t = task.lock().await;
+                                            t.slot_id = Some(slot_id);
+                                            t.is_borrowed_slot = false;
+                                        }
+                                        // 🔥 处理被抢占的备份任务
+                                        if let Some(preempted_id) = preempted_task_id {
+                                            info!("普通任务 {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})", task_id, preempted_id, slot_id, reclaimed_slot_id);
+                                            self.pause_preempted_task(&preempted_id).await;
+                                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
+                                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                                        } else {
+                                            info!("普通任务 {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})", task_id, slot_id, reclaimed_slot_id);
+                                        }
+                                    } else {
+                                        warn!("回收借调槽位成功但重新分配失败，普通任务 {} 加入等待队列", task_id);
+                                        self.add_to_waiting_queue_by_priority(task_id, false).await;
+                                        return Ok(());
+                                    }
+                                } else {
+                                    // 回收失败，加入等待队列
+                                    info!("回收借调槽位失败，普通任务 {} 加入等待队列", task_id);
+                                    self.add_to_waiting_queue_by_priority(task_id, false).await;
+                                    info!(
+                                        "普通任务 {} 无可用任务位，加入等待队列 (已用槽位: {}/{})",
+                                        task_id,
+                                        self.task_slot_pool.used_slots().await,
+                                        self.max_concurrent_tasks
+                                    );
+                                    return Ok(());
                                 }
-                                info!("任务 {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})", task_id, slot_id, reclaimed_slot_id);
-                                // 继续启动任务（不需要 return，直接进入下面的启动流程）
                             } else {
-                                warn!("回收借调槽位成功但重新分配失败，任务 {} 加入等待队列", task_id);
-                                self.waiting_queue
-                                    .write()
-                                    .await
-                                    .push_back(task_id.to_string());
+                                // 没有借调槽位可回收，直接加入等待队列
+                                self.add_to_waiting_queue_by_priority(task_id, false).await;
+                                info!(
+                                    "普通任务 {} 无可用任务位且无借调槽位可回收，加入等待队列 (已用槽位: {}/{})",
+                                    task_id,
+                                    self.task_slot_pool.used_slots().await,
+                                    self.max_concurrent_tasks
+                                );
                                 return Ok(());
                             }
                         } else {
-                            // 回收失败，加入等待队列
-                            info!("回收借调槽位失败，任务 {} 加入等待队列", task_id);
-                            self.waiting_queue
-                                .write()
-                                .await
-                                .push_back(task_id.to_string());
-
+                            // 无文件夹管理器，直接加入等待队列
+                            self.add_to_waiting_queue_by_priority(task_id, false).await;
                             info!(
-                                "任务 {} 无可用任务位，加入等待队列 (已用槽位: {}/{})",
+                                "普通任务 {} 无可用任务位，加入等待队列 (已用槽位: {}/{})",
                                 task_id,
                                 self.task_slot_pool.used_slots().await,
                                 self.max_concurrent_tasks
                             );
                             return Ok(());
                         }
-                    } else {
-                        // 没有借调槽位可回收，直接加入等待队列
-                        self.waiting_queue
-                            .write()
-                            .await
-                            .push_back(task_id.to_string());
-
-                        info!(
-                            "任务 {} 无可用任务位且无借调槽位可回收，加入等待队列 (已用槽位: {}/{})",
-                            task_id,
-                            self.task_slot_pool.used_slots().await,
-                            self.max_concurrent_tasks
-                        );
-                        return Ok(());
                     }
-                } else {
-                    // 无文件夹管理器，直接加入等待队列
-                    self.waiting_queue
-                        .write()
-                        .await
-                        .push_back(task_id.to_string());
-
-                    info!(
-                        "任务 {} 无可用任务位，加入等待队列 (已用槽位: {}/{})",
-                        task_id,
-                        self.task_slot_pool.used_slots().await,
-                        self.max_concurrent_tasks
-                    );
-                    return Ok(());
                 }
             }
         }
@@ -389,11 +523,12 @@ impl DownloadManager {
         cancellation_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
         ws_manager: Option<Arc<WebSocketManager>>,
         persistence_manager: Option<Arc<Mutex<PersistenceManager>>>,
+        tasks: Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
     ) {
-        // 获取 group_id，判断是否为文件夹子任务
-        let group_id = {
+        // 获取 group_id 和 is_backup，判断是否为文件夹子任务
+        let (group_id, is_backup) = {
             let t = task.lock().await;
-            t.group_id.clone()
+            (t.group_id.clone(), t.is_backup)
         };
 
         if group_id.is_some() {
@@ -410,8 +545,8 @@ impl DownloadManager {
                 t.error = Some(error_msg);
             }
 
-            // 重新放回等待队列尾部
-            waiting_queue.write().await.push_back(task_id.clone());
+            // 🔥 使用优先级方法重新放回等待队列（文件夹子任务插入到备份任务之前）
+            Self::add_to_queue_by_priority(&waiting_queue, &tasks, &task_id, is_backup, true).await;
 
             // 移除取消令牌，避免泄漏
             cancellation_tokens.write().await.remove(&task_id);
@@ -429,6 +564,7 @@ impl DownloadManager {
                         task_id: task_id.clone(),
                         error: error_msg.clone(),
                         group_id: None,
+                        is_backup,
                     }),
                     None,
                 );
@@ -472,10 +608,8 @@ impl DownloadManager {
                 "文件夹子任务 {} 没有槽位，无法启动，加入等待队列",
                 task_id
             );
-            self.waiting_queue
-                .write()
-                .await
-                .push_back(task_id.to_string());
+            // 🔥 使用优先级方法：文件夹子任务优先级介于普通任务和备份任务之间
+            self.add_to_waiting_queue_with_task_type(task_id, false, true).await;
             return Ok(());
         }
 
@@ -497,13 +631,20 @@ impl DownloadManager {
         let persistence_manager = self.persistence_manager.clone();
         let ws_manager_arc = self.ws_manager.clone();
         let folder_progress_tx_arc = self.folder_progress_tx.clone();
+        let backup_notification_tx_arc = self.backup_notification_tx.clone();
         let waiting_queue = self.waiting_queue.clone();
         let task_slot_pool_clone = self.task_slot_pool.clone();
+        let tasks_clone = self.tasks.clone(); // 🔥 用于 handle_task_failure 的优先级队列插入
+        let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
+        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
 
         tokio::spawn(async move {
             // 获取 WebSocket 管理器和文件夹进度发送器
             let ws_manager = ws_manager_arc.read().await.clone();
             let folder_progress_tx = folder_progress_tx_arc.read().await.clone();
+            let backup_notification_tx = backup_notification_tx_arc.read().await.clone();
+            let snapshot_manager = snapshot_manager_arc.read().await.clone(); // 🔥 获取快照管理器
+            let encryption_config_store = encryption_config_store_arc.read().await.clone(); // 🔥 获取加密配置存储
             // 准备任务
             let prepare_result = engine
                 .prepare_for_scheduling(task_clone.clone(), cancellation_token.clone())
@@ -535,6 +676,8 @@ impl DownloadManager {
                         group_id,
                         group_root,
                         relative_path,
+                        is_backup,
+                        backup_config_id,
                     ) = {
                         let t = task_clone.lock().await;
                         (
@@ -545,6 +688,8 @@ impl DownloadManager {
                             t.group_id.clone(),
                             t.group_root.clone(),
                             t.relative_path.clone(),
+                            t.is_backup,
+                            t.backup_config_id.clone(),
                         )
                     };
 
@@ -556,17 +701,71 @@ impl DownloadManager {
 
                     // 🔥 发送状态变更事件：pending → downloading
                     // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
-                    if let Some(ref ws) = ws_manager {
+                    if is_backup {
+                        // 备份任务：发送到 backup_notification_tx
+                        use crate::autobackup::events::TransferTaskType;
+                        if let Some(ref tx) = backup_notification_tx {
+                            let notification = BackupTransferNotification::StatusChanged {
+                                task_id: task_id_clone.clone(),
+                                task_type: TransferTaskType::Download,
+                                old_status: crate::autobackup::events::TransferTaskStatus::Pending,
+                                new_status: crate::autobackup::events::TransferTaskStatus::Transferring,
+                            };
+                            let _ = tx.send(notification);
+                        }
+                    } else if let Some(ref ws) = ws_manager {
+                        // 普通任务：发送到 WebSocket
                         ws.send_if_subscribed(
                             TaskEvent::Download(DownloadEvent::StatusChanged {
                                 task_id: task_id_clone.clone(),
                                 old_status: "pending".to_string(),
                                 new_status: "downloading".to_string(),
                                 group_id: group_id.clone(),
+                                is_backup,
                             }),
                             group_id.clone(),
                         );
                     }
+
+                    // 🔥 检测是否为加密文件，并获取 key_version
+                    let (is_encrypted, encryption_key_version) = {
+                        let filename = local_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+
+                        // 通过文件名检测是否为加密文件
+                        let is_encrypted = DownloadTask::detect_encrypted_filename(filename);
+
+                        // 如果是加密文件，尝试从 snapshot_manager 获取 key_version
+                        let key_version = if is_encrypted {
+                            if let Some(ref snapshot_mgr) = snapshot_manager {
+                                match snapshot_mgr.find_by_encrypted_name(filename) {
+                                    Ok(Some(snapshot_info)) => {
+                                        debug!(
+                                            "任务 {} 从映射表获取 key_version: {}",
+                                            task_id_clone, snapshot_info.key_version
+                                        );
+                                        Some(snapshot_info.key_version)
+                                    }
+                                    Ok(None) => {
+                                        debug!("任务 {} 在映射表中未找到加密信息", task_id_clone);
+                                        None
+                                    }
+                                    Err(e) => {
+                                        warn!("任务 {} 查询映射表失败: {}", task_id_clone, e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        (if is_encrypted { Some(true) } else { None }, key_version)
+                    };
 
                     // 🔥 注册任务到持久化管理器
                     if let Some(ref pm) = persistence_manager {
@@ -574,20 +773,40 @@ impl DownloadManager {
                             task_id_clone.clone(),
                             fs_id,
                             remote_path.clone(),
-                            local_path,
+                            local_path.clone(),
                             total_size,
                             chunk_size,
                             total_chunks,
-                            group_id,
-                            group_root,
-                            relative_path,
+                            group_id.clone(),
+                            group_root.clone(),
+                            relative_path.clone(),
+                            is_backup,
+                            backup_config_id.clone(),
+                            is_encrypted,
+                            encryption_key_version,
                         ) {
                             warn!("注册任务到持久化管理器失败: {}", e);
                         } else {
                             info!(
-                                "任务 {} 已注册到持久化管理器 ({} 个分片)",
-                                task_id_clone, total_chunks
+                                "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={})",
+                                task_id_clone, total_chunks, is_backup
                             );
+                        }
+
+                        // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
+                        if let Some(completed_chunks) = pm.lock().await.get_completed_chunks(&task_id_clone) {
+                            let mut cm = chunk_manager.lock().await;
+                            let mut completed_count = 0;
+                            for chunk_index in completed_chunks.iter() {
+                                cm.mark_completed(chunk_index);
+                                completed_count += 1;
+                            }
+                            if completed_count > 0 {
+                                info!(
+                                    "任务 {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
+                                    task_id_clone, completed_count
+                                );
+                            }
                         }
                     }
 
@@ -629,10 +848,19 @@ impl DownloadManager {
                         ws_manager: ws_manager.clone(),
                         progress_throttler: Arc::new(ProgressThrottler::default()),
                         folder_progress_tx: folder_progress_tx.clone(),
+                        backup_notification_tx: backup_notification_tx.clone(),
                         // 🔥 任务位借调机制字段
                         slot_id,
                         is_borrowed_slot,
                         task_slot_pool: Some(task_slot_pool_clone.clone()),
+                        // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
+                        encryption_service: None,
+                        // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
+                        snapshot_manager: snapshot_manager.clone(),
+                        // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+                        encryption_config_store: encryption_config_store.clone(),
+                        // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
+                        manager_tasks: Some(tasks_clone.clone()),
                     };
 
                     // 注册到调度器
@@ -691,6 +919,7 @@ impl DownloadManager {
                                 cancellation_tokens,
                                 ws_manager,
                                 persistence_manager,
+                                tasks_clone,
                             )
                                 .await;
 
@@ -711,6 +940,7 @@ impl DownloadManager {
                         cancellation_tokens,
                         ws_manager,
                         persistence_manager,
+                        tasks_clone,
                     )
                         .await;
 
@@ -725,6 +955,11 @@ impl DownloadManager {
     /// 尝试从等待队列启动任务
     ///
     /// 🔥 改用任务槽可用性检查，并在启动前分配槽位
+    /// 🔥 区分备份任务和普通任务，实现优先级调度：
+    /// - 普通任务优先启动
+    /// - 备份任务只有在没有普通任务等待时才启动
+    /// - 备份任务使用 allocate_backup_slot（不抢占）
+    /// - 普通任务使用 allocate_fixed_slot_with_priority（可抢占备份任务）
     pub(crate) async fn try_start_waiting_tasks(&self) {
         loop {
             // 检查是否有可用任务槽
@@ -741,34 +976,88 @@ impl DownloadManager {
 
             match task_id {
                 Some(id) => {
-                    info!("⚡ 启动等待队列任务: {} (可用槽位: {})", id, available_slots);
-
-                    // 检查任务是否需要分配槽位
-                    let needs_slot = {
+                    // 🔥 获取任务信息：是否为备份任务、是否需要槽位、是否为文件夹子任务
+                    let (is_backup, needs_slot, is_folder_subtask) = {
                         if let Some(task) = self.tasks.read().await.get(&id).cloned() {
                             let t = task.lock().await;
-                            t.slot_id.is_none()
+                            (t.is_backup, t.slot_id.is_none(), t.group_id.is_some())
                         } else {
-                            false
+                            // 任务不存在，跳过
+                            warn!("等待队列中的任务 {} 不存在，跳过", id);
+                            continue;
                         }
                     };
 
+                    // 🔥 备份任务特殊处理：检查是否有普通任务在等待
+                    if is_backup {
+                        let has_normal_waiting = self.has_normal_tasks_waiting().await;
+                        if has_normal_waiting {
+                            // 有普通任务等待，备份任务放回队列末尾，让普通任务先执行
+                            self.waiting_queue.write().await.push_back(id);
+                            info!("备份任务让位：有普通任务等待，备份任务放回队列末尾");
+                            continue;
+                        }
+                    }
+
+                    info!("⚡ 启动等待队列任务: {} (可用槽位: {}, is_backup: {})", id, available_slots, is_backup);
+
                     if needs_slot {
-                        // 尝试分配任务槽
-                        let slot_id = self.task_slot_pool.allocate_fixed_slot(&id, false).await;
-                        if let Some(sid) = slot_id {
-                            // 分配成功，更新任务槽位信息
-                            if let Some(task) = self.tasks.read().await.get(&id).cloned() {
-                                let mut t = task.lock().await;
-                                t.slot_id = Some(sid);
-                                t.is_borrowed_slot = false;
-                                info!("为等待任务 {} 分配槽位: {}", id, sid);
+                        // 🔥 根据任务类型选择不同的槽位分配方法
+                        if is_backup {
+                            // 备份任务：只能使用空闲槽位
+                            let slot_id = self.task_slot_pool.allocate_backup_slot(&id).await;
+                            if let Some(sid) = slot_id {
+                                if let Some(task) = self.tasks.read().await.get(&id).cloned() {
+                                    let mut t = task.lock().await;
+                                    t.slot_id = Some(sid);
+                                    t.is_borrowed_slot = false;
+                                    info!("为备份任务 {} 分配槽位: {}", id, sid);
+                                }
+                            } else {
+                                // 分配失败，放回队列末尾（备份任务优先级最低）
+                                warn!("无法为备份任务 {} 分配槽位，放回等待队列末尾", id);
+                                self.waiting_queue.write().await.push_back(id);
+                                break;
                             }
                         } else {
-                            // 分配失败，放回队列头部
-                            warn!("无法为任务 {} 分配槽位，放回等待队列", id);
-                            self.waiting_queue.write().await.push_front(id);
-                            break;
+                            // 🔥 非备份任务：根据是否为文件夹子任务选择优先级
+                            let priority = if is_folder_subtask {
+                                TaskPriority::SubTask
+                            } else {
+                                TaskPriority::Normal
+                            };
+                            let task_type_str = if is_folder_subtask { "文件夹子任务" } else { "普通任务" };
+
+                            let result = self.task_slot_pool.allocate_fixed_slot_with_priority(
+                                &id, false, priority
+                            ).await;
+
+                            match result {
+                                Some((sid, preempted_task_id)) => {
+                                    if let Some(task) = self.tasks.read().await.get(&id).cloned() {
+                                        let mut t = task.lock().await;
+                                        t.slot_id = Some(sid);
+                                        t.is_borrowed_slot = false;
+                                    }
+
+                                    // 处理被抢占的备份任务
+                                    if let Some(preempted_id) = preempted_task_id {
+                                        info!("{} {} 抢占了备份任务 {} 的槽位: slot_id={}", task_type_str, id, preempted_id, sid);
+                                        // 🔥 直接暂停被抢占的任务（不调用 pause_task 避免递归）
+                                        self.pause_preempted_task(&preempted_id).await;
+                                        // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
+                                        self.add_preempted_backup_to_queue(&preempted_id).await;
+                                    } else {
+                                        info!("为{} {} 分配槽位: {}", task_type_str, id, sid);
+                                    }
+                                }
+                                None => {
+                                    // 分配失败，使用优先级方法放回队列
+                                    warn!("无法为{} {} 分配槽位，放回等待队列", task_type_str, id);
+                                    self.add_to_waiting_queue_with_task_type(&id, is_backup, is_folder_subtask).await;
+                                    break;
+                                }
+                            }
                         }
                     }
 
@@ -796,6 +1085,9 @@ impl DownloadManager {
         let persistence_manager = self.persistence_manager.clone();
         let ws_manager_arc = self.ws_manager.clone();
         let folder_progress_tx_arc = self.folder_progress_tx.clone();
+        let backup_notification_tx_arc = self.backup_notification_tx.clone();
+        let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
+        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
 
         tokio::spawn(async move {
             // 🔥 优化：缩短检查间隔从3秒到1秒，减少等待时间
@@ -841,25 +1133,49 @@ impl DownloadManager {
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
                             if let Some(task) = task {
-                                // 🔥 检查任务是否需要分配槽位
-                                let needs_slot = {
+                                // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务
+                                let (needs_slot, is_backup, is_folder_subtask) = {
                                     let t = task.lock().await;
-                                    t.slot_id.is_none()
+                                    (t.slot_id.is_none(), t.is_backup, t.group_id.is_some())
                                 };
 
                                 if needs_slot {
-                                    // 尝试分配任务槽
-                                    let slot_id = task_slot_pool.allocate_fixed_slot(&id, false).await;
-                                    if let Some(sid) = slot_id {
+                                    // 🔥 根据任务类型选择优先级
+                                    let priority = if is_backup {
+                                        TaskPriority::Backup
+                                    } else if is_folder_subtask {
+                                        TaskPriority::SubTask
+                                    } else {
+                                        TaskPriority::Normal
+                                    };
+
+                                    // 🔥 备份任务使用 allocate_backup_slot，其他任务使用带优先级的分配
+                                    let slot_result = if is_backup {
+                                        task_slot_pool.allocate_backup_slot(&id).await.map(|sid| (sid, None))
+                                    } else {
+                                        task_slot_pool.allocate_fixed_slot_with_priority(&id, false, priority).await
+                                    };
+
+                                    if let Some((sid, preempted_task_id)) = slot_result {
                                         // 分配成功，更新任务槽位信息
                                         let mut t = task.lock().await;
                                         t.slot_id = Some(sid);
                                         t.is_borrowed_slot = false;
-                                        info!("后台监控：为任务 {} 分配槽位: {}", id, sid);
+                                        info!("后台监控：为任务 {} 分配槽位: {} (priority: {:?})", id, sid, priority);
+                                        drop(t); // 释放锁
+
+                                        // 🔥 处理被抢占的备份任务
+                                        if let Some(preempted_id) = preempted_task_id {
+                                            info!("后台监控：任务 {} 抢占了备份任务 {} 的槽位", id, preempted_id);
+                                            // 暂停被抢占的任务并加入等待队列
+                                            Self::pause_and_requeue_preempted_task(
+                                                &tasks, &cancellation_tokens, &waiting_queue, &preempted_id
+                                            ).await;
+                                        }
                                     } else {
-                                        // 分配失败，放回队列头部
+                                        // 分配失败，使用优先级方法放回队列
                                         warn!("后台监控：无法为任务 {} 分配槽位，放回等待队列", id);
-                                        waiting_queue.write().await.push_front(id);
+                                        Self::add_to_queue_by_priority(&waiting_queue, &tasks, &id, is_backup, is_folder_subtask).await;
                                         break;
                                     }
                                 }
@@ -879,14 +1195,22 @@ impl DownloadManager {
                                 let persistence_manager_clone = persistence_manager.clone();
                                 let ws_manager_arc_clone = ws_manager_arc.clone();
                                 let folder_progress_tx_arc_clone = folder_progress_tx_arc.clone();
+                                let backup_notification_tx_arc_clone = backup_notification_tx_arc.clone();
                                 let waiting_queue_clone = waiting_queue.clone();
                                 let task_slot_pool_clone = task_slot_pool.clone();
+                                let tasks_clone = tasks.clone(); // 🔥 用于 handle_task_failure 的优先级队列插入
+                                let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
+                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
 
                                 tokio::spawn(async move {
                                     // 获取 WebSocket 管理器和文件夹进度发送器
                                     let ws_manager = ws_manager_arc_clone.read().await.clone();
                                     let folder_progress_tx =
                                         folder_progress_tx_arc_clone.read().await.clone();
+                                    let backup_notification_tx =
+                                        backup_notification_tx_arc_clone.read().await.clone();
+                                    let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
+                                    let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
                                     let prepare_result = engine_clone
                                         .prepare_for_scheduling(
                                             task_clone.clone(),
@@ -920,6 +1244,8 @@ impl DownloadManager {
                                                 group_id,
                                                 group_root,
                                                 relative_path,
+                                                is_backup,
+                                                backup_config_id,
                                             ) = {
                                                 let t = task_clone.lock().await;
                                                 (
@@ -930,6 +1256,8 @@ impl DownloadManager {
                                                     t.group_id.clone(),
                                                     t.group_root.clone(),
                                                     t.relative_path.clone(),
+                                                    t.is_backup,
+                                                    t.backup_config_id.clone(),
                                                 )
                                             };
 
@@ -941,38 +1269,110 @@ impl DownloadManager {
 
                                             // 🔥 发送状态变更事件：pending → downloading
                                             // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
-                                            if let Some(ref ws) = ws_manager {
+                                            if is_backup {
+                                                // 备份任务：发送到 backup_notification_tx
+                                                use crate::autobackup::events::TransferTaskType;
+                                                if let Some(ref tx) = backup_notification_tx {
+                                                    let notification = BackupTransferNotification::StatusChanged {
+                                                        task_id: id_clone.clone(),
+                                                        task_type: TransferTaskType::Download,
+                                                        old_status: crate::autobackup::events::TransferTaskStatus::Pending,
+                                                        new_status: crate::autobackup::events::TransferTaskStatus::Transferring,
+                                                    };
+                                                    let _ = tx.send(notification);
+                                                }
+                                            } else if let Some(ref ws) = ws_manager {
+                                                // 普通任务：发送到 WebSocket
                                                 ws.send_if_subscribed(
                                                     TaskEvent::Download(DownloadEvent::StatusChanged {
                                                         task_id: id_clone.clone(),
                                                         old_status: "pending".to_string(),
                                                         new_status: "downloading".to_string(),
                                                         group_id: group_id.clone(),
+                                                        is_backup,
                                                     }),
                                                     group_id.clone(),
                                                 );
                                             }
 
+                                            // 🔥 检测是否为加密文件，并获取 key_version
+                                            let (is_encrypted, encryption_key_version) = {
+                                                let filename = local_path
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("");
+
+                                                // 通过文件名检测是否为加密文件
+                                                let is_encrypted = DownloadTask::detect_encrypted_filename(filename);
+
+                                                // 如果是加密文件，尝试从 snapshot_manager 获取 key_version
+                                                let key_version = if is_encrypted {
+                                                    if let Some(ref snapshot_mgr) = snapshot_manager {
+                                                        match snapshot_mgr.find_by_encrypted_name(filename) {
+                                                            Ok(Some(snapshot_info)) => {
+                                                                debug!(
+                                                                    "后台任务 {} 从映射表获取 key_version: {}",
+                                                                    id_clone, snapshot_info.key_version
+                                                                );
+                                                                Some(snapshot_info.key_version)
+                                                            }
+                                                            Ok(None) => {
+                                                                debug!("后台任务 {} 在映射表中未找到加密信息", id_clone);
+                                                                None
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("后台任务 {} 查询映射表失败: {}", id_clone, e);
+                                                                None
+                                                            }
+                                                        }
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+
+                                                (if is_encrypted { Some(true) } else { None }, key_version)
+                                            };
+
                                             // 🔥 注册任务到持久化管理器
                                             if let Some(ref pm) = persistence_manager_clone {
-                                                if let Err(e) =
-                                                    pm.lock().await.register_download_task(
-                                                        id_clone.clone(),
-                                                        fs_id,
-                                                        remote_path.clone(),
-                                                        local_path,
-                                                        total_size,
-                                                        chunk_size,
-                                                        total_chunks,
-                                                        group_id,
-                                                        group_root,
-                                                        relative_path,
-                                                    )
-                                                {
+                                                if let Err(e) = pm.lock().await.register_download_task(
+                                                    id_clone.clone(),
+                                                    fs_id,
+                                                    remote_path.clone(),
+                                                    local_path.clone(),
+                                                    total_size,
+                                                    chunk_size,
+                                                    total_chunks,
+                                                    group_id.clone(),
+                                                    group_root.clone(),
+                                                    relative_path.clone(),
+                                                    is_backup,
+                                                    backup_config_id.clone(),
+                                                    is_encrypted,
+                                                    encryption_key_version,
+                                                ) {
                                                     warn!(
                                                         "后台监控：注册任务到持久化管理器失败: {}",
                                                         e
                                                     );
+                                                }
+
+                                                // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
+                                                if let Some(completed_chunks) = pm.lock().await.get_completed_chunks(&id_clone) {
+                                                    let mut cm = chunk_manager.lock().await;
+                                                    let mut completed_count = 0;
+                                                    for chunk_index in completed_chunks.iter() {
+                                                        cm.mark_completed(chunk_index);
+                                                        completed_count += 1;
+                                                    }
+                                                    if completed_count > 0 {
+                                                        info!(
+                                                            "后台任务 {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
+                                                            id_clone, completed_count
+                                                        );
+                                                    }
                                                 }
                                             }
 
@@ -1019,10 +1419,19 @@ impl DownloadManager {
                                                     ProgressThrottler::default(),
                                                 ),
                                                 folder_progress_tx: folder_progress_tx.clone(),
+                                                backup_notification_tx: backup_notification_tx.clone(),
                                                 // 🔥 任务位借调机制字段
                                                 slot_id,
                                                 is_borrowed_slot,
                                                 task_slot_pool: Some(task_slot_pool_clone.clone()),
+                                                // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
+                                                encryption_service: None,
+                                                // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
+                                                snapshot_manager: snapshot_manager.clone(),
+                                                // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+                                                encryption_config_store: encryption_config_store.clone(),
+                                                // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
+                                                manager_tasks: Some(tasks_clone.clone()),
                                             };
 
                                             // 注册任务到调度器
@@ -1085,6 +1494,7 @@ impl DownloadManager {
                                                         cancellation_tokens_clone,
                                                         ws_manager,
                                                         persistence_manager_clone,
+                                                        tasks_clone,
                                                     )
                                                         .await;
                                                 }
@@ -1103,6 +1513,7 @@ impl DownloadManager {
                                                 cancellation_tokens_clone,
                                                 ws_manager,
                                                 persistence_manager_clone,
+                                                tasks_clone,
                                             )
                                                 .await;
                                         }
@@ -1146,6 +1557,9 @@ impl DownloadManager {
         let persistence_manager = self.persistence_manager.clone();
         let ws_manager_arc = self.ws_manager.clone();
         let folder_progress_tx_arc = self.folder_progress_tx.clone();
+        let backup_notification_tx_arc = self.backup_notification_tx.clone();
+        let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
+        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
 
         tokio::spawn(async move {
             while let Some(()) = rx.recv().await {
@@ -1188,25 +1602,49 @@ impl DownloadManager {
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
                             if let Some(task) = task {
-                                // 🔥 检查任务是否需要分配槽位
-                                let needs_slot = {
+                                // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务
+                                let (needs_slot, is_backup, is_folder_subtask) = {
                                     let t = task.lock().await;
-                                    t.slot_id.is_none()
+                                    (t.slot_id.is_none(), t.is_backup, t.group_id.is_some())
                                 };
 
                                 if needs_slot {
-                                    // 尝试分配任务槽
-                                    let slot_id = task_slot_pool.allocate_fixed_slot(&id, false).await;
-                                    if let Some(sid) = slot_id {
+                                    // 🔥 根据任务类型选择优先级
+                                    let priority = if is_backup {
+                                        TaskPriority::Backup
+                                    } else if is_folder_subtask {
+                                        TaskPriority::SubTask
+                                    } else {
+                                        TaskPriority::Normal
+                                    };
+
+                                    // 🔥 备份任务使用 allocate_backup_slot，其他任务使用带优先级的分配
+                                    let slot_result = if is_backup {
+                                        task_slot_pool.allocate_backup_slot(&id).await.map(|sid| (sid, None))
+                                    } else {
+                                        task_slot_pool.allocate_fixed_slot_with_priority(&id, false, priority).await
+                                    };
+
+                                    if let Some((sid, preempted_task_id)) = slot_result {
                                         // 分配成功，更新任务槽位信息
                                         let mut t = task.lock().await;
                                         t.slot_id = Some(sid);
                                         t.is_borrowed_slot = false;
-                                        info!("0延迟启动：为任务 {} 分配槽位: {}", id, sid);
+                                        info!("0延迟启动：为任务 {} 分配槽位: {} (priority: {:?})", id, sid, priority);
+                                        drop(t); // 释放锁
+
+                                        // 🔥 处理被抢占的备份任务
+                                        if let Some(preempted_id) = preempted_task_id {
+                                            info!("0延迟启动：任务 {} 抢占了备份任务 {} 的槽位", id, preempted_id);
+                                            // 暂停被抢占的任务并加入等待队列
+                                            Self::pause_and_requeue_preempted_task(
+                                                &tasks, &cancellation_tokens, &waiting_queue, &preempted_id
+                                            ).await;
+                                        }
                                     } else {
-                                        // 分配失败，放回队列头部
+                                        // 分配失败，使用优先级方法放回队列
                                         warn!("0延迟启动：无法为任务 {} 分配槽位，放回等待队列", id);
-                                        waiting_queue.write().await.push_front(id);
+                                        Self::add_to_queue_by_priority(&waiting_queue, &tasks, &id, is_backup, is_folder_subtask).await;
                                         break;
                                     }
                                 }
@@ -1227,13 +1665,21 @@ impl DownloadManager {
                                 let persistence_manager_clone = persistence_manager.clone();
                                 let ws_manager_arc_clone = ws_manager_arc.clone();
                                 let folder_progress_tx_arc_clone = folder_progress_tx_arc.clone();
+                                let backup_notification_tx_arc_clone = backup_notification_tx_arc.clone();
                                 let task_slot_pool_clone = task_slot_pool.clone();
+                                let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
+                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
+                                let tasks_clone = tasks.clone(); // 🔥 用于任务完成时立即清理
 
                                 tokio::spawn(async move {
                                     // 获取 WebSocket 管理器和文件夹进度发送器
                                     let ws_manager = ws_manager_arc_clone.read().await.clone();
                                     let folder_progress_tx =
                                         folder_progress_tx_arc_clone.read().await.clone();
+                                    let backup_notification_tx =
+                                        backup_notification_tx_arc_clone.read().await.clone();
+                                    let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
+                                    let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
 
                                     let prepare_result = engine_clone
                                         .prepare_for_scheduling(
@@ -1267,6 +1713,8 @@ impl DownloadManager {
                                                 group_id,
                                                 group_root,
                                                 relative_path,
+                                                is_backup,
+                                                backup_config_id,
                                             ) = {
                                                 let t = task_clone.lock().await;
                                                 (
@@ -1277,6 +1725,8 @@ impl DownloadManager {
                                                     t.group_id.clone(),
                                                     t.group_root.clone(),
                                                     t.relative_path.clone(),
+                                                    t.is_backup,
+                                                    t.backup_config_id.clone(),
                                                 )
                                             };
 
@@ -1288,38 +1738,110 @@ impl DownloadManager {
 
                                             // 🔥 发送状态变更事件：pending → downloading
                                             // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
-                                            if let Some(ref ws) = ws_manager {
+                                            if is_backup {
+                                                // 备份任务：发送到 backup_notification_tx
+                                                use crate::autobackup::events::TransferTaskType;
+                                                if let Some(ref tx) = backup_notification_tx {
+                                                    let notification = BackupTransferNotification::StatusChanged {
+                                                        task_id: id_clone.clone(),
+                                                        task_type: TransferTaskType::Download,
+                                                        old_status: crate::autobackup::events::TransferTaskStatus::Pending,
+                                                        new_status: crate::autobackup::events::TransferTaskStatus::Transferring,
+                                                    };
+                                                    let _ = tx.send(notification);
+                                                }
+                                            } else if let Some(ref ws) = ws_manager {
+                                                // 普通任务：发送到 WebSocket
                                                 ws.send_if_subscribed(
                                                     TaskEvent::Download(DownloadEvent::StatusChanged {
                                                         task_id: id_clone.clone(),
                                                         old_status: "pending".to_string(),
                                                         new_status: "downloading".to_string(),
                                                         group_id: group_id.clone(),
+                                                        is_backup,
                                                     }),
                                                     group_id.clone(),
                                                 );
                                             }
 
+                                            // 🔥 检测是否为加密文件，并获取 key_version
+                                            let (is_encrypted, encryption_key_version) = {
+                                                let filename = local_path
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("");
+
+                                                // 通过文件名检测是否为加密文件
+                                                let is_encrypted = DownloadTask::detect_encrypted_filename(filename);
+
+                                                // 如果是加密文件，尝试从 snapshot_manager 获取 key_version
+                                                let key_version = if is_encrypted {
+                                                    if let Some(ref snapshot_mgr) = snapshot_manager {
+                                                        match snapshot_mgr.find_by_encrypted_name(filename) {
+                                                            Ok(Some(snapshot_info)) => {
+                                                                debug!(
+                                                                    "0延迟任务 {} 从映射表获取 key_version: {}",
+                                                                    id_clone, snapshot_info.key_version
+                                                                );
+                                                                Some(snapshot_info.key_version)
+                                                            }
+                                                            Ok(None) => {
+                                                                debug!("0延迟任务 {} 在映射表中未找到加密信息", id_clone);
+                                                                None
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("0延迟任务 {} 查询映射表失败: {}", id_clone, e);
+                                                                None
+                                                            }
+                                                        }
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+
+                                                (if is_encrypted { Some(true) } else { None }, key_version)
+                                            };
+
                                             // 🔥 注册任务到持久化管理器
                                             if let Some(ref pm) = persistence_manager_clone {
-                                                if let Err(e) =
-                                                    pm.lock().await.register_download_task(
-                                                        id_clone.clone(),
-                                                        fs_id,
-                                                        remote_path.clone(),
-                                                        local_path,
-                                                        total_size,
-                                                        chunk_size,
-                                                        total_chunks,
-                                                        group_id,
-                                                        group_root,
-                                                        relative_path,
-                                                    )
-                                                {
+                                                if let Err(e) = pm.lock().await.register_download_task(
+                                                    id_clone.clone(),
+                                                    fs_id,
+                                                    remote_path.clone(),
+                                                    local_path.clone(),
+                                                    total_size,
+                                                    chunk_size,
+                                                    total_chunks,
+                                                    group_id.clone(),
+                                                    group_root.clone(),
+                                                    relative_path.clone(),
+                                                    is_backup,
+                                                    backup_config_id.clone(),
+                                                    is_encrypted,
+                                                    encryption_key_version,
+                                                ) {
                                                     warn!(
                                                         "0延迟启动：注册任务到持久化管理器失败: {}",
                                                         e
                                                     );
+                                                }
+
+                                                // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
+                                                if let Some(completed_chunks) = pm.lock().await.get_completed_chunks(&id_clone) {
+                                                    let mut cm = chunk_manager.lock().await;
+                                                    let mut completed_count = 0;
+                                                    for chunk_index in completed_chunks.iter() {
+                                                        cm.mark_completed(chunk_index);
+                                                        completed_count += 1;
+                                                    }
+                                                    if completed_count > 0 {
+                                                        info!(
+                                                            "0延迟任务 {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
+                                                            id_clone, completed_count
+                                                        );
+                                                    }
                                                 }
                                             }
 
@@ -1365,10 +1887,19 @@ impl DownloadManager {
                                                     ProgressThrottler::default(),
                                                 ),
                                                 folder_progress_tx: folder_progress_tx.clone(),
+                                                backup_notification_tx: backup_notification_tx.clone(),
                                                 // 🔥 任务位借调机制字段
                                                 slot_id,
                                                 is_borrowed_slot,
                                                 task_slot_pool: Some(task_slot_pool_clone.clone()),
+                                                // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
+                                                encryption_service: None,
+                                                // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
+                                                snapshot_manager: snapshot_manager.clone(),
+                                                // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+                                                encryption_config_store: encryption_config_store.clone(),
+                                                // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
+                                                manager_tasks: Some(tasks_clone.clone()),
                                             };
 
                                             match chunk_scheduler_clone
@@ -1472,6 +2003,7 @@ impl DownloadManager {
 
         let mut t = task.lock().await;
         let group_id = t.group_id.clone();
+        let is_backup = t.is_backup;
 
         if t.status != TaskStatus::Downloading {
             anyhow::bail!("任务未在下载中");
@@ -1512,12 +2044,30 @@ impl DownloadManager {
             }
         }
 
-        // 🔥 发送状态变更事件
+        // 🔥 问题2修复：先持久化状态，再发送事件
+        // 确保前端收到消息时，状态已经保存到磁盘（与 pause_folder 保持一致）
+        if let Some(ref pm) = self.persistence_manager {
+            use crate::persistence::types::TaskPersistenceStatus;
+            if let Err(e) = crate::persistence::metadata::update_metadata(
+                &pm.lock().await.wal_dir(),
+                task_id,
+                |m| {
+                    m.set_status(TaskPersistenceStatus::Paused);
+                },
+            ) {
+                warn!("持久化暂停状态失败: {}", e);
+            } else {
+                info!("任务 {} 暂停状态已持久化", task_id);
+            }
+        }
+
+        // 🔥 发送状态变更事件（问题3修复：在持久化之后发送）
         self.publish_event(DownloadEvent::StatusChanged {
             task_id: task_id.to_string(),
-            old_status,
+            old_status: old_status.clone(),
             new_status: "paused".to_string(),
             group_id: group_id.clone(),
+            is_backup,
         })
             .await;
 
@@ -1525,8 +2075,37 @@ impl DownloadManager {
         self.publish_event(DownloadEvent::Paused {
             task_id: task_id.to_string(),
             group_id,
+            is_backup,
         })
             .await;
+
+        // 🔥 如果是备份任务，发送状态变更通知和暂停通知到 AutoBackupManager
+        if is_backup {
+            use crate::autobackup::events::{TransferTaskType, TransferTaskStatus};
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                // 🔥 问题1修复：发送 StatusChanged 通知（Transferring -> Paused）
+                // 前端依赖 StatusChanged 更新状态，与 resume_task 保持一致
+                let status_notification = BackupTransferNotification::StatusChanged {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                    old_status: TransferTaskStatus::Transferring,
+                    new_status: TransferTaskStatus::Paused,
+                };
+                if let Err(e) = tx.send(status_notification) {
+                    warn!("发送备份任务状态变更通知失败: {}", e);
+                } else {
+                    info!("已发送备份任务状态变更通知: {} (Transferring -> Paused)", task_id);
+                }
+
+                // 发送 Paused 通知
+                let notification = BackupTransferNotification::Paused {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                };
+                let _ = tx.send(notification);
+            }
+        }
 
         // 🔥 根据参数决定是否尝试启动等待队列中的任务
         if !skip_try_start_waiting {
@@ -1534,6 +2113,487 @@ impl DownloadManager {
         }
 
         Ok(())
+    }
+
+    /// 🔥 按优先级将任务加入等待队列（简化版，仅区分备份/非备份）
+    ///
+    /// # 参数
+    /// - `task_id`: 任务ID
+    /// - `is_backup`: 是否为备份任务
+    async fn add_to_waiting_queue_by_priority(&self, task_id: &str, is_backup: bool) {
+        // 委托给完整版方法，非备份任务默认为普通任务（非文件夹子任务）
+        self.add_to_waiting_queue_with_task_type(task_id, is_backup, false).await;
+    }
+
+    /// 🔥 将被抢占的备份任务加入等待队列末尾
+    ///
+    /// 供 FolderManager 等外部模块调用
+    ///
+    /// 完整流程：
+    /// 1. 将任务状态从 Paused 改为 Pending
+    /// 2. 持久化状态
+    /// 3. 发送状态变更事件（Paused -> Pending）
+    /// 4. 发送备份通知
+    /// 5. 将任务加入等待队列
+    pub async fn add_preempted_backup_to_queue(&self, task_id: &str) {
+        // 🔥 问题2/3修复：更新状态从 Paused 到 Pending，并发送通知
+        let (group_id, is_backup) = {
+            let task = match self.tasks.read().await.get(task_id).cloned() {
+                Some(t) => t,
+                None => {
+                    warn!("加入等待队列失败：任务 {} 不存在", task_id);
+                    return;
+                }
+            };
+            let mut t = task.lock().await;
+            // 只有 Paused 状态的任务才需要转换为 Pending
+            if t.status == TaskStatus::Paused {
+                t.status = TaskStatus::Pending;
+                info!("被抢占的备份任务 {} 状态已从 Paused 改为 Pending", task_id);
+            }
+            (t.group_id.clone(), t.is_backup)
+        };
+
+        // 🔥 持久化状态
+        if let Some(ref pm) = self.persistence_manager {
+            use crate::persistence::types::TaskPersistenceStatus;
+            if let Err(e) = crate::persistence::metadata::update_metadata(
+                &pm.lock().await.wal_dir(),
+                task_id,
+                |m| {
+                    m.set_status(TaskPersistenceStatus::Pending);
+                },
+            ) {
+                warn!("持久化等待状态失败: {}", e);
+            }
+        }
+
+        // 🔥 发送状态变更事件（Paused -> Pending）
+        self.publish_event(DownloadEvent::StatusChanged {
+            task_id: task_id.to_string(),
+            old_status: "paused".to_string(),
+            new_status: "pending".to_string(),
+            group_id: group_id.clone(),
+            is_backup,
+        })
+            .await;
+
+        // 🔥 如果是备份任务，发送状态变更通知到 AutoBackupManager
+        if is_backup {
+            use crate::autobackup::events::{TransferTaskType, TransferTaskStatus};
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                let notification = BackupTransferNotification::StatusChanged {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                    old_status: TransferTaskStatus::Paused,
+                    new_status: TransferTaskStatus::Pending,
+                };
+                if let Err(e) = tx.send(notification) {
+                    warn!("发送备份任务等待状态通知失败: {}", e);
+                } else {
+                    info!("已发送备份任务等待状态通知: {} (Paused -> Pending)", task_id);
+                }
+            }
+        }
+
+        // 将任务加入等待队列
+        self.add_to_waiting_queue_with_task_type(task_id, true, false).await;
+        info!("被抢占的备份任务 {} 已加入等待队列末尾", task_id);
+    }
+
+    /// 🔥 静态方法：按优先级将任务加入等待队列
+    ///
+    /// 用于 handle_task_failure 等静态上下文中
+    async fn add_to_queue_by_priority(
+        waiting_queue: &Arc<RwLock<VecDeque<String>>>,
+        tasks: &Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
+        task_id: &str,
+        is_backup: bool,
+        is_folder_subtask: bool,
+    ) {
+        let mut queue = waiting_queue.write().await;
+
+        if is_backup {
+            queue.push_back(task_id.to_string());
+            info!("备份任务 {} 加入等待队列末尾 (队列长度: {})", task_id, queue.len());
+        } else if is_folder_subtask {
+            // 文件夹子任务：插入到备份任务之前
+            let insert_pos = {
+                let tasks_guard = tasks.read().await;
+                let mut backup_pos = None;
+                for (i, id) in queue.iter().enumerate() {
+                    if let Some(task_arc) = tasks_guard.get(id) {
+                        if let Ok(t) = task_arc.try_lock() {
+                            if t.is_backup {
+                                backup_pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                backup_pos
+            };
+
+            if let Some(pos) = insert_pos {
+                queue.insert(pos, task_id.to_string());
+                info!("文件夹子任务 {} 插入到等待队列位置 {} (队列长度: {})", task_id, pos, queue.len());
+            } else {
+                queue.push_back(task_id.to_string());
+                info!("文件夹子任务 {} 加入等待队列末尾 (队列长度: {})", task_id, queue.len());
+            }
+        } else {
+            // 普通任务：插入到文件夹子任务和备份任务之前
+            let insert_pos = {
+                let tasks_guard = tasks.read().await;
+                let mut pos = None;
+                for (i, id) in queue.iter().enumerate() {
+                    if let Some(task_arc) = tasks_guard.get(id) {
+                        if let Ok(t) = task_arc.try_lock() {
+                            if t.is_backup || t.group_id.is_some() {
+                                pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                pos
+            };
+
+            if let Some(pos) = insert_pos {
+                queue.insert(pos, task_id.to_string());
+                info!("普通任务 {} 插入到等待队列位置 {} (队列长度: {})", task_id, pos, queue.len());
+            } else {
+                queue.push_back(task_id.to_string());
+                info!("普通任务 {} 加入等待队列末尾 (队列长度: {})", task_id, queue.len());
+            }
+        }
+    }
+
+    /// 🔥 静态方法：暂停被抢占的任务并加入等待队列
+    ///
+    /// 用于后台监控和0延迟启动等静态上下文中处理被抢占的备份任务
+    ///
+    /// 完整流程：
+    /// 1. 将任务状态从 Downloading 改为 Paused，再改为 Pending
+    /// 2. 将任务加入等待队列
+    ///
+    /// 注意：由于是静态方法，无法发送事件通知，调用方需要自行处理通知
+    async fn pause_and_requeue_preempted_task(
+        tasks: &Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
+        cancellation_tokens: &Arc<RwLock<HashMap<String, CancellationToken>>>,
+        waiting_queue: &Arc<RwLock<VecDeque<String>>>,
+        preempted_id: &str,
+    ) {
+        // 获取被抢占的任务
+        let task = tasks.read().await.get(preempted_id).cloned();
+        if let Some(task) = task {
+            // 更新任务状态：Downloading -> Paused -> Pending
+            {
+                let mut t = task.lock().await;
+                if t.status == TaskStatus::Downloading {
+                    // 🔥 问题2/3修复：直接将状态改为 Pending（跳过 Paused 中间状态）
+                    // 因为被抢占的任务会立即加入等待队列，应该是 Pending 状态
+                    t.status = TaskStatus::Pending;
+                    // 清除槽位信息（槽位已被抢占）
+                    t.slot_id = None;
+                    t.is_borrowed_slot = false;
+                    info!("被抢占的备份任务 {} 状态已改为 Pending", preempted_id);
+                }
+            }
+
+            // 取消任务的取消令牌
+            if let Some(token) = cancellation_tokens.write().await.remove(preempted_id) {
+                token.cancel();
+            }
+
+            // 将被抢占的任务加入等待队列末尾（备份任务优先级最低）
+            Self::add_to_queue_by_priority(waiting_queue, tasks, preempted_id, true, false).await;
+        }
+    }
+
+    /// 🔥 按优先级将任务加入等待队列（完整版，支持三级优先级）
+    ///
+    /// 等待队列按优先级排序：
+    /// - 普通下载任务（is_backup=false, is_folder_subtask=false）：最高优先级
+    /// - 文件夹子任务（is_backup=false, is_folder_subtask=true）：中等优先级
+    /// - 自动备份任务（is_backup=true）：最低优先级，插入到队列末尾
+    ///
+    /// # 参数
+    /// - `task_id`: 任务ID
+    /// - `is_backup`: 是否为备份任务
+    /// - `is_folder_subtask`: 是否为文件夹子任务
+    async fn add_to_waiting_queue_with_task_type(&self, task_id: &str, is_backup: bool, is_folder_subtask: bool) {
+        let mut queue = self.waiting_queue.write().await;
+
+        if is_backup {
+            // 备份任务：直接加入队列末尾
+            queue.push_back(task_id.to_string());
+            info!("备份任务 {} 加入等待队列末尾 (队列长度: {})", task_id, queue.len());
+        } else if is_folder_subtask {
+            // 文件夹子任务：插入到备份任务之前，但在普通任务之后
+            // 找到第一个备份任务或文件夹子任务的位置
+            let insert_pos = {
+                let tasks = self.tasks.read().await;
+                let mut backup_pos = None;
+                for (i, id) in queue.iter().enumerate() {
+                    if let Some(task_arc) = tasks.get(id) {
+                        if let Ok(t) = task_arc.try_lock() {
+                            if t.is_backup {
+                                backup_pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                backup_pos
+            };
+
+            if let Some(pos) = insert_pos {
+                // 插入到第一个备份任务之前
+                queue.insert(pos, task_id.to_string());
+                info!("文件夹子任务 {} 插入到等待队列位置 {} (在备份任务之前, 队列长度: {})", task_id, pos, queue.len());
+            } else {
+                // 没有备份任务，加入队列末尾
+                queue.push_back(task_id.to_string());
+                info!("文件夹子任务 {} 加入等待队列末尾 (无备份任务, 队列长度: {})", task_id, queue.len());
+            }
+        } else {
+            // 普通任务：插入到所有文件夹子任务和备份任务之前
+            // 找到第一个文件夹子任务或备份任务的位置
+            let insert_pos = {
+                let tasks = self.tasks.read().await;
+                let mut pos = None;
+                for (i, id) in queue.iter().enumerate() {
+                    if let Some(task_arc) = tasks.get(id) {
+                        if let Ok(t) = task_arc.try_lock() {
+                            // 找到第一个文件夹子任务或备份任务
+                            if t.is_backup || t.group_id.is_some() {
+                                pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                pos
+            };
+
+            if let Some(pos) = insert_pos {
+                // 插入到第一个文件夹子任务或备份任务之前
+                queue.insert(pos, task_id.to_string());
+                info!("普通任务 {} 插入到等待队列位置 {} (在文件夹子任务/备份任务之前, 队列长度: {})", task_id, pos, queue.len());
+            } else {
+                // 没有文件夹子任务和备份任务，加入队列末尾
+                queue.push_back(task_id.to_string());
+                info!("普通任务 {} 加入等待队列末尾 (无低优先级任务, 队列长度: {})", task_id, queue.len());
+            }
+        }
+    }
+
+    /// 🔥 从等待队列移除并暂停指定的任务列表
+    ///
+    /// 用于备份任务暂停时，将等待队列中属于该备份任务的子任务也暂停
+    ///
+    /// # 参数
+    /// - `task_ids`: 要暂停的任务ID列表
+    ///
+    /// # 返回
+    /// - 成功暂停的任务数量
+    pub async fn pause_waiting_tasks(&self, task_ids: &[String]) -> usize {
+        if task_ids.is_empty() {
+            return 0;
+        }
+
+        let task_id_set: std::collections::HashSet<&String> = task_ids.iter().collect();
+        let mut paused_count = 0;
+
+        // 1. 从等待队列移除
+        {
+            let mut queue = self.waiting_queue.write().await;
+            let original_len = queue.len();
+            queue.retain(|id| !task_id_set.contains(id));
+            let removed = original_len - queue.len();
+            if removed > 0 {
+                info!(
+                    "从下载等待队列移除了 {} 个任务 (队列剩余: {})",
+                    removed, queue.len()
+                );
+            }
+        }
+
+        // 2. 将这些任务标记为暂停状态
+        let tasks = self.tasks.read().await;
+        for task_id in task_ids {
+            if let Some(task_arc) = tasks.get(task_id) {
+                let mut task = task_arc.lock().await;
+                // 只暂停 Pending 状态的任务（等待队列中的任务应该是 Pending 状态）
+                if task.status == TaskStatus::Pending {
+                    let old_status = format!("{:?}", task.status).to_lowercase();
+                    let group_id = task.group_id.clone();
+                    let is_backup = task.is_backup;
+                    task.mark_paused();
+                    paused_count += 1;
+
+                    debug!(
+                        "等待队列中的下载任务 {} 已暂停 (原状态: {})",
+                        task_id, old_status
+                    );
+
+                    drop(task);
+
+                    // 发送状态变更事件
+                    self.publish_event(DownloadEvent::StatusChanged {
+                        task_id: task_id.to_string(),
+                        old_status,
+                        new_status: "paused".to_string(),
+                        group_id: group_id.clone(),
+                        is_backup,
+                    })
+                        .await;
+
+                    // 发送暂停事件
+                    self.publish_event(DownloadEvent::Paused {
+                        task_id: task_id.to_string(),
+                        group_id,
+                        is_backup,
+                    })
+                        .await;
+                }
+            }
+        }
+
+        if paused_count > 0 {
+            info!("已暂停 {} 个等待队列中的下载任务", paused_count);
+        }
+
+        paused_count
+    }
+
+    /// 🔥 检查等待队列中是否有非备份任务（普通任务或文件夹子任务）
+    ///
+    /// 用于判断备份任务是否应该让位
+    /// 包括：
+    /// - 普通单文件任务（group_id.is_none()）
+    /// - 文件夹子任务（group_id.is_some()）
+    async fn has_normal_tasks_waiting(&self) -> bool {
+        let queue = self.waiting_queue.read().await;
+        let tasks = self.tasks.read().await;
+
+        for id in queue.iter() {
+            if let Some(task_arc) = tasks.get(id) {
+                if let Ok(t) = task_arc.try_lock() {
+                    // 只要不是备份任务，就算有普通任务等待
+                    if !t.is_backup {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// 🔥 暂停被抢占的任务（简化版，不触发等待队列启动，避免递归）
+    ///
+    /// 用于 try_start_waiting_tasks 中抢占备份任务时使用
+    /// 与 pause_task 的区别：
+    /// - 不调用 try_start_waiting_tasks（避免递归）
+    ///
+    /// 🔥 修复：现在会发送状态变更通知（Transferring -> Paused）
+    async fn pause_preempted_task(&self, task_id: &str) {
+        // 获取任务
+        let task = match self.tasks.read().await.get(task_id).cloned() {
+            Some(t) => t,
+            None => {
+                warn!("暂停被抢占任务失败：任务 {} 不存在", task_id);
+                return;
+            }
+        };
+
+        // 更新任务状态并获取必要信息
+        let (group_id, is_backup) = {
+            let mut t = task.lock().await;
+            if t.status != TaskStatus::Downloading {
+                warn!("暂停被抢占任务失败：任务 {} 不在下载中，当前状态: {:?}", task_id, t.status);
+                return;
+            }
+            let group_id = t.group_id.clone();
+            let is_backup = t.is_backup;
+            t.mark_paused();
+            // 清除槽位信息（槽位已被抢占）
+            t.slot_id = None;
+            t.is_borrowed_slot = false;
+            (group_id, is_backup)
+        };
+
+        // 从调度器取消任务
+        self.chunk_scheduler.cancel_task(task_id).await;
+
+        // 移除取消令牌
+        self.cancellation_tokens.write().await.remove(task_id);
+
+        // 🔥 持久化暂停状态
+        if let Some(ref pm) = self.persistence_manager {
+            use crate::persistence::types::TaskPersistenceStatus;
+            if let Err(e) = crate::persistence::metadata::update_metadata(
+                &pm.lock().await.wal_dir(),
+                task_id,
+                |m| {
+                    m.set_status(TaskPersistenceStatus::Paused);
+                },
+            ) {
+                warn!("持久化被抢占任务暂停状态失败: {}", e);
+            }
+        }
+
+        // 🔥 发送状态变更事件（Downloading/Transferring -> Paused）
+        self.publish_event(DownloadEvent::StatusChanged {
+            task_id: task_id.to_string(),
+            old_status: "downloading".to_string(),
+            new_status: "paused".to_string(),
+            group_id: group_id.clone(),
+            is_backup,
+        })
+            .await;
+
+        // 🔥 发送暂停事件
+        self.publish_event(DownloadEvent::Paused {
+            task_id: task_id.to_string(),
+            group_id,
+            is_backup,
+        })
+            .await;
+
+        // 🔥 如果是备份任务，发送状态变更通知到 AutoBackupManager
+        if is_backup {
+            use crate::autobackup::events::{TransferTaskStatus, TransferTaskType};
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                // 发送 StatusChanged 通知（Transferring -> Paused）
+                let status_notification = BackupTransferNotification::StatusChanged {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                    old_status: TransferTaskStatus::Transferring,
+                    new_status: TransferTaskStatus::Paused,
+                };
+                if let Err(e) = tx.send(status_notification) {
+                    warn!("发送被抢占备份任务状态变更通知失败: {}", e);
+                } else {
+                    info!(
+                        "已发送被抢占备份任务状态变更通知: {} (Transferring -> Paused)",
+                        task_id
+                    );
+                }
+
+                // 发送 Paused 通知
+                let notification = BackupTransferNotification::Paused {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                };
+                let _ = tx.send(notification);
+            }
+        }
+
+        info!("被抢占的备份任务 {} 已暂停", task_id);
     }
 
     /// 恢复下载任务
@@ -1547,6 +2607,7 @@ impl DownloadManager {
             .context("任务不存在")?;
         let group_id;
         let old_status;
+        let is_backup;
 
         // 检查任务状态并将 Paused 改回 Pending
 
@@ -1563,6 +2624,7 @@ impl DownloadManager {
             // 注意：这里不能用 mark_downloading，因为还没获得资源
             t.status = TaskStatus::Pending;
             group_id = t.group_id.clone();
+            is_backup = t.is_backup;
         }
 
         info!("用户请求恢复下载任务: {}", task_id);
@@ -1573,6 +2635,7 @@ impl DownloadManager {
             old_status,
             new_status: "pending".to_string(),
             group_id: group_id.clone(),
+            is_backup,
         })
             .await;
 
@@ -1580,90 +2643,142 @@ impl DownloadManager {
         self.publish_event(DownloadEvent::Resumed {
             task_id: task_id.to_string(),
             group_id,
+            is_backup,
         })
             .await;
+
+        // 🔥 如果是备份任务，发送恢复通知到 AutoBackupManager
+        if is_backup {
+            use crate::autobackup::events::TransferTaskType;
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                let notification = BackupTransferNotification::Resumed {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                };
+                let _ = tx.send(notification);
+            }
+        }
 
         // 🔥 关键修复：恢复任务时，如果无可用槽位，尝试回收文件夹借调槽位
         // 这与 start_task 的逻辑保持一致
 
         // 检查任务是否已有槽位（文件夹子任务可能已分配）
-        let has_slot = {
+        let (has_slot, is_folder_subtask) = {
             let t = task.lock().await;
-            t.slot_id.is_some()
+            (t.slot_id.is_some(), t.group_id.is_some())
         };
 
         // 如果任务没有槽位（单文件任务），尝试分配或回收
         if !has_slot {
-            let slot_id = self.task_slot_pool.allocate_fixed_slot(task_id, false).await;
+            // 🔥 根据任务类型选择不同的槽位分配策略
+            if is_backup {
+                // 备份任务：只能使用空闲槽位，不能抢占
+                let slot_id = self.task_slot_pool.allocate_backup_slot(task_id).await;
 
-            if let Some(slot_id) = slot_id {
-                // 分配成功
-                {
-                    let mut t = task.lock().await;
-                    t.slot_id = Some(slot_id);
-                    t.is_borrowed_slot = false;
+                if let Some(slot_id) = slot_id {
+                    {
+                        let mut t = task.lock().await;
+                        t.slot_id = Some(slot_id);
+                        t.is_borrowed_slot = false;
+                    }
+                    info!("恢复备份任务 {} 获得任务位: slot_id={}", task_id, slot_id);
+                } else {
+                    // 备份任务无可用槽位，加入等待队列末尾
+                    self.add_to_waiting_queue_with_task_type(task_id, true, false).await;
+                    info!("恢复备份任务 {} 无可用槽位，加入等待队列末尾", task_id);
+                    return Ok(());
                 }
-                info!("恢复任务 {} 获得固定任务位: slot_id={}", task_id, slot_id);
             } else {
-                // 🔥 无可用任务位，先尝试回收文件夹的借调槽位
-                let folder_manager = {
-                    let fm = self.folder_manager.read().await;
-                    fm.clone()
+                // 🔥 非备份任务：根据是否为文件夹子任务选择优先级
+                let priority = if is_folder_subtask {
+                    TaskPriority::SubTask
+                } else {
+                    TaskPriority::Normal
                 };
+                let task_type_str = if is_folder_subtask { "文件夹子任务" } else { "普通任务" };
 
-                if let Some(fm) = folder_manager {
-                    // 检查是否有借调槽位可回收
-                    if self.task_slot_pool.find_folder_with_borrowed_slots().await.is_some() {
-                        info!("恢复任务 {} 无可用槽位，尝试回收文件夹借调槽位", task_id);
+                let result = self.task_slot_pool.allocate_fixed_slot_with_priority(
+                    task_id, false, priority
+                ).await;
 
-                        // 尝试回收一个借调槽位
-                        if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot().await {
-                            // 回收成功，分配槽位给恢复的任务
-                            if let Some(slot_id) = self.task_slot_pool.allocate_fixed_slot(task_id, false).await {
-                                {
-                                    let mut t = task.lock().await;
-                                    t.slot_id = Some(slot_id);
-                                    t.is_borrowed_slot = false;
+                match result {
+                    Some((slot_id, preempted_task_id)) => {
+                        {
+                            let mut t = task.lock().await;
+                            t.slot_id = Some(slot_id);
+                            t.is_borrowed_slot = false;
+                        }
+
+                        // 处理被抢占的备份任务
+                        if let Some(preempted_id) = preempted_task_id {
+                            info!("恢复{} {} 抢占了备份任务 {} 的槽位: slot_id={}", task_type_str, task_id, preempted_id, slot_id);
+                            self.pause_preempted_task(&preempted_id).await;
+                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
+                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                        } else {
+                            info!("恢复{} {} 获得任务位: slot_id={}", task_type_str, task_id, slot_id);
+                        }
+                    }
+                    None => {
+                        // 🔥 无可用任务位，先尝试回收文件夹的借调槽位
+                        let folder_manager = {
+                            let fm = self.folder_manager.read().await;
+                            fm.clone()
+                        };
+
+                        if let Some(fm) = folder_manager {
+                            // 检查是否有借调槽位可回收
+                            if self.task_slot_pool.find_folder_with_borrowed_slots().await.is_some() {
+                                info!("恢复{} {} 无可用槽位，尝试回收文件夹借调槽位", task_type_str, task_id);
+
+                                // 尝试回收一个借调槽位
+                                if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot().await {
+                                    // 回收成功，分配槽位给恢复的任务（使用正确的优先级）
+                                    if let Some((slot_id, preempted_task_id)) = self.task_slot_pool.allocate_fixed_slot_with_priority(
+                                        task_id, false, priority
+                                    ).await {
+                                        {
+                                            let mut t = task.lock().await;
+                                            t.slot_id = Some(slot_id);
+                                            t.is_borrowed_slot = false;
+                                        }
+                                        // 🔥 处理被抢占的备份任务
+                                        if let Some(preempted_id) = preempted_task_id {
+                                            info!("恢复{} {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})", task_type_str, task_id, preempted_id, slot_id, reclaimed_slot_id);
+                                            self.pause_preempted_task(&preempted_id).await;
+                                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
+                                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                                        } else {
+                                            info!("恢复{} {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})", task_type_str, task_id, slot_id, reclaimed_slot_id);
+                                        }
+                                    } else {
+                                        warn!("回收借调槽位成功但重新分配失败，恢复{} {} 加入等待队列", task_type_str, task_id);
+                                        self.add_to_waiting_queue_with_task_type(task_id, false, is_folder_subtask).await;
+                                        return Ok(());
+                                    }
+                                } else {
+                                    // 回收失败，加入等待队列
+                                    info!("回收借调槽位失败，恢复{} {} 加入等待队列", task_type_str, task_id);
+                                    self.add_to_waiting_queue_with_task_type(task_id, false, is_folder_subtask).await;
+                                    return Ok(());
                                 }
-                                info!("恢复任务 {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})", task_id, slot_id, reclaimed_slot_id);
-                                // 继续启动任务
                             } else {
-                                warn!("回收借调槽位成功但重新分配失败，恢复任务 {} 加入等待队列", task_id);
-                                self.waiting_queue
-                                    .write()
-                                    .await
-                                    .push_back(task_id.to_string());
+                                // 没有借调槽位可回收，加入等待队列
+                                self.add_to_waiting_queue_with_task_type(task_id, false, is_folder_subtask).await;
+                                info!(
+                                    "恢复{} {} 无可用槽位且无借调槽位可回收，加入等待队列",
+                                    task_type_str, task_id
+                                );
                                 return Ok(());
                             }
                         } else {
-                            // 回收失败，加入等待队列
-                            info!("回收借调槽位失败，恢复任务 {} 加入等待队列", task_id);
-                            self.waiting_queue
-                                .write()
-                                .await
-                                .push_back(task_id.to_string());
+                            // 无文件夹管理器，加入等待队列
+                            self.add_to_waiting_queue_with_task_type(task_id, false, is_folder_subtask).await;
+                            info!("恢复{} {} 无可用槽位，加入等待队列", task_type_str, task_id);
                             return Ok(());
                         }
-                    } else {
-                        // 没有借调槽位可回收，加入等待队列
-                        self.waiting_queue
-                            .write()
-                            .await
-                            .push_back(task_id.to_string());
-                        info!(
-                            "恢复任务 {} 无可用槽位且无借调槽位可回收，加入等待队列",
-                            task_id
-                        );
-                        return Ok(());
                     }
-                } else {
-                    // 无文件夹管理器，加入等待队列
-                    self.waiting_queue
-                        .write()
-                        .await
-                        .push_back(task_id.to_string());
-                    info!("恢复任务 {} 无可用槽位，加入等待队列", task_id);
-                    return Ok(());
                 }
             }
         }
@@ -1695,6 +2810,7 @@ impl DownloadManager {
 
         let group_id;
         let old_status;
+        let is_backup;
 
         // 检查任务状态并将 Paused 改回 Pending
         {
@@ -1709,6 +2825,7 @@ impl DownloadManager {
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
             group_id = t.group_id.clone();
+            is_backup = t.is_backup;
 
             // 🔥 关键修复：清除槽位信息
             // 当任务被暂停并重新入队时，原来的槽位已经被释放（如借调位回收）
@@ -1718,51 +2835,13 @@ impl DownloadManager {
             t.is_borrowed_slot = false;
         }
 
-        info!("重新入队暂停任务: {} (group: {:?}), 已清除槽位信息", task_id, group_id);
+        info!("重新入队暂停任务: {} (group: {:?}, is_backup: {}), 已清除槽位信息", task_id, group_id, is_backup);
 
-        // 🔥 智能插入位置：保持同一文件夹内子任务的顺序
-        {
-            let mut queue = self.waiting_queue.write().await;
-
-            if let Some(ref gid) = group_id {
-                // 🔥 收集同组任务的位置（找到同一文件夹的第一个等待任务）
-                let same_group_pos = {
-                    let tasks = self.tasks.read().await;
-                    let mut positions = Vec::new();
-                    for (pos, id) in queue.iter().enumerate() {
-                        if let Some(task_arc) = tasks.get(id) {
-                            // 使用 try_lock 避免死锁
-                            if let Ok(t) = task_arc.try_lock() {
-                                if t.group_id.as_deref() == Some(gid) {
-                                    positions.push(pos);
-                                }
-                            }
-                        }
-                    }
-                    positions.first().copied()
-                };
-
-                if let Some(pos) = same_group_pos {
-                    // 插入到同组第一个任务之前
-                    queue.insert(pos, task_id.to_string());
-                    info!(
-                        "任务 {} 插入到同组任务位置 {} (group: {})",
-                        task_id, pos, gid
-                    );
-                } else {
-                    // 没有同组任务，插入到队列前面（优先恢复）
-                    queue.push_front(task_id.to_string());
-                    info!(
-                        "任务 {} 插入到队列前面 (group: {}, 无同组等待任务)",
-                        task_id, gid
-                    );
-                }
-            } else {
-                // 没有 group_id（非文件夹任务），插入到队列前面
-                queue.push_front(task_id.to_string());
-                info!("任务 {} 插入到队列前面 (无 group_id)", task_id);
-            }
-        }
+        // 🔥 使用优先级方法加入等待队列
+        // 备份任务加入队列末尾，非备份任务根据是否为文件夹子任务决定位置
+        let is_folder_subtask = group_id.is_some();
+        drop(task); // 释放任务锁，避免死锁
+        self.add_to_waiting_queue_with_task_type(task_id, is_backup, is_folder_subtask).await;
 
         // 🔥 发送状态变更事件
         self.publish_event(DownloadEvent::StatusChanged {
@@ -1770,6 +2849,7 @@ impl DownloadManager {
             old_status,
             new_status: "pending".to_string(),
             group_id: group_id.clone(),
+            is_backup,
         })
             .await;
 
@@ -1813,20 +2893,23 @@ impl DownloadManager {
     }
 
     pub async fn delete_task(&self, task_id: &str, delete_file: bool) -> Result<()> {
-        // 🔥 在删除前获取 group_id（用于事件通知）
-        let group_id = {
+        // 🔥 在删除前获取 group_id 和 is_backup（用于事件通知）
+        let (group_id, is_backup) = {
             let tasks = self.tasks.read().await;
             if let Some(task_arc) = tasks.get(task_id) {
                 let t = task_arc.lock().await;
-                t.group_id.clone()
+                (t.group_id.clone(), t.is_backup)
             } else {
                 // 任务不在内存，尝试从持久化管理器读取
                 if let Some(ref pm) = self.persistence_manager {
-                    pm.lock().await.history_cache()
-                        .get(task_id)
-                        .and_then(|entry| entry.value().group_id.clone())
+                    let pm_guard = pm.lock().await;
+                    if let Some(metadata) = pm_guard.get_history_task(task_id) {
+                        (metadata.group_id.clone(), metadata.is_backup)
+                    } else {
+                        (None, false)
+                    }
                 } else {
-                    None
+                    (None, false)
                 }
             }
         };
@@ -1891,22 +2974,18 @@ impl DownloadManager {
             // 不在内存，尝试从历史/元数据读取，保证删除幂等
             if let Some(ref pm) = self.persistence_manager {
                 // 先克隆需要的引用，避免持锁期间持有 dashmap Ref 生命周期
-                let (wal_dir, history_cache) = {
+                let (wal_dir, history_task) = {
                     let pm = pm.lock().await;
-                    (pm.wal_dir().clone(), pm.history_cache().clone())
+                    (pm.wal_dir().clone(), pm.get_history_task(task_id))
                 };
 
-                // 先查历史缓存
-                // 避免持有 Ref 生命周期，先克隆需要的数据
-                if let Some(meta) = history_cache
-                    .get(task_id)
-                    .map(|entry| entry.value().clone())
-                {
+                // 先查历史数据库
+                if let Some(meta) = history_task {
                     local_path = meta.local_path.clone();
                     status_completed = meta
                         .status
                         .map(|s| s == crate::persistence::types::TaskPersistenceStatus::Completed);
-                    info!("删除下载任务（历史缓存）: {}", task_id);
+                    info!("删除下载任务（历史数据库）: {}", task_id);
                 } else {
                     // 再从元数据文件读取
                     if let Some(meta) =
@@ -1955,6 +3034,7 @@ impl DownloadManager {
         self.publish_event(DownloadEvent::Deleted {
             task_id: task_id.to_string(),
             group_id,
+            is_backup,
         })
             .await;
 
@@ -1994,43 +3074,69 @@ impl DownloadManager {
     ///
     /// 用于文件夹任务恢复时，没有槽位的子任务应该变成等待状态而不是保持暂停状态
     pub async fn set_task_pending_and_queue(&self, task_id: &str) -> Result<()> {
-        // 更新任务状态为 Pending，同时获取 group_id
-        let (old_status, group_id) = {
+        // 更新任务状态为 Pending，同时获取 group_id 和 is_backup
+        let (old_status, group_id, is_backup) = {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(task_id) {
                 let mut t = task.lock().await;
                 let old = format!("{:?}", t.status).to_lowercase();
                 let gid = t.group_id.clone();
+                let backup = t.is_backup;
                 if t.status == TaskStatus::Paused {
                     t.status = TaskStatus::Pending;
                     info!("任务 {} 状态从 Paused 改为 Pending（等待槽位）", task_id);
                 }
-                (old, gid)
+                (old, gid, backup)
             } else {
                 anyhow::bail!("任务不存在: {}", task_id);
             }
         };
 
-        // 加入等待队列
-        self.waiting_queue
-            .write()
-            .await
-            .push_back(task_id.to_string());
+        // 🔥 使用优先级方法加入等待队列
+        let is_folder_subtask = group_id.is_some();
+        self.add_to_waiting_queue_with_task_type(task_id, is_backup, is_folder_subtask).await;
 
         let queue_len = self.waiting_queue.read().await.len();
         info!(
-            "任务 {} 已加入等待队列（当前队列长度: {}）",
-            task_id, queue_len
+            "任务 {} 已加入等待队列（当前队列长度: {}, is_backup: {}, is_folder_subtask: {}）",
+            task_id, queue_len, is_backup, is_folder_subtask
         );
 
         // 发送状态变更事件
         self.publish_event(DownloadEvent::StatusChanged {
             task_id: task_id.to_string(),
-            old_status,
+            old_status: old_status.clone(),
             new_status: "pending".to_string(),
             group_id,
+            is_backup,
         })
             .await;
+
+        // 🔥 如果是备份任务，发送状态变更通知到 AutoBackupManager
+        if is_backup {
+            use crate::autobackup::events::TransferTaskType;
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                // 将 old_status 字符串转换为 TransferTaskStatus
+                let old_transfer_status = match old_status.as_str() {
+                    "paused" => crate::autobackup::events::TransferTaskStatus::Paused,
+                    "pending" => crate::autobackup::events::TransferTaskStatus::Pending,
+                    "downloading" => crate::autobackup::events::TransferTaskStatus::Transferring,
+                    _ => crate::autobackup::events::TransferTaskStatus::Paused,
+                };
+                let notification = BackupTransferNotification::StatusChanged {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Download,
+                    old_status: old_transfer_status,
+                    new_status: crate::autobackup::events::TransferTaskStatus::Pending,
+                };
+                if let Err(e) = tx.send(notification) {
+                    warn!("发送备份任务等待状态通知失败: {}", e);
+                } else {
+                    info!("已发送备份任务等待状态通知: {} (Paused -> Pending)", task_id);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -2053,31 +3159,35 @@ impl DownloadManager {
         }
     }
 
-    /// 获取所有任务（包括当前任务和历史任务）
+    /// 获取所有任务（包括当前任务和历史任务，排除备份任务）
     pub async fn get_all_tasks(&self) -> Vec<DownloadTask> {
         let tasks = self.tasks.read().await;
         let mut result = Vec::new();
 
-        // 获取当前任务
+        // 获取当前任务（排除备份任务）
         for task in tasks.values() {
-            result.push(task.lock().await.clone());
+            let t = task.lock().await;
+            if !t.is_backup {
+                result.push(t.clone());
+            }
         }
 
-        // 从历史缓存获取历史任务
+        // 从历史数据库获取历史任务
         if let Some(ref pm) = self.persistence_manager {
             let pm = pm.lock().await;
-            let history_cache = pm.history_cache();
 
-            for entry in history_cache.iter() {
-                let metadata = entry.value();
-
-                // 只包含下载任务且状态为已完成
-                if metadata.task_type == TaskType::Download
-                    && metadata.status == Some(TaskPersistenceStatus::Completed)
-                {
+            // 从数据库查询已完成的下载任务（排除备份任务）
+            if let Some((history_tasks, _total)) = pm.get_history_tasks_by_type_and_status(
+                "download",
+                "completed",
+                true,  // exclude_backup
+                0,
+                500,   // 限制最多500条
+            ) {
+                for metadata in history_tasks {
                     // 排除已在当前任务中的（避免重复）
                     if !tasks.contains_key(&metadata.task_id) {
-                        if let Some(task) = Self::convert_history_to_task(metadata) {
+                        if let Some(task) = Self::convert_history_to_task(&metadata) {
                             result.push(task);
                         }
                     }
@@ -2089,6 +3199,101 @@ impl DownloadManager {
         result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         result
+    }
+
+    /// 获取所有备份任务
+    pub async fn get_backup_tasks(&self) -> Vec<DownloadTask> {
+        let tasks = self.tasks.read().await;
+        let mut result = Vec::new();
+
+        for task in tasks.values() {
+            let t = task.lock().await;
+            if t.is_backup {
+                result.push(t.clone());
+            }
+        }
+
+        // 按创建时间倒序排序
+        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        result
+    }
+
+    /// 获取指定备份配置的任务
+    pub async fn get_tasks_by_backup_config(&self, backup_config_id: &str) -> Vec<DownloadTask> {
+        let tasks = self.tasks.read().await;
+        let mut result = Vec::new();
+
+        for task in tasks.values() {
+            let t = task.lock().await;
+            if t.is_backup && t.backup_config_id.as_deref() == Some(backup_config_id) {
+                result.push(t.clone());
+            }
+        }
+
+        result
+    }
+
+    /// 创建备份下载任务
+    ///
+    /// 备份任务使用最低优先级，会在普通任务之后执行
+    ///
+    /// # 参数
+    /// * `fs_id` - 文件服务器ID
+    /// * `remote_path` - 网盘路径
+    /// * `local_path` - 本地保存路径
+    /// * `total_size` - 文件大小
+    /// * `backup_config_id` - 备份配置ID
+    ///
+    /// # 返回
+    /// 任务ID
+    pub async fn create_backup_task(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        total_size: u64,
+        backup_config_id: String,
+    ) -> Result<String> {
+        // 确保目标目录存在
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).context("创建下载目录失败")?;
+            }
+        }
+
+        // 创建备份任务
+        let task = DownloadTask::new_backup(
+            fs_id,
+            remote_path.clone(),
+            local_path.clone(),
+            total_size,
+            backup_config_id.clone(),
+        );
+        let task_id = task.id.clone();
+
+        info!(
+            "创建备份下载任务: id={}, remote={}, local={:?}, size={}, backup_config={}",
+            task_id, remote_path, local_path, total_size, backup_config_id
+        );
+
+        let task_arc = Arc::new(Mutex::new(task));
+        self.tasks.write().await.insert(task_id.clone(), task_arc);
+
+        // 🔥 发送任务创建事件（备份任务，is_backup=true）
+        self.publish_event(DownloadEvent::Created {
+            task_id: task_id.clone(),
+            fs_id,
+            remote_path,
+            local_path: local_path.to_string_lossy().to_string(),
+            total_size,
+            group_id: None,
+            is_backup: true,
+            original_filename: None, // 备份下载任务不需要原始文件名
+        })
+            .await;
+
+        Ok(task_id)
     }
 
     /// 将历史元数据转换为下载任务
@@ -2120,6 +3325,14 @@ impl DownloadManager {
             // 任务位借调机制字段（历史任务不需要槽位）
             slot_id: None,
             is_borrowed_slot: false,
+            // 自动备份字段（从 metadata 恢复）
+            is_backup: metadata.is_backup,
+            backup_config_id: metadata.backup_config_id.clone(),
+            // 解密字段（历史任务默认无解密）
+            is_encrypted: false,
+            decrypt_progress: 0.0,
+            decrypted_path: None,
+            original_filename: None,
         })
     }
 
@@ -2151,38 +3364,24 @@ impl DownloadManager {
         // 释放写锁，避免长时间持锁
         drop(tasks);
 
-        // 3. 从历史缓存和历史文件中清除已完成任务
+        // 3. 从历史数据库中清除已完成任务
         let mut history_count = 0;
         if let Some(ref pm) = self.persistence_manager {
             let pm_guard = pm.lock().await;
-            let history_cache = pm_guard.history_cache();
-            let wal_dir = pm_guard.wal_dir().clone();
-
-            // 收集历史缓存中的已完成下载任务
-            let mut history_to_remove = Vec::new();
-            for entry in history_cache.iter() {
-                let metadata = entry.value();
-                if metadata.task_type == TaskType::Download
-                    && metadata.status == Some(TaskPersistenceStatus::Completed)
-                {
-                    history_to_remove.push(metadata.task_id.clone());
-                }
-            }
-
-            // 从历史缓存中移除
-            for task_id in &history_to_remove {
-                history_cache.remove(task_id);
-            }
-
-            history_count = history_to_remove.len();
+            let history_db = pm_guard.history_db().cloned();
 
             // 释放 pm_guard，避免长时间持锁
             drop(pm_guard);
 
-            // 从历史文件中删除（批量操作）
-            for task_id in &history_to_remove {
-                if let Err(e) = crate::persistence::history::remove_from_history_file(&wal_dir, task_id) {
-                    warn!("从历史文件删除任务失败: task_id={}, 错误: {}", task_id, e);
+            // 从历史数据库中删除已完成的下载任务
+            if let Some(db) = history_db {
+                match db.remove_tasks_by_type_and_status("download", "completed") {
+                    Ok(count) => {
+                        history_count = count;
+                    }
+                    Err(e) => {
+                        warn!("从历史数据库删除已完成下载任务失败: {}", e);
+                    }
                 }
             }
         }
@@ -2312,6 +3511,19 @@ impl DownloadManager {
     /// 设置任务完成通知发送器（用于文件夹下载补充任务）
     pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
         self.chunk_scheduler.set_task_completed_sender(tx).await;
+    }
+
+    /// 🔥 设置备份任务统一通知发送器
+    ///
+    /// AutoBackupManager 调用此方法设置 channel sender，
+    /// 所有备份相关事件（进度、状态、完成、失败等）都通过此 channel 发送
+    pub async fn set_backup_notification_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>) {
+        // 设置到调度器（用于进度和完成/失败事件）
+        self.chunk_scheduler.set_backup_notification_sender(tx.clone()).await;
+        // 设置到管理器自身（用于状态变更事件，如暂停/恢复）
+        let mut guard = self.backup_notification_tx.write().await;
+        *guard = Some(tx);
+        info!("下载管理器已设置备份任务统一通知发送器");
     }
 
     /// 🔥 设置文件夹进度通知发送器（用于子任务进度变化时通知文件夹管理器）
@@ -2501,12 +3713,23 @@ impl DownloadManager {
         }
 
         // 创建恢复任务（使用 Paused 状态）
-        let mut task = DownloadTask::new(
-            recovery_info.fs_id,
-            recovery_info.remote_path.clone(),
-            recovery_info.local_path.clone(),
-            recovery_info.file_size,
-        );
+        // 🔥 根据是否为备份任务选择不同的构造方式
+        let mut task = if recovery_info.is_backup {
+            DownloadTask::new_backup(
+                recovery_info.fs_id,
+                recovery_info.remote_path.clone(),
+                recovery_info.local_path.clone(),
+                recovery_info.file_size,
+                recovery_info.backup_config_id.clone().unwrap_or_default(),
+            )
+        } else {
+            DownloadTask::new(
+                recovery_info.fs_id,
+                recovery_info.remote_path.clone(),
+                recovery_info.local_path.clone(),
+                recovery_info.file_size,
+            )
+        };
 
         // 恢复任务 ID（保持原有 ID）
         task.id = task_id.clone();
@@ -2546,7 +3769,7 @@ impl DownloadManager {
         task.relative_path = recovery_info.relative_path.clone();
 
         info!(
-            "恢复下载任务: id={}, 文件={:?}, 已完成 {}/{} 分片 ({:.1}%), group_id={:?}",
+            "恢复下载任务: id={}, 文件={:?}, 已完成 {}/{} 分片 ({:.1}%), group_id={:?}{}",
             task_id,
             recovery_info.local_path,
             completed_count,
@@ -2556,7 +3779,8 @@ impl DownloadManager {
             } else {
                 0.0
             },
-            recovery_info.group_id
+            recovery_info.group_id,
+            if recovery_info.is_backup { "（备份任务）" } else { "" }
         );
 
         // 🔥 判断是否为单文件任务（无 group_id），需要分配固定任务位

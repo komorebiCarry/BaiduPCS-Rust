@@ -18,6 +18,9 @@ pub struct CreateUploadRequest {
     pub local_path: String,
     /// 网盘目标路径
     pub remote_path: String,
+    /// 是否启用加密（可选，默认 false）
+    #[serde(default)]
+    pub encrypt: bool,
 }
 
 /// 创建文件夹上传任务请求
@@ -30,6 +33,9 @@ pub struct CreateFolderUploadRequest {
     /// 扫描选项（可选）
     #[serde(default)]
     pub scan_options: Option<FolderScanOptions>,
+    /// 是否启用加密（可选，默认 false）
+    #[serde(default)]
+    pub encrypt: bool,
 }
 
 /// 文件夹扫描选项（序列化友好版本）
@@ -67,6 +73,9 @@ impl From<FolderScanOptions> for ScanOptions {
 pub struct CreateBatchUploadRequest {
     /// 文件列表 [(本地路径, 远程路径)]
     pub files: Vec<(String, String)>,
+    /// 是否启用加密（可选，默认 false）
+    #[serde(default)]
+    pub encrypt: bool,
 }
 
 /// POST /api/v1/uploads
@@ -85,12 +94,13 @@ pub async fn create_upload(
 
     let local_path = PathBuf::from(&req.local_path);
 
+    // 🔥 传递 encrypt 参数，普通文件上传 is_folder_upload = false
     match upload_manager
-        .create_task(local_path, req.remote_path)
+        .create_task(local_path, req.remote_path, req.encrypt, false)
         .await
     {
         Ok(task_id) => {
-            info!("创建上传任务成功: {}", task_id);
+            info!("创建上传任务成功: {} (encrypt={})", task_id, req.encrypt);
 
             // 自动开始上传
             if let Err(e) = upload_manager.start_task(&task_id).await {
@@ -137,12 +147,13 @@ pub async fn create_folder_upload(
         })
     };
 
+    // 🔥 传递 encrypt 参数
     match upload_manager
-        .create_folder_task(local_folder, req.remote_folder, scan_options)
+        .create_folder_task(local_folder, req.remote_folder, scan_options, req.encrypt)
         .await
     {
         Ok(task_ids) => {
-            info!("创建文件夹上传任务成功: {} 个文件", task_ids.len());
+            info!("创建文件夹上传任务成功: {} 个文件 (encrypt={})", task_ids.len(), req.encrypt);
 
             // 自动开始所有任务
             for task_id in &task_ids {
@@ -181,9 +192,10 @@ pub async fn create_batch_upload(
         .map(|(local, remote)| (PathBuf::from(local), remote))
         .collect();
 
-    match upload_manager.create_batch_tasks(files).await {
+    // 🔥 传递 encrypt 参数
+    match upload_manager.create_batch_tasks(files, req.encrypt).await {
         Ok(task_ids) => {
-            info!("批量创建上传任务成功: {} 个", task_ids.len());
+            info!("批量创建上传任务成功: {} 个 (encrypt={})", task_ids.len(), req.encrypt);
 
             // 自动开始所有任务
             for task_id in &task_ids {
@@ -249,7 +261,8 @@ pub async fn pause_upload(
         .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    match upload_manager.pause_task(&task_id).await {
+    // skip_try_start_waiting = false，正常暂停行为（暂停后尝试启动等待队列中的任务）
+    match upload_manager.pause_task(&task_id, false).await {
         Ok(()) => {
             info!("暂停上传任务成功: {}", task_id);
             Ok(Json(ApiResponse::success("已暂停".to_string())))

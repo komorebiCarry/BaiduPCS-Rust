@@ -43,6 +43,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '转存管理' }
       },
       {
+        path: '/autobackup',
+        name: 'AutoBackup',
+        component: () => import('@/views/AutoBackupView.vue'),
+        meta: { title: '自动备份' }
+      },
+      {
         path: '/settings',
         name: 'Settings',
         component: () => import('@/views/SettingsView.vue'),

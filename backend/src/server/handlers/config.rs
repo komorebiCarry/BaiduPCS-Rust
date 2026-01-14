@@ -134,7 +134,7 @@ pub async fn reset_to_recommended(
     let upload_manager_guard = app_state.upload_manager.read().await;
     if let Some(upload_manager) = upload_manager_guard.as_ref() {
         upload_manager.update_max_threads(config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(config.upload.max_concurrent_tasks);
+        upload_manager.update_max_concurrent_tasks(config.upload.max_concurrent_tasks).await;
         upload_manager.update_max_retries(config.upload.max_retries);
         info!(
             "✓ 上传管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 最大重试={}",
@@ -227,7 +227,7 @@ pub async fn update_config(
     let upload_manager_guard = app_state.upload_manager.read().await;
     if let Some(upload_manager) = upload_manager_guard.as_ref() {
         upload_manager.update_max_threads(new_config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks);
+        upload_manager.update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks).await;
         upload_manager.update_max_retries(new_config.upload.max_retries);
         info!(
             "✓ 上传管理器配置已动态更新: 线程数={}, 最大任务数={}, 最大重试={}",

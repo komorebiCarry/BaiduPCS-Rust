@@ -5,7 +5,7 @@ import { formatFileSize, formatSpeed, formatETA, extractFilename } from './utils
 export { formatFileSize, formatSpeed, formatETA, extractFilename }
 
 /// 任务状态
-export type TaskStatus = 'pending' | 'downloading' | 'paused' | 'completed' | 'failed'
+export type TaskStatus = 'pending' | 'downloading' | 'decrypting' | 'paused' | 'completed' | 'failed'
 
 /// 下载任务
 export interface DownloadTask {
@@ -27,6 +27,11 @@ export interface DownloadTask {
   relative_path?: string
   /** 🔥 新增：关联的转存任务 ID（如果此下载任务由转存任务自动创建） */
   transfer_task_id?: string
+  // 解密相关字段
+  is_encrypted?: boolean
+  decrypt_progress?: number
+  decrypted_path?: string
+  original_filename?: string
 }
 
 /// 创建下载任务请求
@@ -111,6 +116,8 @@ export interface BatchDownloadItem {
   is_dir: boolean
   /// 文件大小（文件夹为 undefined 或 0）
   size?: number
+  /// 原始名称（加密文件/文件夹的还原名称）
+  original_name?: string
 }
 
 /// 批量下载请求
@@ -176,6 +183,7 @@ export function getStatusText(status: TaskStatus): string {
   const statusMap: Record<TaskStatus, string> = {
     pending: '等待中',
     downloading: '下载中',
+    decrypting: '解密中',
     paused: '已暂停',
     completed: '已完成',
     failed: '失败',
@@ -190,6 +198,7 @@ export function getStatusType(status: TaskStatus): 'success' | 'warning' | 'dang
   const typeMap: Record<TaskStatus, 'success' | 'warning' | 'danger' | 'info'> = {
     pending: 'info',
     downloading: 'warning',
+    decrypting: 'warning',
     paused: 'info',
     completed: 'success',
     failed: 'danger',
@@ -258,9 +267,11 @@ export interface DownloadItem {
 
 /**
  * 创建文件夹下载
+ * @param remotePath 远程路径
+ * @param originalName 原始文件夹名（如果是加密文件夹，传入还原后的名称）
  */
-export async function createFolderDownload(remotePath: string): Promise<string> {
-  return apiClient.post('/downloads/folder', { path: remotePath })
+export async function createFolderDownload(remotePath: string, originalName?: string): Promise<string> {
+  return apiClient.post('/downloads/folder', { path: remotePath, original_name: originalName })
 }
 
 /**
@@ -530,6 +541,15 @@ export interface DownloadItemFromBackend {
   scan_completed?: boolean
   scan_progress?: string
   completed_files?: number
+  // 解密相关字段
+  /** 是否为加密文件 */
+  is_encrypted?: boolean
+  /** 解密进度 (0.0 - 100.0) */
+  decrypt_progress?: number
+  /** 解密后的文件路径 */
+  decrypted_path?: string
+  /** 原始文件名（解密后恢复的文件名） */
+  original_filename?: string
 }
 
 /**

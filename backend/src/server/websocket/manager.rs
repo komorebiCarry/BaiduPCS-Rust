@@ -1,7 +1,7 @@
 //! WebSocket 连接管理器
 //!
 //! 管理所有 WebSocket 连接，实现订阅管理机制和消息节流
-//! 
+//!
 //! ## 设计要点
 //! - 订阅管理：支持通配符匹配（如 `download:*`）
 //! - 反向索引优化：高并发场景性能提升
@@ -25,6 +25,9 @@ const BATCH_INTERVAL_MS: u64 = 100;
 const DEFAULT_MAX_BATCH_SIZE: usize = 10;
 /// last_sent 过期时间（秒）
 const LAST_SENT_EXPIRE_SECS: u64 = 60;
+/// 每个连接的最大待发送事件数（防止内存无限增长）
+/// Requirements: 13.3
+pub const MAX_PENDING_EVENTS_PER_CONNECTION: usize = 100;
 
 /// WebSocket 连接信息
 #[derive(Debug)]
@@ -56,25 +59,25 @@ pub struct PendingEvent {
 pub struct WebSocketManager {
     /// 所有连接
     connections: DashMap<String, WsConnection>,
-    
+
     /// 订阅管理：connection_id -> 订阅模式集合
     /// 使用 Arc<str> 减少内存分配
     subscriptions: DashMap<String, HashSet<Arc<str>>>,
-    
+
     /// 反向索引：订阅模式 -> 连接 ID 集合
     /// 用于快速查找订阅了某个模式的所有连接
     subscription_index: DashMap<Arc<str>, HashSet<String>>,
-    
+
     /// 待发送事件：connection_id -> throttle_key -> PendingEvent
     /// throttle_key = event_type:task_id，避免同一任务的不同事件类型互相覆盖
     pending_events: DashMap<String, HashMap<String, PendingEvent>>,
-    
+
     /// 上次发送时间：connection_id -> throttle_key -> Instant
     last_sent: DashMap<String, HashMap<String, Instant>>,
-    
+
     /// 全局事件 ID 计数器
     event_id_counter: Arc<AtomicU64>,
-    
+
     /// 是否正在运行
     running: AtomicBool,
 }
@@ -96,7 +99,7 @@ impl WebSocketManager {
     // ==================== 订阅管理 ====================
 
     /// 规范化订阅模式，生成所有通配符版本
-    /// 
+    ///
     /// 例如 `download:file:progress` 会生成：
     /// - `download:file:progress`（精确匹配）
     /// - `download:file:*`（匹配所有 download:file 事件）
@@ -105,33 +108,33 @@ impl WebSocketManager {
     fn normalize_subscription(pattern: &str) -> Vec<Arc<str>> {
         let mut patterns = Vec::new();
         patterns.push(Arc::from(pattern));
-        
+
         // 生成通配符版本
         let parts: Vec<&str> = pattern.split(':').collect();
         for i in (1..parts.len()).rev() {
             let wildcard = format!("{}:*", parts[..i].join(":"));
             patterns.push(Arc::from(wildcard.as_str()));
         }
-        
+
         patterns
     }
 
     /// 添加订阅
-    /// 
+    ///
     /// # 参数
     /// - `connection_id`: 连接 ID
     /// - `patterns`: 订阅模式列表
     pub fn subscribe(&self, connection_id: &str, patterns: Vec<String>) {
         let mut conn_subs = self.subscriptions.entry(connection_id.to_string()).or_default();
-        
+
         for pattern in patterns {
             // 规范化订阅模式，生成所有通配符版本，实现 O(1) 匹配
             let normalized_patterns = Self::normalize_subscription(&pattern);
-            
+
             for pattern_arc in normalized_patterns {
                 // 添加到连接的订阅集合
                 conn_subs.insert(Arc::clone(&pattern_arc));
-                
+
                 // 更新反向索引
                 self.subscription_index
                     .entry(pattern_arc)
@@ -139,7 +142,7 @@ impl WebSocketManager {
                     .insert(connection_id.to_string());
             }
         }
-        
+
         info!("连接 {} 订阅更新: {:?}", connection_id, conn_subs.value());
     }
 
@@ -148,10 +151,10 @@ impl WebSocketManager {
         if let Some(mut conn_subs) = self.subscriptions.get_mut(connection_id) {
             for pattern in patterns {
                 let pattern_arc: Arc<str> = Arc::from(pattern.as_str());
-                
+
                 // 从连接的订阅集合移除
                 conn_subs.remove(&pattern_arc);
-                
+
                 // 更新反向索引
                 if let Some(mut index_entry) = self.subscription_index.get_mut(&pattern_arc) {
                     index_entry.remove(connection_id);
@@ -184,6 +187,10 @@ impl WebSocketManager {
     /// 检查连接是否应该接收事件
     ///
     /// 使用规范化订阅实现 O(1) 匹配
+    ///
+    /// ## 备份任务隔离
+    /// - 备份任务事件（is_backup=true）只发送给订阅了 `backup` 的连接
+    /// - 普通订阅（如 `download`、`upload`、`*`）不会收到备份任务事件
     fn should_send_event(
         &self,
         connection_id: &str,
@@ -199,6 +206,22 @@ impl WebSocketManager {
         let category = event.category();
         let event_type = event.event_type();
         let task_id = event.task_id();
+        let is_backup = event.is_backup();
+
+        // --- 备份任务隔离逻辑 ---
+        // 备份任务事件只发送给明确订阅了 backup 的连接
+        if is_backup {
+            // 检查是否订阅了 backup 相关模式
+            let backup_pattern = Arc::from("backup");
+            let backup_wildcard = Arc::from("backup:*");
+
+            if conn_subs.contains(&backup_pattern) || conn_subs.contains(&backup_wildcard) {
+                return true;
+            }
+
+            // 备份任务不发送给普通订阅（即使订阅了 * 或 download/upload）
+            return false;
+        }
 
         // --- 子任务事件优先处理 ---
         if let Some(gid) = group_id {
@@ -242,14 +265,14 @@ impl WebSocketManager {
 
 
     /// 获取节流 key
-    /// 
+    ///
     /// 返回 `event_type:task_id`，避免同一任务的不同事件类型互相覆盖
     fn get_throttle_key(event: &TaskEvent) -> String {
         format!("{}:{}", event.event_type(), event.task_id())
     }
 
     /// 获取动态批量处理数量
-    /// 
+    ///
     /// 根据连接数调整 max_batch_size
     fn get_dynamic_batch_size(&self) -> usize {
         let conn_count = self.connections.len();
@@ -283,19 +306,19 @@ impl WebSocketManager {
     }
 
     /// 移除连接
-    /// 
+    ///
     /// 同时清理订阅、pending_events、last_sent、反向索引
     pub fn unregister(&self, connection_id: &str) {
         if self.connections.remove(connection_id).is_some() {
             // 清理订阅和反向索引
             self.unsubscribe_all(connection_id);
-            
+
             // 清理 pending_events
             self.pending_events.remove(connection_id);
-            
+
             // 清理 last_sent
             self.last_sent.remove(connection_id);
-            
+
             info!("WebSocket 连接已移除并清理: {}", connection_id);
         }
     }
@@ -313,7 +336,7 @@ impl WebSocketManager {
     }
 
     /// 向指定连接发送消息
-    /// 
+    ///
     /// 检查连接存在性并发送消息
     pub fn send_to(&self, connection_id: &str, message: WsServerMessage) -> bool {
         // 先检查连接是否存在
@@ -324,7 +347,7 @@ impl WebSocketManager {
                 return false;
             }
         };
-        
+
         // 发送消息
         match conn.sender.send(message) {
             Ok(_) => true,
@@ -354,9 +377,9 @@ impl WebSocketManager {
     // ==================== 事件发送 ====================
 
     /// 带订阅检查和节流的发送方法
-    /// 
+    ///
     /// 这是业务模块调用的主要方法
-    /// 
+    ///
     /// # 参数
     /// - `event`: 任务事件
     /// - `group_id`: 可选的分组 ID（用于文件夹下载等场景）
@@ -374,7 +397,7 @@ impl WebSocketManager {
         // 遍历所有连接，检查订阅并发送
         for conn in self.connections.iter() {
             let connection_id = &conn.id;
-            
+
             // 检查是否应该发送给该连接
             if !self.should_send_event(connection_id, &event, group_id.as_deref()) {
                 continue;
@@ -412,7 +435,7 @@ impl WebSocketManager {
                             .entry(connection_id.to_string())
                             .or_default()
                             .insert(throttle_key.clone(), now);
-                        
+
                         // 清除该连接该 throttle_key 的待发送事件
                         if let Some(mut pending) = self.pending_events.get_mut(connection_id) {
                             pending.remove(&throttle_key);
@@ -423,18 +446,35 @@ impl WebSocketManager {
             }
 
             // 低/中优先级事件暂存，等待批量发送
-            self.pending_events
+            // 检查并限制 pending_events 大小（Requirements: 13.3）
+            let mut pending_map = self.pending_events
                 .entry(connection_id.to_string())
-                .or_default()
-                .insert(throttle_key.clone(), PendingEvent {
-                    event: timestamped.clone(),
-                    group_id: group_id.clone(),
-                });
+                .or_default();
+
+            // 如果超过限制，丢弃最旧的事件
+            if pending_map.len() >= MAX_PENDING_EVENTS_PER_CONNECTION {
+                // 找到最旧的事件（按 event_id 排序）
+                if let Some(oldest_key) = pending_map.iter()
+                    .min_by_key(|(_, pe)| pe.event.event_id)
+                    .map(|(k, _)| k.clone())
+                {
+                    pending_map.remove(&oldest_key);
+                    warn!(
+                        "连接 {} 的待发送事件队列已满（{}），丢弃最旧事件: {}",
+                        connection_id, MAX_PENDING_EVENTS_PER_CONNECTION, oldest_key
+                    );
+                }
+            }
+
+            pending_map.insert(throttle_key.clone(), PendingEvent {
+                event: timestamped.clone(),
+                group_id: group_id.clone(),
+            });
         }
     }
 
     /// 启动批量发送器
-    /// 
+    ///
     /// 使用 Weak 引用避免循环引用导致的内存泄漏
     pub fn start_batch_sender(self: Arc<Self>) {
         if self.running.swap(true, Ordering::SeqCst) {
@@ -443,13 +483,13 @@ impl WebSocketManager {
         }
 
         let weak_self = Arc::downgrade(&self);
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(BATCH_INTERVAL_MS));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // 使用 Weak 引用，如果 WebSocketManager 已被销毁则退出
                 match weak_self.upgrade() {
                     Some(manager) => {
@@ -477,7 +517,7 @@ impl WebSocketManager {
     }
 
     /// 刷新待发送事件
-    /// 
+    ///
     /// 按连接分组处理，只遍历有 pending 的连接
     fn flush_pending_events(&self) {
         if self.connection_count() == 0 || self.pending_events.is_empty() {
@@ -486,12 +526,12 @@ impl WebSocketManager {
 
         let now = Instant::now();
         let max_batch_size = self.get_dynamic_batch_size();
-        
+
         // 遍历所有有 pending 事件的连接
         let connection_ids: Vec<String> = self.pending_events.iter()
             .map(|entry| entry.key().clone())
             .collect();
-        
+
         for connection_id in connection_ids {
             // 检查连接是否还存在
             if !self.connections.contains_key(&connection_id) {
@@ -506,14 +546,14 @@ impl WebSocketManager {
             // 收集该连接需要发送的事件
             if let Some(mut pending_map) = self.pending_events.get_mut(&connection_id) {
                 let mut last_sent_map = self.last_sent.entry(connection_id.clone()).or_default();
-                
+
                 for (throttle_key, pending_event) in pending_map.iter() {
                     // 重新检查订阅状态（用户可能在事件进入 pending 后取消订阅）
                     if !self.should_send_event(&connection_id, &pending_event.event.event, pending_event.group_id.as_deref()) {
                         keys_to_remove.push(throttle_key.clone());
                         continue;
                     }
-                    
+
                     // 检查频率限制
                     let should_send = match last_sent_map.get(throttle_key) {
                         Some(last) => now.duration_since(*last) >= Duration::from_millis(MIN_PUSH_INTERVAL_MS),
@@ -535,7 +575,7 @@ impl WebSocketManager {
                 for key in &keys_to_remove {
                     pending_map.remove(key);
                 }
-                
+
                 // 清理过期的 last_sent 记录
                 let expire_threshold = Duration::from_secs(LAST_SENT_EXPIRE_SECS);
                 last_sent_map.retain(|_, last| now.duration_since(*last) < expire_threshold);
@@ -583,6 +623,63 @@ impl WebSocketManager {
             warn!("清理超时连接: {}", id);
             self.unregister(&id);
         }
+    }
+
+    /// 清理过期的 last_sent 记录
+    ///
+    /// 移除超过 LAST_SENT_EXPIRE_SECS 未更新的记录
+    /// Requirements: 13.2
+    pub fn cleanup_expired_last_sent(&self) {
+        let now = Instant::now();
+        let expire_threshold = Duration::from_secs(LAST_SENT_EXPIRE_SECS);
+        let mut cleaned_count = 0usize;
+
+        for mut entry in self.last_sent.iter_mut() {
+            let before_len = entry.len();
+            entry.retain(|_, last| now.duration_since(*last) < expire_threshold);
+            cleaned_count += before_len - entry.len();
+        }
+
+        // 移除空的 last_sent 条目
+        self.last_sent.retain(|_, map| !map.is_empty());
+
+        if cleaned_count > 0 {
+            debug!("清理了 {} 条过期的 last_sent 记录", cleaned_count);
+        }
+    }
+
+    /// 连接断开时的完整清理
+    ///
+    /// 清理 pending_events、last_sent 和订阅信息
+    /// Requirements: 13.1
+    pub fn on_connection_closed(&self, connection_id: &str) {
+        // 清理 pending_events
+        if self.pending_events.remove(connection_id).is_some() {
+            debug!("连接 {} 的 pending_events 已清理", connection_id);
+        }
+
+        // 清理 last_sent
+        if self.last_sent.remove(connection_id).is_some() {
+            debug!("连接 {} 的 last_sent 已清理", connection_id);
+        }
+
+        // 清理订阅和反向索引
+        self.unsubscribe_all(connection_id);
+
+        // 从连接列表移除
+        if self.connections.remove(connection_id).is_some() {
+            info!("连接 {} 已关闭并完成清理", connection_id);
+        }
+    }
+
+    /// 获取指定连接的 pending_events 数量
+    ///
+    /// 用于测试和监控
+    pub fn get_pending_events_count(&self, connection_id: &str) -> usize {
+        self.pending_events
+            .get(connection_id)
+            .map(|map| map.len())
+            .unwrap_or(0)
     }
 
     /// 获取连接的订阅列表
@@ -639,23 +736,23 @@ mod tests {
         // 订阅 download 类别
         manager.subscribe("conn-1", vec!["download".to_string()]);
 
-        // 发送事件
-        let event = TaskEvent::Download(DownloadEvent::Created {
+        // 发送高优先级事件（Completed 是 High 优先级，会直接发送）
+        let event = TaskEvent::Download(DownloadEvent::Completed {
             task_id: "test-1".to_string(),
-            fs_id: 123,
-            remote_path: "/test.txt".to_string(),
-            local_path: "./test.txt".to_string(),
-            total_size: 1024,
+            completed_at: 0,
             group_id: None,
+            is_backup: false,
         });
-        
+
         manager.send_if_subscribed(event, None);
 
-        // 验证收到事件（高优先级事件直接发送）
-        let msg = receiver.recv().await.unwrap();
-        match msg {
-            WsServerMessage::Event { .. } => {}
-            _ => panic!("Expected Event message"),
+        // 验证收到事件（高优先级事件直接发送），添加超时避免测试挂起
+        let result = tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await;
+        match result {
+            Ok(Some(WsServerMessage::Event { .. })) => {}
+            Ok(Some(msg)) => panic!("Expected Event message, got {:?}", msg),
+            Ok(None) => panic!("Channel closed unexpectedly"),
+            Err(_) => panic!("Timeout waiting for event - event was not sent"),
         }
     }
 
@@ -672,8 +769,9 @@ mod tests {
             speed: 100,
             progress: 10.0,
             group_id: None,
+            is_backup: false,
         });
-        
+
         manager.send_if_subscribed(event, None);
 
         // 使用 try_recv 验证没有消息

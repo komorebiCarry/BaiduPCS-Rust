@@ -388,6 +388,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
 
         // 保存
@@ -417,6 +419,8 @@ mod tests {
             2 * 1024 * 1024,
             512 * 1024,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
 
         // 设置 upload_id
@@ -482,7 +486,7 @@ mod tests {
             m.set_transfer_status("transferred");
             m.share_info_json = Some(r#"{"files": []}"#.to_string());
         })
-        .unwrap();
+            .unwrap();
         assert!(updated);
 
         // 验证更新
@@ -500,7 +504,7 @@ mod tests {
         let updated = update_metadata(wal_dir, "nonexistent", |m| {
             m.set_transfer_status("test");
         })
-        .unwrap();
+            .unwrap();
         assert!(!updated);
     }
 
@@ -522,6 +526,8 @@ mod tests {
             1024,
             256,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
         assert!(metadata_exists(wal_dir, "task_005"));
@@ -546,6 +552,8 @@ mod tests {
                 1024,
                 256,
                 4,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             );
             save_metadata(wal_dir, &metadata).unwrap();
         }
@@ -597,6 +605,8 @@ mod tests {
             1024,
             256,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 

@@ -36,6 +36,8 @@ pub struct BatchDownloadItem {
     pub is_dir: bool,
     /// 文件大小（文件夹为 None 或 0）
     pub size: Option<u64>,
+    /// 原始名称（加密文件/文件夹的还原名称）
+    pub original_name: Option<String>,
 }
 
 /// 批量下载请求
@@ -333,7 +335,7 @@ pub async fn create_batch_download(
         if item.is_dir {
             // 文件夹下载
             match folder_download_manager
-                .create_folder_download_with_dir(item.path.clone(), &target_dir)
+                .create_folder_download_with_dir(item.path.clone(), &target_dir, item.original_name.clone())
                 .await
             {
                 Ok(folder_id) => {

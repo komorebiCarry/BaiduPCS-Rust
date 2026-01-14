@@ -81,6 +81,7 @@
         :confirm-text="'上传'"
         :multiple="true"
         :initial-path="uploadConfig?.recent_directory"
+        :show-encryption="hasEncryptionKey"
         @select="handleFilePickerSelect"
         @select-multiple="handleFilePickerMultiSelect"
     />
@@ -100,12 +101,15 @@
         <el-table-column type="selection" width="55" />
         <el-table-column label="文件名" min-width="400">
           <template #default="{ row }">
-            <div class="file-name">
+            <div class="file-name" :title="(row.is_encrypted || row.is_encrypted_folder) ? `加密${row.isdir === 1 ? '文件夹' : '文件'}: ${row.server_filename}` : ''">
               <el-icon :size="20" class="file-icon">
                 <Folder v-if="row.isdir === 1"/>
                 <Document v-else/>
               </el-icon>
-              <span>{{ row.server_filename }}</span>
+              <span>{{ getDisplayName(row) }}</span>
+              <el-tag v-if="row.is_encrypted || row.is_encrypted_folder" type="warning" size="small" class="encrypted-tag">
+                加密
+              </el-tag>
             </div>
           </template>
         </el-table-column>
@@ -163,7 +167,12 @@
               <Document v-else/>
             </el-icon>
             <div class="file-card-info">
-              <div class="file-card-name">{{ item.server_filename }}</div>
+              <div class="file-card-name" :title="(item.is_encrypted || item.is_encrypted_folder) ? `加密${item.isdir === 1 ? '文件夹' : '文件'}: ${item.server_filename}` : ''">
+                {{ getDisplayName(item) }}
+                <el-tag v-if="item.is_encrypted || item.is_encrypted_folder" type="warning" size="small" class="encrypted-tag-mobile">
+                  加密
+                </el-tag>
+              </div>
               <div class="file-card-meta">
                 <span v-if="item.isdir === 0">{{ formatFileSize(item.size) }}</span>
                 <span v-else>文件夹</span>
@@ -262,6 +271,7 @@ import {useIsMobile} from '@/utils/responsive'
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem} from '@/api/download'
 import {createUpload, createFolderUpload} from '@/api/upload'
 import {getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig, type UploadConfig} from '@/api/config'
+import {getEncryptionStatus} from '@/api/autobackup'
 import {FilePickerModal} from '@/components/FilePicker'
 import TransferDialog from '@/components/TransferDialog.vue'
 import type {FileEntry} from '@/api/filesystem'
@@ -274,6 +284,9 @@ const downloadConfig = ref<DownloadConfig | null>(null)
 
 // 上传配置状态
 const uploadConfig = ref<UploadConfig | null>(null)
+
+// 加密密钥状态
+const hasEncryptionKey = ref(false)
 
 // 状态
 const loading = ref(false)
@@ -390,6 +403,14 @@ function getRowClassName({row}: { row: FileItem }) {
   return row.isdir === 1 ? 'directory-row' : ''
 }
 
+// 获取文件显示名称（加密文件/文件夹显示原始名称）
+function getDisplayName(file: FileItem): string {
+  if ((file.is_encrypted || file.is_encrypted_folder) && file.original_name) {
+    return file.original_name
+  }
+  return file.server_filename
+}
+
 // 下载文件
 async function handleDownload(file: FileItem) {
   // 确保配置已加载
@@ -443,10 +464,13 @@ async function handleDownloadFolder(folder: FileItem) {
     downloadingFolders.value.add(folder.path)
 
     try {
-      ElMessage.info('正在创建文件夹:' + folder.server_filename + ' 下载任务...')
+      // 获取显示名称（如果是加密文件夹，使用原始名称）
+      const displayName = getDisplayName(folder)
+      ElMessage.info('正在创建文件夹:' + displayName + ' 下载任务...')
 
-      // 创建文件夹下载任务
-      await createFolderDownload(folder.path)
+      // 创建文件夹下载任务（如果是加密文件夹，传递原始名称）
+      const originalName = folder.is_encrypted_folder ? folder.original_name : undefined
+      await createFolderDownload(folder.path, originalName)
 
       ElMessage.success('文件夹下载任务已创建，正在扫描文件...')
 
@@ -460,7 +484,7 @@ async function handleDownloadFolder(folder: FileItem) {
 }
 
 // 处理 FilePicker 选择结果
-async function handleFilePickerSelect(entry: FileEntry) {
+async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false) {
   try {
     if (entry.entryType === 'file') {
       // 单文件上传
@@ -471,9 +495,10 @@ async function handleFilePickerSelect(entry: FileEntry) {
       await createUpload({
         local_path: entry.path,
         remote_path: remotePath,
+        encrypt,
       })
 
-      ElMessage.success('已添加上传任务')
+      ElMessage.success(encrypt ? '已添加加密上传任务' : '已添加上传任务')
     } else {
       // 文件夹上传
       const remoteFolderPath = currentDir.value === '/'
@@ -483,9 +508,10 @@ async function handleFilePickerSelect(entry: FileEntry) {
       await createFolderUpload({
         local_folder: entry.path,
         remote_folder: remoteFolderPath,
+        encrypt,
       })
 
-      ElMessage.success('已添加文件夹上传任务')
+      ElMessage.success(encrypt ? '已添加加密文件夹上传任务' : '已添加文件夹上传任务')
     }
 
     // 更新上传最近目录（使用文件/文件夹的父目录）
@@ -504,13 +530,13 @@ async function handleFilePickerSelect(entry: FileEntry) {
 }
 
 // 处理 FilePicker 多选结果
-async function handleFilePickerMultiSelect(entries: FileEntry[]) {
+async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolean = false) {
   if (entries.length === 0) return
 
   let successCount = 0
   let failedCount = 0
 
-  ElMessage.info(`正在添加 ${entries.length} 个上传任务...`)
+  ElMessage.info(`正在添加 ${entries.length} 个${encrypt ? '加密' : ''}上传任务...`)
 
   for (const entry of entries) {
     try {
@@ -523,6 +549,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[]) {
         await createUpload({
           local_path: entry.path,
           remote_path: remotePath,
+          encrypt,
         })
         successCount++
       } else {
@@ -534,6 +561,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[]) {
         await createFolderUpload({
           local_folder: entry.path,
           remote_folder: remoteFolderPath,
+          encrypt,
         })
         successCount++
       }
@@ -545,7 +573,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[]) {
 
   // 显示结果
   if (failedCount === 0) {
-    ElMessage.success(`成功添加 ${successCount} 个上传任务`)
+    ElMessage.success(`成功添加 ${successCount} 个${encrypt ? '加密' : ''}上传任务`)
   } else if (successCount > 0) {
     ElMessage.warning(`成功 ${successCount} 个，失败 ${failedCount} 个`)
   } else {
@@ -645,6 +673,15 @@ async function loadDownloadConfig() {
   } catch (error: any) {
     console.error('加载配置失败:', error)
   }
+
+  // 加载加密状态
+  try {
+    const encryptionStatus = await getEncryptionStatus()
+    hasEncryptionKey.value = encryptionStatus.has_key
+  } catch (error: any) {
+    console.error('加载加密状态失败:', error)
+    hasEncryptionKey.value = false
+  }
 }
 
 // 处理表格选择变化
@@ -740,7 +777,9 @@ async function executeBatchDownload(targetDir: string) {
       path: file.path,
       name: file.server_filename,
       is_dir: file.isdir === 1,
-      size: file.isdir === 0 ? file.size : undefined
+      size: file.isdir === 0 ? file.size : undefined,
+      // 🔥 修复：传递 original_name 以支持加密文件夹名称还原
+      original_name: (file.is_encrypted || file.is_encrypted_folder) ? file.original_name : undefined
     }))
 
     const totalCount = allItems.length
@@ -815,7 +854,11 @@ async function executeBatchDownload(targetDir: string) {
 // 执行单文件下载（带目录选择）
 async function executeSingleDownload(file: FileItem, targetDir: string) {
   try {
-    ElMessage.info('正在创建:' + file.server_filename + ' 下载任务...')
+    const displayName = getDisplayName(file)
+    ElMessage.info('正在创建:' + displayName + ' 下载任务...')
+
+    // 获取原始名称（如果是加密文件/文件夹）
+    const originalName = (file.is_encrypted || file.is_encrypted_folder) ? file.original_name : undefined
 
     // 使用批量下载 API 以支持自定义目录
     const response = await createBatchDownload({
@@ -824,7 +867,8 @@ async function executeSingleDownload(file: FileItem, targetDir: string) {
         path: file.path,
         name: file.server_filename,
         is_dir: file.isdir === 1,
-        size: file.isdir === 0 ? file.size : undefined
+        size: file.isdir === 0 ? file.size : undefined,
+        original_name: originalName
       }],
       target_dir: targetDir
     })
@@ -932,6 +976,11 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   &:hover {
     color: #409eff;
   }
+
+  .encrypted-tag {
+    margin-left: 4px;
+    flex-shrink: 0;
+  }
 }
 
 :deep(.directory-row) {
@@ -1021,6 +1070,13 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     overflow: hidden;
     text-overflow: ellipsis;
     margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+
+    .encrypted-tag-mobile {
+      flex-shrink: 0;
+    }
   }
 
   .file-card-meta {

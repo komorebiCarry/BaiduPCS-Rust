@@ -32,9 +32,184 @@ pub struct AppConfig {
     /// 持久化配置
     #[serde(default)]
     pub persistence: PersistenceConfig,
-    /// 🔥 日志配置
+    /// 日志配置
     #[serde(default)]
     pub log: LogConfig,
+    /// 自动备份配置
+    #[serde(default)]
+    pub autobackup: AutoBackupConfig,
+}
+
+/// 自动备份配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoBackupConfig {
+    /// 是否启用自动备份功能
+    #[serde(default = "default_autobackup_enabled")]
+    pub enabled: bool,
+    /// 最大并发扫描数
+    #[serde(default = "default_max_concurrent_scans")]
+    pub max_concurrent_scans: usize,
+    /// 最大并发加密数
+    #[serde(default = "default_max_concurrent_encrypts")]
+    pub max_concurrent_encrypts: usize,
+    /// 备份任务最大并发数（备份任务优先级最低）
+    #[serde(default = "default_max_concurrent_backup_tasks")]
+    pub max_concurrent_backup_tasks: usize,
+    /// 文件变更聚合窗口（秒）
+    #[serde(default = "default_change_aggregation_window_secs")]
+    pub change_aggregation_window_secs: u64,
+    /// 临时文件目录（用于加密临时文件）
+    #[serde(default = "default_temp_dir")]
+    pub temp_dir: String,
+    /// 备份配置文件路径
+    #[serde(default = "default_config_path")]
+    pub config_path: String,
+    /// 上传备份触发配置
+    #[serde(default)]
+    pub upload_trigger: UploadTriggerConfig,
+    /// 下载备份触发配置
+    #[serde(default)]
+    pub download_trigger: DownloadTriggerConfig,
+}
+
+/// 上传备份触发配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadTriggerConfig {
+    /// 是否启用文件系统监听
+    #[serde(default = "default_true")]
+    pub watch_enabled: bool,
+    /// 监听防抖时间（毫秒）
+    #[serde(default = "default_watch_debounce_ms")]
+    pub watch_debounce_ms: u64,
+    /// 是否递归监听子目录
+    #[serde(default = "default_true")]
+    pub watch_recursive: bool,
+    /// 是否启用间隔时间兜底（文件监听漏监听时的补充）
+    #[serde(default = "default_true")]
+    pub fallback_interval_enabled: bool,
+    /// 间隔兜底轮询时间（分钟）
+    #[serde(default = "default_fallback_interval_minutes")]
+    pub fallback_interval_minutes: u32,
+    /// 是否启用指定时间全量扫描
+    #[serde(default = "default_true")]
+    pub fallback_scheduled_enabled: bool,
+    /// 指定时间全量扫描 - 小时（0-23）
+    #[serde(default = "default_scheduled_hour")]
+    pub fallback_scheduled_hour: u8,
+    /// 指定时间全量扫描 - 分钟（0-59）
+    #[serde(default)]
+    pub fallback_scheduled_minute: u8,
+}
+
+fn default_watch_debounce_ms() -> u64 {
+    3000
+}
+
+fn default_fallback_interval_minutes() -> u32 {
+    30
+}
+
+fn default_scheduled_hour() -> u8 {
+    2
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UploadTriggerConfig {
+    fn default() -> Self {
+        Self {
+            watch_enabled: true,
+            watch_debounce_ms: 3000,
+            watch_recursive: true,
+            fallback_interval_enabled: true,
+            fallback_interval_minutes: 30,
+            fallback_scheduled_enabled: true,
+            fallback_scheduled_hour: 2,
+            fallback_scheduled_minute: 0,
+        }
+    }
+}
+
+/// 下载备份触发配置（仅支持轮询，不支持文件监听）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadTriggerConfig {
+    /// 轮询模式：interval（间隔轮询）或 scheduled（指定时间）
+    #[serde(default = "default_poll_mode")]
+    pub poll_mode: String,
+    /// 间隔轮询时间（分钟）
+    #[serde(default = "default_download_poll_interval_minutes")]
+    pub poll_interval_minutes: u32,
+    /// 指定时间轮询 - 小时（0-23）
+    #[serde(default = "default_scheduled_hour")]
+    pub poll_scheduled_hour: u8,
+    /// 指定时间轮询 - 分钟（0-59）
+    #[serde(default)]
+    pub poll_scheduled_minute: u8,
+}
+
+fn default_poll_mode() -> String {
+    "scheduled".to_string()
+}
+
+fn default_download_poll_interval_minutes() -> u32 {
+    60
+}
+
+impl Default for DownloadTriggerConfig {
+    fn default() -> Self {
+        Self {
+            poll_mode: "scheduled".to_string(),
+            poll_interval_minutes: 60,
+            poll_scheduled_hour: 2,
+            poll_scheduled_minute: 0,
+        }
+    }
+}
+
+fn default_autobackup_enabled() -> bool {
+    true
+}
+
+fn default_max_concurrent_scans() -> usize {
+    2
+}
+
+fn default_max_concurrent_encrypts() -> usize {
+    2
+}
+
+fn default_max_concurrent_backup_tasks() -> usize {
+    3
+}
+
+fn default_change_aggregation_window_secs() -> u64 {
+    5
+}
+
+fn default_temp_dir() -> String {
+    "config/temp".to_string()
+}
+
+fn default_config_path() -> String {
+    "config/autobackup_configs.json".to_string()
+}
+
+impl Default for AutoBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_autobackup_enabled(),
+            max_concurrent_scans: default_max_concurrent_scans(),
+            max_concurrent_encrypts: default_max_concurrent_encrypts(),
+            max_concurrent_backup_tasks: default_max_concurrent_backup_tasks(),
+            change_aggregation_window_secs: default_change_aggregation_window_secs(),
+            temp_dir: default_temp_dir(),
+            config_path: default_config_path(),
+            upload_trigger: UploadTriggerConfig::default(),
+            download_trigger: DownloadTriggerConfig::default(),
+        }
+    }
 }
 
 /// 日志配置
@@ -359,6 +534,10 @@ pub struct PersistenceConfig {
     #[serde(default = "default_wal_dir")]
     pub wal_dir: String,
 
+    /// 全局数据库路径（历史归档、自动备份等共用）
+    #[serde(default = "default_global_db_path")]
+    pub db_path: String,
+
     /// WAL 批量刷写间隔（毫秒），默认 200ms
     #[serde(default = "default_wal_flush_interval_ms")]
     pub wal_flush_interval_ms: u64,
@@ -389,6 +568,10 @@ fn default_wal_dir() -> String {
     "wal".to_string()
 }
 
+fn default_global_db_path() -> String {
+    "config/baidu-pcs.db".to_string()
+}
+
 fn default_wal_flush_interval_ms() -> u64 {
     200
 }
@@ -417,6 +600,7 @@ impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             wal_dir: default_wal_dir(),
+            db_path: default_global_db_path(),
             wal_flush_interval_ms: default_wal_flush_interval_ms(),
             auto_recover_tasks: default_auto_recover_tasks(),
             wal_retention_days: default_wal_retention_days(),
@@ -693,6 +877,7 @@ impl Default for AppConfig {
             filesystem: FilesystemConfig::default(),
             persistence: PersistenceConfig::default(),
             log: LogConfig::default(),
+            autobackup: AutoBackupConfig::default(),
         }
     }
 }

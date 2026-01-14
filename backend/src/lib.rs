@@ -37,6 +37,15 @@ pub mod persistence;
 // 🔥 日志系统模块
 pub mod logging;
 
+// 🔥 自动备份模块
+pub mod autobackup;
+
+// 🔥 加密模块（通用）
+pub mod encryption;
+
+// 🔥 任务槽池模块（下载和上传共用）
+pub mod task_slot_pool;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;
@@ -64,3 +73,6 @@ pub use common::{
 // 🔥 导出持久化相关类型
 pub use config::PersistenceConfig;
 pub use persistence::{TaskMetadata, TaskPersistenceInfo, TaskType, WalRecord};
+
+// 🔥 导出任务槽池相关类型
+pub use task_slot_pool::{TaskSlot, TaskSlotPool, TaskSlotType, TaskPriority, STALE_WARNING_THRESHOLD, STALE_RELEASE_THRESHOLD, CLEANUP_INTERVAL};

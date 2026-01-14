@@ -44,7 +44,7 @@
             :key="item.id"
             class="task-card"
             :class="{
-              'task-active': item.status === 'downloading' || item.status === 'scanning',
+              'task-active': item.status === 'downloading' || item.status === 'scanning' || item.status === 'decrypting',
               'is-folder': item.type === 'folder'
             }"
             shadow="hover"
@@ -58,7 +58,7 @@
                   <Document v-else/>
                 </el-icon>
                 <span class="filename">
-                    {{ item.type === 'folder' ? item.name : getFilename(item.local_path || '') }}
+                    {{ item.type === 'folder' ? item.name : getDisplayFilename(item) }}
                   </span>
                 <el-tag
                     :type="item.type === 'folder' ? getFolderStatusType(item.status as FolderStatus) : getStatusType(item.status as TaskStatus)"
@@ -71,6 +71,11 @@
                 <span v-if="item.type === 'folder' && item.status === 'scanning'" class="scanning-hint">
                     (已发现 {{ item.total_files }} 个文件)
                   </span>
+                <!-- 加密文件标识 -->
+                <el-tag v-if="item.is_encrypted" type="info" size="small">
+                  <el-icon><Lock /></el-icon>
+                  加密文件
+                </el-tag>
               </div>
               <div class="task-path">
                 {{ item.type === 'folder' ? item.remote_root : item.remote_path }}
@@ -149,8 +154,25 @@
             </div>
           </div>
 
+          <!-- 解密进度显示 -->
+          <div v-if="item.status === 'decrypting'" class="decrypt-progress">
+            <div class="decrypt-header">
+              <el-icon class="decrypt-icon"><Unlock /></el-icon>
+              <span>正在解密文件...</span>
+            </div>
+            <el-progress
+                :percentage="item.decrypt_progress || 0"
+                :stroke-width="6"
+                status="warning"
+            >
+              <template #default="{ percentage }">
+                <span class="progress-text">{{ percentage.toFixed(1) }}%</span>
+              </template>
+            </el-progress>
+          </div>
+
           <!-- 进度条 -->
-          <div class="task-progress">
+          <div class="task-progress" v-if="item.status !== 'decrypting'">
             <el-progress
                 :percentage="((item.downloaded_size || 0) / (item.total_size || 1) * 100)"
                 :status="getProgressStatus(item.status!)"
@@ -358,6 +380,8 @@ import {
   List,
   Search,
   Share,
+  Lock,
+  Unlock,
 } from '@element-plus/icons-vue'
 import {useRouter} from 'vue-router'
 import {useIsMobile} from '@/utils/responsive'
@@ -404,14 +428,14 @@ const wsConnected = ref(false)
 const hasActiveTasks = computed(() => {
   return downloadItems.value.some(item => {
     const status = item.status
-    return status === 'downloading' || status === 'scanning' || status === 'paused' || status === 'pending'
+    return status === 'downloading' || status === 'scanning' || status === 'paused' || status === 'pending' || status === 'decrypting'
   })
 })
 
 // 计算属性
 const activeCount = computed(() => {
   return downloadItems.value.filter(item =>
-      item.status === 'downloading' || item.status === 'scanning'
+      item.status === 'downloading' || item.status === 'scanning' || item.status === 'decrypting'
   ).length
 })
 
@@ -447,6 +471,15 @@ function getFilename(path: string): string {
   return parts[parts.length - 1] || path
 }
 
+// 🔥 获取显示用的文件名（优先使用原始文件名）
+function getDisplayFilename(item: DownloadItemFromBackend): string {
+  // 优先使用原始文件名（加密文件解密后的名称）
+  if (item.original_filename) {
+    return item.original_filename
+  }
+  return getFilename(item.local_path || '')
+}
+
 // 获取文件名（用于子任务表格）
 function getFileName(task: DownloadTask): string {
   return task.relative_path || getFilename(task.remote_path)
@@ -457,6 +490,7 @@ function getProgressStatus(status: TaskStatus | FolderStatus): 'success' | 'exce
   if (status === 'completed') return 'success'
   if (status === 'failed') return 'exception'
   if (status === 'paused') return 'warning'
+  if (status === 'decrypting') return 'warning'
   return undefined
 }
 
@@ -801,7 +835,8 @@ async function refreshFolderDetail() {
 // 🔥 处理下载事件
 function handleDownloadEvent(event: DownloadEvent) {
   const taskId = event.task_id
-  const index = downloadItems.value.findIndex(item => item.id === taskId && item.type === 'file')
+  // 🔥 修复：放宽查找条件，只要 id 匹配且不是文件夹类型即可
+  const index = downloadItems.value.findIndex(item => item.id === taskId && item.type !== 'folder')
 
   switch (event.event_type) {
     case 'created':
@@ -817,6 +852,8 @@ function handleDownloadEvent(event: DownloadEvent) {
           downloaded_size: 0,
           speed: 0,
           group_id: event.group_id,
+          original_filename: event.original_filename, // 🔥 保存原始文件名
+          is_encrypted: !!event.original_filename, // 🔥 有原始文件名说明是加密文件
         } as DownloadItemFromBackend)
       }
       // 🔥 如果是文件夹详情弹窗中的子任务，也添加到弹窗
@@ -864,6 +901,39 @@ function handleDownloadEvent(event: DownloadEvent) {
       }
       break
 
+    case 'decrypt_progress':
+      // 🔥 解密进度更新
+      if (index !== -1) {
+        // 🔥 修复：如果任务已完成，忽略延迟到达的解密进度事件
+        if (downloadItems.value[index].status === 'completed') {
+          break
+        }
+        downloadItems.value[index].decrypt_progress = event.decrypt_progress
+        downloadItems.value[index].status = 'decrypting'
+        downloadItems.value[index].is_encrypted = true
+      }
+      // 🔥 更新文件夹详情弹窗中的子任务解密进度
+      updateFolderDetailTask(taskId, {
+        decrypt_progress: event.decrypt_progress,
+        status: 'decrypting' as TaskStatus,
+        is_encrypted: true,
+      })
+      break
+
+    case 'decrypt_completed':
+      // 🔥 解密完成
+      if (index !== -1) {
+        downloadItems.value[index].decrypt_progress = 100
+        downloadItems.value[index].local_path = event.decrypted_path
+        // 状态变更会由 status_changed 或 completed 事件处理
+      }
+      // 🔥 更新文件夹详情弹窗中的子任务解密完成
+      updateFolderDetailTask(taskId, {
+        decrypt_progress: 100,
+        local_path: event.decrypted_path,
+      })
+      break
+
     case 'status_changed':
       // 状态变更
       if (index !== -1) {
@@ -879,8 +949,12 @@ function handleDownloadEvent(event: DownloadEvent) {
         downloadItems.value[index].status = 'completed'
         downloadItems.value[index].downloaded_size = downloadItems.value[index].total_size
         downloadItems.value[index].speed = 0
+        // 🔥 如果是加密文件，完成时解密进度也应该是 100%
+        if (downloadItems.value[index].is_encrypted) {
+          downloadItems.value[index].decrypt_progress = 100
+        }
       }
-      // 🔥 更新文件夹详情弹窗中的子任务完成状态
+      // 🔥 更新文件夹详情弹窗中的子任务完成状态（不设置 decrypt_progress，避免影响普通文件）
       updateFolderDetailTask(taskId, {status: 'completed' as TaskStatus, speed: 0}, true)
       break
 
@@ -1311,6 +1385,39 @@ onUnmounted(() => {
 
 :deep(.el-progress__text) {
   font-size: 12px !important;
+}
+
+// =====================
+// 解密进度样式
+// =====================
+.decrypt-progress {
+  margin-bottom: 15px;
+  padding: 10px;
+  background: #fdf6ec;
+  border-radius: 4px;
+
+  .decrypt-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: #e6a23c;
+    font-size: 13px;
+
+    .decrypt-icon {
+      animation: pulse 1.5s infinite;
+    }
+  }
+
+  .progress-text {
+    font-size: 12px;
+    font-weight: 500;
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 // 文件夹详情弹窗样式

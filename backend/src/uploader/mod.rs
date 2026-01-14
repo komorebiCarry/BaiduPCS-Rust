@@ -23,7 +23,7 @@ pub use chunk::{
     VIP_CHUNK_SIZE, VIP_FILE_SIZE_LIMIT,
 };
 pub use engine::UploadEngine;
-pub use folder::{FolderScanner, ScanOptions, ScannedFile};
+pub use folder::{FolderScanner, ScanOptions, ScannedFile, BatchedScanIterator, SCAN_BATCH_SIZE};
 pub use health::PcsServerHealthManager;
 pub use manager::{UploadManager, UploadTaskInfo};
 pub use rapid_upload::{RapidCheckResult, RapidUploadChecker, RapidUploadHash};

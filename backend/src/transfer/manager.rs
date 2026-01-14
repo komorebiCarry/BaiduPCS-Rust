@@ -4,7 +4,7 @@ use crate::config::{AppConfig, TransferConfig};
 use crate::downloader::{DownloadManager, FolderDownloadManager, TaskStatus};
 use crate::netdisk::NetdiskClient;
 use crate::persistence::{
-    PersistenceManager, TaskMetadata, TaskPersistenceStatus, TaskType, TransferRecoveryInfo,
+    PersistenceManager, TaskMetadata, TransferRecoveryInfo,
 };
 use crate::server::events::{TaskEvent, TransferEvent};
 use crate::server::websocket::WebSocketManager;
@@ -930,7 +930,7 @@ impl TransferManager {
             if let Some(ref fdm) = *fdm_lock {
                 for folder_path in download_folders {
                     match fdm
-                        .create_folder_download_with_dir(folder_path.clone(), &download_dir)
+                        .create_folder_download_with_dir(folder_path.clone(), &download_dir, None)
                         .await
                     {
                         Ok(folder_id) => {
@@ -1164,6 +1164,7 @@ impl TransferManager {
                     TaskStatus::Completed => completed_count += 1,
                     TaskStatus::Failed => failed_count += 1,
                     TaskStatus::Downloading => downloading_count += 1,
+                    TaskStatus::Decrypting => downloading_count += 1, // 解密中视为进行中
                     TaskStatus::Paused => paused_count += 1,
                     TaskStatus::Pending => downloading_count += 1, // 视为进行中
                 }
@@ -1219,7 +1220,7 @@ impl TransferManager {
             }
         }
 
-        // 从历史缓存获取历史任务
+        // 从历史数据库获取历史任务
         if let Some(pm_arc) = self
             .persistence_manager
             .lock()
@@ -1228,18 +1229,19 @@ impl TransferManager {
             .map(|pm| pm.clone())
         {
             let pm = pm_arc.lock().await;
-            let history_cache = pm.history_cache();
 
-            for entry in history_cache.iter() {
-                let metadata = entry.value();
-
-                // 只包含转存任务且状态为已完成
-                if metadata.task_type == TaskType::Transfer
-                    && metadata.status == Some(TaskPersistenceStatus::Completed)
-                {
+            // 从数据库查询已完成的转存任务
+            if let Some((history_tasks, _total)) = pm.get_history_tasks_by_type_and_status(
+                "transfer",
+                "completed",
+                false,  // don't exclude backup (transfer tasks are not backup tasks)
+                0,
+                500,   // 限制最多500条
+            ) {
+                for metadata in history_tasks {
                     // 排除已在当前任务中的（避免重复）
                     if !self.tasks.contains_key(&metadata.task_id) {
-                        if let Some(task) = Self::convert_history_to_task(metadata) {
+                        if let Some(task) = Self::convert_history_to_task(&metadata) {
                             result.push(task);
                         }
                     }
@@ -1503,7 +1505,5 @@ impl TransferManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // 测试需要模拟 NetdiskClient，这里先跳过
 }

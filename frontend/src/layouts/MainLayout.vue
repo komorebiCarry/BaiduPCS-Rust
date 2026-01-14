@@ -38,6 +38,11 @@
           <template #title>转存管理</template>
         </el-menu-item>
 
+        <el-menu-item index="/autobackup">
+          <el-icon><Refresh /></el-icon>
+          <template #title>自动备份</template>
+        </el-menu-item>
+
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
           <template #title>系统设置</template>
@@ -95,6 +100,11 @@
           <el-menu-item index="/transfers">
             <el-icon><Share /></el-icon>
             <span>转存管理</span>
+          </el-menu-item>
+
+          <el-menu-item index="/autobackup">
+            <el-icon><Refresh /></el-icon>
+            <span>自动备份</span>
           </el-menu-item>
 
           <el-menu-item index="/settings">
@@ -185,6 +195,9 @@
         <span class="tabbar-label">{{ item.label }}</span>
       </div>
     </div>
+
+    <!-- 个人信息弹窗 -->
+    <UserProfileDialog v-model="profileDialogVisible" :user="authStore.user" />
   </el-container>
 </template>
 
@@ -194,6 +207,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/utils/responsive'
+import UserProfileDialog from '@/components/UserProfileDialog.vue'
 import {
   FolderOpened,
   Files,
@@ -207,6 +221,7 @@ import {
   Fold,
   Share,
   Menu,
+  Refresh,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -219,13 +234,14 @@ const isMobile = useIsMobile()
 // 状态
 const isCollapse = ref(false)
 const drawerVisible = ref(false)
+const profileDialogVisible = ref(false)
 
 // 底部导航栏配置
 const tabbarItems = [
   { path: '/files', label: '文件', icon: markRaw(Files) },
   { path: '/downloads', label: '下载', icon: markRaw(Download) },
   { path: '/uploads', label: '上传', icon: markRaw(Upload) },
-  { path: '/transfers', label: '转存', icon: markRaw(Share) },
+  { path: '/autobackup', label: '备份', icon: markRaw(Refresh) },
   { path: '/settings', label: '设置', icon: markRaw(Setting) },
 ]
 
@@ -240,6 +256,7 @@ const pageTitle = computed(() => {
     '/downloads': '下载管理',
     '/uploads': '上传管理',
     '/transfers': '转存管理',
+    '/autobackup': '自动备份',
     '/settings': '系统设置',
   }
   return titles[route.path] || '百度网盘'
@@ -262,7 +279,7 @@ function handleMenuSelect() {
 
 // 抽屉用户点击
 function handleUserClick() {
-  ElMessage.info('个人信息功能开发中...')
+  profileDialogVisible.value = true
 }
 
 // 抽屉退出登录
@@ -288,7 +305,7 @@ async function handleLogout() {
 async function handleCommand(command: string) {
   switch (command) {
     case 'profile':
-      ElMessage.info('个人信息功能开发中...')
+      profileDialogVisible.value = true
       break
     case 'logout':
       await handleLogout()

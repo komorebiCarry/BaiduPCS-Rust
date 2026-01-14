@@ -242,8 +242,9 @@ pub async fn qrcode_status(
                         info!("✅ 下载管理器初始化成功");
 
                         // 初始化上传管理器（使用配置参数）
+                        let config_dir = std::path::Path::new("config");
                         let upload_manager =
-                            UploadManager::new_with_config(client.clone(), &updated_user, &upload_config);
+                            UploadManager::new_with_config(client.clone(), &updated_user, &upload_config, config_dir);
                         let upload_manager_arc = Arc::new(upload_manager);
 
                         // 设置上传管理器的持久化管理器
@@ -254,6 +255,11 @@ pub async fn qrcode_status(
                         // 设置上传管理器的 WebSocket 管理器
                         upload_manager_arc
                             .set_ws_manager(Arc::clone(&state.ws_manager))
+                            .await;
+
+                        // 🔥 设置备份记录管理器（用于文件夹名加密映射）
+                        upload_manager_arc
+                            .set_backup_record_manager(Arc::clone(&state.backup_record_manager))
                             .await;
 
                         *state.upload_manager.write().await = Some(Arc::clone(&upload_manager_arc));
@@ -293,6 +299,14 @@ pub async fn qrcode_status(
                         // 启动 WebSocket 批量发送器
                         Arc::clone(&state.ws_manager).start_batch_sender();
                         info!("✅ WebSocket 批量发送器已启动");
+
+                        // 🔥 启动内存监控器
+                        Arc::clone(&state.memory_monitor).start();
+                        info!("✅ 内存监控器已启动");
+
+                        // 🔥 初始化自动备份管理器
+                        state.init_autobackup_manager().await;
+                        info!("✅ 自动备份管理器初始化完成");
                     }
                     Err(e) => {
                         error!("❌ 初始化下载管理器失败: {}", e);

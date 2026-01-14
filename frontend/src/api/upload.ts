@@ -2,7 +2,7 @@ import { apiClient } from './client'
 import { formatFileSize as sharedFormatFileSize, formatSpeed as sharedFormatSpeed, formatETA as sharedFormatETA, extractFilename as sharedExtractFilename } from './utils'
 
 /// 任务状态
-export type UploadTaskStatus = 'pending' | 'uploading' | 'paused' | 'completed' | 'failed'
+export type UploadTaskStatus = 'pending' | 'checking_rapid' | 'encrypting' | 'uploading' | 'paused' | 'completed' | 'rapid_upload_success' | 'failed'
 
 /// 上传任务
 export interface UploadTask {
@@ -21,12 +21,17 @@ export interface UploadTask {
   // 分片信息
   total_chunks?: number
   completed_chunks?: number
+  // 加密相关字段
+  encrypt_enabled?: boolean
+  encrypt_progress?: number
+  original_size?: number
 }
 
 /// 创建上传任务请求
 export interface CreateUploadRequest {
   local_path: string
   remote_path: string
+  encrypt?: boolean
 }
 
 /// 文件夹扫描选项
@@ -42,11 +47,13 @@ export interface CreateFolderUploadRequest {
   local_folder: string
   remote_folder: string
   scan_options?: FolderScanOptions
+  encrypt?: boolean
 }
 
 /// 批量创建上传任务请求
 export interface CreateBatchUploadRequest {
   files: [string, string][] // [(本地路径, 远程路径)]
+  encrypt?: boolean
 }
 
 /**
@@ -150,9 +157,12 @@ export function calculateETA(task: UploadTask): number | null {
 export function getStatusText(status: UploadTaskStatus): string {
   const statusMap: Record<UploadTaskStatus, string> = {
     pending: '等待中',
+    checking_rapid: '秒传检查中',
+    encrypting: '加密中',
     uploading: '上传中',
     paused: '已暂停',
     completed: '已完成',
+    rapid_upload_success: '秒传成功',
     failed: '失败',
   }
   return statusMap[status] || '未知'
@@ -164,9 +174,12 @@ export function getStatusText(status: UploadTaskStatus): string {
 export function getStatusType(status: UploadTaskStatus): 'success' | 'warning' | 'danger' | 'info' {
   const typeMap: Record<UploadTaskStatus, 'success' | 'warning' | 'danger' | 'info'> = {
     pending: 'info',
+    checking_rapid: 'warning',
+    encrypting: 'warning',
     uploading: 'warning',
     paused: 'info',
     completed: 'success',
+    rapid_upload_success: 'success',
     failed: 'danger',
   }
   return typeMap[status] || 'info'

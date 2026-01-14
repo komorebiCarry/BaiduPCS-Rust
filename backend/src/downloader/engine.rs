@@ -1,4 +1,5 @@
 use crate::auth::UserAuth;
+use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
 use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
@@ -16,6 +17,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -2325,12 +2327,15 @@ impl DownloadEngine {
         // 将 Referer 转换为 String（如果存在）
         let referer = referer.map(|s| s.to_string());
 
-        let mut handles = Vec::new();
+        // 使用 JoinSet 管理并发任务，支持统一取消
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         for chunk_index in chunks_to_download {
             // 检查任务是否已被取消
             if cancellation_token.is_cancelled() {
                 warn!("任务在创建分片任务时被取消，停止创建新的分片任务");
+                // 取消所有已创建的任务
+                join_set.abort_all();
                 break;
             }
 
@@ -2352,7 +2357,7 @@ impl DownloadEngine {
             let task = task.clone();
             let cancellation_token = cancellation_token.clone();
 
-            let handle = tokio::spawn(async move {
+            join_set.spawn(async move {
                 // ✅ 在任务内部获取 permit（不会阻塞循环，实现真正的并发启动）
                 // - 如果有空闲线程，立即获取并开始下载
                 // - 如果线程池满了，在这里等待（不影响其他分片任务的创建）
@@ -2401,6 +2406,7 @@ impl DownloadEngine {
                     None, // progress_throttler（独立模式不需要）
                     String::new(), // task_id（独立模式不需要）
                     None, // folder_progress_tx（独立模式不需要）
+                    None, // backup_notification_tx（独立模式不需要）
                 )
                     .await;
 
@@ -2415,24 +2421,38 @@ impl DownloadEngine {
 
                 result
             });
-
-            handles.push(handle);
         }
 
-        // 等待所有分片完成
-        for handle in handles {
-            match handle.await {
+        // 等待所有分片完成，使用 JoinSet 支持统一取消
+        while let Some(result) = join_set.join_next().await {
+            // 检查任务是否被取消
+            if cancellation_token.is_cancelled() {
+                warn!("任务在下载过程中被取消，取消所有剩余分片任务");
+                join_set.abort_all();
+                anyhow::bail!("任务已被取消");
+            }
+
+            match result {
                 Ok(Ok(_)) => {} // 分片下载成功
                 Ok(Err(e)) => {
                     // 分片下载失败，检查是否是因为取消
                     if cancellation_token.is_cancelled() {
                         warn!("分片下载因任务取消而失败");
+                        join_set.abort_all();
                         anyhow::bail!("任务已被取消");
                     }
+                    // 取消所有剩余任务
+                    join_set.abort_all();
                     return Err(e);
                 }
                 Err(e) => {
+                    if e.is_cancelled() {
+                        // 任务被取消，这是预期的
+                        debug!("分片任务被取消");
+                        continue;
+                    }
                     error!("分片任务异常: {}", e);
+                    join_set.abort_all();
                     anyhow::bail!("分片任务异常: {}", e);
                 }
             }
@@ -2479,6 +2499,7 @@ impl DownloadEngine {
     /// * `progress_throttler` - 进度节流器（可选，200ms 间隔）
     /// * `task_id` - 任务 ID（用于进度事件）
     /// * `folder_progress_tx` - 文件夹进度通知发送器（可选，仅文件夹子任务需要）
+    /// * `backup_notification_tx` - 备份任务统一通知发送器（可选，仅备份任务需要）
     pub async fn download_chunk_with_retry(
         chunk_index: usize,
         client: Client,
@@ -2497,6 +2518,7 @@ impl DownloadEngine {
         progress_throttler: Option<Arc<ProgressThrottler>>,
         task_id: String,
         folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
+        backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
     ) -> Result<()> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
@@ -2602,14 +2624,17 @@ impl DownloadEngine {
             let task_id_clone = task_id.clone();
             let total_size_clone = total_size;
             let folder_progress_tx_clone = folder_progress_tx.clone();
+            let backup_notification_tx_clone = backup_notification_tx.clone();
             let progress_callback = move |bytes: u64| {
                 // 使用 tokio::task::block_in_place 在同步闭包中执行异步操作
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        // 更新任务已下载大小，并获取 group_id
-                        let (downloaded_size, speed, group_id) = {
+                        // 更新任务已下载大小，并获取 group_id 和 is_backup
+                        let (downloaded_size, speed, group_id, is_backup) = {
                             let mut t = task_clone.lock().await;
-                            t.downloaded_size += bytes;
+                            // 🔥 修复：限制 downloaded_size 不超过 total_size，防止断点续传时重复累加
+                            let new_size = t.downloaded_size.saturating_add(bytes);
+                            t.downloaded_size = std::cmp::min(new_size, t.total_size);
                             let downloaded = t.downloaded_size;
 
                             // 更新速度计算器
@@ -2617,7 +2642,7 @@ impl DownloadEngine {
                             calc.add_sample(bytes);
                             t.speed = calc.speed();
 
-                            (downloaded, t.speed, t.group_id.clone())
+                            (downloaded, t.speed, t.group_id.clone(), t.is_backup)
                         };
 
                         // 🔧 克隆一个临时变量用于 send
@@ -2637,22 +2662,38 @@ impl DownloadEngine {
                                 };
 
                                 // 🔥 如果是文件夹子任务（有 group_id），发送到 download:folder:{group_id} 订阅
-                                ws.send_if_subscribed(
-                                    TaskEvent::Download(DownloadEvent::Progress {
-                                        task_id: task_id_clone.clone(),
-                                        downloaded_size,
-                                        total_size: total_size_clone,
-                                        speed,
-                                        progress,
-                                        group_id: group_id.clone(),
-                                    }),
-                                    group_id_for_ws
-                                );
+                                if !is_backup {
+                                    ws.send_if_subscribed(
+                                        TaskEvent::Download(DownloadEvent::Progress {
+                                            task_id: task_id_clone.clone(),
+                                            downloaded_size,
+                                            total_size: total_size_clone,
+                                            speed,
+                                            progress,
+                                            group_id: group_id.clone(),
+                                            is_backup,
+                                        }),
+                                        group_id_for_ws,
+                                    );
+                                }
 
                                 // 🔥 如果是文件夹子任务，通知文件夹管理器发送聚合进度
                                 if let Some(ref group_id) = group_id {
                                     if let Some(ref tx) = folder_progress_tx_clone {
                                         let _ = tx.send(group_id.clone());
+                                    }
+                                }
+
+                                // 🔥 如果是备份任务，发送进度通知到 AutoBackupManager
+                                if is_backup {
+                                    if let Some(ref tx) = backup_notification_tx_clone {
+                                        let notification = BackupTransferNotification::Progress {
+                                            task_id: task_id_clone.clone(),
+                                            task_type: TransferTaskType::Download,
+                                            transferred_bytes: downloaded_size,
+                                            total_bytes: total_size_clone,
+                                        };
+                                        let _ = tx.send(notification);
                                     }
                                 }
                             }

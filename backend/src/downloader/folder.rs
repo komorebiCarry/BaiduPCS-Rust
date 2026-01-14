@@ -90,15 +90,23 @@ pub struct FolderDownload {
     /// 正在使用借调位的子任务ID映射（task_id -> slot_id）
     #[serde(skip)]
     pub borrowed_subtask_map: HashMap<String, usize>,
+
+    /// 🔥 加密文件夹映射（加密相对路径 -> 解密后相对路径）
+    /// 用于在扫描完成后重命名文件夹并更新路径
+    #[serde(default, skip)]
+    pub encrypted_folder_mappings: HashMap<String, String>,
 }
 
 impl FolderDownload {
     /// 创建新的文件夹下载
+    ///
+    /// 🔥 修复：从 local_root 提取文件夹名称（解密后的原始名称）
+    /// 而不是从 remote_root（可能是加密的 BPR_DIR_xxx 格式）
     pub fn new(remote_root: String, local_root: PathBuf) -> Self {
-        let name = remote_root
-            .trim_end_matches('/')
-            .split('/')
-            .last()
+        // 优先从 local_root 提取名称（已解密的原始名称）
+        let name = local_root
+            .file_name()
+            .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
 
@@ -125,6 +133,7 @@ impl FolderDownload {
             fixed_slot_id: None,
             borrowed_slot_ids: Vec::new(),
             borrowed_subtask_map: HashMap::new(),
+            encrypted_folder_mappings: HashMap::new(),
         }
     }
 

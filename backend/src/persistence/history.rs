@@ -470,6 +470,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
 
         if completed {

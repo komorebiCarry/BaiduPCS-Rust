@@ -1,3 +1,5 @@
+use crate::encryption::service::EncryptionService;
+use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
 use crate::downloader::{
     ChunkManager, DownloadEngine, DownloadTask, SpeedCalculator, UrlHealthManager,
 };
@@ -129,13 +131,33 @@ pub struct TaskScheduleInfo {
     /// 可选，仅文件夹子任务需要
     pub folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
 
+    // 🔥 备份任务统一通知发送器（进度、状态、完成、失败等）
+    /// 可选，仅备份任务需要
+    pub backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
+
     // 🔥 任务位借调机制相关字段
     /// 占用的槽位ID（可选）
     pub slot_id: Option<usize>,
     /// 是否使用借调位（而非固定位）
     pub is_borrowed_slot: bool,
     /// 任务位池引用（用于释放槽位）
-    pub task_slot_pool: Option<Arc<crate::downloader::task_slot_pool::TaskSlotPool>>,
+    pub task_slot_pool: Option<Arc<crate::task_slot_pool::TaskSlotPool>>,
+
+    // 🔥 加密服务（用于下载完成后解密加密文件）
+    /// 加密服务引用（可选，仅当需要解密时使用）
+    pub encryption_service: Option<Arc<EncryptionService>>,
+
+    // 🔥 加密快照管理器（用于查询加密文件映射，获取原始文件名）
+    /// 快照管理器引用（可选，用于解密后重命名）
+    pub snapshot_manager: Option<Arc<crate::encryption::snapshot::SnapshotManager>>,
+
+    // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+    /// 加密配置存储引用（可选，用于密钥轮换后解密旧文件）
+    pub encryption_config_store: Option<Arc<crate::encryption::EncryptionConfigStore>>,
+
+    // 🔥 Manager 任务列表引用（用于任务完成时立即清理，避免内存泄漏）
+    /// DownloadManager.tasks 的引用，任务完成后从中移除
+    pub manager_tasks: Option<Arc<RwLock<std::collections::HashMap<String, Arc<Mutex<crate::downloader::DownloadTask>>>>>>,
 }
 
 /// 全局分片调度器
@@ -162,6 +184,9 @@ pub struct ChunkScheduler {
     scheduler_running: Arc<AtomicBool>,
     /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
     task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    /// 🔥 备份任务统一通知发送器（用于通知 AutoBackupManager 所有事件）
+    /// 包括：进度更新、状态变更、任务完成、任务失败等
+    backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
     /// 🔥 等待队列触发器（任务完成时通知 DownloadManager 启动等待任务）
     waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     /// 上一轮的任务数（用于检测任务数变化）
@@ -184,6 +209,7 @@ impl ChunkScheduler {
             max_concurrent_tasks: Arc::new(AtomicUsize::new(max_concurrent_tasks)),
             scheduler_running: Arc::new(AtomicBool::new(false)),
             task_completed_tx: Arc::new(RwLock::new(None)),
+            backup_notification_tx: Arc::new(RwLock::new(None)),
             waiting_queue_trigger: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
         };
@@ -202,6 +228,16 @@ impl ChunkScheduler {
         let mut sender = self.task_completed_tx.write().await;
         *sender = Some(tx);
         info!("任务完成通知 channel 已设置");
+    }
+
+    /// 🔥 设置备份任务统一通知发送器
+    ///
+    /// AutoBackupManager 调用此方法设置 channel sender，
+    /// 所有备份相关事件（进度、状态、完成、失败等）都通过此 channel 发送
+    pub async fn set_backup_notification_sender(&self, tx: mpsc::UnboundedSender<BackupTransferNotification>) {
+        let mut sender = self.backup_notification_tx.write().await;
+        *sender = Some(tx);
+        info!("备份下载任务统一通知 channel 已设置");
     }
 
     /// 🔥 设置等待队列触发器
@@ -241,8 +277,20 @@ impl ChunkScheduler {
     /// 注册任务到调度器
     ///
     /// 将任务添加到活跃任务列表，不再限制并发数（由任务槽控制）
-    pub async fn register_task(&self, task_info: TaskScheduleInfo) -> Result<()> {
+    pub async fn register_task(&self, mut task_info: TaskScheduleInfo) -> Result<()> {
         let task_id = task_info.task_id.clone();
+
+        // 🔥 如果是备份任务，注入调度器的 backup_notification_tx
+        {
+            let t = task_info.task.lock().await;
+            if t.is_backup {
+                let notification_tx = self.backup_notification_tx.read().await.clone();
+                if notification_tx.is_some() {
+                    task_info.backup_notification_tx = notification_tx;
+                    info!("备份下载任务 {} 已注入统一通知 sender", task_id);
+                }
+            }
+        }
 
         // 添加到活跃任务列表（不再检查并发上限，由任务槽控制）
         self.active_tasks
@@ -291,6 +339,7 @@ impl ChunkScheduler {
         let slot_pool = self.slot_pool.clone();
         let scheduler_running = self.scheduler_running.clone();
         let task_completed_tx = self.task_completed_tx.clone();
+        let backup_notification_tx = self.backup_notification_tx.clone();
         let waiting_queue_trigger = self.waiting_queue_trigger.clone();
         let last_task_count = self.last_task_count.clone();
 
@@ -448,6 +497,7 @@ impl ChunkScheduler {
                                 active_tasks.clone(),
                                 slot_pool.clone(),
                                 active_chunk_count.clone(),
+                                backup_notification_tx.clone(),
                             );
 
                             scheduled_count += 1;
@@ -467,32 +517,86 @@ impl ChunkScheduler {
                                 task_info.cancellation_token.cancel();
                                 debug!("任务 {} 的 cancellation_token 已取消", task_id);
 
-                                // 标记任务完成，并获取 group_id
-                                let group_id = {
+                                // 🔥 检测是否为加密文件，如果是则执行解密
+                                let decrypt_result = Self::try_decrypt_if_encrypted(&task_info).await;
+
+                                // 🔥 修复：根据解密结果决定任务状态
+                                // 如果解密失败，标记为 Failed 而不是 Completed
+                                let (group_id, is_backup, decrypt_error) = {
                                     let mut t = task_info.task.lock().await;
-                                    t.mark_completed();
-                                    t.group_id.clone()
+
+                                    if let Err(ref e) = decrypt_result {
+                                        // 解密失败，标记为失败状态
+                                        let error_msg = format!("解密失败: {}", e);
+                                        t.mark_failed(error_msg.clone());
+                                        error!("任务 {} 解密失败: {}", task_id, e);
+                                        (t.group_id.clone(), t.is_backup, Some(error_msg))
+                                    } else {
+                                        // 解密成功或无需解密，标记为完成
+                                        t.mark_completed();
+                                        (t.group_id.clone(), t.is_backup, None)
+                                    }
                                 };
 
-                                // 🔥 发布任务完成事件
-                                if let Some(ref ws_manager) = task_info.ws_manager {
-                                    ws_manager.send_if_subscribed(
-                                        TaskEvent::Download(DownloadEvent::Completed {
-                                            task_id: task_id.to_string(),
-                                            completed_at: chrono::Utc::now().timestamp_millis(),
-                                            group_id: group_id.clone(),
-                                        }),
-                                        group_id.clone(),
-                                    );
+                                // 🔥 发布任务事件（根据解密结果发送 Completed 或 Failed）
+                                if !is_backup {
+                                    if let Some(ref ws_manager) = task_info.ws_manager {
+                                        if let Some(ref error_msg) = decrypt_error {
+                                            // 解密失败，发送 Failed 事件
+                                            ws_manager.send_if_subscribed(
+                                                TaskEvent::Download(DownloadEvent::Failed {
+                                                    task_id: task_id.to_string(),
+                                                    error: error_msg.clone(),
+                                                    group_id: group_id.clone(),
+                                                    is_backup,
+                                                }),
+                                                group_id.clone(),
+                                            );
+                                        } else {
+                                            // 解密成功或无需解密，发送 Completed 事件
+                                            ws_manager.send_if_subscribed(
+                                                TaskEvent::Download(DownloadEvent::Completed {
+                                                    task_id: task_id.to_string(),
+                                                    completed_at: chrono::Utc::now().timestamp_millis(),
+                                                    group_id: group_id.clone(),
+                                                    is_backup,
+                                                }),
+                                                group_id.clone(),
+                                            );
+                                        }
+                                    }
                                 }
 
-                                // 🔥 清理持久化文件（任务完成）
-                                if let Some(ref pm) = task_info.persistence_manager {
-                                    if let Err(e) = pm.lock().await.on_task_completed(task_id) {
-                                        error!("清理任务持久化文件失败: {}", e);
-                                    } else {
-                                        debug!("任务 {} 持久化文件已清理", task_id);
+                                // 🔥 根据解密结果区分成功和失败的清理逻辑（与上传任务行为保持一致）
+                                if decrypt_error.is_none() {
+                                    // 成功时（解密成功或无需解密）：归档到历史数据库，从 manager_tasks 移除
+                                    if let Some(ref pm) = task_info.persistence_manager {
+                                        if let Err(e) = pm.lock().await.on_task_completed(task_id) {
+                                            error!("归档下载任务到历史数据库失败: {}", e);
+                                        } else {
+                                            debug!("下载任务 {} 已归档到历史数据库", task_id);
+                                        }
                                     }
+
+                                    // 🔥 从 DownloadManager.tasks 中移除任务（成功时立即清理，避免内存泄漏）
+                                    if let Some(ref manager_tasks) = task_info.manager_tasks {
+                                        manager_tasks.write().await.remove(task_id);
+                                        debug!("下载任务 {} 已从 DownloadManager.tasks 中移除", task_id);
+                                    }
+                                } else {
+                                    // 失败时（解密失败）：更新 WAL 元数据，不从 manager_tasks 移除（让前端能看到）
+                                    if let Some(ref pm) = task_info.persistence_manager {
+                                        if let Err(e) = pm.lock().await.update_task_error(
+                                            task_id,
+                                            decrypt_error.clone().unwrap_or_default()
+                                        ) {
+                                            warn!("更新下载任务错误信息失败: {}", e);
+                                        } else {
+                                            debug!("下载任务 {} 错误信息已更新到 WAL", task_id);
+                                        }
+                                    }
+                                    // 🔥 失败时不从 manager_tasks 移除，让前端能看到失败任务
+                                    debug!("下载任务 {} 失败，保留在 manager_tasks 中供前端查看", task_id);
                                 }
 
                                 // 🔥 释放任务槽位（单文件任务释放固定位，借调位由 FolderManager 管理）
@@ -515,6 +619,34 @@ impl ChunkScheduler {
                                             error!("发送任务完成通知失败: {}", e);
                                         } else {
                                             debug!("已发送任务完成通知: group_id={}", gid);
+                                        }
+                                    }
+                                }
+
+                                // 🔥 如果是备份任务，通知 AutoBackupManager（根据解密结果发送 Completed 或 Failed）
+                                if is_backup {
+                                    let tx_guard = backup_notification_tx.read().await;
+                                    if let Some(tx) = tx_guard.as_ref() {
+                                        let notification = if let Some(ref error_msg) = decrypt_error {
+                                            // 解密失败，发送 Failed 通知
+                                            BackupTransferNotification::Failed {
+                                                task_id: task_id.to_string(),
+                                                task_type: TransferTaskType::Download,
+                                                error_message: error_msg.clone(),
+                                            }
+                                        } else {
+                                            // 解密成功或无需解密，发送 Completed 通知
+                                            BackupTransferNotification::Completed {
+                                                task_id: task_id.to_string(),
+                                                task_type: TransferTaskType::Download,
+                                            }
+                                        };
+                                        if let Err(e) = tx.send(notification) {
+                                            error!("发送备份下载任务通知失败: {}", e);
+                                        } else {
+                                            debug!("已发送备份下载任务通知: task_id={}, 状态={}",
+                                                task_id,
+                                                if decrypt_error.is_some() { "失败" } else { "完成" });
                                         }
                                     }
                                 }
@@ -560,12 +692,14 @@ impl ChunkScheduler {
     /// * `active_tasks` - 活跃任务列表（用于在失败时移除任务）
     /// * `slot_pool` - 线程槽位池
     /// * `global_active_count` - 全局活跃分片计数器
+    /// * `backup_notification_tx` - 备份任务统一通知发送器
     fn spawn_chunk_download(
         chunk_index: usize,
         task_info: TaskScheduleInfo,
         active_tasks: Arc<RwLock<HashMap<String, TaskScheduleInfo>>>,
         slot_pool: Arc<ChunkSlotPool>,
         global_active_count: Arc<AtomicUsize>,
+        backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
     ) {
         tokio::spawn(async move {
             let task_id = task_info.task_id.clone();
@@ -597,6 +731,7 @@ impl ChunkScheduler {
                 Some(task_info.progress_throttler.clone()),
                 task_id.clone(),
                 task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
+                task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
             )
                 .await;
 
@@ -644,24 +779,40 @@ impl ChunkScheduler {
                             manager.unmark_downloading(chunk_index);
                         }
 
-                        // 标记任务失败，并获取 group_id
-                        let (error_msg, group_id) = {
+                        // 标记任务失败，并获取 group_id 和 is_backup
+                        let (error_msg, group_id, is_backup) = {
                             let mut t = task_info.task.lock().await;
                             let err = e.to_string();
                             t.mark_failed(err.clone());
-                            (err, t.group_id.clone())
+                            (err, t.group_id.clone(), t.is_backup)
                         };
 
                         // 🔥 发布任务失败事件
-                        if let Some(ref ws_manager) = task_info.ws_manager {
-                            ws_manager.send_if_subscribed(
-                                TaskEvent::Download(DownloadEvent::Failed {
+                        if !is_backup {
+                            if let Some(ref ws_manager) = task_info.ws_manager {
+                                ws_manager.send_if_subscribed(
+                                    TaskEvent::Download(DownloadEvent::Failed {
+                                        task_id: task_id.clone(),
+                                        error: error_msg.clone(),
+                                        group_id: group_id.clone(),
+                                        is_backup,
+                                    }),
+                                    group_id,
+                                );
+                            }
+                        }
+
+                        // 🔥 如果是备份任务，通知 AutoBackupManager
+                        if is_backup {
+                            let tx_guard = backup_notification_tx.read().await;
+                            if let Some(tx) = tx_guard.as_ref() {
+                                let notification = BackupTransferNotification::Failed {
                                     task_id: task_id.clone(),
-                                    error: error_msg.clone(),
-                                    group_id: group_id.clone(),
-                                }),
-                                group_id,
-                            );
+                                    task_type: TransferTaskType::Download,
+                                    error_message: error_msg.clone(),
+                                };
+                                let _ = tx.send(notification);
+                            }
                         }
 
                         // 🔥 更新持久化错误信息
@@ -684,6 +835,341 @@ impl ChunkScheduler {
     pub fn stop(&self) {
         self.scheduler_running.store(false, Ordering::SeqCst);
         info!("调度器停止信号已发送");
+    }
+
+    /// 🔥 检测并解密加密文件
+    ///
+    /// 下载完成后自动检测文件是否为加密文件，如果是则执行解密流程
+    ///
+    /// # 参数
+    /// * `task_info` - 任务调度信息
+    ///
+    /// # 返回
+    /// - Ok(()) - 不是加密文件或解密成功
+    /// - Err(e) - 解密失败
+    async fn try_decrypt_if_encrypted(task_info: &TaskScheduleInfo) -> Result<()> {
+        // 1. 检测是否为加密文件
+        let (local_path, task_id, group_id, is_backup) = {
+            let task = task_info.task.lock().await;
+            (
+                task.local_path.clone(),
+                task.id.clone(),
+                task.group_id.clone(),
+                task.is_backup,
+            )
+        };
+
+        // 检查文件名是否为加密文件格式
+        let filename = local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string(); // 转换为 String 避免借用问题
+
+        let is_encrypted_by_name = crate::downloader::task::DownloadTask::detect_encrypted_filename(&filename);
+
+        // 检查文件头魔数
+        let is_encrypted_by_content = if local_path.exists() {
+            EncryptionService::is_encrypted_file(&local_path).unwrap_or(false)
+        } else {
+            false
+        };
+
+        let is_encrypted = is_encrypted_by_name || is_encrypted_by_content;
+
+        if !is_encrypted {
+            debug!("任务 {} 不是加密文件，跳过解密", task_id);
+            return Ok(());
+        }
+
+        // 2. 🔥 根据 key_version 选择正确的解密密钥
+        // 优先从 snapshot_manager 查询 key_version，然后从 encryption_config_store 获取对应密钥
+        let encryption_service = {
+            // 尝试从 snapshot_manager 获取 key_version
+            let key_version = if let Some(ref snapshot_mgr) = task_info.snapshot_manager {
+                match snapshot_mgr.find_by_encrypted_name(&filename) {
+                    Ok(Some(snapshot_info)) => {
+                        info!(
+                            "任务 {} 从映射表获取 key_version: {}",
+                            task_id, snapshot_info.key_version
+                        );
+                        Some(snapshot_info.key_version)
+                    }
+                    Ok(None) => {
+                        debug!("任务 {} 在映射表中未找到加密信息，使用默认密钥", task_id);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("任务 {} 查询映射表失败: {}，使用默认密钥", task_id, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // 如果有 key_version 且有 encryption_config_store，尝试获取对应版本的密钥
+            if let (Some(version), Some(ref config_store)) = (key_version, &task_info.encryption_config_store) {
+                match config_store.get_key_by_version(version) {
+                    Ok(Some(key_info)) => {
+                        info!(
+                            "任务 {} 使用 key_version={} 的密钥进行解密",
+                            task_id, version
+                        );
+                        match EncryptionService::from_base64_key(&key_info.master_key, key_info.algorithm) {
+                            Ok(service) => Arc::new(service),
+                            Err(e) => {
+                                warn!(
+                                    "任务 {} 创建 key_version={} 的加密服务失败: {}，回退到默认密钥",
+                                    task_id, version, e
+                                );
+                                // 回退到默认的 encryption_service
+                                match &task_info.encryption_service {
+                                    Some(service) => service.clone(),
+                                    None => {
+                                        warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "任务 {} 未找到 key_version={} 的密钥，回退到默认密钥",
+                            task_id, version
+                        );
+                        // 回退到默认的 encryption_service
+                        match &task_info.encryption_service {
+                            Some(service) => service.clone(),
+                            None => {
+                                warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "任务 {} 获取 key_version={} 的密钥失败: {}，回退到默认密钥",
+                            task_id, version, e
+                        );
+                        // 回退到默认的 encryption_service
+                        match &task_info.encryption_service {
+                            Some(service) => service.clone(),
+                            None => {
+                                warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 没有 key_version 或没有 config_store，使用默认的 encryption_service
+                match &task_info.encryption_service {
+                    Some(service) => service.clone(),
+                    None => {
+                        warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        info!("🔐 任务 {} 检测到加密文件，开始解密...", task_id);
+
+        // 3. 更新任务状态为解密中
+        {
+            let mut task = task_info.task.lock().await;
+            task.is_encrypted = true;
+            task.mark_decrypting();
+        }
+
+        // 4. 发送状态变更事件
+        if is_backup {
+            // 备份任务：发送到 backup_notification_tx
+            if let Some(ref tx) = task_info.backup_notification_tx {
+                let _ = tx.send(BackupTransferNotification::DecryptStarted {
+                    task_id: task_id.clone(),
+                    file_name: filename.clone(),
+                });
+            }
+        } else {
+            // 普通任务：发送到 WebSocket
+            if let Some(ref ws_manager) = task_info.ws_manager {
+                ws_manager.send_if_subscribed(
+                    TaskEvent::Download(DownloadEvent::StatusChanged {
+                        task_id: task_id.clone(),
+                        old_status: "downloading".to_string(),
+                        new_status: "decrypting".to_string(),
+                        group_id: group_id.clone(),
+                        is_backup,
+                    }),
+                    group_id.clone(),
+                );
+            }
+        }
+
+        // 5. 生成解密后的文件路径（优先使用映射表中的原始文件名）
+        let decrypted_path = Self::generate_decrypted_path(
+            &local_path,
+            &filename,
+            task_info.snapshot_manager.as_ref(),
+        );
+
+        // 6. 获取加密文件信息（原始大小）
+        let original_size = match EncryptionService::get_encrypted_file_info(&local_path)? {
+            Some((_, size)) => size,
+            None => {
+                return Err(anyhow::anyhow!("无法读取加密文件信息"));
+            }
+        };
+
+        // 7. 执行解密（带进度回调）
+        let task_id_clone = task_id.clone();
+        let group_id_clone = group_id.clone();
+        let ws_manager_clone = task_info.ws_manager.clone();
+        let backup_notification_tx_clone = task_info.backup_notification_tx.clone();
+        let task_clone = task_info.task.clone();
+        let local_path_for_decrypt = local_path.clone();
+        let decrypted_path_for_decrypt = decrypted_path.clone();
+        let filename_clone = filename.clone();
+
+        let _decrypt_result = tokio::task::spawn_blocking(move || {
+            encryption_service.decrypt_file_with_progress(
+                &local_path_for_decrypt,
+                &decrypted_path_for_decrypt,
+                move |processed, total| {
+                    let progress = (processed as f64 / total as f64) * 100.0;
+
+                    // 更新任务解密进度
+                    if let Ok(mut task) = task_clone.try_lock() {
+                        task.update_decrypt_progress(progress);
+                    }
+
+                    // 发送解密进度事件
+                    if is_backup {
+                        // 备份任务：发送到 backup_notification_tx
+                        if let Some(ref tx) = backup_notification_tx_clone {
+                            let _ = tx.send(BackupTransferNotification::DecryptProgress {
+                                task_id: task_id_clone.clone(),
+                                file_name: filename_clone.clone(),
+                                progress,
+                                processed_bytes: processed,
+                                total_bytes: total,
+                            });
+                        }
+                    } else {
+                        // 普通任务：发送到 WebSocket
+                        if let Some(ref ws_manager) = ws_manager_clone {
+                            ws_manager.send_if_subscribed(
+                                TaskEvent::Download(DownloadEvent::DecryptProgress {
+                                    task_id: task_id_clone.clone(),
+                                    decrypt_progress: progress,
+                                    processed_bytes: processed,
+                                    total_bytes: total,
+                                    group_id: group_id_clone.clone(),
+                                    is_backup,
+                                }),
+                                group_id_clone.clone(),
+                            );
+                        }
+                    }
+                },
+            )
+        })
+            .await
+            .map_err(|e| anyhow::anyhow!("解密任务执行失败: {}", e))??;
+
+        // 8. 删除加密文件
+        if let Err(e) = tokio::fs::remove_file(&local_path).await {
+            warn!("删除加密文件失败: {:?}, 路径: {:?}", e, local_path);
+        } else {
+            debug!("已删除加密文件: {:?}", local_path);
+        }
+
+        // 9. 更新任务信息
+        {
+            let mut task = task_info.task.lock().await;
+            task.mark_decrypt_completed(decrypted_path.clone(), original_size);
+            task.local_path = decrypted_path.clone(); // 更新为解密后的路径
+        }
+
+        // 10. 🔥 更新持久化文件中的本地路径（解密后的路径）
+        if let Some(ref pm) = task_info.persistence_manager {
+            if let Err(e) = pm.lock().await.update_local_path(&task_id, decrypted_path.clone()) {
+                warn!("更新持久化本地路径失败: {}", e);
+            } else {
+                debug!("已更新持久化本地路径: {:?}", decrypted_path);
+            }
+        }
+
+        // 11. 🔥 备份任务：发送解密完成通知
+        // 普通任务不发送 DecryptCompleted 事件（解密完成后会立即发送 Completed 事件）
+        // 但备份任务需要发送，以便自动备份 manager 转发给前端显示解密完成状态
+        if is_backup {
+            if let Some(ref tx) = task_info.backup_notification_tx {
+                let original_name = decrypted_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let _ = tx.send(BackupTransferNotification::DecryptCompleted {
+                    task_id: task_id.clone(),
+                    file_name: filename.clone(),
+                    original_name,
+                    decrypted_path: decrypted_path.to_string_lossy().to_string(),
+                });
+            }
+        }
+
+        info!("✅ 任务 {} 解密完成，原始大小: {} bytes", task_id, original_size);
+
+        Ok(())
+    }
+
+    /// 生成解密后的文件路径
+    ///
+    /// 优先从映射表查询原始文件名，如果没有则使用默认命名规则
+    ///
+    /// # 参数
+    /// * `encrypted_path` - 加密文件路径
+    /// * `filename` - 文件名
+    /// * `snapshot_manager` - 快照管理器（可选，用于查询原始文件名）
+    ///
+    /// # 返回
+    /// 解密后的文件路径
+    fn generate_decrypted_path(
+        encrypted_path: &std::path::Path,
+        filename: &str,
+        snapshot_manager: Option<&Arc<crate::encryption::snapshot::SnapshotManager>>,
+    ) -> PathBuf {
+        let parent = encrypted_path.parent().unwrap_or(std::path::Path::new("."));
+
+        // 🔥 优先查询映射表获取原始文件名
+        if let Some(snapshot_mgr) = snapshot_manager {
+            if let Ok(Some(snapshot_info)) = snapshot_mgr.find_by_encrypted_name(filename) {
+                info!(
+                    "找到加密文件映射: {} -> {}",
+                    filename, snapshot_info.original_name
+                );
+                return parent.join(&snapshot_info.original_name);
+            }
+        }
+
+        // 如果没有映射信息，使用默认命名规则（向后兼容）
+        if crate::downloader::task::DownloadTask::detect_encrypted_filename(filename) {
+            // 从加密文件名提取 UUID
+            let uuid = EncryptionService::extract_uuid_from_encrypted_name(filename)
+                .unwrap_or("unknown");
+            parent.join(format!("decrypted_{}", uuid))
+        } else {
+            // 移除 .bkup 扩展名
+            let stem = encrypted_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("decrypted_file");
+            parent.join(stem)
+        }
     }
 
     /// 🔥 获取所有活跃任务的当前速度

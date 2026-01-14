@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_service_new() {
-        let service = FilesystemService::new(FilesystemConfig::default());
+        let _service = FilesystemService::new(FilesystemConfig::default());
         // 确保服务可以创建
         assert!(true);
     }
@@ -546,6 +546,7 @@ mod tests {
 
         let list = response.unwrap();
         assert_eq!(list.page, 0);
-        assert!(list.total >= 0);
+        // total 是 usize 类型，验证列表返回成功即可
+        let _ = list.total;
     }
 }

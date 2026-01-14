@@ -3,7 +3,7 @@
 //! 支持控制台输出和文件持久化，按文件大小和启动时间滚动，自动清理过期日志
 
 use crate::config::LogConfig;
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,11 +18,13 @@ use tracing_subscriber::{
 };
 
 /// 日志文件管理器（内部状态）
-/// 
+///
 /// 负责管理日志文件的创建、滚动和写入
 struct LogFileManagerInner {
-    /// 服务启动时间戳（格式：YYYY-MM-DD-HHMMSS）
-    start_timestamp: String,
+    /// 当前日志文件的日期，用于检测跨天
+    current_date: NaiveDate,
+    /// 当前日志文件的时间戳（格式：YYYY-MM-DD-HHMMSS）
+    current_timestamp: String,
     /// 日志目录路径
     log_dir: PathBuf,
     /// 当前文件句柄
@@ -38,77 +40,109 @@ struct LogFileManagerInner {
 impl LogFileManagerInner {
     /// 创建新的日志文件管理器
     fn new(log_dir: PathBuf, max_file_size: u64) -> io::Result<Self> {
-        // 生成启动时间戳
-        let start_timestamp = Local::now().format("%Y-%m-%d-%H%M%S").to_string();
-        
+        let now = Local::now();
+        let current_date = now.date_naive();
+        let current_timestamp = now.format("%Y-%m-%d-%H%M%S").to_string();
+
         let mut manager = Self {
-            start_timestamp,
+            current_date,
+            current_timestamp,
             log_dir,
             current_file: None,
             current_index: 0,
             max_file_size,
             current_size: 0,
         };
-        
+
         // 创建初始日志文件
         manager.create_new_file()?;
-        
+
         Ok(manager)
     }
-    
+
     /// 生成日志文件路径
     fn generate_file_path(&self, index: u32) -> PathBuf {
         let filename = if index == 0 {
-            format!("baidu-pcs-rust.{}.log", self.start_timestamp)
+            format!("baidu-pcs-rust.{}.log", self.current_timestamp)
         } else {
-            format!("baidu-pcs-rust.{}_{}.log", self.start_timestamp, index)
+            format!("baidu-pcs-rust.{}_{}.log", self.current_timestamp, index)
         };
         self.log_dir.join(filename)
     }
-    
+
     /// 创建新的日志文件
     fn create_new_file(&mut self) -> io::Result<()> {
         let file_path = self.generate_file_path(self.current_index);
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&file_path)?;
-        
+
         self.current_file = Some(file);
         self.current_size = 0;
-        
+
         Ok(())
     }
-    
-    /// 检查是否需要滚动到新文件
-    fn should_rotate(&self, incoming_size: usize) -> bool {
+
+    /// 检查是否需要按日期滚动（跨天）
+    fn should_rotate_by_date(&self) -> bool {
+        Local::now().date_naive() != self.current_date
+    }
+
+    /// 检查是否需要按大小滚动
+    fn should_rotate_by_size(&self, incoming_size: usize) -> bool {
         self.current_size + incoming_size as u64 > self.max_file_size
     }
-    
-    /// 滚动到新文件
-    fn rotate(&mut self) -> io::Result<()> {
+
+    /// 按日期滚动到新文件（跨天时调用）
+    fn rotate_by_date(&mut self) -> io::Result<()> {
         // 关闭当前文件
         if let Some(mut file) = self.current_file.take() {
             file.flush()?;
         }
-        
-        // 增加文件序号
-        self.current_index += 1;
-        
+
+        // 更新日期和时间戳
+        let now = Local::now();
+        self.current_date = now.date_naive();
+        self.current_timestamp = now.format("%Y-%m-%d-%H%M%S").to_string();
+
+        // 重置文件序号
+        self.current_index = 0;
+
         // 创建新文件
         self.create_new_file()?;
-        
+
         Ok(())
     }
-    
+
+    /// 按大小滚动到新文件
+    fn rotate_by_size(&mut self) -> io::Result<()> {
+        // 关闭当前文件
+        if let Some(mut file) = self.current_file.take() {
+            file.flush()?;
+        }
+
+        // 增加文件序号
+        self.current_index += 1;
+
+        // 创建新文件
+        self.create_new_file()?;
+
+        Ok(())
+    }
+
     /// 写入数据
     fn write_data(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // 检查是否需要滚动
-        if self.should_rotate(buf.len()) {
-            self.rotate()?;
+        // 优先检查日期滚动（跨天）
+        if self.should_rotate_by_date() {
+            self.rotate_by_date()?;
         }
-        
+        // 再检查大小滚动
+        else if self.should_rotate_by_size(buf.len()) {
+            self.rotate_by_size()?;
+        }
+
         // 写入数据
         if let Some(file) = &mut self.current_file {
             let written = file.write(buf)?;
@@ -118,7 +152,7 @@ impl LogFileManagerInner {
             Err(io::Error::new(io::ErrorKind::Other, "日志文件未打开"))
         }
     }
-    
+
     /// 刷新文件缓冲区
     fn flush_file(&mut self) -> io::Result<()> {
         if let Some(file) = &mut self.current_file {
@@ -129,7 +163,7 @@ impl LogFileManagerInner {
 }
 
 /// 日志文件管理器（线程安全包装）
-/// 
+///
 /// 实现了 Write trait，可以作为日志输出目标
 pub struct LogFileManager {
     inner: Arc<Mutex<LogFileManagerInner>>,
@@ -150,7 +184,7 @@ impl Write for LogFileManager {
         let mut inner = self.inner.lock().unwrap();
         inner.write_data(buf)
     }
-    
+
     fn flush(&mut self) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.flush_file()
@@ -199,7 +233,7 @@ pub fn init_logging(config: &LogConfig) -> LogGuard {
                 .with(env_filter)
                 .with(console_layer)
                 .init();
-            
+
             return LogGuard { _file_guard: None };
         }
 
@@ -263,7 +297,7 @@ pub fn init_logging(config: &LogConfig) -> LogGuard {
 }
 
 /// 清理过期日志文件
-/// 
+///
 /// 支持两种文件格式：
 /// - 旧格式：baidu-pcs-rust.YYYY-MM-DD.log
 /// - 新格式：baidu-pcs-rust.YYYY-MM-DD-HHMMSS.log 和 baidu-pcs-rust.YYYY-MM-DD-HHMMSS_N.log
@@ -283,7 +317,7 @@ fn cleanup_old_logs(log_dir: &Path, retention_days: u32) {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        
+
         // 只处理日志文件
         if !path.is_file() {
             continue;
@@ -330,7 +364,7 @@ fn cleanup_old_logs(log_dir: &Path, retention_days: u32) {
 }
 
 /// 从文件名中提取日期部分
-/// 
+///
 /// 支持的格式：
 /// - baidu-pcs-rust.YYYY-MM-DD.log -> YYYY-MM-DD
 /// - baidu-pcs-rust.YYYY-MM-DD-HHMMSS.log -> YYYY-MM-DD
@@ -339,7 +373,7 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
     // 移除前缀和后缀
     let name = filename.strip_prefix("baidu-pcs-rust.")?;
     let name = name.strip_suffix(".log")?;
-    
+
     // 提取日期部分 (YYYY-MM-DD)
     // 格式可能是：
     // - YYYY-MM-DD
@@ -358,7 +392,7 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
 fn check_by_modified_time(entry: &fs::DirEntry, retention_days: u32) -> bool {
     let now = chrono::Utc::now();
     let retention_duration = chrono::Duration::days(retention_days as i64);
-    
+
     if let Ok(metadata) = entry.metadata() {
         if let Ok(modified) = metadata.modified() {
             let modified_datetime: chrono::DateTime<chrono::Utc> = modified.into();
@@ -366,7 +400,7 @@ fn check_by_modified_time(entry: &fs::DirEntry, retention_days: u32) -> bool {
             return age > retention_duration;
         }
     }
-    
+
     false
 }
 

@@ -212,6 +212,38 @@ async fn main() -> anyhow::Result<()> {
         // 转存配置API
         .route("/config/transfer", get(handlers::get_transfer_config))
         .route("/config/transfer", put(handlers::update_transfer_config))
+        // 🔥 自动备份API
+        .route("/autobackup/configs", get(handlers::autobackup::list_backup_configs))
+        .route("/autobackup/configs", post(handlers::autobackup::create_backup_config))
+        .route("/autobackup/configs/:id", get(handlers::autobackup::get_backup_config))
+        .route("/autobackup/configs/:id", put(handlers::autobackup::update_backup_config))
+        .route("/autobackup/configs/:id", delete(handlers::autobackup::delete_backup_config))
+        .route("/autobackup/configs/:id/enable", post(handlers::autobackup::enable_backup_config))
+        .route("/autobackup/configs/:id/disable", post(handlers::autobackup::disable_backup_config))
+        .route("/autobackup/configs/:id/trigger", post(handlers::autobackup::trigger_backup))
+        .route("/autobackup/configs/:id/tasks", get(handlers::autobackup::list_backup_tasks))
+        .route("/autobackup/tasks/:id", get(handlers::autobackup::get_backup_task))
+        .route("/autobackup/tasks/:id/cancel", post(handlers::autobackup::cancel_backup_task))
+        .route("/autobackup/tasks/:id/pause", post(handlers::autobackup::pause_backup_task))
+        .route("/autobackup/tasks/:id/resume", post(handlers::autobackup::resume_backup_task))
+        .route("/autobackup/tasks/:id", delete(handlers::autobackup::delete_backup_task))
+        .route("/autobackup/tasks/:id/files", get(handlers::autobackup::list_file_tasks))
+        .route("/autobackup/tasks/:task_id/files/:file_task_id/retry", post(handlers::autobackup::retry_file_task))
+        .route("/autobackup/status", get(handlers::autobackup::get_manager_status))
+        .route("/autobackup/stats", get(handlers::autobackup::get_record_stats))
+        .route("/autobackup/cleanup", post(handlers::autobackup::cleanup_records))
+        // 🔥 加密API
+        .route("/encryption/status", get(handlers::autobackup::get_encryption_status))
+        .route("/encryption/key/generate", post(handlers::autobackup::generate_encryption_key))
+        .route("/encryption/key/import", post(handlers::autobackup::import_encryption_key))
+        .route("/encryption/key/export", get(handlers::autobackup::export_encryption_key))
+        .route("/encryption/key", delete(handlers::autobackup::delete_encryption_key))
+        .route("/encryption/key/force", delete(handlers::autobackup::force_delete_encryption_key))
+        // 🔥 系统能力检测 API
+        .route("/system/watch-capability", get(handlers::autobackup::get_watch_capability))
+        // 🔥 自动备份全局触发配置 API
+        .route("/config/autobackup/trigger", get(handlers::autobackup::get_trigger_config))
+        .route("/config/autobackup/trigger", put(handlers::autobackup::update_trigger_config))
         // 🔥 WebSocket 路由
         .route("/ws", get(websocket::handle_websocket))
         .with_state(app_state.clone());

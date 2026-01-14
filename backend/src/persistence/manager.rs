@@ -25,8 +25,9 @@ use tracing::{debug, error, info, warn};
 use crate::config::PersistenceConfig;
 
 use super::history;
+use super::history_db::HistoryDbManager;
 use super::metadata::{delete_task_files, save_metadata, update_metadata};
-use super::types::{TaskMetadata, TaskPersistenceInfo, TaskType};
+use super::types::{TaskMetadata, TaskPersistenceInfo, TaskPersistenceStatus, TaskType};
 use super::wal::{self, append_records, delete_wal_file, read_records};
 
 /// 持久化管理器
@@ -43,9 +44,8 @@ pub struct PersistenceManager {
     /// Key: task_id, Value: TaskPersistenceInfo
     tasks: Arc<DashMap<String, TaskPersistenceInfo>>,
 
-    /// 历史任务缓存
-    /// Key: task_id, Value: TaskMetadata
-    history_cache: Arc<DashMap<String, TaskMetadata>>,
+    /// 历史数据库管理器
+    history_db: Option<Arc<HistoryDbManager>>,
 
     /// 后台刷写任务句柄
     flush_task: Option<tokio::task::JoinHandle<()>>,
@@ -65,7 +65,7 @@ impl std::fmt::Debug for PersistenceManager {
         f.debug_struct("PersistenceManager")
             .field("wal_dir", &self.wal_dir)
             .field("tasks_count", &self.tasks.len())
-            .field("history_cache_count", &self.history_cache.len())
+            .field("history_db_enabled", &self.history_db.is_some())
             .field("auto_recover_tasks", &self.config.auto_recover_tasks)
             .finish_non_exhaustive()
     }
@@ -90,6 +90,23 @@ impl PersistenceManager {
             error!("创建 WAL 目录失败: {:?}, 错误: {}", wal_dir, e);
         }
 
+        // 初始化历史数据库（使用全局配置的 db_path）
+        let db_path = if std::path::Path::new(&config.db_path).is_absolute() {
+            PathBuf::from(&config.db_path)
+        } else {
+            base_dir.join(&config.db_path)
+        };
+        let history_db = match HistoryDbManager::new(&db_path) {
+            Ok(db) => {
+                info!("历史数据库初始化成功: {:?}", db_path);
+                Some(Arc::new(db))
+            }
+            Err(e) => {
+                error!("历史数据库初始化失败: {:?}, 错误: {}", db_path, e);
+                None
+            }
+        };
+
         let (shutdown_tx, _) = broadcast::channel(1);
 
         info!("持久化管理器已创建，WAL 目录: {:?}", wal_dir);
@@ -98,7 +115,7 @@ impl PersistenceManager {
             config,
             wal_dir,
             tasks: Arc::new(DashMap::new()),
-            history_cache: Arc::new(DashMap::new()),
+            history_db,
             flush_task: None,
             cleanup_task: None,
             archive_task: None,
@@ -116,9 +133,67 @@ impl PersistenceManager {
         &self.config
     }
 
-    /// 获取历史缓存引用
-    pub fn history_cache(&self) -> &Arc<DashMap<String, TaskMetadata>> {
-        &self.history_cache
+    /// 获取历史数据库管理器引用
+    pub fn history_db(&self) -> Option<&Arc<HistoryDbManager>> {
+        self.history_db.as_ref()
+    }
+
+    /// 获取单个历史任务（从数据库查询）
+    pub fn get_history_task(&self, task_id: &str) -> Option<TaskMetadata> {
+        self.history_db
+            .as_ref()
+            .and_then(|db| db.get_task_history(task_id).ok().flatten())
+    }
+
+    /// 分页获取历史任务（从数据库查询）
+    ///
+    /// # Arguments
+    /// * `offset` - 偏移量
+    /// * `limit` - 每页数量
+    ///
+    /// # Returns
+    /// * `Option<(Vec<TaskMetadata>, usize)>` - (任务列表, 总数)
+    pub fn get_history_tasks_paginated(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<TaskMetadata>, usize)> {
+        self.history_db
+            .as_ref()
+            .and_then(|db| db.get_task_history_paginated(offset, limit).ok())
+    }
+
+    /// 按类型和状态分页获取历史任务（从数据库查询）
+    ///
+    /// # Arguments
+    /// * `task_type` - 任务类型 (download, upload, transfer)
+    /// * `status` - 任务状态 (completed, failed, etc.)
+    /// * `exclude_backup` - 是否排除备份任务
+    /// * `offset` - 偏移量
+    /// * `limit` - 每页数量
+    ///
+    /// # Returns
+    /// * `Option<(Vec<TaskMetadata>, usize)>` - (任务列表, 总数)
+    pub fn get_history_tasks_by_type_and_status(
+        &self,
+        task_type: &str,
+        status: &str,
+        exclude_backup: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Option<(Vec<TaskMetadata>, usize)> {
+        self.history_db
+            .as_ref()
+            .and_then(|db| {
+                db.get_task_history_by_type_status_exclude_backup(
+                    task_type,
+                    status,
+                    exclude_backup,
+                    offset,
+                    limit,
+                )
+                    .ok()
+            })
     }
 
     // ========================================================================
@@ -134,8 +209,8 @@ impl PersistenceManager {
             return;
         }
 
-        // 加载历史缓存
-        self.load_history_cache();
+        // 执行 JSONL -> SQLite 迁移（一次性，成功后删除旧文件）
+        self.migrate_jsonl_to_db();
 
         // 启动时执行一次归档
         self.archive_completed_tasks_once();
@@ -162,52 +237,178 @@ impl PersistenceManager {
         self.start_archive_task();
     }
 
-    /// 加载历史缓存
-    fn load_history_cache(&mut self) {
-        match history::load_history_cache(&self.wal_dir) {
-            Ok(cache) => {
-                let count = cache.len();
-                // 将加载的数据转移到 self.history_cache
-                for entry in cache.into_iter() {
-                    self.history_cache.insert(entry.0, entry.1);
-                }
-                info!("已加载 {} 条历史任务记录", count);
+    /// 从 JSONL 文件迁移到 SQLite 数据库（一次性迁移）
+    fn migrate_jsonl_to_db(&self) {
+        let history_db = match &self.history_db {
+            Some(db) => db,
+            None => {
+                warn!("历史数据库不可用，跳过迁移");
+                return;
             }
-            Err(e) => {
-                error!("加载历史缓存失败: {}", e);
+        };
+
+        // 迁移任务历史 (history.jsonl)
+        let history_jsonl_path = history::get_history_path(&self.wal_dir);
+        if history_jsonl_path.exists() {
+            info!("检测到旧历史文件，开始迁移: {:?}", history_jsonl_path);
+            match history::load_history_cache(&self.wal_dir) {
+                Ok(cache) => {
+                    let tasks: Vec<TaskMetadata> = cache.into_iter().map(|(_, v)| v).collect();
+                    if !tasks.is_empty() {
+                        match history_db.add_tasks_to_history_batch(&tasks) {
+                            Ok(count) => {
+                                info!("成功迁移 {} 条任务历史到数据库", count);
+                                // 迁移成功后重命名旧文件为 .bak
+                                let bak_path = history_jsonl_path.with_extension("jsonl.bak");
+                                if let Err(e) = std::fs::rename(&history_jsonl_path, &bak_path) {
+                                    warn!("重命名旧历史文件失败: {}", e);
+                                } else {
+                                    info!("已将旧历史文件重命名为: {:?}", bak_path);
+                                    // 删除备份文件
+                                    if let Err(e) = std::fs::remove_file(&bak_path) {
+                                        warn!("删除备份文件失败: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("迁移任务历史到数据库失败: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("加载旧历史文件失败: {}", e);
+                }
+            }
+        }
+
+        // 迁移文件夹历史 (folder_history.jsonl)
+        let folder_history_jsonl_path = super::folder::get_folder_history_path(&self.wal_dir);
+        if folder_history_jsonl_path.exists() {
+            info!("检测到旧文件夹历史文件，开始迁移: {:?}", folder_history_jsonl_path);
+            match super::folder::load_folder_history(&self.wal_dir) {
+                Ok(folders) => {
+                    if !folders.is_empty() {
+                        match history_db.add_folders_to_history_batch(&folders) {
+                            Ok(count) => {
+                                info!("成功迁移 {} 条文件夹历史到数据库", count);
+                                // 迁移成功后重命名旧文件为 .bak
+                                let bak_path = folder_history_jsonl_path.with_extension("jsonl.bak");
+                                if let Err(e) = std::fs::rename(&folder_history_jsonl_path, &bak_path) {
+                                    warn!("重命名旧文件夹历史文件失败: {}", e);
+                                } else {
+                                    info!("已将旧文件夹历史文件重命名为: {:?}", bak_path);
+                                    // 删除备份文件
+                                    if let Err(e) = std::fs::remove_file(&bak_path) {
+                                        warn!("删除备份文件失败: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("迁移文件夹历史到数据库失败: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("加载旧文件夹历史文件失败: {}", e);
+                }
             }
         }
     }
 
-    /// 启动时执行一次归档
+    /// 启动时执行一次归档（直接写入数据库）
     fn archive_completed_tasks_once(&self) {
-        // 归档已完成的单文件任务
-        match history::archive_completed_tasks(&self.wal_dir) {
-            Ok(count) => {
-                if count > 0 {
-                    info!("启动时归档了 {} 个已完成任务", count);
-                    // 重新加载历史缓存以包含新归档的任务
-                    if let Ok(cache) = history::load_history_cache(&self.wal_dir) {
-                        for entry in cache.into_iter() {
-                            self.history_cache.insert(entry.0, entry.1);
-                        }
+        // 扫描已完成的单文件任务元数据，直接归档到数据库
+        let completed_tasks = self.scan_completed_task_metadata();
+        if !completed_tasks.is_empty() {
+            if let Some(db) = &self.history_db {
+                match db.add_tasks_to_history_batch(&completed_tasks) {
+                    Ok(count) => {
+                        info!("启动时归档了 {} 个已完成任务到数据库", count);
+                        // 删除已归档任务的 .meta 文件
+                        self.cleanup_archived_metadata();
+                    }
+                    Err(e) => {
+                        error!("启动时归档任务到数据库失败: {}", e);
                     }
                 }
             }
-            Err(e) => {
-                error!("启动时归档失败: {}", e);
-            }
         }
 
-        // 归档已完成的文件夹任务
-        match super::folder::archive_completed_folders(&self.wal_dir) {
-            Ok(count) => {
-                if count > 0 {
-                    info!("启动时归档了 {} 个已完成文件夹", count);
+        // 扫描已完成的文件夹任务，直接归档到数据库
+        let completed_folders = self.scan_completed_folder_metadata();
+        if !completed_folders.is_empty() {
+            if let Some(db) = &self.history_db {
+                match db.add_folders_to_history_batch(&completed_folders) {
+                    Ok(count) => {
+                        info!("启动时归档了 {} 个已完成文件夹到数据库", count);
+                        // 删除已归档文件夹的持久化文件
+                        self.cleanup_archived_folders(&completed_folders);
+                    }
+                    Err(e) => {
+                        error!("启动时归档文件夹到数据库失败: {}", e);
+                    }
                 }
             }
-            Err(e) => {
-                error!("启动时文件夹归档失败: {}", e);
+        }
+    }
+
+    /// 扫描已完成的任务元数据
+    fn scan_completed_task_metadata(&self) -> Vec<TaskMetadata> {
+        use super::metadata::scan_all_metadata;
+        use super::types::TaskPersistenceStatus;
+
+        let mut completed = Vec::new();
+        if let Ok(all_metadata) = scan_all_metadata(&self.wal_dir) {
+            for metadata in all_metadata {
+                if metadata.status == Some(TaskPersistenceStatus::Completed) {
+                    completed.push(metadata);
+                }
+            }
+        }
+        completed
+    }
+
+    /// 扫描已完成的文件夹元数据
+    fn scan_completed_folder_metadata(&self) -> Vec<super::folder::FolderPersisted> {
+        use super::folder::load_all_folders;
+        use crate::downloader::folder::FolderStatus;
+
+        let mut completed = Vec::new();
+        if let Ok(all_folders) = load_all_folders(&self.wal_dir) {
+            for folder in all_folders {
+                if folder.status == FolderStatus::Completed {
+                    completed.push(folder);
+                }
+            }
+        }
+        completed
+    }
+
+    /// 清理已归档的任务元数据文件
+    fn cleanup_archived_metadata(&self) {
+        use super::metadata::{delete_task_files, scan_all_metadata};
+        use super::types::TaskPersistenceStatus;
+
+        if let Ok(all_metadata) = scan_all_metadata(&self.wal_dir) {
+            for metadata in all_metadata {
+                if metadata.status == Some(TaskPersistenceStatus::Completed) {
+                    if let Err(e) = delete_task_files(&self.wal_dir, &metadata.task_id) {
+                        warn!("删除已归档任务文件失败: {}, 错误: {}", metadata.task_id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 清理已归档的文件夹持久化文件
+    fn cleanup_archived_folders(&self, folders: &[super::folder::FolderPersisted]) {
+        use super::folder::delete_folder;
+
+        for folder in folders {
+            if let Err(e) = delete_folder(&self.wal_dir, &folder.id) {
+                warn!("删除已归档文件夹文件失败: {}, 错误: {}", folder.id, e);
             }
         }
     }
@@ -219,7 +420,7 @@ impl PersistenceManager {
         }
 
         let wal_dir = self.wal_dir.clone();
-        let history_cache = Arc::clone(&self.history_cache);
+        let history_db = self.history_db.clone();
         let archive_hour = self.config.history_archive_hour;
         let archive_minute = self.config.history_archive_minute;
         let retention_days = self.config.history_retention_days;
@@ -228,7 +429,7 @@ impl PersistenceManager {
         let handle = tokio::spawn(async move {
             history_archive_loop(
                 wal_dir,
-                history_cache,
+                history_db,
                 archive_hour,
                 archive_minute,
                 retention_days,
@@ -320,6 +521,10 @@ impl PersistenceManager {
     /// * `group_id` - 文件夹下载组ID（单文件下载时为 None）
     /// * `group_root` - 文件夹根路径（单文件下载时为 None）
     /// * `relative_path` - 相对于根文件夹的路径（单文件下载时为 None）
+    /// * `is_backup` - 是否为备份任务
+    /// * `backup_config_id` - 备份配置ID（备份任务时使用）
+    /// * `is_encrypted` - 是否为加密文件（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
     pub fn register_download_task(
         &self,
         task_id: String,
@@ -332,6 +537,10 @@ impl PersistenceManager {
         group_id: Option<String>,
         group_root: Option<String>,
         relative_path: Option<String>,
+        is_backup: bool,
+        backup_config_id: Option<String>,
+        is_encrypted: Option<bool>,
+        encryption_key_version: Option<u32>,
     ) -> std::io::Result<()> {
         // 创建元数据
         let mut metadata = TaskMetadata::new_download(
@@ -342,10 +551,16 @@ impl PersistenceManager {
             file_size,
             chunk_size,
             total_chunks,
+            is_encrypted,
+            encryption_key_version,
         );
 
         // 设置文件夹下载组信息
         metadata.set_group_info(group_id, group_root, relative_path);
+
+        // 🔥 设置备份任务信息
+        metadata.is_backup = is_backup;
+        metadata.backup_config_id = backup_config_id;
 
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
@@ -354,7 +569,7 @@ impl PersistenceManager {
         let info = TaskPersistenceInfo::new_download(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
-        debug!("已注册下载任务: {}", task_id);
+        debug!("已注册下载任务: {} (is_backup={}, is_encrypted={:?})", task_id, is_backup, is_encrypted);
 
         Ok(())
     }
@@ -368,6 +583,8 @@ impl PersistenceManager {
     /// * `file_size` - 文件大小（字节）
     /// * `chunk_size` - 分片大小（字节）
     /// * `total_chunks` - 总分片数
+    /// * `encrypt_enabled` - 是否启用加密（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
     pub fn register_upload_task(
         &self,
         task_id: String,
@@ -376,6 +593,8 @@ impl PersistenceManager {
         file_size: u64,
         chunk_size: u64,
         total_chunks: usize,
+        encrypt_enabled: Option<bool>,
+        encryption_key_version: Option<u32>,
     ) -> std::io::Result<()> {
         // 创建元数据
         let metadata = TaskMetadata::new_upload(
@@ -385,6 +604,8 @@ impl PersistenceManager {
             file_size,
             chunk_size,
             total_chunks,
+            encrypt_enabled,
+            encryption_key_version,
         );
 
         // 保存元数据到文件
@@ -394,7 +615,108 @@ impl PersistenceManager {
         let info = TaskPersistenceInfo::new_upload(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
-        debug!("已注册上传任务: {}", task_id);
+        debug!("已注册上传任务: {} (encrypt_enabled={:?})", task_id, encrypt_enabled);
+
+        Ok(())
+    }
+
+    /// 注册备份上传任务
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `source_path` - 本地源文件路径
+    /// * `target_path` - 远程目标路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `backup_config_id` - 备份配置 ID
+    /// * `encrypt_enabled` - 是否启用加密（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn register_upload_backup_task(
+        &self,
+        task_id: String,
+        source_path: PathBuf,
+        target_path: String,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        backup_config_id: String,
+        encrypt_enabled: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> std::io::Result<()> {
+        // 创建备份任务元数据
+        let metadata = TaskMetadata::new_upload_backup(
+            task_id.clone(),
+            source_path,
+            target_path,
+            file_size,
+            chunk_size,
+            total_chunks,
+            backup_config_id,
+            encrypt_enabled,
+            encryption_key_version,
+        );
+
+        // 保存元数据到文件
+        save_metadata(&self.wal_dir, &metadata)?;
+
+        // 创建内存状态
+        let info = TaskPersistenceInfo::new_upload(task_id.clone(), total_chunks);
+        self.tasks.insert(task_id.clone(), info);
+
+        debug!("已注册备份上传任务: {} (encrypt_enabled={:?})", task_id, encrypt_enabled);
+
+        Ok(())
+    }
+
+    /// 注册备份下载任务
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `fs_id` - 百度网盘文件 fs_id
+    /// * `remote_path` - 远程文件路径
+    /// * `local_path` - 本地保存路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `backup_config_id` - 备份配置 ID
+    /// * `is_encrypted` - 是否为加密文件（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn register_download_backup_task(
+        &self,
+        task_id: String,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        backup_config_id: String,
+        is_encrypted: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> std::io::Result<()> {
+        // 创建备份任务元数据
+        let metadata = TaskMetadata::new_download_backup(
+            task_id.clone(),
+            fs_id,
+            remote_path,
+            local_path,
+            file_size,
+            chunk_size,
+            total_chunks,
+            backup_config_id,
+            is_encrypted,
+            encryption_key_version,
+        );
+
+        // 保存元数据到文件
+        save_metadata(&self.wal_dir, &metadata)?;
+
+        // 创建内存状态
+        let info = TaskPersistenceInfo::new_download(task_id.clone(), total_chunks);
+        self.tasks.insert(task_id.clone(), info);
+
+        debug!("已注册备份下载任务: {} (is_encrypted={:?})", task_id, is_encrypted);
 
         Ok(())
     }
@@ -455,7 +777,8 @@ impl PersistenceManager {
             info.mark_chunk_completed(chunk_index);
             debug!("分片完成: task_id={}, chunk_index={}", task_id, chunk_index);
         } else {
-            warn!("任务不存在，无法标记分片完成: task_id={}", task_id);
+            // 备份任务创建的临时上传任务不会注册到持久化管理器，这是预期行为
+            debug!("任务不存在，跳过分片完成标记: task_id={}", task_id);
         }
     }
 
@@ -473,7 +796,8 @@ impl PersistenceManager {
                 task_id, chunk_index
             );
         } else {
-            warn!("任务不存在，无法标记分片完成: task_id={}", task_id);
+            // 备份任务创建的临时上传任务不会注册到持久化管理器，这是预期行为
+            debug!("任务不存在，跳过分片完成标记(带MD5): task_id={}", task_id);
         }
     }
 
@@ -486,7 +810,7 @@ impl PersistenceManager {
     /// 1. 从内存中移除任务
     /// 2. 只删除 WAL 文件（保留元数据）
     /// 3. 更新元数据：标记为已完成
-    /// 4. 添加到历史缓存
+    /// 4. 添加到历史数据库
     ///
     /// # Arguments
     /// * `task_id` - 任务 ID
@@ -506,13 +830,18 @@ impl PersistenceManager {
             m.mark_completed();
         })?;
 
-        // 4. 加载完成的元数据并添加到历史缓存
+        // 4. 加载完成的元数据并添加到历史数据库
         if let Some(metadata) = super::metadata::load_metadata(&self.wal_dir, task_id) {
-            self.history_cache.insert(task_id.to_string(), metadata);
+            // 添加到数据库
+            if let Some(db) = &self.history_db {
+                if let Err(e) = db.add_task_to_history(&metadata) {
+                    warn!("添加任务到历史数据库失败: task_id={}, 错误: {}", task_id, e);
+                }
+            }
         }
 
         info!(
-            "任务完成，已标记为已完成并添加到历史缓存: task_id={}",
+            "任务完成，已标记为已完成并添加到历史数据库: task_id={}",
             task_id
         );
 
@@ -523,7 +852,7 @@ impl PersistenceManager {
     ///
     /// 1. 从内存中移除任务
     /// 2. 删除持久化文件（WAL 和元数据）
-    /// 3. 从历史缓存和文件中删除
+    /// 3. 从历史数据库中删除
     ///
     /// # Arguments
     /// * `task_id` - 任务 ID
@@ -534,12 +863,11 @@ impl PersistenceManager {
         // 2. 删除持久化文件
         let deleted = delete_task_files(&self.wal_dir, task_id)?;
 
-        // 3. 从历史缓存中删除
-        self.history_cache.remove(task_id);
-
-        // 4. 从历史文件中删除
-        if let Err(e) = history::remove_from_history_file(&self.wal_dir, task_id) {
-            warn!("从历史文件中删除任务失败: task_id={}, 错误: {}", task_id, e);
+        // 3. 从历史数据库中删除
+        if let Some(db) = &self.history_db {
+            if let Err(e) = db.remove_task_from_history(task_id) {
+                warn!("从历史数据库中删除任务失败: task_id={}, 错误: {}", task_id, e);
+            }
         }
 
         info!(
@@ -630,7 +958,7 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// 更新任务错误信息
+    /// 更新任务错误信息并将状态标记为 Failed
     ///
     /// # Arguments
     /// * `task_id` - 任务 ID
@@ -639,9 +967,10 @@ impl PersistenceManager {
         let error_owned = error_msg.clone();
         update_metadata(&self.wal_dir, task_id, move |m| {
             m.set_error_msg(error_owned);
+            m.mark_failed();
         })?;
 
-        debug!("已更新任务错误信息: task_id={}, error={}", task_id, error_msg);
+        debug!("已更新任务错误信息并标记为失败: task_id={}, error={}", task_id, error_msg);
 
         Ok(())
     }
@@ -657,6 +986,68 @@ impl PersistenceManager {
         })?;
 
         debug!("已更新 upload_id: task_id={}", task_id);
+
+        Ok(())
+    }
+
+    /// 更新任务状态
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `status` - 新状态
+    pub fn update_task_status(
+        &self,
+        task_id: &str,
+        status: TaskPersistenceStatus,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_status(status);
+        })?;
+
+        debug!("已更新任务状态: task_id={}, status={:?}", task_id, status);
+
+        Ok(())
+    }
+
+    /// 更新任务的加密信息
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `encrypt_enabled` - 是否启用加密
+    /// * `key_version` - 加密密钥版本
+    pub fn update_encryption_info(
+        &self,
+        task_id: &str,
+        encrypt_enabled: bool,
+        key_version: Option<u32>,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_encryption_info(encrypt_enabled, key_version);
+        })?;
+
+        debug!(
+            "已更新加密信息: task_id={}, encrypt_enabled={}, key_version={:?}",
+            task_id, encrypt_enabled, key_version
+        );
+
+        Ok(())
+    }
+
+    /// 更新任务的本地路径（解密完成后更新为解密后的路径）
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `local_path` - 新的本地路径
+    pub fn update_local_path(
+        &self,
+        task_id: &str,
+        local_path: std::path::PathBuf,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_local_path(local_path);
+        })?;
+
+        debug!("已更新本地路径: task_id={}", task_id);
 
         Ok(())
     }
@@ -939,7 +1330,7 @@ async fn wal_cleanup_loop(
 /// 每天指定时间执行历史归档和过期历史清理
 async fn history_archive_loop(
     wal_dir: PathBuf,
-    history_cache: Arc<DashMap<String, TaskMetadata>>,
+    history_db: Option<Arc<HistoryDbManager>>,
     archive_hour: u8,
     archive_minute: u8,
     retention_days: u64,
@@ -974,66 +1365,14 @@ async fn history_archive_loop(
                     info!("开始执行定时历史归档...");
                     last_archive_date = Some(current_date);
 
-                    // 1. 执行历史归档
-                    match history::archive_completed_tasks(&wal_dir) {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!("定时归档完成: 归档了 {} 个已完成任务", count);
-                                // 重新加载历史缓存
-                                if let Ok(cache) = history::load_history_cache(&wal_dir) {
-                                    for entry in cache.into_iter() {
-                                        history_cache.insert(entry.0, entry.1);
-                                    }
-                                }
-                            } else {
-                                debug!("定时归档完成: 无需归档的任务");
-                            }
-                        }
-                        Err(e) => {
-                            error!("定时归档失败: {}", e);
-                        }
-                    }
+                    // 1. 执行历史归档（扫描 .meta 文件，归档到数据库）
+                    archive_completed_to_db(&wal_dir, &history_db).await;
 
                     // 2. 执行文件夹历史归档
-                    match super::folder::archive_completed_folders(&wal_dir) {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!("定时归档完成: 归档了 {} 个已完成文件夹", count);
-                            }
-                        }
-                        Err(e) => {
-                            error!("文件夹归档失败: {}", e);
-                        }
-                    }
+                    archive_folders_to_db(&wal_dir, &history_db).await;
 
-                    // 3. 清理过期历史
-                    match history::cleanup_expired_history(&wal_dir, retention_days) {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!("清理过期历史完成: 清理了 {} 条记录", count);
-                                // 从缓存中移除过期任务
-                                let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
-                                history_cache.retain(|_, v| {
-                                    v.completed_at.map(|t| t >= cutoff).unwrap_or(true)
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            error!("清理过期历史失败: {}", e);
-                        }
-                    }
-
-                    // 4. 清理过期文件夹历史
-                    match super::folder::cleanup_expired_folder_history(&wal_dir, retention_days) {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!("清理过期文件夹历史完成: 清理了 {} 条记录", count);
-                            }
-                        }
-                        Err(e) => {
-                            error!("清理过期文件夹历史失败: {}", e);
-                        }
-                    }
+                    // 3. 清理过期历史（从数据库中清理）
+                    cleanup_expired_from_db(&history_db, retention_days).await;
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -1044,6 +1383,130 @@ async fn history_archive_loop(
     }
 
     info!("历史归档循环已退出");
+}
+
+/// 归档已完成任务到数据库（直接扫描 .meta 文件，不经过 JSONL）
+async fn archive_completed_to_db(
+    wal_dir: &PathBuf,
+    history_db: &Option<Arc<HistoryDbManager>>,
+) {
+    use super::metadata::{delete_task_files, scan_all_metadata};
+    use super::types::TaskPersistenceStatus;
+
+    // 直接扫描 .meta 文件中已完成的任务
+    let completed_tasks: Vec<TaskMetadata> = match scan_all_metadata(wal_dir) {
+        Ok(all_metadata) => all_metadata
+            .into_iter()
+            .filter(|m| m.status == Some(TaskPersistenceStatus::Completed))
+            .collect(),
+        Err(e) => {
+            error!("扫描元数据失败: {}", e);
+            return;
+        }
+    };
+
+    if completed_tasks.is_empty() {
+        debug!("定时归档完成: 无需归档的任务");
+        return;
+    }
+
+    // 直接写入数据库
+    if let Some(db) = history_db {
+        match db.add_tasks_to_history_batch(&completed_tasks) {
+            Ok(count) => {
+                info!("定时归档完成: 归档了 {} 个已完成任务到数据库", count);
+                // 删除 .meta 文件
+                for task in &completed_tasks {
+                    if let Err(e) = delete_task_files(wal_dir, &task.task_id) {
+                        warn!("删除已归档任务文件失败: {}, 错误: {}", task.task_id, e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("归档任务到数据库失败: {}", e);
+            }
+        }
+    } else {
+        // 无数据库时仅记录日志
+        warn!("历史数据库不可用，跳过归档 {} 个已完成任务", completed_tasks.len());
+    }
+}
+
+/// 归档已完成文件夹到数据库（直接扫描文件夹持久化文件，不经过 JSONL）
+async fn archive_folders_to_db(
+    wal_dir: &PathBuf,
+    history_db: &Option<Arc<HistoryDbManager>>,
+) {
+    use super::folder::{delete_folder, load_all_folders};
+    use crate::downloader::folder::FolderStatus;
+
+    // 直接扫描文件夹持久化文件中已完成的文件夹
+    let completed_folders: Vec<super::folder::FolderPersisted> = match load_all_folders(wal_dir) {
+        Ok(all_folders) => all_folders
+            .into_iter()
+            .filter(|f| f.status == FolderStatus::Completed)
+            .collect(),
+        Err(e) => {
+            error!("扫描文件夹失败: {}", e);
+            return;
+        }
+    };
+
+    if completed_folders.is_empty() {
+        debug!("定时归档完成: 无需归档的文件夹");
+        return;
+    }
+
+    // 直接写入数据库
+    if let Some(db) = history_db {
+        match db.add_folders_to_history_batch(&completed_folders) {
+            Ok(count) => {
+                info!("定时归档完成: 归档了 {} 个已完成文件夹到数据库", count);
+                // 删除已归档文件夹的持久化文件
+                for folder in &completed_folders {
+                    if let Err(e) = delete_folder(wal_dir, &folder.id) {
+                        warn!("删除已归档文件夹文件失败: {}, 错误: {}", folder.id, e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("归档文件夹到数据库失败: {}", e);
+            }
+        }
+    }
+}
+
+/// 清理过期历史（从数据库）
+async fn cleanup_expired_from_db(
+    history_db: &Option<Arc<HistoryDbManager>>,
+    retention_days: u64,
+) {
+    // 从数据库清理
+    if let Some(db) = history_db {
+        // 清理过期任务历史
+        match db.cleanup_expired_task_history(retention_days) {
+            Ok(count) => {
+                if count > 0 {
+                    info!("清理过期任务历史完成: 清理了 {} 条记录", count);
+                }
+            }
+            Err(e) => {
+                error!("清理过期任务历史失败: {}", e);
+            }
+        }
+
+        // 清理过期文件夹历史
+        match db.cleanup_expired_folder_history(retention_days) {
+            Ok(count) => {
+                if count > 0 {
+                    info!("清理过期文件夹历史完成: 清理了 {} 条记录", count);
+                }
+            }
+            Err(e) => {
+                error!("清理过期文件夹历史失败: {}", e);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1064,6 +1527,7 @@ mod tests {
     fn create_test_config() -> PersistenceConfig {
         PersistenceConfig {
             wal_dir: "wal".to_string(),
+            db_path: "config/baidu-pcs.db".to_string(),
             wal_flush_interval_ms: 100,
             auto_recover_tasks: true,
             wal_retention_days: 7,
@@ -1102,6 +1566,10 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1127,6 +1595,8 @@ mod tests {
                 2 * 1024 * 1024,
                 512 * 1024,
                 4,
+                None,  // encrypt_enabled
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1173,6 +1643,10 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1204,6 +1678,8 @@ mod tests {
                 1024,
                 256,
                 4,
+                None,  // encrypt_enabled
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1236,6 +1712,10 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1256,8 +1736,10 @@ mod tests {
         assert!(meta.is_completed());
         assert!(meta.completed_at.is_some());
 
-        // 任务应该在历史缓存中
-        assert!(manager.history_cache().contains_key("dl_003"));
+        // 任务应该在历史数据库中（如果数据库可用）
+        if let Some(db) = manager.history_db() {
+            assert!(db.task_exists_in_history("dl_003").unwrap_or(false));
+        }
     }
 
     #[test]
@@ -1328,6 +1810,8 @@ mod tests {
                 1024,
                 256,
                 4,
+                None,  // encrypt_enabled
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1360,6 +1844,10 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1398,6 +1886,10 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             )
             .unwrap();
 
@@ -1447,6 +1939,10 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,  // is_encrypted
+                None,  // encryption_key_version
             )
             .unwrap();
 

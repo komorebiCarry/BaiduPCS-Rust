@@ -6,7 +6,6 @@ pub mod manager;
 pub mod progress;
 pub mod scheduler;
 pub mod task;
-pub mod task_slot_pool;
 
 pub use chunk::{Chunk, ChunkManager};
 pub use engine::{DownloadEngine, UrlHealthManager};
@@ -16,4 +15,3 @@ pub use manager::DownloadManager;
 pub use progress::SpeedCalculator;
 pub use scheduler::{calculate_task_max_chunks, ChunkScheduler, TaskScheduleInfo};
 pub use task::{DownloadTask, TaskStatus};
-pub use task_slot_pool::{TaskSlot, TaskSlotPool, TaskSlotType};

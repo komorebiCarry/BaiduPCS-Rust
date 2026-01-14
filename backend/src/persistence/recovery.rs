@@ -289,7 +289,7 @@ fn validate_upload_task(recovered: &RecoveredTask) -> Result<(), String> {
 
 /// 清理已完成任务的持久化文件
 ///
-/// 🔥 修复：在删除文件前，先将已完成任务归档到历史记录
+/// 🔥 修复：在删除文件前，先将已完成任务归档到历史记录（优先使用数据库）
 ///
 /// # Arguments
 /// * `wal_dir` - WAL/元数据目录
@@ -298,27 +298,56 @@ fn validate_upload_task(recovered: &RecoveredTask) -> Result<(), String> {
 /// # Returns
 /// 成功清理的任务数
 pub fn cleanup_completed_tasks(wal_dir: &Path, task_ids: &[String]) -> usize {
-    use super::history::add_to_history;
+    cleanup_completed_tasks_with_db(wal_dir, task_ids, None)
+}
+
+/// 清理已完成任务的持久化文件（带数据库支持）
+///
+/// # Arguments
+/// * `wal_dir` - WAL/元数据目录
+/// * `task_ids` - 需要清理的任务 ID 列表
+/// * `history_db` - 历史数据库管理器（可选）
+///
+/// # Returns
+/// 成功清理的任务数
+pub fn cleanup_completed_tasks_with_db(
+    wal_dir: &Path,
+    task_ids: &[String],
+    history_db: Option<&super::history_db::HistoryDbManager>,
+) -> usize {
     use super::metadata::load_metadata;
 
     let mut cleaned = 0;
     let mut archived = 0;
 
     for task_id in task_ids {
-        // 🔥 修复：在删除前先归档到历史记录
+        // 在删除前先归档到历史记录
         if let Some(mut metadata) = load_metadata(wal_dir, task_id) {
             // 确保标记为已完成
             metadata.mark_completed();
-            
-            // 归档到历史文件
-            match add_to_history(wal_dir, &metadata) {
-                Ok(()) => {
-                    archived += 1;
-                    debug!("已归档已完成任务到历史: {}", task_id);
+
+            // 优先归档到数据库
+            if let Some(db) = history_db {
+                match db.add_task_to_history(&metadata) {
+                    Ok(()) => {
+                        archived += 1;
+                        debug!("已归档已完成任务到数据库: {}", task_id);
+                    }
+                    Err(e) => {
+                        warn!("归档任务 {} 到数据库失败: {}", task_id, e);
+                    }
                 }
-                Err(e) => {
-                    warn!("归档任务 {} 到历史失败: {}", task_id, e);
-                    // 即使归档失败也继续清理文件
+            } else {
+                // 回退到文件归档
+                use super::history::add_to_history;
+                match add_to_history(wal_dir, &metadata) {
+                    Ok(()) => {
+                        archived += 1;
+                        debug!("已归档已完成任务到历史文件: {}", task_id);
+                    }
+                    Err(e) => {
+                        warn!("归档任务 {} 到历史文件失败: {}", task_id, e);
+                    }
                 }
             }
         }
@@ -499,6 +528,16 @@ pub struct DownloadRecoveryInfo {
     pub group_root: Option<String>,
     /// 相对于根文件夹的路径
     pub relative_path: Option<String>,
+    // === 自动备份字段 ===
+    /// 是否为备份任务
+    pub is_backup: bool,
+    /// 关联的备份配置 ID
+    pub backup_config_id: Option<String>,
+    // === 加密字段 ===
+    /// 是否为加密文件
+    pub is_encrypted: bool,
+    /// 加密密钥版本
+    pub encryption_key_version: Option<u32>,
 }
 
 impl DownloadRecoveryInfo {
@@ -520,6 +559,12 @@ impl DownloadRecoveryInfo {
             group_id: metadata.group_id.clone(),
             group_root: metadata.group_root.clone(),
             relative_path: metadata.relative_path.clone(),
+            // 恢复备份标识
+            is_backup: metadata.is_backup,
+            backup_config_id: metadata.backup_config_id.clone(),
+            // 恢复加密字段
+            is_encrypted: metadata.is_encrypted,
+            encryption_key_version: metadata.encryption_key_version,
         })
     }
 
@@ -556,6 +601,16 @@ pub struct UploadRecoveryInfo {
     pub upload_id: Option<String>,
     /// 创建时间
     pub created_at: i64,
+    // === 自动备份字段 ===
+    /// 是否为备份任务
+    pub is_backup: bool,
+    /// 关联的备份配置 ID
+    pub backup_config_id: Option<String>,
+    // === 加密字段 ===
+    /// 是否启用加密
+    pub encrypt_enabled: bool,
+    /// 加密密钥版本
+    pub encryption_key_version: Option<u32>,
 }
 
 impl UploadRecoveryInfo {
@@ -577,6 +632,12 @@ impl UploadRecoveryInfo {
                 .unwrap_or_else(|| vec![None; metadata.total_chunks.unwrap_or(0)]),
             upload_id: metadata.upload_id.clone(),
             created_at: metadata.created_at.timestamp(),
+            // 恢复备份标识
+            is_backup: metadata.is_backup,
+            backup_config_id: metadata.backup_config_id.clone(),
+            // 恢复加密字段
+            encrypt_enabled: metadata.encrypt_enabled,
+            encryption_key_version: metadata.encryption_key_version,
         })
     }
 
@@ -657,6 +718,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -695,6 +758,8 @@ mod tests {
             1024,
             256,
             4,
+            None,  // encrypt_enabled
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -761,6 +826,8 @@ mod tests {
             1024,
             256,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -796,6 +863,8 @@ mod tests {
             1024,
             256,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -827,6 +896,8 @@ mod tests {
             1024,
             256,
             4,
+            None,  // encrypt_enabled
+            None,  // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -848,6 +919,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
         );
 
         let mut completed_chunks = BitSet::with_capacity(4);

@@ -27,6 +27,18 @@ sha1 = "0.10"
 md5 = "0.7"
 hex = "0.4"
 base64 = "0.21"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+# 文件系统监听
+notify = "6.0"
+walkdir = "2.4"
+
+# 数据库
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 
 # 日志
 tracing = "0.1"
@@ -64,6 +76,10 @@ parking_lot = "0.12"
 urlencoding = "2.1"
 regex = "1.12.2"
 
+# 系统信息（内存监控）
+sysinfo = "0.30"
+
 [dev-dependencies]
 # 测试工具
 tempfile = "3.8"
+proptest = "1.4"

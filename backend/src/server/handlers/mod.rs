@@ -1,6 +1,7 @@
 // API处理器模块
 
 pub mod auth;
+pub mod autobackup;
 pub mod config;
 pub mod download;
 pub mod file;

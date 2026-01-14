@@ -633,7 +633,9 @@ impl QRCodeAuth {
             Some(0)
         };
 
-        // 提取空间信息（这个API似乎不返回，后续可以调用其他API获取）
+        // 提取空间信息（优先从当前API获取）
+        // 注意：/api/quota 需要 PANPSC 等预热后的 Cookie，登录时无法获取
+        // 空间信息会在预热后由 NetDiskClient 获取
         let total_space = json["total"].as_u64();
         let used_space = json["used"].as_u64();
 

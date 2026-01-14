@@ -55,6 +55,7 @@
 
 pub mod folder;
 pub mod history;
+pub mod history_db;
 pub mod manager;
 pub mod metadata;
 pub mod recovery;
@@ -81,9 +82,9 @@ pub use manager::PersistenceManager;
 
 // 导出恢复模块
 pub use recovery::{
-    cleanup_completed_tasks, cleanup_expired_tasks, cleanup_invalid_tasks, scan_recoverable_tasks,
-    DownloadRecoveryInfo, RecoveredTask, RecoveryScanResult, TransferRecoveryInfo,
-    UploadRecoveryInfo,
+    cleanup_completed_tasks, cleanup_completed_tasks_with_db, cleanup_expired_tasks,
+    cleanup_invalid_tasks, scan_recoverable_tasks, DownloadRecoveryInfo, RecoveredTask,
+    RecoveryScanResult, TransferRecoveryInfo, UploadRecoveryInfo,
 };
 
 // 导出历史归档模块
@@ -99,3 +100,6 @@ pub use folder::{
     delete_folder, get_folder_history_path, load_all_folders, load_folder, load_folder_history,
     load_folder_history_ids, remove_folder_from_history, save_folder, FolderPersisted,
 };
+
+// 导出历史数据库模块
+pub use history_db::HistoryDbManager;

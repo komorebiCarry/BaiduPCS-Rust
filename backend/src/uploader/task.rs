@@ -14,6 +14,8 @@ pub enum UploadTaskStatus {
     Pending,
     /// 秒传检查中
     CheckingRapid,
+    /// 加密中（新增）
+    Encrypting,
     /// 上传中
     Uploading,
     /// 已暂停
@@ -84,6 +86,74 @@ pub struct UploadTask {
     /// 已完成分片数
     #[serde(default)]
     pub completed_chunks: usize,
+
+    // === 🔥 新增：自动备份相关字段 ===
+    /// 是否为自动备份任务
+    #[serde(default)]
+    pub is_backup: bool,
+
+    /// 关联的备份配置ID（is_backup=true 时使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_config_id: Option<String>,
+
+    /// 关联的备份文件任务ID（is_backup=true 时使用，用于发送 BackupEvent）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_file_task_id: Option<String>,
+
+    /// 关联的备份主任务ID（is_backup=true 时使用，用于发送 BackupEvent）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_task_id: Option<String>,
+
+    // === 🔥 任务槽位相关字段 ===
+    /// 占用的槽位ID（用于任务槽机制）
+    #[serde(skip)]
+    pub slot_id: Option<usize>,
+
+    /// 是否使用借调位（上传暂不使用，保留字段与下载一致）
+    #[serde(skip)]
+    pub is_borrowed_slot: bool,
+
+    // === 🔥 加密相关字段 ===
+    /// 是否启用加密
+    #[serde(default)]
+    pub encrypt_enabled: bool,
+
+    /// 加密进度 (0.0 - 100.0)
+    #[serde(default)]
+    pub encrypt_progress: f64,
+
+    /// 加密后的临时文件路径（加密完成后上传此文件）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_temp_path: Option<PathBuf>,
+
+    /// 原始文件大小（加密前）
+    #[serde(default)]
+    pub original_size: u64,
+
+    // === 🔥 加密映射元数据（用于保存到 encryption_snapshots 表）===
+    /// 加密后的文件名（如 BPR_BKUP_uuid.bkup）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_name: Option<String>,
+
+    /// 加密随机数（Base64 编码，用于解密）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_nonce: Option<String>,
+
+    /// 加密算法（aes-256-gcm 或 chacha20-poly1305）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_algorithm: Option<String>,
+
+    /// 加密格式版本号
+    #[serde(default)]
+    pub encryption_version: u8,
+
+    /// 加密密钥版本号（用于密钥轮换后解密）
+    #[serde(default = "default_key_version")]
+    pub encryption_key_version: u32,
+}
+
+fn default_key_version() -> u32 {
+    1
 }
 
 impl UploadTask {
@@ -110,6 +180,25 @@ impl UploadTask {
             relative_path: None,
             total_chunks: 0,
             completed_chunks: 0,
+            // 自动备份字段初始化
+            is_backup: false,
+            backup_config_id: None,
+            backup_file_task_id: None,
+            backup_task_id: None,
+            // 任务槽位字段初始化
+            slot_id: None,
+            is_borrowed_slot: false,
+            // 加密字段初始化
+            encrypt_enabled: false,
+            encrypt_progress: 0.0,
+            encrypted_temp_path: None,
+            original_size: total_size,
+            // 加密映射元数据初始化
+            encrypted_name: None,
+            encryption_nonce: None,
+            encryption_algorithm: None,
+            encryption_version: 0,
+            encryption_key_version: 1,
         }
     }
 
@@ -126,6 +215,25 @@ impl UploadTask {
         task.group_id = Some(group_id);
         task.group_root = Some(group_root);
         task.relative_path = Some(relative_path);
+        task
+    }
+
+    /// 创建自动备份上传任务
+    pub fn new_backup(
+        local_path: PathBuf,
+        remote_path: String,
+        total_size: u64,
+        backup_config_id: String,
+        encrypt_enabled: bool,
+        backup_task_id: Option<String>,
+        backup_file_task_id: Option<String>,
+    ) -> Self {
+        let mut task = Self::new(local_path, remote_path, total_size);
+        task.is_backup = true;
+        task.backup_config_id = Some(backup_config_id);
+        task.encrypt_enabled = encrypt_enabled;
+        task.backup_task_id = backup_task_id;
+        task.backup_file_task_id = backup_file_task_id;
         task
     }
 
@@ -149,6 +257,56 @@ impl UploadTask {
     /// 标记为秒传检查中
     pub fn mark_checking_rapid(&mut self) {
         self.status = UploadTaskStatus::CheckingRapid;
+        if self.started_at.is_none() {
+            self.started_at = Some(chrono::Utc::now().timestamp());
+        }
+    }
+
+    /// 标记为加密中
+    pub fn mark_encrypting(&mut self) {
+        self.status = UploadTaskStatus::Encrypting;
+        if self.started_at.is_none() {
+            self.started_at = Some(chrono::Utc::now().timestamp());
+        }
+    }
+
+    /// 更新加密进度
+    pub fn update_encrypt_progress(&mut self, progress: f64) {
+        self.encrypt_progress = progress.clamp(0.0, 100.0);
+    }
+
+    /// 标记加密完成，设置加密后的临时文件路径和加密元数据
+    ///
+    /// 注意：此方法会同时将状态更新为 Uploading，确保状态一致性
+    /// 这样在发送 EncryptCompleted 事件时，前端查询状态就能得到正确的 Uploading 状态
+    ///
+    /// # 参数
+    /// * `encrypted_path` - 加密后的临时文件路径
+    /// * `encrypted_size` - 加密后的文件大小
+    /// * `encrypted_name` - 加密后的文件名（如 BPR_BKUP_uuid.bkup）
+    /// * `nonce` - 加密随机数（Base64 编码）
+    /// * `algorithm` - 加密算法名称
+    /// * `version` - 加密格式版本号
+    pub fn mark_encrypt_completed(
+        &mut self,
+        encrypted_path: PathBuf,
+        encrypted_size: u64,
+        encrypted_name: String,
+        nonce: String,
+        algorithm: String,
+        version: u8,
+    ) {
+        self.encrypted_temp_path = Some(encrypted_path);
+        self.total_size = encrypted_size; // 更新为加密后的大小
+        self.encrypt_progress = 100.0;
+        // 🔥 保存加密映射元数据（用于上传完成后写入 encryption_snapshots 表）
+        self.encrypted_name = Some(encrypted_name);
+        self.encryption_nonce = Some(nonce);
+        self.encryption_algorithm = Some(algorithm);
+        self.encryption_version = version;
+        // 🔥 加密完成后立即将状态更新为 Uploading，避免前端查询时状态不一致
+        // 这解决了 EncryptCompleted 事件发送后、mark_uploading() 调用前的时间窗口问题
+        self.status = UploadTaskStatus::Uploading;
         if self.started_at.is_none() {
             self.started_at = Some(chrono::Utc::now().timestamp());
         }
@@ -284,5 +442,167 @@ mod tests {
         assert!(task.is_rapid_upload);
         assert_eq!(task.uploaded_size, task.total_size);
         assert!(task.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_task_slot_fields() {
+        let task = UploadTask::new(
+            PathBuf::from("./test/file.txt"),
+            "/test/file.txt".to_string(),
+            1024,
+        );
+
+        assert!(task.slot_id.is_none());
+        assert!(!task.is_borrowed_slot);
+    }
+
+    #[test]
+    fn test_backup_task_slot_fields() {
+        let task = UploadTask::new_backup(
+            PathBuf::from("./test/file.txt"),
+            "/test/file.txt".to_string(),
+            1024,
+            "config-123".to_string(),
+            false,
+            Some("backup-task-123".to_string()),
+            Some("file-task-456".to_string()),
+        );
+
+        assert!(task.slot_id.is_none());
+        assert!(!task.is_borrowed_slot);
+        assert!(task.is_backup);
+        assert_eq!(task.backup_task_id, Some("backup-task-123".to_string()));
+        assert_eq!(task.backup_file_task_id, Some("file-task-456".to_string()));
+    }
+
+    #[test]
+    fn test_encrypting_status() {
+        let mut task = UploadTask::new(
+            PathBuf::from("./test/file.txt"),
+            "/test/file.txt".to_string(),
+            1024,
+        );
+
+        // 测试加密状态转换
+        task.encrypt_enabled = true;
+        task.mark_encrypting();
+        assert_eq!(task.status, UploadTaskStatus::Encrypting);
+        assert!(task.started_at.is_some());
+
+        // 测试加密进度更新
+        task.update_encrypt_progress(50.0);
+        assert_eq!(task.encrypt_progress, 50.0);
+
+        // 测试进度边界
+        task.update_encrypt_progress(150.0);
+        assert_eq!(task.encrypt_progress, 100.0);
+
+        task.update_encrypt_progress(-10.0);
+        assert_eq!(task.encrypt_progress, 0.0);
+    }
+
+    #[test]
+    fn test_encrypt_completed() {
+        let mut task = UploadTask::new(
+            PathBuf::from("./test/file.txt"),
+            "/test/file.txt".to_string(),
+            1024,
+        );
+
+        task.encrypt_enabled = true;
+        task.mark_encrypting();
+        task.mark_encrypt_completed(
+            PathBuf::from("./test/file.bkup"),
+            1100,
+            "BPR_BKUP_test-uuid.bkup".to_string(),
+            "base64_nonce_value".to_string(),
+            "aes-256-gcm".to_string(),
+            1,
+        );
+
+        assert_eq!(task.encrypt_progress, 100.0);
+        assert_eq!(task.total_size, 1100);
+        assert!(task.encrypted_temp_path.is_some());
+        // 🔥 验证加密完成后状态自动转换为 Uploading
+        assert_eq!(task.status, UploadTaskStatus::Uploading);
+        // 🔥 验证加密元数据已保存
+        assert_eq!(task.encrypted_name, Some("BPR_BKUP_test-uuid.bkup".to_string()));
+        assert_eq!(task.encryption_nonce, Some("base64_nonce_value".to_string()));
+        assert_eq!(task.encryption_algorithm, Some("aes-256-gcm".to_string()));
+        assert_eq!(task.encryption_version, 1);
+    }
+
+    /// 测试旧版本 JSON 数据反序列化兼容性
+    /// 确保缺少新增加密字段的旧数据能正确反序列化
+    #[test]
+    fn test_backward_compatibility_deserialization() {
+        // 模拟旧版本的 JSON 数据（不包含加密相关字段）
+        let old_json = r#"{
+            "id": "old-task-123",
+            "local_path": "./test/file.txt",
+            "remote_path": "/test/file.txt",
+            "total_size": 1024,
+            "uploaded_size": 512,
+            "status": "uploading",
+            "speed": 100,
+            "created_at": 1703203200,
+            "started_at": 1703203201,
+            "completed_at": null,
+            "error": null,
+            "is_rapid_upload": false,
+            "content_md5": null,
+            "slice_md5": null,
+            "content_crc32": null,
+            "group_id": null,
+            "group_root": null,
+            "relative_path": null,
+            "total_chunks": 4,
+            "completed_chunks": 2,
+            "is_backup": false,
+            "backup_config_id": null
+        }"#;
+
+        // 反序列化应该成功，新字段使用默认值
+        let task: UploadTask = serde_json::from_str(old_json).expect("反序列化旧版本数据失败");
+
+        // 验证基本字段
+        assert_eq!(task.id, "old-task-123");
+        assert_eq!(task.total_size, 1024);
+        assert_eq!(task.status, UploadTaskStatus::Uploading);
+
+        // 验证新增加密字段使用默认值
+        assert!(!task.encrypt_enabled); // 默认 false
+        assert_eq!(task.encrypt_progress, 0.0); // 默认 0.0
+        assert!(task.encrypted_temp_path.is_none()); // 默认 None
+        assert_eq!(task.original_size, 0); // 默认 0
+    }
+
+    /// 测试新版本 JSON 数据序列化/反序列化
+    #[test]
+    fn test_new_version_serialization() {
+        let mut task = UploadTask::new(
+            PathBuf::from("./test/file.txt"),
+            "/test/file.txt".to_string(),
+            1024,
+        );
+        task.encrypt_enabled = true;
+        task.encrypt_progress = 50.0;
+        task.encrypted_temp_path = Some(PathBuf::from("./temp/encrypted.bkup"));
+        task.original_size = 1024;
+
+        // 序列化
+        let json = serde_json::to_string(&task).expect("序列化失败");
+
+        // 反序列化
+        let restored: UploadTask = serde_json::from_str(&json).expect("反序列化失败");
+
+        // 验证加密字段正确恢复
+        assert!(restored.encrypt_enabled);
+        assert_eq!(restored.encrypt_progress, 50.0);
+        assert_eq!(
+            restored.encrypted_temp_path,
+            Some(PathBuf::from("./temp/encrypted.bkup"))
+        );
+        assert_eq!(restored.original_size, 1024);
     }
 }

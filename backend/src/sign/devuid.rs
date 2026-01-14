@@ -17,6 +17,7 @@
 ///
 /// # 示例
 /// ```
+/// use baidu_netdisk_rust::sign::devuid::generate_devuid;
 /// let devuid = generate_devuid("test_bduss");
 /// // 输出类似: "5D41402ABC4B2A76B9719D911017C592|0"
 /// ```

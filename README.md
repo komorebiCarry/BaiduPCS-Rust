@@ -121,22 +121,85 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
 - ✅ WebSocket 实时推送
 - ✅ 日志持久化与滚动
 
+### 🔄 自动备份
+- ✅ **上传备份**（本地 → 云端）：自动将本地文件夹备份到百度网盘
+- ✅ **下载备份**（云端 → 本地）：自动将云端文件同步到本地
+- ✅ **文件系统监听**：实时检测本地文件变化（Windows 使用 ReadDirectoryChangesW）
+- ✅ **定时轮询兜底**：防止监听遗漏，支持间隔轮询和指定时间全量扫描
+- ✅ 备份配置管理：创建/编辑/删除配置、手动触发、禁用/启用
+- ✅ 备份历史记录与 SQLite 持久化
+
+### 🔐 客户端侧加密
+- ✅ **AES-256-GCM 加密算法**：端到端加密保护文件隐私
+- ✅ **支持普通上传和自动备份**：灵活选择是否启用加密
+- ✅ 加密密钥管理：生成、导出、删除密钥
+- ✅ 加密文件使用 `.dat` 扩展名隐藏真实文件类型
+- ✅ 加密快照管理：记录映射关系，支持下载自动解密
+- ✅ **文件管理原始文件名显示**：加密文件在文件列表中自动还原显示原始文件名
+
+> ⚠️ **重要提示**：请务必妥善备份以下文件，否则已加密的文件将**无法解密**！
+> - `config/encryption.json`：加密密钥文件（建议同时使用界面的"导出密钥"功能备份）
+> - `config/baidu-pcs.db`：数据库文件，包含加密映射表（记录加密文件与原始文件名的对应关系）
+
+<details>
+<summary>📖 <b>加密映射原理说明</b>（点击展开）</summary>
+
+#### 文件加密
+- 每个文件加密后生成唯一的 UUID 文件名（如 `a1b2c3d4-xxxx.dat`）
+- 映射关系：`加密文件名 → 原始文件名` 存储在数据库中
+
+#### 文件夹加密映射
+文件夹使用**路径感知**的加密映射策略：
+
+**加密时（原始名 → 加密名）**：根据 `(父路径, 文件夹名)` 查询或生成 UUID
+```
+示例：
+1. 首次遇到 /backup/a/docs：
+   - 查询：parent=/backup/a, name=docs → 未找到
+   - 生成新 UUID：abc-123-xxx
+   - 保存映射：(/backup/a, docs) → abc-123-xxx
+
+2. 首次遇到 /backup/b/docs：
+   - 查询：parent=/backup/b, name=docs → 未找到
+   - 生成新 UUID：def-456-xxx（不同路径，不同 UUID）
+   - 保存映射：(/backup/b, docs) → def-456-xxx
+
+3. 再次遇到 /backup/a/docs：
+   - 查询：parent=/backup/a, name=docs → 找到 abc-123-xxx
+   - 复用已有加密名（保持一致性）
+```
+
+**解密时（加密名 → 原始名）**：直接根据 UUID 查询，无需父路径（UUID 全局唯一）
+
+这种设计确保：
+- ✅ 不同路径下的同名文件夹使用不同的加密名，避免冲突
+- ✅ 同一路径下的文件夹多次上传时复用同一加密名，保持一致性
+- ✅ 解密时通过唯一的 UUID 直接还原原始文件夹名
+
+</details>
+
 ---
 
 ## 📋 最新版本
 
-### v1.5.1 (当前版本)
+### v1.6.0 (当前版本)
 
-**基于 v1.5.0 的功能特性：**
-- ✨ **任务持久化**：新增 WAL + 元数据的持久化管理器，支持后台批量刷写、断点恢复与优雅关闭（下载/上传/转存任务重启可恢复）
-- ✨ **移动端适配**：主布局新增移动端抽屉导航与底部 Tab 栏，响应式样式覆盖文件/下载/上传/转存/设置页
-- ✨ **日志持久化与滚动**：支持日志文件落盘、按大小滚动和保留天数配置，默认启用
-- ✨ **任务槽机制**：下载引入任务槽（固定位+借调位）机制，替代预注册机制，保证并发可控
-- ✨ **WebSocket 实时推送**：任务状态可实时刷新
+**主要新功能：**
+- ✨ **自动备份功能**：支持本地文件夹自动备份到百度网盘
+    - 支持上传备份（本地 → 云端）和下载备份（云端 → 本地）两种方向
+    - 文件系统监听：实时检测本地文件变化
+    - 定时轮询兜底：防止监听遗漏，支持间隔轮询和指定时间全量扫描
+    - 备份配置管理、历史记录查看、SQLite 持久化断点恢复
+- ✨ **客户端侧加密**：支持普通上传任务和自动备份任务
+    - AES-256-GCM 加密算法，端到端加密保护文件隐私
+    - 加密密钥管理：生成、导出、删除密钥
+    - 下载自动解密
 
-**v1.5.1 更新内容：**
-- 🐛 修复若干 bug
-- ✨ 系统页面选择下载目录支持文件资源管理器
+**技术改进：**
+- 🔧 任务槽池机制重构：上传模块也采用统一的任务槽机制
+- 🔧 优先级调度支持：普通任务可抢占备份任务槽位
+- 🔧 历史记录从 JSONL 迁移到 SQLite
+- 🔧 新增 ARM64 Docker 镜像构建支持
 
 > 📝 **完整版本历史**：查看 [CHANGELOG.md](CHANGELOG.md) 了解所有版本的详细更新记录
 
@@ -190,6 +253,11 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
 
 浏览和管理百度网盘中的文件和目录，支持目录导航、文件信息查看和下载操作。
 
+#### 文件管理（加密文件显示）
+![文件管理-加密文件](docs/images/file-management-encrypted.png)
+
+加密文件和文件夹在文件列表中会显示"加密"标签，并自动还原显示原始文件名（通过查询本地加密映射表）。下载加密文件时会自动解密并恢复原始文件名。
+
 #### 下载管理
 ![下载管理](docs/images/download-management.png)
 
@@ -238,6 +306,21 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
 ![系统设置](docs/images/system-settings.png)
 
 配置服务器参数和下载选项，包括线程数、分片大小、下载目录等。
+
+#### 自动备份管理
+![自动备份管理](docs/images/autobackup-management.png)
+
+集中管理所有备份配置，查看备份状态、活跃任务数和加密状态，支持手动触发备份、禁用/启用和删除操作。
+
+#### 自动备份设置
+![自动备份设置](docs/images/autobackup-setting.png)
+
+配置备份触发方式，包括文件系统监听（实时检测文件变化）、轮询兜底设置和下载备份轮询模式。
+
+#### 加密设置
+![加密设置](docs/images/encrypted-setting.png)
+
+在系统设置中配置客户端侧加密，支持生成、导出和删除加密密钥，使用 AES-256-GCM 算法保护文件隐私。
 
 ### 使用 Docker（推荐）
 
@@ -303,20 +386,26 @@ open http://localhost:18888
 - 前端页面和 API 调用都通过 `http://localhost:18888` 访问
 - 前端在容器内部通过 `http://localhost:18888/api/v1` 调用后端 API
 - **挂载目录说明**：
-    - `config`：配置文件目录（应用配置、下载设置等）
+    - `config`：配置文件目录，包含以下重要文件：
+        - `encryption.json`：加密密钥文件
+        - `baidu-pcs.db`：SQLite 数据库（历史记录、加密映射表等）
+        - `autobackup_configs.json`：自动备份配置
     - `downloads`：下载文件保存目录
     - `data`：会话数据目录（登录信息、会话持久化）
     - `logs`：日志文件目录（应用运行日志，支持滚动）
     - `wal`：WAL 目录（任务持久化数据，支持断点恢复）
+- ⚠️ **重要提示**：如果启用了客户端侧加密功能，请务必备份以下文件：
+    - `config/encryption.json`：加密密钥，**丢失后将无法解密已加密的文件**！
+    - `config/baidu-pcs.db`：包含加密文件映射表，用于解密时查找原始文件名
 - 预构建镜像自动发布在以下位置：
     - [GitHub Container Registry](https://github.com/komorebiCarry/BaiduPCS-Rust/pkgs/container/baidupcs-rust) - `ghcr.io/komorebicarry/baidupcs-rust:latest`（推荐，无需额外注册）
     - [Docker Hub](https://hub.docker.com/r/komorebicarry/baidupcs-rust) - `komorebicarry/baidupcs-rust:latest`（可选，需要配置 secrets）
 - 当创建 Git 标签（如 `v1.0.0`）时，GitHub Actions 会自动构建并推送 Docker 镜像
 - **Linux 用户推荐使用 Docker Hub 镜像**（更通用，无需登录）：`komorebicarry/baidupcs-rust:latest`
-- **如果镜像拉取较慢**，也可以从 [GitHub Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面直接下载 Docker 镜像文件（`baidupcs-rust-{版本号}-docker.tar.gz`），然后使用以下命令加载：
+- **如果镜像拉取较慢**，也可以从 [GitHub Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面直接下载 Docker 镜像文件（`BaiduPCS-Rust-{版本号}-docker.tar.gz`），然后使用以下命令加载：
   ```bash
   # 下载镜像文件后，加载镜像
-  docker load < baidupcs-rust-v1.5.1-docker.tar.gz
+  docker load < BaiduPCS-Rust-v1.6.0-docker.tar.gz
   
   # 加载后可以使用镜像运行容器
   docker run -d \
@@ -328,7 +417,7 @@ open http://localhost:18888
     -v $(pwd)/logs:/app/logs \
     -v $(pwd)/wal:/app/wal \
     --restart unless-stopped \
-    baidupcs-rust:v1.5.1
+    baidupcs-rust:v1.6.0
   ```
 
 ### 手动安装
@@ -566,8 +655,9 @@ cargo test
 - [x] ✅ WebSocket 实时推送与心跳/重连
 - [x] ✅ 日志持久化与滚动
 - [x] ✅ 移动端适配
-- [ ] 📝 自动备份
-- [ ] 📝 加密自动备份
+- [x] ✅ 自动备份
+- [x] ✅ 客户端侧加密（支持普通上传和自动备份）
+- [ ] 📝 下载/上传 SSD 缓冲区（针对 NAS 用户：① 减少 HDD 活跃时间，让硬盘更多休眠；② 提升传输效率，仅网速 > 磁盘速度时有效）
 
 ---
 

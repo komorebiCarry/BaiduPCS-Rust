@@ -10,6 +10,7 @@ import type {
   FolderEvent,
   UploadEvent,
   TransferEvent,
+  BackupEvent,
   TimestampedEvent,
 } from '@/types/events'
 
@@ -21,6 +22,7 @@ type DownloadEventCallback = (event: DownloadEvent) => void
 type FolderEventCallback = (event: FolderEvent) => void
 type UploadEventCallback = (event: UploadEvent) => void
 type TransferEventCallback = (event: TransferEvent) => void
+type BackupEventCallback = (event: BackupEvent) => void
 type ConnectionStateCallback = (state: ConnectionState) => void
 
 // 重连配置
@@ -43,6 +45,7 @@ class WebSocketClient {
   private folderListeners: Set<FolderEventCallback> = new Set()
   private uploadListeners: Set<UploadEventCallback> = new Set()
   private transferListeners: Set<TransferEventCallback> = new Set()
+  private backupListeners: Set<BackupEventCallback> = new Set()
   private connectionStateListeners: Set<ConnectionStateCallback> = new Set()
 
   // 连接 ID
@@ -137,7 +140,7 @@ class WebSocketClient {
       this.reconnectAttempt = 0
       this.setConnectionState('connected')
       this.startHeartbeat()
-      
+
       // 🔥 连接成功后自动恢复订阅
       if (this.currentSubscriptions.size > 0) {
         const subscriptions = Array.from(this.currentSubscriptions)
@@ -227,10 +230,10 @@ class WebSocketClient {
 
     // 🔥 记录接收到的事件
     console.log(
-      `📡 [WS接收] 类别=${category} | 事件=${(event.event as any).event_type} | 任务=${
-        (event.event as any).task_id || (event.event as any).folder_id || 'unknown'
-      } | 事件ID=${event.event_id} | 时间戳=${event.timestamp}`,
-      event
+        `📡 [WS接收] 类别=${category} | 事件=${(event.event as any).event_type} | 任务=${
+            (event.event as any).task_id || (event.event as any).folder_id || 'unknown'
+        } | 事件ID=${event.event_id} | 时间戳=${event.timestamp}`,
+        event
     )
 
     switch (category) {
@@ -245,6 +248,9 @@ class WebSocketClient {
         break
       case 'transfer':
         this.transferListeners.forEach((cb) => cb(event.event as TransferEvent))
+        break
+      case 'backup':
+        this.backupListeners.forEach((cb) => cb(event.event as BackupEvent))
         break
       default:
         console.warn('[WS] 未知事件类别:', category)
@@ -354,6 +360,14 @@ class WebSocketClient {
   }
 
   /**
+   * 订阅备份事件
+   */
+  public onBackupEvent(callback: BackupEventCallback): () => void {
+    this.backupListeners.add(callback)
+    return () => this.backupListeners.delete(callback)
+  }
+
+  /**
    * 订阅连接状态变化
    */
   public onConnectionStateChange(callback: ConnectionStateCallback): () => void {
@@ -374,7 +388,7 @@ class WebSocketClient {
 
   /**
    * 订阅事件
-   * 
+   *
    * 订阅名称格式：
    * - `download:file` - 文件下载事件
    * - `download:folder` - 文件夹下载事件
