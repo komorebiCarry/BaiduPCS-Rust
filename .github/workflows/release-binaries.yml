@@ -172,7 +172,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          tags: BaiduPCS-Rust:${{ github.ref_name }}-amd64
+          tags: baidupcs-rust:${{ github.ref_name }}-amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
           outputs: type=docker,dest=/tmp/BaiduPCS-Rust-${{ github.ref_name }}-amd64.tar
