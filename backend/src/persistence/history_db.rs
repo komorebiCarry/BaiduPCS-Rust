@@ -146,6 +146,22 @@ impl HistoryDbManager {
             [],
         )?;
 
+        // 创建 cloud_dl_auto_download 表（离线下载自动下载配置）
+        conn.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS cloud_dl_auto_download (
+                task_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                local_path TEXT,
+                ask_each_time INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                triggered INTEGER NOT NULL DEFAULT 0,
+                triggered_at INTEGER
+            )
+            "#,
+            [],
+        )?;
+
         info!("历史数据库表初始化完成");
         Ok(())
     }
@@ -331,7 +347,7 @@ impl HistoryDbManager {
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT 
+            SELECT
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
@@ -423,7 +439,7 @@ impl HistoryDbManager {
         let row: Option<TaskHistoryRow> = conn
             .query_row(
                 r#"
-                SELECT 
+                SELECT
                     task_id, task_type, status, created_at, updated_at, completed_at,
                     fs_id, remote_path, local_path,
                     source_path, target_path, upload_id,
@@ -479,11 +495,11 @@ impl HistoryDbManager {
     }
 
     /// 分页获取任务历史
-    /// 
+    ///
     /// # Arguments
     /// * `offset` - 偏移量
     /// * `limit` - 每页数量
-    /// 
+    ///
     /// # Returns
     /// * `(Vec<TaskMetadata>, usize)` - (任务列表, 总数)
     pub fn get_task_history_paginated(
@@ -506,7 +522,7 @@ impl HistoryDbManager {
         // 获取分页数据
         let mut stmt = conn.prepare(
             r#"
-            SELECT 
+            SELECT
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
@@ -570,13 +586,13 @@ impl HistoryDbManager {
     }
 
     /// 按任务类型和状态分页获取任务历史
-    /// 
+    ///
     /// # Arguments
     /// * `task_type` - 任务类型 (download, upload, transfer)
     /// * `status` - 任务状态 (completed, failed, etc.)
     /// * `offset` - 偏移量
     /// * `limit` - 每页数量
-    /// 
+    ///
     /// # Returns
     /// * `(Vec<TaskMetadata>, usize)` - (任务列表, 总数)
     pub fn get_task_history_by_type_and_status(
@@ -601,7 +617,7 @@ impl HistoryDbManager {
         // 获取分页数据
         let mut stmt = conn.prepare(
             r#"
-            SELECT 
+            SELECT
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
@@ -666,14 +682,14 @@ impl HistoryDbManager {
     }
 
     /// 按任务类型和状态获取任务历史（排除备份任务）
-    /// 
+    ///
     /// # Arguments
     /// * `task_type` - 任务类型 (download, upload, transfer)
     /// * `status` - 任务状态 (completed, failed, etc.)
     /// * `exclude_backup` - 是否排除备份任务
     /// * `offset` - 偏移量
     /// * `limit` - 每页数量
-    /// 
+    ///
     /// # Returns
     /// * `(Vec<TaskMetadata>, usize)` - (任务列表, 总数)
     pub fn get_task_history_by_type_status_exclude_backup(
@@ -701,7 +717,7 @@ impl HistoryDbManager {
         // 获取分页数据
         let query_sql = format!(
             r#"
-            SELECT 
+            SELECT
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
@@ -989,7 +1005,7 @@ impl HistoryDbManager {
 
         let mut stmt = conn.prepare(
             r#"
-            SELECT 
+            SELECT
                 folder_id, name, remote_root, local_root, status,
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
@@ -1073,6 +1089,24 @@ impl HistoryDbManager {
             info!("已从历史数据库中删除文件夹: {}", folder_id);
         }
         Ok(deleted > 0)
+    }
+
+    /// 删除所有已完成的文件夹历史
+    pub fn remove_completed_folders(&self) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = conn.execute(
+            "DELETE FROM folder_history WHERE status = 'completed'",
+            [],
+        )?;
+
+        if deleted > 0 {
+            info!("已从历史数据库中删除 {} 个已完成的文件夹", deleted);
+        }
+        Ok(deleted)
     }
 
     /// 清理过期的文件夹历史
@@ -1300,4 +1334,251 @@ struct FolderHistoryRow {
     error: Option<String>,
     transfer_task_id: Option<String>,
     pending_files_json: Option<String>,
+}
+
+// ========================================================================
+// 离线下载自动下载配置
+// ========================================================================
+
+/// 离线下载自动下载配置（用于持久化）
+#[derive(Debug, Clone)]
+pub struct CloudDlAutoDownloadConfig {
+    /// 离线下载任务 ID
+    pub task_id: i64,
+    /// 是否启用自动下载
+    pub enabled: bool,
+    /// 本地下载目录
+    pub local_path: Option<String>,
+    /// 完成时是否每次询问下载目录
+    pub ask_each_time: bool,
+    /// 创建时间戳
+    pub created_at: i64,
+    /// 是否已触发自动下载（防止重复触发）
+    pub triggered: bool,
+    /// 触发时间戳（触发自动下载的时间）
+    pub triggered_at: Option<i64>,
+}
+
+
+// ========================================================================
+// cloud_dl_auto_download 操作
+// ========================================================================
+
+impl HistoryDbManager {
+    /// 保存离线下载自动下载配置
+    pub fn save_cloud_dl_auto_download(&self, config: &CloudDlAutoDownloadConfig) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO cloud_dl_auto_download (
+                task_id, enabled, local_path, ask_each_time, created_at, triggered, triggered_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                config.task_id,
+                if config.enabled { 1 } else { 0 },
+                config.local_path,
+                if config.ask_each_time { 1 } else { 0 },
+                config.created_at,
+                if config.triggered { 1 } else { 0 },
+                config.triggered_at,
+            ],
+        )?;
+
+        debug!("已保存离线下载自动下载配置: task_id={}", config.task_id);
+        Ok(())
+    }
+
+    /// 标记自动下载已触发（防止重复触发）
+    pub fn mark_cloud_dl_auto_download_triggered(&self, task_id: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let now = chrono::Utc::now().timestamp();
+        let updated = conn.execute(
+            "UPDATE cloud_dl_auto_download SET triggered = 1, triggered_at = ?1 WHERE task_id = ?2 AND triggered = 0",
+            params![now, task_id],
+        )?;
+
+        if updated > 0 {
+            info!("已标记离线下载自动下载为已触发: task_id={}", task_id);
+        }
+        Ok(updated > 0)
+    }
+
+    /// 删除离线下载自动下载配置
+    pub fn remove_cloud_dl_auto_download(&self, task_id: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = conn.execute(
+            "DELETE FROM cloud_dl_auto_download WHERE task_id = ?1",
+            params![task_id],
+        )?;
+
+        if deleted > 0 {
+            debug!("已删除离线下载自动下载配置: task_id={}", task_id);
+        }
+        Ok(deleted > 0)
+    }
+
+    /// 加载所有未触发的离线下载自动下载配置
+    ///
+    /// 只返回 triggered = 0 的配置，用于服务重启后恢复监听
+    pub fn load_pending_cloud_dl_auto_download(&self) -> Result<Vec<CloudDlAutoDownloadConfig>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT task_id, enabled, local_path, ask_each_time, created_at, triggered, triggered_at
+            FROM cloud_dl_auto_download
+            WHERE triggered = 0
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(CloudDlAutoDownloadConfig {
+                task_id: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                local_path: row.get(2)?,
+                ask_each_time: row.get::<_, i64>(3)? != 0,
+                created_at: row.get(4)?,
+                triggered: row.get::<_, i64>(5)? != 0,
+                triggered_at: row.get(6)?,
+            })
+        })?;
+
+        let mut configs = Vec::new();
+        for row in rows {
+            match row {
+                Ok(config) => configs.push(config),
+                Err(e) => warn!("读取离线下载自动下载配置失败: {}", e),
+            }
+        }
+
+        info!("从数据库加载了 {} 条待触发的离线下载自动下载配置", configs.len());
+        Ok(configs)
+    }
+
+    /// 加载所有离线下载自动下载配置（包括已触发的）
+    pub fn load_all_cloud_dl_auto_download(&self) -> Result<Vec<CloudDlAutoDownloadConfig>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT task_id, enabled, local_path, ask_each_time, created_at, triggered, triggered_at
+            FROM cloud_dl_auto_download
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(CloudDlAutoDownloadConfig {
+                task_id: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                local_path: row.get(2)?,
+                ask_each_time: row.get::<_, i64>(3)? != 0,
+                created_at: row.get(4)?,
+                triggered: row.get::<_, i64>(5)? != 0,
+                triggered_at: row.get(6)?,
+            })
+        })?;
+
+        let mut configs = Vec::new();
+        for row in rows {
+            match row {
+                Ok(config) => configs.push(config),
+                Err(e) => warn!("读取离线下载自动下载配置失败: {}", e),
+            }
+        }
+
+        info!("从数据库加载了 {} 条离线下载自动下载配置", configs.len());
+        Ok(configs)
+    }
+
+    /// 获取单个离线下载自动下载配置
+    pub fn get_cloud_dl_auto_download(&self, task_id: i64) -> Result<Option<CloudDlAutoDownloadConfig>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let config = conn
+            .query_row(
+                r#"
+                SELECT task_id, enabled, local_path, ask_each_time, created_at, triggered, triggered_at
+                FROM cloud_dl_auto_download
+                WHERE task_id = ?1
+                "#,
+                params![task_id],
+                |row| {
+                    Ok(CloudDlAutoDownloadConfig {
+                        task_id: row.get(0)?,
+                        enabled: row.get::<_, i64>(1)? != 0,
+                        local_path: row.get(2)?,
+                        ask_each_time: row.get::<_, i64>(3)? != 0,
+                        created_at: row.get(4)?,
+                        triggered: row.get::<_, i64>(5)? != 0,
+                        triggered_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(config)
+    }
+
+    /// 清理已触发的离线下载自动下载配置（可选：保留最近 N 天的记录）
+    pub fn cleanup_triggered_cloud_dl_auto_download(&self, retention_days: Option<u64>) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = if let Some(days) = retention_days {
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).timestamp();
+            conn.execute(
+                "DELETE FROM cloud_dl_auto_download WHERE triggered = 1 AND triggered_at < ?1",
+                params![cutoff],
+            )?
+        } else {
+            conn.execute(
+                "DELETE FROM cloud_dl_auto_download WHERE triggered = 1",
+                [],
+            )?
+        };
+
+        if deleted > 0 {
+            info!("已清理 {} 条已触发的离线下载自动下载配置", deleted);
+        }
+        Ok(deleted)
+    }
+
+    /// 清理所有离线下载自动下载配置
+    pub fn clear_all_cloud_dl_auto_download(&self) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = conn.execute("DELETE FROM cloud_dl_auto_download", [])?;
+
+        if deleted > 0 {
+            info!("已清理 {} 条离线下载自动下载配置", deleted);
+        }
+        Ok(deleted)
+    }
 }

@@ -7,7 +7,7 @@ use crate::autobackup::AutoBackupManager;
 use crate::common::{MemoryMonitor, MemoryMonitorConfig};
 use crate::config::AppConfig;
 use crate::downloader::{DownloadManager, FolderDownloadManager};
-use crate::netdisk::NetdiskClient;
+use crate::netdisk::{CloudDlMonitor, NetdiskClient};
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, scan_recoverable_tasks, DownloadRecoveryInfo,
     PersistenceManager, TransferRecoveryInfo, UploadRecoveryInfo,
@@ -52,6 +52,8 @@ pub struct AppState {
     pub backup_record_manager: Arc<BackupRecordManager>,
     /// 🔥 内存监控器
     pub memory_monitor: Arc<MemoryMonitor>,
+    /// 🔥 离线下载监听服务
+    pub cloud_dl_monitor: Arc<RwLock<Option<Arc<CloudDlMonitor>>>>,
 }
 
 impl AppState {
@@ -101,6 +103,7 @@ impl AppState {
             snapshot_manager,
             backup_record_manager,
             memory_monitor,
+            cloud_dl_monitor: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -116,18 +119,55 @@ impl AppState {
             // 初始化网盘客户端
             let client = NetdiskClient::new(user_auth.clone())?;
 
-            // 如果没有预热 Cookie,执行预热并保存
-            if user_auth.panpsc.is_none()
+            // 预热过期时间（2小时 = 7200秒）
+            const WARMUP_EXPIRE_SECS: i64 = 86400;
+
+            // 检查是否需要预热：
+            // 1. 预热数据不存在
+            // 2. 或者预热数据已过期（超过24小时）
+            let need_warmup = if user_auth.panpsc.is_none()
                 || user_auth.csrf_token.is_none()
                 || user_auth.bdstoken.is_none()
             {
                 info!("服务启动检测到会话未预热,开始预热...");
+                true
+            } else if let Some(last_warmup) = user_auth.last_warmup_at {
+                let now = chrono::Utc::now().timestamp();
+                let elapsed = now - last_warmup;
+                if elapsed > WARMUP_EXPIRE_SECS {
+                    info!(
+                        "防止预热数据过期({}秒前),清除旧数据并重新预热...",
+                        elapsed
+                    );
+                    // 清除过期的预热数据
+                    user_auth.panpsc = None;
+                    user_auth.csrf_token = None;
+                    user_auth.bdstoken = None;
+                    true
+                } else {
+                    info!(
+                        "检测到已有预热 Cookie({}秒前预热),跳过预热",
+                        elapsed
+                    );
+                    false
+                }
+            } else {
+                // 有预热数据但没有时间戳（旧版本数据），执行预热
+                info!("预热数据缺少时间戳,重新预热...");
+                user_auth.panpsc = None;
+                user_auth.csrf_token = None;
+                user_auth.bdstoken = None;
+                true
+            };
+
+            if need_warmup {
                 match client.warmup_and_get_cookies().await {
                     Ok((panpsc, csrf_token, bdstoken, stoken)) => {
                         info!("预热成功,更新 session.json");
                         user_auth.panpsc = panpsc;
                         user_auth.csrf_token = csrf_token;
                         user_auth.bdstoken = bdstoken;
+                        user_auth.last_warmup_at = Some(chrono::Utc::now().timestamp());
                         // 预热时下发的 STOKEN 优先于之前保存的
                         if stoken.is_some() {
                             user_auth.stoken = stoken;
@@ -145,8 +185,6 @@ impl AppState {
                         warn!("预热失败(可能需要重新登录): {}", e);
                     }
                 }
-            } else {
-                info!("检测到已有预热 Cookie,跳过预热");
             }
 
             let client_arc = Arc::new(client.clone());
@@ -186,6 +224,11 @@ impl AppState {
             // 🔥 设置文件夹下载管理器的 WAL 目录（用于文件夹持久化）
             let wal_dir = pm_arc.lock().await.wal_dir().clone();
             self.folder_download_manager.set_wal_dir(wal_dir).await;
+
+            // 🔥 设置文件夹下载管理器的持久化管理器（用于加载历史文件夹）
+            self.folder_download_manager
+                .set_persistence_manager(Arc::clone(&pm_arc))
+                .await;
 
             // 🔥 设置文件夹下载管理器的 WebSocket 管理器
             self.folder_download_manager
@@ -253,6 +296,9 @@ impl AppState {
 
             *self.transfer_manager.write().await = Some(Arc::clone(&transfer_manager_arc));
             info!("转存管理器初始化完成");
+
+            // 🔥 初始化离线下载监听服务
+            self.init_cloud_dl_monitor().await;
 
             // 🔥 恢复任务
             self.recover_tasks(
@@ -452,11 +498,141 @@ impl AppState {
         }
     }
 
+    /// 🔥 初始化离线下载监听服务
+    pub async fn init_cloud_dl_monitor(&self) {
+        // 获取网盘客户端
+        let client_lock = self.netdisk_client.read().await;
+        let client = match client_lock.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                warn!("网盘客户端未初始化，跳过离线下载监听服务初始化");
+                return;
+            }
+        };
+        drop(client_lock);
+
+        // 创建监听服务
+        let monitor = CloudDlMonitor::new(Arc::new(client));
+
+        // 设置 WebSocket 管理器
+        monitor.set_ws_manager(Arc::clone(&self.ws_manager)).await;
+
+        // 设置数据库路径（用于持久化自动下载配置）
+        let config = self.config.read().await;
+        let db_path = std::path::PathBuf::from(&config.persistence.db_path);
+        drop(config);
+        monitor.set_db_path(db_path).await;
+
+        // 🔥 设置下载管理器（用于自动下载功能）
+        if let Some(ref dm) = *self.download_manager.read().await {
+            monitor.set_download_manager(Arc::clone(dm)).await;
+        }
+
+        // 🔥 设置文件夹下载管理器（用于自动下载文件夹）
+        monitor.set_folder_download_manager(Arc::clone(&self.folder_download_manager)).await;
+
+        // 从数据库加载未触发的自动下载配置
+        let loaded = monitor.load_auto_download_configs_from_db().await;
+        if loaded > 0 {
+            info!("离线下载监听服务已恢复 {} 个自动下载配置", loaded);
+        }
+
+        let monitor_arc = Arc::new(monitor);
+
+        // 启动后台监听任务
+        let monitor_clone = Arc::clone(&monitor_arc);
+        tokio::spawn(async move {
+            monitor_clone.start().await;
+        });
+
+        *self.cloud_dl_monitor.write().await = Some(monitor_arc);
+        info!("离线下载监听服务初始化完成");
+    }
+
+    /// 🔥 手动触发预热
+    ///
+    /// 当 API 返回特定错误码（如 errno=-6）时，可调用此方法重新预热会话。
+    /// 预热成功后会自动更新 session.json。
+    ///
+    /// # 返回值
+    /// - `Ok(true)` - 预热成功
+    /// - `Ok(false)` - 无需预热（用户未登录或客户端未初始化）
+    /// - `Err(e)` - 预热失败
+    pub async fn trigger_warmup(&self) -> anyhow::Result<bool> {
+        // 获取网盘客户端
+        let client = {
+            let client_lock = self.netdisk_client.read().await;
+            match client_lock.as_ref() {
+                Some(c) => c.clone(),
+                None => {
+                    warn!("网盘客户端未初始化，无法执行预热");
+                    return Ok(false);
+                }
+            }
+        };
+
+        // 获取当前用户
+        let mut user_auth = {
+            let user_lock = self.current_user.read().await;
+            match user_lock.as_ref() {
+                Some(u) => u.clone(),
+                None => {
+                    warn!("用户未登录，无法执行预热");
+                    return Ok(false);
+                }
+            }
+        };
+
+        info!("手动触发预热...");
+
+        // 清除旧的预热数据
+        user_auth.panpsc = None;
+        user_auth.csrf_token = None;
+        user_auth.bdstoken = None;
+
+        // 执行预热
+        match client.warmup_and_get_cookies().await {
+            Ok((panpsc, csrf_token, bdstoken, stoken)) => {
+                info!("手动预热成功，更新 session.json");
+                user_auth.panpsc = panpsc;
+                user_auth.csrf_token = csrf_token;
+                user_auth.bdstoken = bdstoken;
+                user_auth.last_warmup_at = Some(chrono::Utc::now().timestamp());
+
+                // 预热时下发的 STOKEN 优先于之前保存的
+                if stoken.is_some() {
+                    user_auth.stoken = stoken;
+                }
+
+                // 更新内存中的用户信息
+                *self.current_user.write().await = Some(user_auth.clone());
+
+                // 保存到 session.json
+                let mut session_manager = self.session_manager.lock().await;
+                if let Err(e) = session_manager.save_session(&user_auth).await {
+                    error!("保存预热 Cookie 失败: {}", e);
+                }
+
+                Ok(true)
+            }
+            Err(e) => {
+                error!("手动预热失败: {}", e);
+                Err(anyhow::anyhow!("预热失败: {}", e))
+            }
+        }
+    }
+
     /// 🔥 优雅关闭
     ///
     /// 关闭持久化管理器，确保所有 WAL 数据刷写到磁盘
     pub async fn shutdown(&self) {
         info!("正在关闭应用状态...");
+
+        // 停止离线下载监听服务
+        if let Some(ref monitor) = *self.cloud_dl_monitor.read().await {
+            monitor.stop();
+            info!("离线下载监听服务已停止");
+        }
 
         // 停止内存监控器
         self.memory_monitor.stop();

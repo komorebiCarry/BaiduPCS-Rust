@@ -104,6 +104,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    // 检查连接是否订阅了 cloud_dl，如果是则减少订阅者计数
+    let subscriptions = ws_manager.get_subscriptions(&connection_id);
+    let was_subscribed_cloud_dl = subscriptions.iter().any(|s| {
+        s == "cloud_dl" || s.starts_with("cloud_dl:")
+    });
+
+    if was_subscribed_cloud_dl {
+        if let Some(ref monitor) = *state.cloud_dl_monitor.read().await {
+            monitor.remove_subscriber();
+            debug!("连接关闭，cloud_dl 订阅者减少: {}", connection_id);
+        }
+    }
+
     // 清理连接
     ws_manager.unregister(&connection_id);
     info!("WebSocket 连接已关闭: {}", connection_id);
@@ -126,10 +139,28 @@ async fn handle_client_message(state: &AppState, connection_id: &str, text: &str
             }
             WsClientMessage::Subscribe { subscriptions } => {
                 debug!("收到订阅请求: {} - {:?}", connection_id, subscriptions);
-                
+
+                // 检查是否订阅了 cloud_dl
+                let subscribing_cloud_dl = subscriptions.iter().any(|s| {
+                    s == "cloud_dl" || s.starts_with("cloud_dl:")
+                });
+
+                // 检查之前是否已经订阅过 cloud_dl（防止重复计数）
+                let was_subscribed_cloud_dl = state.ws_manager.get_subscriptions(connection_id)
+                    .iter()
+                    .any(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+
                 // 添加订阅
                 state.ws_manager.subscribe(connection_id, subscriptions);
-                
+
+                // 只有之前没订阅过 cloud_dl，现在新订阅了，才增加订阅者计数
+                if subscribing_cloud_dl && !was_subscribed_cloud_dl {
+                    if let Some(ref monitor) = *state.cloud_dl_monitor.read().await {
+                        monitor.add_subscriber();
+                        debug!("cloud_dl 订阅者增加: {}", connection_id);
+                    }
+                }
+
                 // 返回订阅成功消息
                 let current_subs = state.ws_manager.get_subscriptions(connection_id);
                 state.ws_manager.send_to(
@@ -139,10 +170,23 @@ async fn handle_client_message(state: &AppState, connection_id: &str, text: &str
             }
             WsClientMessage::Unsubscribe { subscriptions } => {
                 debug!("收到取消订阅请求: {} - {:?}", connection_id, subscriptions);
-                
+
+                // 检查是否取消订阅了 cloud_dl
+                let unsubscribing_cloud_dl = subscriptions.iter().any(|s| {
+                    s == "cloud_dl" || s.starts_with("cloud_dl:")
+                });
+
                 // 移除订阅
                 state.ws_manager.unsubscribe(connection_id, subscriptions);
-                
+
+                // 如果取消订阅了 cloud_dl，通知监听服务减少订阅者
+                if unsubscribing_cloud_dl {
+                    if let Some(ref monitor) = *state.cloud_dl_monitor.read().await {
+                        monitor.remove_subscriber();
+                        debug!("cloud_dl 订阅者减少: {}", connection_id);
+                    }
+                }
+
                 // 返回取消订阅成功消息
                 let current_subs = state.ws_manager.get_subscriptions(connection_id);
                 state.ws_manager.send_to(

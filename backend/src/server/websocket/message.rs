@@ -15,13 +15,15 @@ pub enum WsClientMessage {
     /// 请求状态快照
     RequestSnapshot,
     /// 订阅事件
-    /// 
+    ///
     /// 支持的订阅模式：
     /// - `download` - 所有下载事件
     /// - `download:*` - 所有下载事件（通配符）
     /// - `folder` - 所有文件夹下载事件
     /// - `upload` - 所有上传事件
     /// - `transfer` - 所有转存事件
+    /// - `cloud_dl` - 所有离线下载事件
+    /// - `cloud_dl:*` - 所有离线下载事件（通配符）
     /// - `*` - 所有事件
     Subscribe {
         /// 要订阅的模式列表

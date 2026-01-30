@@ -43,6 +43,11 @@
           <template #title>自动备份</template>
         </el-menu-item>
 
+        <el-menu-item index="/cloud-dl">
+          <el-icon><Link /></el-icon>
+          <template #title>离线下载</template>
+        </el-menu-item>
+
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
           <template #title>系统设置</template>
@@ -105,6 +110,11 @@
           <el-menu-item index="/autobackup">
             <el-icon><Refresh /></el-icon>
             <span>自动备份</span>
+          </el-menu-item>
+
+          <el-menu-item index="/cloud-dl">
+            <el-icon><Link /></el-icon>
+            <span>离线下载</span>
           </el-menu-item>
 
           <el-menu-item index="/settings">
@@ -234,6 +244,7 @@ import {
   Menu,
   Refresh,
   Lock,
+  Link,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -270,6 +281,7 @@ const pageTitle = computed(() => {
     '/uploads': '上传管理',
     '/transfers': '转存管理',
     '/autobackup': '自动备份',
+    '/cloud-dl': '离线下载',
     '/settings': '系统设置',
   }
   return titles[route.path] || '百度网盘'

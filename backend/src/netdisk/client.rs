@@ -1483,7 +1483,7 @@ impl NetdiskClient {
                 "创建文件夹失败: error_code={}, error_msg={}",
                 error_code, error_msg
             );
-            anyhow::bail!("创建文件夹失败: {} - {}", error_code, error_msg);
+            anyhow::bail!("创建文件夹失败: errno={}, msg={}", error_code, error_msg);
         }
 
         info!("创建文件夹成功: path={}", remote_path);
@@ -2075,6 +2075,591 @@ impl NetdiskClient {
                 transferred_fs_ids: vec![],
             })
         }
+    }
+
+    // =====================================================
+    // 离线下载（Cloud Download）相关 API
+    // =====================================================
+
+    /// 标准化磁力链接
+    ///
+    /// 百度网盘离线下载 API 只接受大写十六进制格式的 info hash。
+    /// 此函数将 Base32 编码的 hash 转换为十六进制，并将小写转换为大写。
+    /// 同时简化磁力链接，只保留 xt 参数，去掉 tracker 等其他参数。
+    ///
+    /// # 参数
+    /// * `magnet_url` - 原始磁力链接
+    ///
+    /// # 返回
+    /// 标准化后的磁力链接（格式：magnet:?xt=urn:btih:HASH）
+    fn normalize_magnet_link(magnet_url: &str) -> String {
+        // 检查是否是磁力链接
+        if !magnet_url.to_lowercase().starts_with("magnet:?") {
+            return magnet_url.to_string();
+        }
+
+        // 解析磁力链接参数，提取 info hash
+        let query_start = magnet_url.find('?').unwrap_or(magnet_url.len());
+        let query_str = &magnet_url[query_start + 1..];
+
+        // 只提取 xt 参数中的 info hash，忽略其他参数（tr, dn 等）
+        // 百度 API 只需要简单的 magnet:?xt=urn:btih:HASH 格式
+        for param in query_str.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                if key == "xt" && value.to_lowercase().starts_with("urn:btih:") {
+                    // 提取 info hash
+                    let hash = &value[9..]; // 跳过 "urn:btih:"
+
+                    let normalized_hash = if hash.len() == 32 {
+                        // Base32 编码，需要转换为十六进制
+                        match Self::base32_to_hex(hash) {
+                            Some(hex) => {
+                                info!(
+                                    "磁力链接 hash 从 Base32 转换为十六进制: {} -> {}",
+                                    hash, hex
+                                );
+                                hex
+                            }
+                            None => {
+                                warn!("Base32 解码失败，保持原样: {}", hash);
+                                hash.to_uppercase()
+                            }
+                        }
+                    } else if hash.len() == 40 {
+                        // 已经是十六进制，只需转换为大写
+                        let upper = hash.to_uppercase();
+                        if upper != hash {
+                            info!("磁力链接 hash 转换为大写: {} -> {}", hash, upper);
+                        }
+                        upper
+                    } else {
+                        // 未知格式，保持原样
+                        warn!("未知的 info hash 格式 (长度={}): {}", hash.len(), hash);
+                        hash.to_string()
+                    };
+
+                    // 返回简化的磁力链接，只包含 xt 参数
+                    let result = format!("magnet:?xt=urn:btih:{}", normalized_hash);
+                    info!("磁力链接标准化完成: {} -> {}", magnet_url, result);
+                    return result;
+                }
+            }
+        }
+
+        // 没有找到有效的 xt 参数，返回原始链接
+        warn!("磁力链接中未找到有效的 xt 参数: {}", magnet_url);
+        magnet_url.to_string()
+    }
+
+    /// 将 Base32 编码的字符串转换为十六进制
+    ///
+    /// BitTorrent 使用的是 RFC 4648 Base32 编码（无填充）
+    fn base32_to_hex(base32: &str) -> Option<String> {
+        // Base32 字母表 (RFC 4648)
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+        let input = base32.to_uppercase();
+        let input_bytes = input.as_bytes();
+
+        // 验证输入长度（32 字符 Base32 = 20 字节 = 40 字符十六进制）
+        if input_bytes.len() != 32 {
+            return None;
+        }
+
+        // 解码 Base32
+        let mut bits: u64 = 0;
+        let mut bit_count = 0;
+        let mut output = Vec::with_capacity(20);
+
+        for &c in input_bytes {
+            let value = ALPHABET.iter().position(|&x| x == c)? as u64;
+            bits = (bits << 5) | value;
+            bit_count += 5;
+
+            if bit_count >= 8 {
+                bit_count -= 8;
+                output.push((bits >> bit_count) as u8);
+                bits &= (1 << bit_count) - 1;
+            }
+        }
+
+        // 转换为十六进制（大写）
+        let hex: String = output.iter().map(|b| format!("{:02X}", b)).collect();
+
+        Some(hex)
+    }
+
+    /// 查询磁力链接信息，获取文件列表
+    ///
+    /// # 参数
+    /// * `magnet_url` - 磁力链接
+    /// * `save_path` - 保存路径
+    ///
+    /// # 返回
+    /// 文件数量
+    async fn cloud_dl_query_magnet_info(&self, magnet_url: &str, save_path: &str) -> Result<usize> {
+        info!("查询磁力链接信息: {}", magnet_url);
+
+        let url = "https://pan.baidu.com/rest/2.0/services/cloud_dl";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .form(&[
+                ("method", "query_magnetinfo"),
+                ("app_id", "250528"),
+                ("source_url", magnet_url),
+                ("save_path", save_path),
+                ("type", "4"),
+            ])
+            .send()
+            .await
+            .context("查询磁力链接信息请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取磁力链接信息响应失败")?;
+
+        info!("查询磁力链接信息响应: status={}, body={}", status, response_text);
+
+        // 解析响应，提取文件数量
+        let json: serde_json::Value =
+            serde_json::from_str(&response_text).context("解析磁力链接信息响应失败")?;
+
+        // 检查错误码
+        if let Some(error_code) = json.get("error_code").and_then(|v| v.as_i64()) {
+            if error_code != 0 {
+                let error_msg = json
+                    .get("error_msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误");
+                anyhow::bail!("查询磁力链接信息失败: {} ({})", error_msg, error_code);
+            }
+        }
+
+        // 提取文件列表
+        let file_count = json
+            .get("magnet_info")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+
+        info!("磁力链接包含 {} 个文件", file_count);
+
+        Ok(file_count)
+    }
+
+    /// 添加离线下载任务
+    ///
+    /// # 参数
+    /// * `source_url` - 下载源链接（支持 HTTP/HTTPS/磁力链接/ed2k）
+    /// * `save_path` - 网盘保存路径（默认为根目录 "/"）
+    ///
+    /// # 返回
+    /// 新创建的任务 ID
+    pub async fn cloud_dl_add_task(&self, source_url: &str, save_path: &str) -> Result<i64> {
+        info!("添加离线下载任务: source_url={}, save_path={}", source_url, save_path);
+
+        // 标准化磁力链接（将 Base32 转换为十六进制，小写转大写）
+        let normalized_url = Self::normalize_magnet_link(source_url);
+
+        // 判断是否为磁力链接
+        let is_magnet = normalized_url.starts_with("magnet:");
+
+        // 对于磁力链接，需要先查询文件列表，然后选择所有文件
+        let selected_idx = if is_magnet {
+            match self.cloud_dl_query_magnet_info(&normalized_url, save_path).await {
+                Ok(file_count) if file_count > 0 => {
+                    // 生成所有文件的索引：1,2,3,...,n（索引从1开始）
+                    let indices: Vec<String> = (1..=file_count).map(|i| i.to_string()).collect();
+                    indices.join(",")
+                }
+                Ok(_) => {
+                    warn!("磁力链接文件列表为空，使用默认索引");
+                    String::new()
+                }
+                Err(e) => {
+                    warn!("查询磁力链接信息失败: {}，使用默认索引", e);
+                    String::new()
+                }
+            }
+        } else {
+            // 非磁力链接不需要 selected_idx
+            String::new()
+        };
+
+        info!("selected_idx={}", selected_idx);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=add_task&\
+             app_id=250528&\
+             task_from=0&\
+             selected_idx={}&\
+             save_path={}&\
+             source_url={}",
+            urlencoding::encode(&selected_idx),
+            urlencoding::encode(save_path),
+            urlencoding::encode(&normalized_url)
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("添加离线下载任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取添加任务响应失败")?;
+
+        info!("添加离线任务响应: status={}, body={}", status, response_text);
+
+        let api_response: crate::netdisk::cloud_dl::BaiduAddTaskResponse =
+            serde_json::from_str(&response_text).context("解析添加任务响应失败")?;
+
+        if !api_response.is_success() {
+            let error_code = api_response.get_error_code();
+            let error_msg = api_response.get_error_msg();
+            error!(
+                "添加离线任务失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("添加离线任务失败: {}", error_msg);
+        }
+
+        info!("添加离线任务成功: task_id={}", api_response.task_id);
+        Ok(api_response.task_id)
+    }
+
+    /// 查询离线下载任务列表
+    ///
+    /// # 参数
+    /// * `start` - 起始位置（默认 0）
+    /// * `limit` - 返回数量限制（默认 1000）
+    /// * `status` - 状态过滤（255 表示所有状态）
+    ///
+    /// # 返回
+    /// 任务信息列表
+    pub async fn cloud_dl_list_task(&self) -> Result<Vec<crate::netdisk::CloudDlTaskInfo>> {
+        self.cloud_dl_list_task_with_params(0, 1000, 255).await
+    }
+
+    /// 查询离线下载任务列表（带参数）
+    ///
+    /// # 参数
+    /// * `start` - 起始位置
+    /// * `limit` - 返回数量限制
+    /// * `status` - 状态过滤（255 表示所有状态）
+    ///
+    /// # 返回
+    /// 任务信息列表
+    pub async fn cloud_dl_list_task_with_params(
+        &self,
+        start: u32,
+        limit: u32,
+        status: u32,
+    ) -> Result<Vec<crate::netdisk::CloudDlTaskInfo>> {
+        info!(
+            "查询离线下载任务列表: start={}, limit={}, status={}",
+            start, limit, status
+        );
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=list_task&\
+             need_task_info=1&\
+             status={}&\
+             start={}&\
+             limit={}&\
+             app_id=250528",
+            status, start, limit
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("查询离线任务列表请求失败")?;
+
+        let status_code = response.status();
+        let response_text = response.text().await.context("读取任务列表响应失败")?;
+
+        debug!(
+            "查询离线任务列表响应: status={}, body={}",
+            status_code, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduListTaskResponse =
+            serde_json::from_str(&response_text).map_err(|e| {
+                error!(
+                    "解析任务列表响应失败: error={}, response_text={}",
+                    e, response_text
+                );
+                anyhow::anyhow!("解析任务列表响应失败: {}", e)
+            })?;
+
+        if api_response.errno != 0 {
+            error!(
+                "查询离线任务列表失败: errno={}, errmsg={}",
+                api_response.errno, api_response.errmsg
+            );
+            anyhow::bail!(
+                "查询离线任务列表失败: errno={}, errmsg={}",
+                api_response.errno,
+                api_response.errmsg
+            );
+        }
+
+        let tasks: Vec<crate::netdisk::CloudDlTaskInfo> = api_response
+            .task_info
+            .into_iter()
+            .map(|t| t.into_task_info())
+            .collect();
+
+        info!("查询到 {} 个离线下载任务", tasks.len());
+        Ok(tasks)
+    }
+
+    /// 查询指定任务详情
+    ///
+    /// # 参数
+    /// * `task_ids` - 任务 ID 列表
+    ///
+    /// # 返回
+    /// 任务信息列表
+    pub async fn cloud_dl_query_task(
+        &self,
+        task_ids: &[i64],
+    ) -> Result<Vec<crate::netdisk::CloudDlTaskInfo>> {
+        if task_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ids_str = task_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        info!("查询离线任务详情: task_ids={}", ids_str);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=query_task&\
+             app_id=250528&\
+             op_type=1&\
+             task_ids={}",
+            ids_str
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("查询离线任务详情请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取任务详情响应失败")?;
+
+        info!(
+            "查询离线任务详情响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduQueryTaskResponse =
+            serde_json::from_str(&response_text).context("解析任务详情响应失败")?;
+
+        if api_response.errno != 0 {
+            error!(
+                "查询离线任务详情失败: errno={}, errmsg={}",
+                api_response.errno, api_response.errmsg
+            );
+            anyhow::bail!(
+                "查询离线任务详情失败: errno={}, errmsg={}",
+                api_response.errno,
+                api_response.errmsg
+            );
+        }
+
+        // task_info 是一个对象，key 是 task_id，value 是任务信息
+        let mut tasks = Vec::new();
+        if let Some(task_map) = api_response.task_info.as_object() {
+            for (task_id_str, task_value) in task_map {
+                if let Ok(mut baidu_task) =
+                    serde_json::from_value::<crate::netdisk::cloud_dl::BaiduTaskInfo>(
+                        task_value.clone(),
+                    )
+                {
+                    // 如果 task_id 为空，使用 JSON key 作为 task_id
+                    if baidu_task.task_id.is_empty() {
+                        baidu_task.task_id = task_id_str.clone();
+                    }
+                    tasks.push(baidu_task.into_task_info());
+                }
+            }
+        }
+
+        info!("查询到 {} 个任务详情", tasks.len());
+        Ok(tasks)
+    }
+
+    /// 取消离线下载任务
+    ///
+    /// # 参数
+    /// * `task_id` - 任务 ID
+    ///
+    /// # 返回
+    /// 操作是否成功
+    pub async fn cloud_dl_cancel_task(&self, task_id: i64) -> Result<()> {
+        info!("取消离线下载任务: task_id={}", task_id);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=cancel_task&\
+             app_id=250528&\
+             task_id={}",
+            task_id
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("取消离线任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取取消任务响应失败")?;
+
+        debug!(
+            "取消离线任务响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduOperationResponse =
+            serde_json::from_str(&response_text).context("解析取消任务响应失败")?;
+
+        if !api_response.is_success() {
+            let error_code = api_response.get_error_code();
+            let error_msg = api_response.get_error_msg();
+            error!(
+                "取消离线任务失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("{}", error_msg);
+        }
+
+        info!("取消离线任务成功: task_id={}", task_id);
+        Ok(())
+    }
+
+    /// 删除离线下载任务
+    ///
+    /// # 参数
+    /// * `task_id` - 任务 ID
+    ///
+    /// # 返回
+    /// 操作是否成功
+    pub async fn cloud_dl_delete_task(&self, task_id: i64) -> Result<()> {
+        info!("删除离线下载任务: task_id={}", task_id);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=delete_task&\
+             app_id=250528&\
+             task_id={}",
+            task_id
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("删除离线任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取删除任务响应失败")?;
+
+        info!(
+            "删除离线任务响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduOperationResponse =
+            serde_json::from_str(&response_text).context("解析删除任务响应失败")?;
+
+        if !api_response.is_success() {
+            let error_code = api_response.get_error_code();
+            let error_msg = api_response.get_error_msg();
+            error!(
+                "删除离线任务失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("{}", error_msg);
+        }
+
+        info!("删除离线任务成功: task_id={}", task_id);
+        Ok(())
+    }
+
+    /// 清空离线下载任务记录
+    ///
+    /// # 返回
+    /// 清空的任务数量
+    pub async fn cloud_dl_clear_task(&self) -> Result<i32> {
+        info!("清空离线下载任务记录");
+
+        let url = "https://pan.baidu.com/rest/2.0/services/cloud_dl?method=clear_task&app_id=250528";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("清空离线任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取清空任务响应失败")?;
+
+        debug!(
+            "清空离线任务响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduClearTaskResponse =
+            serde_json::from_str(&response_text).context("解析清空任务响应失败")?;
+
+        if api_response.errno != 0 {
+            error!(
+                "清空离线任务失败: errno={}, errmsg={}",
+                api_response.errno, api_response.errmsg
+            );
+            anyhow::bail!(
+                "清空离线任务失败: errno={}, errmsg={}",
+                api_response.errno,
+                api_response.errmsg
+            );
+        }
+
+        info!("清空离线任务成功: total={}", api_response.total);
+        Ok(api_response.total)
     }
 }
 

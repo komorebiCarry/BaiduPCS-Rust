@@ -183,7 +183,7 @@ pub struct ChunkScheduler {
     /// 调度器是否正在运行
     scheduler_running: Arc<AtomicBool>,
     /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
-    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String)>>>>,
     /// 🔥 备份任务统一通知发送器（用于通知 AutoBackupManager 所有事件）
     /// 包括：进度更新、状态变更、任务完成、任务失败等
     backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
@@ -248,7 +248,7 @@ impl ChunkScheduler {
     ///
     /// FolderDownloadManager 调用此方法设置 channel sender，
     /// 当文件夹子任务完成时会发送 group_id 到 channel
-    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<String>) {
+    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<(String, String)>) {
         let mut sender = self.task_completed_tx.write().await;
         *sender = Some(tx);
         info!("任务完成通知 channel 已设置");
@@ -756,7 +756,7 @@ impl ChunkScheduler {
         task_id: &str,
         task_info: &TaskScheduleInfo,
         decrypt_result: Result<()>,
-        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<(String, String)>>>>,
         backup_notification_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
         waiting_queue_trigger: &Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     ) {
@@ -836,11 +836,11 @@ impl ChunkScheduler {
             }
         }
 
-        // 通知文件夹任务补充
+        // 通知文件夹任务补充（发送 group_id 和 task_id）
         if let Some(gid) = group_id.clone() {
             let tx_guard = task_completed_tx.read().await;
             if let Some(tx) = tx_guard.as_ref() {
-                if let Err(e) = tx.send(gid.clone()) {
+                if let Err(e) = tx.send((gid.clone(), task_id.to_string())) {
                     error!("发送任务完成通知失败: {}", e);
                 }
             }

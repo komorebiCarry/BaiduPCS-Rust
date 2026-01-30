@@ -381,6 +381,48 @@ pub async fn create_folder(
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
+            let error_msg = e.to_string();
+
+            // 检查是否是 errno=-6，需要预热重试
+            if error_msg.contains("errno=-6") {
+                warn!("创建文件夹遇到 errno=-6，触发预热重试...");
+
+                // 触发预热
+                match state.trigger_warmup().await {
+                    Ok(true) => {
+                        info!("预热成功，重试创建文件夹...");
+                        // 重新获取客户端（预热后可能更新了）
+                        let client = state.netdisk_client.read().await;
+                        if let Some(ref c) = *client {
+                            match c.create_folder(&request.path).await {
+                                Ok(response) => {
+                                    let data = CreateFolderData {
+                                        fs_id: response.fs_id,
+                                        path: response.path,
+                                        isdir: response.isdir,
+                                    };
+                                    info!("预热重试成功，创建文件夹: fs_id={}", data.fs_id);
+                                    return Ok(Json(ApiResponse::success(data)));
+                                }
+                                Err(retry_err) => {
+                                    error!("预热重试后仍失败: {}", retry_err);
+                                    return Ok(Json(ApiResponse::error(
+                                        500,
+                                        format!("创建文件夹失败（已重试）: {}", retry_err),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        warn!("预热跳过（用户未登录）");
+                    }
+                    Err(warmup_err) => {
+                        error!("预热失败: {}", warmup_err);
+                    }
+                }
+            }
+
             error!("创建文件夹失败: {}", e);
             Ok(Json(ApiResponse::error(
                 500,

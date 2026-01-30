@@ -117,8 +117,8 @@ pub async fn get_all_downloads_mixed(
         download_manager.get_all_tasks().await
     };
 
-    // 获取所有文件夹任务
-    let folders = app_state.folder_download_manager.get_all_folders().await;
+    // 获取所有文件夹任务（内存 + 历史数据库）
+    let folders = app_state.folder_download_manager.get_all_folders_with_history().await;
 
     let mut items: Vec<DownloadItem> = Vec::new();
 

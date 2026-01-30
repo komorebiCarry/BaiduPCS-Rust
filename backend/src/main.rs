@@ -280,6 +280,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/encryption/key/export", get(handlers::autobackup::export_encryption_key))
         .route("/encryption/key", delete(handlers::autobackup::delete_encryption_key))
         .route("/encryption/key/force", delete(handlers::autobackup::force_delete_encryption_key))
+        // 🔥 离线下载 API
+        .route("/cloud-dl/tasks", post(handlers::cloud_dl::add_task))
+        .route("/cloud-dl/tasks", get(handlers::cloud_dl::list_tasks))
+        .route("/cloud-dl/tasks/clear", delete(handlers::cloud_dl::clear_tasks))
+        .route("/cloud-dl/tasks/refresh", post(handlers::cloud_dl::refresh_tasks))
+        .route("/cloud-dl/tasks/:task_id", get(handlers::cloud_dl::query_task))
+        .route("/cloud-dl/tasks/:task_id", delete(handlers::cloud_dl::delete_task))
+        .route("/cloud-dl/tasks/:task_id/cancel", post(handlers::cloud_dl::cancel_task))
         // 🔥 系统能力检测 API
         .route("/system/watch-capability", get(handlers::autobackup::get_watch_capability))
         // 🔥 自动备份全局触发配置 API

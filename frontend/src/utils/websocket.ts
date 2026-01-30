@@ -11,6 +11,7 @@ import type {
   UploadEvent,
   TransferEvent,
   BackupEvent,
+  CloudDlEvent,
   TimestampedEvent,
 } from '@/types/events'
 
@@ -23,6 +24,7 @@ type FolderEventCallback = (event: FolderEvent) => void
 type UploadEventCallback = (event: UploadEvent) => void
 type TransferEventCallback = (event: TransferEvent) => void
 type BackupEventCallback = (event: BackupEvent) => void
+type CloudDlEventCallback = (event: CloudDlEvent) => void
 type ConnectionStateCallback = (state: ConnectionState) => void
 
 // 重连配置
@@ -46,6 +48,7 @@ class WebSocketClient {
   private uploadListeners: Set<UploadEventCallback> = new Set()
   private transferListeners: Set<TransferEventCallback> = new Set()
   private backupListeners: Set<BackupEventCallback> = new Set()
+  private cloudDlListeners: Set<CloudDlEventCallback> = new Set()
   private connectionStateListeners: Set<ConnectionStateCallback> = new Set()
 
   // 连接 ID
@@ -252,6 +255,9 @@ class WebSocketClient {
       case 'backup':
         this.backupListeners.forEach((cb) => cb(event.event as BackupEvent))
         break
+      case 'cloud_dl':
+        this.cloudDlListeners.forEach((cb) => cb(event.event as CloudDlEvent))
+        break
       default:
         console.warn('[WS] 未知事件类别:', category)
     }
@@ -365,6 +371,14 @@ class WebSocketClient {
   public onBackupEvent(callback: BackupEventCallback): () => void {
     this.backupListeners.add(callback)
     return () => this.backupListeners.delete(callback)
+  }
+
+  /**
+   * 订阅离线下载事件
+   */
+  public onCloudDlEvent(callback: CloudDlEventCallback): () => void {
+    this.cloudDlListeners.add(callback)
+    return () => this.cloudDlListeners.delete(callback)
   }
 
   /**

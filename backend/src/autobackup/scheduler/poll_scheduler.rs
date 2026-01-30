@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
+use rand::Rng;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -110,20 +111,41 @@ impl PollScheduler {
         }
     }
 
-    /// 运行间隔轮询
+    /// 运行间隔轮询（带抖动，防止固定间隔被风控识别）
     async fn run_interval_poll(
         config_id: String,
-        interval: Duration,
+        base_interval: Duration,
         event_tx: mpsc::UnboundedSender<ChangeEvent>,
         cancel_token: CancellationToken,
     ) {
-        let mut interval_timer = tokio::time::interval(interval);
-        // 跳过第一次立即触发
-        interval_timer.tick().await;
+        // 首次启动加入 0-50% 随机延迟，避免重启后立即请求
+        let initial_delay = Self::add_jitter(base_interval, 0.25);
+        tracing::debug!(
+            "Poll scheduler starting for {}, initial delay: {:?}",
+            config_id,
+            initial_delay
+        );
+
+        tokio::select! {
+            _ = tokio::time::sleep(initial_delay) => {}
+            _ = cancel_token.cancelled() => {
+                tracing::debug!("Poll scheduler cancelled during initial delay: {}", config_id);
+                return;
+            }
+        }
 
         loop {
+            // 每次轮询加入 ±20% 的抖动
+            let jittered_interval = Self::add_jitter(base_interval, 0.2);
+            tracing::debug!(
+                "Next poll for {} in {:?} (base: {:?})",
+                config_id,
+                jittered_interval,
+                base_interval
+            );
+
             tokio::select! {
-                _ = interval_timer.tick() => {
+                _ = tokio::time::sleep(jittered_interval) => {
                     // 判断是否为全局轮询
                     let event = if let Some((direction, poll_type)) = parse_global_poll_id(&config_id) {
                         tracing::debug!("Global interval poll triggered: {:?} {:?}", direction, poll_type);
@@ -146,7 +168,7 @@ impl PollScheduler {
         }
     }
 
-    /// 运行定时轮询
+    /// 运行定时轮询（带抖动，防止固定时间被风控识别）
     async fn run_scheduled_poll(
         config_id: String,
         scheduled_time: ScheduledTime,
@@ -155,7 +177,20 @@ impl PollScheduler {
     ) {
         loop {
             // 计算下次触发时间
-            let delay = Self::calculate_delay_to_scheduled_time(scheduled_time);
+            let base_delay = Self::calculate_delay_to_scheduled_time(scheduled_time);
+            // 加入 ±5 分钟的抖动
+            let jitter_secs = rand::thread_rng().gen_range(-300i64..=300i64);
+            let delay_secs = (base_delay.as_secs() as i64 + jitter_secs).max(1) as u64;
+            let delay = Duration::from_secs(delay_secs);
+
+            tracing::debug!(
+                "Scheduled poll for {} at {:02}:{:02}, delay: {:?} (jitter: {}s)",
+                config_id,
+                scheduled_time.hour,
+                scheduled_time.minute,
+                delay,
+                jitter_secs
+            );
 
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {
@@ -199,6 +234,26 @@ impl PollScheduler {
 
         let duration = target_datetime - now.naive_local();
         Duration::from_secs(duration.num_seconds().max(1) as u64)
+    }
+
+    /// 给间隔加入随机抖动，防止固定间隔被风控识别
+    ///
+    /// # 参数
+    /// - `base`: 基础间隔
+    /// - `jitter_factor`: 抖动因子，0.2 表示 ±20% 的抖动范围
+    ///
+    /// # 返回
+    /// 加入抖动后的间隔，最小 10 分钟
+    fn add_jitter(base: Duration, jitter_factor: f64) -> Duration {
+        const MIN_INTERVAL_SECS: u64 = 10 * 60; // 最小 10 分钟，防止过于频繁
+
+        let mut rng = rand::thread_rng();
+        let base_secs = base.as_secs_f64();
+        let jitter_range = base_secs * jitter_factor;
+        let jitter = rng.gen_range(-jitter_range..=jitter_range);
+        let result_secs = (base_secs + jitter).max(MIN_INTERVAL_SECS as f64);
+
+        Duration::from_secs_f64(result_secs)
     }
 
     /// 手动触发轮询
@@ -295,8 +350,8 @@ impl DirectoryScanner {
             };
             scanner.scan_collect()
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("Scan task failed: {}", e))
+            .await
+            .map_err(|e| anyhow::anyhow!("Scan task failed: {}", e))
     }
 }
 

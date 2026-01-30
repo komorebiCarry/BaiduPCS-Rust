@@ -3459,13 +3459,33 @@ impl DownloadManager {
                         warn!("从历史数据库删除已完成下载任务失败: {}", e);
                     }
                 }
+                // 🔥 同时清除 folder_history表中已完成的文件夹任务
+                match db.remove_completed_folders() {
+                    Ok(count) => {
+                        history_count += count;
+                        info!("从历史数据库删除了 {} 个已完成的文件夹任务", count);
+                    }
+                    Err(e) => {
+                        warn!("从历史数据库删除已完成文件夹任务失败: {}", e);
+                    }
+                }
             }
         }
 
-        let total_count = memory_count + history_count;
+        // 4. 清除 FolderDownloadManager 内存中已完成的文件夹
+        let folder_memory_count = {
+            let fm = self.folder_manager.read().await;
+            if let Some(ref folder_manager) = *fm {
+                folder_manager.clear_completed_folders().await
+            } else {
+                0
+            }
+        };
+
+        let total_count = memory_count + history_count + folder_memory_count;
         info!(
-            "清除了 {} 个已完成的任务（内存: {}, 历史: {}）",
-            total_count, memory_count, history_count
+            "清除了 {} 个已完成的任务（文件内存: {}, 文件夹内存: {}, 历史: {}）",
+            total_count, memory_count, folder_memory_count, history_count
         );
         total_count
     }
@@ -3585,7 +3605,7 @@ impl DownloadManager {
     }
 
     /// 设置任务完成通知发送器（用于文件夹下载补充任务）
-    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, String)>) {
         self.chunk_scheduler.set_task_completed_sender(tx).await;
     }
 
@@ -3954,6 +3974,7 @@ mod tests {
             csrf_token: Some("mock_csrf".to_string()),
             bdstoken: Some("mock_bdstoken".to_string()),
             login_time: 0,
+            last_warmup_at: None,
         }
     }
 

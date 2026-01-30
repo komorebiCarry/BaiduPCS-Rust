@@ -2821,6 +2821,7 @@ mod tests {
             csrf_token: Some("mock_csrf".to_string()),
             bdstoken: Some("mock_bdstoken".to_string()),
             login_time: 0,
+            last_warmup_at: None,
         }
     }
 

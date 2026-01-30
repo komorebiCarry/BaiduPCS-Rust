@@ -466,6 +466,42 @@ export type TransferEvent =
     | TransferEventFailed
     | TransferEventDeleted
 
+// ============ 离线下载事件 ============
+
+export interface CloudDlEventStatusChanged {
+  event_type: 'status_changed'
+  task_id: number
+  old_status: number | null
+  new_status: number
+  task: any
+}
+
+export interface CloudDlEventTaskCompleted {
+  event_type: 'task_completed'
+  task_id: number
+  task: any
+  auto_download_config: any | null
+}
+
+export interface CloudDlEventProgressUpdate {
+  event_type: 'progress_update'
+  task_id: number
+  finished_size: number
+  file_size: number
+  progress_percent: number
+}
+
+export interface CloudDlEventTaskListRefreshed {
+  event_type: 'task_list_refreshed'
+  tasks: any[]
+}
+
+export type CloudDlEvent =
+    | CloudDlEventStatusChanged
+    | CloudDlEventTaskCompleted
+    | CloudDlEventProgressUpdate
+    | CloudDlEventTaskListRefreshed
+
 // ============ 统一任务事件 ============
 
 export interface TaskEventDownload {
@@ -493,12 +529,18 @@ export interface TaskEventBackup {
   event: BackupEvent
 }
 
+export interface TaskEventCloudDl {
+  category: 'cloud_dl'
+  event: CloudDlEvent
+}
+
 export type TaskEvent =
     | TaskEventDownload
     | TaskEventFolder
     | TaskEventUpload
     | TaskEventTransfer
     | TaskEventBackup
+    | TaskEventCloudDl
 
 // ============ 带时间戳的事件 ============
 
@@ -506,7 +548,7 @@ export interface TimestampedEvent {
   event_id: number
   timestamp: number
   category: string
-  event: DownloadEvent | FolderEvent | UploadEvent | TransferEvent | BackupEvent
+  event: DownloadEvent | FolderEvent | UploadEvent | TransferEvent | BackupEvent | CloudDlEvent
 }
 
 // ============ WebSocket 消息类型 ============

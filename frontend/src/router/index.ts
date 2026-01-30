@@ -56,6 +56,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '自动备份' }
       },
       {
+        path: '/cloud-dl',
+        name: 'CloudDl',
+        component: () => import('@/views/CloudDlView.vue'),
+        meta: { title: '离线下载' }
+      },
+      {
         path: '/settings',
         name: 'Settings',
         component: () => import('@/views/SettingsView.vue'),

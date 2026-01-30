@@ -1,7 +1,7 @@
 //! 文件夹下载数据结构
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -95,6 +95,11 @@ pub struct FolderDownload {
     /// 用于在扫描完成后重命名文件夹并更新路径
     #[serde(default, skip)]
     pub encrypted_folder_mappings: HashMap<String, String>,
+
+    /// 🔥 已计数的任务ID集合（用于避免重复计数 completed_count）
+    /// 解决问题：使用固定位的子任务完成时也需要递增 completed_count
+    #[serde(default, skip)]
+    pub counted_task_ids: HashSet<String>,
 }
 
 impl FolderDownload {
@@ -134,6 +139,7 @@ impl FolderDownload {
             borrowed_slot_ids: Vec::new(),
             borrowed_subtask_map: HashMap::new(),
             encrypted_folder_mappings: HashMap::new(),
+            counted_task_ids: HashSet::new(),
         }
     }
 

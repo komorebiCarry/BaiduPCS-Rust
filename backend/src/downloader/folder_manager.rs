@@ -380,7 +380,8 @@ impl FolderDownloadManager {
             {
                 let mut folders = self.folders.write().await;
                 if let Some(folder) = folders.get_mut(&folder_id) {
-                    folder.completed_count = completed_count;
+                    // 🔥 注意：不再从 tasks 计算 completed_count，因为已完成的任务会从内存移除
+                    // completed_count 由 start_task_completed_listener 维护
                     folder.downloaded_size = downloaded_size;
 
                     // 🔥 维护 borrowed_subtask_map：记录使用借调位的子任务
@@ -628,8 +629,8 @@ impl FolderDownloadManager {
 
     /// 设置下载管理器
     pub async fn set_download_manager(&self, manager: Arc<DownloadManager>) {
-        // 创建任务完成通知 channel
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        // 创建任务完成通知 channel（发送 group_id 和 task_id）
+        let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
 
         // 设置 sender 到 download_manager
         manager.set_task_completed_sender(tx).await;
@@ -698,41 +699,40 @@ impl FolderDownloadManager {
                 let folder_info = {
                     let folders_guard = folders.read().await;
                     folders_guard.get(&folder_id).map(|f| {
-                        (f.total_files, f.total_size, f.status.clone())
+                        (f.total_files, f.total_size, f.status.clone(), f.completed_count, f.downloaded_size)
                     })
                 };
 
-                let (total_files, total_size, status) = match folder_info {
+                let (total_files, total_size, status, completed_files, folder_downloaded_size) = match folder_info {
                     Some(info) => info,
                     None => continue,
                 };
 
                 // 获取该文件夹的所有子任务
                 let tasks = dm.get_tasks_by_group(&folder_id).await;
-                if tasks.is_empty() {
-                    continue;
-                }
 
-                // 聚合进度数据
-                let completed_files = tasks
-                    .iter()
-                    .filter(|t| t.status == TaskStatus::Completed)
-                    .count() as u64;
-
-                let downloaded_size: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
-
-                let speed: u64 = tasks
-                    .iter()
-                    .filter(|t| t.status == TaskStatus::Downloading)
-                    .map(|t| t.speed)
-                    .sum();
+                // 🔥 即使 tasks 为空，如果已完成也要发送进度事件
+                // 因为已完成的任务会从内存中移除
+                let (downloaded_size, speed) = if tasks.is_empty() {
+                    // 使用 folder 中保存的 downloaded_size
+                    (folder_downloaded_size, 0)
+                } else {
+                    let downloaded: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
+                    let spd: u64 = tasks
+                        .iter()
+                        .filter(|t| t.status == TaskStatus::Downloading)
+                        .map(|t| t.speed)
+                        .sum();
+                    (downloaded, spd)
+                };
 
                 // 更新文件夹的 downloaded_size（实时同步）
-                {
+                // 🔥 注意：不再从 tasks 计算 completed_count，因为已完成的任务会从内存移除
+                // completed_count 由 start_task_completed_listener 维护
+                if !tasks.is_empty() {
                     let mut folders_guard = folders.write().await;
                     if let Some(folder) = folders_guard.get_mut(&folder_id) {
                         folder.downloaded_size = downloaded_size;
-                        folder.completed_count = completed_files;
                     }
                 }
 
@@ -757,7 +757,7 @@ impl FolderDownloadManager {
     ///
     /// 当收到子任务完成通知时，立即从 pending_files 补充新任务
     /// 根据文件夹可用槽位数量（借调位+固定位）动态补充，充分利用槽位资源
-    fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<String>) {
+    fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<(String, String)>) {
         let folders = self.folders.clone();
         let download_manager = self.download_manager.clone();
         let wal_dir = self.wal_dir.clone();
@@ -765,7 +765,7 @@ impl FolderDownloadManager {
         let cancellation_tokens = self.cancellation_tokens.clone();
 
         tokio::spawn(async move {
-            while let Some(group_id) = rx.recv().await {
+            while let Some((group_id, task_id)) = rx.recv().await {
                 // 获取下载管理器
                 let dm = {
                     let guard = download_manager.read().await;
@@ -778,52 +778,56 @@ impl FolderDownloadManager {
                 };
 
                 // 🔥 清理已完成子任务的借调位映射并实际释放槽位
-                // 当子任务完成时，需要从 borrowed_subtask_map 中移除，并实际释放借调槽位到任务位池
+                // 🔥 关键修复：直接使用收到的 task_id，不再依赖 get_tasks_by_group
+                // 因为任务完成后会立即从内存中移除，get_tasks_by_group 无法获取到已完成的任务
                 {
-                    let tasks = dm.get_tasks_by_group(&group_id).await;
-                    let completed_tasks: Vec<String> = tasks
-                        .iter()
-                        .filter(|t| t.status == TaskStatus::Completed)
-                        .map(|t| t.id.clone())
-                        .collect();
+                    let slot_pool = dm.task_slot_pool();
 
-                    if !completed_tasks.is_empty() {
-                        let slot_pool = dm.task_slot_pool();
+                    // 🔥 直接处理收到的 task_id
+                    let slot_id_to_release = {
+                        let mut folders_guard = folders.write().await;
 
-                        // 🔥 先收集需要释放的槽位信息，避免在循环中释放和重新获取锁
-                        let slot_ids_to_release = {
-                            let mut folders_guard = folders.write().await;
-                            let mut slot_ids = Vec::new();
+                        if let Some(folder) = folders_guard.get_mut(&group_id) {
+                            // 🔥 检查任务是否已经被计数过
+                            let already_counted = folder.counted_task_ids.contains(&task_id);
 
-                            if let Some(folder) = folders_guard.get_mut(&group_id) {
-                                for task_id in &completed_tasks {
-                                    if let Some(slot_id) = folder.borrowed_subtask_map.remove(task_id) {
-                                        info!(
-                                            "子任务 {} 完成，清理借调位映射: slot_id={}, folder={}",
-                                            task_id, slot_id, group_id
-                                        );
+                            // 处理借调位映射
+                            let slot_id = if let Some(slot_id) = folder.borrowed_subtask_map.remove(&task_id) {
+                                info!(
+                                    "子任务 {} 完成，清理借调位映射: slot_id={}, folder={}",
+                                    task_id, slot_id, group_id
+                                );
+                                // 🔥 从文件夹的借调位记录中移除
+                                folder.borrowed_slot_ids.retain(|&id| id != slot_id);
+                                Some(slot_id)
+                            } else {
+                                None
+                            };
 
-                                        // 🔥 从文件夹的借调位记录中移除
-                                        folder.borrowed_slot_ids.retain(|&id| id != slot_id);
-                                        slot_ids.push(slot_id);
-                                    }
-                                }
+                            // 🔥 对未计数的任务递增 completed_count
+                            if !already_counted {
+                                folder.counted_task_ids.insert(task_id.clone());
+                                folder.completed_count += 1;
+                                info!(
+                                    "文件夹 {} 已完成 {}/{} 个文件 (task_id={})",
+                                    group_id, folder.completed_count, folder.total_files, task_id
+                                );
                             }
 
-                            slot_ids
-                        }; // 锁在此处自动释放
-
-                        // 🔥 释放锁后，统一释放所有借调槽位
-                        for slot_id in slot_ids_to_release {
-                            slot_pool.release_borrowed_slot(&group_id, slot_id).await;
-                            info!("子任务完成，已释放借调槽位 {} 到任务位池", slot_id);
+                            slot_id
+                        } else {
+                            None
                         }
+                    }; // 锁在此处自动释放
 
-                        // 🔥 释放槽位后，尝试启动等待队列中的任务
-                        if !completed_tasks.is_empty() {
-                            dm.try_start_waiting_tasks().await;
-                        }
+                    // 🔥 释放锁后，释放借调槽位
+                    if let Some(slot_id) = slot_id_to_release {
+                        slot_pool.release_borrowed_slot(&group_id, slot_id).await;
+                        info!("子任务完成，已释放借调槽位 {} 到任务位池", slot_id);
                     }
+
+                    // 🔥 尝试启动等待队列中的任务
+                    dm.try_start_waiting_tasks().await;
                 }
 
                 // 🔥 计算文件夹可用的槽位数量（借调位 + 固定位）
@@ -851,12 +855,10 @@ impl FolderDownloadManager {
                     continue;
                 }
 
-                // 获取子任务列表并更新文件夹进度
+                // 获取子任务列表统计活跃任务数
+                // 🔥 注意：不再从 tasks 计算 completed_count，因为已完成的任务会从内存移除
+                // 使用文件夹自己维护的 completed_count（在子任务完成时递增）
                 let tasks = dm.get_tasks_by_group(&group_id).await;
-                let completed_count = tasks
-                    .iter()
-                    .filter(|t| t.status == TaskStatus::Completed)
-                    .count() as u64;
                 let active_count = tasks
                     .iter()
                     .filter(|t| {
@@ -887,6 +889,8 @@ impl FolderDownloadManager {
                         continue;
                     }
 
+                    // 🔥 使用文件夹自己维护的 completed_count 检查是否全部完成
+                    let completed_count = folder.completed_count;
 
                     // 检查是否全部完成
                     if folder.pending_files.is_empty()
@@ -1689,10 +1693,50 @@ impl FolderDownloadManager {
         folders.values().cloned().collect()
     }
 
+    /// 获取所有文件夹下载（内存 + 历史数据库）
+    ///
+    /// 类似于 DownloadManager::get_all_tasks()，合并内存中的文件夹和历史数据库中的已完成文件夹
+    pub async fn get_all_folders_with_history(&self) -> Vec<FolderDownload> {
+        // 1. 获取内存中的文件夹
+        let folders = self.folders.read().await;
+        let mut result: Vec<FolderDownload> = folders.values().cloned().collect();
+        let folder_ids: std::collections::HashSet<String> =
+            folders.keys().cloned().collect();
+        drop(folders);
+
+        // 2. 从历史数据库加载已完成的文件夹
+        let history_folders = self.load_folder_history().await;
+
+        // 3. 合并，排除已在内存中的（避免重复）
+        for hist_folder in history_folders {
+            if !folder_ids.contains(&hist_folder.id) {
+                result.push(hist_folder);
+            }
+        }
+
+        result
+    }
+
     /// 获取指定文件夹下载
     pub async fn get_folder(&self, folder_id: &str) -> Option<FolderDownload> {
         let folders = self.folders.read().await;
         folders.get(folder_id).cloned()
+    }
+
+    /// 清除内存中已完成的文件夹
+    ///
+    /// 返回清除的数量
+    pub async fn clear_completed_folders(&self) -> usize {
+        let mut folders = self.folders.write().await;
+        let before_count = folders.len();
+
+        folders.retain(|_, folder| folder.status != FolderStatus::Completed);
+
+        let removed = before_count - folders.len();
+        if removed > 0 {
+            info!("从内存中清除了 {} 个已完成的文件夹", removed);
+        }
+        removed
     }
 
     /// 从历史记录加载已完成的文件夹（优先从数据库加载）
@@ -2289,6 +2333,14 @@ impl FolderDownloadManager {
 
         // 持久化取消状态
         self.persist_folder(folder_id).await;
+
+        // 🔥 从 folders HashMap 中移除已取消的文件夹
+        // 避免已取消的文件夹仍然出现在 get_all_folders 列表中
+        {
+            let mut folders = self.folders.write().await;
+            folders.remove(folder_id);
+            info!("已从 folders HashMap 中移除已取消的文件夹: {}", folder_id);
+        }
 
         // 🔥 发布删除事件（取消视为删除）
         self.publish_event(FolderEvent::Deleted {

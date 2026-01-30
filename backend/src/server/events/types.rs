@@ -754,6 +754,68 @@ impl BackupEvent {
     }
 }
 
+/// 离线下载事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum CloudDlEvent {
+    /// 任务状态变化
+    StatusChanged {
+        task_id: i64,
+        old_status: Option<i32>,
+        new_status: i32,
+        task: serde_json::Value,
+    },
+    /// 任务完成（可触发自动下载）
+    TaskCompleted {
+        task_id: i64,
+        task: serde_json::Value,
+        auto_download_config: Option<serde_json::Value>,
+    },
+    /// 进度更新
+    ProgressUpdate {
+        task_id: i64,
+        finished_size: i64,
+        file_size: i64,
+        progress_percent: f32,
+    },
+    /// 任务列表刷新（初始加载或手动刷新）
+    TaskListRefreshed {
+        tasks: Vec<serde_json::Value>,
+    },
+}
+
+impl CloudDlEvent {
+    /// 获取任务 ID（如果有）
+    pub fn task_id(&self) -> Option<String> {
+        match self {
+            CloudDlEvent::StatusChanged { task_id, .. } => Some(task_id.to_string()),
+            CloudDlEvent::TaskCompleted { task_id, .. } => Some(task_id.to_string()),
+            CloudDlEvent::ProgressUpdate { task_id, .. } => Some(task_id.to_string()),
+            CloudDlEvent::TaskListRefreshed { .. } => None,
+        }
+    }
+
+    /// 获取事件优先级
+    pub fn priority(&self) -> EventPriority {
+        match self {
+            CloudDlEvent::ProgressUpdate { .. } => EventPriority::Low,
+            CloudDlEvent::StatusChanged { .. } => EventPriority::Medium,
+            CloudDlEvent::TaskCompleted { .. } => EventPriority::High,
+            CloudDlEvent::TaskListRefreshed { .. } => EventPriority::High,
+        }
+    }
+
+    /// 获取事件类型名称
+    pub fn event_type_name(&self) -> &'static str {
+        match self {
+            CloudDlEvent::StatusChanged { .. } => "status_changed",
+            CloudDlEvent::TaskCompleted { .. } => "task_completed",
+            CloudDlEvent::ProgressUpdate { .. } => "progress_update",
+            CloudDlEvent::TaskListRefreshed { .. } => "task_list_refreshed",
+        }
+    }
+}
+
 /// 统一任务事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "category", content = "event")]
@@ -773,6 +835,9 @@ pub enum TaskEvent {
     /// 备份事件
     #[serde(rename = "backup")]
     Backup(BackupEvent),
+    /// 离线下载事件
+    #[serde(rename = "cloud_dl")]
+    CloudDl(CloudDlEvent),
 }
 
 impl TaskEvent {
@@ -784,6 +849,19 @@ impl TaskEvent {
             TaskEvent::Upload(e) => e.task_id(),
             TaskEvent::Transfer(e) => e.task_id(),
             TaskEvent::Backup(e) => e.task_id(),
+            TaskEvent::CloudDl(_e) => {
+                // CloudDl 使用 i64 task_id，这里返回静态字符串
+                // 实际 task_id 通过 task_id_string() 方法获取
+                "cloud_dl"
+            }
+        }
+    }
+
+    /// 获取任务 ID 字符串（用于 CloudDl 等使用数字 ID 的事件）
+    pub fn task_id_string(&self) -> String {
+        match self {
+            TaskEvent::CloudDl(e) => e.task_id().unwrap_or_default(),
+            _ => self.task_id().to_string(),
         }
     }
 
@@ -795,6 +873,7 @@ impl TaskEvent {
             TaskEvent::Upload(e) => e.priority(),
             TaskEvent::Transfer(e) => e.priority(),
             TaskEvent::Backup(e) => e.priority(),
+            TaskEvent::CloudDl(e) => e.priority(),
         }
     }
 
@@ -806,6 +885,7 @@ impl TaskEvent {
             TaskEvent::Upload(_) => "upload",
             TaskEvent::Transfer(_) => "transfer",
             TaskEvent::Backup(_) => "backup",
+            TaskEvent::CloudDl(_) => "cloud_dl",
         }
     }
 
@@ -817,6 +897,7 @@ impl TaskEvent {
             TaskEvent::Upload(e) => e.event_type_name(),
             TaskEvent::Transfer(e) => e.event_type_name(),
             TaskEvent::Backup(e) => e.event_type_name(),
+            TaskEvent::CloudDl(e) => e.event_type_name(),
         }
     }
 
@@ -849,6 +930,10 @@ impl TaskEvent {
             TaskEvent::Backup(BackupEvent::StatusChanged { new_status, .. }) => {
                 new_status == "transferring" || new_status == "preparing"
             }
+            TaskEvent::CloudDl(CloudDlEvent::ProgressUpdate { .. }) => true,
+            TaskEvent::CloudDl(CloudDlEvent::StatusChanged { new_status, .. }) => {
+                *new_status == 1 // Running status
+            }
             _ => false,
         }
     }
@@ -861,9 +946,10 @@ impl TaskEvent {
             TaskEvent::Download(e) => e.is_backup(),
             TaskEvent::Upload(e) => e.is_backup(),
             TaskEvent::Backup(_) => true,
-            // 文件夹下载和转存任务不支持备份标记
+            // 文件夹下载、转存任务和离线下载不支持备份标记
             TaskEvent::Folder(_) => false,
             TaskEvent::Transfer(_) => false,
+            TaskEvent::CloudDl(_) => false,
         }
     }
 }

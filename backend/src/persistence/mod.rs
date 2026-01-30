@@ -102,4 +102,4 @@ pub use folder::{
 };
 
 // 导出历史数据库模块
-pub use history_db::HistoryDbManager;
+pub use history_db::{CloudDlAutoDownloadConfig, HistoryDbManager};

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod autobackup;
+pub mod cloud_dl;
 pub mod config;
 pub mod download;
 pub mod file;

@@ -228,6 +228,12 @@ pub async fn qrcode_status(
                         let wal_dir = pm_arc.lock().await.wal_dir().clone();
                         state.folder_download_manager.set_wal_dir(wal_dir).await;
 
+                        // 设置文件夹下载管理器的持久化管理器（用于加载历史文件夹）
+                        state
+                            .folder_download_manager
+                            .set_persistence_manager(Arc::clone(&pm_arc))
+                            .await;
+
                         // 设置文件夹下载管理器的 WebSocket 管理器
                         state
                             .folder_download_manager
@@ -307,6 +313,10 @@ pub async fn qrcode_status(
                         // 🔥 初始化自动备份管理器
                         state.init_autobackup_manager().await;
                         info!("✅ 自动备份管理器初始化完成");
+
+                        // 🔥 初始化离线下载监听服务
+                        state.init_cloud_dl_monitor().await;
+                        info!("✅ 离线下载监听服务初始化完成");
                     }
                     Err(e) => {
                         error!("❌ 初始化下载管理器失败: {}", e);

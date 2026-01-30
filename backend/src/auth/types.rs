@@ -39,6 +39,9 @@ pub struct UserAuth {
     pub bdstoken: Option<String>,
     /// 登录时间戳
     pub login_time: i64,
+    /// 上次预热时间戳（用于判断预热数据是否过期）
+    #[serde(default)]
+    pub last_warmup_at: Option<i64>,
 }
 
 impl UserAuth {
@@ -62,6 +65,7 @@ impl UserAuth {
             csrf_token: None,
             bdstoken: None,
             login_time: chrono::Utc::now().timestamp(),
+            last_warmup_at: None,
         }
     }
 
@@ -94,6 +98,7 @@ impl UserAuth {
             csrf_token: None,
             bdstoken: None,
             login_time: chrono::Utc::now().timestamp(),
+            last_warmup_at: None,
         }
     }
 
