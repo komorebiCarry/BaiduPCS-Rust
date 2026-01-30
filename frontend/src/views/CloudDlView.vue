@@ -59,12 +59,12 @@
     <!-- 移动端任务卡片列表 -->
     <div v-else class="task-cards">
       <el-empty v-if="!loading && tasks.length === 0" description="暂无离线下载任务" />
-      <div 
-        v-for="task in tasks" 
-        :key="task.task_id" 
-        class="task-card"
-        :class="getTaskCardClass(task.status)"
-        @click="handleShowDetail(task)"
+      <div
+          v-for="task in tasks"
+          :key="task.task_id"
+          class="task-card"
+          :class="getTaskCardClass(task.status)"
+          @click="handleShowDetail(task)"
       >
         <div class="task-header">
           <span class="task-name">{{ task.task_name }}</span>
@@ -91,11 +91,11 @@
 
     <!-- 任务详情弹窗 -->
     <el-dialog
-      v-model="showDetailDialog"
-      title="任务详情"
-      :width="isMobile ? '95%' : '600px'"
-      :fullscreen="isMobile"
-      @close="detailTask = null"
+        v-model="showDetailDialog"
+        title="任务详情"
+        :width="isMobile ? '95%' : '600px'"
+        :fullscreen="isMobile"
+        @close="detailTask = null"
     >
       <div v-if="detailLoading" class="detail-loading">
         <el-icon class="is-loading"><Loading /></el-icon>
@@ -108,13 +108,13 @@
             {{ detailTask.status_text || getStatusText(detailTask.status) }}
           </el-tag>
         </div>
-        
+
         <!-- 进度条（仅进行中任务显示） -->
         <div v-if="detailTask.status === 1" class="detail-progress">
           <el-progress
-            :percentage="getProgress(detailTask)"
-            :stroke-width="10"
-            :color="'#e6a23c'"
+              :percentage="getProgress(detailTask)"
+              :stroke-width="10"
+              :color="'#e6a23c'"
           >
             <template #default="{ percentage }">
               <span class="progress-text">{{ percentage.toFixed(1) }}%</span>
@@ -124,7 +124,7 @@
             {{ formatFileSize(detailTask.finished_size) }} / {{ formatFileSize(detailTask.file_size) }}
           </div>
         </div>
-        
+
         <!-- 基本信息 -->
         <div class="detail-section">
           <h4>基本信息</h4>
@@ -159,13 +159,13 @@
             </div>
           </div>
         </div>
-        
+
         <!-- 下载链接 -->
         <div class="detail-section">
           <h4>下载链接</h4>
           <div class="source-url">{{ detailTask.source_url }}</div>
         </div>
-        
+
         <!-- 文件列表 -->
         <div v-if="detailTask.file_list && detailTask.file_list.length > 0" class="detail-section">
           <h4>文件列表 ({{ detailTask.file_list.length }} 个文件)</h4>
@@ -189,19 +189,19 @@
 
     <!-- 添加任务对话框 -->
     <el-dialog
-      v-model="showAddDialog"
-      title="添加离线下载任务"
-      :width="isMobile ? '95%' : '550px'"
-      :fullscreen="isMobile"
-      @close="resetAddForm"
+        v-model="showAddDialog"
+        title="添加离线下载任务"
+        :width="isMobile ? '95%' : '550px'"
+        :fullscreen="isMobile"
+        @close="resetAddForm"
     >
       <el-form :model="addForm" label-width="100px" :label-position="isMobile ? 'top' : 'right'">
         <el-form-item label="下载链接" required>
           <el-input
-            v-model="addForm.source_url"
-            type="textarea"
-            :rows="3"
-            placeholder="请输入下载链接（支持 HTTP/HTTPS/磁力链接/ed2k）"
+              v-model="addForm.source_url"
+              type="textarea"
+              :rows="3"
+              placeholder="请输入下载链接（支持 HTTP/HTTPS/磁力链接/ed2k）"
           />
         </el-form-item>
         <el-form-item label="保存路径">
@@ -236,21 +236,21 @@
 
     <!-- 网盘路径选择器 -->
     <NetdiskPathSelector
-      v-model="addForm.save_path"
-      :fs-id="addForm.save_path_fs_id"
-      @update:fs-id="addForm.save_path_fs_id = $event"
-      ref="netdiskPathSelectorRef"
+        v-model="addForm.save_path"
+        :fs-id="addForm.save_path_fs_id"
+        @update:fs-id="addForm.save_path_fs_id = $event"
+        ref="netdiskPathSelectorRef"
     />
     <el-dialog
-      v-model="showPathSelector"
-      title="选择网盘保存路径"
-      :width="isMobile ? '95%' : '600px'"
-      @open="handlePathSelectorOpen"
+        v-model="showPathSelector"
+        title="选择网盘保存路径"
+        :width="isMobile ? '95%' : '600px'"
+        @open="handlePathSelectorOpen"
     >
       <NetdiskPathSelector
-        v-model="tempSavePath"
-        :fs-id="tempSavePathFsId"
-        @update:fs-id="tempSavePathFsId = $event"
+          v-model="tempSavePath"
+          :fs-id="tempSavePathFsId"
+          @update:fs-id="tempSavePathFsId = $event"
       />
       <template #footer>
         <div class="dialog-footer">
@@ -262,23 +262,23 @@
 
     <!-- 本地目录选择器 -->
     <FilePickerModal
-      v-model="showLocalPathSelector"
-      mode="select-directory"
-      title="选择本地下载目录"
-      confirm-text="选择"
-      :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory"
-      @confirm="handleLocalPathSelect"
+        v-model="showLocalPathSelector"
+        mode="select-directory"
+        title="选择本地下载目录"
+        confirm-text="选择"
+        :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory"
+        @confirm="handleLocalPathSelect"
     />
 
     <!-- 自动下载确认弹窗 -->
     <FilePickerModal
-      v-model="showAutoDownloadPicker"
-      mode="download"
-      title="选择下载目录"
-      :default-download-dir="autoDownloadDefaultDir || downloadConfig?.default_directory"
-      :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory"
-      @confirm-download="handleAutoDownloadConfirm"
-      @use-default="handleAutoDownloadUseDefault"
+        v-model="showAutoDownloadPicker"
+        mode="download"
+        title="选择下载目录"
+        :default-download-dir="autoDownloadDefaultDir || downloadConfig?.default_directory"
+        :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory"
+        @confirm-download="handleAutoDownloadConfirm"
+        @use-default="handleAutoDownloadUseDefault"
     />
   </div>
 </template>
@@ -337,8 +337,17 @@ const showDetailDialog = ref(false)
 const detailLoading = ref(false)
 const detailTask = ref<CloudDlTaskInfo | null>(null)
 
-// 添加任务表单
-const addForm = ref<AddTaskRequest & { save_path_fs_id: number }>({
+// 添加任务表单 - 使用明确的类型定义避免 undefined 问题
+interface AddTaskFormData {
+  source_url: string
+  save_path: string
+  save_path_fs_id: number
+  auto_download: boolean
+  local_download_path: string
+  ask_download_path: boolean
+}
+
+const addForm = ref<AddTaskFormData>({
   source_url: '',
   save_path: '/',
   save_path_fs_id: 0,
@@ -457,7 +466,7 @@ async function handleShowDetail(task: CloudDlTaskInfo) {
   showDetailDialog.value = true
   detailLoading.value = true
   detailTask.value = null
-  
+
   try {
     const detail = await queryTask(task.task_id)
     detailTask.value = detail
@@ -473,16 +482,16 @@ async function handleShowDetail(task: CloudDlTaskInfo) {
 // 从详情弹窗取消任务
 async function handleCancelFromDetail() {
   if (!detailTask.value) return
-  
+
   try {
     await ElMessageBox.confirm(
-      `确定要取消任务 "${detailTask.value.task_name}" 吗？`,
-      '取消确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要取消任务 "${detailTask.value.task_name}" 吗？`,
+        '取消确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await cancelTask(detailTask.value.task_id)
@@ -499,16 +508,16 @@ async function handleCancelFromDetail() {
 // 从详情弹窗删除任务
 async function handleDeleteFromDetail() {
   if (!detailTask.value) return
-  
+
   try {
     await ElMessageBox.confirm(
-      `确定要删除任务 "${detailTask.value.task_name}" 吗？`,
-      '删除确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要删除任务 "${detailTask.value.task_name}" 吗？`,
+        '删除确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await deleteTask(detailTask.value.task_id)
@@ -616,7 +625,7 @@ async function handleAddTask() {
         recent_save_fs_id: addForm.value.save_path_fs_id,
         recent_save_path: addForm.value.save_path,
       }).catch(err => console.error('更新最近保存路径失败:', err))
-      
+
       if (transferConfig.value) {
         transferConfig.value.recent_save_fs_id = addForm.value.save_path_fs_id
         transferConfig.value.recent_save_path = addForm.value.save_path
@@ -648,13 +657,13 @@ async function handleAddTask() {
 async function handleCancel(task: CloudDlTaskInfo) {
   try {
     await ElMessageBox.confirm(
-      `确定要取消任务 "${task.task_name}" 吗？`,
-      '取消确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要取消任务 "${task.task_name}" 吗？`,
+        '取消确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await cancelTask(task.task_id)
@@ -671,13 +680,13 @@ async function handleCancel(task: CloudDlTaskInfo) {
 async function handleDelete(task: CloudDlTaskInfo) {
   try {
     await ElMessageBox.confirm(
-      `确定要删除任务 "${task.task_name}" 吗？`,
-      '删除确认',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要删除任务 "${task.task_name}" 吗？`,
+        '删除确认',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
 
     await deleteTask(task.task_id)
@@ -756,7 +765,7 @@ onMounted(async () => {
   } catch (error: any) {
     console.error('加载配置失败:', error)
   }
-  
+
   // 加载任务列表
   loadTasks()
 })
@@ -819,7 +828,7 @@ onMounted(async () => {
   justify-content: center;
   padding: 40px;
   color: #909399;
-  
+
   .el-icon {
     font-size: 32px;
     margin-bottom: 12px;
@@ -835,7 +844,7 @@ onMounted(async () => {
     margin-bottom: 20px;
     padding-bottom: 16px;
     border-bottom: 1px solid #ebeef5;
-    
+
     .detail-title {
       flex: 1;
       margin: 0;
@@ -846,13 +855,13 @@ onMounted(async () => {
       line-height: 1.4;
     }
   }
-  
+
   .detail-progress {
     margin-bottom: 20px;
     padding: 16px;
     background: #fdf6ec;
     border-radius: 8px;
-    
+
     .progress-info {
       margin-top: 8px;
       text-align: center;
@@ -860,10 +869,10 @@ onMounted(async () => {
       color: #e6a23c;
     }
   }
-  
+
   .detail-section {
     margin-bottom: 20px;
-    
+
     h4 {
       margin: 0 0 12px 0;
       font-size: 14px;
@@ -871,12 +880,12 @@ onMounted(async () => {
       color: #606266;
     }
   }
-  
+
   .detail-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
     gap: 12px;
-    
+
     .detail-item {
       display: flex;
       flex-direction: column;
@@ -884,24 +893,24 @@ onMounted(async () => {
       padding: 10px 12px;
       background: #f8f9fa;
       border-radius: 6px;
-      
+
       .detail-label {
         font-size: 12px;
         color: #909399;
       }
-      
+
       .detail-value {
         font-size: 14px;
         color: #303133;
         word-break: break-all;
-        
+
         &.path {
           color: #409eff;
         }
       }
     }
   }
-  
+
   .source-url {
     padding: 12px;
     background: #f8f9fa;
@@ -913,36 +922,36 @@ onMounted(async () => {
     max-height: 100px;
     overflow-y: auto;
   }
-  
+
   .file-list {
     max-height: 200px;
     overflow-y: auto;
     border: 1px solid #ebeef5;
     border-radius: 6px;
-    
+
     .file-item {
       display: flex;
       align-items: center;
       gap: 8px;
       padding: 10px 12px;
       border-bottom: 1px solid #ebeef5;
-      
+
       &:last-child {
         border-bottom: none;
       }
-      
+
       .el-icon {
         color: #909399;
         flex-shrink: 0;
       }
-      
+
       .file-name {
         flex: 1;
         font-size: 13px;
         color: #303133;
         word-break: break-all;
       }
-      
+
       .file-size {
         flex-shrink: 0;
         font-size: 12px;
@@ -962,11 +971,11 @@ onMounted(async () => {
   flex-direction: column;
   gap: 12px;
   padding-bottom: 16px;
-  
+
   // 隐藏滚动条但保留滚动功能
   -ms-overflow-style: none;
   scrollbar-width: none;
-  
+
   &::-webkit-scrollbar {
     display: none;
   }
@@ -979,7 +988,7 @@ onMounted(async () => {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
   transition: all 0.2s ease;
   border: 1px solid transparent;
-  
+
   &:active {
     transform: scale(0.98);
     box-shadow: 0 1px 6px rgba(0, 0, 0, 0.06);
@@ -1004,7 +1013,7 @@ onMounted(async () => {
       -webkit-box-orient: vertical;
       overflow: hidden;
     }
-    
+
     .el-tag {
       flex-shrink: 0;
       border-radius: 6px;
@@ -1053,12 +1062,12 @@ onMounted(async () => {
 
   .task-progress {
     margin-bottom: 14px;
-    
+
     :deep(.el-progress-bar__outer) {
       border-radius: 4px;
       background: #e9ecef;
     }
-    
+
     :deep(.el-progress-bar__inner) {
       border-radius: 4px;
     }
@@ -1070,28 +1079,28 @@ onMounted(async () => {
     gap: 10px;
     padding-top: 12px;
     border-top: 1px solid #f0f0f0;
-    
+
     .el-button {
       min-width: 70px;
       border-radius: 6px;
       font-weight: 500;
-      
+
       &--small {
         height: 32px;
         font-size: 13px;
       }
     }
   }
-  
+
   // 不同状态的卡片边框颜色
   &.status-running {
     border-color: rgba(230, 162, 60, 0.3);
   }
-  
+
   &.status-success {
     border-color: rgba(103, 194, 58, 0.3);
   }
-  
+
   &.status-error {
     border-color: rgba(245, 108, 108, 0.3);
   }
@@ -1134,32 +1143,32 @@ onMounted(async () => {
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
-  
+
   // 对话框头部
   .el-dialog__header {
     background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
     border-bottom: 1px solid #ebeef5;
     padding: 18px 24px;
     margin-right: 0;
-    
+
     .el-dialog__title {
       font-size: 17px;
       font-weight: 600;
       color: #303133;
       letter-spacing: 0.3px;
     }
-    
+
     .el-dialog__headerbtn {
       top: 18px;
       right: 20px;
       width: 28px;
       height: 28px;
-      
+
       .el-dialog__close {
         font-size: 16px;
         color: #909399;
         transition: all 0.2s ease;
-        
+
         &:hover {
           color: #409eff;
           transform: rotate(90deg);
@@ -1167,13 +1176,13 @@ onMounted(async () => {
       }
     }
   }
-  
+
   // 对话框内容区
   .el-dialog__body {
     padding: 24px;
     background: #ffffff;
   }
-  
+
   // 对话框底部
   .el-dialog__footer {
     background: #fafafa;
@@ -1185,21 +1194,21 @@ onMounted(async () => {
 // 表单项样式
 :deep(.el-form-item) {
   margin-bottom: 22px;
-  
+
   &:last-child {
     margin-bottom: 0;
   }
-  
+
   .el-form-item__label {
     font-weight: 500;
     color: #606266;
     font-size: 14px;
-    
+
     &::before {
       color: #f56c6c;
     }
   }
-  
+
   .el-form-item__content {
     line-height: 1.5;
   }
@@ -1211,20 +1220,20 @@ onMounted(async () => {
     border-radius: 6px;
     transition: all 0.2s ease;
     box-shadow: 0 0 0 1px #dcdfe6 inset;
-    
+
     &:hover {
       box-shadow: 0 0 0 1px #c0c4cc inset;
     }
-    
+
     &.is-focus {
       box-shadow: 0 0 0 1px #409eff inset;
     }
   }
-  
+
   .el-input__inner {
     font-size: 14px;
     color: #303133;
-    
+
     &::placeholder {
       color: #c0c4cc;
     }
@@ -1240,15 +1249,15 @@ onMounted(async () => {
     border-radius: 6px;
     padding: 10px 12px;
     transition: all 0.2s ease;
-    
+
     &::placeholder {
       color: #c0c4cc;
     }
-    
+
     &:hover {
       border-color: #c0c4cc;
     }
-    
+
     &:focus {
       border-color: #409eff;
       box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.1);
@@ -1260,7 +1269,7 @@ onMounted(async () => {
 :deep(.el-switch) {
   --el-switch-on-color: #409eff;
   --el-switch-off-color: #dcdfe6;
-  
+
   .el-switch__core {
     border-radius: 12px;
     transition: all 0.2s ease;
@@ -1273,7 +1282,7 @@ onMounted(async () => {
     font-size: 13px;
     color: #606266;
   }
-  
+
   .el-checkbox__input.is-checked + .el-checkbox__label {
     color: #409eff;
   }
@@ -1284,26 +1293,26 @@ onMounted(async () => {
   display: flex;
   justify-content: flex-end;
   gap: 12px;
-  
+
   .el-button {
     min-width: 80px;
     border-radius: 6px;
     font-weight: 500;
     transition: all 0.2s ease;
-    
+
     &--primary {
       box-shadow: 0 2px 8px rgba(64, 158, 255, 0.3);
-      
+
       &:hover {
         box-shadow: 0 4px 12px rgba(64, 158, 255, 0.4);
         transform: translateY(-1px);
       }
-      
+
       &:active {
         transform: translateY(0);
       }
     }
-    
+
     &--default {
       &:hover {
         border-color: #409eff;
@@ -1331,106 +1340,106 @@ onMounted(async () => {
       justify-content: flex-end;
     }
   }
-  
+
   // 移动端详情弹窗适配
   .task-detail {
     .detail-header {
       flex-direction: column;
       gap: 12px;
-      
+
       .detail-title {
         font-size: 16px;
       }
     }
-    
+
     .detail-grid {
       grid-template-columns: 1fr;
     }
-    
+
     .file-list {
       max-height: 150px;
     }
   }
-  
+
   // 移动端对话框适配
   :deep(.el-dialog) {
     width: 95% !important;
     margin: 3vh auto !important;
     border-radius: 16px;
-    
+
     .el-dialog__header {
       padding: 16px 18px;
       background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
-      
+
       .el-dialog__title {
         font-size: 16px;
       }
-      
+
       .el-dialog__headerbtn {
         top: 16px;
         right: 16px;
       }
     }
-    
+
     .el-dialog__body {
       padding: 18px;
       max-height: 60vh;
       overflow-y: auto;
     }
-    
+
     .el-dialog__footer {
       padding: 14px 18px;
     }
   }
-  
+
   // 全屏对话框适配
   :deep(.el-dialog.is-fullscreen) {
     border-radius: 0;
-    
+
     .el-dialog__body {
       max-height: calc(100vh - 120px);
     }
   }
-  
+
   // 移动端表单标签垂直布局
   :deep(.el-form-item) {
     margin-bottom: 18px;
-    
+
     .el-form-item__label {
       font-size: 14px;
       padding-bottom: 8px;
     }
   }
-  
+
   // 移动端输入框优化
   :deep(.el-input) {
     .el-input__wrapper {
       padding: 8px 12px;
     }
-    
+
     .el-input__inner {
       font-size: 16px; // 防止 iOS 自动缩放
     }
   }
-  
+
   :deep(.el-textarea) {
     .el-textarea__inner {
       font-size: 16px; // 防止 iOS 自动缩放
       min-height: 100px;
     }
   }
-  
+
   // 移动端路径选择器
   .path-selector {
     flex-direction: column;
     gap: 10px;
-    
+
     .el-button {
       width: 100%;
       height: 40px;
     }
   }
-  
+
   // 移动端自动下载提示
   .auto-download-hint {
     display: block;
@@ -1439,31 +1448,31 @@ onMounted(async () => {
     font-size: 13px;
     color: #909399;
   }
-  
+
   // 移动端复选框
   .ask-path-checkbox {
     margin-top: 12px;
-    
+
     :deep(.el-checkbox__label) {
       font-size: 14px;
     }
   }
-  
+
   // 移动端对话框底部按钮
   .dialog-footer {
     flex-direction: column;
     gap: 10px;
-    
+
     .el-button {
       width: 100%;
       height: 44px;
       margin: 0;
       font-size: 15px;
-      
+
       &:first-child {
         order: 2;
       }
-      
+
       &:last-child {
         order: 1;
       }
@@ -1478,7 +1487,7 @@ onMounted(async () => {
   .cloud-dl-view {
     padding: 16px;
   }
-  
+
   .toolbar {
     .header-left {
       h2 {
@@ -1486,23 +1495,23 @@ onMounted(async () => {
       }
     }
   }
-  
+
   .task-container {
     padding: 14px;
-    
+
     :deep(.el-table) {
       font-size: 13px;
-      
+
       .el-table__header th {
         padding: 10px 0;
       }
-      
+
       .el-table__body td {
         padding: 10px 0;
       }
     }
   }
-  
+
   :deep(.el-dialog) {
     width: 80% !important;
     max-width: 600px;
@@ -1516,64 +1525,64 @@ onMounted(async () => {
   .cloud-dl-view {
     padding: 10px;
   }
-  
+
   .toolbar {
     gap: 8px;
-    
+
     .header-left {
       .el-tag {
         font-size: 11px;
         padding: 0 6px;
       }
     }
-    
+
     .header-right {
       gap: 6px;
-      
+
       .el-button.is-circle {
         width: 36px;
         height: 36px;
       }
     }
   }
-  
+
   .task-cards {
     gap: 10px;
   }
-  
+
   .task-card {
     padding: 14px;
     border-radius: 10px;
-    
+
     .task-header {
       margin-bottom: 12px;
-      
+
       .task-name {
         font-size: 14px;
       }
-      
+
       .el-tag {
         font-size: 11px;
         padding: 0 6px;
       }
     }
-    
+
     .task-info {
       padding: 10px;
-      
+
       .info-row {
         font-size: 12px;
-        
+
         .label {
           width: 40px;
         }
       }
     }
-    
+
     .task-actions {
       padding-top: 10px;
       gap: 8px;
-      
+
       .el-button--small {
         min-width: 60px;
         height: 30px;
@@ -1581,39 +1590,39 @@ onMounted(async () => {
       }
     }
   }
-  
+
   :deep(.el-dialog) {
     width: 98% !important;
     margin: 2vh auto !important;
-    
+
     .el-dialog__header {
       padding: 14px 16px;
-      
+
       .el-dialog__title {
         font-size: 15px;
       }
     }
-    
+
     .el-dialog__body {
       padding: 14px;
     }
-    
+
     .el-dialog__footer {
       padding: 12px 14px;
     }
   }
-  
+
   :deep(.el-form-item) {
     margin-bottom: 14px;
-    
+
     .el-form-item__label {
       font-size: 13px;
     }
   }
-  
+
   .dialog-footer {
     gap: 8px;
-    
+
     .el-button {
       height: 40px;
       font-size: 14px;
@@ -1628,43 +1637,43 @@ onMounted(async () => {
   .cloud-dl-view {
     padding: 8px 16px;
   }
-  
+
   .toolbar {
     margin-bottom: 8px;
   }
-  
+
   .task-cards {
     gap: 8px;
   }
-  
+
   .task-card {
     padding: 12px;
-    
+
     .task-header {
       margin-bottom: 8px;
     }
-    
+
     .task-info {
       padding: 8px;
       margin-bottom: 8px;
-      
+
       .info-row {
         margin-bottom: 4px;
       }
     }
-    
+
     .task-progress {
       margin-bottom: 8px;
     }
-    
+
     .task-actions {
       padding-top: 8px;
     }
   }
-  
+
   :deep(.el-dialog) {
     margin: 2vh auto !important;
-    
+
     .el-dialog__body {
       max-height: 50vh;
       padding: 12px;
@@ -1679,7 +1688,7 @@ onMounted(async () => {
   .cloud-dl-view.is-mobile {
     padding-bottom: calc(12px + env(safe-area-inset-bottom));
   }
-  
+
   .task-cards {
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -1699,15 +1708,15 @@ onMounted(async () => {
 @media (prefers-contrast: high) {
   .task-card {
     border: 2px solid #303133;
-    
+
     &.status-running {
       border-color: #e6a23c;
     }
-    
+
     &.status-success {
       border-color: #67c23a;
     }
-    
+
     &.status-error {
       border-color: #f56c6c;
     }
@@ -1720,23 +1729,23 @@ onMounted(async () => {
 @media (prefers-reduced-motion: reduce) {
   .task-card {
     transition: none;
-    
+
     &:active {
       transform: none;
     }
   }
-  
+
   :deep(.el-dialog__close) {
     transition: none;
-    
+
     &:hover {
       transform: none;
     }
   }
-  
+
   .dialog-footer .el-button {
     transition: none;
-    
+
     &:hover {
       transform: none;
     }
