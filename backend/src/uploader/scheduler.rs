@@ -171,6 +171,10 @@ pub struct UploadTaskScheduleInfo {
     /// 任务槽池引用（可选，由 UploadManager 传入）
     pub task_slot_pool: Option<Arc<TaskSlotPool>>,
 
+    // 🔥 槽位刷新节流器（30秒间隔，防止槽位超时释放）
+    /// 槽位刷新节流器（可选，仅当 task_slot_pool 存在时创建）
+    pub slot_touch_throttler: Option<Arc<crate::task_slot_pool::SlotTouchThrottler>>,
+
     // 🔥 加密快照管理器（用于保存加密映射到 encryption_snapshots 表）
     /// 快照管理器引用（可选，仅加密上传任务需要）
     pub snapshot_manager: Option<Arc<SnapshotManager>>,
@@ -1232,6 +1236,12 @@ impl UploadChunkScheduler {
                         if speed > 0 {
                             t.speed = speed;
                         }
+
+                        // 🔥 刷新槽位时间戳（带节流，防止槽位超时释放）
+                        if let Some(ref throttler) = task_info.slot_touch_throttler {
+                            throttler.try_touch().await;
+                        }
+
                         // 🔥 发布带节流的进度事件（每 200ms 最多发布一次）
                         if let Some(ref ws_manager) = task_info.ws_manager {
                             // 使用节流器控制发布频率

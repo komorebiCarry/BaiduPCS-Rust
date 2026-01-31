@@ -232,6 +232,9 @@ impl UploadManager {
             backup_record_manager: Arc::new(RwLock::new(None)),
         };
 
+        // 🔥 设置槽位超时释放处理器
+        manager.setup_stale_release_handler();
+
         // 启动后台任务：定期检查并启动等待队列中的任务
         if use_scheduler {
             manager.start_waiting_queue_monitor();
@@ -1954,6 +1957,11 @@ impl UploadManager {
                 backup_notification_tx: None,
                 // 🔥 传入任务槽池引用，用于任务完成/失败时释放槽位
                 task_slot_pool: Some(task_slot_pool.clone()),
+                // 🔥 槽位刷新节流器（30秒间隔，防止槽位超时释放）
+                slot_touch_throttler: Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                    task_slot_pool.clone(),
+                    task_id_string.clone(),
+                ))),
                 // 🔥 传入加密快照管理器，用于上传完成后保存加密映射
                 snapshot_manager,
                 // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
@@ -3169,6 +3177,51 @@ impl UploadManager {
         }
     }
 
+    /// 🔥 设置槽位超时释放处理器
+    ///
+    /// 当槽位因超时被自动释放时，将对应任务状态设置为失败
+    fn setup_stale_release_handler(&self) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // 设置通知通道到槽位池
+        let task_slot_pool = self.task_slot_pool.clone();
+        tokio::spawn(async move {
+            task_slot_pool.set_stale_release_handler(tx).await;
+        });
+
+        // 启动监听循环
+        let tasks = self.tasks.clone();
+        let ws_manager = self.ws_manager.clone();
+        tokio::spawn(async move {
+            while let Some(task_id) = rx.recv().await {
+                info!("收到槽位超时释放通知，将上传任务设置为失败: {}", task_id);
+
+                // 更新任务状态为失败
+                if let Some(task_info) = tasks.get(&task_id) {
+                    let mut t = task_info.task.lock().await;
+                    t.status = crate::uploader::UploadTaskStatus::Failed;
+                    t.error = Some("槽位超时释放：任务长时间无进度更新，可能已卡住".to_string());
+
+                    // 发送 WebSocket 通知
+                    let ws_guard = ws_manager.read().await;
+                    if let Some(ref ws) = *ws_guard {
+                        use crate::server::events::{TaskEvent, UploadEvent};
+                        ws.send_if_subscribed(
+                            TaskEvent::Upload(UploadEvent::Failed {
+                                task_id: task_id.clone(),
+                                error: "槽位超时释放：任务长时间无进度更新，可能已卡住".to_string(),
+                                is_backup: false,
+                            }),
+                            None,
+                        );
+                    }
+                }
+            }
+        });
+
+        info!("上传管理器已设置槽位超时释放处理器");
+    }
+
     /// 启动后台监控任务：定期检查并启动等待队列中的任务
     ///
     /// 这确保了当活跃任务自然完成时，等待队列中的任务能被自动启动
@@ -3735,6 +3788,11 @@ impl UploadManager {
                                     backup_notification_tx: None,
                                     // 🔥 传入任务槽池引用，用于任务完成/失败时释放槽位
                                     task_slot_pool: Some(task_slot_pool_clone.clone()),
+                                    // 🔥 槽位刷新节流器（30秒间隔，防止槽位超时释放）
+                                    slot_touch_throttler: Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                                        task_slot_pool_clone.clone(),
+                                        task_id_clone.clone(),
+                                    ))),
                                     // 🔥 传入加密快照管理器，用于上传完成后保存加密映射
                                     snapshot_manager: snapshot_manager_clone,
                                     // 🔥 Manager 任务列表引用（用于任务完成时立即清理）

@@ -644,6 +644,7 @@ impl ChunkScheduler {
                 task_id.clone(),
                 task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
                 task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
+                task_info.task_slot_pool.clone(), // 🔥 任务槽池（用于刷新槽位时间戳）
             )
                 .await;
 

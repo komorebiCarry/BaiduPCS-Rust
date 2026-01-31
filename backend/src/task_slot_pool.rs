@@ -144,6 +144,8 @@ pub struct TaskSlotPool {
     borrowed_map: Arc<RwLock<HashMap<String, Vec<usize>>>>,
     /// 清理任务句柄（用于 shutdown 时取消）
     cleanup_task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// 槽位超时释放通知通道（用于通知任务管理器将任务状态设置为失败）
+    stale_release_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl TaskSlotPool {
@@ -158,7 +160,21 @@ impl TaskSlotPool {
             slots: Arc::new(RwLock::new(slots)),
             borrowed_map: Arc::new(RwLock::new(HashMap::new())),
             cleanup_task_handle: Arc::new(Mutex::new(None)),
+            stale_release_tx: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 设置槽位超时释放通知处理器
+    ///
+    /// 当槽位因超时被自动释放时，会通过此通道发送任务 ID，
+    /// 任务管理器可以监听此通道并将对应任务状态设置为失败。
+    ///
+    /// # Arguments
+    /// * `tx` - 通知通道发送端
+    pub async fn set_stale_release_handler(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        let mut guard = self.stale_release_tx.write().await;
+        *guard = Some(tx);
+        info!("已设置槽位超时释放通知处理器");
     }
 
     /// 获取最大槽位数
@@ -355,7 +371,7 @@ impl TaskSlotPool {
     }
 
     /// 获取可用槽位数（包括固定位和可借调位）
-    /// 
+    ///
     /// 返回当前空闲的槽位总数，用于替代预注册机制中的余量查询
     pub async fn available_slots(&self) -> usize {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
@@ -680,7 +696,7 @@ impl TaskSlotPool {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
 
         let mut slots = self.slots.write().await;
-        
+
         for slot in slots.iter_mut() {
             if slot.id >= max_slots || slot.is_free() {
                 continue;
@@ -688,19 +704,19 @@ impl TaskSlotPool {
 
             if let Some(last_updated) = slot.last_updated_at {
                 let elapsed = now.duration_since(last_updated);
-                
+
                 if elapsed >= STALE_RELEASE_THRESHOLD {
                     // 超过5分钟，自动释放
                     let task_id = slot.task_id.clone().unwrap_or_default();
                     let allocated_at = slot.allocated_at;
-                    
+
                     error!(
                         "槽位过期自动释放: slot_id={}, task_id={}, 已占用时间={:?}, 最后更新={:?}",
-                        slot.id, task_id, 
+                        slot.id, task_id,
                         allocated_at.map(|t| now.duration_since(t)),
                         elapsed
                     );
-                    
+
                     released_tasks.push(task_id);
                     slot.release();
                 } else if elapsed >= STALE_WARNING_THRESHOLD {
@@ -727,11 +743,23 @@ impl TaskSlotPool {
             for task_id in &released_tasks {
                 borrowed_map.remove(task_id);
             }
-            
+
             info!(
                 "清理过期槽位完成: 释放了 {} 个槽位",
                 released_tasks.len()
             );
+
+            // 🔥 通知任务管理器将任务状态设置为失败
+            let tx_guard = self.stale_release_tx.read().await;
+            if let Some(ref tx) = *tx_guard {
+                for task_id in &released_tasks {
+                    if let Err(e) = tx.send(task_id.clone()) {
+                        warn!("发送槽位超时释放通知失败: task_id={}, error={}", task_id, e);
+                    } else {
+                        info!("已发送槽位超时释放通知: task_id={}", task_id);
+                    }
+                }
+            }
         }
 
         released_tasks
@@ -741,7 +769,7 @@ impl TaskSlotPool {
     ///
     /// 使用 tokio::spawn 启动后台任务，每 30 秒执行一次槽位清理检查。
     /// 返回一个 JoinHandle，可用于取消清理任务。
-    /// 
+    ///
     /// 注意：此方法返回的 JoinHandle 不会被自动保存。
     /// 如果需要在 shutdown 时自动取消任务，请使用 start_cleanup_task_managed 方法。
     ///
@@ -752,15 +780,15 @@ impl TaskSlotPool {
     /// tokio::task::JoinHandle，可用于等待或取消任务
     pub fn start_cleanup_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         info!("启动槽位清理后台任务，间隔: {:?}", CLEANUP_INTERVAL);
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-            
+
             loop {
                 interval.tick().await;
-                
+
                 let released = self.cleanup_stale_slots().await;
-                
+
                 if !released.is_empty() {
                     warn!(
                         "定期清理发现 {} 个过期槽位: {:?}",
@@ -781,16 +809,16 @@ impl TaskSlotPool {
     /// * `self` - Arc 包装的 TaskSlotPool 实例
     pub async fn start_cleanup_task_managed(self: Arc<Self>) {
         info!("启动槽位清理后台任务（托管模式），间隔: {:?}", CLEANUP_INTERVAL);
-        
+
         let pool = self.clone();
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-            
+
             loop {
                 interval.tick().await;
-                
+
                 let released = pool.cleanup_stale_slots().await;
-                
+
                 if !released.is_empty() {
                     warn!(
                         "定期清理发现 {} 个过期槽位: {:?}",
@@ -800,7 +828,7 @@ impl TaskSlotPool {
                 }
             }
         });
-        
+
         // 保存句柄
         let mut guard = self.cleanup_task_handle.lock().await;
         *guard = Some(handle);
@@ -812,7 +840,7 @@ impl TaskSlotPool {
     /// 如果没有运行中的清理任务，此方法会立即返回。
     pub async fn shutdown(&self) {
         info!("正在关闭任务位池...");
-        
+
         let mut guard = self.cleanup_task_handle.lock().await;
         if let Some(handle) = guard.take() {
             info!("取消槽位清理后台任务");
@@ -826,7 +854,7 @@ impl TaskSlotPool {
         } else {
             debug!("没有运行中的清理任务需要取消");
         }
-        
+
         info!("任务位池已关闭");
     }
 
@@ -837,6 +865,97 @@ impl TaskSlotPool {
             !handle.is_finished()
         } else {
             false
+        }
+    }
+}
+
+/// 槽位刷新节流器
+///
+/// 用于在进度更新时定期刷新任务槽位的时间戳，防止槽位因超时被释放。
+/// 内置 30 秒节流，避免频繁调用 touch_slot() 造成锁竞争。
+///
+/// # 使用场景
+/// - 下载任务进度回调
+/// - 上传任务进度回调
+/// - 自动备份任务进度回调
+///
+/// # 示例
+/// ```ignore
+/// let throttler = SlotTouchThrottler::new(pool.clone(), task_id.clone());
+/// // 在进度回调中调用
+/// throttler.try_touch_sync();
+/// ```
+pub struct SlotTouchThrottler {
+    /// 任务槽池引用
+    task_slot_pool: Arc<TaskSlotPool>,
+    /// 任务 ID（对于文件夹子任务，应使用文件夹 ID）
+    task_id: String,
+    /// 上次刷新时间
+    last_touch_time: std::sync::Mutex<Instant>,
+    /// 节流间隔（默认 30 秒）
+    throttle_interval: Duration,
+}
+
+impl std::fmt::Debug for SlotTouchThrottler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotTouchThrottler")
+            .field("task_id", &self.task_id)
+            .field("throttle_interval", &self.throttle_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SlotTouchThrottler {
+    /// 创建新的槽位刷新节流器
+    ///
+    /// # Arguments
+    /// * `task_slot_pool` - 任务槽池引用
+    /// * `task_id` - 任务 ID（对于文件夹子任务，应传入文件夹 ID）
+    pub fn new(task_slot_pool: Arc<TaskSlotPool>, task_id: String) -> Self {
+        Self {
+            task_slot_pool,
+            task_id,
+            last_touch_time: std::sync::Mutex::new(Instant::now()),
+            throttle_interval: Duration::from_secs(30),
+        }
+    }
+
+    /// 尝试刷新槽位时间戳（带节流，异步版本）
+    ///
+    /// 如果距离上次刷新超过 30 秒，则调用 touch_slot()
+    pub async fn try_touch(&self) {
+        let should_touch = {
+            let last = self.last_touch_time.lock().unwrap();
+            last.elapsed() >= self.throttle_interval
+        };
+
+        if should_touch {
+            if self.task_slot_pool.touch_slot(&self.task_id).await {
+                let mut last = self.last_touch_time.lock().unwrap();
+                *last = Instant::now();
+            }
+        }
+    }
+
+    /// 尝试刷新槽位时间戳（带节流，同步版本）
+    ///
+    /// 用于同步闭包中（如 progress_callback）
+    /// 内部使用 block_in_place 执行异步操作
+    pub fn try_touch_sync(&self) {
+        let should_touch = {
+            let last = self.last_touch_time.lock().unwrap();
+            last.elapsed() >= self.throttle_interval
+        };
+
+        if should_touch {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    if self.task_slot_pool.touch_slot(&self.task_id).await {
+                        let mut last = self.last_touch_time.lock().unwrap();
+                        *last = Instant::now();
+                    }
+                });
+            });
         }
     }
 }
@@ -1114,7 +1233,7 @@ mod tests {
 
         let slot3 = pool.allocate_fixed_slot("task3", false).await;
         assert!(slot3.is_some());
-        
+
         let slot4 = pool.allocate_fixed_slot("task4", false).await;
         assert!(slot4.is_none());
     }
@@ -1191,16 +1310,16 @@ mod tests {
     #[tokio::test]
     async fn test_available_slots_basic() {
         let pool = TaskSlotPool::new(5);
-        
+
         assert_eq!(pool.available_slots().await, 5);
-        
+
         pool.allocate_fixed_slot("task1", false).await;
         pool.allocate_fixed_slot("task2", false).await;
         assert_eq!(pool.available_slots().await, 3);
-        
+
         pool.allocate_borrowed_slots("folder1", 1).await;
         assert_eq!(pool.available_slots().await, 2);
-        
+
         pool.release_fixed_slot("task1").await;
         assert_eq!(pool.available_slots().await, 3);
     }
@@ -1208,12 +1327,12 @@ mod tests {
     #[tokio::test]
     async fn test_available_slots_edge_cases() {
         let pool = TaskSlotPool::new(3);
-        
+
         pool.allocate_fixed_slot("task1", false).await;
         pool.allocate_fixed_slot("task2", false).await;
         pool.allocate_fixed_slot("task3", false).await;
         assert_eq!(pool.available_slots().await, 0);
-        
+
         pool.release_fixed_slot("task1").await;
         pool.release_fixed_slot("task2").await;
         pool.release_fixed_slot("task3").await;
@@ -1224,7 +1343,7 @@ mod tests {
     async fn test_available_slots_concurrent() {
         let pool = Arc::new(TaskSlotPool::new(10));
         let mut handles = vec![];
-        
+
         for i in 0..20 {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
@@ -1237,14 +1356,14 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         let mut success = 0;
         for handle in handles {
             if handle.await.unwrap().is_some() {
                 success += 1;
             }
         }
-        
+
         assert_eq!(success, 10);
         assert_eq!(pool.available_slots().await, 0);
     }

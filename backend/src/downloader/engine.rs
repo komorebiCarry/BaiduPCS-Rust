@@ -2407,6 +2407,7 @@ impl DownloadEngine {
                     String::new(), // task_id（独立模式不需要）
                     None, // folder_progress_tx（独立模式不需要）
                     None, // backup_notification_tx（独立模式不需要）
+                    None, // task_slot_pool（独立模式不需要）
                 )
                     .await;
 
@@ -2519,6 +2520,7 @@ impl DownloadEngine {
         task_id: String,
         folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
         backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
+        task_slot_pool: Option<Arc<crate::task_slot_pool::TaskSlotPool>>,
     ) -> Result<()> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
@@ -2625,6 +2627,18 @@ impl DownloadEngine {
             let total_size_clone = total_size;
             let folder_progress_tx_clone = folder_progress_tx.clone();
             let backup_notification_tx_clone = backup_notification_tx.clone();
+            // 🔥 创建槽位刷新节流器（用于防止槽位超时释放）
+            let slot_touch_throttler = if let Some(ref pool) = task_slot_pool {
+                // 获取 group_id（如果是文件夹子任务，使用文件夹 ID；否则使用任务 ID）
+                let touch_id = {
+                    let t = task.blocking_lock();
+                    t.group_id.clone().unwrap_or_else(|| task_id.clone())
+                };
+                Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(pool.clone(), touch_id)))
+            } else {
+                None
+            };
+            let slot_touch_throttler_clone = slot_touch_throttler.clone();
             let progress_callback = move |bytes: u64| {
                 // 使用 tokio::task::block_in_place 在同步闭包中执行异步操作
                 tokio::task::block_in_place(|| {
@@ -2647,6 +2661,11 @@ impl DownloadEngine {
 
                         // 🔧 克隆一个临时变量用于 send
                         let group_id_for_ws = group_id.clone();
+
+                        // 🔥 刷新槽位时间戳（带节流，防止槽位超时释放）
+                        if let Some(ref throttler) = slot_touch_throttler_clone {
+                            throttler.try_touch().await;
+                        }
                         // 🔥 发布带节流的进度事件（每 200ms 最多发布一次）
                         if let Some(ref ws) = ws_manager_clone {
                             let should_emit = throttler_clone

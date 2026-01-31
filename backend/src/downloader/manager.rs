@@ -114,6 +114,9 @@ impl DownloadManager {
             encryption_config_store: Arc::new(RwLock::new(None)),
         };
 
+        // 🔥 设置槽位超时释放处理器
+        manager.setup_stale_release_handler();
+
         // 启动后台任务：定期检查并启动等待队列中的任务
         manager.start_waiting_queue_monitor();
 
@@ -1532,6 +1535,53 @@ impl DownloadManager {
                 }
             }
         });
+    }
+
+    /// 🔥 设置槽位超时释放处理器
+    ///
+    /// 当槽位因超时被自动释放时，将对应任务状态设置为失败
+    fn setup_stale_release_handler(&self) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // 设置通知通道到槽位池
+        let task_slot_pool = self.task_slot_pool.clone();
+        tokio::spawn(async move {
+            task_slot_pool.set_stale_release_handler(tx).await;
+        });
+
+        // 启动监听循环
+        let tasks = self.tasks.clone();
+        let ws_manager = self.ws_manager.clone();
+        tokio::spawn(async move {
+            while let Some(task_id) = rx.recv().await {
+                info!("收到槽位超时释放通知，将任务设置为失败: {}", task_id);
+
+                // 更新任务状态为失败
+                let tasks_guard = tasks.read().await;
+                if let Some(task) = tasks_guard.get(&task_id) {
+                    let mut t = task.lock().await;
+                    t.status = crate::downloader::TaskStatus::Failed;
+                    t.error = Some("槽位超时释放：任务长时间无进度更新，可能已卡住".to_string());
+
+                    // 发送 WebSocket 通知
+                    let ws_guard = ws_manager.read().await;
+                    if let Some(ref ws) = *ws_guard {
+                        use crate::server::events::{TaskEvent, DownloadEvent};
+                        ws.send_if_subscribed(
+                            TaskEvent::Download(DownloadEvent::Failed {
+                                task_id: task_id.clone(),
+                                error: "槽位超时释放：任务长时间无进度更新，可能已卡住".to_string(),
+                                group_id: t.group_id.clone(),
+                                is_backup: t.is_backup,
+                            }),
+                            t.group_id.clone(),
+                        );
+                    }
+                }
+            }
+        });
+
+        info!("下载管理器已设置槽位超时释放处理器");
     }
 
     /// 🔥 设置任务完成触发器（0延迟启动等待任务）
