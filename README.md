@@ -165,7 +165,9 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
 - ✅ 支持 AES-256-GCM 和 ChaCha20-Poly1305 算法
 - ✅ 跨平台支持（Windows、Linux、macOS）
 
-**下载：** 从 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面下载对应平台的 `decrypt-cli` 可执行文件。
+**下载：**
+- 推荐从 [`decrypt-cli-v0.1.0` 专用发布页](https://github.com/komorebiCarry/BaiduPCS-Rust/releases/tag/decrypt-cli-v0.1.0) 直接下载对应平台的 `decrypt-cli` 可执行文件
+- 也可以在项目的 [Releases 页面](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 中查看全部版本
 
 <details>
 <summary>📖 <b>decrypt-cli 使用说明</b>（点击展开）</summary>
