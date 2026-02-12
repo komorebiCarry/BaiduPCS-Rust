@@ -47,7 +47,7 @@
             :class="{
               'task-active': item.status === 'downloading' || item.status === 'scanning' || item.status === 'decrypting',
               'is-folder': item.type === 'folder',
-              'task-highlighted': highlightIds.has(item.id)
+              'task-highlighted': highlightIds.has(item.id ?? '')
             }"
             shadow="hover"
         >
