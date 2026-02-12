@@ -58,6 +58,12 @@ pub struct CreateTransferRequest {
     /// 分享直下任务会自动创建临时目录，下载完成后自动清理
     #[allow(dead_code)]
     pub is_share_direct_download: bool,
+    /// 用户选择的文件 fs_id 列表（可选）
+    /// 为空或未提供时转存所有文件（向后兼容）
+    pub selected_fs_ids: Option<Vec<u64>>,
+    /// 用户选择的文件完整信息列表（可选）
+    /// 前端在文件选择模式下传入，包含选中文件的名称、大小、类型等信息
+    pub selected_files: Option<Vec<SharedFileInfo>>,
 }
 
 /// 创建转存任务响应
@@ -67,6 +73,15 @@ pub struct CreateTransferResponse {
     pub status: Option<TransferStatus>,
     pub need_password: bool,
     pub error: Option<String>,
+}
+
+/// 预览分享结果（包含文件列表和分享信息）
+pub struct PreviewShareResult {
+    pub files: Vec<SharedFileInfo>,
+    pub short_key: String,
+    pub shareid: String,
+    pub uk: String,
+    pub bdstoken: String,
 }
 
 impl TransferManager {
@@ -131,6 +146,108 @@ impl TransferManager {
         info!("转存管理器已设置文件夹下载管理器");
     }
 
+    /// 预览分享链接中的文件列表（不执行转存）
+    ///
+    /// 步骤：
+    /// 1. parse_share_link(share_url) → 提取 short_key 和可能的密码
+    /// 2. access_share_page(short_key, password) → 获取 SharePageInfo
+    /// 3. 如果有密码，调用 verify_share_password() → 验证密码并获取 sekey
+    /// 4. list_share_files(short_key, shareid, uk, bdstoken, page, num) → 获取根目录文件列表
+    /// 5. 返回 PreviewShareResult（文件列表 + 分享信息）
+    pub async fn preview_share(
+        &self,
+        share_url: &str,
+        password: Option<String>,
+        page: u32,
+        num: u32,
+    ) -> Result<PreviewShareResult> {
+        info!("预览分享链接: url={}", share_url);
+
+        // 1. 解析分享链接
+        let share_link = self.client.parse_share_link(share_url)?;
+
+        // 合并密码：请求中的密码 > 链接中的密码
+        let password = password.or(share_link.password.clone());
+
+        // 2. 访问分享页面，获取分享信息
+        let share_info = self
+            .client
+            .access_share_page(&share_link.short_key, &password, true)
+            .await?;
+
+        // 3. 如果有密码，验证密码
+        if let Some(ref pwd) = password {
+            let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+            self.client
+                .verify_share_password(
+                    &share_info.shareid,
+                    &share_info.share_uk,
+                    &share_info.bdstoken,
+                    pwd,
+                    &referer,
+                )
+                .await?;
+            info!("预览: 提取码验证成功");
+        }
+
+        // 4. 获取文件列表（根目录，由前端传入分页参数）
+        let list_result = self
+            .client
+            .list_share_files(
+                &share_link.short_key,
+                &share_info.bdstoken,
+                page,
+                num,
+            )
+            .await?;
+
+        // 用根目录响应中的 uk/shareid 补充（access_share_page 可能提取失败）
+        let uk = if !list_result.uk.is_empty() {
+            list_result.uk
+        } else {
+            share_info.uk
+        };
+        let shareid = if !list_result.shareid.is_empty() {
+            list_result.shareid
+        } else {
+            share_info.shareid
+        };
+
+        info!("预览: 获取到 {} 个文件, uk={}, shareid={}", list_result.files.len(), uk, shareid);
+        Ok(PreviewShareResult {
+            files: list_result.files,
+            short_key: share_link.short_key,
+            shareid,
+            uk,
+            bdstoken: share_info.bdstoken,
+        })
+    }
+
+    /// 浏览分享链接中指定目录的文件列表
+    ///
+    /// 用于文件夹导航：前端点击文件夹后，调用此方法获取子目录内容。
+    /// 需要传入首次预览时获取的 share_info，避免重复访问分享页面。
+    pub async fn preview_share_dir(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        uk: &str,
+        bdstoken: &str,
+        dir: &str,
+        page: u32,
+        num: u32,
+    ) -> Result<Vec<SharedFileInfo>> {
+        info!("浏览分享子目录: short_key={}, dir={}, page={}, num={}", short_key, dir, page, num);
+
+        let file_list = self
+            .client
+            .list_share_files_in_dir(short_key, shareid, uk, bdstoken, dir, page, num)
+            .await?;
+
+        info!("子目录: 获取到 {} 个文件, dir={}", file_list.len(), dir);
+        Ok(file_list)
+    }
+
     /// 创建转存任务
     ///
     /// 如果需要密码，返回 need_password=true
@@ -193,6 +310,10 @@ impl TransferManager {
             task.is_share_direct_download = true;
             task.temp_dir = temp_dir.clone();
         }
+
+        // 设置选择性转存字段
+        task.selected_fs_ids = request.selected_fs_ids.clone();
+        task.selected_files = request.selected_files.clone();
 
         let task_id = task.id.clone();
 
@@ -480,35 +601,93 @@ impl TransferManager {
         }
 
         // 列出分享文件
-        let file_list = client
-            .list_share_files(
-                &share_link.short_key,
-                &share_info.shareid,
-                &share_info.bdstoken,
-            )
-            .await?;
+        // 如果用户已选择了具体文件（selected_fs_ids 非空），只需拉第一页用于展示文件名
+        // 如果是全选模式（selected_fs_ids 为空），需要循环分页拉取全部 fs_id
+        let has_selected_fs_ids = {
+            let t = task.read().await;
+            t.selected_fs_ids.as_ref().map_or(false, |ids| !ids.is_empty())
+        };
+
+        let file_list = if has_selected_fs_ids {
+            // 用户已选择文件，只拉第一页用于展示文件名
+            let result = client
+                .list_share_files(
+                    &share_link.short_key,
+                    &share_info.bdstoken,
+                    1,
+                    100,
+                )
+                .await?;
+            result.files
+        } else {
+            // 全选模式，循环分页拉取全部
+            let mut all_files = Vec::new();
+            let page_size: u32 = 100;
+            let mut page: u32 = 1;
+            loop {
+                let result = client
+                    .list_share_files(
+                        &share_link.short_key,
+                        &share_info.bdstoken,
+                        page,
+                        page_size,
+                    )
+                    .await?;
+                let batch_len = result.files.len();
+                all_files.extend(result.files);
+                if (batch_len as u32) < page_size {
+                    break;
+                }
+                page += 1;
+            }
+            all_files
+        };
 
         info!("获取到 {} 个文件", file_list.len());
 
-        // 🔥 从分享文件列表中提取主要文件名
-        let transfer_file_name = if !file_list.is_empty() {
-            if file_list.len() == 1 {
+        // 🔥 根据 selected_fs_ids 和 selected_files 构建过滤后的文件列表
+        // 优先使用前端传入的 selected_files（包含完整文件信息，支持子目录选择场景）
+        // 如果没有 selected_files，则从根目录 file_list 中按 selected_fs_ids 过滤
+        let (selected_fs_ids_snapshot, selected_files_snapshot) = {
+            let t = task.read().await;
+            (t.selected_fs_ids.clone(), t.selected_files.clone())
+        };
+        let filtered_file_list = if let Some(ref selected_files) = selected_files_snapshot {
+            if !selected_files.is_empty() {
+                selected_files.clone()
+            } else {
+                file_list.clone()
+            }
+        } else if let Some(ref selected) = selected_fs_ids_snapshot {
+            if !selected.is_empty() {
+                let selected_set: std::collections::HashSet<u64> = selected.iter().copied().collect();
+                file_list.iter().filter(|f| selected_set.contains(&f.fs_id)).cloned().collect::<Vec<_>>()
+            } else {
+                file_list.clone()
+            }
+        } else {
+            file_list.clone()
+        };
+
+        // 🔥 从过滤后的文件列表中提取主要文件名
+        let transfer_file_name = if !filtered_file_list.is_empty() {
+            if filtered_file_list.len() == 1 {
                 // 只有一个文件/文件夹，使用其名称
-                Some(file_list[0].name.clone())
+                Some(filtered_file_list[0].name.clone())
             } else {
                 // 多个文件，使用第一个文件名 + 等x个文件
-                Some(format!("{} 等{}个文件", file_list[0].name, file_list.len()))
+                Some(format!("{} 等{}个文件", filtered_file_list[0].name, filtered_file_list.len()))
             }
         } else {
             None
         };
 
-        // 更新任务文件列表和文件名
+        // 更新任务文件列表和文件名（使用过滤后的列表）
         let old_status;
         {
             let mut t = task.write().await;
             old_status = format!("{:?}", t.status).to_lowercase();
-            t.set_file_list(file_list.clone());
+            t.set_file_list(filtered_file_list.clone());
             t.mark_transferring();
 
             // 🔥 设置文件名（用于展示）
@@ -543,6 +722,16 @@ impl TransferManager {
                 if let Err(e) = pm.update_transfer_file_name(task_id, file_name.clone()) {
                     warn!("更新转存文件名失败: {}", e);
                 }
+            }
+
+            // 更新文件列表
+            match serde_json::to_string(&filtered_file_list) {
+                Ok(json) => {
+                    if let Err(e) = pm.update_transfer_file_list(task_id, json) {
+                        warn!("更新转存文件列表失败: {}", e);
+                    }
+                }
+                Err(e) => warn!("序列化文件列表失败: {}", e),
             }
         }
 
@@ -629,7 +818,19 @@ impl TransferManager {
             }
         }
 
-        let fs_ids: Vec<u64> = file_list.iter().map(|f| f.fs_id).collect();
+        // 构建 fs_ids：根据 selected_fs_ids 决定转存哪些文件
+        let selected_fs_ids = {
+            let t = task.read().await;
+            t.selected_fs_ids.clone()
+        };
+        let fs_ids = build_fs_ids(&file_list, &selected_fs_ids);
+
+        // 根据实际 fs_ids 更新 total_count
+        {
+            let mut t = task.write().await;
+            t.total_count = fs_ids.len();
+        }
+
         let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
 
         info!("执行转存: {} 个文件 -> {}", fs_ids.len(), save_path);
@@ -1006,36 +1207,50 @@ impl TransferManager {
         let mut download_files: Vec<(u64, String, String, u64)> = Vec::new(); // (fs_id, remote_path, filename, size)
         let mut download_folders: Vec<String> = Vec::new(); // 文件夹路径
 
+        // 🔥 构建 name -> SharedFileInfo 的映射，用于按文件名匹配
+        // 注意：transferred_fs_ids 是百度返回的转存后新 fs_id（to_fs_id），
+        // 与 file_list 中的原始分享 fs_id 不同，无法直接用 fs_id 匹配。
+        // 同一分享目录下不会有同名文件，所以文件名匹配在实际场景中是可靠的。
+        let file_info_by_name: std::collections::HashMap<&str, &SharedFileInfo> = file_list
+            .iter()
+            .map(|f| (f.name.as_str(), f))
+            .collect();
+
         for (idx, transferred_path) in transfer_result.transferred_paths.iter().enumerate() {
-            // 尝试从 file_list 中获取对应文件的信息
-            if idx < file_list.len() {
-                let file_info = &file_list[idx];
-                // 调试：打印 file_info 的 JSON
-                match serde_json::to_string(file_info) {
-                    Ok(json) => {
-                        info!("file_info[{}] = {}", idx, json);
-                    }
-                    Err(e) => {
-                        warn!("序列化 file_info 失败: idx={}, error={}", idx, e);
-                    }
-                }
+            let transferred_fs_id = transfer_result.transferred_fs_ids.get(idx).copied();
+            // 优先用 from_paths 的原始文件名匹配（百度转存可能重命名文件，如加时间戳后缀避免重名）
+            // fallback 到 transferred_path 的文件名
+            let from_filename = transfer_result.from_paths.get(idx)
+                .map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+            let to_filename = transferred_path.rsplit('/').next().unwrap_or(transferred_path);
+
+            let file_info = from_filename.as_deref()
+                .and_then(|name| file_info_by_name.get(name).copied())
+                .or_else(|| file_info_by_name.get(to_filename).copied());
+
+            if let Some(file_info) = file_info {
+                info!("匹配文件信息: idx={}, name={}, is_dir={}, transferred_fs_id={:?}",
+                    idx, file_info.name, file_info.is_dir, transferred_fs_id);
                 if file_info.is_dir {
                     // 文件夹：记录路径，稍后调用文件夹下载
                     download_folders.push(transferred_path.clone());
                     info!("发现文件夹: {}", transferred_path);
                 } else {
-                    // 文件：记录下载信息
+                    // 文件：记录下载信息，使用转存后的新 fs_id
                     download_files.push((
-                        transfer_result
-                            .transferred_fs_ids
-                            .get(idx)
-                            .copied()
-                            .unwrap_or(file_info.fs_id),
+                        transferred_fs_id.unwrap_or(0),
                         transferred_path.clone(),
                         file_info.name.clone(),
                         file_info.size,
                     ));
                 }
+            } else {
+                // 无法匹配到文件信息（可能是同名碰撞或分页未拉全）
+                warn!("无法匹配文件信息: idx={}, path={}, from={:?}, to_filename={}",
+                    idx, transferred_path, from_filename, to_filename);
+                // 默认当作文件处理，使用转存后的文件名
+                let fs_id = transferred_fs_id.unwrap_or(0);
+                download_files.push((fs_id, transferred_path.clone(), to_filename.to_string(), 0));
             }
         }
 
@@ -1745,9 +1960,12 @@ impl TransferManager {
             .as_ref()
             .and_then(|json_str| serde_json::from_str::<SharePageInfo>(json_str).ok());
 
-        // 解析文件列表（如果存在，需要从其他地方获取，这里暂时为空）
-        // TODO: 如果 metadata 中有文件列表信息，可以在这里恢复
-        let file_list = Vec::new();
+        // 解析文件列表（从持久化的 JSON 恢复）
+        let file_list = metadata
+            .file_list_json
+            .as_ref()
+            .and_then(|json_str| serde_json::from_str::<Vec<SharedFileInfo>>(json_str).ok())
+            .unwrap_or_default();
 
         // 转换转存状态
         let status = match metadata.transfer_status.as_deref() {
@@ -1758,31 +1976,39 @@ impl TransferManager {
             _ => TransferStatus::Completed, // 已完成的任务默认使用 Completed
         };
 
+        // 根据文件列表计算 total_count 和 transferred_count
+        let total_count = if !file_list.is_empty() {
+            file_list.len()
+        } else {
+            metadata.download_task_ids.len()
+        };
+        let transferred_count = total_count;
+
         Some(TransferTask {
             id: metadata.task_id.clone(),
             share_url,
             password: metadata.share_pwd.clone(),
             save_path,
             save_fs_id,
-            auto_download: metadata.auto_download.unwrap_or(false), // 从持久化中读取
+            auto_download: metadata.auto_download.unwrap_or(false),
             local_download_path: None,
             status,
             error: None,
             download_task_ids: metadata.download_task_ids.clone(),
             share_info,
             file_list,
-            // 使用 download_task_ids 的长度来推断总文件数（已完成的历史任务）
-            // 如果没有下载任务，说明只是转存没有下载，使用 0
-            transferred_count: metadata.download_task_ids.len(),
-            total_count: metadata.download_task_ids.len(),
+            transferred_count,
+            total_count,
             created_at: metadata.created_at.timestamp(),
             updated_at: metadata.updated_at.timestamp(),
             failed_download_ids: Vec::new(),
             completed_download_ids: Vec::new(),
             download_started_at: None,
-            file_name: metadata.transfer_file_name.clone(), // 从持久化中读取
-            is_share_direct_download: false, // 历史任务默认不是分享直下
-            temp_dir: None,
+            file_name: metadata.transfer_file_name.clone(),
+            is_share_direct_download: metadata.is_share_direct_download.unwrap_or(false),
+            temp_dir: metadata.temp_dir.clone(),
+            selected_fs_ids: None,
+            selected_files: None,
         })
     }
 
@@ -2051,6 +2277,13 @@ impl TransferManager {
         // 恢复任务 ID（保持原有 ID）
         task.id = task_id.clone();
         task.created_at = recovery_info.created_at;
+
+        // 恢复文件列表
+        if let Some(ref json) = recovery_info.file_list_json {
+            if let Ok(file_list) = serde_json::from_str::<Vec<SharedFileInfo>>(json) {
+                task.set_file_list(file_list);
+            }
+        }
 
         // 根据保存的状态恢复任务状态
         let status = recovery_info.status.as_deref().unwrap_or("checking_share");
@@ -2380,6 +2613,27 @@ impl TransferManager {
         } else {
             info!("启动时清理孤立临时目录已禁用");
         }
+    }
+}
+
+/// 根据 selected_fs_ids 构建实际要转存的 fs_id 列表
+///
+/// - selected_fs_ids 为 None 或空数组 → 返回 file_list 中所有文件的 fs_id（向后兼容）
+/// - selected_fs_ids 非空 → 直接返回用户选择的 fs_id 列表（包括文件夹）
+pub fn build_fs_ids(
+    file_list: &[SharedFileInfo],
+    selected_fs_ids: &Option<Vec<u64>>,
+) -> Vec<u64> {
+    if let Some(ref selected) = selected_fs_ids {
+        if selected.is_empty() {
+            file_list.iter().map(|f| f.fs_id).collect()
+        } else {
+            // 直接使用用户选择的 fs_id 列表，不过滤文件夹
+            // 用户明确选择了文件夹就应该转存文件夹
+            selected.clone()
+        }
+    } else {
+        file_list.iter().map(|f| f.fs_id).collect()
     }
 }
 

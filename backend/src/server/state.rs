@@ -195,6 +195,7 @@ impl AppState {
             let download_dir = config.download.download_dir.clone();
             let max_global_threads = config.download.max_global_threads;
             let max_concurrent_tasks = config.download.max_concurrent_tasks;
+            let max_retries = config.download.max_retries;
             drop(config);
 
             let mut manager = DownloadManager::with_config(
@@ -202,6 +203,7 @@ impl AppState {
                 download_dir,
                 max_global_threads,
                 max_concurrent_tasks,
+                max_retries,
             )?;
 
             // 🔥 设置持久化管理器

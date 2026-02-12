@@ -84,6 +84,15 @@ pub struct CreateTransferRequest {
     /// 分享直下任务会自动创建临时目录，下载完成后自动清理
     #[serde(default)]
     pub is_share_direct_download: bool,
+    /// 用户选择的文件 fs_id 列表（可选）
+    /// 为空或未提供时转存所有文件（向后兼容）
+    #[serde(default)]
+    pub selected_fs_ids: Option<Vec<u64>>,
+    /// 用户选择的文件完整信息列表（可选）
+    /// 前端在文件选择模式下传入，用于后端获取选中文件的名称、大小、类型等信息
+    /// 解决子目录选择场景下后端无法从根目录文件列表中匹配到子文件信息的问题
+    #[serde(default)]
+    pub selected_files: Option<Vec<crate::transfer::SharedFileInfo>>,
 }
 
 /// 创建转存任务响应
@@ -145,6 +154,8 @@ pub async fn create_transfer(
         auto_download: req.auto_download,
         local_download_path: req.local_download_path,
         is_share_direct_download: req.is_share_direct_download,
+        selected_fs_ids: req.selected_fs_ids,
+        selected_files: req.selected_files,
     };
 
     // 创建任务
@@ -337,6 +348,156 @@ pub struct CleanupOrphanedResponse {
     pub deleted_count: usize,
     /// 删除失败的目录路径列表
     pub failed_paths: Vec<String>,
+}
+
+/// 预览分享文件请求
+#[derive(Debug, Deserialize)]
+pub struct PreviewShareRequest {
+    pub share_url: String,
+    pub password: Option<String>,
+    /// 页码（从 1 开始，默认 1）
+    pub page: Option<u32>,
+    /// 每页数量（默认 100）
+    pub num: Option<u32>,
+}
+
+/// 预览分享文件响应
+#[derive(Debug, Serialize)]
+pub struct PreviewShareResponse {
+    pub files: Vec<crate::transfer::SharedFileInfo>,
+    /// 分享信息（用于后续目录导航，首次预览时返回）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_info: Option<PreviewShareInfo>,
+}
+
+/// 预览时返回的分享信息（前端缓存后用于目录导航）
+#[derive(Debug, Serialize)]
+pub struct PreviewShareInfo {
+    pub short_key: String,
+    pub shareid: String,
+    pub uk: String,
+    pub bdstoken: String,
+}
+
+/// POST /api/v1/transfers/preview
+/// 预览分享链接中的文件列表（不执行转存）
+pub async fn preview_share_files(
+    State(app_state): State<AppState>,
+    Json(req): Json<PreviewShareRequest>,
+) -> Json<TransferApiResponse<PreviewShareResponse>> {
+    // 获取转存管理器
+    let transfer_manager = {
+        let guard = app_state.transfer_manager.read().await;
+        match guard.clone() {
+            Some(tm) => tm,
+            None => {
+                error!("转存管理器未初始化");
+                return Json(TransferApiResponse::error(
+                    error_codes::MANAGER_NOT_READY,
+                    "转存管理器未初始化，请先登录",
+                ));
+            }
+        }
+    };
+
+    let page = req.page.unwrap_or(1);
+    let num = req.num.unwrap_or(100);
+
+    match transfer_manager
+        .preview_share(&req.share_url, req.password, page, num)
+        .await
+    {
+        Ok(result) => {
+            info!("预览分享文件成功: {} 个文件", result.files.len());
+            Json(TransferApiResponse::success(PreviewShareResponse {
+                files: result.files,
+                share_info: Some(PreviewShareInfo {
+                    short_key: result.short_key,
+                    shareid: result.shareid,
+                    uk: result.uk,
+                    bdstoken: result.bdstoken,
+                }),
+            }))
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            error!("预览分享文件失败: {}", err_msg);
+
+            // 根据错误内容返回不同的错误码（与 create_transfer 一致）
+            let code = if err_msg.contains("需要密码") || err_msg.contains("need password") || err_msg.contains("需要提取码") {
+                error_codes::NEED_PASSWORD
+            } else if err_msg.contains("提取码错误") || err_msg.contains("-9") {
+                error_codes::INVALID_PASSWORD
+            } else if err_msg.contains("已失效") || err_msg.contains("expired") {
+                error_codes::SHARE_EXPIRED
+            } else if err_msg.contains("不存在") || err_msg.contains("not found") {
+                error_codes::SHARE_NOT_FOUND
+            } else {
+                -1
+            };
+
+            Json(TransferApiResponse::error(code, err_msg))
+        }
+    }
+}
+
+/// 浏览分享子目录请求
+#[derive(Debug, Deserialize)]
+pub struct PreviewShareDirRequest {
+    /// 分享短链 ID（如 "1abcDEFg"）
+    pub short_key: String,
+    /// 分享 ID
+    pub shareid: String,
+    /// 分享者 UK
+    pub uk: String,
+    /// CSRF 令牌
+    pub bdstoken: String,
+    /// 要浏览的目录路径
+    pub dir: String,
+    /// 页码（从 1 开始，默认 1）
+    pub page: Option<u32>,
+    /// 每页数量（默认 100）
+    pub num: Option<u32>,
+}
+
+/// POST /api/v1/transfers/preview/dir
+/// 浏览分享链接中指定目录的文件列表（文件夹导航）
+pub async fn preview_share_dir(
+    State(app_state): State<AppState>,
+    Json(req): Json<PreviewShareDirRequest>,
+) -> Json<TransferApiResponse<PreviewShareResponse>> {
+    // 获取转存管理器
+    let transfer_manager = {
+        let guard = app_state.transfer_manager.read().await;
+        match guard.clone() {
+            Some(tm) => tm,
+            None => {
+                error!("转存管理器未初始化");
+                return Json(TransferApiResponse::error(
+                    error_codes::MANAGER_NOT_READY,
+                    "转存管理器未初始化，请先登录",
+                ));
+            }
+        }
+    };
+
+    let page = req.page.unwrap_or(1);
+    let num = req.num.unwrap_or(100);
+
+    match transfer_manager
+        .preview_share_dir(&req.short_key, &req.shareid, &req.uk, &req.bdstoken, &req.dir, page, num)
+        .await
+    {
+        Ok(files) => {
+            info!("浏览分享子目录成功: {} 个文件, dir={}", files.len(), req.dir);
+            Json(TransferApiResponse::success(PreviewShareResponse { files, share_info: None }))
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            error!("浏览分享子目录失败: {}", err_msg);
+            Json(TransferApiResponse::error(-1, err_msg))
+        }
+    }
 }
 
 /// POST /api/v1/transfers/cleanup

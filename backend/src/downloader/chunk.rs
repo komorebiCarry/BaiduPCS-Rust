@@ -47,6 +47,7 @@ impl Chunk {
     /// # 参数
     /// * `referer` - Referer 头（如果存在），用于 Range 请求避免 403 Forbidden
     /// * `progress_callback` - 进度回调函数，参数为新下载的字节数
+    /// * `read_timeout_secs` - 流式读取超时（秒），防止CDN连接挂起
     pub async fn download<F>(
         &mut self,
         client: &Client,
@@ -56,6 +57,7 @@ impl Chunk {
         output_path: &Path,
         timeout_secs: u64,
         chunk_thread_id: usize,
+        read_timeout_secs: u64,
         progress_callback: F,
     ) -> Result<u64>
     where
@@ -121,11 +123,11 @@ impl Chunk {
         // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
         // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
         // 需要对每次stream.next()单独设置超时
-        const READ_TIMEOUT_SECS: u64 = 30;
+        // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
 
         loop {
             let chunk_result = match tokio::time::timeout(
-                std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+                std::time::Duration::from_secs(read_timeout_secs),
                 stream.next(),
             )
                 .await
@@ -135,11 +137,11 @@ impl Chunk {
                 Err(_) => {
                     warn!(
                         "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，已下载 {} bytes",
-                        chunk_thread_id, self.index, READ_TIMEOUT_SECS, total_bytes_downloaded
+                        chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded
                     );
                     anyhow::bail!(
                         "读取数据流超时: {}秒内无数据到达",
-                        READ_TIMEOUT_SECS
+                        read_timeout_secs
                     );
                 }
             };
@@ -294,6 +296,16 @@ impl ChunkManager {
     pub fn unmark_downloading(&mut self, index: usize) {
         if let Some(chunk) = self.chunks.get_mut(index) {
             chunk.downloading = false;
+        }
+    }
+
+    /// 递增分片重试次数，返回递增后的值
+    pub fn increment_retry(&mut self, index: usize) -> u32 {
+        if let Some(chunk) = self.chunks.get_mut(index) {
+            chunk.retries += 1;
+            chunk.retries
+        } else {
+            0
         }
     }
 
