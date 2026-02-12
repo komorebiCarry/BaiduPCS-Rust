@@ -158,6 +158,10 @@ pub struct TaskScheduleInfo {
     // 🔥 Manager 任务列表引用（用于任务完成时立即清理，避免内存泄漏）
     /// DownloadManager.tasks 的引用，任务完成后从中移除
     pub manager_tasks: Option<Arc<RwLock<std::collections::HashMap<String, Arc<Mutex<crate::downloader::DownloadTask>>>>>>,
+
+    // 🔥 链接级重试次数（单次调度内换链接重试的上限）
+    /// 从配置 DownloadConfig.max_retries 读取
+    pub max_retries: u32,
 }
 
 /// 全局分片调度器
@@ -646,6 +650,7 @@ impl ChunkScheduler {
                 task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
                 task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
                 task_info.task_slot_pool.clone(), // 🔥 任务槽池（用于刷新槽位时间戳）
+                task_info.max_retries, // 🔥 链接级重试次数（从配置读取）
             )
                 .await;
 
@@ -687,58 +692,68 @@ impl ChunkScheduler {
                             slot_id, chunk_index, e
                         );
 
-                        // 取消下载标记（允许重新调度）
-                        {
+                        // 取消下载标记 + 递增分片调度级重试计数
+                        let chunk_retries = {
                             let mut manager = task_info.chunk_manager.lock().await;
                             manager.unmark_downloading(chunk_index);
-                        }
-
-                        // 标记任务失败，并获取 group_id 和 is_backup
-                        let (error_msg, group_id, is_backup) = {
-                            let mut t = task_info.task.lock().await;
-                            let err = e.to_string();
-                            t.mark_failed(err.clone());
-                            (err, t.group_id.clone(), t.is_backup)
+                            manager.increment_retry(chunk_index)
                         };
 
-                        // 🔥 发布任务失败事件
-                        if !is_backup {
-                            if let Some(ref ws_manager) = task_info.ws_manager {
-                                ws_manager.send_if_subscribed(
-                                    TaskEvent::Download(DownloadEvent::Failed {
+                        // 外层调度级重试上限 = 内层链接级重试 * 2
+                        // 内层（engine）每次调度换链接重试 max_retries 次
+                        // 外层（scheduler）控制分片总共被重新调度几次
+                        let max_schedule_retries = task_info.max_retries * 2;
+
+                        if chunk_retries < max_schedule_retries {
+                            // 分片还有重试机会，留在任务中等待调度器下一轮重新调度
+                            warn!(
+                                "[分片线程{}] 分片 #{} 第 {}/{} 次调度失败，等待重新调度: {}",
+                                slot_id, chunk_index, chunk_retries, max_schedule_retries, e
+                            );
+                        } else {
+                            // 重试耗尽，杀掉整个任务（保持现有逻辑）
+                            let (error_msg, group_id, is_backup) = {
+                                let mut t = task_info.task.lock().await;
+                                let err = e.to_string();
+                                t.mark_failed(err.clone());
+                                (err, t.group_id.clone(), t.is_backup)
+                            };
+
+                            if !is_backup {
+                                if let Some(ref ws_manager) = task_info.ws_manager {
+                                    ws_manager.send_if_subscribed(
+                                        TaskEvent::Download(DownloadEvent::Failed {
+                                            task_id: task_id.clone(),
+                                            error: error_msg.clone(),
+                                            group_id: group_id.clone(),
+                                            is_backup,
+                                        }),
+                                        group_id,
+                                    );
+                                }
+                            }
+
+                            if is_backup {
+                                let tx_guard = backup_notification_tx.read().await;
+                                if let Some(tx) = tx_guard.as_ref() {
+                                    let notification = BackupTransferNotification::Failed {
                                         task_id: task_id.clone(),
-                                        error: error_msg.clone(),
-                                        group_id: group_id.clone(),
-                                        is_backup,
-                                    }),
-                                    group_id,
-                                );
+                                        task_type: TransferTaskType::Download,
+                                        error_message: error_msg.clone(),
+                                    };
+                                    let _ = tx.send(notification);
+                                }
                             }
-                        }
 
-                        // 🔥 如果是备份任务，通知 AutoBackupManager
-                        if is_backup {
-                            let tx_guard = backup_notification_tx.read().await;
-                            if let Some(tx) = tx_guard.as_ref() {
-                                let notification = BackupTransferNotification::Failed {
-                                    task_id: task_id.clone(),
-                                    task_type: TransferTaskType::Download,
-                                    error_message: error_msg.clone(),
-                                };
-                                let _ = tx.send(notification);
+                            if let Some(ref pm) = task_info.persistence_manager {
+                                if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
+                                    warn!("更新下载任务错误信息失败: {}", e);
+                                }
                             }
-                        }
 
-                        // 🔥 更新持久化错误信息
-                        if let Some(ref pm) = task_info.persistence_manager {
-                            if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
-                                warn!("更新下载任务错误信息失败: {}", e);
-                            }
+                            active_tasks.write().await.remove(&task_id);
+                            error!("任务 {} 因分片 #{} 重试耗尽已从调度器移除", task_id, chunk_index);
                         }
-
-                        // 从调度器移除任务
-                        active_tasks.write().await.remove(&task_id);
-                        error!("任务 {} 因分片下载失败已从调度器移除", task_id);
                     }
                 }
             }

@@ -289,7 +289,14 @@ pub fn load_folder_history_ids(wal_dir: &Path) -> std::io::Result<HashSet<String
     let file = std::fs::File::open(&history_path)?;
     let reader = BufReader::new(file);
 
-    for line in reader.lines().flatten() {
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("读取文件 {} 时遇到 IO 错误，跳过该行: {}", history_path.display(), e);
+                continue;
+            }
+        };
         if let Ok(folder) = serde_json::from_str::<FolderPersisted>(&line) {
             ids.insert(folder.id);
         }
@@ -312,7 +319,14 @@ pub fn remove_folder_from_history(wal_dir: &Path, folder_id: &str) -> std::io::R
     let mut records: Vec<String> = Vec::new();
     let mut found = false;
 
-    for line in reader.lines().flatten() {
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("读取文件 {} 时遇到 IO 错误，跳过该行: {}", history_path.display(), e);
+                continue;
+            }
+        };
         if !line.trim().is_empty() {
             if let Ok(folder) = serde_json::from_str::<FolderPersisted>(&line) {
                 if folder.id == folder_id {
@@ -416,7 +430,14 @@ pub fn cleanup_expired_folder_history(wal_dir: &Path, retention_days: u64) -> st
     let mut kept_records: Vec<String> = Vec::new();
     let mut expired_count = 0;
 
-    for line in reader.lines().flatten() {
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("读取文件 {} 时遇到 IO 错误，跳过该行: {}", history_path.display(), e);
+                continue;
+            }
+        };
         if !line.trim().is_empty() {
             if let Ok(folder) = serde_json::from_str::<FolderPersisted>(&line) {
                 let is_expired = folder

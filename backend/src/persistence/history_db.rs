@@ -73,6 +73,9 @@ impl HistoryDbManager {
                 transfer_status TEXT,
                 transfer_file_name TEXT,
                 auto_download INTEGER,
+                -- 分享直下字段
+                file_list_json TEXT,
+                is_share_direct_download INTEGER,
                 -- 共用字段
                 file_size INTEGER,
                 chunk_size INTEGER,
@@ -162,6 +165,10 @@ impl HistoryDbManager {
             [],
         )?;
 
+        // 兼容旧数据库：添加新列（已存在则忽略）
+        let _ = conn.execute("ALTER TABLE task_history ADD COLUMN file_list_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE task_history ADD COLUMN is_share_direct_download INTEGER", []);
+
         info!("历史数据库表初始化完成");
         Ok(())
     }
@@ -198,7 +205,8 @@ impl HistoryDbManager {
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
-                transfer_task_id, download_task_ids
+                transfer_task_id, download_task_ids,
+                file_list_json, is_share_direct_download
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9,
@@ -207,7 +215,8 @@ impl HistoryDbManager {
                 ?19, ?20, ?21, ?22,
                 ?23, ?24, ?25,
                 ?26, ?27,
-                ?28, ?29
+                ?28, ?29,
+                ?30, ?31
             )
             "#,
             params![
@@ -240,6 +249,8 @@ impl HistoryDbManager {
                 metadata.backup_config_id,
                 metadata.transfer_task_id,
                 download_task_ids,
+                metadata.file_list_json,
+                metadata.is_share_direct_download.map(|b| if b { 1 } else { 0 }),
             ],
         )?;
 
@@ -272,7 +283,8 @@ impl HistoryDbManager {
                     file_size, chunk_size, total_chunks, error_msg,
                     group_id, group_root, relative_path,
                     is_backup, backup_config_id,
-                    transfer_task_id, download_task_ids
+                    transfer_task_id, download_task_ids,
+                    file_list_json, is_share_direct_download
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9,
@@ -281,7 +293,8 @@ impl HistoryDbManager {
                     ?19, ?20, ?21, ?22,
                     ?23, ?24, ?25,
                     ?26, ?27,
-                    ?28, ?29
+                    ?28, ?29,
+                    ?30, ?31
                 )
                 "#,
             )?;
@@ -328,6 +341,8 @@ impl HistoryDbManager {
                     metadata.backup_config_id,
                     metadata.transfer_task_id,
                     download_task_ids,
+                    metadata.file_list_json,
+                    metadata.is_share_direct_download.map(|b| if b { 1 } else { 0 }),
                 ])?;
                 count += 1;
             }
@@ -351,7 +366,7 @@ impl HistoryDbManager {
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
-                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download,
+                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download, file_list_json, is_share_direct_download,
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
@@ -381,17 +396,19 @@ impl HistoryDbManager {
                 transfer_status: row.get(15)?,
                 transfer_file_name: row.get(16)?,
                 auto_download: row.get(17)?,
-                file_size: row.get(18)?,
-                chunk_size: row.get(19)?,
-                total_chunks: row.get(20)?,
-                error_msg: row.get(21)?,
-                group_id: row.get(22)?,
-                group_root: row.get(23)?,
-                relative_path: row.get(24)?,
-                is_backup: row.get(25)?,
-                backup_config_id: row.get(26)?,
-                transfer_task_id: row.get(27)?,
-                download_task_ids: row.get(28)?,
+                file_list_json: row.get(18)?,
+                is_share_direct_download: row.get(19)?,
+                file_size: row.get(20)?,
+                chunk_size: row.get(21)?,
+                total_chunks: row.get(22)?,
+                error_msg: row.get(23)?,
+                group_id: row.get(24)?,
+                group_root: row.get(25)?,
+                relative_path: row.get(26)?,
+                is_backup: row.get(27)?,
+                backup_config_id: row.get(28)?,
+                transfer_task_id: row.get(29)?,
+                download_task_ids: row.get(30)?,
             })
         })?;
 
@@ -443,7 +460,7 @@ impl HistoryDbManager {
                     task_id, task_type, status, created_at, updated_at, completed_at,
                     fs_id, remote_path, local_path,
                     source_path, target_path, upload_id,
-                    share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download,
+                    share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download, file_list_json, is_share_direct_download,
                     file_size, chunk_size, total_chunks, error_msg,
                     group_id, group_root, relative_path,
                     is_backup, backup_config_id,
@@ -472,17 +489,19 @@ impl HistoryDbManager {
                         transfer_status: row.get(15)?,
                         transfer_file_name: row.get(16)?,
                         auto_download: row.get(17)?,
-                        file_size: row.get(18)?,
-                        chunk_size: row.get(19)?,
-                        total_chunks: row.get(20)?,
-                        error_msg: row.get(21)?,
-                        group_id: row.get(22)?,
-                        group_root: row.get(23)?,
-                        relative_path: row.get(24)?,
-                        is_backup: row.get(25)?,
-                        backup_config_id: row.get(26)?,
-                        transfer_task_id: row.get(27)?,
-                        download_task_ids: row.get(28)?,
+                        file_list_json: row.get(18)?,
+                        is_share_direct_download: row.get(19)?,
+                        file_size: row.get(20)?,
+                        chunk_size: row.get(21)?,
+                        total_chunks: row.get(22)?,
+                        error_msg: row.get(23)?,
+                        group_id: row.get(24)?,
+                        group_root: row.get(25)?,
+                        relative_path: row.get(26)?,
+                        is_backup: row.get(27)?,
+                        backup_config_id: row.get(28)?,
+                        transfer_task_id: row.get(29)?,
+                        download_task_ids: row.get(30)?,
                     })
                 },
             )
@@ -526,7 +545,7 @@ impl HistoryDbManager {
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
-                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download,
+                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download, file_list_json, is_share_direct_download,
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
@@ -557,17 +576,19 @@ impl HistoryDbManager {
                 transfer_status: row.get(15)?,
                 transfer_file_name: row.get(16)?,
                 auto_download: row.get(17)?,
-                file_size: row.get(18)?,
-                chunk_size: row.get(19)?,
-                total_chunks: row.get(20)?,
-                error_msg: row.get(21)?,
-                group_id: row.get(22)?,
-                group_root: row.get(23)?,
-                relative_path: row.get(24)?,
-                is_backup: row.get(25)?,
-                backup_config_id: row.get(26)?,
-                transfer_task_id: row.get(27)?,
-                download_task_ids: row.get(28)?,
+                file_list_json: row.get(18)?,
+                is_share_direct_download: row.get(19)?,
+                file_size: row.get(20)?,
+                chunk_size: row.get(21)?,
+                total_chunks: row.get(22)?,
+                error_msg: row.get(23)?,
+                group_id: row.get(24)?,
+                group_root: row.get(25)?,
+                relative_path: row.get(26)?,
+                is_backup: row.get(27)?,
+                backup_config_id: row.get(28)?,
+                transfer_task_id: row.get(29)?,
+                download_task_ids: row.get(30)?,
             })
         })?;
 
@@ -621,7 +642,7 @@ impl HistoryDbManager {
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
-                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download,
+                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download, file_list_json, is_share_direct_download,
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
@@ -653,17 +674,19 @@ impl HistoryDbManager {
                 transfer_status: row.get(15)?,
                 transfer_file_name: row.get(16)?,
                 auto_download: row.get(17)?,
-                file_size: row.get(18)?,
-                chunk_size: row.get(19)?,
-                total_chunks: row.get(20)?,
-                error_msg: row.get(21)?,
-                group_id: row.get(22)?,
-                group_root: row.get(23)?,
-                relative_path: row.get(24)?,
-                is_backup: row.get(25)?,
-                backup_config_id: row.get(26)?,
-                transfer_task_id: row.get(27)?,
-                download_task_ids: row.get(28)?,
+                file_list_json: row.get(18)?,
+                is_share_direct_download: row.get(19)?,
+                file_size: row.get(20)?,
+                chunk_size: row.get(21)?,
+                total_chunks: row.get(22)?,
+                error_msg: row.get(23)?,
+                group_id: row.get(24)?,
+                group_root: row.get(25)?,
+                relative_path: row.get(26)?,
+                is_backup: row.get(27)?,
+                backup_config_id: row.get(28)?,
+                transfer_task_id: row.get(29)?,
+                download_task_ids: row.get(30)?,
             })
         })?;
 
@@ -721,7 +744,7 @@ impl HistoryDbManager {
                 task_id, task_type, status, created_at, updated_at, completed_at,
                 fs_id, remote_path, local_path,
                 source_path, target_path, upload_id,
-                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download,
+                share_link, share_pwd, transfer_target_path, transfer_status, transfer_file_name, auto_download, file_list_json, is_share_direct_download,
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
@@ -755,17 +778,19 @@ impl HistoryDbManager {
                 transfer_status: row.get(15)?,
                 transfer_file_name: row.get(16)?,
                 auto_download: row.get(17)?,
-                file_size: row.get(18)?,
-                chunk_size: row.get(19)?,
-                total_chunks: row.get(20)?,
-                error_msg: row.get(21)?,
-                group_id: row.get(22)?,
-                group_root: row.get(23)?,
-                relative_path: row.get(24)?,
-                is_backup: row.get(25)?,
-                backup_config_id: row.get(26)?,
-                transfer_task_id: row.get(27)?,
-                download_task_ids: row.get(28)?,
+                file_list_json: row.get(18)?,
+                is_share_direct_download: row.get(19)?,
+                file_size: row.get(20)?,
+                chunk_size: row.get(21)?,
+                total_chunks: row.get(22)?,
+                error_msg: row.get(23)?,
+                group_id: row.get(24)?,
+                group_root: row.get(25)?,
+                relative_path: row.get(26)?,
+                is_backup: row.get(27)?,
+                backup_config_id: row.get(28)?,
+                transfer_task_id: row.get(29)?,
+                download_task_ids: row.get(30)?,
             })
         })?;
 
@@ -1222,8 +1247,9 @@ impl HistoryDbManager {
             share_info_json: None,
             auto_download: row.auto_download.map(|v| v != 0),
             transfer_file_name: row.transfer_file_name,
+            file_list_json: row.file_list_json,
             // 分享直下字段
-            is_share_direct_download: None,
+            is_share_direct_download: row.is_share_direct_download.map(|v| v != 0),
             temp_dir: None,
             group_id: row.group_id,
             group_root: row.group_root,
@@ -1304,6 +1330,8 @@ struct TaskHistoryRow {
     transfer_status: Option<String>,
     transfer_file_name: Option<String>,
     auto_download: Option<i64>,
+    file_list_json: Option<String>,
+    is_share_direct_download: Option<i64>,
     file_size: Option<i64>,
     chunk_size: Option<i64>,
     total_chunks: Option<i64>,

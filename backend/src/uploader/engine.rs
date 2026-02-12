@@ -319,6 +319,9 @@ impl UploadEngine {
         // 活跃分片计数器
         let active_chunks = Arc::new(AtomicUsize::new(0));
 
+        // 收集首个分片错误（不立即中断，让其他分片跑完）
+        let mut first_error: Option<anyhow::Error> = None;
+
         // 调度所有分片
         loop {
             // 检查取消
@@ -365,8 +368,16 @@ impl UploadEngine {
 
                             // 等待一个任务完成
                             if let Some(result) = join_set.join_next().await {
-                                self.handle_chunk_result(result, &chunk_md5s, &active_chunks)
-                                    .await?;
+                                if let Err(e) = self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await {
+                                    if self.cancel_token.is_cancelled() {
+                                        join_set.abort_all();
+                                        return Err(e);
+                                    }
+                                    error!("分片上传失败（其他分片继续）: {}", e);
+                                    if first_error.is_none() {
+                                        first_error = Some(e);
+                                    }
+                                }
                             }
 
                             // 重新获取分片
@@ -429,15 +440,36 @@ impl UploadEngine {
 
             // 非阻塞检查是否有任务完成
             while let Some(result) = join_set.try_join_next() {
-                self.handle_chunk_result(result, &chunk_md5s, &active_chunks)
-                    .await?;
+                if let Err(e) = self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await {
+                    if self.cancel_token.is_cancelled() {
+                        join_set.abort_all();
+                        return Err(e);
+                    }
+                    error!("分片上传失败（其他分片继续）: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
         }
 
         // 等待所有剩余任务完成
         while let Some(result) = join_set.join_next().await {
-            self.handle_chunk_result(result, &chunk_md5s, &active_chunks)
-                .await?;
+            if let Err(e) = self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await {
+                if self.cancel_token.is_cancelled() {
+                    join_set.abort_all();
+                    return Err(e);
+                }
+                error!("分片上传失败（其他分片继续）: {}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        // 检查是否有分片失败
+        if let Some(e) = first_error {
+            return Err(e);
         }
 
         info!("[并发上传] 所有 {} 个分片上传完成", chunk_count);

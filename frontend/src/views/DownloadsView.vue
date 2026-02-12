@@ -42,10 +42,12 @@
         <el-card
             v-for="item in downloadItems"
             :key="item.id"
+            :data-task-id="item.id"
             class="task-card"
             :class="{
               'task-active': item.status === 'downloading' || item.status === 'scanning' || item.status === 'decrypting',
-              'is-folder': item.type === 'folder'
+              'is-folder': item.type === 'folder',
+              'task-highlighted': highlightIds.has(item.id)
             }"
             shadow="hover"
         >
@@ -343,7 +345,7 @@
 </template>
 
 <script setup lang="ts">
-import {ref, computed, onMounted, onUnmounted} from 'vue'
+import {ref, computed, onMounted, onUnmounted, nextTick} from 'vue'
 import {ElMessage, ElMessageBox} from 'element-plus'
 import {
   getAllDownloadsMixed,
@@ -383,7 +385,7 @@ import {
   Lock,
   Unlock,
 } from '@element-plus/icons-vue'
-import {useRouter} from 'vue-router'
+import {useRouter, useRoute} from 'vue-router'
 import {useIsMobile} from '@/utils/responsive'
 // 🔥 WebSocket 相关导入
 import {getWebSocketClient, connectWebSocket, type ConnectionState} from '@/utils/websocket'
@@ -394,6 +396,10 @@ import type {DownloadEvent, FolderEvent} from '@/types/events'
 
 // 路由
 const router = useRouter()
+const route = useRoute()
+
+// 高亮的下载任务 ID 集合（从转存页跳转过来时使用）
+const highlightIds = ref<Set<string>>(new Set())
 
 // 状态
 const loading = ref(false)
@@ -1201,8 +1207,35 @@ function cleanupWebSocketSubscriptions() {
 }
 
 // 组件挂载时加载任务列表
-onMounted(() => {
-  refreshTasks()
+onMounted(async () => {
+  // 解析 highlight 参数（支持逗号分隔的多个 ID）
+  // 文件夹下载 ID 带 "folder:" 前缀，需要去掉前缀才能匹配 item.id
+  const highlightParam = route.query.highlight as string | undefined
+  if (highlightParam) {
+    highlightIds.value = new Set(
+        highlightParam.split(',').filter(Boolean).map(id => id.replace(/^folder:/, ''))
+    )
+  }
+
+  await refreshTasks()
+
+  // 高亮任务加载完成后滚动到第一个高亮任务
+  if (highlightIds.value.size > 0) {
+    nextTick(() => {
+      const firstId = [...highlightIds.value][0]
+      const el = document.querySelector(`[data-task-id="${firstId}"]`)
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+      // 3 秒后清除高亮
+      setTimeout(() => {
+        highlightIds.value = new Set()
+        // 清除 URL 中的 highlight 参数
+        router.replace({ query: {} })
+      }, 3000)
+    })
+  }
+
   // 🔥 设置 WebSocket 订阅
   setupWebSocketSubscriptions()
   // updateAutoRefresh 会在 refreshTasks 完成后根据任务状态自动启动定时器
@@ -1277,6 +1310,18 @@ onUnmounted(() => {
 
   &.is-folder {
     border-left: 4px solid #67c23a;
+  }
+
+  &.task-highlighted {
+    border-color: #e6a23c;
+    box-shadow: 0 2px 16px rgba(230, 162, 60, 0.35);
+    animation: highlight-fade 3s ease-out;
+  }
+
+  @keyframes highlight-fade {
+    0% { box-shadow: 0 2px 16px rgba(230, 162, 60, 0.5); }
+    70% { box-shadow: 0 2px 16px rgba(230, 162, 60, 0.35); }
+    100% { box-shadow: none; border-color: transparent; }
   }
 
   &:hover {

@@ -21,9 +21,6 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// 最大重试次数
-const MAX_RETRIES: u32 = 3;
-
 /// 重试指数退避初始延迟（毫秒）
 const INITIAL_BACKOFF_MS: u64 = 100;
 
@@ -2408,6 +2405,7 @@ impl DownloadEngine {
                     None, // folder_progress_tx（独立模式不需要）
                     None, // backup_notification_tx（独立模式不需要）
                     None, // task_slot_pool（独立模式不需要）
+                    3,    // max_retries（独立模式使用默认值）
                 )
                     .await;
 
@@ -2425,6 +2423,8 @@ impl DownloadEngine {
         }
 
         // 等待所有分片完成，使用 JoinSet 支持统一取消
+        let mut first_error: Option<anyhow::Error> = None;
+
         while let Some(result) = join_set.join_next().await {
             // 检查任务是否被取消
             if cancellation_token.is_cancelled() {
@@ -2436,22 +2436,23 @@ impl DownloadEngine {
             match result {
                 Ok(Ok(_)) => {} // 分片下载成功
                 Ok(Err(e)) => {
-                    // 分片下载失败，检查是否是因为取消
                     if cancellation_token.is_cancelled() {
                         warn!("分片下载因任务取消而失败");
                         join_set.abort_all();
                         anyhow::bail!("任务已被取消");
                     }
-                    // 取消所有剩余任务
-                    join_set.abort_all();
-                    return Err(e);
+                    // 记录首个错误，但不 abort 其他分片，让它们继续完成
+                    error!("分片下载失败（其他分片继续）: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                 }
                 Err(e) => {
                     if e.is_cancelled() {
-                        // 任务被取消，这是预期的
                         debug!("分片任务被取消");
                         continue;
                     }
+                    // JoinError（panic）是严重问题，仍然 abort
                     error!("分片任务异常: {}", e);
                     join_set.abort_all();
                     anyhow::bail!("分片任务异常: {}", e);
@@ -2468,6 +2469,10 @@ impl DownloadEngine {
         // 验证所有分片是否完成
         let manager = chunk_manager.lock().await;
         if !manager.is_completed() {
+            // 优先返回实际的分片错误信息，而非泛化的"部分分片下载失败"
+            if let Some(e) = first_error {
+                return Err(e);
+            }
             anyhow::bail!("部分分片下载失败");
         }
 
@@ -2521,6 +2526,7 @@ impl DownloadEngine {
         folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
         backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
         task_slot_pool: Option<Arc<crate::task_slot_pool::TaskSlotPool>>,
+        max_retries: u32,
     ) -> Result<()> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
@@ -2725,6 +2731,12 @@ impl DownloadEngine {
             let download_start = std::time::Instant::now();
 
             // 尝试下载
+            // 读取超时：取连接超时的一半，钳位到 [30, 90] 秒
+            // timeout_secs（30-180s）是整个分片的连接+传输超时，
+            // 但 read_timeout 针对的是"单次 stream.next() 零字节到达"的场景，
+            // 不需要那么长，否则挂起的 CDN 连接要等 180s 才能被发现
+            let read_timeout = (timeout_secs / 2).clamp(30, 90);
+
             match chunk
                 .download(
                     &client,
@@ -2734,6 +2746,7 @@ impl DownloadEngine {
                     output_path,
                     timeout_secs,
                     chunk_thread_id,
+                    read_timeout,
                     progress_callback,
                 )
                 .await
@@ -2780,7 +2793,7 @@ impl DownloadEngine {
                     retries += 1;
 
                     // 检查是否达到重试次数上限，或所有链接都已尝试过
-                    if retries >= MAX_RETRIES || tried_urls.len() >= available_count {
+                    if retries >= max_retries || tried_urls.len() >= available_count {
                         error!(
                             "[分片线程{}] ✗ 分片 #{} 下载失败，已尝试 {} 个链接，重试 {} 次",
                             chunk_thread_id,
@@ -2799,7 +2812,7 @@ impl DownloadEngine {
                         tried_urls.len(),
                         available_count,
                         retries,
-                        MAX_RETRIES,
+                        max_retries,
                         last_error
                     );
 
