@@ -115,6 +115,13 @@ pub struct TransferTask {
     /// 临时目录路径（网盘路径，分享直下专用，用于清理）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_dir: Option<String>,
+    /// 用户选择的文件 fs_id 列表（可选，用于选择性转存）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_fs_ids: Option<Vec<u64>>,
+    /// 用户选择的文件完整信息列表（可选，用于获取选中文件的元信息）
+    /// 解决子目录选择场景下后端无法从根目录文件列表中匹配到子文件信息的问题
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_files: Option<Vec<SharedFileInfo>>,
 }
 
 impl TransferTask {
@@ -151,6 +158,8 @@ impl TransferTask {
             file_name: None,
             is_share_direct_download: false,
             temp_dir: None,
+            selected_fs_ids: None,
+            selected_files: None,
         }
     }
 

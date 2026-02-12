@@ -191,6 +191,7 @@ pub async fn qrcode_status(
                 let download_dir = config.download.download_dir.clone();
                 let max_global_threads = config.download.max_global_threads;
                 let max_concurrent_tasks = config.download.max_concurrent_tasks;
+                let max_retries = config.download.max_retries;
                 let upload_config = config.upload.clone();
                 let transfer_config = config.transfer.clone();
                 drop(config);
@@ -203,6 +204,7 @@ pub async fn qrcode_status(
                     download_dir,
                     max_global_threads,
                     max_concurrent_tasks,
+                    max_retries,
                 ) {
                     Ok(mut manager) => {
                         // 设置持久化管理器

@@ -99,6 +99,47 @@ export interface CreateTransferRequest {
   local_download_path?: string
   /** 分享直下：是否为分享直下任务 */
   is_share_direct_download?: boolean
+  /** 选中的文件 fs_id 列表（可选，为空或未提供时转存所有文件） */
+  selected_fs_ids?: number[]
+  /** 选中的文件完整信息列表（可选，用于后端获取选中文件的元信息） */
+  selected_files?: SharedFileInfo[]
+}
+
+/// 预览分享文件请求
+export interface PreviewShareRequest {
+  share_url: string
+  password?: string
+  /** 页码（从 1 开始，默认 1） */
+  page?: number
+  /** 每页数量（默认 100） */
+  num?: number
+}
+
+/// 分享信息（用于目录导航）
+export interface PreviewShareInfo {
+  short_key: string
+  shareid: string
+  uk: string
+  bdstoken: string
+}
+
+/// 预览分享文件响应
+export interface PreviewShareResponse {
+  files: SharedFileInfo[]
+  share_info?: PreviewShareInfo
+}
+
+/// 浏览分享子目录请求
+export interface PreviewShareDirRequest {
+  short_key: string
+  shareid: string
+  uk: string
+  bdstoken: string
+  dir: string
+  /** 页码（从 1 开始，默认 1） */
+  page?: number
+  /** 每页数量（默认 100） */
+  num?: number
 }
 
 /// 创建转存任务响应
@@ -139,6 +180,23 @@ export interface TransferApiError {
  */
 export async function createTransfer(req: CreateTransferRequest): Promise<CreateTransferResponse> {
   return apiClient.post('/transfers', req)
+}
+
+/**
+ * 预览分享文件列表（不执行转存）
+ * 超时设置为 15s，超时后前端显示提示并允许重试
+ * @throws TransferApiError 特殊错误（需要密码、密码错误等）
+ */
+export async function previewShareFiles(req: PreviewShareRequest): Promise<PreviewShareResponse> {
+  return apiClient.post('/transfers/preview', req, { timeout: 15000 })
+}
+
+/**
+ * 浏览分享子目录文件列表（文件夹导航）
+ * 复用首次预览返回的 share_info，无需重新访问分享页面
+ */
+export async function previewShareDir(req: PreviewShareDirRequest): Promise<PreviewShareResponse> {
+  return apiClient.post('/transfers/preview/dir', req, { timeout: 10000 })
 }
 
 /**

@@ -965,6 +965,25 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 更新转存文件列表（JSON 序列化）
+    ///
+    /// # Arguments
+    /// * `task_id` - 转存任务 ID
+    /// * `file_list_json` - 文件列表的 JSON 字符串
+    pub fn update_transfer_file_list(
+        &self,
+        task_id: &str,
+        file_list_json: String,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_file_list_json(file_list_json);
+        })?;
+
+        debug!("已更新转存文件列表: task_id={}", task_id);
+
+        Ok(())
+    }
+
     /// 更新任务错误信息并将状态标记为 Failed
     ///
     /// # Arguments

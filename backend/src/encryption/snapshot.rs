@@ -320,7 +320,7 @@ mod tests {
         ).unwrap();
 
         // 通过原始路径查找
-        let found = snapshot_manager.find_by_original("config_2", "/documents").unwrap();
+        let found = snapshot_manager.find_by_original("/documents", "report.pdf").unwrap();
         assert!(found.is_some());
 
         let snapshot = found.unwrap();

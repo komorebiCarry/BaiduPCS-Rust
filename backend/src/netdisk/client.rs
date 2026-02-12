@@ -1819,24 +1819,27 @@ impl NetdiskClient {
         }
     }
 
-    /// 列出分享中的文件
+    /// 列出分享中的文件（根目录，与官方接口对齐）
+    ///
+    /// 官方根目录请求使用 shorturl + root=1，不传 dir
+    /// 响应中包含 uk 和 share_id，用于后续子目录导航拼接 dir
     ///
     /// # 参数
-    /// * `short_key` - 分享短链 ID
-    /// * `shareid` - 分享 ID
-    /// * `share_uk` - 分享者 UK
+    /// * `short_key` - 分享短链 ID（如 "1abcDEFg"）
     /// * `bdstoken` - CSRF 令牌
-    /// * `sekey` - 验证后的密钥（URL 编码的 randsk，可选）
+    /// * `page` - 页码（从 1 开始）
+    /// * `num` - 每页数量
     ///
     /// # 返回
-    /// 分享文件列表
+    /// ShareFileListResult（包含文件列表 + uk + shareid）
     pub async fn list_share_files(
         &self,
         short_key: &str,
-        shareid: &str,
         bdstoken: &str,
-    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
-        info!("获取分享文件列表: shareid={}", shareid);
+        page: u32,
+        num: u32,
+    ) -> Result<crate::transfer::ShareFileListResult> {
+        info!("获取分享文件列表(根目录): short_key={}, page={}, num={}", short_key, page, num);
 
         // short_key 包含 '1'（如 "1abcDEFg"），需要去掉第一个字符
         let shorturl = if short_key.starts_with('1') && short_key.len() > 1 {
@@ -1847,9 +1850,10 @@ impl NetdiskClient {
 
         let url = format!(
             "https://pan.baidu.com/share/list?\
-             shorturl={}&bdstoken={}&\
-             root=1&web=5&app_id={}&channel=chunlei",
-            shorturl, BAIDU_APP_ID, bdstoken
+             shorturl={}&root=1&order=time&desc=1&showempty=0&\
+             web=1&page={}&num={}&view_mode=1&channel=chunlei&\
+             app_id={}&bdstoken={}&clienttype=0",
+            shorturl, page, num, BAIDU_APP_ID, bdstoken
         );
 
         let referer = format!("https://pan.baidu.com/s/{}", short_key);
@@ -1864,13 +1868,12 @@ impl NetdiskClient {
             .context("获取分享文件列表失败")?;
 
         let response_text = response.text().await.context("读取文件列表响应失败")?;
-        debug!("文件列表响应: {}", response_text);
+        info!("文件列表响应: {}", response_text);
 
         let json: Value = serde_json::from_str(&response_text).context("解析文件列表响应失败")?;
 
         let errno = json["errno"].as_i64().unwrap_or(-1);
         if errno != 0 {
-            // 提取错误消息
             let errmsg = json["errmsg"]
                 .as_str()
                 .map(|s| s.to_string())
@@ -1889,11 +1892,20 @@ impl NetdiskClient {
             anyhow::bail!("获取文件列表失败: errno={}, errmsg={}", errno, errmsg);
         }
 
+        // 从响应中提取 uk 和 share_id（用于子目录导航拼接 dir）
+        let resp_uk = json["uk"].as_u64().map(|v| v.to_string())
+            .or_else(|| json["uk"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let resp_shareid = json["share_id"].as_u64().map(|v| v.to_string())
+            .or_else(|| json["share_id"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        info!("根目录响应: uk={}, share_id={}", resp_uk, resp_shareid);
+
         let list = json["list"].as_array().context("文件列表格式错误")?;
 
         let mut files = Vec::new();
         for item in list {
-            // fs_id 可能是字符串或数字，需要同时支持两种格式
             let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
                 id_str.parse::<u64>().unwrap_or(0)
             } else {
@@ -1934,6 +1946,103 @@ impl NetdiskClient {
             });
         }
 
+        Ok(crate::transfer::ShareFileListResult {
+            files,
+            uk: resp_uk,
+            shareid: resp_shareid,
+        })
+    }
+
+    /// 列出分享中指定目录下的文件（用于文件夹导航，与官方接口对齐）
+    ///
+    /// 官方子目录请求使用 uk + shareid + dir，不传 shorturl/root
+    pub async fn list_share_files_in_dir(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        uk: &str,
+        bdstoken: &str,
+        dir: &str,
+        page: u32,
+        num: u32,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        info!("获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}", shareid, dir, page, num);
+
+        let encoded_dir = urlencoding::encode(dir);
+
+        let url = format!(
+            "https://pan.baidu.com/share/list?\
+             uk={}&shareid={}&order=name&desc=0&showempty=0&\
+             view_mode=1&web=1&page={}&num={}&dir={}&channel=chunlei&\
+             app_id={}&bdstoken={}&clienttype=0",
+            uk, shareid, page, num, encoded_dir, BAIDU_APP_ID, bdstoken
+        );
+
+        let referer = format!("https://pan.baidu.com/s/{}", short_key);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", &referer)
+            .send()
+            .await
+            .context("获取分享子目录文件列表失败")?;
+
+        let response_text = response.text().await.context("读取子目录文件列表响应失败")?;
+        debug!("子目录文件列表响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+        if errno != 0 {
+            let errmsg = json["errmsg"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("未知错误，错误码: {}", errno));
+            anyhow::bail!("获取子目录文件列表失败: errno={}, errmsg={}", errno, errmsg);
+        }
+
+        let list = json["list"].as_array().context("子目录文件列表格式错误")?;
+
+        let mut files = Vec::new();
+        for item in list {
+            let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
+                id_str.parse::<u64>().unwrap_or(0)
+            } else {
+                item["fs_id"].as_u64().unwrap_or(0)
+            };
+
+            let is_dir = if let Some(n) = item["isdir"].as_i64() {
+                n == 1
+            } else if let Some(s) = item["isdir"].as_str() {
+                s == "1"
+            } else {
+                false
+            };
+            let path = item["path"].as_str().unwrap_or_default().to_string();
+            let size = if let Some(n) = item["size"].as_u64() {
+                n
+            } else if let Some(s) = item["size"].as_str() {
+                s.parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            };
+            let name = item["server_filename"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+
+            files.push(crate::transfer::SharedFileInfo {
+                fs_id,
+                is_dir,
+                path,
+                size,
+                name,
+            });
+        }
+
+        info!("子目录文件列表: {} 个文件, dir={}", files.len(), dir);
         Ok(files)
     }
 
@@ -1999,11 +2108,15 @@ impl NetdiskClient {
             let extra_list = json["extra"]["list"].as_array();
             let mut transferred_paths = Vec::new();
             let mut transferred_fs_ids = Vec::new();
+            let mut from_paths = Vec::new();
 
             if let Some(list) = extra_list {
                 for item in list {
                     if let Some(path) = item["to"].as_str() {
                         transferred_paths.push(path.to_string());
+                    }
+                    if let Some(from) = item["from"].as_str() {
+                        from_paths.push(from.to_string());
                     }
                     if let Some(fsid) = item["to_fs_id"].as_u64() {
                         transferred_fs_ids.push(fsid);
@@ -2014,6 +2127,7 @@ impl NetdiskClient {
             Ok(crate::transfer::TransferResult {
                 success: true,
                 transferred_paths,
+                from_paths,
                 error: None,
                 transferred_fs_ids,
             })
@@ -2032,6 +2146,7 @@ impl NetdiskClient {
                         return Ok(crate::transfer::TransferResult {
                             success: false,
                             transferred_paths: vec![],
+                            from_paths: vec![],
                             error: Some(format!("同名文件已存在: {}", filename)),
                             transferred_fs_ids: vec![],
                         });
@@ -2046,6 +2161,7 @@ impl NetdiskClient {
                 return Ok(crate::transfer::TransferResult {
                     success: false,
                     transferred_paths: vec![],
+                    from_paths: vec![],
                     error: Some(format!(
                         "转存文件数 {} 超过上限 {}",
                         target_file_nums, target_file_nums_limit
@@ -2057,27 +2173,52 @@ impl NetdiskClient {
             Ok(crate::transfer::TransferResult {
                 success: false,
                 transferred_paths: vec![],
+                from_paths: vec![],
                 error: Some(format!("转存失败: {}", response_text)),
                 transferred_fs_ids: vec![],
             })
         } else if errno == 4 {
-            // errno=4 可能是"文件重复"或"请求超时"，使用百度返回的 show_msg
-            let show_msg = json["show_msg"].as_str().unwrap_or("").to_string();
-            let error_msg = if show_msg.is_empty() {
-                "文件重复".to_string()
+            // errno=4 + duplicated 字段 = 文件/文件夹重复
+            // 百度的 show_msg 可能显示"请求超时"，但实际是重复
+            let duplicated = &json["duplicated"];
+            if duplicated.is_object() || duplicated.is_array() {
+                // 提取重复文件名
+                let dup_names: Vec<String> = duplicated["list"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| item["server_filename"].as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let error_msg = if dup_names.is_empty() {
+                    "目标位置已存在同名文件/文件夹".to_string()
+                } else {
+                    format!("目标位置已存在同名文件: {}", dup_names.join(", "))
+                };
+                Ok(crate::transfer::TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(error_msg),
+                    transferred_fs_ids: vec![],
+                })
             } else {
-                show_msg
-            };
-            Ok(crate::transfer::TransferResult {
-                success: false,
-                transferred_paths: vec![],
-                error: Some(error_msg),
-                transferred_fs_ids: vec![],
-            })
+                // 没有 duplicated 字段，可能是真的超时
+                let show_msg = json["show_msg"].as_str().unwrap_or("请求超时").to_string();
+                Ok(crate::transfer::TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(show_msg),
+                    transferred_fs_ids: vec![],
+                })
+            }
         } else {
             Ok(crate::transfer::TransferResult {
                 success: false,
                 transferred_paths: vec![],
+                from_paths: vec![],
                 error: Some(format!("转存失败: {}", response_text)),
                 transferred_fs_ids: vec![],
             })

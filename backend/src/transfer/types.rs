@@ -49,6 +49,17 @@ pub struct SharePageInfo {
     pub bdstoken: String,
 }
 
+/// 根目录文件列表结果（包含 uk/shareid，用于子目录导航拼接 dir）
+#[derive(Debug, Clone)]
+pub struct ShareFileListResult {
+    /// 文件列表
+    pub files: Vec<SharedFileInfo>,
+    /// 分享者 UK（从响应 JSON 提取）
+    pub uk: String,
+    /// 分享 ID（从响应 JSON 提取）
+    pub shareid: String,
+}
+
 /// 分享文件信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedFileInfo {
@@ -69,8 +80,10 @@ pub struct SharedFileInfo {
 pub struct TransferResult {
     /// 是否成功
     pub success: bool,
-    /// 转存后的文件路径列表
+    /// 转存后的文件路径列表（百度可能重命名，如加时间戳后缀避免重名）
     pub transferred_paths: Vec<String>,
+    /// 转存前的原始路径列表（与 transferred_paths 一一对应，用于匹配原始文件信息）
+    pub from_paths: Vec<String>,
     /// 错误信息
     pub error: Option<String>,
     /// 转存后的文件 fs_id 列表
