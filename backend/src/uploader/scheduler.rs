@@ -841,66 +841,73 @@ impl UploadChunkScheduler {
                         slot_id, chunk_index, e
                     );
 
-                    // 取消上传标记
-                    {
+                    // 取消上传标记 + 递增分片调度级重试计数
+                    let chunk_retries = {
                         let mut manager = task_info.chunk_manager.lock().await;
                         if let Some(c) = manager.chunks_mut().get_mut(chunk_index) {
                             c.uploading = false;
                         }
-                    }
-
-                    // 标记任务失败
-                    let error_msg = e.to_string();
-                    let is_backup = {
-                        let mut t = task_info.task.lock().await;
-                        t.mark_failed(error_msg.clone());
-                        t.is_backup
+                        manager.increment_retry(chunk_index)
                     };
 
-                    // 🔥 发布任务失败事件
-                    if !is_backup {
-                        if let Some(ref ws_manager) = task_info.ws_manager {
-                            ws_manager.send_if_subscribed(
-                                TaskEvent::Upload(UploadEvent::Failed {
+                    // 外层调度级重试上限 = 内层重试 * 2
+                    let max_schedule_retries = max_retries.load(Ordering::SeqCst) as u32 * 2;
+
+                    if chunk_retries < max_schedule_retries {
+                        // 分片还有重试机会，留在任务中等待调度器下一轮重新调度
+                        warn!(
+                            "[上传线程{}] 分片 #{} 第 {}/{} 次调度失败，等待重新调度: {}",
+                            slot_id, chunk_index, chunk_retries, max_schedule_retries, e
+                        );
+                    } else {
+                        // 重试耗尽，杀掉整个任务
+                        let error_msg = e.to_string();
+                        let is_backup = {
+                            let mut t = task_info.task.lock().await;
+                            t.mark_failed(error_msg.clone());
+                            t.is_backup
+                        };
+
+                        if !is_backup {
+                            if let Some(ref ws_manager) = task_info.ws_manager {
+                                ws_manager.send_if_subscribed(
+                                    TaskEvent::Upload(UploadEvent::Failed {
+                                        task_id: task_id.clone(),
+                                        error: error_msg.clone(),
+                                        is_backup,
+                                    }),
+                                    None,
+                                );
+                            }
+                        }
+
+                        if is_backup {
+                            let tx_guard = backup_notification_tx.read().await;
+                            if let Some(tx) = tx_guard.as_ref() {
+                                let notification = BackupTransferNotification::Failed {
                                     task_id: task_id.clone(),
-                                    error: error_msg.clone(),
-                                    is_backup,
-                                }),
-                                None,
-                            );
+                                    task_type: TransferTaskType::Upload,
+                                    error_message: error_msg.clone(),
+                                };
+                                let _ = tx.send(notification);
+                            }
                         }
-                    }
 
-                    // 🔥 如果是备份任务，通知 AutoBackupManager
-                    if is_backup {
-                        let tx_guard = backup_notification_tx.read().await;
-                        if let Some(tx) = tx_guard.as_ref() {
-                            let notification = BackupTransferNotification::Failed {
-                                task_id: task_id.clone(),
-                                task_type: TransferTaskType::Upload,
-                                error_message: error_msg.clone(),
-                            };
-                            let _ = tx.send(notification);
+                        if let Some(ref pm) = task_info.persistence_manager {
+                            if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
+                                warn!("更新上传任务错误信息失败: {}", e);
+                            }
                         }
-                    }
 
-                    // 🔥 更新持久化错误信息
-                    if let Some(ref pm) = task_info.persistence_manager {
-                        if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
-                            warn!("更新上传任务错误信息失败: {}", e);
+                        active_tasks.write().await.remove(&task_id);
+
+                        if let Some(ref pool) = task_info.task_slot_pool {
+                            pool.release_fixed_slot(&task_id).await;
+                            info!("上传任务 {} 分片上传失败，释放槽位", task_id);
                         }
+
+                        error!("上传任务 {} 因分片 #{} 重试耗尽已从调度器移除", task_id, chunk_index);
                     }
-
-                    // 从调度器移除任务
-                    active_tasks.write().await.remove(&task_id);
-
-                    // 🔥 释放槽位（任务失败）
-                    if let Some(ref pool) = task_info.task_slot_pool {
-                        pool.release_fixed_slot(&task_id).await;
-                        info!("上传任务 {} 分片上传失败，释放槽位", task_id);
-                    }
-
-                    error!("上传任务 {} 因分片上传失败已从调度器移除", task_id);
                 }
             } else {
                 // 检查是否所有分片都完成

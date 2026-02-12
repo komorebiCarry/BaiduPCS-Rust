@@ -483,6 +483,8 @@ pub struct TransferRecoveryInfo {
     pub temp_dir: Option<String>,
     /// 是否为分享直下任务
     pub is_share_direct_download: bool,
+    /// 文件列表 JSON
+    pub file_list_json: Option<String>,
 }
 
 impl TransferRecoveryInfo {
@@ -500,6 +502,7 @@ impl TransferRecoveryInfo {
             created_at: metadata.created_at.timestamp(),
             temp_dir: metadata.temp_dir.clone(),
             is_share_direct_download: metadata.is_share_direct_download.unwrap_or(false),
+            file_list_json: metadata.file_list_json.clone(),
         })
     }
 }

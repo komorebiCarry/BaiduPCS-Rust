@@ -59,8 +59,9 @@
         <el-card
             v-for="task in tasks"
             :key="task.id"
+            :data-task-id="task.id"
             class="task-card"
-            :class="{ 'task-active': isActiveStatus(task.status) }"
+            :class="{ 'task-active': isActiveStatus(task.status), 'task-highlighted': highlightIds.has(task.id) }"
             shadow="hover"
         >
           <!-- 任务信息 -->
@@ -142,7 +143,7 @@
                     size="small"
                     type="primary"
                     link
-                    @click="goToDownloadTask(task.download_task_ids[0])"
+                    @click="goToDownloadTasks(task.download_task_ids)"
                     style="margin-left: 8px"
                 >
                   <el-icon><Document /></el-icon>
@@ -200,7 +201,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Share,
@@ -211,7 +212,7 @@ import {
   Document,
   Download,
 } from '@element-plus/icons-vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { useIsMobile } from '@/utils/responsive'
 import {
   getAllTransfers,
@@ -234,9 +235,13 @@ import type { TransferEvent } from '@/types/events'
 
 // 路由
 const router = useRouter()
+const route = useRoute()
 
 // 响应式检测
 const isMobile = useIsMobile()
+
+// 高亮的转存任务 ID 集合（从下载页跳转过来时使用）
+const highlightIds = ref<Set<string>>(new Set())
 
 // 状态
 const loading = ref(false)
@@ -491,11 +496,11 @@ function handleTransferSuccess(taskId: string) {
   refreshTasks()
 }
 
-// 🔥 跳转到关联的下载任务
-function goToDownloadTask(downloadTaskId: string) {
+// 🔥 跳转到关联的下载任务（支持多个）
+function goToDownloadTasks(downloadTaskIds: string[]) {
   router.push({
     name: 'Downloads',
-    query: { highlight: downloadTaskId }
+    query: { highlight: downloadTaskIds.join(',') }
   })
 }
 
@@ -574,8 +579,31 @@ function cleanupWebSocketSubscriptions() {
 }
 
 // 组件挂载
-onMounted(() => {
-  refreshTasks()
+onMounted(async () => {
+  // 解析 highlight 参数（从下载页跳转过来时）
+  const highlightParam = route.query.highlight as string | undefined
+  if (highlightParam) {
+    highlightIds.value = new Set(highlightParam.split(',').filter(Boolean))
+  }
+
+  await refreshTasks()
+
+  // 高亮任务加载完成后滚动到第一个高亮任务
+  if (highlightIds.value.size > 0) {
+    nextTick(() => {
+      const firstId = [...highlightIds.value][0]
+      const el = document.querySelector(`[data-task-id="${firstId}"]`)
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+      // 3 秒后清除高亮
+      setTimeout(() => {
+        highlightIds.value = new Set()
+        router.replace({ query: {} })
+      }, 3000)
+    })
+  }
+
   setupWebSocketSubscriptions()
 })
 
@@ -642,6 +670,18 @@ onUnmounted(() => {
   &.task-active {
     border-color: #409eff;
     box-shadow: 0 2px 12px rgba(64, 158, 255, 0.2);
+  }
+
+  &.task-highlighted {
+    border-color: #e6a23c;
+    box-shadow: 0 2px 16px rgba(230, 162, 60, 0.35);
+    animation: highlight-fade 3s ease-out;
+  }
+
+  @keyframes highlight-fade {
+    0% { box-shadow: 0 2px 16px rgba(230, 162, 60, 0.5); }
+    70% { box-shadow: 0 2px 16px rgba(230, 162, 60, 0.35); }
+    100% { box-shadow: none; border-color: transparent; }
   }
 
   &:hover {

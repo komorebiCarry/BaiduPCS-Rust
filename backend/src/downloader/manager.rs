@@ -55,12 +55,14 @@ pub struct DownloadManager {
     snapshot_manager: Arc<RwLock<Option<Arc<crate::encryption::snapshot::SnapshotManager>>>>,
     /// 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
     encryption_config_store: Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
+    /// 🔥 链接级重试次数（从配置读取，传递给 TaskScheduleInfo）
+    max_retries: u32,
 }
 
 impl DownloadManager {
     /// 创建新的下载管理器
     pub fn new(user_auth: UserAuth, download_dir: PathBuf) -> Result<Self> {
-        Self::with_config(user_auth, download_dir, 10, 5)
+        Self::with_config(user_auth, download_dir, 10, 5, 3)
     }
 
     /// 使用指定配置创建下载管理器（不再需要 chunk_size 参数，引擎会自动计算）
@@ -69,6 +71,7 @@ impl DownloadManager {
         download_dir: PathBuf,
         max_global_threads: usize,
         max_concurrent_tasks: usize,
+        max_retries: u32,
     ) -> Result<Self> {
         // 确保下载目录存在（路径验证已在配置保存时完成）
         if !download_dir.exists() {
@@ -112,6 +115,7 @@ impl DownloadManager {
             folder_manager: Arc::new(RwLock::new(None)),
             snapshot_manager: Arc::new(RwLock::new(None)),
             encryption_config_store: Arc::new(RwLock::new(None)),
+            max_retries,
         };
 
         // 🔥 设置槽位超时释放处理器
@@ -640,6 +644,7 @@ impl DownloadManager {
         let tasks_clone = self.tasks.clone(); // 🔥 用于 handle_task_failure 的优先级队列插入
         let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
         let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
+        let max_retries = self.max_retries;
 
         tokio::spawn(async move {
             // 获取 WebSocket 管理器和文件夹进度发送器
@@ -867,6 +872,8 @@ impl DownloadManager {
                         encryption_config_store: encryption_config_store.clone(),
                         // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
                         manager_tasks: Some(tasks_clone.clone()),
+                        // 🔥 链接级重试次数（从配置读取）
+                        max_retries,
                     };
 
                     // 注册到调度器
@@ -1094,6 +1101,7 @@ impl DownloadManager {
         let backup_notification_tx_arc = self.backup_notification_tx.clone();
         let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
         let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
+        let max_retries = self.max_retries;
 
         tokio::spawn(async move {
             // 🔥 优化：缩短检查间隔从3秒到1秒，减少等待时间
@@ -1441,6 +1449,8 @@ impl DownloadManager {
                                                 encryption_config_store: encryption_config_store.clone(),
                                                 // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
                                                 manager_tasks: Some(tasks_clone.clone()),
+                                                // 🔥 链接级重试次数（从配置读取）
+                                                max_retries,
                                             };
 
                                             // 注册任务到调度器
@@ -1616,6 +1626,7 @@ impl DownloadManager {
         let backup_notification_tx_arc = self.backup_notification_tx.clone();
         let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
         let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
+        let max_retries = self.max_retries;
 
         tokio::spawn(async move {
             while let Some(()) = rx.recv().await {
@@ -1960,6 +1971,8 @@ impl DownloadManager {
                                                 encryption_config_store: encryption_config_store.clone(),
                                                 // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
                                                 manager_tasks: Some(tasks_clone.clone()),
+                                                // 🔥 链接级重试次数（从配置读取）
+                                                max_retries,
                                             };
 
                                             match chunk_scheduler_clone

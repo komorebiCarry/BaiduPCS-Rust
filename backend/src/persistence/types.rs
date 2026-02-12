@@ -195,6 +195,10 @@ pub struct TaskMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_file_name: Option<String>,
 
+    /// 转存文件列表（JSON 序列化的 Vec<SharedFileInfo>）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_list_json: Option<String>,
+
     // === 分享直下相关字段 ===
     /// 是否为分享直下任务
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,6 +310,7 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            file_list_json: None,
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
@@ -374,6 +379,7 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            file_list_json: None,
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
@@ -438,6 +444,7 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            file_list_json: None,
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
@@ -504,6 +511,7 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            file_list_json: None,
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
@@ -564,6 +572,7 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: Some(auto_download),
             transfer_file_name: file_name,
+            file_list_json: None,
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
@@ -621,6 +630,12 @@ impl TaskMetadata {
     /// 设置转存文件名称
     pub fn set_transfer_file_name(&mut self, file_name: String) {
         self.transfer_file_name = Some(file_name);
+        self.touch();
+    }
+
+    /// 设置转存文件列表（JSON 序列化）
+    pub fn set_file_list_json(&mut self, json: String) {
+        self.file_list_json = Some(json);
         self.touch();
     }
 

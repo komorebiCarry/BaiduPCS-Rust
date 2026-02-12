@@ -1186,9 +1186,9 @@ mod tests {
     #[test]
     fn test_polling_config_default() {
         let config = PollingConfig::default();
-        assert_eq!(config.active_interval, Duration::from_secs(30));
+        assert_eq!(config.active_interval, Duration::from_secs(15));
         assert_eq!(config.idle_interval, Duration::from_secs(60));
-        assert_eq!(config.min_interval, Duration::from_secs(180));
+        assert_eq!(config.min_interval, Duration::from_secs(15));
         assert_eq!(config.max_check_interval, Duration::from_secs(3600));
         assert!((config.backoff_multiplier - 1.5).abs() < 0.01);
         assert!((config.check_before_completion - 0.8).abs() < 0.01);

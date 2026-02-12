@@ -232,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
         // 转存API
         .route("/transfers", post(handlers::create_transfer))
         .route("/transfers", get(handlers::get_all_transfers))
+        .route("/transfers/preview", post(handlers::preview_share_files))
+        .route("/transfers/preview/dir", post(handlers::preview_share_dir))
         .route("/transfers/cleanup", post(handlers::cleanup_orphaned_temp_dirs))
         .route("/transfers/:id", get(handlers::get_transfer))
         .route("/transfers/:id", delete(handlers::delete_transfer))
