@@ -80,6 +80,8 @@ export type ProxyScope = 'default' | 'transfer_only'
 export interface ProxyConfig {
   proxy_type: ProxyType
   scope: ProxyScope
+  temporary_fallback: boolean
+  temporary_fallback_probe_interval_secs: number
   host: string
   port: number
   username: string

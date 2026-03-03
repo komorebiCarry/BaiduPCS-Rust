@@ -39,8 +39,12 @@ impl Default for ProxyScope {
     }
 }
 
+fn default_temporary_fallback_probe_interval_secs() -> u64 {
+    20
+}
+
 /// 网络代理配置
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// 代理类型
     #[serde(default)]
@@ -60,6 +64,28 @@ pub struct ProxyConfig {
     /// 代理生效范围
     #[serde(default)]
     pub scope: ProxyScope,
+    /// 启用后，当代理链路出现网络错误时允许临时回退到直连
+    #[serde(default)]
+    pub temporary_fallback: bool,
+    /// 临时 fallback 下，代理恢复探测间隔（秒，允许范围 3~60）
+    #[serde(default = "default_temporary_fallback_probe_interval_secs")]
+    pub temporary_fallback_probe_interval_secs: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            proxy_type: ProxyType::None,
+            host: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            scope: ProxyScope::Default,
+            temporary_fallback: false,
+            temporary_fallback_probe_interval_secs: default_temporary_fallback_probe_interval_secs(
+            ),
+        }
+    }
 }
 
 impl ProxyConfig {
@@ -82,6 +108,11 @@ impl ProxyConfig {
     /// 面向上传/下载数据传输链路的有效代理配置
     pub fn for_transfer(&self) -> Self {
         self.clone()
+    }
+
+    /// 临时 fallback 代理探测间隔（秒，自动夹取到 3~60）
+    pub fn temporary_fallback_probe_interval_secs(&self) -> u64 {
+        self.temporary_fallback_probe_interval_secs.clamp(3, 60)
     }
 
     /// 构建 reqwest Proxy

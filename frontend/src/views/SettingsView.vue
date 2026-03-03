@@ -102,6 +102,30 @@
                 </el-radio-group>
               </el-form-item>
 
+              <el-form-item label="临时 fallback" prop="network.proxy.temporary_fallback">
+                <el-switch
+                    v-model="formData.network.proxy.temporary_fallback"
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+                <div class="form-tip">代理链路出现网络错误时，传输请求可临时回退直连，并定期探测恢复代理。</div>
+              </el-form-item>
+
+              <el-form-item
+                  label="fallback 探测间隔（秒）"
+                  prop="network.proxy.temporary_fallback_probe_interval_secs"
+              >
+                <el-input-number
+                    v-model="formData.network.proxy.temporary_fallback_probe_interval_secs"
+                    :min="3"
+                    :max="60"
+                    :step="1"
+                    controls-position="right"
+                    :disabled="formData.network.proxy.proxy_type === 'none' || !formData.network.proxy.temporary_fallback"
+                    style="width: 100%"
+                />
+                <div class="form-tip">范围 3~60 秒。临时 fallback 后将按该间隔用代理探测故障服务器连通性。</div>
+              </el-form-item>
+
               <el-form-item label="代理服务器" prop="network.proxy.host">
                 <el-input
                     v-model="formData.network.proxy.host"
@@ -930,6 +954,26 @@ const rules = reactive<FormRules<AppConfig>>({
       trigger: 'blur'
     }
   ],
+  'network.proxy.temporary_fallback_probe_interval_secs': [
+    {
+      validator: (_rule: any, value: any, callback: any) => {
+        if (!formData.value) {
+          callback()
+          return
+        }
+        if (formData.value.network.proxy.proxy_type === 'none' || !formData.value.network.proxy.temporary_fallback) {
+          callback()
+          return
+        }
+        if (typeof value !== 'number' || value < 3 || value > 60) {
+          callback(new Error('临时 fallback 探测间隔必须在 3-60 秒'))
+          return
+        }
+        callback()
+      },
+      trigger: 'change'
+    }
+  ],
   'network.proxy.port': [
     {
       validator: (_rule: any, value: any, callback: any) => {
@@ -1013,6 +1057,12 @@ async function loadConfig() {
     const form = formData.value
     if (form && !form.network.proxy.scope) {
       form.network.proxy.scope = 'default'
+    }
+    if (form && typeof form.network.proxy.temporary_fallback !== 'boolean') {
+      form.network.proxy.temporary_fallback = false
+    }
+    if (form && typeof form.network.proxy.temporary_fallback_probe_interval_secs !== 'number') {
+      form.network.proxy.temporary_fallback_probe_interval_secs = 20
     }
 
     // 同时加载推荐配置
