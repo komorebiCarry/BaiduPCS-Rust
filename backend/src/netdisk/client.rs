@@ -3,6 +3,7 @@
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
 use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
+use crate::common::{ProxyConfig, ProxyScope};
 use crate::netdisk::{
     CreateFileResponse, FileListResponse, LocateDownloadResponse, PrecreateResponse,
     RapidUploadResponse, UploadChunkResponse, UploadErrorKind,
@@ -14,14 +15,18 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart;
 use reqwest::Client;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// 百度网盘客户端
 #[derive(Debug, Clone)]
 pub struct NetdiskClient {
-    /// HTTP客户端
+    /// HTTP客户端（按配置可能带代理）
     client: Client,
+    /// 直连客户端（不使用代理）
+    direct_client: Client,
     /// Cookie Jar (用于调试和检查 Cookie 状态)
     cookie_jar: std::sync::Arc<reqwest::cookie::Jar>,
     /// 用户认证信息
@@ -37,6 +42,14 @@ pub struct NetdiskClient {
     panpsc_cookie: std::sync::Arc<Mutex<Option<String>>>,
     /// bdstoken（/api/loginStatus 或 /api/gettemplatevariable 返回）
     bdstoken: std::sync::Arc<Mutex<Option<String>>>,
+    /// 当前客户端代理配置
+    proxy_config: ProxyConfig,
+    /// 是否处于临时直连 fallback
+    temporary_fallback_active: std::sync::Arc<AtomicBool>,
+    /// 最近一次代理恢复探测时间
+    last_proxy_probe_at: std::sync::Arc<Mutex<Option<Instant>>>,
+    /// 最近一次触发 fallback 的传输服务器（用于按服务器探测恢复）
+    last_fallback_server: std::sync::Arc<Mutex<Option<String>>>,
 }
 
 impl NetdiskClient {
@@ -45,6 +58,11 @@ impl NetdiskClient {
     /// # 参数
     /// * `user_auth` - 用户认证信息（包含BDUSS）
     pub fn new(user_auth: UserAuth) -> Result<Self> {
+        Self::new_with_proxy(user_auth, &ProxyConfig::default())
+    }
+
+    /// 创建新的网盘客户端（可选代理）
+    pub fn new_with_proxy(user_auth: UserAuth, proxy_config: &ProxyConfig) -> Result<Self> {
         use reqwest::cookie::Jar;
         use std::sync::Arc;
 
@@ -95,12 +113,21 @@ impl NetdiskClient {
         // 3. 创建客户端,使用 cookie_provider 自动管理 Cookie
         // 后续请求会自动收集服务器返回的 Set-Cookie
         // 注意: 不要禁用重定向 (Policy::none())，否则 Cookie Jar 可能无法正确携带 Cookie
-        let client = Client::builder()
+        let proxied_builder = Client::builder()
             .cookie_provider(Arc::clone(&jar))
             .timeout(std::time::Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(10)) // 允许最多 10 次重定向
+            .redirect(reqwest::redirect::Policy::limited(10)); // 允许最多 10 次重定向
+        let client = proxy_config
+            .apply_to_builder(proxied_builder)?
             .build()
             .context("Failed to create HTTP client")?;
+        let direct_client = Client::builder()
+            .cookie_provider(Arc::clone(&jar))
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .no_proxy()
+            .build()
+            .context("Failed to create direct HTTP client")?;
 
         info!(
             "初始化网盘客户端成功, UID={}, PTOKEN={}",
@@ -124,6 +151,7 @@ impl NetdiskClient {
 
         Ok(Self {
             client,
+            direct_client,
             cookie_jar: jar,
             user_auth,
             mobile_user_agent: Self::default_mobile_user_agent(),
@@ -131,6 +159,10 @@ impl NetdiskClient {
             web_session_ready,
             panpsc_cookie,
             bdstoken,
+            proxy_config: proxy_config.clone(),
+            temporary_fallback_active: std::sync::Arc::new(AtomicBool::new(false)),
+            last_proxy_probe_at: std::sync::Arc::new(Mutex::new(None)),
+            last_fallback_server: std::sync::Arc::new(Mutex::new(None)),
         })
     }
 
@@ -170,6 +202,104 @@ impl NetdiskClient {
     /// 注意: 必须与登录时的 UA 完全一致 (复用 auth/constants.rs 的 USER_AGENT)
     fn default_web_user_agent() -> String {
         WEB_USER_AGENT.to_string()
+    }
+
+    fn is_network_error(err: &reqwest::Error) -> bool {
+        err.is_connect() || err.is_timeout() || err.is_request() || err.is_body()
+    }
+
+    fn use_direct_for_api_requests(&self) -> bool {
+        self.proxy_config.scope == ProxyScope::TransferOnly
+    }
+
+    fn transfer_request_client(&self) -> &Client {
+        if self.temporary_fallback_active.load(Ordering::Relaxed) {
+            &self.direct_client
+        } else {
+            &self.client
+        }
+    }
+
+    async fn maybe_probe_proxy_recovery(&self) {
+        if !self.proxy_config.temporary_fallback || !self.proxy_config.is_enabled() {
+            return;
+        }
+        if !self.temporary_fallback_active.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut last_probe_at = self.last_proxy_probe_at.lock().await;
+        let now = Instant::now();
+        let interval_secs = self.proxy_config.temporary_fallback_probe_interval_secs();
+        if let Some(last) = *last_probe_at {
+            let interval = Duration::from_secs(interval_secs);
+            if now.duration_since(last) < interval {
+                info!(
+                    "代理探测跳过（未到间隔）: interval={}s",
+                    interval_secs
+                );
+                return;
+            }
+        }
+        *last_probe_at = Some(now);
+        drop(last_probe_at);
+
+        // fallback 由哪个传输服务器触发，就优先探测哪个服务器的代理连通性
+        let probe_server = {
+            let server_guard = self.last_fallback_server.lock().await;
+            server_guard
+                .clone()
+                .unwrap_or_else(|| "pan.baidu.com".to_string())
+        };
+        let probe_url = format!("https://{}/", probe_server);
+
+        info!(
+            "开始代理恢复探测: server={}, url={}, interval={}s",
+            probe_server, probe_url, interval_secs
+        );
+
+        let probe_result = self
+            .client
+            .head(&probe_url)
+            .header("User-Agent", &self.mobile_user_agent)
+            .send()
+            .await;
+
+        match probe_result {
+            // 只要代理链路能拿到 HTTP 响应（无论 2xx/3xx/4xx/5xx），
+            // 就认为代理连接能力已恢复，切回代理。
+            Ok(resp) => {
+                info!(
+                    "代理探测已收到响应，恢复走代理链路: server={}, status={}",
+                    probe_server,
+                    resp.status()
+                );
+                self.temporary_fallback_active
+                    .store(false, Ordering::Relaxed);
+            }
+            Err(err) => warn!("代理探测失败: server={}, err={}", probe_server, err),
+        }
+    }
+
+    async fn send_upload_chunk_once(
+        &self,
+        client: &Client,
+        url: &str,
+        data: Vec<u8>,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let part = multipart::Part::bytes(data)
+            .file_name("file")
+            .mime_str("application/octet-stream")
+            .expect("valid upload mime type");
+        let form = multipart::Form::new().part("file", part);
+
+        client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .multipart(form)
+            .send()
+            .await
     }
 
     /// 确保 Web 会话已预热（用于获取 BAIDUID / PANPSC 等 Cookie）
@@ -387,7 +517,7 @@ impl NetdiskClient {
             "步骤 1/4 (/disk/home)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         self.debug_print_cookies("步骤 1/4 后 Cookie 状态");
 
@@ -411,7 +541,7 @@ impl NetdiskClient {
             "步骤 2/4 (/api/loginStatus)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
             if let Some(bdstoken) = json["login_info"]["bdstoken"].as_str() {
@@ -447,7 +577,7 @@ impl NetdiskClient {
             "步骤 3/4 (/api/gettemplatevariable)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         // 提取 bdstoken
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body3) {
@@ -485,7 +615,7 @@ impl NetdiskClient {
             "步骤 4/4 (/pcloud/user/getinfo)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         self.debug_print_cookies("步骤 4/4 后 Cookie 状态");
 
@@ -788,8 +918,16 @@ impl NetdiskClient {
         debug!("BDUSS: {}...", &self.bduss()[..20.min(self.bduss().len())]);
 
         // 4. 发送 POST 请求
-        let response = match self
-            .client
+        // locatedownload 属于获取下载元信息的 API 请求：
+        // - default 模式：按当前代理配置走
+        // - transfer_only 模式：应走直连（仅真实下载传输走代理）
+        let client = if self.use_direct_for_api_requests() {
+            &self.direct_client
+        } else {
+            &self.client
+        };
+
+        let response = match client
             .post(&url)
             .header("Cookie", format!("BDUSS={}", self.bduss()))
             .header("User-Agent", &self.mobile_user_agent)
@@ -978,8 +1116,13 @@ impl NetdiskClient {
     ) -> Result<RapidUploadResponse> {
         let url = "https://pan.baidu.com/api/create";
 
-        let response = self
-            .client
+        let client = if self.use_direct_for_api_requests() {
+            &self.direct_client
+        } else {
+            &self.client
+        };
+
+        let response = client
             .post(url)
             // .query(&[("method", "create")])
             .header("Cookie", format!("BDUSS={}", self.bduss()))
@@ -1046,8 +1189,13 @@ impl NetdiskClient {
             BAIDU_APP_ID
         );
 
-        let response = self
-            .client
+        let client = if self.use_direct_for_api_requests() {
+            &self.direct_client
+        } else {
+            &self.client
+        };
+
+        let response = client
             .get(&url)
             .header("Cookie", format!("BDUSS={}", self.bduss()))
             .header("User-Agent", &self.mobile_user_agent)
@@ -1102,8 +1250,13 @@ impl NetdiskClient {
 
         let url = "https://pan.baidu.com/api/precreate";
 
-        let response = self
-            .client
+        let client = if self.use_direct_for_api_requests() {
+            &self.direct_client
+        } else {
+            &self.client
+        };
+
+        let response = client
             .post(url)
             // .query(&[("method", "precreate")])
             .header("Cookie", format!("BDUSS={}", self.bduss()))
@@ -1198,22 +1351,42 @@ impl NetdiskClient {
             part_seq
         );
 
-        // 构建 multipart form
-        let part = multipart::Part::bytes(data)
-            .file_name("file")
-            .mime_str("application/octet-stream")?;
+        self.maybe_probe_proxy_recovery().await;
 
-        let form = multipart::Form::new().part("file", part);
+        let use_direct = self.temporary_fallback_active.load(Ordering::Relaxed);
+        let first_client = if use_direct {
+            &self.direct_client
+        } else {
+            self.transfer_request_client()
+        };
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
-            .header("User-Agent", &self.mobile_user_agent)
-            .multipart(form)
-            .send()
+        let response = match self
+            .send_upload_chunk_once(first_client, &url, data.clone())
             .await
-            .context("上传分片请求发送失败")?;
+        {
+            Ok(resp) => resp,
+            Err(err)
+                if !use_direct
+                    && self.proxy_config.temporary_fallback
+                    && self.proxy_config.is_enabled()
+                    && Self::is_network_error(&err) =>
+            {
+                warn!(
+                    "代理链路网络错误，临时回退直连: server={}, err={}",
+                    pcs_server, err
+                );
+                self.temporary_fallback_active
+                    .store(true, Ordering::Relaxed);
+                {
+                    let mut server_guard = self.last_fallback_server.lock().await;
+                    *server_guard = Some(pcs_server.to_string());
+                }
+                self.send_upload_chunk_once(&self.direct_client, &url, data)
+                    .await
+                    .context("上传分片请求发送失败")?
+            }
+            Err(err) => return Err(err).context("上传分片请求发送失败"),
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取上传分片响应失败")?;
@@ -1839,7 +2012,10 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<crate::transfer::ShareFileListResult> {
-        info!("获取分享文件列表(根目录): short_key={}, page={}, num={}", short_key, page, num);
+        info!(
+            "获取分享文件列表(根目录): short_key={}, page={}, num={}",
+            short_key, page, num
+        );
 
         // short_key 包含 '1'（如 "1abcDEFg"），需要去掉第一个字符
         let shorturl = if short_key.starts_with('1') && short_key.len() > 1 {
@@ -1893,10 +2069,14 @@ impl NetdiskClient {
         }
 
         // 从响应中提取 uk 和 share_id（用于子目录导航拼接 dir）
-        let resp_uk = json["uk"].as_u64().map(|v| v.to_string())
+        let resp_uk = json["uk"]
+            .as_u64()
+            .map(|v| v.to_string())
             .or_else(|| json["uk"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        let resp_shareid = json["share_id"].as_u64().map(|v| v.to_string())
+        let resp_shareid = json["share_id"]
+            .as_u64()
+            .map(|v| v.to_string())
             .or_else(|| json["share_id"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
 
@@ -1966,7 +2146,10 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
-        info!("获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}", shareid, dir, page, num);
+        info!(
+            "获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}",
+            shareid, dir, page, num
+        );
 
         let encoded_dir = urlencoding::encode(dir);
 
@@ -1989,10 +2172,14 @@ impl NetdiskClient {
             .await
             .context("获取分享子目录文件列表失败")?;
 
-        let response_text = response.text().await.context("读取子目录文件列表响应失败")?;
+        let response_text = response
+            .text()
+            .await
+            .context("读取子目录文件列表响应失败")?;
         debug!("子目录文件列表响应: {}", response_text);
 
-        let json: Value = serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
+        let json: Value =
+            serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
 
         let errno = json["errno"].as_i64().unwrap_or(-1);
         if errno != 0 {
@@ -2187,7 +2374,9 @@ impl NetdiskClient {
                     .as_array()
                     .map(|list| {
                         list.iter()
-                            .filter_map(|item| item["server_filename"].as_str().map(|s| s.to_string()))
+                            .filter_map(|item| {
+                                item["server_filename"].as_str().map(|s| s.to_string())
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -2369,7 +2558,10 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取磁力链接信息响应失败")?;
 
-        info!("查询磁力链接信息响应: status={}, body={}", status, response_text);
+        info!(
+            "查询磁力链接信息响应: status={}, body={}",
+            status, response_text
+        );
 
         // 解析响应，提取文件数量
         let json: serde_json::Value =
@@ -2407,7 +2599,10 @@ impl NetdiskClient {
     /// # 返回
     /// 新创建的任务 ID
     pub async fn cloud_dl_add_task(&self, source_url: &str, save_path: &str) -> Result<i64> {
-        info!("添加离线下载任务: source_url={}, save_path={}", source_url, save_path);
+        info!(
+            "添加离线下载任务: source_url={}, save_path={}",
+            source_url, save_path
+        );
 
         // 标准化磁力链接（将 Base32 转换为十六进制，小写转大写）
         let normalized_url = Self::normalize_magnet_link(source_url);
@@ -2417,7 +2612,10 @@ impl NetdiskClient {
 
         // 对于磁力链接，需要先查询文件列表，然后选择所有文件
         let selected_idx = if is_magnet {
-            match self.cloud_dl_query_magnet_info(&normalized_url, save_path).await {
+            match self
+                .cloud_dl_query_magnet_info(&normalized_url, save_path)
+                .await
+            {
                 Ok(file_count) if file_count > 0 => {
                     // 生成所有文件的索引：1,2,3,...,n（索引从1开始）
                     let indices: Vec<String> = (1..=file_count).map(|i| i.to_string()).collect();
@@ -2464,7 +2662,10 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取添加任务响应失败")?;
 
-        info!("添加离线任务响应: status={}, body={}", status, response_text);
+        info!(
+            "添加离线任务响应: status={}, body={}",
+            status, response_text
+        );
 
         let api_response: crate::netdisk::cloud_dl::BaiduAddTaskResponse =
             serde_json::from_str(&response_text).context("解析添加任务响应失败")?;
@@ -2643,10 +2844,9 @@ impl NetdiskClient {
         let mut tasks = Vec::new();
         if let Some(task_map) = api_response.task_info.as_object() {
             for (task_id_str, task_value) in task_map {
-                if let Ok(mut baidu_task) =
-                    serde_json::from_value::<crate::netdisk::cloud_dl::BaiduTaskInfo>(
-                        task_value.clone(),
-                    )
+                if let Ok(mut baidu_task) = serde_json::from_value::<
+                    crate::netdisk::cloud_dl::BaiduTaskInfo,
+                >(task_value.clone())
                 {
                     // 如果 task_id 为空，使用 JSON key 作为 task_id
                     if baidu_task.task_id.is_empty() {
@@ -2772,7 +2972,8 @@ impl NetdiskClient {
     pub async fn cloud_dl_clear_task(&self) -> Result<i32> {
         info!("清空离线下载任务记录");
 
-        let url = "https://pan.baidu.com/rest/2.0/services/cloud_dl?method=clear_task&app_id=250528";
+        let url =
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?method=clear_task&app_id=250528";
 
         let response = self
             .client
@@ -2976,7 +3177,10 @@ impl NetdiskClient {
         let response_text = response.text().await.context("读取分享列表响应失败")?;
 
         // 临时使用 info 级别日志查看响应内容
-        info!("获取分享列表响应: status={}, body={}", status, response_text);
+        info!(
+            "获取分享列表响应: status={}, body={}",
+            status, response_text
+        );
 
         let list_response: crate::netdisk::ShareListResponse =
             serde_json::from_str(&response_text).context("解析分享列表响应失败")?;
@@ -3147,10 +3351,7 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取删除文件响应失败")?;
 
-        info!(
-            "删除文件响应: status={}, body={}",
-            status, response_text
-        );
+        info!("删除文件响应: status={}, body={}", status, response_text);
 
         // 解析响应
         let api_response: crate::netdisk::DeleteFilesApiResponse =
@@ -3284,7 +3485,11 @@ mod tests {
 
         assert!(!response.success);
         assert!(response.error.is_some());
-        assert!(response.error.as_ref().unwrap().contains("部分文件删除失败"));
+        assert!(response
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("部分文件删除失败"));
         assert_eq!(response.failed_paths, failed_paths);
         assert_eq!(response.deleted_count, 5);
     }

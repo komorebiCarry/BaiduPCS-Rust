@@ -73,12 +73,32 @@ export interface TransferConfig {
   recent_save_path?: string     // 最近使用的网盘目录路径
 }
 
+
+export type ProxyType = 'none' | 'http' | 'socks5'
+export type ProxyScope = 'default' | 'transfer_only'
+
+export interface ProxyConfig {
+  proxy_type: ProxyType
+  scope: ProxyScope
+  temporary_fallback: boolean
+  temporary_fallback_probe_interval_secs: number
+  host: string
+  port: number
+  username: string
+  password: string
+}
+
+export interface NetworkConfig {
+  proxy: ProxyConfig
+}
+
 /// 应用配置
 export interface AppConfig {
   server: ServerConfig
   download: DownloadConfig
   upload: UploadConfig
   transfer?: TransferConfig
+  network: NetworkConfig
 }
 
 /// VIP 推荐配置

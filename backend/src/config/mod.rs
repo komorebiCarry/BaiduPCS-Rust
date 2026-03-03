@@ -9,12 +9,22 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
 
+use crate::common::ProxyConfig;
+
 pub use env_detector::{EnvDetector, EnvInfo, OsType};
 pub use mount_detector::{MountDetector, MountPoint};
 pub use path_validator::{PathValidationResult, PathValidator};
 
 // Re-export WebAuthConfig from web_auth module
 pub use crate::web_auth::{AuthMode, WebAuthConfig};
+
+/// 网络配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkConfig {
+    /// 代理配置
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+}
 
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +57,9 @@ pub struct AppConfig {
     /// 分享直下配置
     #[serde(default)]
     pub share_direct_download: ShareDirectDownloadConfig,
+    /// 网络配置
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 /// 自动备份配置
@@ -947,6 +960,7 @@ impl Default for AppConfig {
             autobackup: AutoBackupConfig::default(),
             web_auth: WebAuthConfig::default(),
             share_direct_download: ShareDirectDownloadConfig::default(),
+            network: NetworkConfig::default(),
         }
     }
 }

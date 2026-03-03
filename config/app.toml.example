@@ -55,3 +55,16 @@ cleanup_on_failure = true
 # 默认关闭，避免误删用户数据
 cleanup_orphaned_on_startup = false
 
+
+# 网络代理配置
+[network.proxy]
+# 代理类型: "none" | "http" | "socks5"
+proxy_type = "none"
+# 代理服务器地址
+host = ""
+# 代理端口
+port = 0
+# 代理认证用户名（可选）
+username = ""
+# 代理认证密码（可选）
+password = ""

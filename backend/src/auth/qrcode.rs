@@ -2,6 +2,7 @@
 
 use crate::auth::constants::*;
 use crate::auth::{QRCode, QRCodeStatus, UserAuth};
+use crate::common::ProxyConfig;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
@@ -16,11 +17,14 @@ pub struct QRCodeAuth {
 impl QRCodeAuth {
     /// 创建新的二维码登录客户端
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
-            .cookie_store(true)
-            .user_agent(USER_AGENT)
-            .build()
-            .context("Failed to create HTTP client")?;
+        Self::new_with_proxy(&ProxyConfig::default())
+    }
+
+    /// 创建新的二维码登录客户端（可选代理）
+    pub fn new_with_proxy(proxy_config: &ProxyConfig) -> Result<Self> {
+        let builder = Client::builder().cookie_store(true).user_agent(USER_AGENT);
+        let builder = proxy_config.apply_to_builder(builder)?;
+        let client = builder.build().context("Failed to create HTTP client")?;
 
         Ok(Self {
             client,

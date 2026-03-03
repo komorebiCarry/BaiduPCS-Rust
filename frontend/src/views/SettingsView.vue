@@ -74,6 +74,99 @@
               </el-form-item>
             </el-card>
 
+            <!-- 网络代理配置 -->
+            <el-card class="setting-card" shadow="hover">
+              <template #header>
+                <div class="card-header">
+                  <el-icon :size="20" color="#409eff">
+                    <Connection />
+                  </el-icon>
+                  <span>网络代理</span>
+                </div>
+              </template>
+
+              <el-form-item label="代理类型" prop="network.proxy.proxy_type">
+                <el-radio-group v-model="formData.network.proxy.proxy_type">
+                  <el-radio value="none">不使用代理</el-radio>
+                  <el-radio value="http">HTTP 代理</el-radio>
+                  <el-radio value="socks5">SOCKS5 代理</el-radio>
+                </el-radio-group>
+                <div class="form-tip">支持 Windows / macOS / Linux (arm64) 平台。</div>
+              </el-form-item>
+
+
+              <el-form-item label="代理作用范围" prop="network.proxy.scope">
+                <el-radio-group v-model="formData.network.proxy.scope">
+                  <el-radio value="default">默认（当前设置）</el-radio>
+                  <el-radio value="transfer_only">仅代理上传下载相关逻辑</el-radio>
+                </el-radio-group>
+              </el-form-item>
+
+              <el-form-item label="临时 fallback" prop="network.proxy.temporary_fallback">
+                <el-switch
+                    v-model="formData.network.proxy.temporary_fallback"
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+                <div class="form-tip">代理链路出现网络错误时，传输请求可临时回退直连，并定期探测恢复代理。</div>
+              </el-form-item>
+
+              <el-form-item
+                  label="fallback 探测间隔（秒）"
+                  prop="network.proxy.temporary_fallback_probe_interval_secs"
+              >
+                <el-input-number
+                    v-model="formData.network.proxy.temporary_fallback_probe_interval_secs"
+                    :min="3"
+                    :max="60"
+                    :step="1"
+                    controls-position="right"
+                    :disabled="formData.network.proxy.proxy_type === 'none' || !formData.network.proxy.temporary_fallback"
+                    style="width: 100%"
+                />
+                <div class="form-tip">范围 3~60 秒。临时 fallback 后将按该间隔用代理探测故障服务器连通性。</div>
+              </el-form-item>
+
+              <el-form-item label="代理服务器" prop="network.proxy.host">
+                <el-input
+                    v-model="formData.network.proxy.host"
+                    placeholder="例如: 127.0.0.1 或 proxy.example.com"
+                    clearable
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+              </el-form-item>
+
+              <el-form-item label="代理端口" prop="network.proxy.port">
+                <el-input-number
+                    v-model="formData.network.proxy.port"
+                    :min="1"
+                    :max="65535"
+                    :step="1"
+                    controls-position="right"
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                    style="width: 100%"
+                />
+              </el-form-item>
+
+              <el-form-item label="代理用户名" prop="network.proxy.username">
+                <el-input
+                    v-model="formData.network.proxy.username"
+                    placeholder="可选，例如: my_user"
+                    clearable
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+              </el-form-item>
+
+              <el-form-item label="代理密码" prop="network.proxy.password">
+                <el-input
+                    v-model="formData.network.proxy.password"
+                    placeholder="可选，留空表示无认证"
+                    show-password
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+                <div class="form-tip">代理配置保存后，新建网络连接会使用代理；建议重启服务或重新登录后生效更彻底。</div>
+              </el-form-item>
+            </el-card>
+
             <!-- Web 访问认证设置 -->
             <AuthSettingsSection />
 
@@ -838,6 +931,72 @@ const rules = reactive<FormRules<AppConfig>>({
     { required: true, message: '请输入监听端口', trigger: 'blur' },
     { type: 'number', min: 1, max: 65535, message: '端口范围: 1-65535', trigger: 'blur' },
   ],
+  'network.proxy.host': [
+    {
+      validator: (_rule: any, value: any, callback: any) => {
+        if (!formData.value) {
+          callback()
+          return
+        }
+
+        if (formData.value.network.proxy.proxy_type === 'none') {
+          callback()
+          return
+        }
+
+        if (!value || !String(value).trim()) {
+          callback(new Error('启用代理时，请输入代理服务器地址'))
+          return
+        }
+
+        callback()
+      },
+      trigger: 'blur'
+    }
+  ],
+  'network.proxy.temporary_fallback_probe_interval_secs': [
+    {
+      validator: (_rule: any, value: any, callback: any) => {
+        if (!formData.value) {
+          callback()
+          return
+        }
+        if (formData.value.network.proxy.proxy_type === 'none' || !formData.value.network.proxy.temporary_fallback) {
+          callback()
+          return
+        }
+        if (typeof value !== 'number' || value < 3 || value > 60) {
+          callback(new Error('临时 fallback 探测间隔必须在 3-60 秒'))
+          return
+        }
+        callback()
+      },
+      trigger: 'change'
+    }
+  ],
+  'network.proxy.port': [
+    {
+      validator: (_rule: any, value: any, callback: any) => {
+        if (!formData.value) {
+          callback()
+          return
+        }
+
+        if (formData.value.network.proxy.proxy_type === 'none') {
+          callback()
+          return
+        }
+
+        if (typeof value !== 'number' || value < 1 || value > 65535) {
+          callback(new Error('启用代理时，端口范围必须是 1-65535'))
+          return
+        }
+
+        callback()
+      },
+      trigger: 'change'
+    }
+  ],
   'download.download_dir': [
     { required: true, message: '请输入下载目录', trigger: 'blur' },
     {
@@ -893,6 +1052,18 @@ async function loadConfig() {
   try {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
+
+    // 兼容旧配置：未包含 proxy.scope 时，回落到默认模式
+    const form = formData.value
+    if (form && !form.network.proxy.scope) {
+      form.network.proxy.scope = 'default'
+    }
+    if (form && typeof form.network.proxy.temporary_fallback !== 'boolean') {
+      form.network.proxy.temporary_fallback = false
+    }
+    if (form && typeof form.network.proxy.temporary_fallback_probe_interval_secs !== 'number') {
+      form.network.proxy.temporary_fallback_probe_interval_secs = 20
+    }
 
     // 同时加载推荐配置
     try {

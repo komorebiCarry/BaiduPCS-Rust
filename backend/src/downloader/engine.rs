@@ -1,5 +1,6 @@
 use crate::auth::UserAuth;
 use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
+use crate::common::ProxyConfig;
 use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
@@ -815,29 +816,40 @@ pub struct DownloadEngine {
     vip_type: VipType,
     /// 文件系统操作锁（保护目录创建，防止删除-创建竞态）
     fs_lock: Arc<Mutex<()>>,
+    /// 代理配置
+    proxy_config: ProxyConfig,
 }
 
 impl DownloadEngine {
     /// 创建新的下载引擎
     pub fn new(user_auth: UserAuth) -> Self {
+        Self::new_with_proxy(user_auth, ProxyConfig::default())
+    }
+
+    /// 创建新的下载引擎（可选代理）
+    pub fn new_with_proxy(user_auth: UserAuth, proxy_config: ProxyConfig) -> Self {
         // 基础HTTP客户端，使用较长的超时时间以支持大分片下载
         // 实际超时会在每个请求中根据分片大小动态调整
-        let client = Client::builder()
+        let builder = Client::builder()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .timeout(std::time::Duration::from_secs(600)) // 10分钟基础超时（会被请求级别的超时覆盖）
-            .build()
-            .expect("Failed to build HTTP client");
+            .timeout(std::time::Duration::from_secs(600)); // 10分钟基础超时（会被请求级别的超时覆盖）
+        let builder = proxy_config
+            .apply_to_builder(builder)
+            .expect("Failed to apply proxy configuration");
+        let client = builder.build().expect("Failed to build HTTP client");
 
         // 从 user_auth 中提取 VIP 等级
         let vip_type = VipType::from_u32(user_auth.vip_type.unwrap_or(0));
 
-        let netdisk_client = NetdiskClient::new(user_auth).expect("Failed to create NetdiskClient");
+        let netdisk_client = NetdiskClient::new_with_proxy(user_auth, &proxy_config)
+            .expect("Failed to create NetdiskClient");
 
         Self {
             client,
             netdisk_client,
             vip_type,
             fs_lock: Arc::new(Mutex::new(())),
+            proxy_config,
         }
     }
 
@@ -853,7 +865,7 @@ impl DownloadEngine {
         // 使用 Android 客户端的 User-Agent（与 NetdiskClient 一致）
         let pan_ua = "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
 
-        Client::builder()
+        let builder = Client::builder()
             .user_agent(pan_ua)
             .timeout(std::time::Duration::from_secs(120)) // 2分钟超时
             .pool_max_idle_per_host(200) // 增大连接池：100 -> 200
@@ -866,8 +878,11 @@ impl DownloadEngine {
             .http2_initial_stream_window_size(Some(1024 * 1024 * 2)) // 2MB初始流窗口（默认65KB）
             .http2_initial_connection_window_size(Some(1024 * 1024 * 4)) // 4MB初始连接窗口（默认65KB）
             .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(20)) // HTTP/2 keep-alive超时
-            .build()
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(20)); // HTTP/2 keep-alive超时
+
+        self.proxy_config
+            .apply_to_builder(builder)
+            .and_then(|b| b.build().context("Failed to build download HTTP client"))
             .expect("Failed to build download HTTP client")
     }
 
@@ -1419,7 +1434,7 @@ impl DownloadEngine {
                                 &url,
                                 total_size,
                             )
-                                .await
+                            .await
                             {
                                 Ok(speed) => {
                                     let health = health_clone.lock().await;
@@ -1471,8 +1486,8 @@ impl DownloadEngine {
             referer.as_deref(), // 传递 Referer 头（如果存在）
             cancellation_token, // 传递取消令牌
         )
-            .await
-            .context("下载分片失败")?;
+        .await
+        .context("下载分片失败")?;
 
         // 9. 校验文件大小
         self.verify_file_size(local_path, total_size)
@@ -2399,15 +2414,15 @@ impl DownloadEngine {
                     total_size,
                     cancellation_token,
                     "usize".parse()?,
-                    None, // ws_manager（独立模式不需要）
-                    None, // progress_throttler（独立模式不需要）
+                    None,          // ws_manager（独立模式不需要）
+                    None,          // progress_throttler（独立模式不需要）
                     String::new(), // task_id（独立模式不需要）
-                    None, // folder_progress_tx（独立模式不需要）
-                    None, // backup_notification_tx（独立模式不需要）
-                    None, // task_slot_pool（独立模式不需要）
-                    3,    // max_retries（独立模式使用默认值）
+                    None,          // folder_progress_tx（独立模式不需要）
+                    None,          // backup_notification_tx（独立模式不需要）
+                    None,          // task_slot_pool（独立模式不需要）
+                    3,             // max_retries（独立模式使用默认值）
                 )
-                    .await;
+                .await;
 
                 drop(permit); // 🔥 释放 permit，其他等待的分片可以使用
 
@@ -2640,7 +2655,10 @@ impl DownloadEngine {
                     let t = task.lock().await;
                     t.group_id.clone().unwrap_or_else(|| task_id.clone())
                 };
-                Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(pool.clone(), touch_id)))
+                Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                    pool.clone(),
+                    touch_id,
+                )))
             } else {
                 None
             };
@@ -2833,6 +2851,7 @@ impl DownloadEngine {
 mod tests {
     use super::*;
     use crate::auth::UserAuth;
+    use crate::common::ProxyConfig;
 
     fn create_mock_user_auth() -> UserAuth {
         UserAuth {

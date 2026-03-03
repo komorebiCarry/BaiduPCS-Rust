@@ -27,6 +27,33 @@ pub struct ConfigUpdateResponse {
     pub path_validation: PathValidationResult,
 }
 
+fn validate_proxy_config(config: &AppConfig) -> ApiResult<()> {
+    let proxy = &config.network.proxy;
+
+    if !proxy.is_enabled() {
+        return Ok(());
+    }
+
+    if proxy.host.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "代理已启用时，代理服务器地址不能为空".to_string(),
+        ));
+    }
+
+    if proxy.port == 0 {
+        return Err(ApiError::BadRequest(
+            "代理已启用时，代理端口必须在 1-65535 范围内".to_string(),
+        ));
+    }
+
+    // 预检 URL 组装是否有效
+    proxy
+        .to_reqwest_proxy()
+        .map_err(|e| ApiError::BadRequest(format!("代理配置无效: {}", e)))?;
+
+    Ok(())
+}
+
 /// GET /api/v1/config
 /// 获取当前配置
 pub async fn get_config(
@@ -52,7 +79,7 @@ pub async fn get_recommended_config(
         VipType::Vip => "普通会员",
         VipType::Svip => "超级会员",
     }
-        .to_string();
+    .to_string();
 
     // 获取推荐配置
     let recommended = DownloadConfig::recommended_for_vip(vip_type);
@@ -134,7 +161,9 @@ pub async fn reset_to_recommended(
     let upload_manager_guard = app_state.upload_manager.read().await;
     if let Some(upload_manager) = upload_manager_guard.as_ref() {
         upload_manager.update_max_threads(config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(config.upload.max_concurrent_tasks).await;
+        upload_manager
+            .update_max_concurrent_tasks(config.upload.max_concurrent_tasks)
+            .await;
         upload_manager.update_max_retries(config.upload.max_retries);
         info!(
             "✓ 上传管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 最大重试={}",
@@ -169,6 +198,8 @@ pub async fn update_config(
     if new_config.download.max_concurrent_tasks == 0 {
         return Err(ApiError::BadRequest("最大同时下载数必须大于0".to_string()));
     }
+
+    validate_proxy_config(&new_config)?;
 
     // 获取当前用户的 VIP 类型并验证
     let current_user = app_state.current_user.read().await;
@@ -227,7 +258,9 @@ pub async fn update_config(
     let upload_manager_guard = app_state.upload_manager.read().await;
     if let Some(upload_manager) = upload_manager_guard.as_ref() {
         upload_manager.update_max_threads(new_config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks).await;
+        upload_manager
+            .update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks)
+            .await;
         upload_manager.update_max_retries(new_config.upload.max_retries);
         info!(
             "✓ 上传管理器配置已动态更新: 线程数={}, 最大任务数={}, 最大重试={}",
