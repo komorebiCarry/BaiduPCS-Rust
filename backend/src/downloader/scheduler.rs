@@ -11,7 +11,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -88,8 +88,8 @@ pub struct TaskScheduleInfo {
     pub speed_calc: Arc<Mutex<SpeedCalculator>>,
 
     // 下载所需的配置
-    /// HTTP 客户端
-    pub client: Client,
+    /// HTTP 客户端（共享引用，代理热更新时自动生效）
+    pub client: Arc<StdRwLock<Client>>,
     /// Cookie
     pub cookie: String,
     /// Referer 头
@@ -162,6 +162,10 @@ pub struct TaskScheduleInfo {
     // 🔥 链接级重试次数（单次调度内换链接重试的上限）
     /// 从配置 DownloadConfig.max_retries 读取
     pub max_retries: u32,
+
+    // 🔥 代理故障回退管理器
+    /// 可选，用于记录代理失败/成功并触发自动回退
+    pub fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
 }
 
 /// 全局分片调度器
@@ -629,10 +633,13 @@ impl ChunkScheduler {
                 slot_id, chunk_index
             );
 
+            // 每次调度时从共享引用读取最新客户端（代理热更新后自动生效）
+            let client = task_info.client.read().unwrap().clone();
+
             // 调用 DownloadEngine 的下载方法（传入事件总线和节流器）
             let result = DownloadEngine::download_chunk_with_retry(
                 chunk_index,
-                task_info.client.clone(),
+                client,
                 &task_info.cookie,
                 task_info.referer.as_deref(),
                 task_info.url_health.clone(),
@@ -651,6 +658,7 @@ impl ChunkScheduler {
                 task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
                 task_info.task_slot_pool.clone(), // 🔥 任务槽池（用于刷新槽位时间戳）
                 task_info.max_retries, // 🔥 链接级重试次数（从配置读取）
+                task_info.fallback_mgr.clone(), // 🔥 代理故障回退管理器
             )
                 .await;
 

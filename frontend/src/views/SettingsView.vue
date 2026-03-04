@@ -28,649 +28,803 @@
 
       <!-- 设置内容 -->
       <el-main>
-        <el-skeleton :loading="loading" :rows="8" animated>
-          <el-form
-              v-if="formData"
-              ref="formRef"
-              :model="formData"
-              :rules="rules"
-              label-width="140px"
-              label-position="left"
-          >
-            <!-- 服务器配置 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#409eff">
-                    <Monitor />
-                  </el-icon>
-                  <span>服务器配置</span>
-                </div>
-              </template>
+        <div class="settings-layout">
+          <!-- 左侧锚点导航（仅桌面端） -->
+          <nav v-if="!isMobile" class="settings-nav">
+            <ul>
+              <li
+                  v-for="item in navItems"
+                  :key="item.id"
+                  :class="{ active: activeSection === item.id }"
+                  @click="scrollToSection(item.id)"
+              >
+                <span class="nav-dot" :style="{ background: item.color }"></span>
+                <span class="nav-label">{{ item.label }}</span>
+              </li>
+            </ul>
+          </nav>
 
-              <el-form-item label="监听地址" prop="server.host">
-                <el-input
-                    v-model="formData.server.host"
-                    placeholder="例如: 127.0.0.1"
-                    clearable
-                >
-                  <template #prepend>
-                    <el-icon><Connection /></el-icon>
+          <!-- 右侧内容区 -->
+          <div class="settings-content" ref="contentRef">
+            <el-skeleton :loading="loading" :rows="8" animated>
+              <el-form
+                  v-if="formData"
+                  ref="formRef"
+                  :model="formData"
+                  :rules="rules"
+                  label-width="140px"
+                  label-position="left"
+              >
+                <!-- 服务器配置 -->
+                <el-card id="section-server" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#409eff">
+                        <Monitor />
+                      </el-icon>
+                      <span>服务器配置</span>
+                    </div>
                   </template>
-                </el-input>
-                <div class="form-tip">服务器监听的IP地址</div>
-              </el-form-item>
 
-              <el-form-item label="监听端口" prop="server.port">
-                <el-input-number
-                    v-model="formData.server.port"
-                    :min="1"
-                    :max="65535"
-                    :step="1"
-                    controls-position="right"
-                    style="width: 100%"
-                />
-                <div class="form-tip">服务器监听的端口号，修改后需要重启服务器</div>
-              </el-form-item>
-            </el-card>
+                  <el-form-item label="监听地址" prop="server.host">
+                    <el-input
+                        v-model="formData.server.host"
+                        placeholder="例如: 127.0.0.1"
+                        clearable
+                    >
+                      <template #prepend>
+                        <el-icon><Connection /></el-icon>
+                      </template>
+                    </el-input>
+                    <div class="form-tip">服务器监听的IP地址</div>
+                  </el-form-item>
 
-            <!-- Web 访问认证设置 -->
-            <AuthSettingsSection />
+                  <el-form-item label="监听端口" prop="server.port">
+                    <el-input-number
+                        v-model="formData.server.port"
+                        :min="1"
+                        :max="65535"
+                        :step="1"
+                        controls-position="right"
+                        style="width: 100%"
+                    />
+                    <div class="form-tip">服务器监听的端口号，修改后需要重启服务器</div>
+                  </el-form-item>
+                </el-card>
 
-            <!-- 下载配置 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#67c23a">
-                    <Download />
-                  </el-icon>
-                  <span>下载配置</span>
+                <!-- Web 访问认证设置 -->
+                <div id="section-auth">
+                  <AuthSettingsSection />
                 </div>
-              </template>
 
-              <!-- VIP 等级信息 -->
-              <el-alert
-                  v-if="recommended"
-                  :title="`您的会员等级: ${recommended.vip_name}`"
-                  type="info"
-                  :closable="false"
-                  style="margin-bottom: 20px"
-              >
-                <template #default>
-                  <div class="vip-info">
-                    <div class="vip-item">
-                      <el-icon><User /></el-icon>
-                      <span>推荐线程数: {{ recommended.recommended.threads }} 个</span>
+                <!-- 下载配置 -->
+                <el-card id="section-download" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#67c23a">
+                        <Download />
+                      </el-icon>
+                      <span>下载配置</span>
                     </div>
-                    <div class="vip-item">
-                      <el-icon><Files /></el-icon>
-                      <span>推荐分片大小: {{ recommended.recommended.chunk_size }} MB</span>
-                    </div>
-                    <div class="vip-item">
-                      <el-icon><Download /></el-icon>
-                      <span>最大同时下载: {{ recommended.recommended.max_tasks }} 个文件</span>
-                    </div>
-                  </div>
-                </template>
-              </el-alert>
+                  </template>
 
-              <!-- 警告提示 -->
-              <el-alert
-                  v-if="recommended && recommended.warnings && recommended.warnings.length > 0"
-                  type="warning"
-                  :closable="false"
-                  style="margin-bottom: 20px"
-              >
-                <template #default>
-                  <div v-for="(warning, index) in recommended.warnings" :key="index">
-                    <div style="white-space: pre-wrap">{{ warning }}</div>
-                  </div>
-                </template>
-              </el-alert>
-
-              <el-form-item label="下载目录" prop="download.download_dir">
-                <div class="input-with-button">
-                  <el-input
-                      v-model="formData.download.download_dir"
-                      placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
-                      clearable
+                  <!-- VIP 等级信息 -->
+                  <el-alert
+                      v-if="recommended"
+                      :title="`您的会员等级: ${recommended.vip_name}`"
+                      type="info"
+                      :closable="false"
+                      style="margin-bottom: 20px"
                   >
-                    <template #prepend>
-                      <el-icon><Folder /></el-icon>
+                    <template #default>
+                      <div class="vip-info">
+                        <div class="vip-item">
+                          <el-icon><User /></el-icon>
+                          <span>推荐线程数: {{ recommended.recommended.threads }} 个</span>
+                        </div>
+                        <div class="vip-item">
+                          <el-icon><Files /></el-icon>
+                          <span>推荐分片大小: {{ recommended.recommended.chunk_size }} MB</span>
+                        </div>
+                        <div class="vip-item">
+                          <el-icon><Download /></el-icon>
+                          <span>最大同时下载: {{ recommended.recommended.max_tasks }} 个文件</span>
+                        </div>
+                      </div>
                     </template>
-                  </el-input>
-                  <el-button
-                      type="primary"
-                      @click="handleSelectDownloadDir"
+                  </el-alert>
+
+                  <!-- 警告提示 -->
+                  <el-alert
+                      v-if="recommended && recommended.warnings && recommended.warnings.length > 0"
+                      type="warning"
+                      :closable="false"
+                      style="margin-bottom: 20px"
                   >
-                    <el-icon><FolderOpened /></el-icon>
-                    <span v-if="!isMobile">浏览</span>
-                  </el-button>
-                </div>
-                <div class="form-tip">
-                  <div>文件下载的保存目录，必须使用绝对路径</div>
-                  <div style="margin-top: 4px;">
-                    Windows 示例: <code>D:\Downloads</code> 或 <code>C:\Users\YourName\Downloads</code><br/>
-                    Linux/Docker 示例: <code>/app/downloads</code> 或 <code>/home/user/downloads</code>
-                  </div>
-                </div>
-              </el-form-item>
+                    <template #default>
+                      <div v-for="(warning, index) in recommended.warnings" :key="index">
+                        <div style="white-space: pre-wrap">{{ warning }}</div>
+                      </div>
+                    </template>
+                  </el-alert>
 
-              <el-form-item label="下载时选择目录" prop="download.ask_each_time">
-                <el-switch
-                    v-model="formData.download.ask_each_time"
-                    active-text="每次询问"
-                    inactive-text="使用默认"
-                />
-                <div class="form-tip">
-                  开启后，每次下载都会弹出文件资源管理器让您选择保存位置；
-                  关闭后将直接使用默认下载目录
-                </div>
-              </el-form-item>
+                  <el-form-item label="下载目录" prop="download.download_dir">
+                    <div class="input-with-button">
+                      <el-input
+                          v-model="formData.download.download_dir"
+                          placeholder="请输入绝对路径，例如: /app/downloads 或 D:\Downloads"
+                          clearable
+                      >
+                        <template #prepend>
+                          <el-icon><Folder /></el-icon>
+                        </template>
+                      </el-input>
+                      <el-button
+                          type="primary"
+                          @click="handleSelectDownloadDir"
+                      >
+                        <el-icon><FolderOpened /></el-icon>
+                        <span v-if="!isMobile">浏览</span>
+                      </el-button>
+                    </div>
+                    <div class="form-tip">
+                      <div>文件下载的保存目录，必须使用绝对路径</div>
+                      <div style="margin-top: 4px;">
+                        Windows 示例: <code>D:\Downloads</code> 或 <code>C:\Users\YourName\Downloads</code><br/>
+                        Linux/Docker 示例: <code>/app/downloads</code> 或 <code>/home/user/downloads</code>
+                      </div>
+                    </div>
+                  </el-form-item>
 
-              <el-form-item label="全局最大线程数" prop="download.max_global_threads">
-                <el-slider
-                    v-model="formData.download.max_global_threads"
-                    :min="1"
-                    :max="20"
-                    :step="1"
-                    :marks="threadMarks"
-                    show-stops
-                    style="width: calc(100% - 20px); margin-right: 20px"
-                />
-                <div class="value-display">
-                  当前: {{ formData.download.max_global_threads }} 个
-                  <span v-if="recommended" class="recommend-hint">
+                  <el-form-item label="下载时选择目录" prop="download.ask_each_time">
+                    <el-switch
+                        v-model="formData.download.ask_each_time"
+                        active-text="每次询问"
+                        inactive-text="使用默认"
+                    />
+                    <div class="form-tip">
+                      开启后，每次下载都会弹出文件资源管理器让您选择保存位置；
+                      关闭后将直接使用默认下载目录
+                    </div>
+                  </el-form-item>
+
+                  <el-form-item label="全局最大线程数" prop="download.max_global_threads">
+                    <el-slider
+                        v-model="formData.download.max_global_threads"
+                        :min="1"
+                        :max="20"
+                        :step="1"
+                        :marks="threadMarks"
+                        show-stops
+                        style="width: calc(100% - 20px); margin-right: 20px"
+                    />
+                    <div class="value-display">
+                      当前: {{ formData.download.max_global_threads }} 个
+                      <span v-if="recommended" class="recommend-hint">
                     (推荐: {{ recommended.recommended.threads }} 个)
                   </span>
-                </div>
-                <div class="form-tip">
-                  <el-icon><InfoFilled /></el-icon>
-                  所有下载任务共享的线程池大小，单文件可使用全部线程进行分片下载
-                </div>
-                <div class="form-tip warning-tip" v-if="formData.download.max_global_threads > 10 && recommended && recommended.vip_type === 0">
-                  ⚠️ 警告：普通用户建议保持1个线程，调大可能触发限速！
-                </div>
-              </el-form-item>
+                    </div>
+                    <div class="form-tip">
+                      <el-icon><InfoFilled /></el-icon>
+                      所有下载任务共享的线程池大小，单文件可使用全部线程进行分片下载
+                    </div>
+                    <div class="form-tip warning-tip" v-if="formData.download.max_global_threads > 10 && recommended && recommended.vip_type === 0">
+                      ⚠️ 警告：普通用户建议保持1个线程，调大可能触发限速！
+                    </div>
+                  </el-form-item>
 
-              <el-form-item label="最大同时下载数" prop="download.max_concurrent_tasks">
-                <el-slider
-                    v-model="formData.download.max_concurrent_tasks"
-                    :min="1"
-                    :max="10"
-                    :step="1"
-                    :marks="taskMarks"
-                    show-stops
-                    style="width: calc(100% - 20px); margin-right: 20px"
-                />
-                <div class="value-display">
-                  当前: {{ formData.download.max_concurrent_tasks }} 个
-                  <span v-if="recommended" class="recommend-hint">
+                  <el-form-item label="最大同时下载数" prop="download.max_concurrent_tasks">
+                    <el-slider
+                        v-model="formData.download.max_concurrent_tasks"
+                        :min="1"
+                        :max="10"
+                        :step="1"
+                        :marks="taskMarks"
+                        show-stops
+                        style="width: calc(100% - 20px); margin-right: 20px"
+                    />
+                    <div class="value-display">
+                      当前: {{ formData.download.max_concurrent_tasks }} 个
+                      <span v-if="recommended" class="recommend-hint">
                     (推荐: {{ recommended.recommended.max_tasks }} 个)
                   </span>
-                </div>
-                <div class="form-tip">
-                  可以同时进行下载的文件数量上限
-                </div>
-              </el-form-item>
+                    </div>
+                    <div class="form-tip">
+                      可以同时进行下载的文件数量上限
+                    </div>
+                  </el-form-item>
 
-              <!-- 分片大小说明（自适应，不可配置） -->
-              <el-alert
-                  title="智能分片大小"
-                  type="success"
-                  :closable="false"
-                  style="margin-bottom: 20px"
-              >
-                <template #default>
-                  <div style="line-height: 1.8">
-                    系统会根据文件大小和您的VIP等级自动选择最优分片大小：<br/>
-                    • 小文件（<5MB）使用 256KB 分片<br/>
-                    • 中等文件（5-10MB）使用 512KB 分片<br/>
-                    • 中大型文件（10-500MB）使用 1MB-4MB 分片<br/>
-                    • 大文件（≥500MB）使用 5MB 分片<br/>
-                    • VIP限制：普通用户最高4MB，普通会员最高4MB，SVIP最高5MB<br/>
-                    • 注意：百度网盘限制单个Range请求最大5MB，超过会返回403错误
-                  </div>
-                </template>
-              </el-alert>
-
-              <el-form-item label="最大重试次数" prop="download.max_retries">
-                <el-input-number
-                    v-model="formData.download.max_retries"
-                    :min="0"
-                    :max="10"
-                    :step="1"
-                    controls-position="right"
-                    style="width: 100%"
-                />
-                <div class="form-tip">下载分片失败后的重试次数，0 表示不重试</div>
-              </el-form-item>
-            </el-card>
-
-            <!-- 上传配置 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#e6a23c">
-                    <Upload />
-                  </el-icon>
-                  <span>上传配置</span>
-                </div>
-              </template>
-
-              <el-form-item label="全局最大线程数" prop="upload.max_global_threads">
-                <el-slider
-                    v-model="formData.upload.max_global_threads"
-                    :min="1"
-                    :max="20"
-                    :step="1"
-                    :marks="threadMarks"
-                    show-stops
-                    style="width: calc(100% - 20px); margin-right: 20px"
-                />
-                <div class="value-display">
-                  当前: {{ formData.upload.max_global_threads }} 个
-                </div>
-                <div class="form-tip">
-                  <el-icon><InfoFilled /></el-icon>
-                  所有上传任务共享的线程池大小
-                </div>
-              </el-form-item>
-
-              <el-form-item label="最大同时上传数" prop="upload.max_concurrent_tasks">
-                <el-slider
-                    v-model="formData.upload.max_concurrent_tasks"
-                    :min="1"
-                    :max="10"
-                    :step="1"
-                    :marks="taskMarks"
-                    show-stops
-                    style="width: calc(100% - 20px); margin-right: 20px"
-                />
-                <div class="value-display">
-                  当前: {{ formData.upload.max_concurrent_tasks }} 个
-                </div>
-                <div class="form-tip">
-                  可以同时进行上传的文件数量上限
-                </div>
-              </el-form-item>
-
-              <el-form-item label="最大重试次数" prop="upload.max_retries">
-                <el-input-number
-                    v-model="formData.upload.max_retries"
-                    :min="0"
-                    :max="10"
-                    :step="1"
-                    controls-position="right"
-                    style="width: 100%"
-                />
-                <div class="form-tip">上传分片失败后的重试次数，0 表示不重试</div>
-              </el-form-item>
-
-              <el-form-item label="跳过隐藏文件" prop="upload.skip_hidden_files">
-                <el-switch
-                    v-model="formData.upload.skip_hidden_files"
-                    active-text="跳过"
-                    inactive-text="不跳过"
-                />
-                <div class="form-tip">
-                  上传文件夹时是否跳过以"."开头的隐藏文件/文件夹（如 .git、.DS_Store 等）
-                </div>
-              </el-form-item>
-
-              <!-- 分片大小说明（自适应，不可配置） -->
-              <el-alert
-                  title="智能分片大小（自动适配）"
-                  type="success"
-                  :closable="false"
-              >
-                <template #default>
-                  <div style="line-height: 1.8">
-                    系统会根据文件大小和您的VIP等级自动选择最优分片大小：<br/>
-                    • 普通用户：固定 4MB 分片<br/>
-                    • 普通会员：智能选择 4-16MB 分片<br/>
-                    • 超级会员：智能选择 4-32MB 分片<br/>
-                    <br/>
-                    <strong>⚠️ 重要说明：</strong><br/>
-                    • 上传时的实际分片大小（4-32MB）用于提升传输效率<br/>
-                  </div>
-                </template>
-              </el-alert>
-            </el-card>
-
-            <!-- 转存配置 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#909399">
-                    <Share />
-                  </el-icon>
-                  <span>转存配置</span>
-                </div>
-              </template>
-
-              <el-form-item label="默认行为">
-                <el-radio-group v-model="transferBehavior">
-                  <el-radio value="transfer_only">仅转存到网盘</el-radio>
-                  <el-radio value="transfer_and_download">转存后自动下载</el-radio>
-                </el-radio-group>
-                <div class="form-tip">
-                  选择"转存后自动下载"时，会根据下载配置决定是否弹出文件选择器
-                </div>
-              </el-form-item>
-            </el-card>
-
-            <!-- 加密设置 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#f56c6c">
-                    <Key />
-                  </el-icon>
-                  <span>加密设置</span>
-                </div>
-              </template>
-              <!-- 免责声明 -->
-              <el-alert
-                  type="error"
-                  :closable="false"
-                  style="margin-bottom: 20px; border-left: 4px solid #f56c6c;"
-              >
-                <template #title>
-                  <div style="font-weight: 600; margin-bottom: 8px;">⚠️ 重要提示</div>
-                  <div style="line-height: 1.8; font-size: 13px;">
-                    本加密功能采用客户端侧加密技术，可在一定程度上保护您的文件隐私，但请注意：
-                    <ul style="margin: 8px 0 0 0; padding-left: 20px; line-height: 1.8;">
-                      <li>加密技术无法提供100%的绝对安全保障，百度官方可能通过其他技术手段检测到加密文件</li>
-                      <li>强烈建议对重要文件进行多重备份，并妥善保管加密密钥</li>
-                      <li>使用前请充分了解相关风险，并自行评估是否适合您的使用场景</li>
-                    </ul>
-                  </div>
-                </template>
-              </el-alert>
-
-              <!-- 加密状态卡片 -->
-              <div class="encryption-status-card">
-                <div class="status-header">
-                  <span class="status-label">加密密钥状态</span>
-                  <el-tag :type="encryptionStatus?.has_key ? 'success' : 'info'" size="small">
-                    {{ encryptionStatus?.has_key ? '已配置' : '未配置' }}
-                  </el-tag>
-                </div>
-                <div v-if="encryptionStatus?.has_key" class="status-detail">
-                  算法: {{ encryptionStatus.algorithm }}<br>
-                  创建时间: {{ encryptionStatus.key_created_at ? formatDate(encryptionStatus.key_created_at) : '-' }}
-                </div>
-              </div>
-
-              <!-- 未配置密钥时显示 -->
-              <div v-if="!encryptionStatus?.has_key" class="encryption-form">
-                <el-form-item label="加密算法">
-                  <el-select v-model="keyAlgorithm" style="width: 100%">
-                    <el-option value="AES-256-GCM" label="AES-256-GCM（推荐）" />
-                    <el-option value="ChaCha20-Poly1305" label="ChaCha20-Poly1305" />
-                  </el-select>
-                </el-form-item>
-                <el-button type="primary" style="width: 100%" @click="handleGenerateKey">
-                  <el-icon><Key /></el-icon>
-                  生成新密钥
-                </el-button>
-                <el-divider>或</el-divider>
-                <el-form-item label="导入密钥">
-                  <el-input v-model="encryptionKey" placeholder="粘贴Base64编码的密钥" />
-                </el-form-item>
-                <el-button style="width: 100%" @click="handleImportKey">
-                  <el-icon><Upload /></el-icon>
-                  导入密钥
-                </el-button>
-              </div>
-
-              <!-- 已配置密钥时显示 -->
-              <div v-else class="encryption-actions">
-                <el-button @click="handleExportKey">
-                  <el-icon><CopyDocument /></el-icon>
-                  导出密钥
-                </el-button>
-                <el-button type="danger" plain @click="handleDeleteKey">
-                  <el-icon><Delete /></el-icon>
-                  删除密钥
-                </el-button>
-              </div>
-
-              <!-- 导出解密数据区域 -->
-              <el-divider v-if="encryptionStatus?.has_key" content-position="left">导出解密数据</el-divider>
-              <div v-if="encryptionStatus?.has_key" class="export-decrypt-section">
-                <el-alert
-                    type="warning"
-                    :closable="false"
-                    show-icon
-                    style="margin-bottom: 16px"
-                >
-                  <template #title>
-                    <strong>安全提示：</strong>导出的数据包含敏感的加密密钥和文件映射信息，请妥善保管！
-                  </template>
-                </el-alert>
-
-                <div class="export-actions">
-                  <el-button type="primary" @click="handleExportDecryptBundle" :loading="exportingBundle">
-                    <el-icon><Download /></el-icon>
-                    导出解密数据包
-                  </el-button>
-                  <el-dropdown @command="handleSeparateExport" trigger="click">
-                    <el-button :loading="exportingSeparate">
-                      <el-icon><Document /></el-icon>
-                      分别导出
-                      <el-icon class="el-icon--right"><ArrowDown /></el-icon>
-                    </el-button>
-                    <template #dropdown>
-                      <el-dropdown-menu>
-                        <el-dropdown-item command="keys">导出密钥配置 (encryption.json)</el-dropdown-item>
-                        <el-dropdown-item command="mapping">导出映射数据 (mapping.json)</el-dropdown-item>
-                      </el-dropdown-menu>
+                  <!-- 分片大小说明（自适应，不可配置） -->
+                  <el-alert
+                      title="智能分片大小"
+                      type="success"
+                      :closable="false"
+                      style="margin-bottom: 20px"
+                  >
+                    <template #default>
+                      <div style="line-height: 1.8">
+                        系统会根据文件大小和您的VIP等级自动选择最优分片大小：<br/>
+                        • 小文件（<5MB）使用 256KB 分片<br/>
+                        • 中等文件（5-10MB）使用 512KB 分片<br/>
+                        • 中大型文件（10-500MB）使用 1MB-4MB 分片<br/>
+                        • 大文件（≥500MB）使用 5MB 分片<br/>
+                        • VIP限制：普通用户最高4MB，普通会员最高4MB，SVIP最高5MB<br/>
+                        • 注意：百度网盘限制单个Range请求最大5MB，超过会返回403错误
+                      </div>
                     </template>
-                  </el-dropdown>
-                </div>
+                  </el-alert>
 
-                <div class="form-tip" style="margin-top: 12px">
-                  <strong>解密数据包</strong>：包含 encryption.json（密钥配置）和 mapping.json（文件映射），可配合 decrypt-cli 工具在其他机器上解密文件。
-                </div>
-              </div>
+                  <el-form-item label="最大重试次数" prop="download.max_retries">
+                    <el-input-number
+                        v-model="formData.download.max_retries"
+                        :min="0"
+                        :max="10"
+                        :step="1"
+                        controls-position="right"
+                        style="width: 100%"
+                    />
+                    <div class="form-tip">下载分片失败后的重试次数，0 表示不重试</div>
+                  </el-form-item>
+                </el-card>
 
-              <el-alert type="warning" :closable="false" show-icon style="margin-top: 16px">
-                <template #title>
-                  <strong>重要提示：</strong>请妥善保管加密密钥。如果密钥丢失，将无法解密已加密的文件！
-                </template>
-              </el-alert>
+                <!-- 上传配置 -->
+                <el-card id="section-upload" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#e6a23c">
+                        <Upload />
+                      </el-icon>
+                      <span>上传配置</span>
+                    </div>
+                  </template>
 
-              <div class="form-tip" style="margin-top: 12px">
-                加密密钥用于自动备份和上传时的客户端侧加密。配置密钥后，可在创建备份任务或上传文件时选择是否启用加密。
-              </div>
-            </el-card>
+                  <el-form-item label="全局最大线程数" prop="upload.max_global_threads">
+                    <el-slider
+                        v-model="formData.upload.max_global_threads"
+                        :min="1"
+                        :max="20"
+                        :step="1"
+                        :marks="threadMarks"
+                        show-stops
+                        style="width: calc(100% - 20px); margin-right: 20px"
+                    />
+                    <div class="value-display">
+                      当前: {{ formData.upload.max_global_threads }} 个
+                    </div>
+                    <div class="form-tip">
+                      <el-icon><InfoFilled /></el-icon>
+                      所有上传任务共享的线程池大小
+                    </div>
+                  </el-form-item>
 
-            <!-- 自动备份设置 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#67c23a">
-                    <Refresh />
-                  </el-icon>
-                  <span>自动备份设置</span>
-                </div>
-              </template>
+                  <el-form-item label="最大同时上传数" prop="upload.max_concurrent_tasks">
+                    <el-slider
+                        v-model="formData.upload.max_concurrent_tasks"
+                        :min="1"
+                        :max="10"
+                        :step="1"
+                        :marks="taskMarks"
+                        show-stops
+                        style="width: calc(100% - 20px); margin-right: 20px"
+                    />
+                    <div class="value-display">
+                      当前: {{ formData.upload.max_concurrent_tasks }} 个
+                    </div>
+                    <div class="form-tip">
+                      可以同时进行上传的文件数量上限
+                    </div>
+                  </el-form-item>
 
-              <!-- 前置条件提示 -->
-              <el-alert
-                  v-if="!encryptionStatus?.has_key"
-                  title="需要先配置加密密钥才能使用自动备份功能"
-                  type="warning"
-                  :closable="false"
-                  show-icon
-                  style="margin-bottom: 16px"
-              />
+                  <el-form-item label="最大重试次数" prop="upload.max_retries">
+                    <el-input-number
+                        v-model="formData.upload.max_retries"
+                        :min="0"
+                        :max="10"
+                        :step="1"
+                        controls-position="right"
+                        style="width: 100%"
+                    />
+                    <div class="form-tip">上传分片失败后的重试次数，0 表示不重试</div>
+                  </el-form-item>
 
-              <!-- 文件监听能力状态 -->
-              <div class="watch-capability-card" :class="{ 'is-available': watchCapability?.available }">
-                <div class="capability-header">
-                  <span class="capability-label">文件监听能力</span>
-                  <el-tag :type="watchCapability?.available ? 'success' : 'danger'" size="small">
-                    {{ watchCapability?.available ? '可用' : '不可用' }}
-                  </el-tag>
-                </div>
-                <div class="capability-detail">
-                  平台: {{ watchCapability?.platform || '-' }} | 后端: {{ watchCapability?.backend || '-' }}
-                </div>
-                <div v-if="watchCapability?.reason" class="capability-reason">
-                  原因: {{ watchCapability.reason }}
-                </div>
-                <div v-if="watchCapability?.suggestion" class="capability-suggestion">
-                  建议: {{ watchCapability.suggestion }}
-                </div>
-                <div v-if="watchCapability?.warnings?.length" class="capability-warnings">
-                  <div v-for="(warning, index) in watchCapability.warnings" :key="index" class="warning-item">
-                    {{ warning }}
+                  <el-form-item label="跳过隐藏文件" prop="upload.skip_hidden_files">
+                    <el-switch
+                        v-model="formData.upload.skip_hidden_files"
+                        active-text="跳过"
+                        inactive-text="不跳过"
+                    />
+                    <div class="form-tip">
+                      上传文件夹时是否跳过以"."开头的隐藏文件/文件夹（如 .git、.DS_Store 等）
+                    </div>
+                  </el-form-item>
+
+                  <!-- 分片大小说明（自适应，不可配置） -->
+                  <el-alert
+                      title="智能分片大小（自动适配）"
+                      type="success"
+                      :closable="false"
+                  >
+                    <template #default>
+                      <div style="line-height: 1.8">
+                        系统会根据文件大小和您的VIP等级自动选择最优分片大小：<br/>
+                        • 普通用户：固定 4MB 分片<br/>
+                        • 普通会员：智能选择 4-16MB 分片<br/>
+                        • 超级会员：智能选择 4-32MB 分片<br/>
+                        <br/>
+                        <strong>⚠️ 重要说明：</strong><br/>
+                        • 上传时的实际分片大小（4-32MB）用于提升传输效率<br/>
+                      </div>
+                    </template>
+                  </el-alert>
+                </el-card>
+
+                <!-- 转存配置 -->
+                <el-card id="section-transfer" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#909399">
+                        <Share />
+                      </el-icon>
+                      <span>转存配置</span>
+                    </div>
+                  </template>
+
+                  <el-form-item label="默认行为">
+                    <el-radio-group v-model="transferBehavior">
+                      <el-radio value="transfer_only">仅转存到网盘</el-radio>
+                      <el-radio value="transfer_and_download">转存后自动下载</el-radio>
+                    </el-radio-group>
+                    <div class="form-tip">
+                      选择"转存后自动下载"时，会根据下载配置决定是否弹出文件选择器
+                    </div>
+                  </el-form-item>
+                </el-card>
+
+                <!-- 加密设置 -->
+                <el-card id="section-encryption" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#f56c6c">
+                        <Key />
+                      </el-icon>
+                      <span>加密设置</span>
+                    </div>
+                  </template>
+                  <!-- 免责声明 -->
+                  <el-alert
+                      type="error"
+                      :closable="false"
+                      style="margin-bottom: 20px; border-left: 4px solid #f56c6c;"
+                  >
+                    <template #title>
+                      <div style="font-weight: 600; margin-bottom: 8px;">⚠️ 重要提示</div>
+                      <div style="line-height: 1.8; font-size: 13px;">
+                        本加密功能采用客户端侧加密技术，可在一定程度上保护您的文件隐私，但请注意：
+                        <ul style="margin: 8px 0 0 0; padding-left: 20px; line-height: 1.8;">
+                          <li>加密技术无法提供100%的绝对安全保障，百度官方可能通过其他技术手段检测到加密文件</li>
+                          <li>强烈建议对重要文件进行多重备份，并妥善保管加密密钥</li>
+                          <li>使用前请充分了解相关风险，并自行评估是否适合您的使用场景</li>
+                        </ul>
+                      </div>
+                    </template>
+                  </el-alert>
+
+                  <!-- 加密状态卡片 -->
+                  <div class="encryption-status-card">
+                    <div class="status-header">
+                      <span class="status-label">加密密钥状态</span>
+                      <el-tag :type="encryptionStatus?.has_key ? 'success' : 'info'" size="small">
+                        {{ encryptionStatus?.has_key ? '已配置' : '未配置' }}
+                      </el-tag>
+                    </div>
+                    <div v-if="encryptionStatus?.has_key" class="status-detail">
+                      算法: {{ encryptionStatus.algorithm }}<br>
+                      创建时间: {{ encryptionStatus.key_created_at ? formatDate(encryptionStatus.key_created_at) : '-' }}
+                    </div>
                   </div>
-                </div>
-              </div>
 
-              <el-divider content-position="left">上传备份触发方式</el-divider>
+                  <!-- 未配置密钥时显示 -->
+                  <div v-if="!encryptionStatus?.has_key" class="encryption-form">
+                    <el-form-item label="加密算法">
+                      <el-select v-model="keyAlgorithm" style="width: 100%">
+                        <el-option value="AES-256-GCM" label="AES-256-GCM（推荐）" />
+                        <el-option value="ChaCha20-Poly1305" label="ChaCha20-Poly1305" />
+                      </el-select>
+                    </el-form-item>
+                    <el-button type="primary" style="width: 100%" @click="handleGenerateKey">
+                      <el-icon><Key /></el-icon>
+                      生成新密钥
+                    </el-button>
+                    <el-divider>或</el-divider>
+                    <el-form-item label="导入密钥">
+                      <el-input v-model="encryptionKey" placeholder="粘贴Base64编码的密钥" />
+                    </el-form-item>
+                    <el-button style="width: 100%" @click="handleImportKey">
+                      <el-icon><Upload /></el-icon>
+                      导入密钥
+                    </el-button>
+                  </div>
 
-              <!-- 文件系统监听 -->
-              <el-form-item>
-                <el-checkbox
-                    v-model="triggerConfig.upload_trigger.watch_enabled"
-                    :disabled="!encryptionStatus?.has_key || !watchCapability?.available"
-                    @change="handleTriggerConfigChange"
-                >
-                  启用文件系统监听（实时检测本地文件变化）
-                </el-checkbox>
-              </el-form-item>
+                  <!-- 已配置密钥时显示 -->
+                  <div v-else class="encryption-actions">
+                    <el-button @click="handleExportKey">
+                      <el-icon><CopyDocument /></el-icon>
+                      导出密钥
+                    </el-button>
+                    <el-button type="danger" plain @click="handleDeleteKey">
+                      <el-icon><Delete /></el-icon>
+                      删除密钥
+                    </el-button>
+                  </div>
 
-              <div v-if="triggerConfig.upload_trigger.watch_enabled" class="nested-config">
-                <el-divider content-position="left" style="margin: 12px 0">
-                  <span style="font-size: 12px; color: #909399">监听兜底设置（防止监听遗漏）</span>
-                </el-divider>
+                  <!-- 导出解密数据区域 -->
+                  <el-divider v-if="encryptionStatus?.has_key" content-position="left">导出解密数据</el-divider>
+                  <div v-if="encryptionStatus?.has_key" class="export-decrypt-section">
+                    <el-alert
+                        type="warning"
+                        :closable="false"
+                        show-icon
+                        style="margin-bottom: 16px"
+                    >
+                      <template #title>
+                        <strong>安全提示：</strong>导出的数据包含敏感的加密密钥和文件映射信息，请妥善保管！
+                      </template>
+                    </el-alert>
 
-                <!-- 间隔时间兜底 -->
-                <el-form-item>
-                  <el-checkbox
-                      v-model="triggerConfig.upload_trigger.fallback_interval_enabled"
-                      :disabled="!encryptionStatus?.has_key"
-                      @change="handleTriggerConfigChange"
-                  >
-                    启用间隔时间兜底
-                  </el-checkbox>
-                </el-form-item>
-                <el-form-item v-if="triggerConfig.upload_trigger.fallback_interval_enabled" label="间隔时间（分钟）">
-                  <el-input-number
-                      v-model="triggerConfig.upload_trigger.fallback_interval_minutes"
-                      :min="10"
-                      :max="1440"
-                      :step="10"
-                      :disabled="!encryptionStatus?.has_key"
-                      @change="handleTriggerConfigChange"
+                    <div class="export-actions">
+                      <el-button type="primary" @click="handleExportDecryptBundle" :loading="exportingBundle">
+                        <el-icon><Download /></el-icon>
+                        导出解密数据包
+                      </el-button>
+                      <el-dropdown @command="handleSeparateExport" trigger="click">
+                        <el-button :loading="exportingSeparate">
+                          <el-icon><Document /></el-icon>
+                          分别导出
+                          <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+                        </el-button>
+                        <template #dropdown>
+                          <el-dropdown-menu>
+                            <el-dropdown-item command="keys">导出密钥配置 (encryption.json)</el-dropdown-item>
+                            <el-dropdown-item command="mapping">导出映射数据 (mapping.json)</el-dropdown-item>
+                          </el-dropdown-menu>
+                        </template>
+                      </el-dropdown>
+                    </div>
+
+                    <div class="form-tip" style="margin-top: 12px">
+                      <strong>解密数据包</strong>：包含 encryption.json（密钥配置）和 mapping.json（文件映射），可配合 decrypt-cli 工具在其他机器上解密文件。
+                    </div>
+                  </div>
+
+                  <el-alert type="warning" :closable="false" show-icon style="margin-top: 16px">
+                    <template #title>
+                      <strong>重要提示：</strong>请妥善保管加密密钥。如果密钥丢失，将无法解密已加密的文件！
+                    </template>
+                  </el-alert>
+
+                  <div class="form-tip" style="margin-top: 12px">
+                    加密密钥用于自动备份和上传时的客户端侧加密。配置密钥后，可在创建备份任务或上传文件时选择是否启用加密。
+                  </div>
+                </el-card>
+
+                <!-- 自动备份设置 -->
+                <el-card id="section-backup" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#67c23a">
+                        <Refresh />
+                      </el-icon>
+                      <span>自动备份设置</span>
+                    </div>
+                  </template>
+
+                  <!-- 前置条件提示 -->
+                  <el-alert
+                      v-if="!encryptionStatus?.has_key"
+                      title="需要先配置加密密钥才能使用自动备份功能"
+                      type="warning"
+                      :closable="false"
+                      show-icon
+                      style="margin-bottom: 16px"
                   />
-                  <div class="form-tip">每隔指定时间进行一次增量扫描（最小 10 分钟，防止触发风控）</div>
-                </el-form-item>
 
-                <!-- 指定时间全量扫描 -->
-                <el-form-item>
-                  <el-checkbox
-                      v-model="triggerConfig.upload_trigger.fallback_scheduled_enabled"
-                      :disabled="!encryptionStatus?.has_key"
-                      @change="handleTriggerConfigChange"
-                  >
-                    启用指定时间全量扫描
-                  </el-checkbox>
-                </el-form-item>
-                <el-form-item v-if="triggerConfig.upload_trigger.fallback_scheduled_enabled" label="扫描时间">
-                  <el-time-picker
-                      v-model="uploadScheduledTime"
-                      format="HH:mm"
-                      :disabled="!encryptionStatus?.has_key"
-                      @change="handleUploadScheduledTimeChange"
-                  />
-                  <div class="form-tip">每天在指定时间进行一次全量扫描</div>
-                </el-form-item>
-              </div>
+                  <!-- 文件监听能力状态 -->
+                  <div class="watch-capability-card" :class="{ 'is-available': watchCapability?.available }">
+                    <div class="capability-header">
+                      <span class="capability-label">文件监听能力</span>
+                      <el-tag :type="watchCapability?.available ? 'success' : 'danger'" size="small">
+                        {{ watchCapability?.available ? '可用' : '不可用' }}
+                      </el-tag>
+                    </div>
+                    <div class="capability-detail">
+                      平台: {{ watchCapability?.platform || '-' }} | 后端: {{ watchCapability?.backend || '-' }}
+                    </div>
+                    <div v-if="watchCapability?.reason" class="capability-reason">
+                      原因: {{ watchCapability.reason }}
+                    </div>
+                    <div v-if="watchCapability?.suggestion" class="capability-suggestion">
+                      建议: {{ watchCapability.suggestion }}
+                    </div>
+                    <div v-if="watchCapability?.warnings?.length" class="capability-warnings">
+                      <div v-for="(warning, index) in watchCapability.warnings" :key="index" class="warning-item">
+                        {{ warning }}
+                      </div>
+                    </div>
+                  </div>
 
-              <el-divider content-position="left">下载备份触发方式（仅支持轮询）</el-divider>
+                  <el-divider content-position="left">上传备份触发方式</el-divider>
 
-              <el-form-item label="轮询模式">
-                <el-radio-group
-                    v-model="triggerConfig.download_trigger.poll_mode"
-                    :disabled="!encryptionStatus?.has_key"
-                    @change="handleTriggerConfigChange"
-                >
-                  <el-radio value="interval">间隔轮询</el-radio>
-                  <el-radio value="scheduled">指定时间（推荐）</el-radio>
-                </el-radio-group>
-              </el-form-item>
+                  <!-- 文件系统监听 -->
+                  <el-form-item>
+                    <el-checkbox
+                        v-model="triggerConfig.upload_trigger.watch_enabled"
+                        :disabled="!encryptionStatus?.has_key || !watchCapability?.available"
+                        @change="handleTriggerConfigChange"
+                    >
+                      启用文件系统监听（实时检测本地文件变化）
+                    </el-checkbox>
+                  </el-form-item>
 
-              <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'interval'" label="轮询间隔（分钟）">
-                <el-input-number
-                    v-model="triggerConfig.download_trigger.poll_interval_minutes"
-                    :min="10"
-                    :max="1440"
-                    :step="10"
-                    :disabled="!encryptionStatus?.has_key"
-                    @change="handleTriggerConfigChange"
-                />
-                <div class="form-tip">每隔指定时间检查云端文件变化（最小 10 分钟，防止触发风控）</div>
-              </el-form-item>
+                  <div v-if="triggerConfig.upload_trigger.watch_enabled" class="nested-config">
+                    <el-divider content-position="left" style="margin: 12px 0">
+                      <span style="font-size: 12px; color: #909399">监听兜底设置（防止监听遗漏）</span>
+                    </el-divider>
 
-              <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'scheduled'" label="轮询时间">
-                <el-time-picker
-                    v-model="downloadScheduledTime"
-                    format="HH:mm"
-                    :disabled="!encryptionStatus?.has_key"
-                    @change="handleDownloadScheduledTimeChange"
-                />
-                <div class="form-tip">每天在指定时间检查云端文件变化（推荐凌晨，避免频繁API调用）</div>
-              </el-form-item>
+                    <!-- 间隔时间兜底 -->
+                    <el-form-item>
+                      <el-checkbox
+                          v-model="triggerConfig.upload_trigger.fallback_interval_enabled"
+                          :disabled="!encryptionStatus?.has_key"
+                          @change="handleTriggerConfigChange"
+                      >
+                        启用间隔时间兜底
+                      </el-checkbox>
+                    </el-form-item>
+                    <el-form-item v-if="triggerConfig.upload_trigger.fallback_interval_enabled" label="间隔时间（分钟）">
+                      <el-input-number
+                          v-model="triggerConfig.upload_trigger.fallback_interval_minutes"
+                          :min="10"
+                          :max="1440"
+                          :step="10"
+                          :disabled="!encryptionStatus?.has_key"
+                          @change="handleTriggerConfigChange"
+                      />
+                      <div class="form-tip">每隔指定时间进行一次增量扫描（最小 10 分钟，防止触发风控）</div>
+                    </el-form-item>
 
-              <el-alert type="info" :closable="false" show-icon style="margin-top: 16px">
-                <template #title>
-                  下载备份不支持文件系统监听，因为百度网盘API不提供目录变化通知接口。建议使用"指定时间"模式，避免频繁调用API导致限速。
-                </template>
-              </el-alert>
-            </el-card>
+                    <!-- 指定时间全量扫描 -->
+                    <el-form-item>
+                      <el-checkbox
+                          v-model="triggerConfig.upload_trigger.fallback_scheduled_enabled"
+                          :disabled="!encryptionStatus?.has_key"
+                          @change="handleTriggerConfigChange"
+                      >
+                        启用指定时间全量扫描
+                      </el-checkbox>
+                    </el-form-item>
+                    <el-form-item v-if="triggerConfig.upload_trigger.fallback_scheduled_enabled" label="扫描时间">
+                      <el-time-picker
+                          v-model="uploadScheduledTime"
+                          format="HH:mm"
+                          :disabled="!encryptionStatus?.has_key"
+                          @change="handleUploadScheduledTimeChange"
+                      />
+                      <div class="form-tip">每天在指定时间进行一次全量扫描</div>
+                    </el-form-item>
+                  </div>
 
-            <!-- 关于信息 -->
-            <el-card class="setting-card" shadow="hover">
-              <template #header>
-                <div class="card-header">
-                  <el-icon :size="20" color="#909399">
-                    <InfoFilled />
-                  </el-icon>
-                  <span>关于</span>
-                </div>
-              </template>
+                  <el-divider content-position="left">下载备份触发方式（仅支持轮询）</el-divider>
 
-              <div class="about-content">
-                <div class="about-item">
-                  <span class="label">项目名称:</span>
-                  <span class="value">百度网盘 Rust 客户端</span>
-                </div>
-                <div class="about-item">
-                  <span class="label">版本:</span>
-                  <span class="value">v1.4.0</span>
-                </div>
-                <div class="about-item">
-                  <span class="label">后端技术:</span>
-                  <span class="value">Rust + Axum + Tokio</span>
-                </div>
-                <div class="about-item">
-                  <span class="label">前端技术:</span>
-                  <span class="value">Vue 3 + TypeScript + Element Plus</span>
-                </div>
-                <div class="about-item">
-                  <span class="label">许可证:</span>
-                  <span class="value">MIT License</span>
-                </div>
-              </div>
-            </el-card>
-          </el-form>
-        </el-skeleton>
+                  <el-form-item label="轮询模式">
+                    <el-radio-group
+                        v-model="triggerConfig.download_trigger.poll_mode"
+                        :disabled="!encryptionStatus?.has_key"
+                        @change="handleTriggerConfigChange"
+                    >
+                      <el-radio value="interval">间隔轮询</el-radio>
+                      <el-radio value="scheduled">指定时间（推荐）</el-radio>
+                    </el-radio-group>
+                  </el-form-item>
+
+                  <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'interval'" label="轮询间隔（分钟）">
+                    <el-input-number
+                        v-model="triggerConfig.download_trigger.poll_interval_minutes"
+                        :min="10"
+                        :max="1440"
+                        :step="10"
+                        :disabled="!encryptionStatus?.has_key"
+                        @change="handleTriggerConfigChange"
+                    />
+                    <div class="form-tip">每隔指定时间检查云端文件变化（最小 10 分钟，防止触发风控）</div>
+                  </el-form-item>
+
+                  <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'scheduled'" label="轮询时间">
+                    <el-time-picker
+                        v-model="downloadScheduledTime"
+                        format="HH:mm"
+                        :disabled="!encryptionStatus?.has_key"
+                        @change="handleDownloadScheduledTimeChange"
+                    />
+                    <div class="form-tip">每天在指定时间检查云端文件变化（推荐凌晨，避免频繁API调用）</div>
+                  </el-form-item>
+
+                  <el-alert type="info" :closable="false" show-icon style="margin-top: 16px">
+                    <template #title>
+                      下载备份不支持文件系统监听，因为百度网盘API不提供目录变化通知接口。建议使用"指定时间"模式，避免频繁调用API导致限速。
+                    </template>
+                  </el-alert>
+                </el-card>
+
+                <!-- 网络代理配置 -->
+                <el-card id="section-proxy" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#9b59b6">
+                        <Promotion />
+                      </el-icon>
+                      <span>网络代理</span>
+                    </div>
+                  </template>
+
+                  <el-form-item label="代理类型">
+                    <el-radio-group v-model="proxyType" @change="handleProxyTypeChange">
+                      <el-radio value="none">无代理</el-radio>
+                      <el-radio value="http">HTTP 代理</el-radio>
+                      <el-radio value="socks5">SOCKS5 代理</el-radio>
+                    </el-radio-group>
+                  </el-form-item>
+
+                  <template v-if="proxyType !== 'none'">
+                    <el-form-item label="主机地址">
+                      <el-input
+                          v-model="proxyHost"
+                          placeholder="例如: 127.0.0.1"
+                          clearable
+                      />
+                    </el-form-item>
+
+                    <el-form-item label="端口">
+                      <el-input-number
+                          v-model="proxyPort"
+                          :min="1"
+                          :max="65535"
+                          :step="1"
+                          controls-position="right"
+                          style="width: 100%"
+                      />
+                    </el-form-item>
+
+                    <el-form-item label="用户名">
+                      <el-input
+                          v-model="proxyUsername"
+                          placeholder="可选"
+                          clearable
+                      />
+                    </el-form-item>
+
+                    <el-form-item label="密码">
+                      <el-input
+                          v-model="proxyPassword"
+                          type="password"
+                          placeholder="可选"
+                          show-password
+                          clearable
+                          autocomplete="new-password"
+                      />
+                    </el-form-item>
+
+                    <el-form-item label="自动回退">
+                      <el-switch
+                          v-model="proxyAllowFallback"
+                          active-text="允许"
+                          inactive-text="禁止"
+                      />
+                      <div class="form-tip" style="margin-top: 4px;">
+                        代理故障时自动回退到直连模式。关闭后，若代理不可用将无法访问本页面，需手动编辑 config/app.toml 修改代理配置。
+                      </div>
+                    </el-form-item>
+
+                    <!-- 代理运行状态指示器 -->
+                    <el-form-item label="运行状态">
+                      <div class="proxy-status-indicator">
+                        <el-tag
+                            v-if="proxyRuntimeStatus === 'normal'"
+                            type="success"
+                            effect="light"
+                            size="small"
+                        >
+                          ● 代理正常
+                        </el-tag>
+                        <el-tag
+                            v-else-if="proxyRuntimeStatus === 'fallen_back_to_direct'"
+                            type="warning"
+                            effect="light"
+                            size="small"
+                        >
+                          ● 已回退到直连
+                        </el-tag>
+                        <el-tag
+                            v-else-if="proxyRuntimeStatus === 'probing'"
+                            type="primary"
+                            effect="light"
+                            size="small"
+                            class="probing-tag"
+                        >
+                          ● 探测中
+                          <span v-if="proxyNextProbeIn !== null"> ({{ proxyNextProbeIn }}s)</span>
+                        </el-tag>
+                        <el-tag
+                            v-else
+                            type="info"
+                            effect="light"
+                            size="small"
+                        >
+                          ● 未配置
+                        </el-tag>
+                        <span v-if="proxyFlapCount > 0" class="flap-count">
+                      抖动次数: {{ proxyFlapCount }}
+                    </span>
+                      </div>
+                    </el-form-item>
+
+                    <!-- 测试连接按钮 -->
+                    <el-form-item label=" ">
+                      <el-button
+                          type="primary"
+                          plain
+                          :loading="testingProxy"
+                          @click="handleTestProxy"
+                          :disabled="!proxyHost || !proxyPort"
+                      >
+                        <el-icon v-if="!testingProxy"><Connection /></el-icon>
+                        测试连接
+                      </el-button>
+                    </el-form-item>
+                  </template>
+
+                  <div class="form-tip">
+                    配置代理后，所有网络请求（登录、API 调用、文件下载）将通过代理服务器转发。保存后立即生效，无需重启。
+                  </div>
+                </el-card>
+
+                <!-- 关于信息 -->
+                <el-card id="section-about" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#909399">
+                        <InfoFilled />
+                      </el-icon>
+                      <span>关于</span>
+                    </div>
+                  </template>
+
+                  <div class="about-content">
+                    <div class="about-item">
+                      <span class="label">项目名称:</span>
+                      <span class="value">百度网盘 Rust 客户端</span>
+                    </div>
+                    <div class="about-item">
+                      <span class="label">版本:</span>
+                      <span class="value">v1.9.2</span>
+                    </div>
+                    <div class="about-item">
+                      <span class="label">后端技术:</span>
+                      <span class="value">Rust + Axum + Tokio</span>
+                    </div>
+                    <div class="about-item">
+                      <span class="label">前端技术:</span>
+                      <span class="value">Vue 3 + TypeScript + Element Plus</span>
+                    </div>
+                    <div class="about-item">
+                      <span class="label">许可证:</span>
+                      <span class="value">MIT License</span>
+                    </div>
+                  </div>
+                </el-card>
+              </el-form>
+            </el-skeleton>
+          </div>
+        </div>
       </el-main>
     </el-container>
 
@@ -715,12 +869,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useIsMobile } from '@/utils/responsive'
 import { useConfigStore } from '@/stores/config'
-import type { AppConfig } from '@/api/config'
-import { getRecommendedConfig, resetToRecommended } from '@/api/config'
+import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
+import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
 import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import {
@@ -744,6 +898,7 @@ import {
   Refresh,
   Document,
   ArrowDown,
+  Promotion,
 } from '@element-plus/icons-vue'
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
 import {
@@ -777,6 +932,40 @@ const formData = ref<AppConfig | null>(null)
 const recommended = ref<any>(null)
 const transferBehavior = ref('transfer_only')
 const showDirPicker = ref(false)
+
+// 锚点导航
+const contentRef = ref<HTMLElement>()
+const activeSection = ref('section-server')
+let sectionObserver: IntersectionObserver | null = null
+
+const navItems = [
+  { id: 'section-server', label: '服务器', color: '#409eff' },
+  { id: 'section-auth', label: '访问认证', color: '#e6a23c' },
+  { id: 'section-download', label: '下载', color: '#67c23a' },
+  { id: 'section-upload', label: '上传', color: '#e6a23c' },
+  { id: 'section-transfer', label: '转存', color: '#909399' },
+  { id: 'section-encryption', label: '加密', color: '#f56c6c' },
+  { id: 'section-backup', label: '自动备份', color: '#67c23a' },
+  { id: 'section-proxy', label: '网络代理', color: '#9b59b6' },
+  { id: 'section-about', label: '关于', color: '#909399' },
+]
+
+// 代理相关状态
+const proxyType = ref<ProxyType>('none')
+const proxyHost = ref('')
+const proxyPort = ref(0)
+const proxyUsername = ref('')
+const proxyPassword = ref('')
+const proxyAllowFallback = ref(true)
+
+// 代理测试连接
+const testingProxy = ref(false)
+
+// 代理运行状态
+const proxyRuntimeStatus = ref<ProxyRuntimeStatus>('no_proxy')
+const proxyFlapCount = ref(0)
+const proxyNextProbeIn = ref<number | null>(null)
+let proxyStatusTimer: ReturnType<typeof setInterval> | null = null
 
 // 加密相关状态
 const encryptionStatus = ref<EncryptionStatus | null>(null)
@@ -894,6 +1083,24 @@ async function loadConfig() {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
 
+    // 初始化代理配置状态
+    if (formData.value?.network?.proxy) {
+      const p = formData.value.network.proxy
+      proxyType.value = p.proxy_type || 'none'
+      proxyHost.value = p.host || ''
+      proxyPort.value = p.port || 0
+      proxyUsername.value = p.username || ''
+      proxyPassword.value = p.password || ''
+      proxyAllowFallback.value = p.allow_fallback !== false
+    } else {
+      proxyType.value = 'none'
+      proxyHost.value = ''
+      proxyPort.value = 0
+      proxyUsername.value = ''
+      proxyPassword.value = ''
+      proxyAllowFallback.value = true
+    }
+
     // 同时加载推荐配置
     try {
       recommended.value = await getRecommendedConfig()
@@ -908,10 +1115,18 @@ async function loadConfig() {
     } catch (error) {
       console.warn('获取转存配置失败:', error)
     }
+
+    // 根据代理配置决定是否启动状态轮询
+    if (proxyType.value !== 'none') {
+      startProxyStatusPolling()
+    } else {
+      stopProxyStatusPolling()
+    }
   } catch (error: any) {
     ElMessage.error('加载配置失败: ' + (error.message || '未知错误'))
   } finally {
     loading.value = false
+    nextTick(() => initSectionObserver())
   }
 }
 
@@ -951,7 +1166,31 @@ async function handleSave() {
     // 验证表单
     await formRef.value.validate()
 
+    // 代理启用时验证必填字段
+    if (proxyType.value !== 'none') {
+      if (!proxyHost.value || !proxyHost.value.trim()) {
+        ElMessage.error('代理主机地址不能为空')
+        return
+      }
+      if (!proxyPort.value || proxyPort.value <= 0) {
+        ElMessage.error('代理端口不能为空')
+        return
+      }
+    }
+
     saving.value = true
+    // 同步代理配置到 formData
+    if (!formData.value.network) {
+      formData.value.network = { proxy: { proxy_type: 'none', host: '', port: 0 } }
+    }
+    formData.value.network.proxy = {
+      proxy_type: proxyType.value,
+      host: proxyHost.value,
+      port: proxyPort.value,
+      username: proxyUsername.value || undefined,
+      password: proxyPassword.value || undefined,
+      allow_fallback: proxyAllowFallback.value,
+    }
     await configStore.saveConfig(formData.value)
 
     // 同时保存转存配置
@@ -971,7 +1210,14 @@ async function handleSave() {
       console.warn('保存自动备份触发配置失败:', error)
     }
 
-    ElMessage.success('配置已保存')
+    ElMessage.success(proxyType.value !== 'none' ? '代理配置已保存并生效' : '配置已保存')
+
+    // 根据代理类型启动/停止状态轮询
+    if (proxyType.value !== 'none') {
+      startProxyStatusPolling()
+    } else {
+      stopProxyStatusPolling()
+    }
 
     // 重新加载推荐配置以更新警告
     try {
@@ -1012,6 +1258,71 @@ function handleDirConfirm(path: string) {
     ElMessage.success('已选择目录: ' + path)
   }
   showDirPicker.value = false
+}
+
+// 代理类型变更
+function handleProxyTypeChange(val: ProxyType) {
+  if (val === 'none') {
+    proxyHost.value = ''
+    proxyPort.value = 0
+    proxyUsername.value = ''
+    proxyPassword.value = ''
+  }
+}
+
+// 测试代理连接
+async function handleTestProxy() {
+  if (!proxyHost.value || !proxyPort.value) {
+    ElMessage.warning('请先填写代理主机和端口')
+    return
+  }
+  testingProxy.value = true
+  try {
+    const resp = await testProxyConnection({
+      proxy_type: proxyType.value,
+      host: proxyHost.value,
+      port: proxyPort.value,
+      username: proxyUsername.value || undefined,
+      password: proxyPassword.value || undefined,
+      allow_fallback: proxyAllowFallback.value,
+    })
+    if (resp.success) {
+      ElMessage.success(`代理连接成功，延迟 ${resp.latency_ms}ms`)
+    } else {
+      ElMessage.error(`代理连接失败: ${resp.error}`)
+    }
+  } catch (e: any) {
+    ElMessage.error(e.message || '测试请求失败')
+  } finally {
+    testingProxy.value = false
+  }
+}
+
+// 获取代理运行状态
+async function fetchProxyStatus() {
+  try {
+    const resp = await getProxyStatus()
+    proxyRuntimeStatus.value = resp.status
+    proxyFlapCount.value = resp.flap_count
+    proxyNextProbeIn.value = resp.next_probe_in_secs
+  } catch {
+    // 静默失败，不影响用户操作
+  }
+}
+
+// 启动代理状态轮询（5秒间隔）
+function startProxyStatusPolling() {
+  stopProxyStatusPolling()
+  fetchProxyStatus()
+  proxyStatusTimer = setInterval(fetchProxyStatus, 5000)
+}
+
+// 停止代理状态轮询
+function stopProxyStatusPolling() {
+  if (proxyStatusTimer) {
+    clearInterval(proxyStatusTimer)
+    proxyStatusTimer = null
+  }
 }
 
 // 加载加密状态
@@ -1215,11 +1526,51 @@ function formatDate(dateStr: string): string {
 }
 
 // 组件挂载
+// 锚点导航：平滑滚动到指定分区
+function scrollToSection(id: string) {
+  const el = document.getElementById(id)
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+}
+
+// 锚点导航：初始化 IntersectionObserver 追踪当前可见分区
+function initSectionObserver() {
+  if (isMobile.value) return
+  const root = contentRef.value
+  if (!root) return
+  const ids = navItems.map(n => n.id)
+  sectionObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            activeSection.value = entry.target.id
+          }
+        }
+      },
+      { root, rootMargin: '-10% 0px -60% 0px', threshold: 0 }
+  )
+  for (const id of ids) {
+    const el = document.getElementById(id)
+    if (el) sectionObserver.observe(el)
+  }
+}
+
 onMounted(() => {
   loadConfig()
   loadEncryptionStatus()
   loadWatchCapability()
   loadTriggerConfig()
+  // 代理状态轮询在 loadConfig 完成后根据代理类型决定是否启动
+})
+
+// 组件卸载
+onUnmounted(() => {
+  stopProxyStatusPolling()
+  if (sectionObserver) {
+    sectionObserver.disconnect()
+    sectionObserver = null
+  }
 })
 </script>
 
@@ -1255,8 +1606,74 @@ onMounted(() => {
 }
 
 .el-main {
+  padding: 0;
+  overflow: hidden;
+}
+
+.settings-layout {
+  display: flex;
+  height: 100%;
+}
+
+.settings-nav {
+  width: 120px;
+  min-width: 120px;
+  background: white;
+  border-right: 1px solid #e8e8e8;
+  padding: 16px 0;
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+
+  ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #666;
+    transition: all 0.2s;
+    border-left: 3px solid transparent;
+
+    &:hover {
+      color: #333;
+      background: #f5f7fa;
+    }
+
+    &.active {
+      color: #409eff;
+      font-weight: 600;
+      background: #ecf5ff;
+      border-left-color: #409eff;
+    }
+  }
+
+  .nav-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .nav-label {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
   padding: 20px;
-  overflow: auto;
+  scroll-behavior: smooth;
 }
 
 .setting-card {
@@ -1489,6 +1906,10 @@ onMounted(() => {
   }
 
   .el-main {
+    padding: 0;
+  }
+
+  .settings-content {
     padding: 12px;
   }
 
@@ -1603,5 +2024,26 @@ onMounted(() => {
     height: 40px;
     line-height: 40px;
   }
+}
+
+// 代理运行状态指示器
+.proxy-status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.probing-tag {
+  animation: probing-blink 1.5s ease-in-out infinite;
+}
+
+@keyframes probing-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.flap-count {
+  font-size: 12px;
+  color: #909399;
 }
 </style>

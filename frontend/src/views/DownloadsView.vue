@@ -9,28 +9,36 @@
         </el-tag>
       </div>
       <div class="header-right">
-        <!-- PC端按钮 -->
-        <template v-if="!isMobile">
-          <el-button @click="refreshTasks">
-            <el-icon><Refresh/></el-icon>
-            刷新
+        <el-button @click="refreshTasks" :circle="isMobile">
+          <el-icon><Refresh/></el-icon>
+          <span v-if="!isMobile">刷新</span>
+        </el-button>
+        <el-dropdown @command="handleBatchCommand" trigger="click">
+          <el-button>
+            批量操作
+            <el-icon class="el-icon--right"><ArrowDown/></el-icon>
           </el-button>
-          <el-button @click="handleClearCompleted" :disabled="completedCount === 0">
-            清除已完成 ({{ completedCount }})
-          </el-button>
-          <el-button @click="handleClearFailed" :disabled="failedCount === 0" type="danger" plain>
-            清除失败 ({{ failedCount }})
-          </el-button>
-        </template>
-        <!-- 移动端按钮 -->
-        <template v-else>
-          <el-button circle @click="refreshTasks">
-            <el-icon><Refresh/></el-icon>
-          </el-button>
-          <el-button circle @click="handleClearCompleted" :disabled="completedCount === 0">
-            <el-icon><Delete/></el-icon>
-          </el-button>
-        </template>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="pause" :disabled="activeCount === 0">
+                <el-icon><VideoPause/></el-icon>
+                全部暂停 ({{ activeCount }})
+              </el-dropdown-item>
+              <el-dropdown-item command="resume" :disabled="pausedCount === 0">
+                <el-icon><VideoPlay/></el-icon>
+                全部继续 ({{ pausedCount }})
+              </el-dropdown-item>
+              <el-dropdown-item command="clearCompleted" :disabled="completedCount === 0" divided>
+                <el-icon><Delete/></el-icon>
+                清除已完成 ({{ completedCount }})
+              </el-dropdown-item>
+              <el-dropdown-item command="clearFailed" :disabled="failedCount === 0">
+                <el-icon><Delete/></el-icon>
+                清除失败 ({{ failedCount }})
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </div>
 
@@ -120,7 +128,7 @@
                 暂停
               </el-button>
               <el-button
-                  v-if="item.status === 'paused'"
+                  v-if="item.status === 'paused' || item.status === 'failed'"
                   size="small"
                   type="primary"
                   @click="handleResume(item)"
@@ -128,7 +136,7 @@
                 <el-icon>
                   <VideoPlay/>
                 </el-icon>
-                继续
+                {{ item.status === 'failed' ? '重试' : '继续' }}
               </el-button>
               <el-button
                   v-if="item.status === 'completed'"
@@ -358,6 +366,8 @@ import {
   cancelFolderDownload,
   clearCompleted,
   clearFailed,
+  batchPauseDownloads,
+  batchResumeDownloads,
   calculateETA,
   formatFileSize,
   formatSpeed,
@@ -384,6 +394,7 @@ import {
   Share,
   Lock,
   Unlock,
+  ArrowDown,
 } from '@element-plus/icons-vue'
 import {useRouter, useRoute} from 'vue-router'
 import {useIsMobile} from '@/utils/responsive'
@@ -451,6 +462,10 @@ const completedCount = computed(() => {
 
 const failedCount = computed(() => {
   return downloadItems.value.filter(item => item.status === 'failed').length
+})
+
+const pausedCount = computed(() => {
+  return downloadItems.value.filter(item => item.status === 'paused').length
 })
 
 const activeCountType = computed(() => {
@@ -712,6 +727,38 @@ async function handleClearFailed() {
     if (error !== 'cancel') {
       console.error('清除失败任务失败:', error)
     }
+  }
+}
+
+// 批量操作命令分发
+function handleBatchCommand(command: string) {
+  switch (command) {
+    case 'pause': handleBatchPause(); break
+    case 'resume': handleBatchResume(); break
+    case 'clearCompleted': handleClearCompleted(); break
+    case 'clearFailed': handleClearFailed(); break
+  }
+}
+
+// 全部暂停
+async function handleBatchPause() {
+  try {
+    const res = await batchPauseDownloads({ all: true })
+    ElMessage.success(`已暂停 ${res.success_count} 个任务`)
+    refreshTasks()
+  } catch (error: any) {
+    console.error('批量暂停失败:', error)
+  }
+}
+
+// 全部继续
+async function handleBatchResume() {
+  try {
+    const res = await batchResumeDownloads({ all: true })
+    ElMessage.success(`已恢复 ${res.success_count} 个任务`)
+    refreshTasks()
+  } catch (error: any) {
+    console.error('批量恢复失败:', error)
   }
 }
 

@@ -107,7 +107,7 @@ async function loadActiveTasksForAllConfigs() {
 // 为单个配置加载活跃任务和文件任务
 async function loadActiveTaskForConfig(configId: string) {
   try {
-    const taskList = await listBackupTasks(configId)
+    const { tasks: taskList } = await listBackupTasks(configId, 1, 1)
     // 找到活跃的任务（非完成、非取消、非失败状态）
     const activeTask = taskList.find(t =>
         !['completed', 'cancelled', 'failed', 'partially_completed'].includes(t.status)
@@ -279,7 +279,7 @@ function openTaskDetail(tasks: BackupTask[], configName: string) {
 // 打开历史任务（获取所有任务并打开详情）
 async function openHistoryTasks(config: BackupConfig) {
   try {
-    const tasks = await listBackupTasks(config.id)
+    const { tasks, total } = await listBackupTasks(config.id, 1, 50)
     if (tasks.length > 0) {
       // 打开任务列表详情
       openTaskDetail(tasks, config.name)
@@ -324,7 +324,7 @@ async function handleTaskDetailCancel(taskId: string) {
 // 刷新选中的任务列表
 async function refreshSelectedTasks(configId: string) {
   try {
-    const tasks = await listBackupTasks(configId)
+    const { tasks } = await listBackupTasks(configId, 1, 50)
     selectedTasks.value = tasks
   } catch (e: any) {
     console.error('刷新任务列表失败:', e)

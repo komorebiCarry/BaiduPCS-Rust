@@ -1,6 +1,6 @@
 use crate::auth::UserAuth;
 use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
-use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig};
+use crate::common::{ProxyConfig, RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
 use crate::netdisk::NetdiskClient;
@@ -13,7 +13,7 @@ use reqwest::Client;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -809,17 +809,32 @@ pub struct DownloadEngine {
     /// HTTP 客户端（基础客户端，未使用但保留以备将来使用）
     #[allow(dead_code)]
     client: Client,
-    /// 网盘客户端
-    netdisk_client: NetdiskClient,
+    /// 网盘客户端（Arc<RwLock> 包装，支持代理热更新时重建）
+    netdisk_client: Arc<StdRwLock<NetdiskClient>>,
     /// 用户 VIP 等级
     vip_type: VipType,
     /// 文件系统操作锁（保护目录创建，防止删除-创建竞态）
     fs_lock: Arc<Mutex<()>>,
+    /// 共享代理配置（热更新时外部直接修改）
+    proxy_config: Arc<StdRwLock<Option<ProxyConfig>>>,
+    /// 共享下载客户端（热更新时重建替换）
+    shared_download_client: Arc<StdRwLock<Client>>,
+    /// 代理故障回退管理器
+    pub(crate) fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
 }
 
 impl DownloadEngine {
     /// 创建新的下载引擎
     pub fn new(user_auth: UserAuth) -> Self {
+        Self::new_with_proxy(user_auth, None, None)
+    }
+
+    /// 创建新的下载引擎（支持代理配置）
+    pub fn new_with_proxy(
+        user_auth: UserAuth,
+        proxy_config: Option<&ProxyConfig>,
+        fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
+    ) -> Self {
         // 基础HTTP客户端，使用较长的超时时间以支持大分片下载
         // 实际超时会在每个请求中根据分片大小动态调整
         let client = Client::builder()
@@ -831,29 +846,34 @@ impl DownloadEngine {
         // 从 user_auth 中提取 VIP 等级
         let vip_type = VipType::from_u32(user_auth.vip_type.unwrap_or(0));
 
-        let netdisk_client = NetdiskClient::new(user_auth).expect("Failed to create NetdiskClient");
+        let netdisk_client = NetdiskClient::new_with_proxy(user_auth, proxy_config, fallback_mgr.clone())
+            .expect("Failed to create NetdiskClient");
+        let netdisk_client = Arc::new(StdRwLock::new(netdisk_client));
+
+        let proxy_config_shared = Arc::new(StdRwLock::new(proxy_config.cloned()));
+
+        // 创建初始共享下载客户端
+        let initial_download_client = Self::build_download_client(proxy_config)
+            .expect("初始创建下载客户端失败");
+        let shared_download_client = Arc::new(StdRwLock::new(initial_download_client));
 
         Self {
             client,
             netdisk_client,
             vip_type,
             fs_lock: Arc::new(Mutex::new(())),
+            proxy_config: proxy_config_shared,
+            shared_download_client,
+            fallback_mgr,
         }
     }
 
-    /// 创建用于下载的 HTTP 客户端（使用 Android UA 和 Cookie）
-    ///
-    /// 关键配置：
-    /// - DisableKeepAlives: false (启用 Keep-Alive)
-    /// - MaxIdleConns: 100
-    /// - IdleConnTimeout: 90s
-    /// - Timeout: 2min
-    /// - CheckRedirect: 删除 Referer
-    fn create_download_client(&self) -> Client {
+    /// 构建下载专用 HTTP 客户端（静态方法，可用于初始创建和热更新重建）
+    fn build_download_client(proxy_config: Option<&ProxyConfig>) -> Result<Client> {
         // 使用 Android 客户端的 User-Agent（与 NetdiskClient 一致）
         let pan_ua = "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
 
-        Client::builder()
+        let mut builder = Client::builder()
             .user_agent(pan_ua)
             .timeout(std::time::Duration::from_secs(120)) // 2分钟超时
             .pool_max_idle_per_host(200) // 增大连接池：100 -> 200
@@ -866,9 +886,66 @@ impl DownloadEngine {
             .http2_initial_stream_window_size(Some(1024 * 1024 * 2)) // 2MB初始流窗口（默认65KB）
             .http2_initial_connection_window_size(Some(1024 * 1024 * 4)) // 4MB初始连接窗口（默认65KB）
             .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(20)) // HTTP/2 keep-alive超时
-            .build()
-            .expect("Failed to build download HTTP client")
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(20)); // HTTP/2 keep-alive超时
+
+        if let Some(proxy) = proxy_config {
+            builder = proxy.apply_to_builder(builder)
+                .context("下载客户端应用代理配置失败")?;
+        }
+
+        builder.build().context("构建下载 HTTP 客户端失败")
+    }
+
+    /// 创建用于下载的 HTTP 客户端（从共享代理配置读取最新配置）
+    ///
+    /// 关键配置：
+    /// - DisableKeepAlives: false (启用 Keep-Alive)
+    /// - MaxIdleConns: 100
+    /// - IdleConnTimeout: 90s
+    /// - Timeout: 2min
+    /// - CheckRedirect: 删除 Referer
+    fn create_download_client(&self) -> Result<Client> {
+        let proxy = self.proxy_config.read().unwrap();
+        Self::build_download_client(proxy.as_ref())
+    }
+
+    /// 获取当前共享下载客户端（分片下载时调用）
+    /// 每个分片下载通过此方法获取客户端，开销仅为一次 StdRwLock::read()
+    pub fn get_download_client(&self) -> Client {
+        self.shared_download_client.read().unwrap().clone()
+    }
+
+    /// 获取当前网盘客户端快照（Locate 请求等场景使用）
+    /// 克隆出来避免跨 await 持锁
+    fn get_netdisk_client(&self) -> NetdiskClient {
+        self.netdisk_client.read().unwrap().clone()
+    }
+
+    /// 热更新：更新代理配置并重建共享下载客户端和网盘客户端（代理变更时由 DownloadManager 调用）
+    pub fn update_proxy_and_rebuild_client(&self, new_proxy: Option<&ProxyConfig>) {
+        *self.proxy_config.write().unwrap() = new_proxy.cloned();
+        // 重建分片下载客户端
+        match self.create_download_client() {
+            Ok(new_client) => {
+                *self.shared_download_client.write().unwrap() = new_client;
+                tracing::info!("✓ 下载客户端已重建（代理热更新）");
+            }
+            Err(e) => {
+                tracing::warn!("下载客户端重建失败，保留旧客户端: {}", e);
+            }
+        }
+        // 重建网盘客户端（用于 Locate 下载请求等）
+        let user_auth = self.netdisk_client.read().unwrap().user_auth().clone();
+        let fallback_mgr = self.fallback_mgr.clone();
+        match NetdiskClient::new_with_proxy(user_auth, new_proxy, fallback_mgr) {
+            Ok(new_netdisk_client) => {
+                *self.netdisk_client.write().unwrap() = new_netdisk_client;
+                tracing::info!("✓ DownloadEngine NetdiskClient 已重建（代理热更新）");
+            }
+            Err(e) => {
+                tracing::warn!("DownloadEngine NetdiskClient 重建失败，保留旧客户端: {}", e);
+            }
+        }
     }
 
     /// 根据分片大小计算合理的超时时间（秒）
@@ -904,7 +981,7 @@ impl DownloadEngine {
         task: Arc<Mutex<DownloadTask>>,
         cancellation_token: CancellationToken,
     ) -> Result<(
-        Client,                       // HTTP 客户端
+        Arc<StdRwLock<Client>>,       // HTTP 客户端（共享引用，代理热更新时自动生效）
         String,                       // Cookie
         Option<String>,               // Referer 头
         Arc<Mutex<UrlHealthManager>>, // URL 健康管理器
@@ -937,7 +1014,7 @@ impl DownloadEngine {
 
         // 2. 获取所有可用下载链接
         let all_urls = match self
-            .netdisk_client
+            .get_netdisk_client()
             .get_locate_download_url(&remote_path)
             .await
         {
@@ -956,8 +1033,9 @@ impl DownloadEngine {
 
         info!("获取到 {} 个下载链接", all_urls.len());
 
-        // 3. 创建用于下载的专用 HTTP 客户端
-        let download_client = self.create_download_client();
+        // 3. 获取共享下载客户端引用（代理热更新时会替换内部 Client，后续重试自动生效）
+        let download_client = self.shared_download_client.clone();
+        let download_client_snapshot = self.get_download_client();
 
         // 4. 🔥 并行探测所有下载链接，过滤出可用的链接
         // 使用分批并行，每批最多 10 个，一般情况下可以一次性并行探测所有链接
@@ -967,7 +1045,7 @@ impl DownloadEngine {
         let mut referer: Option<String> = None;
 
         // 预先获取 bduss，避免在 async 闭包中借用 self
-        let bduss = self.netdisk_client.bduss().to_string();
+        let bduss = self.get_netdisk_client().bduss().to_string();
 
         const BATCH_SIZE: usize = 10; // 每批并行探测的链接数
 
@@ -980,7 +1058,7 @@ impl DownloadEngine {
                 .iter()
                 .enumerate()
                 .map(|(batch_idx, url)| {
-                    let client = download_client.clone();
+                    let client = download_client_snapshot.clone();
                     let url = url.clone();
                     let bduss = bduss.clone();
                     let total_size = total_size;
@@ -1104,7 +1182,7 @@ impl DownloadEngine {
         }
 
         // 10. 生成 Cookie
-        let cookie = format!("BDUSS={}", self.netdisk_client.bduss());
+        let cookie = format!("BDUSS={}", self.get_netdisk_client().bduss());
 
         info!("任务准备完成，等待调度器调度");
 
@@ -1161,7 +1239,7 @@ impl DownloadEngine {
 
         // 2. 获取所有可用下载链接（用于失败时切换）
         let all_urls = match self
-            .netdisk_client
+            .get_netdisk_client()
             .get_locate_download_url(&remote_path)
             .await
         {
@@ -1238,7 +1316,7 @@ impl DownloadEngine {
     ) -> Result<()> {
         // 1. 创建用于下载的专用 HTTP 客户端（所有请求复用同一个 client）
         // ⚠️ 关键：必须复用 client 以保持连接池和 session 一致
-        let download_client = self.create_download_client();
+        let download_client = self.get_download_client();
 
         // 2. 探测所有下载链接，过滤出可用的链接
         info!("开始探测 {} 个下载链接...", download_urls.len());
@@ -1381,7 +1459,7 @@ impl DownloadEngine {
         {
             let url_health_clone = url_health.clone();
             let download_client_clone = download_client.clone();
-            let bduss = self.netdisk_client.bduss().to_string();
+            let bduss = self.get_netdisk_client().bduss().to_string();
             let cookie = format!("BDUSS={}", bduss);
             let cancellation_token_clone = cancellation_token.clone();
 
@@ -1524,7 +1602,7 @@ impl DownloadEngine {
         let start_time = std::time::Instant::now();
 
         // 使用传入的复用 client（与后续分片下载使用同一个 client）
-        let bduss = self.netdisk_client.bduss();
+        let bduss = self.get_netdisk_client().bduss().to_string();
 
         let response = client
             .get(url)
@@ -1791,7 +1869,7 @@ impl DownloadEngine {
 
         // 1. 获取新链接
         let all_urls = self
-            .netdisk_client
+            .get_netdisk_client()
             .get_locate_download_url(remote_path)
             .await
             .context("刷新时获取下载链接失败")?;
@@ -1804,7 +1882,7 @@ impl DownloadEngine {
         info!("刷新链接: 获取到 {} 个链接，开始并行探测", all_urls.len());
 
         // 2. ⚠️ 并行探测所有链接（修复问题1）
-        let bduss = self.netdisk_client.bduss().to_string();
+        let bduss = self.get_netdisk_client().bduss().to_string();
         let cookie = format!("BDUSS={}", bduss);
 
         let probe_futures: Vec<_> = all_urls
@@ -2318,7 +2396,7 @@ impl DownloadEngine {
         );
 
         // 创建下载专用的 Cookie
-        let bduss = self.netdisk_client.bduss().to_string();
+        let bduss = self.get_netdisk_client().bduss().to_string();
         let cookie = format!("BDUSS={}", bduss);
 
         // 将 Referer 转换为 String（如果存在）
@@ -2406,6 +2484,7 @@ impl DownloadEngine {
                     None, // backup_notification_tx（独立模式不需要）
                     None, // task_slot_pool（独立模式不需要）
                     3,    // max_retries（独立模式使用默认值）
+                    None, // fallback_mgr（独立模式不需要）
                 )
                     .await;
 
@@ -2527,6 +2606,7 @@ impl DownloadEngine {
         backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
         task_slot_pool: Option<Arc<crate::task_slot_pool::TaskSlotPool>>,
         max_retries: u32,
+        fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
     ) -> Result<()> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
@@ -2778,6 +2858,13 @@ impl DownloadEngine {
 
                     // 注意：进度和速度已经在 progress_callback 中实时更新，无需再次更新
 
+                    // 🔥 代理回退：下载成功时记录成功（仅在使用代理且未回退时）
+                    if let Some(ref mgr) = fallback_mgr {
+                        if !mgr.is_fallen_back() {
+                            mgr.record_success();
+                        }
+                    }
+
                     info!(
                         "[分片线程{}] ✓ 分片 #{} 下载成功",
                         chunk_thread_id, chunk_index
@@ -2786,6 +2873,35 @@ impl DownloadEngine {
                 }
                 Err(e) => {
                     // ❌ 下载失败
+
+                    // 🔥 代理回退：下载失败时检测是否为代理/连接错误
+                    if let Some(ref mgr) = fallback_mgr {
+                        if !mgr.is_fallen_back() {
+                            if crate::common::proxy_fallback::is_proxy_or_connection_error(&e) {
+                                let should_fallback = mgr.record_failure();
+                                if should_fallback {
+                                    // 检查 allow_fallback 配置
+                                    let allow = mgr.user_proxy_config().await
+                                        .map(|c| c.allow_fallback)
+                                        .unwrap_or(true);
+                                    if allow {
+                                        warn!(
+                                            "[分片线程{}] ⚠ 代理连续失败达到阈值，触发回退到直连",
+                                            chunk_thread_id
+                                        );
+                                        // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
+                                        mgr.execute_fallback().await;
+                                    } else {
+                                        info!(
+                                            "[分片线程{}] 代理失败达到阈值但 allow_fallback=false，不执行回退",
+                                            chunk_thread_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 新设计中,失败会通过score机制自动处理
                     // 这里只记录错误并切换链接重试
 

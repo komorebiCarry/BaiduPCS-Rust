@@ -255,6 +255,12 @@ pub struct TaskMetadata {
     /// 加密时使用的密钥版本（上传/下载任务）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_key_version: Option<u32>,
+
+    /// 加密前的原始远程路径（用于去重索引，与自动恢复功能无关）
+    /// 去重索引 key = (local_path, original_remote_path)，重启后从 .meta 文件重建
+    /// 非加密模式下为 None（target_path 即为原始路径）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_remote_path: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -326,6 +332,7 @@ impl TaskMetadata {
             encrypt_enabled: false,
             is_encrypted: is_encrypted.unwrap_or(false),
             encryption_key_version,
+            original_remote_path: None,
         }
     }
 
@@ -395,6 +402,7 @@ impl TaskMetadata {
             encrypt_enabled: false,
             is_encrypted: is_encrypted.unwrap_or(false),
             encryption_key_version,
+            original_remote_path: None,
         }
     }
 
@@ -460,6 +468,7 @@ impl TaskMetadata {
             encrypt_enabled: encrypt_enabled.unwrap_or(false),
             is_encrypted: false,
             encryption_key_version,
+            original_remote_path: None,
         }
     }
 
@@ -527,6 +536,7 @@ impl TaskMetadata {
             encrypt_enabled: encrypt_enabled.unwrap_or(false),
             is_encrypted: false,
             encryption_key_version,
+            original_remote_path: None,
         }
     }
 
@@ -588,6 +598,7 @@ impl TaskMetadata {
             encrypt_enabled: false,
             is_encrypted: false,
             encryption_key_version: None,
+            original_remote_path: None,
         }
     }
 

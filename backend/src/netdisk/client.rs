@@ -3,6 +3,7 @@
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
 use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
+use crate::common::ProxyConfig;
 use crate::netdisk::{
     CreateFileResponse, FileListResponse, LocateDownloadResponse, PrecreateResponse,
     RapidUploadResponse, UploadChunkResponse, UploadErrorKind,
@@ -37,6 +38,10 @@ pub struct NetdiskClient {
     panpsc_cookie: std::sync::Arc<Mutex<Option<String>>>,
     /// bdstoken（/api/loginStatus 或 /api/gettemplatevariable 返回）
     bdstoken: std::sync::Arc<Mutex<Option<String>>>,
+    /// 代理配置（用于临时客户端创建）
+    proxy_config: Option<ProxyConfig>,
+    /// 代理故障回退管理器
+    pub(crate) fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
 }
 
 impl NetdiskClient {
@@ -45,6 +50,20 @@ impl NetdiskClient {
     /// # 参数
     /// * `user_auth` - 用户认证信息（包含BDUSS）
     pub fn new(user_auth: UserAuth) -> Result<Self> {
+        Self::new_with_proxy(user_auth, None, None)
+    }
+
+    /// 创建新的网盘客户端（支持代理配置）
+    ///
+    /// # 参数
+    /// * `user_auth` - 用户认证信息（包含BDUSS）
+    /// * `proxy_config` - 可选的代理配置
+    /// * `fallback_mgr` - 可选的代理故障回退管理器
+    pub fn new_with_proxy(
+        user_auth: UserAuth,
+        proxy_config: Option<&ProxyConfig>,
+        fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
+    ) -> Result<Self> {
         use reqwest::cookie::Jar;
         use std::sync::Arc;
 
@@ -95,10 +114,17 @@ impl NetdiskClient {
         // 3. 创建客户端,使用 cookie_provider 自动管理 Cookie
         // 后续请求会自动收集服务器返回的 Set-Cookie
         // 注意: 不要禁用重定向 (Policy::none())，否则 Cookie Jar 可能无法正确携带 Cookie
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .cookie_provider(Arc::clone(&jar))
             .timeout(std::time::Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(10)) // 允许最多 10 次重定向
+            .redirect(reqwest::redirect::Policy::limited(10)); // 允许最多 10 次重定向
+
+        // 应用代理配置
+        if let Some(proxy) = proxy_config {
+            builder = proxy.apply_to_builder(builder)?;
+        }
+
+        let client = builder
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -131,7 +157,66 @@ impl NetdiskClient {
             web_session_ready,
             panpsc_cookie,
             bdstoken,
+            proxy_config: proxy_config.cloned(),
+            fallback_mgr,
         })
+    }
+
+    /// 创建带代理配置的临时客户端（禁用 cookie_store，手动控制 Cookie）
+    fn build_temp_client_with_proxy(&self) -> Result<Client> {
+        let mut builder = Client::builder()
+            .cookie_store(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30));
+        if let Some(ref proxy) = self.proxy_config {
+            builder = proxy.apply_to_builder(builder)?;
+        }
+        Ok(builder.build()?)
+    }
+
+    /// 记录 API 请求结果到代理回退管理器
+    ///
+    /// 成功时重置连续失败计数，失败时（仅代理/连接错误）递增失败计数。
+    /// 仅在使用代理且未回退到直连时生效。
+    fn record_proxy_result(&self, result: &Result<(), &anyhow::Error>) {
+        if let Some(ref mgr) = self.fallback_mgr {
+            if mgr.is_fallen_back() {
+                return; // 已回退到直连，不记录
+            }
+            match result {
+                Ok(()) => {
+                    mgr.record_success();
+                }
+                Err(e) => {
+                    if crate::common::proxy_fallback::is_proxy_or_connection_error(e) {
+                        let should_fallback = mgr.record_failure();
+                        if should_fallback {
+                            warn!("NetdiskClient: 代理连续失败达到阈值，触发回退到直连");
+                            // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
+                            let mgr_clone = std::sync::Arc::clone(mgr);
+                            tokio::spawn(async move {
+                                let allow = mgr_clone.user_proxy_config().await
+                                    .map(|c| c.allow_fallback)
+                                    .unwrap_or(true);
+                                if allow {
+                                    mgr_clone.execute_fallback().await;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 记录 API 请求成功到代理回退管理器（简化版，用于请求成功后调用）
+    fn record_proxy_success(&self) {
+        self.record_proxy_result(&Ok(()));
+    }
+
+    /// 记录 API 请求失败到代理回退管理器（简化版，用于请求失败后调用）
+    fn record_proxy_failure(&self, error: &anyhow::Error) {
+        self.record_proxy_result(&Err(error));
     }
 
     /// 打印 Cookie Jar 中的 Cookie（用于调试）
@@ -551,6 +636,7 @@ impl NetdiskClient {
 
             match self.perform_web_warmup().await {
                 Ok(()) => {
+                    self.record_proxy_success();
                     if attempt > 0 {
                         info!("预热重试成功（第 {} 次尝试）", attempt + 1);
                     }
@@ -590,6 +676,7 @@ impl NetdiskClient {
                     return Ok((panpsc, csrf_token, bdstoken, stoken));
                 }
                 Err(e) => {
+                    self.record_proxy_failure(&e);
                     warn!("预热第 {} 次尝试失败: {}", attempt + 1, e);
                     last_error = Some(e);
                 }
@@ -674,6 +761,8 @@ impl NetdiskClient {
             }
             Err(e) => {
                 warn!("BDUSS 验证失败：请求失败 {}", e);
+                // 记录代理失败（加速回退触发）
+                self.record_proxy_failure(&e.into());
                 // 网络错误，假设有效让后续逻辑处理
                 true
             }
@@ -683,6 +772,11 @@ impl NetdiskClient {
     /// 获取用户UID
     pub fn uid(&self) -> u64 {
         self.user_auth.uid
+    }
+
+    /// 获取用户认证信息（用于重建客户端）
+    pub fn user_auth(&self) -> &UserAuth {
+        &self.user_auth
     }
 
     /// 获取用户BDUSS
@@ -726,8 +820,19 @@ impl NetdiskClient {
             .header("Cookie", format!("BDUSS={}", self.bduss()))
             .header("User-Agent", &self.mobile_user_agent)
             .send()
-            .await
-            .context("Failed to fetch file list")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("Failed to fetch file list");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let file_list: FileListResponse = response
             .json()
@@ -796,10 +901,15 @@ impl NetdiskClient {
             .send()
             .await
         {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
             Err(e) => {
                 error!("发送 Locate 下载请求失败: path={}, 错误: {}", path, e);
-                return Err(e).context("发送 Locate 下载请求失败");
+                let err = anyhow::Error::from(e).context("发送 Locate 下载请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
             }
         };
 
@@ -997,8 +1107,19 @@ impl NetdiskClient {
                 ("block_list", &block_list),
             ])
             .send()
-            .await
-            .context("创建文件请求发送失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("创建文件请求发送失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取创建文件响应失败")?;
@@ -1052,8 +1173,19 @@ impl NetdiskClient {
             .header("Cookie", format!("BDUSS={}", self.bduss()))
             .header("User-Agent", &self.mobile_user_agent)
             .send()
-            .await
-            .context("获取上传服务器请求失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("获取上传服务器请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取上传服务器响应失败")?;
@@ -1121,8 +1253,19 @@ impl NetdiskClient {
                 ("block_list", block_list),
             ])
             .send()
-            .await
-            .context("预创建请求发送失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("预创建请求发送失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取预创建响应失败")?;
@@ -1212,8 +1355,19 @@ impl NetdiskClient {
             .header("User-Agent", &self.mobile_user_agent)
             .multipart(form)
             .send()
-            .await
-            .context("上传分片请求发送失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("上传分片请求发送失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取上传分片响应失败")?;
@@ -1222,6 +1376,18 @@ impl NetdiskClient {
             "上传分片响应: part={}, status={}, body={}",
             part_seq, status, response_text
         );
+
+        // 先检查 HTTP 状态码，非 2xx 直接返回可重试/不可重试错误
+        // 避免对 HTML 错误页等非 JSON 响应进行解析导致误导性错误信息
+        if !status.is_success() {
+            let truncated_body: String = response_text.chars().take(200).collect();
+            let error_msg = format!(
+                "上传分片HTTP错误: part={}, status={}, body={}",
+                part_seq, status, truncated_body
+            );
+            error!("{}", error_msg);
+            anyhow::bail!(error_msg);
+        }
 
         let chunk_response: UploadChunkResponse = serde_json::from_str(&response_text)
             .with_context(|| {
@@ -1411,11 +1577,7 @@ impl NetdiskClient {
         // 2. 统一从 CookieJar 中收集所有 domain = .baidu.com 的 cookie
         let merged_cookie_str = self.collect_all_baidu_cookies().await?;
         // 3. 创建独立的 HTTP Client，确保我们自定义的 Cookie Header 不会被覆盖
-        let pan_client = reqwest::Client::builder()
-            .cookie_store(false) // 强制禁止自动 cookie → 我们自己设置 Cookie 头
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let pan_client = self.build_temp_client_with_proxy()?;
 
         // 使用 Web 端 API (与 Baidu 网页端保持一致)
         let url = format!(
@@ -1442,8 +1604,19 @@ impl NetdiskClient {
             .headers(headers)
             .form(&[("path", remote_path), ("isdir", "1"), ("block_list", "[]")])
             .send()
-            .await
-            .context("创建文件夹请求失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("创建文件夹请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取创建文件夹响应失败")?;
@@ -1612,8 +1785,19 @@ impl NetdiskClient {
             .header("User-Agent", WEB_USER_AGENT)
             .header("Referer", &referer)
             .send()
-            .await
-            .context("访问分享页面失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("访问分享页面失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let body = response.text().await.context("读取分享页面失败")?;
@@ -2093,8 +2277,19 @@ impl NetdiskClient {
             .header("Content-Type", "application/x-www-form-urlencoded")
             .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
             .send()
-            .await
-            .context("转存请求失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("转存请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let response_text = response.text().await.context("读取转存响应失败")?;
         info!("转存响应: {}", response_text);
@@ -3126,11 +3321,7 @@ impl NetdiskClient {
 
         // 收集 cookies 并创建独立 client（与 create_folder 一致）
         let merged_cookie_str = self.collect_all_baidu_cookies().await?;
-        let pan_client = reqwest::Client::builder()
-            .cookie_store(false)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let pan_client = self.build_temp_client_with_proxy()?;
 
         let mut headers = HeaderMap::new();
         headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
@@ -3141,8 +3332,19 @@ impl NetdiskClient {
             .headers(headers)
             .form(&[("filelist", filelist_json.as_str())])
             .send()
-            .await
-            .context("删除文件请求失败")?;
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("删除文件请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取删除文件响应失败")?;

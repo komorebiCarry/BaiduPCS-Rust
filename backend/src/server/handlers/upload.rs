@@ -1,5 +1,5 @@
 use crate::server::AppState;
-use crate::uploader::{ScanOptions, UploadTask};
+use crate::uploader::{ScanOptions, ScanTaskStatus, UploadTask};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -78,6 +78,23 @@ pub struct CreateBatchUploadRequest {
     pub encrypt: bool,
 }
 
+/// 扫描启动响应
+#[derive(Debug, Serialize)]
+pub struct ScanStartResponse {
+    pub scan_task_id: String,
+}
+
+/// 扫描状态响应
+#[derive(Debug, Serialize)]
+pub struct ScanStatusResponse {
+    pub scan_task_id: String,
+    pub status: String,
+    pub scanned_files: usize,
+    pub created_tasks: usize,
+    pub skipped_duplicates: usize,
+    pub total_size: u64,
+}
+
 /// POST /api/v1/uploads
 /// 创建单文件上传任务
 pub async fn create_upload(
@@ -117,14 +134,14 @@ pub async fn create_upload(
 }
 
 /// POST /api/v1/uploads/folder
-/// 创建文件夹上传任务
+/// 创建文件夹上传任务（异步扫描模式）
 pub async fn create_folder_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateFolderUploadRequest>,
-) -> Result<Json<ApiResponse<Vec<String>>>, StatusCode> {
-    // 获取上传管理器
-    let upload_manager = app_state
-        .upload_manager
+) -> Result<Json<ApiResponse<ScanStartResponse>>, StatusCode> {
+    // 获取扫描管理器
+    let scan_manager = app_state
+        .scan_manager
         .read()
         .await
         .clone()
@@ -133,11 +150,10 @@ pub async fn create_folder_upload(
     // 获取配置
     let config = app_state.config.read().await;
     let skip_hidden_files = config.upload.skip_hidden_files;
-    drop(config); // 释放读锁
+    drop(config);
 
     let local_folder = PathBuf::from(&req.local_folder);
 
-    // 如果用户没有提供扫描选项，使用配置中的设置
     let scan_options = if let Some(opts) = req.scan_options {
         Some(opts.into())
     } else {
@@ -147,25 +163,16 @@ pub async fn create_folder_upload(
         })
     };
 
-    // 🔥 传递 encrypt 参数
-    match upload_manager
-        .create_folder_task(local_folder, req.remote_folder, scan_options, req.encrypt)
+    match scan_manager
+        .start_scan(local_folder, req.remote_folder, scan_options, req.encrypt)
         .await
     {
-        Ok(task_ids) => {
-            info!("创建文件夹上传任务成功: {} 个文件 (encrypt={})", task_ids.len(), req.encrypt);
-
-            // 自动开始所有任务
-            for task_id in &task_ids {
-                if let Err(e) = upload_manager.start_task(task_id).await {
-                    error!("启动上传任务失败: {}, 错误: {:?}", task_id, e);
-                }
-            }
-
-            Ok(Json(ApiResponse::success(task_ids)))
+        Ok(scan_task_id) => {
+            info!("文件夹扫描任务已启动: {} (encrypt={})", scan_task_id, req.encrypt);
+            Ok(Json(ApiResponse::success(ScanStartResponse { scan_task_id })))
         }
         Err(e) => {
-            error!("创建文件夹上传任务失败: {:?}", e);
+            error!("启动文件夹扫描失败: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -294,7 +301,10 @@ pub async fn resume_upload(
         }
         Err(e) => {
             error!("恢复上传任务失败: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Ok(Json(ApiResponse::error(
+                -1,
+                format!("恢复上传任务失败: {}", e),
+            )))
         }
     }
 }
@@ -356,4 +366,126 @@ pub async fn clear_failed_uploads(
     let count = upload_manager.clear_failed().await;
     info!("清除了 {} 个失败的上传任务", count);
     Ok(Json(ApiResponse::success(count)))
+}
+
+/// GET /api/v1/uploads/scan/:id
+/// 查询扫描任务状态
+pub async fn get_scan_status(
+    State(app_state): State<AppState>,
+    Path(scan_task_id): Path<String>,
+) -> Result<Json<ApiResponse<ScanStatusResponse>>, StatusCode> {
+    let scan_manager = app_state
+        .scan_manager
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match scan_manager.get_scan_status(&scan_task_id) {
+        Some(info) => {
+            let status_str = match info.status {
+                ScanTaskStatus::Scanning => "scanning",
+                ScanTaskStatus::Completed => "completed",
+                ScanTaskStatus::Failed => "failed",
+                ScanTaskStatus::Cancelled => "cancelled",
+            };
+            Ok(Json(ApiResponse::success(ScanStatusResponse {
+                scan_task_id: info.scan_task_id,
+                status: status_str.to_string(),
+                scanned_files: info.scanned_files,
+                created_tasks: info.created_tasks,
+                skipped_duplicates: info.skipped_duplicates,
+                total_size: info.total_size,
+            })))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// POST /api/v1/uploads/scan/:id/cancel
+/// 取消扫描任务
+pub async fn cancel_scan(
+    State(app_state): State<AppState>,
+    Path(scan_task_id): Path<String>,
+) -> Result<Json<ApiResponse<String>>, StatusCode> {
+    let scan_manager = app_state
+        .scan_manager
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if scan_manager.cancel_scan(&scan_task_id) {
+        info!("取消扫描任务: {}", scan_task_id);
+        Ok(Json(ApiResponse::success("已取消".to_string())))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+// ==================== 批量操作 ====================
+
+use super::common::{BatchOperationRequest, BatchOperationItem, BatchOperationResponse};
+
+/// POST /api/v1/uploads/batch/pause
+pub async fn batch_pause_uploads(
+    State(app_state): State<AppState>,
+    Json(req): Json<BatchOperationRequest>,
+) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let mgr = app_state.upload_manager.read().await.clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let ids = if req.all == Some(true) {
+        mgr.get_pausable_task_ids().await
+    } else {
+        req.task_ids.unwrap_or_default()
+    };
+
+    let raw = mgr.batch_pause(&ids).await;
+    let results: Vec<BatchOperationItem> = raw.into_iter()
+        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+        .collect();
+    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+}
+
+/// POST /api/v1/uploads/batch/resume
+pub async fn batch_resume_uploads(
+    State(app_state): State<AppState>,
+    Json(req): Json<BatchOperationRequest>,
+) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let mgr = app_state.upload_manager.read().await.clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let ids = if req.all == Some(true) {
+        mgr.get_resumable_task_ids().await
+    } else {
+        req.task_ids.unwrap_or_default()
+    };
+
+    let raw = mgr.batch_resume(&ids).await;
+    let results: Vec<BatchOperationItem> = raw.into_iter()
+        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+        .collect();
+    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+}
+
+/// POST /api/v1/uploads/batch/delete
+pub async fn batch_delete_uploads(
+    State(app_state): State<AppState>,
+    Json(req): Json<BatchOperationRequest>,
+) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let mgr = app_state.upload_manager.read().await.clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let ids = if req.all == Some(true) {
+        mgr.get_all_task_ids()
+    } else {
+        req.task_ids.unwrap_or_default()
+    };
+
+    let raw = mgr.batch_delete(&ids).await;
+    let results: Vec<BatchOperationItem> = raw.into_iter()
+        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+        .collect();
+    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
 }

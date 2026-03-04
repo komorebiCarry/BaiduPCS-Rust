@@ -1,6 +1,8 @@
 // 应用状态
 
 use crate::auth::{QRCodeAuth, SessionManager, UserAuth};
+use crate::common::ProxyType;
+use crate::common::{ProxyConfig, ProxyFallbackManager, ProxyHotUpdater};
 use crate::encryption::SnapshotManager;
 use crate::autobackup::record::BackupRecordManager;
 use crate::autobackup::AutoBackupManager;
@@ -14,7 +16,7 @@ use crate::persistence::{
 };
 use crate::server::websocket::WebSocketManager;
 use crate::transfer::TransferManager;
-use crate::uploader::UploadManager;
+use crate::uploader::{ScanManager, UploadManager};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -22,8 +24,8 @@ use tracing::{error, info, warn};
 /// 应用全局状态
 #[derive(Clone)]
 pub struct AppState {
-    /// 二维码认证客户端
-    pub qrcode_auth: Arc<QRCodeAuth>,
+    /// 二维码认证客户端（支持热替换）
+    pub qrcode_auth: Arc<RwLock<QRCodeAuth>>,
     /// 会话管理器
     pub session_manager: Arc<Mutex<SessionManager>>,
     /// 当前登录用户
@@ -54,6 +56,10 @@ pub struct AppState {
     pub memory_monitor: Arc<MemoryMonitor>,
     /// 🔥 离线下载监听服务
     pub cloud_dl_monitor: Arc<RwLock<Option<Arc<CloudDlMonitor>>>>,
+    /// 🔥 代理故障回退管理器
+    pub fallback_mgr: Arc<ProxyFallbackManager>,
+    /// 🔥 扫描管理器（用户登录后创建）
+    pub scan_manager: Arc<RwLock<Option<Arc<ScanManager>>>>,
 }
 
 impl AppState {
@@ -87,8 +93,18 @@ impl AppState {
         let memory_monitor = Arc::new(MemoryMonitor::new(MemoryMonitorConfig::default()));
         info!("内存监控器已创建");
 
+        // 读取代理配置
+        let proxy_config = if config.network.proxy.proxy_type != ProxyType::None {
+            Some(&config.network.proxy)
+        } else {
+            None
+        };
+
+        // 🔥 创建代理故障回退管理器
+        let fallback_mgr = Arc::new(ProxyFallbackManager::new());
+
         Ok(Self {
-            qrcode_auth: Arc::new(QRCodeAuth::new()?),
+            qrcode_auth: Arc::new(RwLock::new(QRCodeAuth::new_with_proxy(proxy_config)?)),
             session_manager: Arc::new(Mutex::new(SessionManager::default())),
             current_user: Arc::new(RwLock::new(None)),
             netdisk_client: Arc::new(RwLock::new(None)),
@@ -104,6 +120,8 @@ impl AppState {
             backup_record_manager,
             memory_monitor,
             cloud_dl_monitor: Arc::new(RwLock::new(None)),
+            fallback_mgr,
+            scan_manager: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -117,7 +135,37 @@ impl AppState {
             *self.current_user.write().await = Some(user_auth.clone());
 
             // 初始化网盘客户端
-            let client = NetdiskClient::new(user_auth.clone())?;
+            let config_guard = self.config.read().await;
+            let proxy_config_for_client = if config_guard.network.proxy.proxy_type != ProxyType::None
+                && !self.fallback_mgr.is_fallen_back()
+            {
+                Some(config_guard.network.proxy.clone())
+            } else {
+                None
+            };
+            drop(config_guard);
+
+            let fallback_for_client = if proxy_config_for_client.is_some() {
+                Some(Arc::clone(&self.fallback_mgr))
+            } else {
+                None
+            };
+            let client = NetdiskClient::new_with_proxy(
+                user_auth.clone(),
+                proxy_config_for_client.as_ref(),
+                fallback_for_client.clone(),
+            )?;
+
+            // 设置代理回退管理器的用户代理配置
+            // 🔥 始终从原始配置读取，而非 proxy_config_for_client（回退时后者为 None）
+            {
+                let cfg = self.config.read().await;
+                if cfg.network.proxy.proxy_type != ProxyType::None {
+                    self.fallback_mgr
+                        .set_user_proxy_config(Some(cfg.network.proxy.clone()))
+                        .await;
+                }
+            }
 
             // 预热过期时间（2小时 = 7200秒）
             const WARMUP_EXPIRE_SECS: i64 = 86400;
@@ -204,6 +252,8 @@ impl AppState {
                 max_global_threads,
                 max_concurrent_tasks,
                 max_retries,
+                proxy_config_for_client.as_ref(),
+                fallback_for_client,
             )?;
 
             // 🔥 设置持久化管理器
@@ -225,7 +275,7 @@ impl AppState {
 
             // 🔥 设置文件夹下载管理器的 WAL 目录（用于文件夹持久化）
             let wal_dir = pm_arc.lock().await.wal_dir().clone();
-            self.folder_download_manager.set_wal_dir(wal_dir).await;
+            self.folder_download_manager.set_wal_dir(wal_dir.clone()).await;
 
             // 🔥 设置文件夹下载管理器的持久化管理器（用于加载历史文件夹）
             self.folder_download_manager
@@ -271,9 +321,23 @@ impl AppState {
 
             *self.upload_manager.write().await = Some(Arc::clone(&upload_manager_arc));
 
+            // 🔥 初始化扫描管理器
+            let config = self.config.read().await;
+            let max_pending = config.scan.max_pending_tasks;
+            drop(config);
+            let scan_mgr = ScanManager::new(
+                Arc::clone(&upload_manager_arc),
+                Arc::clone(&self.ws_manager),
+                Arc::clone(&self.memory_monitor),
+                wal_dir.clone(),
+                max_pending,
+            );
+            *self.scan_manager.write().await = Some(Arc::new(scan_mgr));
+            info!("扫描管理器初始化完成");
+
             // 初始化转存管理器
             let transfer_manager =
-                TransferManager::new(Arc::new(client), transfer_config, Arc::clone(&self.config));
+                TransferManager::new(Arc::new(std::sync::RwLock::new(client)), transfer_config, Arc::clone(&self.config));
             let transfer_manager_arc = Arc::new(transfer_manager);
 
             // 设置下载管理器（用于自动下载功能）
@@ -466,6 +530,19 @@ impl AppState {
                     manager.set_download_manager(Arc::clone(download_mgr));
                 }
 
+                // 设置代理配置（使备份任务的 NetdiskClient 走代理）
+                {
+                    let config_guard = self.config.read().await;
+                    let proxy = if config_guard.network.proxy.proxy_type != crate::common::ProxyType::None
+                        && !self.fallback_mgr.is_fallen_back()
+                    {
+                        Some(config_guard.network.proxy.clone())
+                    } else {
+                        None
+                    };
+                    manager.set_proxy_config(proxy, Arc::clone(&self.fallback_mgr));
+                }
+
                 // 🔥 注入 snapshot_manager 到 DownloadManager 和 UploadManager
                 // 使用 AppState 中已创建的 snapshot_manager（而非从 manager 获取）
                 let encryption_config_store = manager.get_encryption_config_store();
@@ -652,3 +729,122 @@ impl AppState {
 }
 
 // 注意：Default trait 不能用于 async，移除或使用 lazy_static
+
+#[async_trait::async_trait]
+impl ProxyHotUpdater for AppState {
+    async fn update_qrcode_auth(&self, proxy: Option<&ProxyConfig>) -> anyhow::Result<()> {
+        let new_auth = QRCodeAuth::new_with_proxy(proxy)?;
+        *self.qrcode_auth.write().await = new_auth;
+        Ok(())
+    }
+
+    async fn update_netdisk_client(&self, proxy: Option<&ProxyConfig>) -> anyhow::Result<()> {
+        let user_auth = self.current_user.read().await.clone();
+        if let Some(user) = user_auth {
+            let new_client = NetdiskClient::new_with_proxy(
+                user,
+                proxy,
+                Some(Arc::clone(&self.fallback_mgr)),
+            )?;
+            *self.netdisk_client.write().await = Some(new_client);
+        }
+        Ok(())
+    }
+
+    async fn update_download_engine(&self, proxy: Option<&ProxyConfig>) {
+        let dm_guard = self.download_manager.read().await;
+        if let Some(dm) = dm_guard.as_ref() {
+            dm.update_proxy_config(proxy);
+        }
+    }
+
+    async fn update_upload_engine(&self, proxy: Option<&ProxyConfig>) {
+        let um_guard = self.upload_manager.read().await;
+        if let Some(um) = um_guard.as_ref() {
+            let user_auth = self.current_user.read().await.clone();
+            if let Some(user) = user_auth {
+                match NetdiskClient::new_with_proxy(
+                    user,
+                    proxy,
+                    Some(Arc::clone(&self.fallback_mgr)),
+                ) {
+                    Ok(new_client) => {
+                        um.update_netdisk_client(new_client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("UploadManager NetdiskClient 热更新失败: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn update_transfer_engine(&self, proxy: Option<&ProxyConfig>) {
+        let tm_guard = self.transfer_manager.read().await;
+        if let Some(tm) = tm_guard.as_ref() {
+            let user_auth = self.current_user.read().await.clone();
+            if let Some(user) = user_auth {
+                match NetdiskClient::new_with_proxy(
+                    user,
+                    proxy,
+                    Some(Arc::clone(&self.fallback_mgr)),
+                ) {
+                    Ok(new_client) => {
+                        tm.update_netdisk_client(new_client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("TransferManager NetdiskClient 热更新失败: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn update_cloud_dl_monitor(&self, proxy: Option<&ProxyConfig>) {
+        let monitor_guard = self.cloud_dl_monitor.read().await;
+        if let Some(monitor) = monitor_guard.as_ref() {
+            let user_auth = self.current_user.read().await.clone();
+            if let Some(user) = user_auth {
+                match NetdiskClient::new_with_proxy(
+                    user,
+                    proxy,
+                    Some(Arc::clone(&self.fallback_mgr)),
+                ) {
+                    Ok(new_client) => {
+                        monitor.update_client(new_client);
+                    }
+                    Err(e) => {
+                        tracing::warn!("CloudDlMonitor NetdiskClient 热更新失败: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn update_folder_download_manager(&self, proxy: Option<&ProxyConfig>) {
+        let user_auth = self.current_user.read().await.clone();
+        if let Some(user) = user_auth {
+            match NetdiskClient::new_with_proxy(
+                user,
+                proxy,
+                Some(Arc::clone(&self.fallback_mgr)),
+            ) {
+                Ok(new_client) => {
+                    self.folder_download_manager
+                        .set_netdisk_client(Arc::new(new_client))
+                        .await;
+                    info!("✓ FolderDownloadManager NetdiskClient 已热更新");
+                }
+                Err(e) => {
+                    tracing::warn!("FolderDownloadManager NetdiskClient 热更新失败: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn update_autobackup_manager(&self, proxy: Option<&ProxyConfig>) {
+        if let Some(ref mgr) = *self.autobackup_manager.read().await {
+            mgr.update_proxy_config(proxy);
+        }
+    }
+}

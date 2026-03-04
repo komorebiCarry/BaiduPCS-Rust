@@ -100,13 +100,13 @@ impl BackupRecordManager {
 
         // 创建上传记录索引
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_records_lookup 
+            "CREATE INDEX IF NOT EXISTS idx_upload_records_lookup
              ON upload_records(config_id, relative_path, file_name)",
             [],
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_upload_records_dedup 
+            "CREATE INDEX IF NOT EXISTS idx_upload_records_dedup
              ON upload_records(config_id, file_size, head_md5)",
             [],
         )?;
@@ -135,7 +135,7 @@ impl BackupRecordManager {
 
         // 创建下载记录索引
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_download_records_lookup 
+            "CREATE INDEX IF NOT EXISTS idx_download_records_lookup
              ON download_records(config_id, remote_path, file_name)",
             [],
         )?;
@@ -169,13 +169,13 @@ impl BackupRecordManager {
 
         // 创建快照索引
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_snapshots_lookup 
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_lookup
              ON encryption_snapshots(config_id, original_path, original_name)",
             [],
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_snapshots_encrypted 
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_encrypted
              ON encryption_snapshots(encrypted_name)",
             [],
         )?;
@@ -213,8 +213,8 @@ impl BackupRecordManager {
 
         let result: Option<(i32, Option<String>)> = conn
             .query_row(
-                "SELECT 1, full_md5 FROM upload_records 
-                 WHERE config_id = ?1 AND relative_path = ?2 AND file_name = ?3 
+                "SELECT 1, full_md5 FROM upload_records
+                 WHERE config_id = ?1 AND relative_path = ?2 AND file_name = ?3
                  AND file_size = ?4 AND head_md5 = ?5",
                 params![config_id, relative_path, file_name, file_size as i64, head_md5],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -233,8 +233,8 @@ impl BackupRecordManager {
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT OR REPLACE INTO upload_records 
-             (config_id, relative_path, file_name, file_size, head_md5, full_md5, 
+            "INSERT OR REPLACE INTO upload_records
+             (config_id, relative_path, file_name, file_size, head_md5, full_md5,
               remote_path, encrypted, encrypted_name, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
@@ -263,8 +263,8 @@ impl BackupRecordManager {
         let mut count = 0;
         for record in records {
             tx.execute(
-                "INSERT OR REPLACE INTO upload_records 
-                 (config_id, relative_path, file_name, file_size, head_md5, full_md5, 
+                "INSERT OR REPLACE INTO upload_records
+                 (config_id, relative_path, file_name, file_size, head_md5, full_md5,
                   remote_path, encrypted, encrypted_name, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
@@ -291,7 +291,7 @@ impl BackupRecordManager {
     pub fn delete_upload_record(&self, config_id: &str, relative_path: &str, file_name: &str) -> Result<bool> {
         let conn = self.get_conn()?;
         let rows = conn.execute(
-            "DELETE FROM upload_records 
+            "DELETE FROM upload_records
              WHERE config_id = ?1 AND relative_path = ?2 AND file_name = ?3",
             params![config_id, relative_path, file_name],
         )?;
@@ -323,8 +323,8 @@ impl BackupRecordManager {
 
         let exists: bool = conn
             .query_row(
-                "SELECT 1 FROM download_records 
-                 WHERE config_id = ?1 AND remote_path = ?2 AND file_name = ?3 
+                "SELECT 1 FROM download_records
+                 WHERE config_id = ?1 AND remote_path = ?2 AND file_name = ?3
                  AND file_size = ?4 AND fs_id = ?5",
                 params![config_id, remote_path, file_name, file_size as i64, fs_id],
                 |_| Ok(true),
@@ -341,8 +341,8 @@ impl BackupRecordManager {
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT OR REPLACE INTO download_records 
-             (config_id, remote_path, file_name, file_size, fs_id, local_path, 
+            "INSERT OR REPLACE INTO download_records
+             (config_id, remote_path, file_name, file_size, fs_id, local_path,
               encrypted, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
@@ -369,8 +369,8 @@ impl BackupRecordManager {
         let mut count = 0;
         for record in records {
             tx.execute(
-                "INSERT OR REPLACE INTO download_records 
-                 (config_id, remote_path, file_name, file_size, fs_id, local_path, 
+                "INSERT OR REPLACE INTO download_records
+                 (config_id, remote_path, file_name, file_size, fs_id, local_path,
                   encrypted, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                 params![
@@ -399,8 +399,8 @@ impl BackupRecordManager {
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT OR REPLACE INTO encryption_snapshots 
-             (config_id, original_path, original_name, encrypted_name, file_size, 
+            "INSERT OR REPLACE INTO encryption_snapshots
+             (config_id, original_path, original_name, encrypted_name, file_size,
               nonce, algorithm, version, key_version, remote_path, status, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
             params![
@@ -428,7 +428,7 @@ impl BackupRecordManager {
 
         let result = conn
             .query_row(
-                "SELECT config_id, original_path, original_name, encrypted_name, 
+                "SELECT config_id, original_path, original_name, encrypted_name,
                         file_size, nonce, algorithm, version, key_version, remote_path, is_directory, status
                  FROM encryption_snapshots
                  WHERE encrypted_name = ?1",
@@ -518,8 +518,8 @@ impl BackupRecordManager {
         let now = Utc::now().to_rfc3339();
 
         let rows = conn.execute(
-            "UPDATE encryption_snapshots 
-             SET nonce = ?1, algorithm = ?2, version = ?3, status = 'completed', updated_at = ?4 
+            "UPDATE encryption_snapshots
+             SET nonce = ?1, algorithm = ?2, version = ?3, status = 'completed', updated_at = ?4
              WHERE encrypted_name = ?5",
             params![nonce, algorithm, version, now, encrypted_name],
         )?;
@@ -879,6 +879,18 @@ pub fn calculate_head_md5(path: &Path) -> Result<String> {
 
     let digest = md5::compute(&buffer);
     Ok(format!("{:x}", digest))
+}
+
+/// 异步计算文件头 MD5（前 128KB）
+pub async fn calculate_head_md5_async(path: &Path) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    const HEAD_SIZE: usize = 128 * 1024;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0u8; HEAD_SIZE];
+    let n = file.read(&mut buffer).await?;
+    buffer.truncate(n);
+    Ok(format!("{:x}", md5::compute(&buffer)))
 }
 
 /// 计算完整文件 MD5

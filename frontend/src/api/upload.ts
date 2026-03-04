@@ -126,6 +126,37 @@ export async function clearFailed(): Promise<number> {
   return apiClient.post('/uploads/clear/failed')
 }
 
+// ============================================
+// 批量操作相关类型和函数
+// ============================================
+
+export interface BatchOperationRequest {
+  task_ids?: string[]
+  all?: boolean
+}
+
+export interface BatchOperationResponse {
+  total: number
+  success_count: number
+  failed_count: number
+  results: { task_id: string; success: boolean; error?: string }[]
+}
+
+/** 批量暂停上传 */
+export async function batchPauseUploads(req: BatchOperationRequest): Promise<BatchOperationResponse> {
+  return apiClient.post('/uploads/batch/pause', req)
+}
+
+/** 批量恢复上传 */
+export async function batchResumeUploads(req: BatchOperationRequest): Promise<BatchOperationResponse> {
+  return apiClient.post('/uploads/batch/resume', req)
+}
+
+/** 批量删除上传 */
+export async function batchDeleteUploads(req: BatchOperationRequest): Promise<BatchOperationResponse> {
+  return apiClient.post('/uploads/batch/delete', req)
+}
+
 /**
  * 计算上传进度百分比
  */

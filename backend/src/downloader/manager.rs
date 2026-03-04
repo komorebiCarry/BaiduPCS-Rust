@@ -1,7 +1,7 @@
 use crate::auth::UserAuth;
 use crate::autobackup::events::BackupTransferNotification;
 use crate::common::{
-    RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, StagnationConfig,
+    ProxyConfig, RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, StagnationConfig,
 };
 use crate::downloader::{
     calculate_task_max_chunks, ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo,
@@ -14,9 +14,9 @@ use crate::persistence::{
 use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
 use crate::server::websocket::WebSocketManager;
 use anyhow::{Context, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -57,12 +57,14 @@ pub struct DownloadManager {
     encryption_config_store: Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
     /// 🔥 链接级重试次数（从配置读取，传递给 TaskScheduleInfo）
     max_retries: u32,
+    /// 🔥 活跃任务计数（O(1) 查询，漂移校准每 60 秒）
+    active_count: Arc<AtomicUsize>,
 }
 
 impl DownloadManager {
     /// 创建新的下载管理器
     pub fn new(user_auth: UserAuth, download_dir: PathBuf) -> Result<Self> {
-        Self::with_config(user_auth, download_dir, 10, 5, 3)
+        Self::with_config(user_auth, download_dir, 10, 5, 3, None, None)
     }
 
     /// 使用指定配置创建下载管理器（不再需要 chunk_size 参数，引擎会自动计算）
@@ -72,6 +74,8 @@ impl DownloadManager {
         max_global_threads: usize,
         max_concurrent_tasks: usize,
         max_retries: u32,
+        proxy_config: Option<&ProxyConfig>,
+        fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
     ) -> Result<Self> {
         // 确保下载目录存在（路径验证已在配置保存时完成）
         if !download_dir.exists() {
@@ -87,7 +91,7 @@ impl DownloadManager {
             download_dir, max_global_threads, max_concurrent_tasks
         );
 
-        let engine = Arc::new(DownloadEngine::new(user_auth));
+        let engine = Arc::new(DownloadEngine::new_with_proxy(user_auth, proxy_config, fallback_mgr));
 
         let manager = Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -116,6 +120,7 @@ impl DownloadManager {
             snapshot_manager: Arc::new(RwLock::new(None)),
             encryption_config_store: Arc::new(RwLock::new(None)),
             max_retries,
+            active_count: Arc::new(AtomicUsize::new(0)),
         };
 
         // 🔥 设置槽位超时释放处理器
@@ -127,6 +132,31 @@ impl DownloadManager {
         // 🔥 设置任务完成触发器（0延迟启动等待任务）
         manager.setup_waiting_queue_trigger();
 
+        // 🔥 启动活跃计数漂移校准（每 60 秒）
+        {
+            let tasks_ref = manager.tasks.clone();
+            let counter = manager.active_count.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let tasks = tasks_ref.read().await;
+                    let mut real = 0usize;
+                    for task_arc in tasks.values() {
+                        let t = task_arc.lock().await;
+                        if matches!(t.status, TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting) {
+                            real += 1;
+                        }
+                    }
+                    drop(tasks);
+                    let stored = counter.load(Ordering::SeqCst);
+                    if stored != real {
+                        tracing::warn!("download active_count 漂移校准: {} -> {}", stored, real);
+                        counter.store(real, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+
         Ok(manager)
     }
 
@@ -136,6 +166,12 @@ impl DownloadManager {
     pub fn set_persistence_manager(&mut self, pm: Arc<Mutex<PersistenceManager>>) {
         self.persistence_manager = Some(pm);
         info!("下载管理器已设置持久化管理器");
+    }
+
+    /// 热更新代理配置（由 update_config handler 调用）
+    /// 直接通过 self.engine 调用 DownloadEngine 的方法，无需中间引用
+    pub fn update_proxy_config(&self, new_proxy: Option<&ProxyConfig>) {
+        self.engine.update_proxy_and_rebuild_client(new_proxy);
     }
 
     /// 🔥 设置 WebSocket 管理器
@@ -283,6 +319,9 @@ impl DownloadManager {
 
         let task_arc = Arc::new(Mutex::new(task));
         self.tasks.write().await.insert(task_id.clone(), task_arc);
+
+        // 🔥 活跃计数 +1（新建任务为 Pending）
+        self.inc_active();
 
         // 🔥 发送任务创建事件
         self.publish_event(DownloadEvent::Created {
@@ -830,7 +869,7 @@ impl DownloadManager {
 
                     // 为速度异常检测保存需要的引用
                     let url_health_for_detection = url_health.clone();
-                    let client_for_detection = client.clone();
+                    let client_for_detection = client.read().unwrap().clone();
                     let cancellation_token_for_detection = cancellation_token.clone();
                     let chunk_scheduler_for_detection = chunk_scheduler.clone();
 
@@ -874,6 +913,8 @@ impl DownloadManager {
                         manager_tasks: Some(tasks_clone.clone()),
                         // 🔥 链接级重试次数（从配置读取）
                         max_retries,
+                        // 🔥 代理故障回退管理器
+                        fallback_mgr: engine.fallback_mgr.clone(),
                     };
 
                     // 注册到调度器
@@ -1402,7 +1443,7 @@ impl DownloadManager {
 
                                             // 为速度异常检测保存需要的引用
                                             let url_health_for_detection = url_health.clone();
-                                            let client_for_detection = client.clone();
+                                            let client_for_detection = client.read().unwrap().clone();
                                             let cancellation_token_for_detection =
                                                 cancellation_token.clone();
                                             let chunk_scheduler_for_detection =
@@ -1451,6 +1492,8 @@ impl DownloadManager {
                                                 manager_tasks: Some(tasks_clone.clone()),
                                                 // 🔥 链接级重试次数（从配置读取）
                                                 max_retries,
+                                                // 🔥 代理故障回退管理器
+                                                fallback_mgr: engine_clone.fallback_mgr.clone(),
                                             };
 
                                             // 注册任务到调度器
@@ -1578,6 +1621,8 @@ impl DownloadManager {
                     let mut t = task.lock().await;
                     t.status = crate::downloader::TaskStatus::Failed;
                     t.error = Some("槽位超时释放：任务长时间无进度更新，可能已卡住".to_string());
+                    // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
+                    t.slot_id = None;
 
                     // 发送 WebSocket 通知
                     let ws_guard = ws_manager.read().await;
@@ -1924,7 +1969,7 @@ impl DownloadManager {
                                             );
 
                                             let url_health_for_detection = url_health.clone();
-                                            let client_for_detection = client.clone();
+                                            let client_for_detection = client.read().unwrap().clone();
                                             let cancellation_token_for_detection =
                                                 cancellation_token.clone();
                                             let chunk_scheduler_for_detection =
@@ -1973,6 +2018,8 @@ impl DownloadManager {
                                                 manager_tasks: Some(tasks_clone.clone()),
                                                 // 🔥 链接级重试次数（从配置读取）
                                                 max_retries,
+                                                // 🔥 代理故障回退管理器
+                                                fallback_mgr: engine_clone.fallback_mgr.clone(),
                                             };
 
                                             match chunk_scheduler_clone
@@ -2171,6 +2218,9 @@ impl DownloadManager {
 
         info!("暂停下载任务: {}", task_id);
         drop(t);
+
+        // 🔥 活跃计数 -1（Downloading → Paused）
+        self.dec_active();
 
         // 从调度器取消任务
         self.chunk_scheduler.cancel_task(task_id).await;
@@ -2743,7 +2793,7 @@ impl DownloadManager {
         info!("被抢占的备份任务 {} 已暂停", task_id);
     }
 
-    /// 恢复下载任务
+    /// 恢复下载任务（支持从 Paused 或 Failed 状态恢复）
     pub async fn resume_task(&self, task_id: &str) -> Result<()> {
         let task = self
             .tasks
@@ -2756,25 +2806,34 @@ impl DownloadManager {
         let old_status;
         let is_backup;
 
-        // 检查任务状态并将 Paused 改回 Pending
+        // 检查任务状态并将 Paused/Failed 改回 Pending
 
         {
             let mut t = task.lock().await;
-            if t.status != TaskStatus::Paused {
-                anyhow::bail!("任务未暂停，当前状态: {:?}", t.status);
+            match t.status {
+                TaskStatus::Paused => {
+                    old_status = "paused".to_string();
+                }
+                TaskStatus::Failed => {
+                    // 🔥 允许从失败状态重试：重置错误信息
+                    old_status = "failed".to_string();
+                    t.error = None;
+                }
+                _ => {
+                    anyhow::bail!("任务当前状态不支持恢复: {:?}", t.status);
+                }
             }
 
-            // 🔥 保存旧状态
-            old_status = format!("{:?}", t.status).to_lowercase();
-
             // 将状态改回 Pending，准备重新启动
-            // 注意：这里不能用 mark_downloading，因为还没获得资源
             t.status = TaskStatus::Pending;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
         }
 
         info!("用户请求恢复下载任务: {}", task_id);
+
+        // 🔥 活跃计数 +1（Paused/Failed → Pending）
+        self.inc_active();
 
         // 🔥 发送状态变更事件
         self.publish_event(DownloadEvent::StatusChanged {
@@ -2984,6 +3043,9 @@ impl DownloadManager {
 
         info!("重新入队暂停任务: {} (group: {:?}, is_backup: {}), 已清除槽位信息", task_id, group_id, is_backup);
 
+        // 🔥 活跃计数 +1（Paused → Pending）
+        self.inc_active();
+
         // 🔥 使用优先级方法加入等待队列
         // 备份任务加入队列末尾，非备份任务根据是否为文件夹子任务决定位置
         let is_folder_subtask = group_id.is_some();
@@ -3014,15 +3076,24 @@ impl DownloadManager {
 
         // 🔥 立即更新任务状态为 Paused（表示已停止）
         // 这样 folder_manager 就不会等待30秒超时
-        {
+        let was_active = {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(task_id) {
                 let mut t = task.lock().await;
                 if t.status == TaskStatus::Downloading || t.status == TaskStatus::Pending {
                     t.mark_paused(); // 立即标记为暂停
                     info!("任务 {} 状态已更新为 Paused（取消中）", task_id);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
             }
+        };
+
+        if was_active {
+            self.dec_active();
         }
 
         // 从调度器取消任务（已注册的任务）
@@ -3040,23 +3111,27 @@ impl DownloadManager {
     }
 
     pub async fn delete_task(&self, task_id: &str, delete_file: bool) -> Result<()> {
-        // 🔥 在删除前获取 group_id 和 is_backup（用于事件通知）
-        let (group_id, is_backup) = {
+        // 🔥 在删除前获取 group_id、is_backup 和活跃状态（用于事件通知和计数）
+        let (group_id, is_backup, was_active) = {
             let tasks = self.tasks.read().await;
             if let Some(task_arc) = tasks.get(task_id) {
                 let t = task_arc.lock().await;
-                (t.group_id.clone(), t.is_backup)
+                let active = matches!(
+                    t.status,
+                    TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
+                );
+                (t.group_id.clone(), t.is_backup, active)
             } else {
                 // 任务不在内存，尝试从持久化管理器读取
                 if let Some(ref pm) = self.persistence_manager {
                     let pm_guard = pm.lock().await;
                     if let Some(metadata) = pm_guard.get_history_task(task_id) {
-                        (metadata.group_id.clone(), metadata.is_backup)
+                        (metadata.group_id.clone(), metadata.is_backup, false)
                     } else {
-                        (None, false)
+                        (None, false, false)
                     }
                 } else {
-                    (None, false)
+                    (None, false, false)
                 }
             }
         };
@@ -3110,6 +3185,11 @@ impl DownloadManager {
         let removed_task = self.tasks.write().await.remove(task_id);
         let mut local_path = None;
         let mut status_completed = None;
+
+        // 🔥 活跃计数 -1（删除活跃任务）
+        if was_active && removed_task.is_some() {
+            self.dec_active();
+        }
 
         if let Some(task) = removed_task {
             let t = task.lock().await;
@@ -3187,6 +3267,149 @@ impl DownloadManager {
 
         // 尝试启动等待队列中的任务
         self.try_start_waiting_tasks().await;
+
+        Ok(())
+    }
+
+    /// 批量删除下载任务（用于自动备份取消等场景）
+    ///
+    /// 与逐个调用 delete_task 相比，此方法：
+    /// - 一次性清理 waiting_queue（O(n) 而非 O(n²)）
+    /// - 跳过每个任务的 100ms sleep
+    /// - 仅在所有任务删除完成后调用一次 try_start_waiting_tasks
+    pub async fn batch_delete_tasks(&self, task_ids: &[String], delete_file: bool) -> (usize, usize) {
+        if task_ids.is_empty() {
+            return (0, 0);
+        }
+
+        let id_set: HashSet<&str> = task_ids.iter().map(|s| s.as_str()).collect();
+
+        // 1. 一次性从 waiting_queue 移除所有目标任务
+        {
+            let mut queue = self.waiting_queue.write().await;
+            queue.retain(|id| !id_set.contains(id.as_str()));
+        }
+
+        // 2. 批量取消所有任务的 cancellation token
+        {
+            let tokens = self.cancellation_tokens.read().await;
+            for task_id in task_ids {
+                if let Some(token) = tokens.get(task_id.as_str()) {
+                    token.cancel();
+                }
+            }
+        }
+
+        // 等待一次让所有任务有机会清理
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // 批量移除 cancellation tokens
+        {
+            let mut tokens = self.cancellation_tokens.write().await;
+            for task_id in task_ids {
+                tokens.remove(task_id.as_str());
+            }
+        }
+
+        // 3. 逐个处理任务删除（释放槽位、移除、清理文件）
+        let mut success = 0usize;
+        let mut failed = 0usize;
+
+        for task_id in task_ids {
+            if let Err(e) = self.delete_task_internal(task_id, delete_file).await {
+                tracing::debug!("批量删除下载任务失败: task={}, error={}", task_id, e);
+                failed += 1;
+            } else {
+                success += 1;
+            }
+        }
+
+        // 4. 所有任务删除完成后，仅调用一次 try_start_waiting_tasks
+        self.try_start_waiting_tasks().await;
+
+        (success, failed)
+    }
+
+    /// 删除单个下载任务的内部实现（不触发 waiting_queue 清理、sleep 和 try_start_waiting_tasks）
+    async fn delete_task_internal(&self, task_id: &str, delete_file: bool) -> Result<()> {
+        // 获取任务信息
+        let (group_id, is_backup, was_active) = {
+            let tasks = self.tasks.read().await;
+            if let Some(task_arc) = tasks.get(task_id) {
+                let t = task_arc.lock().await;
+                let active = matches!(
+                    t.status,
+                    TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
+                );
+                (t.group_id.clone(), t.is_backup, active)
+            } else {
+                (None, false, false)
+            }
+        };
+
+        // 从调度器取消
+        self.chunk_scheduler.cancel_task(task_id).await;
+
+        // 释放槽位
+        let (slot_id_to_release, is_borrowed) = {
+            let tasks = self.tasks.read().await;
+            if let Some(task_arc) = tasks.get(task_id) {
+                let t = task_arc.lock().await;
+                (t.slot_id, t.is_borrowed_slot)
+            } else {
+                (None, false)
+            }
+        };
+
+        if let Some(_slot_id) = slot_id_to_release {
+            if !is_borrowed {
+                self.task_slot_pool.release_fixed_slot(task_id).await;
+            }
+        }
+
+        // 移除任务
+        let removed_task = self.tasks.write().await.remove(task_id);
+        let mut local_path = None;
+        let mut status_completed = None;
+
+        if was_active && removed_task.is_some() {
+            self.dec_active();
+        }
+
+        if let Some(task) = removed_task {
+            let t = task.lock().await;
+            local_path = Some(t.local_path.clone());
+            status_completed = Some(t.status == TaskStatus::Completed);
+            drop(t);
+        }
+
+        // 决定是否删除本地文件
+        let should_delete = match status_completed {
+            Some(true) => delete_file,
+            Some(false) => true,
+            None => delete_file,
+        };
+
+        if let Some(path) = local_path {
+            if should_delete && path.exists() {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+
+        // 清理持久化文件
+        if let Some(ref pm) = self.persistence_manager {
+            if let Err(e) = pm.lock().await.on_task_deleted(task_id) {
+                warn!("清理任务持久化文件失败: {}", e);
+            }
+        }
+
+        // 发送删除事件（备份任务会被 publish_event 跳过）
+        self.publish_event(DownloadEvent::Deleted {
+            task_id: task_id.to_string(),
+            group_id,
+            is_backup,
+        })
+            .await;
 
         Ok(())
     }
@@ -3345,6 +3568,24 @@ impl DownloadManager {
         }
     }
 
+    /// 获取活跃任务数（O(1)）
+    pub fn active_task_count(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+
+    /// 活跃计数 +1
+    fn inc_active(&self) {
+        self.active_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 活跃计数 -1
+    fn dec_active(&self) {
+        let prev = self.active_count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 0 {
+            self.active_count.store(0, Ordering::SeqCst);
+        }
+    }
+
     /// 获取所有任务（包括当前任务和历史任务，排除备份任务）
     pub async fn get_all_tasks(&self) -> Vec<DownloadTask> {
         let tasks = self.tasks.read().await;
@@ -3465,6 +3706,9 @@ impl DownloadManager {
 
         let task_arc = Arc::new(Mutex::new(task));
         self.tasks.write().await.insert(task_id.clone(), task_arc);
+
+        // 🔥 活跃计数 +1（新建备份任务为 Pending）
+        self.inc_active();
 
         // 🔥 发送任务创建事件（备份任务，is_backup=true）
         self.publish_event(DownloadEvent::Created {
@@ -3631,6 +3875,149 @@ impl DownloadManager {
 
         info!("清除了 {} 个失败的任务", count);
         count
+    }
+
+    // ==================== 批量操作方法 ====================
+
+    /// 批量暂停下载任务
+    ///
+    /// 🔥 修复：全部暂停时，等待队列中的非备份任务也会被暂停，防止暂停后队列任务继续启动
+    /// 自动备份任务不受影响，仍保留在等待队列中
+    pub async fn batch_pause(&self, task_ids: &[String]) -> Vec<(String, bool, Option<String>)> {
+        let mut results = Vec::with_capacity(task_ids.len());
+
+        // 🔥 第一步：暂停等待队列中的非备份 Pending 任务
+        let mut pending_paused: Vec<String> = Vec::new();
+        for id in task_ids {
+            let task = self.tasks.read().await.get(id).cloned();
+            if let Some(task) = task {
+                let mut t = task.lock().await;
+                if t.status == TaskStatus::Pending && !t.is_backup {
+                    let group_id = t.group_id.clone();
+                    let is_backup = t.is_backup;
+                    t.mark_paused();
+                    drop(t);
+
+                    self.dec_active();
+
+                    // 移除取消令牌（如果有）
+                    self.cancellation_tokens.write().await.remove(id);
+
+                    // 持久化暂停状态
+                    if let Some(ref pm) = self.persistence_manager {
+                        use crate::persistence::types::TaskPersistenceStatus;
+                        if let Err(e) = crate::persistence::metadata::update_metadata(
+                            &pm.lock().await.wal_dir(),
+                            id,
+                            |m| {
+                                m.set_status(TaskPersistenceStatus::Paused);
+                            },
+                        ) {
+                            warn!("持久化暂停状态失败: {}", e);
+                        }
+                    }
+
+                    self.publish_event(DownloadEvent::StatusChanged {
+                        task_id: id.to_string(),
+                        old_status: "pending".to_string(),
+                        new_status: "paused".to_string(),
+                        group_id: group_id.clone(),
+                        is_backup,
+                    })
+                        .await;
+
+                    self.publish_event(DownloadEvent::Paused {
+                        task_id: id.to_string(),
+                        group_id,
+                        is_backup,
+                    })
+                        .await;
+
+                    pending_paused.push(id.clone());
+                    results.push((id.clone(), true, None));
+                }
+            }
+        }
+
+        // 🔥 从等待队列中批量移除已暂停的任务（一次写锁，O(n)）
+        if !pending_paused.is_empty() {
+            let paused_set: std::collections::HashSet<&String> = pending_paused.iter().collect();
+            let mut queue = self.waiting_queue.write().await;
+            queue.retain(|id| !paused_set.contains(id));
+            info!("批量暂停：从等待队列移除 {} 个非备份 Pending 任务", pending_paused.len());
+        }
+
+        // 🔥 第二步：暂停活跃任务（Downloading），跳过已处理的 Pending 任务
+        let paused_set: std::collections::HashSet<&String> = pending_paused.iter().collect();
+        for id in task_ids {
+            if paused_set.contains(id) {
+                continue;
+            }
+            match self.pause_task(id, true).await {
+                Ok(_) => results.push((id.clone(), true, None)),
+                Err(e) => results.push((id.clone(), false, Some(e.to_string()))),
+            }
+        }
+
+        self.try_start_waiting_tasks().await;
+        results
+    }
+
+    /// 批量恢复下载任务
+    pub async fn batch_resume(&self, task_ids: &[String]) -> Vec<(String, bool, Option<String>)> {
+        let mut results = Vec::with_capacity(task_ids.len());
+        for id in task_ids {
+            match self.resume_task(id).await {
+                Ok(_) => results.push((id.clone(), true, None)),
+                Err(e) => results.push((id.clone(), false, Some(e.to_string()))),
+            }
+        }
+        results
+    }
+
+    /// 批量删除下载任务
+    pub async fn batch_delete(&self, task_ids: &[String], delete_files: bool) -> Vec<(String, bool, Option<String>)> {
+        let mut results = Vec::with_capacity(task_ids.len());
+        for id in task_ids {
+            match self.delete_task(id, delete_files).await {
+                Ok(_) => results.push((id.clone(), true, None)),
+                Err(e) => results.push((id.clone(), false, Some(e.to_string()))),
+            }
+        }
+        results
+    }
+
+    /// 获取可暂停的任务ID列表
+    pub async fn get_pausable_task_ids(&self) -> Vec<String> {
+        let tasks = self.tasks.read().await;
+        let mut ids = Vec::new();
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            // 🔥 只返回非备份任务（下载管理页面不应操作自动备份任务）
+            if !t.is_backup && matches!(t.status, TaskStatus::Downloading | TaskStatus::Pending) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// 获取可恢复的任务ID列表
+    pub async fn get_resumable_task_ids(&self) -> Vec<String> {
+        let tasks = self.tasks.read().await;
+        let mut ids = Vec::new();
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            // 🔥 只返回非备份任务（下载管理页面不应操作自动备份任务）
+            if !t.is_backup && matches!(t.status, TaskStatus::Paused | TaskStatus::Failed) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// 获取所有任务ID列表（用于批量删除）
+    pub async fn get_all_task_ids(&self) -> Vec<String> {
+        self.tasks.read().await.keys().cloned().collect()
     }
 
     /// 获取下载目录

@@ -1,6 +1,7 @@
 // 认证API处理器
 
 use crate::auth::{QRCode, QRCodeStatus};
+use crate::common::ProxyType;
 use crate::server::AppState;
 use crate::transfer::TransferManager;
 use crate::uploader::UploadManager;
@@ -52,7 +53,7 @@ pub async fn generate_qrcode(
 ) -> Result<Json<ApiResponse<QRCode>>, StatusCode> {
     info!("API: 生成登录二维码");
 
-    match state.qrcode_auth.generate_qrcode().await {
+    match state.qrcode_auth.read().await.generate_qrcode().await {
         Ok(qrcode) => {
             info!("二维码生成成功: sign={}", qrcode.sign);
             Ok(Json(ApiResponse::success(qrcode)))
@@ -91,7 +92,7 @@ pub async fn qrcode_status(
                 user.uid
             );
 
-            match state.qrcode_auth.verify_bduss(&user.bduss).await {
+            match state.qrcode_auth.read().await.verify_bduss(&user.bduss).await {
                 Ok(true) => {
                     info!("✅ BDUSS 仍然有效，直接返回登录成功状态");
 
@@ -124,7 +125,7 @@ pub async fn qrcode_status(
         }
     }
 
-    match state.qrcode_auth.poll_status(&params.sign).await {
+    match state.qrcode_auth.read().await.poll_status(&params.sign).await {
         Ok(status) => {
             // 如果登录成功，保存会话并初始化用户资源
             if let QRCodeStatus::Success { ref user, .. } = status {
@@ -150,7 +151,25 @@ pub async fn qrcode_status(
                 *state.current_user.write().await = Some(user.clone());
 
                 // 初始化网盘客户端
-                let client = match crate::netdisk::NetdiskClient::new(user.clone()) {
+                let config_guard = state.config.read().await;
+                let proxy_config = if config_guard.network.proxy.proxy_type != ProxyType::None {
+                    Some(config_guard.network.proxy.clone())
+                } else {
+                    None
+                };
+                drop(config_guard);
+
+                // 设置代理回退管理器的用户代理配置
+                state.fallback_mgr
+                    .set_user_proxy_config(proxy_config.clone())
+                    .await;
+
+                let fallback_for_client = if proxy_config.is_some() {
+                    Some(Arc::clone(&state.fallback_mgr))
+                } else {
+                    None
+                };
+                let client = match crate::netdisk::NetdiskClient::new_with_proxy(user.clone(), proxy_config.as_ref(), fallback_for_client.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("初始化网盘客户端失败: {}", e);
@@ -205,6 +224,8 @@ pub async fn qrcode_status(
                     max_global_threads,
                     max_concurrent_tasks,
                     max_retries,
+                    proxy_config.as_ref(),
+                    fallback_for_client,
                 ) {
                     Ok(mut manager) => {
                         // 设置持久化管理器
@@ -275,7 +296,7 @@ pub async fn qrcode_status(
 
                         // 初始化转存管理器
                         let transfer_manager = TransferManager::new(
-                            Arc::new(client),
+                            Arc::new(std::sync::RwLock::new(client)),
                             transfer_config,
                             Arc::clone(&state.config),
                         );
@@ -353,7 +374,7 @@ pub async fn get_current_user(
             info!("✅ 找到会话: UID={}, 用户名={}", user.uid, user.username);
 
             // 验证 BDUSS 是否仍然有效
-            match state.qrcode_auth.verify_bduss(&user.bduss).await {
+            match state.qrcode_auth.read().await.verify_bduss(&user.bduss).await {
                 Ok(true) => {
                     // BDUSS 有效，检查客户端是否已初始化
                     info!("BDUSS 验证通过");

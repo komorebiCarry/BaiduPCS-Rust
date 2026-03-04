@@ -816,6 +816,64 @@ impl CloudDlEvent {
     }
 }
 
+/// 扫描事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum ScanEvent {
+    Started {
+        scan_task_id: String,
+        local_folder: String,
+        remote_folder: String,
+    },
+    Progress {
+        scan_task_id: String,
+        scanned_files: usize,
+        scanned_dirs: usize,
+        current_path: String,
+        created_tasks: usize,
+        skipped_duplicates: usize,
+        total_size: u64,
+    },
+    Completed {
+        scan_task_id: String,
+        total_files: usize,
+        total_size: u64,
+        created_tasks: usize,
+        skipped_duplicates: usize,
+    },
+    Failed {
+        scan_task_id: String,
+        error: String,
+    },
+}
+
+impl ScanEvent {
+    pub fn task_id(&self) -> &str {
+        match self {
+            ScanEvent::Started { scan_task_id, .. } => scan_task_id,
+            ScanEvent::Progress { scan_task_id, .. } => scan_task_id,
+            ScanEvent::Completed { scan_task_id, .. } => scan_task_id,
+            ScanEvent::Failed { scan_task_id, .. } => scan_task_id,
+        }
+    }
+
+    pub fn priority(&self) -> EventPriority {
+        match self {
+            ScanEvent::Progress { .. } => EventPriority::Low,
+            _ => EventPriority::High,
+        }
+    }
+
+    pub fn event_type_name(&self) -> &'static str {
+        match self {
+            ScanEvent::Started { .. } => "scan_started",
+            ScanEvent::Progress { .. } => "scan_progress",
+            ScanEvent::Completed { .. } => "scan_completed",
+            ScanEvent::Failed { .. } => "scan_failed",
+        }
+    }
+}
+
 /// 统一任务事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "category", content = "event")]
@@ -838,6 +896,9 @@ pub enum TaskEvent {
     /// 离线下载事件
     #[serde(rename = "cloud_dl")]
     CloudDl(CloudDlEvent),
+    /// 扫描事件
+    #[serde(rename = "scan")]
+    Scan(ScanEvent),
 }
 
 impl TaskEvent {
@@ -854,6 +915,7 @@ impl TaskEvent {
                 // 实际 task_id 通过 task_id_string() 方法获取
                 "cloud_dl"
             }
+            TaskEvent::Scan(e) => e.task_id(),
         }
     }
 
@@ -874,6 +936,7 @@ impl TaskEvent {
             TaskEvent::Transfer(e) => e.priority(),
             TaskEvent::Backup(e) => e.priority(),
             TaskEvent::CloudDl(e) => e.priority(),
+            TaskEvent::Scan(e) => e.priority(),
         }
     }
 
@@ -886,6 +949,7 @@ impl TaskEvent {
             TaskEvent::Transfer(_) => "transfer",
             TaskEvent::Backup(_) => "backup",
             TaskEvent::CloudDl(_) => "cloud_dl",
+            TaskEvent::Scan(_) => "scan",
         }
     }
 
@@ -898,6 +962,7 @@ impl TaskEvent {
             TaskEvent::Transfer(e) => e.event_type_name(),
             TaskEvent::Backup(e) => e.event_type_name(),
             TaskEvent::CloudDl(e) => e.event_type_name(),
+            TaskEvent::Scan(e) => e.event_type_name(),
         }
     }
 
@@ -934,6 +999,8 @@ impl TaskEvent {
             TaskEvent::CloudDl(CloudDlEvent::StatusChanged { new_status, .. }) => {
                 *new_status == 1 // Running status
             }
+            TaskEvent::Scan(ScanEvent::Started { .. }) => true,
+            TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
             _ => false,
         }
     }
@@ -950,6 +1017,7 @@ impl TaskEvent {
             TaskEvent::Folder(_) => false,
             TaskEvent::Transfer(_) => false,
             TaskEvent::CloudDl(_) => false,
+            TaskEvent::Scan(_) => false,
         }
     }
 }

@@ -270,9 +270,19 @@ export async function getBackupTask(taskId: string): Promise<BackupTask> {
   throw new Error(response.data.error || '获取任务失败')
 }
 
-/** 获取配置的所有任务 */
-export async function listBackupTasks(configId: string): Promise<BackupTask[]> {
-  const response = await rawApiClient.get<ApiResponse<BackupTask[]>>(`/autobackup/configs/${configId}/tasks`)
+/** 任务列表分页响应 */
+export interface BackupTasksResponse {
+  tasks: BackupTask[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** 获取配置的任务列表（分页） */
+export async function listBackupTasks(configId: string, page = 1, pageSize = 20): Promise<BackupTasksResponse> {
+  const response = await rawApiClient.get<ApiResponse<BackupTasksResponse>>(`/autobackup/configs/${configId}/tasks`, {
+    params: { page, page_size: pageSize }
+  })
   if (response.data.success && response.data.data) {
     return response.data.data
   }
