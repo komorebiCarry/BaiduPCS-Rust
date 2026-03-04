@@ -20,6 +20,7 @@ pub mod error;
 pub mod events;
 pub mod persistence;
 pub mod validation;
+pub mod scan_cache;
 
 pub use common::{TempFileGuard, TempFileManager};
 pub use config::*;

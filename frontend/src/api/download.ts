@@ -559,3 +559,35 @@ export interface DownloadItemFromBackend {
 export async function getAllDownloadsMixed(): Promise<DownloadItemFromBackend[]> {
   return apiClient.get('/downloads/all')
 }
+
+// ============================================
+// 批量操作相关类型和函数
+// ============================================
+
+export interface BatchOperationRequest {
+  task_ids?: string[]
+  all?: boolean
+  delete_files?: boolean
+}
+
+export interface BatchOperationResponse {
+  total: number
+  success_count: number
+  failed_count: number
+  results: { task_id: string; success: boolean; error?: string }[]
+}
+
+/** 批量暂停下载 */
+export async function batchPauseDownloads(req: BatchOperationRequest): Promise<BatchOperationResponse> {
+  return apiClient.post('/downloads/batch/pause', req)
+}
+
+/** 批量恢复下载 */
+export async function batchResumeDownloads(req: BatchOperationRequest): Promise<BatchOperationResponse> {
+  return apiClient.post('/downloads/batch/resume', req)
+}
+
+/** 批量删除下载 */
+export async function batchDeleteDownloads(req: BatchOperationRequest): Promise<BatchOperationResponse> {
+  return apiClient.post('/downloads/batch/delete', req)
+}

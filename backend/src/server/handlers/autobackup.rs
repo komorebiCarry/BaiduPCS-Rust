@@ -150,21 +150,40 @@ pub async fn get_backup_task(
     Path(task_id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<BackupTask>>> {
     let manager = get_manager(&state).await?;
-    if let Some(task) = manager.get_task_async(&task_id).await {
+    if let Some(mut task) = manager.get_task_async(&task_id).await {
+        task.pending_upload_task_ids.clear();
+        task.pending_download_task_ids.clear();
+        task.transfer_task_map.clear();
         Ok(Json(ApiResponse::success(task)))
     } else {
         Err(not_found_error("任务不存在"))
     }
 }
 
-/// 获取配置的所有任务
+/// 获取配置的任务列表（支持分页）
 pub async fn list_backup_tasks(
     State(state): State<AppState>,
     Path(config_id): Path<String>,
-) -> ApiResult<Json<ApiResponse<Vec<BackupTask>>>> {
+    axum::extract::Query(params): axum::extract::Query<BackupTasksQuery>,
+) -> ApiResult<Json<ApiResponse<BackupTasksResponse>>> {
     let manager = get_manager(&state).await?;
-    let tasks = manager.get_tasks_by_config_async(&config_id).await;
-    Ok(Json(ApiResponse::success(tasks)))
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20);
+
+    let (mut tasks, total) = manager.list_tasks_by_config_async(&config_id, page, page_size).await;
+    // 清除大型内部追踪字段，减少响应体积
+    for task in &mut tasks {
+        task.pending_upload_task_ids.clear();
+        task.pending_download_task_ids.clear();
+        task.transfer_task_map.clear();
+        task.pending_files.clear();
+    }
+    Ok(Json(ApiResponse::success(BackupTasksResponse {
+        tasks,
+        total,
+        page,
+        page_size,
+    })))
 }
 
 /// 取消备份任务
@@ -493,6 +512,20 @@ pub struct CleanupRecordsResponse {
 }
 
 // ==================== 子任务相关数据结构 ====================
+
+#[derive(Debug, Deserialize)]
+pub struct BackupTasksQuery {
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupTasksResponse {
+    pub tasks: Vec<BackupTask>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct FileTasksQuery {

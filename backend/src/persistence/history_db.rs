@@ -1259,6 +1259,7 @@ impl HistoryDbManager {
             error_msg: row.error_msg,
             is_backup: row.is_backup.map(|v| v != 0).unwrap_or(false),
             backup_config_id: row.backup_config_id,
+            original_remote_path: None,
             // 加密字段
             encrypt_enabled: false,
             is_encrypted: false,

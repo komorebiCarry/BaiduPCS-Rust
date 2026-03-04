@@ -13,6 +13,7 @@ pub mod folder;
 pub mod health;
 pub mod manager;
 pub mod rapid_upload;
+pub mod scan_manager;
 pub mod scheduler;
 pub mod task;
 
@@ -28,6 +29,7 @@ pub use health::PcsServerHealthManager;
 pub use manager::{UploadManager, UploadTaskInfo};
 pub use rapid_upload::{RapidCheckResult, RapidUploadChecker, RapidUploadHash};
 pub use scheduler::{UploadChunkScheduler, UploadTaskScheduleInfo};
+pub use scan_manager::{ScanManager, ScanTaskInfo, ScanTaskStatus, ScanCheckpoint};
 pub use task::{UploadTask, UploadTaskStatus};
 
 /// 🔥 根据文件大小计算上传任务最大并发分片数

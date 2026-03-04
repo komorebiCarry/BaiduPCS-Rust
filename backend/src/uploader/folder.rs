@@ -7,6 +7,7 @@
 //! - 分批扫描支持（内存优化）
 
 use anyhow::{Context, Result};
+use serde::{Serialize, Deserialize};
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
@@ -26,7 +27,7 @@ pub struct ScannedFile {
 }
 
 /// 文件夹扫描配置
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanOptions {
     /// 是否跟随符号链接
     pub follow_symlinks: bool,
@@ -220,6 +221,8 @@ pub struct BatchedScanIterator {
     finished: bool,
     /// 已扫描的文件总数
     total_scanned: usize,
+    /// 已扫描的目录列表（用于检查点持久化）
+    scanned_dirs: Vec<PathBuf>,
 }
 
 impl BatchedScanIterator {
@@ -257,7 +260,51 @@ impl BatchedScanIterator {
             batch_size,
             finished: false,
             total_scanned: 0,
+            scanned_dirs: Vec::new(),
         })
+    }
+
+    /// 从检查点恢复分批扫描迭代器
+    pub fn from_checkpoint(
+        root_path: PathBuf,
+        options: ScanOptions,
+        batch_size: usize,
+        scanned_dirs: Vec<PathBuf>,
+        pending_dirs: Vec<PathBuf>,
+        current_dir: Option<PathBuf>,
+        scanned_files_count: usize,
+    ) -> Result<Self> {
+        if !root_path.exists() {
+            anyhow::bail!("扫描路径不存在: {}", root_path.display());
+        }
+        let mut dirs = VecDeque::from(pending_dirs);
+        if let Some(dir) = current_dir {
+            dirs.push_front(dir);
+        }
+        info!(
+            "从检查点恢复扫描: {}, 已扫描目录={}, 待扫描目录={}, 已扫描文件={}",
+            root_path.display(), scanned_dirs.len(), dirs.len(), scanned_files_count
+        );
+        Ok(Self {
+            pending_dirs: dirs,
+            pending_files: VecDeque::new(),
+            root_path,
+            options,
+            batch_size,
+            finished: false,
+            total_scanned: scanned_files_count,
+            scanned_dirs,
+        })
+    }
+
+    /// 获取已扫描的目录列表
+    pub fn scanned_dirs(&self) -> &[PathBuf] {
+        &self.scanned_dirs
+    }
+
+    /// 获取待扫描的目录队列
+    pub fn pending_dirs(&self) -> &VecDeque<PathBuf> {
+        &self.pending_dirs
     }
 
     /// 获取下一批文件
@@ -420,6 +467,7 @@ impl BatchedScanIterator {
             }
         }
 
+        self.scanned_dirs.push(dir_path.to_path_buf());
         Ok(())
     }
 

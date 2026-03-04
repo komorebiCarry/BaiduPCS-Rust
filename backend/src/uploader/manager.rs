@@ -30,10 +30,10 @@ use crate::uploader::{
 };
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -78,8 +78,8 @@ pub struct RestoredChunkInfo {
 
 /// 上传管理器
 pub struct UploadManager {
-    /// 网盘客户端
-    client: NetdiskClient,
+    /// 网盘客户端（共享引用，代理热更新时自动生效）
+    client: Arc<StdRwLock<NetdiskClient>>,
     /// 用户 VIP 类型
     vip_type: VipType,
     /// 所有任务（task_id -> TaskInfo）- 使用 Arc 包装以支持跨线程共享
@@ -114,6 +114,12 @@ pub struct UploadManager {
     snapshot_manager: Arc<RwLock<Option<Arc<SnapshotManager>>>>,
     /// 🔥 备份记录管理器（用于文件夹名加密映射）
     backup_record_manager: Arc<RwLock<Option<Arc<BackupRecordManager>>>>,
+    /// 去重索引：(local_path, original_remote_path) → task_id
+    dedup_index: DashMap<(PathBuf, String), String>,
+    /// 反向索引：task_id → (local_path, original_remote_path)
+    dedup_reverse: DashMap<String, (PathBuf, String)>,
+    /// 🔥 活跃任务计数器（Pending/Uploading/Encrypting/CheckingRapid），O(1) 查询
+    active_count: Arc<AtomicUsize>,
 }
 
 impl UploadManager {
@@ -213,7 +219,7 @@ impl UploadManager {
         let encryption_config_store = Arc::new(EncryptionConfigStore::new(config_dir));
 
         let manager = Self {
-            client,
+            client: Arc::new(StdRwLock::new(client)),
             vip_type,
             tasks: tasks.clone(),
             waiting_queue: waiting_queue.clone(),
@@ -230,6 +236,9 @@ impl UploadManager {
             encryption_config_store,
             snapshot_manager: Arc::new(RwLock::new(None)),
             backup_record_manager: Arc::new(RwLock::new(None)),
+            dedup_index: DashMap::new(),
+            dedup_reverse: DashMap::new(),
+            active_count: Arc::new(AtomicUsize::new(0)),
         };
 
         // 🔥 设置槽位超时释放处理器
@@ -238,6 +247,39 @@ impl UploadManager {
         // 启动后台任务：定期检查并启动等待队列中的任务
         if use_scheduler {
             manager.start_waiting_queue_monitor();
+        }
+
+        // 🔥 启动活跃计数漂移校准（每 60 秒）
+        {
+            let tasks_ref = tasks.clone();
+            let counter = manager.active_count.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let mut real = 0usize;
+                    for entry in tasks_ref.iter() {
+                        if let Ok(task) = entry.task.try_lock() {
+                            if matches!(
+                                task.status,
+                                UploadTaskStatus::Pending
+                                    | UploadTaskStatus::Uploading
+                                    | UploadTaskStatus::Encrypting
+                                    | UploadTaskStatus::CheckingRapid
+                            ) {
+                                real += 1;
+                            }
+                        }
+                    }
+                    let stored = counter.load(Ordering::SeqCst);
+                    if stored != real {
+                        tracing::warn!(
+                            "active_count 漂移校准: {} -> {}",
+                            stored, real
+                        );
+                        counter.store(real, Ordering::SeqCst);
+                    }
+                }
+            });
         }
 
         manager
@@ -249,6 +291,14 @@ impl UploadManager {
             scheduler.update_max_threads(new_max);
         }
         info!("🔧 上传管理器: 动态调整全局最大线程数为 {}", new_max);
+    }
+
+    /// 热更新网盘客户端（代理回退/恢复时调用）
+    ///
+    /// 替换共享引用内的 NetdiskClient，已调度的上传任务在下次重试时自动使用新客户端。
+    pub fn update_netdisk_client(&self, new_client: NetdiskClient) {
+        *self.client.write().unwrap() = new_client;
+        info!("✓ UploadManager NetdiskClient 已热更新");
     }
 
     /// 动态更新最大并发任务数
@@ -1279,6 +1329,7 @@ impl UploadManager {
         };
 
         self.tasks.insert(task_id.clone(), task_info);
+        self.inc_active();
 
         // 🔥 发送任务创建事件
         self.publish_event(UploadEvent::Created {
@@ -1415,13 +1466,13 @@ impl UploadManager {
     /// - 调度器模式：分配槽位后调用 start_task_internal
     /// - 独立模式：直接启动 UploadEngine 执行上传
     pub async fn start_task(&self, task_id: &str) -> Result<()> {
-        let task_info = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
+        // 🔥 从 DashMap 提取所需数据后立即释放 shard 锁，避免跨 await 持有
+        let (local_path, remote_path, total_size, is_backup, existing_slot_id, task_arc) = {
+            let task_info = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
 
-        // 检查任务状态
-        let (local_path, remote_path, total_size, is_backup, existing_slot_id) = {
             let task = task_info.task.lock().await;
             match task.status {
                 UploadTaskStatus::Pending | UploadTaskStatus::Paused => {}
@@ -1437,17 +1488,22 @@ impl UploadManager {
                     // 允许重试失败的任务
                 }
             }
-            (
+            let result = (
                 task.local_path.clone(),
                 task.remote_path.clone(),
                 task.total_size,
                 task.is_backup,
                 task.slot_id,
-            )
+                task_info.task.clone(),
+            );
+            drop(task);
+            result
+            // task_info (DashMap ref) 在此处释放
         };
 
-        // 动态获取上传服务器列表
-        match self.client.locate_upload().await {
+        // 动态获取上传服务器列表（不再持有 DashMap 锁）
+        let client_snapshot = self.client.read().unwrap().clone();
+        match client_snapshot.locate_upload().await {
             Ok(servers) => {
                 if !servers.is_empty() {
                     self.server_health.update_servers(servers);
@@ -1460,24 +1516,18 @@ impl UploadManager {
 
         // 根据模式选择启动方式
         if self.use_scheduler && self.scheduler.is_some() {
-            // 🔥 调度器模式：先分配槽位，再调用 start_task_internal
-            // 检查任务是否已有槽位（从等待队列启动时已分配）
             if existing_slot_id.is_some() {
-                // 已有槽位，直接启动（不应该发生，但作为防御性编程）
                 warn!(
                     "上传任务 {} 已有槽位 {:?}，直接启动 (is_backup={})",
                     task_id, existing_slot_id, is_backup
                 );
             } else {
-                // 🔥 槽位分配
                 let slot_allocation_result = if is_backup {
-                    // 备份任务：只能使用空闲槽位，不能抢占
                     self.task_slot_pool
                         .allocate_backup_slot(task_id)
                         .await
                         .map(|sid| (sid, None))
                 } else {
-                    // 普通任务：可以抢占备份任务的槽位
                     self.task_slot_pool
                         .allocate_fixed_slot_with_priority(task_id, false, TaskPriority::Normal)
                         .await
@@ -1485,9 +1535,9 @@ impl UploadManager {
 
                 match slot_allocation_result {
                     Some((slot_id, preempted_task_id)) => {
-                        // 分配成功，记录槽位ID到任务
+                        // 🔥 短暂获取 DashMap ref 更新槽位
                         {
-                            let mut t = task_info.task.lock().await;
+                            let mut t = task_arc.lock().await;
                             t.slot_id = Some(slot_id);
                             t.is_borrowed_slot = false;
                         }
@@ -1501,7 +1551,6 @@ impl UploadManager {
                             self.task_slot_pool.max_slots()
                         );
 
-                        // 🔥 处理被抢占的备份任务
                         if let Some(preempted_id) = preempted_task_id {
                             info!(
                                 "普通任务 {} 抢占了备份任务 {} 的槽位",
@@ -1511,27 +1560,27 @@ impl UploadManager {
                         }
                     }
                     None => {
-                        // 分配失败，加入等待队列
                         self.add_to_waiting_queue_by_priority(task_id, is_backup)
                             .await;
 
                         info!(
-                            "上传任务 {} 加入等待队列（无可用槽位, is_backup={}）(已用槽位: {}/{})",
+                            "上传任务 {} 加入等待队列（无可用槽位, is_backup={}）(已用槽位: {}/{}, 等待队列长度: {})",
                             task_id,
                             is_backup,
                             self.task_slot_pool.used_slots().await,
-                            self.task_slot_pool.max_slots()
+                            self.task_slot_pool.max_slots(),
+                            self.waiting_queue.read().await.len()
                         );
                         return Ok(());
                     }
                 }
             }
 
-            // 🔥 槽位分配成功，调用 start_task_internal 执行实际启动
-            self.start_task_internal(task_id, &task_info, local_path, remote_path, total_size)
+            // 🔥 不再传递 DashMap ref
+            self.start_task_internal(task_id, local_path, remote_path, total_size)
                 .await
         } else {
-            self.start_task_standalone(task_id, &task_info).await
+            self.start_task_standalone(task_id).await
         }
     }
 
@@ -1546,14 +1595,16 @@ impl UploadManager {
     async fn start_task_internal(
         &self,
         task_id: &str,
-        task_info: &dashmap::mapref::one::Ref<'_, String, UploadTaskInfo>,
         local_path: PathBuf,
         remote_path: String,
         total_size: u64,
     ) -> Result<()> {
         let scheduler = self.scheduler.as_ref().unwrap();
 
-        // 🔥 检查任务是否有槽位（必须有槽位才能启动）
+        // 🔥 从 DashMap 获取任务信息并立即克隆所需字段，避免长时间持有 shard 锁
+        let task_info = self.tasks.get(task_id)
+            .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
+
         let (is_backup, has_slot) = {
             let t = task_info.task.lock().await;
             (t.is_backup, t.slot_id.is_some())
@@ -1575,7 +1626,7 @@ impl UploadManager {
             task_id, is_backup
         );
 
-        // 克隆需要的数据
+        // 克隆需要的数据（从 task_info 中提取，然后立即释放 DashMap shard 锁）
         let task = task_info.task.clone();
         let cancel_token = task_info.cancel_token.clone();
         let is_paused = task_info.is_paused.clone();
@@ -1584,6 +1635,11 @@ impl UploadManager {
         let uploaded_bytes = task_info.uploaded_bytes.clone();
         let last_speed_time = task_info.last_speed_time.clone();
         let last_speed_bytes = task_info.last_speed_bytes.clone();
+        let restored_upload_id = task_info.restored_upload_id.clone();
+        let restored_completed_chunks = task_info.restored_completed_chunks.clone();
+        // 🔥 立即释放 DashMap shard 锁，避免跨 await 持有
+        drop(task_info);
+
         let server_health = self.server_health.clone();
         let client = self.client.clone();
         let scheduler = scheduler.clone();
@@ -1591,24 +1647,14 @@ impl UploadManager {
         let vip_type = self.vip_type;
         let task_slot_pool = self.task_slot_pool.clone();
         let persistence_manager = self.persistence_manager.lock().await.clone();
-        // 🔥 检查是否有恢复的 upload_id
-        let restored_upload_id = task_info.restored_upload_id.clone();
-        // 🔥 获取恢复的分片信息（用于延迟创建分片管理器）
-        let restored_completed_chunks = task_info.restored_completed_chunks.clone();
-        // 🔥 获取 WebSocket 管理器
         let ws_manager = self.ws_manager.read().await.clone();
-        // 🔥 克隆 tasks 引用，用于更新 restored_upload_id
         let tasks = self.tasks.clone();
-        // 🔥 获取备份通知发送器
         let backup_notification_tx = self.backup_notification_tx.read().await.clone();
-        // 🔥 获取 is_backup 和加密相关字段
         let (is_backup, encrypt_enabled, original_size) = {
-            let t = task_info.task.lock().await;
+            let t = task.lock().await;
             (t.is_backup, t.encrypt_enabled, t.original_size)
         };
-        // 🔥 克隆加密配置存储
         let encryption_config_store = self.encryption_config_store.clone();
-        // 🔥 获取加密快照管理器（用于保存加密映射）
         let snapshot_manager = self.snapshot_manager.read().await.clone();
 
         // 在后台执行 precreate 并注册到调度器
@@ -1792,7 +1838,9 @@ impl UploadManager {
             } else {
                 // 没有恢复的 upload_id，需要调用 precreate
                 // 🔥 使用 actual_total_size（加密后的文件大小）
-                let precreate_response = match client
+                // 🔥 从共享引用读取最新客户端（代理热更新后自动生效）
+                let client_snapshot = client.read().unwrap().clone();
+                let precreate_response = match client_snapshot
                     .precreate(&remote_path, actual_total_size, &block_list)
                     .await
                 {
@@ -1989,13 +2037,20 @@ impl UploadManager {
     async fn start_task_standalone(
         &self,
         task_id: &str,
-        task_info: &dashmap::mapref::one::Ref<'_, String, UploadTaskInfo>,
     ) -> Result<()> {
-        // 克隆需要的数据
+        // 🔥 从 DashMap 获取并立即克隆所需字段，避免长时间持有 shard 锁
+        let task_info = self.tasks.get(task_id)
+            .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
+
         let task = task_info.task.clone();
         let cancel_token = task_info.cancel_token.clone();
+        let chunk_manager_opt = task_info.chunk_manager.clone();
+        let restored_completed_chunks = task_info.restored_completed_chunks.clone();
+        // 🔥 立即释放 DashMap shard 锁
+        drop(task_info);
+
         let server_health = self.server_health.clone();
-        let client = self.client.clone();
+        let client = self.client.read().unwrap().clone();
         let vip_type = self.vip_type;
 
         // 🔥 延迟创建分片管理器（独立模式也需要）
@@ -2003,13 +2058,13 @@ impl UploadManager {
             let t = task.lock().await;
             t.total_size
         };
-        let chunk_manager = match &task_info.chunk_manager {
+        let chunk_manager = match &chunk_manager_opt {
             Some(cm) => cm.clone(),
             None => {
                 // 创建新的分片管理器
                 let mut cm = UploadChunkManager::with_vip_type(total_size, vip_type);
                 // 如果有恢复的分片信息，标记已完成的分片
-                if let Some(ref restored_info) = task_info.restored_completed_chunks {
+                if let Some(ref restored_info) = restored_completed_chunks {
                     for &chunk_index in &restored_info.completed_chunks {
                         // chunk_md5s 是 Vec，通过索引获取
                         let md5 = restored_info.chunk_md5s.get(chunk_index).cloned().flatten();
@@ -2082,6 +2137,9 @@ impl UploadManager {
                 drop(task);
                 drop(task_info);
 
+                // 🔥 活跃计数 -1（从 active → Paused）
+                self.dec_active();
+
                 // 🔥 释放槽位（暂停时释放，让其他任务可以使用）
                 if let Some(sid) = slot_id {
                     self.task_slot_pool.release_fixed_slot(task_id).await;
@@ -2124,36 +2182,105 @@ impl UploadManager {
 
                 Ok(())
             }
+            UploadTaskStatus::Pending => {
+                // 🔥 暂停等待中的任务：从等待队列移除 + 标记为 Paused
+                let is_backup = task.is_backup;
+
+                task.mark_paused();
+                info!("暂停等待中的上传任务: {}", task_id);
+                drop(task);
+                drop(task_info);
+
+                // 从等待队列中移除
+                {
+                    let mut queue = self.waiting_queue.write().await;
+                    queue.retain(|id| id != task_id);
+                }
+
+                // 活跃计数 -1（Pending 也算活跃）
+                self.dec_active();
+
+                // 发送状态变更事件
+                self.publish_event(UploadEvent::StatusChanged {
+                    task_id: task_id.to_string(),
+                    old_status: "pending".to_string(),
+                    new_status: "paused".to_string(),
+                    is_backup,
+                })
+                    .await;
+
+                // 发送暂停事件
+                self.publish_event(UploadEvent::Paused {
+                    task_id: task_id.to_string(),
+                    is_backup,
+                })
+                    .await;
+
+                // 如果是备份任务，发送暂停通知到 AutoBackupManager
+                if is_backup {
+                    use crate::autobackup::events::TransferTaskType;
+                    let tx_guard = self.backup_notification_tx.read().await;
+                    if let Some(tx) = tx_guard.as_ref() {
+                        let notification = BackupTransferNotification::Paused {
+                            task_id: task_id.to_string(),
+                            task_type: TransferTaskType::Upload,
+                        };
+                        let _ = tx.send(notification);
+                    }
+                }
+
+                Ok(())
+            }
             _ => Err(anyhow::anyhow!("任务当前状态不支持暂停")),
         }
     }
 
-    /// 恢复上传任务
+    /// 恢复上传任务（支持从 Paused 或 Failed 状态恢复）
     pub async fn resume_task(&self, task_id: &str) -> Result<()> {
-        let task_info = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
-
+        // 🔥 从 DashMap 提取数据后立即释放 shard 锁
         let old_status;
         let is_backup;
+        let is_failed;
         {
-            let task = task_info.task.lock().await;
-            if task.status != UploadTaskStatus::Paused {
-                return Err(anyhow::anyhow!("任务不是暂停状态"));
+            let task_info = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
+
+            {
+                let mut task = task_info.task.lock().await;
+                match task.status {
+                    UploadTaskStatus::Paused => {
+                        is_failed = false;
+                        old_status = "paused".to_string();
+                    }
+                    UploadTaskStatus::Failed => {
+                        is_failed = true;
+                        old_status = "failed".to_string();
+                        task.error = None;
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "任务当前状态不支持恢复: {:?}",
+                            task.status
+                        ));
+                    }
+                }
+                task.status = UploadTaskStatus::Pending;
+                is_backup = task.is_backup;
             }
-            // 🔥 保存旧状态和 is_backup
-            old_status = format!("{:?}", task.status).to_lowercase();
-            is_backup = task.is_backup;
+
+            task_info.is_paused.store(false, Ordering::SeqCst);
+            // task_info (DashMap ref) 在此处释放
         }
 
-        // 清除暂停标志（调度器模式使用）
-        task_info.is_paused.store(false, Ordering::SeqCst);
+        // 🔥 DashMap ref 已释放，安全地执行 async 操作
+        self.inc_active();
 
         // 🔥 发送状态变更事件
         self.publish_event(UploadEvent::StatusChanged {
             task_id: task_id.to_string(),
-            old_status,
+            old_status: old_status.clone(),
             new_status: "pending".to_string(),
             is_backup,
         })
@@ -2171,19 +2298,24 @@ impl UploadManager {
             use crate::autobackup::events::TransferTaskType;
             let tx_guard = self.backup_notification_tx.read().await;
             if let Some(tx) = tx_guard.as_ref() {
-                // 🔥 发送状态变更通知 (Paused -> Pending)
+                // 🔥 发送状态变更通知 (Paused/Failed -> Pending)
+                let backup_old_status = if is_failed {
+                    crate::autobackup::events::TransferTaskStatus::Failed
+                } else {
+                    crate::autobackup::events::TransferTaskStatus::Paused
+                };
                 let status_notification = BackupTransferNotification::StatusChanged {
                     task_id: task_id.to_string(),
                     task_type: TransferTaskType::Upload,
-                    old_status: crate::autobackup::events::TransferTaskStatus::Paused,
+                    old_status: backup_old_status,
                     new_status: crate::autobackup::events::TransferTaskStatus::Pending,
                 };
                 if let Err(e) = tx.send(status_notification) {
                     warn!("发送备份任务等待状态通知失败: {}", e);
                 } else {
                     info!(
-                        "已发送备份上传任务等待状态通知: {} (Paused -> Pending)",
-                        task_id
+                        "已发送备份上传任务等待状态通知: {} ({} -> Pending)",
+                        task_id, old_status
                     );
                 }
 
@@ -2208,31 +2340,42 @@ impl UploadManager {
             queue.retain(|id| id != task_id);
         }
 
-        let task_info = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
+        // 🔥 从 DashMap 提取数据后立即释放 shard 锁
+        let (slot_id, was_active) = {
+            let task_info = self
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
 
-        // 发送取消信号
-        task_info.cancel_token.cancel();
+            task_info.cancel_token.cancel();
 
-        // 🔥 获取槽位ID并更新任务状态
-        let slot_id = {
-            let mut task = task_info.task.lock().await;
-            let sid = task.slot_id;
-            task.slot_id = None;
-            task.mark_failed("用户取消".to_string());
-            sid
+            let (slot_id, was_active) = {
+                let mut task = task_info.task.lock().await;
+                let active = matches!(
+                    task.status,
+                    UploadTaskStatus::Pending | UploadTaskStatus::Uploading
+                    | UploadTaskStatus::Encrypting | UploadTaskStatus::CheckingRapid
+                );
+                let sid = task.slot_id;
+                task.slot_id = None;
+                task.mark_failed("用户取消".to_string());
+                (sid, active)
+            };
+
+            (slot_id, was_active)
+            // task_info (DashMap ref) 在此处释放
         };
 
-        // 如果使用调度器模式，也从调度器取消
+        if was_active {
+            self.dec_active();
+        }
+
+        // 🔥 DashMap ref 已释放，安全地执行 async 操作
         if let Some(scheduler) = &self.scheduler {
             scheduler.cancel_task(task_id).await;
         }
 
         info!("取消上传任务: {}", task_id);
-
-        drop(task_info);
 
         // 🔥 释放槽位
         if let Some(sid) = slot_id {
@@ -2254,14 +2397,19 @@ impl UploadManager {
             queue.retain(|id| id != task_id);
         }
 
-        // 🔥 在移除任务之前获取 is_backup 和 slot_id 字段
-        let (is_backup, slot_id) = if let Some(task_info) = self.tasks.get(task_id) {
+        // 🔥 在移除任务之前获取 is_backup、slot_id 和活跃状态
+        let (is_backup, slot_id, was_active) = if let Some(task_info) = self.tasks.get(task_id) {
             // 先取消任务
             task_info.cancel_token.cancel();
             let task = task_info.task.lock().await;
-            (task.is_backup, task.slot_id)
+            let active = matches!(
+                task.status,
+                UploadTaskStatus::Pending | UploadTaskStatus::Uploading
+                | UploadTaskStatus::Encrypting | UploadTaskStatus::CheckingRapid
+            );
+            (task.is_backup, task.slot_id, active)
         } else {
-            (false, None)
+            (false, None, false)
         };
 
         // 🔥 释放槽位（在移除任务前）
@@ -2277,6 +2425,14 @@ impl UploadManager {
 
         // 移除任务
         self.tasks.remove(task_id);
+
+        // 🔥 活跃计数 -1
+        if was_active {
+            self.dec_active();
+        }
+
+        // 清理去重索引
+        self.remove_dedup_entry(task_id);
 
         // 🔥 清理持久化文件
         if let Some(pm_arc) = self
@@ -2302,6 +2458,106 @@ impl UploadManager {
 
         // 尝试启动等待队列中的任务
         self.try_start_waiting_tasks().await;
+
+        Ok(())
+    }
+
+    /// 批量删除上传任务（用于自动备份取消等场景）
+    ///
+    /// 与逐个调用 delete_task 相比，此方法：
+    /// - 一次性清理 waiting_queue（O(n) 而非 O(n²)）
+    /// - 仅在所有任务删除完成后调用一次 try_start_waiting_tasks
+    /// - 避免重复的锁竞争和不必要的调度尝试
+    pub async fn batch_delete_tasks(&self, task_ids: &[String]) -> (usize, usize) {
+        if task_ids.is_empty() {
+            return (0, 0);
+        }
+
+        let id_set: HashSet<&str> = task_ids.iter().map(|s| s.as_str()).collect();
+
+        // 1. 一次性从 waiting_queue 移除所有目标任务
+        {
+            let mut queue = self.waiting_queue.write().await;
+            queue.retain(|id| !id_set.contains(id.as_str()));
+        }
+
+        // 2. 逐个取消、释放槽位、移除任务（但不调用 try_start_waiting_tasks）
+        let mut success = 0usize;
+        let mut failed = 0usize;
+
+        for task_id in task_ids {
+            if let Err(e) = self.delete_task_internal(task_id).await {
+                tracing::debug!("批量删除上传任务失败: task={}, error={}", task_id, e);
+                failed += 1;
+            } else {
+                success += 1;
+            }
+        }
+
+        // 3. 所有任务删除完成后，仅调用一次 try_start_waiting_tasks
+        self.try_start_waiting_tasks().await;
+
+        (success, failed)
+    }
+
+    /// 删除单个上传任务的内部实现（不触发 waiting_queue 清理和 try_start_waiting_tasks）
+    async fn delete_task_internal(&self, task_id: &str) -> Result<()> {
+        // 获取任务信息并取消
+        let (is_backup, slot_id, was_active) = if let Some(task_info) = self.tasks.get(task_id) {
+            task_info.cancel_token.cancel();
+            let task = task_info.task.lock().await;
+            let active = matches!(
+                task.status,
+                UploadTaskStatus::Pending | UploadTaskStatus::Uploading
+                | UploadTaskStatus::Encrypting | UploadTaskStatus::CheckingRapid
+            );
+            (task.is_backup, task.slot_id, active)
+        } else {
+            warn!("删除上传任务失败: 任务不存在: {}", task_id);
+            return Err(anyhow::anyhow!("任务不存在: {}", task_id));
+        };
+
+        // 释放槽位
+        if slot_id.is_some() {
+            self.task_slot_pool.release_fixed_slot(task_id).await;
+        }
+
+        // 从调度器移除
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.cancel_task(task_id).await;
+        }
+
+        // 移除任务
+        self.tasks.remove(task_id);
+
+        if was_active {
+            self.dec_active();
+        }
+
+        // 清理去重索引
+        self.remove_dedup_entry(task_id);
+
+        // 清理持久化文件
+        if let Some(pm_arc) = self
+            .persistence_manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|pm| pm.clone())
+        {
+            if let Err(e) = pm_arc.lock().await.on_task_deleted(task_id) {
+                warn!("清理上传任务持久化文件失败: task_id={}, 错误: {}", task_id, e);
+                // 🔥 持久化清理失败不应该导致整个删除操作失败
+                // return Err(anyhow::anyhow!("清理持久化文件失败: {}", e));
+            }
+        }
+
+        // 发送删除事件（备份任务会被 publish_event 跳过）
+        self.publish_event(UploadEvent::Deleted {
+            task_id: task_id.to_string(),
+            is_backup,
+        })
+            .await;
 
         Ok(())
     }
@@ -2590,6 +2846,7 @@ impl UploadManager {
         };
 
         self.tasks.insert(task_id.clone(), task_info);
+        self.inc_active();
 
         // 发送任务创建事件（备份任务也发送事件，但前端可以根据 is_backup 过滤）
         self.publish_event(UploadEvent::Created {
@@ -2655,11 +2912,10 @@ impl UploadManager {
         })
     }
 
-    /// 获取活跃任务数
-    pub fn active_task_count(&self) -> usize {
+    /// 获取正在传输的任务数（Uploading/CheckingRapid）
+    pub fn transferring_task_count(&self) -> usize {
         let mut count = 0;
         for entry in self.tasks.iter() {
-            // 这里使用 try_lock 避免阻塞
             if let Ok(task) = entry.task.try_lock() {
                 if matches!(
                     task.status,
@@ -2670,6 +2926,25 @@ impl UploadManager {
             }
         }
         count
+    }
+
+    /// 获取活跃任务数（Pending/Uploading/Encrypting/CheckingRapid），O(1)
+    pub fn active_task_count(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+
+    /// 活跃计数 +1
+    fn inc_active(&self) {
+        self.active_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 活跃计数 -1
+    fn dec_active(&self) {
+        let prev = self.active_count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 0 {
+            // 防止下溢，修正为 0
+            self.active_count.store(0, Ordering::SeqCst);
+        }
     }
 
     /// 清除已完成的任务
@@ -2690,6 +2965,7 @@ impl UploadManager {
         // 2. 从内存中移除
         let memory_count = to_remove.len();
         for task_id in &to_remove {
+            self.remove_dedup_entry(task_id);
             self.tasks.remove(task_id);
         }
 
@@ -2742,12 +3018,208 @@ impl UploadManager {
         }
 
         for task_id in to_remove {
+            self.remove_dedup_entry(&task_id);
             self.tasks.remove(&task_id);
             removed += 1;
         }
 
         info!("清除了 {} 个失败的上传任务", removed);
         removed
+    }
+
+    // ==================== 批量操作方法 ====================
+
+    /// 批量暂停上传任务
+    pub async fn batch_pause(&self, task_ids: &[String]) -> Vec<(String, bool, Option<String>)> {
+        let mut results = Vec::with_capacity(task_ids.len());
+        for id in task_ids {
+            match self.pause_task(id, true).await {
+                Ok(_) => results.push((id.clone(), true, None)),
+                Err(e) => results.push((id.clone(), false, Some(e.to_string()))),
+            }
+        }
+        self.try_start_waiting_tasks().await;
+        results
+    }
+
+    /// 批量恢复上传任务
+    pub async fn batch_resume(&self, task_ids: &[String]) -> Vec<(String, bool, Option<String>)> {
+        info!("批量恢复上传任务: 共 {} 个任务", task_ids.len());
+        let mut results = Vec::with_capacity(task_ids.len());
+        let mut success_count = 0;
+        let mut fail_count = 0;
+
+        for id in task_ids {
+            match self.resume_task(id).await {
+                Ok(_) => {
+                    results.push((id.clone(), true, None));
+                    success_count += 1;
+                }
+                Err(e) => {
+                    results.push((id.clone(), false, Some(e.to_string())));
+                    fail_count += 1;
+                    warn!("恢复上传任务 {} 失败: {}", id, e);
+                }
+            }
+        }
+
+        info!(
+            "批量恢复上传任务完成: 成功 {}, 失败 {}, 总计 {}",
+            success_count, fail_count, task_ids.len()
+        );
+
+        // 🔥 关键修复：批量恢复后尝试启动等待队列中的任务
+        self.try_start_waiting_tasks().await;
+
+        results
+    }
+
+    /// 批量删除上传任务
+    pub async fn batch_delete(&self, task_ids: &[String]) -> Vec<(String, bool, Option<String>)> {
+        let mut results = Vec::with_capacity(task_ids.len());
+        for id in task_ids {
+            match self.delete_task(id).await {
+                Ok(_) => results.push((id.clone(), true, None)),
+                Err(e) => results.push((id.clone(), false, Some(e.to_string()))),
+            }
+        }
+        results
+    }
+
+    /// 获取可暂停的任务ID列表
+    pub async fn get_pausable_task_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for entry in self.tasks.iter() {
+            let task = entry.task.lock().await;
+            // 🔥 只返回非备份任务（上传管理页面不应操作自动备份任务）
+            if !task.is_backup && matches!(task.status, UploadTaskStatus::Uploading | UploadTaskStatus::CheckingRapid | UploadTaskStatus::Pending) {
+                ids.push(entry.key().clone());
+            }
+        }
+        ids
+    }
+
+    /// 获取可恢复的任务ID列表
+    pub async fn get_resumable_task_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for entry in self.tasks.iter() {
+            let task = entry.task.lock().await;
+            // 🔥 只返回非备份任务（上传管理页面不应操作自动备份任务）
+            if !task.is_backup && matches!(task.status, UploadTaskStatus::Paused | UploadTaskStatus::Failed) {
+                ids.push(entry.key().clone());
+            }
+        }
+        tracing::info!("获取可恢复的上传任务: 找到 {} 个非备份任务（Paused 或 Failed 状态）", ids.len());
+        ids
+    }
+
+    /// 获取所有任务ID列表（用于批量删除）
+    pub fn get_all_task_ids(&self) -> Vec<String> {
+        self.tasks.iter().map(|e| e.key().clone()).collect()
+    }
+
+    // ==================== 去重索引方法 ====================
+
+    /// 查询去重索引
+    pub fn find_duplicate_task(
+        &self,
+        local_path: &Path,
+        original_remote_path: &str,
+    ) -> Option<String> {
+        let canonical = dunce::canonicalize(local_path)
+            .unwrap_or_else(|_| local_path.to_path_buf());
+        let key = (canonical, original_remote_path.to_string());
+        self.dedup_index.get(&key).map(|v| v.value().clone())
+    }
+
+    /// 重建去重索引条目（恢复任务时调用）
+    fn rebuild_dedup_index_entry(
+        &self,
+        task_id: &str,
+        local_path: &Path,
+        original_remote_path: &str,
+    ) {
+        let canonical = dunce::canonicalize(local_path)
+            .unwrap_or_else(|e| {
+                warn!("canonicalize failed for {}: {}, using raw path", local_path.display(), e);
+                local_path.to_path_buf()
+            });
+        let key = (canonical, original_remote_path.to_string());
+        self.dedup_index.insert(key.clone(), task_id.to_string());
+        self.dedup_reverse.insert(task_id.to_string(), key);
+    }
+
+    /// 移除去重索引条目
+    fn remove_dedup_entry(&self, task_id: &str) {
+        if let Some((_, key)) = self.dedup_reverse.remove(task_id) {
+            self.dedup_index.remove(&key);
+        }
+    }
+
+    /// 批量创建去重任务
+    pub async fn create_batch_tasks_dedup(
+        &self,
+        files: Vec<(PathBuf, String)>,
+        encrypt: bool,
+        is_folder_upload: bool,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let mut new_ids = Vec::new();
+        let mut existing_ids = Vec::new();
+
+        for (local_path, original_remote_path) in files {
+            let canonical = dunce::canonicalize(&local_path)
+                .unwrap_or_else(|_| local_path.clone());
+
+            if let Some(existing_id) = self.find_duplicate_task(&canonical, &original_remote_path) {
+                existing_ids.push(existing_id);
+                continue;
+            }
+
+            match self.create_task(
+                canonical.clone(),
+                original_remote_path.clone(),
+                encrypt,
+                is_folder_upload,
+            ).await {
+                Ok(task_id) => {
+                    let key = (canonical, original_remote_path.clone());
+                    self.dedup_index.insert(key.clone(), task_id.clone());
+                    self.dedup_reverse.insert(task_id.clone(), key);
+
+                    // 更新 metadata 的 original_remote_path
+                    self.update_task_original_remote_path(&task_id, &original_remote_path).await;
+
+                    if let Err(e) = self.start_task(&task_id).await {
+                        warn!("启动上传任务 {} 失败: {}", task_id, e);
+                    }
+                    new_ids.push(task_id);
+                }
+                Err(e) => {
+                    warn!("创建上传任务失败 {}: {}", local_path.display(), e);
+                }
+            }
+        }
+
+        Ok((new_ids, existing_ids))
+    }
+
+    /// 更新任务的 original_remote_path
+    async fn update_task_original_remote_path(&self, task_id: &str, original_remote_path: &str) {
+        if let Some(pm_arc) = self
+            .persistence_manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|pm| pm.clone())
+        {
+            let pm = pm_arc.lock().await;
+            if let Err(e) = pm.update_original_remote_path(
+                task_id,
+                original_remote_path.to_string(),
+            ) {
+                warn!("更新 original_remote_path 失败: {}", e);
+            }
+        }
     }
 
     /// 开始所有待处理的任务
@@ -2952,11 +3424,12 @@ impl UploadManager {
             }
         }
 
-        // 2. 将这些任务标记为暂停状态
+        // 2. 将这些任务标记为暂停状态，收集事件数据后再发送（避免持有 DashMap ref 跨 await）
+        let mut events_to_publish: Vec<(String, String, bool)> = Vec::new();
+
         for task_id in task_ids {
             if let Some(task_info) = self.tasks.get(task_id) {
                 let mut task = task_info.task.lock().await;
-                // 只暂停 Pending 状态的任务（等待队列中的任务应该是 Pending 状态）
                 if task.status == UploadTaskStatus::Pending {
                     let old_status = format!("{:?}", task.status).to_lowercase();
                     let is_backup = task.is_backup;
@@ -2969,30 +3442,33 @@ impl UploadManager {
                         old_status
                     );
 
-                    // 设置暂停标志
                     task_info
                         .is_paused
                         .store(true, std::sync::atomic::Ordering::SeqCst);
 
                     drop(task);
-
-                    // 发送状态变更事件
-                    self.publish_event(UploadEvent::StatusChanged {
-                        task_id: task_id.to_string(),
-                        old_status,
-                        new_status: "paused".to_string(),
-                        is_backup,
-                    })
-                        .await;
-
-                    // 发送暂停事件
-                    self.publish_event(UploadEvent::Paused {
-                        task_id: task_id.to_string(),
-                        is_backup,
-                    })
-                        .await;
+                    // 收集事件数据，稍后发送
+                    events_to_publish.push((task_id.clone(), old_status, is_backup));
                 }
+                // task_info (DashMap ref) 在此处释放
             }
+        }
+
+        // 🔥 DashMap ref 已释放，安全地发送事件
+        for (task_id, old_status, is_backup) in events_to_publish {
+            self.publish_event(UploadEvent::StatusChanged {
+                task_id: task_id.clone(),
+                old_status,
+                new_status: "paused".to_string(),
+                is_backup,
+            })
+                .await;
+
+            self.publish_event(UploadEvent::Paused {
+                task_id,
+                is_backup,
+            })
+                .await;
         }
 
         if paused_count > 0 {
@@ -3128,7 +3604,8 @@ impl UploadManager {
                             }
 
                             // 🔥 刷新上传服务器列表（保持和 start_task 一致的行为）
-                            match self.client.locate_upload().await {
+                            let client_snapshot = self.client.read().unwrap().clone();
+                            match client_snapshot.locate_upload().await {
                                 Ok(servers) => {
                                     if !servers.is_empty() {
                                         self.server_health.update_servers(servers);
@@ -3144,23 +3621,20 @@ impl UploadManager {
                                 id, is_backup, slot_id
                             );
 
-                            // 🔥 调用 start_task_internal 而不是 start_task
+                            // 🔥 调用 start_task_internal（不再传递 DashMap ref）
                             if let Some((local_path, remote_path, total_size)) = task_params {
-                                if let Some(task_info) = self.tasks.get(&id) {
-                                    if let Err(e) = self
-                                        .start_task_internal(
-                                            &id,
-                                            &task_info,
-                                            local_path,
-                                            remote_path,
-                                            total_size,
-                                        )
-                                        .await
-                                    {
-                                        error!("启动等待上传任务失败: {}, 错误: {}", id, e);
-                                        // 启动失败，释放槽位
-                                        self.task_slot_pool.release_fixed_slot(&id).await;
-                                    }
+                                if let Err(e) = self
+                                    .start_task_internal(
+                                        &id,
+                                        local_path,
+                                        remote_path,
+                                        total_size,
+                                    )
+                                    .await
+                                {
+                                    error!("启动等待上传任务失败: {}, 错误: {}", id, e);
+                                    // 启动失败，释放槽位
+                                    self.task_slot_pool.release_fixed_slot(&id).await;
                                 }
                             }
                         }
@@ -3201,6 +3675,8 @@ impl UploadManager {
                     let mut t = task_info.task.lock().await;
                     t.status = crate::uploader::UploadTaskStatus::Failed;
                     t.error = Some("槽位超时释放：任务长时间无进度更新，可能已卡住".to_string());
+                    // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
+                    t.slot_id = None;
 
                     // 发送 WebSocket 通知
                     let ws_guard = ws_manager.read().await;
@@ -3603,7 +4079,9 @@ impl UploadManager {
                                     };
 
                                 // 2. 预创建文件（使用实际文件大小，可能是加密后的大小）
-                                let precreate_response = match client_clone
+                                // 🔥 从共享引用读取最新客户端（代理热更新后自动生效）
+                                let client_snapshot = client_clone.read().unwrap().clone();
+                                let precreate_response = match client_snapshot
                                     .precreate(&remote_path, actual_total_size, &block_list)
                                     .await
                                 {
@@ -3981,6 +4459,12 @@ impl UploadManager {
                 warn!("恢复任务持久化状态失败: {}", e);
             }
         }
+
+        // 重建去重索引
+        let dedup_path = recovery_info.original_remote_path
+            .as_deref()
+            .unwrap_or(&recovery_info.target_path);
+        self.rebuild_dedup_index_entry(&task_id, &recovery_info.source_path, dedup_path);
 
         Ok(task_id)
     }

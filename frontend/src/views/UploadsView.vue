@@ -9,26 +9,36 @@
         </el-tag>
       </div>
       <div class="header-right">
-        <template v-if="!isMobile">
-          <el-button @click="refreshTasks">
-            <el-icon><Refresh /></el-icon>
-            刷新
+        <el-button @click="refreshTasks" :circle="isMobile">
+          <el-icon><Refresh /></el-icon>
+          <span v-if="!isMobile">刷新</span>
+        </el-button>
+        <el-dropdown @command="handleBatchCommand" trigger="click">
+          <el-button>
+            批量操作
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
           </el-button>
-          <el-button @click="handleClearCompleted" :disabled="completedCount === 0">
-            清除已完成 ({{ completedCount }})
-          </el-button>
-          <el-button @click="handleClearFailed" :disabled="failedCount === 0" type="danger" plain>
-            清除失败 ({{ failedCount }})
-          </el-button>
-        </template>
-        <template v-else>
-          <el-button circle @click="refreshTasks">
-            <el-icon><Refresh /></el-icon>
-          </el-button>
-          <el-button circle @click="handleClearCompleted" :disabled="completedCount === 0">
-            <el-icon><Delete /></el-icon>
-          </el-button>
-        </template>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="pause" :disabled="activeCount === 0">
+                <el-icon><VideoPause /></el-icon>
+                全部暂停 ({{ activeCount }})
+              </el-dropdown-item>
+              <el-dropdown-item command="resume" :disabled="pausedCount === 0">
+                <el-icon><VideoPlay /></el-icon>
+                全部继续 ({{ pausedCount }})
+              </el-dropdown-item>
+              <el-dropdown-item command="clearCompleted" :disabled="completedCount === 0" divided>
+                <el-icon><Delete /></el-icon>
+                清除已完成 ({{ completedCount }})
+              </el-dropdown-item>
+              <el-dropdown-item command="clearFailed" :disabled="failedCount === 0">
+                <el-icon><Delete /></el-icon>
+                清除失败 ({{ failedCount }})
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </div>
 
@@ -189,6 +199,8 @@ import {
   deleteUpload,
   clearCompleted,
   clearFailed,
+  batchPauseUploads,
+  batchResumeUploads,
   calculateProgress,
   calculateETA,
   formatFileSize,
@@ -209,6 +221,7 @@ import {
   CircleCheck,
   RefreshRight,
   Lock,
+  ArrowDown,
 } from '@element-plus/icons-vue'
 import {useIsMobile} from '@/utils/responsive'
 // 🔥 WebSocket 相关导入
@@ -248,6 +261,10 @@ const completedCount = computed(() => {
 
 const failedCount = computed(() => {
   return uploadItems.value.filter(item => item.status === 'failed').length
+})
+
+const pausedCount = computed(() => {
+  return uploadItems.value.filter(item => item.status === 'paused').length
 })
 
 const activeCountType = computed(() => {
@@ -406,6 +423,38 @@ async function handleClearFailed() {
     if (error !== 'cancel') {
       console.error('清除失败任务失败:', error)
     }
+  }
+}
+
+// 批量操作命令分发
+function handleBatchCommand(command: string) {
+  switch (command) {
+    case 'pause': handleBatchPause(); break
+    case 'resume': handleBatchResume(); break
+    case 'clearCompleted': handleClearCompleted(); break
+    case 'clearFailed': handleClearFailed(); break
+  }
+}
+
+// 全部暂停
+async function handleBatchPause() {
+  try {
+    const res = await batchPauseUploads({ all: true })
+    ElMessage.success(`已暂停 ${res.success_count} 个任务`)
+    refreshTasks()
+  } catch (error: any) {
+    console.error('批量暂停失败:', error)
+  }
+}
+
+// 全部继续
+async function handleBatchResume() {
+  try {
+    const res = await batchResumeUploads({ all: true })
+    ElMessage.success(`已恢复 ${res.success_count} 个任务`)
+    refreshTasks()
+  } catch (error: any) {
+    console.error('批量恢复失败:', error)
   }
 }
 

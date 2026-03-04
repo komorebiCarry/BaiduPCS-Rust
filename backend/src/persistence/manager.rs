@@ -1102,6 +1102,18 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 更新任务的 original_remote_path
+    pub fn update_original_remote_path(
+        &self,
+        task_id: &str,
+        original_remote_path: String,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.original_remote_path = Some(original_remote_path);
+        })?;
+        Ok(())
+    }
+
     // ========================================================================
     // 查询方法
     // ========================================================================

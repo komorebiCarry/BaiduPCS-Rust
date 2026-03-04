@@ -69,8 +69,8 @@ pub use transfer::{
 
 // 🔥 导出CDN刷新相关类型
 pub use common::{
-    RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, SpeedAnomalyDetector,
-    StagnationConfig, ThreadStagnationDetector,
+    ProxyConfig, ProxyType, RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig,
+    SpeedAnomalyDetector, StagnationConfig, ThreadStagnationDetector,
 };
 
 // 🔥 导出持久化相关类型

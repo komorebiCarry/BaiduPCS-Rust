@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod autobackup;
 pub mod cloud_dl;
+pub mod common;
 pub mod config;
 pub mod download;
 pub mod encryption_export;

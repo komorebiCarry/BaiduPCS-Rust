@@ -13,7 +13,7 @@ use crate::transfer::types::{ShareLink, SharePageInfo, SharedFileInfo, TransferR
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -27,8 +27,8 @@ pub struct TransferTaskInfo {
 
 /// 转存管理器
 pub struct TransferManager {
-    /// 网盘客户端
-    client: Arc<NetdiskClient>,
+    /// 网盘客户端（共享引用，代理热更新时自动生效）
+    client: Arc<StdRwLock<NetdiskClient>>,
     /// 所有转存任务
     tasks: Arc<DashMap<String, TransferTaskInfo>>,
     /// 下载管理器（用于自动下载）
@@ -87,7 +87,7 @@ pub struct PreviewShareResult {
 impl TransferManager {
     /// 创建新的转存管理器
     pub fn new(
-        client: Arc<NetdiskClient>,
+        client: Arc<StdRwLock<NetdiskClient>>,
         config: TransferConfig,
         app_config: Arc<RwLock<AppConfig>>,
     ) -> Self {
@@ -102,6 +102,12 @@ impl TransferManager {
             persistence_manager: Arc::new(Mutex::new(None)),
             ws_manager: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 🔥 热更新网盘客户端（代理切换时由 ProxyHotUpdater 调用）
+    pub fn update_netdisk_client(&self, new_client: NetdiskClient) {
+        *self.client.write().unwrap() = new_client;
+        info!("✓ TransferManager NetdiskClient 已热更新");
     }
 
     /// 🔥 设置持久化管理器
@@ -164,21 +170,23 @@ impl TransferManager {
         info!("预览分享链接: url={}", share_url);
 
         // 1. 解析分享链接
-        let share_link = self.client.parse_share_link(share_url)?;
+        let share_link = self.client.read().unwrap().parse_share_link(share_url)?;
 
         // 合并密码：请求中的密码 > 链接中的密码
         let password = password.or(share_link.password.clone());
 
+        // 🔥 从共享引用快照当前客户端
+        let client = self.client.read().unwrap().clone();
+
         // 2. 访问分享页面，获取分享信息
-        let share_info = self
-            .client
+        let share_info = client
             .access_share_page(&share_link.short_key, &password, true)
             .await?;
 
         // 3. 如果有密码，验证密码
         if let Some(ref pwd) = password {
             let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-            self.client
+            client
                 .verify_share_password(
                     &share_info.shareid,
                     &share_info.share_uk,
@@ -191,8 +199,7 @@ impl TransferManager {
         }
 
         // 4. 获取文件列表（根目录，由前端传入分页参数）
-        let list_result = self
-            .client
+        let list_result = client
             .list_share_files(
                 &share_link.short_key,
                 &share_info.bdstoken,
@@ -239,8 +246,8 @@ impl TransferManager {
     ) -> Result<Vec<SharedFileInfo>> {
         info!("浏览分享子目录: short_key={}, dir={}, page={}, num={}", short_key, dir, page, num);
 
-        let file_list = self
-            .client
+        let client = self.client.read().unwrap().clone();
+        let file_list = client
             .list_share_files_in_dir(short_key, shareid, uk, bdstoken, dir, page, num)
             .await?;
 
@@ -259,7 +266,7 @@ impl TransferManager {
         info!("创建转存任务: url={}, is_share_direct_download={}", request.share_url, request.is_share_direct_download);
 
         // 1. 解析分享链接
-        let share_link = self.client.parse_share_link(&request.share_url)?;
+        let share_link = self.client.read().unwrap().parse_share_link(&request.share_url)?;
 
         // 合并密码：请求中的密码 > 链接中的密码
         let password = request.password.or(share_link.password.clone());
@@ -318,8 +325,8 @@ impl TransferManager {
         let task_id = task.id.clone();
 
         // 4. 访问分享页面，获取分享信息
-        let share_info_result = self
-            .client
+        let client = self.client.read().unwrap().clone();
+        let share_info_result = client
             .access_share_page(&share_link.short_key, &share_link.password, true)
             .await;
 
@@ -328,8 +335,7 @@ impl TransferManager {
                 // 如果有密码，先验证密码
                 if let Some(ref pwd) = password {
                     let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-                    match self
-                        .client
+                    match client
                         .verify_share_password(
                             &info.shareid,
                             &info.share_uk,
@@ -547,7 +553,7 @@ impl TransferManager {
 
     /// 执行转存任务的核心逻辑
     async fn execute_task(
-        client: Arc<NetdiskClient>,
+        client_shared: Arc<StdRwLock<NetdiskClient>>,
         tasks: Arc<DashMap<String, TransferTaskInfo>>,
         download_manager: Arc<RwLock<Option<Arc<DownloadManager>>>>,
         folder_download_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
@@ -559,6 +565,9 @@ impl TransferManager {
         share_link: ShareLink,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
+        // 🔥 从共享引用快照当前客户端（代理热更新后自动生效）
+        let client = Arc::new(client_shared.read().unwrap().clone());
+
         // 获取任务
         let task_info = tasks.get(task_id).context("任务不存在")?;
         let task = task_info.task.clone();
@@ -974,7 +983,7 @@ impl TransferManager {
                 if auto_download {
                     // 启动自动下载
                     Self::start_auto_download(
-                        client,
+                        client_shared,
                         tasks.clone(),
                         download_manager,
                         folder_download_manager,
@@ -1140,7 +1149,7 @@ impl TransferManager {
     /// 2. 遍历转存的文件/文件夹，文件调用文件下载，文件夹调用文件夹下载
     /// 3. 启动下载状态监听，更新转存任务状态
     async fn start_auto_download(
-        _client: Arc<NetdiskClient>,
+        _client: Arc<StdRwLock<NetdiskClient>>,
         tasks: Arc<DashMap<String, TransferTaskInfo>>,
         download_manager: Arc<RwLock<Option<Arc<DownloadManager>>>>,
         folder_download_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
@@ -1431,7 +1440,7 @@ impl TransferManager {
     /// 通过轮询方式监听关联的下载任务状态，当所有下载完成或失败时更新转存任务状态
     /// 对于分享直下任务，下载完成后会触发临时目录清理
     fn start_download_status_watcher(
-        client: Arc<NetdiskClient>,
+        client: Arc<StdRwLock<NetdiskClient>>,
         tasks: Arc<DashMap<String, TransferTaskInfo>>,
         download_manager: Arc<RwLock<Option<Arc<DownloadManager>>>>,
         folder_download_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
@@ -1442,6 +1451,8 @@ impl TransferManager {
         cancellation_token: CancellationToken,
     ) {
         tokio::spawn(async move {
+            // 🔥 从共享引用快照当前客户端（代理热更新后自动生效）
+            let client = Arc::new(client.read().unwrap().clone());
             const CHECK_INTERVAL: Duration = Duration::from_secs(2);
             const DOWNLOAD_TIMEOUT_HOURS: i64 = 24;
 
@@ -1760,7 +1771,7 @@ impl TransferManager {
     ///
     /// # 安全性
     /// 确保不删除父目录 `{config.temp_dir}`，只删除任务特定的子目录
-    async fn cleanup_temp_dir_internal(client: &Arc<NetdiskClient>, temp_dir: &str) {
+    async fn cleanup_temp_dir_internal(client: &NetdiskClient, temp_dir: &str) {
         const CLEANUP_TIMEOUT_SECS: u64 = 30;
 
         info!("开始清理临时目录: {}", temp_dir);
@@ -2106,7 +2117,8 @@ impl TransferManager {
 
                         if cleanup_on_failure {
                             info!("转存取消，触发临时目录清理: task_id={}, temp_dir={}", id, temp_dir);
-                            Self::cleanup_temp_dir_internal(&self.client, temp_dir).await;
+                            let client_snap = self.client.read().unwrap().clone();
+                            Self::cleanup_temp_dir_internal(&client_snap, temp_dir).await;
                         }
                     }
                 }
@@ -2155,7 +2167,8 @@ impl TransferManager {
 
                         if cleanup_on_failure {
                             info!("下载取消，触发临时目录清理: task_id={}, temp_dir={}", id, temp_dir);
-                            Self::cleanup_temp_dir_internal(&self.client, temp_dir).await;
+                            let client_snap = self.client.read().unwrap().clone();
+                            Self::cleanup_temp_dir_internal(&client_snap, temp_dir).await;
                         }
                     }
                 }
@@ -2375,7 +2388,8 @@ impl TransferManager {
 
                 tokio::spawn(async move {
                     info!("重试清理临时目录: task_id={}, temp_dir={}", task_id_clone, temp_dir);
-                    Self::cleanup_temp_dir_internal(&client, &temp_dir).await;
+                    let client_snap = client.read().unwrap().clone();
+                    Self::cleanup_temp_dir_internal(&client_snap, &temp_dir).await;
 
                     // 清理完成，更新状态为 Completed
                     if let Some(task_info) = tasks.get(&task_id_clone) {
@@ -2449,7 +2463,8 @@ impl TransferManager {
         info!("开始清理孤立临时目录: base={}", temp_dir_base);
 
         // 1. 获取临时目录下的所有子目录
-        let list_result = self.client.get_file_list(&temp_dir_base, 1, 1000).await;
+        let client_snapshot = self.client.read().unwrap().clone();
+        let list_result = client_snapshot.get_file_list(&temp_dir_base, 1, 1000).await;
         let subdirs = match list_result {
             Ok(response) => {
                 if response.errno != 0 {
@@ -2550,7 +2565,7 @@ impl TransferManager {
         info!("发现 {} 个孤立目录，开始清理", orphaned_dirs.len());
 
         // 4. 删除孤立目录
-        let delete_result = self.client.delete_files(&orphaned_dirs).await;
+        let delete_result = client_snapshot.delete_files(&orphaned_dirs).await;
         match delete_result {
             Ok(result) => {
                 if result.success {

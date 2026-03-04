@@ -2,6 +2,7 @@
 
 use crate::auth::constants::*;
 use crate::auth::{QRCode, QRCodeStatus, UserAuth};
+use crate::common::ProxyConfig;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
@@ -16,9 +17,20 @@ pub struct QRCodeAuth {
 impl QRCodeAuth {
     /// 创建新的二维码登录客户端
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
+        Self::new_with_proxy(None)
+    }
+
+    /// 创建新的二维码登录客户端（支持代理配置）
+    pub fn new_with_proxy(proxy_config: Option<&ProxyConfig>) -> Result<Self> {
+        let mut builder = Client::builder()
             .cookie_store(true)
-            .user_agent(USER_AGENT)
+            .user_agent(USER_AGENT);
+
+        if let Some(proxy) = proxy_config {
+            builder = proxy.apply_to_builder(builder)?;
+        }
+
+        let client = builder
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -565,10 +577,29 @@ impl QRCodeAuth {
                 Ok(true)
             }
             Err(e) => {
-                warn!("BDUSS验证失败: {}", e);
-                Ok(false)
+                // 区分网络/代理错误与真正的 BDUSS 失效
+                // 网络错误应传播为 Err，避免调用方误删 session
+                if Self::is_network_error(&e) {
+                    warn!("BDUSS验证遇到网络错误（可能是代理故障）: {}", e);
+                    Err(e)
+                } else {
+                    warn!("BDUSS已失效: {}", e);
+                    Ok(false)
+                }
             }
         }
+    }
+
+    /// 判断 anyhow 错误链中是否包含网络/连接层错误
+    fn is_network_error(err: &anyhow::Error) -> bool {
+        for cause in err.chain() {
+            if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
+                if re.is_connect() || re.is_timeout() || re.is_request() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// 通过百度网盘API获取用户信息

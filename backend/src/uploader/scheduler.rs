@@ -22,7 +22,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -116,8 +116,8 @@ pub struct UploadTaskScheduleInfo {
     pub server_health: Arc<PcsServerHealthManager>,
 
     // 上传所需的配置
-    /// 网盘客户端
-    pub client: NetdiskClient,
+    /// 网盘客户端（共享引用，代理热更新时自动生效）
+    pub client: Arc<StdRwLock<NetdiskClient>>,
     /// 本地文件路径
     pub local_path: PathBuf,
     /// 远程路径
@@ -602,8 +602,8 @@ impl UploadChunkScheduler {
                                         task_id
                                     );
 
-                                    let create_result = task_info
-                                        .client
+                                    let client_snapshot = task_info.client.read().unwrap().clone();
+                                    let create_result = client_snapshot
                                         .create_file(
                                             &task_info.remote_path,
                                             &task_info.block_list,
@@ -929,8 +929,8 @@ impl UploadChunkScheduler {
                         );
 
                         // 调用 create_file 合并分片
-                        let create_result = task_info
-                            .client
+                        let client_snapshot = task_info.client.read().unwrap().clone();
+                        let create_result = client_snapshot
                             .create_file(
                                 &task_info.remote_path,
                                 &task_info.block_list,
@@ -1165,8 +1165,8 @@ impl UploadChunkScheduler {
 
             // 上传分片
             let start_time = std::time::Instant::now();
-            match task_info
-                .client
+            let client_snapshot = task_info.client.read().unwrap().clone();
+            match client_snapshot
                 .upload_chunk(
                     &task_info.remote_path,
                     &task_info.upload_id,

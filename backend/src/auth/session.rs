@@ -81,12 +81,7 @@ impl SessionManager {
         let user_auth: UserAuth =
             serde_json::from_str(&content).context("Failed to deserialize session")?;
 
-        // 检查会话是否过期（默认30天）
-        if user_auth.is_expired(30) {
-            warn!("会话已过期");
-            return Ok(None);
-        }
-
+        // BDUSS 本地不做过期判断，由 verify_bduss 调百度 API 决定
         info!("会话加载成功: UID={}", user_auth.uid);
 
         // 更新内存缓存
@@ -119,14 +114,8 @@ impl SessionManager {
     ///
     /// 返回内存中的会话，如果没有则尝试从文件加载
     pub async fn get_session(&mut self) -> Result<Option<UserAuth>> {
-        // 如果内存中有会话，直接返回
+        // 如果内存中有会话，直接返回（BDUSS 是否失效由 verify_bduss 判断）
         if let Some(ref session) = self.current_session {
-            // 检查是否过期
-            if session.is_expired(30) {
-                warn!("内存中的会话已过期");
-                self.current_session = None;
-                return Ok(None);
-            }
             return Ok(Some(session.clone()));
         }
 

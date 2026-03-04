@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
+use crate::common::{ProxyConfig, ProxyFallbackManager};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -25,6 +26,7 @@ use super::record::{BackupRecordManager, calculate_head_md5};
 use super::scheduler::{ChangeAggregator, ChangeEvent, PollScheduler, PollScheduleConfig, ScheduledTime, TaskController, TriggerSource, task_loop};
 use super::task::*;
 use super::validation::{validate_for_create, validate_for_update, validate_for_execute};
+use super::scan_cache::ScanCacheManager;
 use super::watcher::{FileChangeEvent, FileWatcher};
 
 /// 自动备份管理器
@@ -77,6 +79,12 @@ pub struct AutoBackupManager {
     task_controllers: Arc<DashMap<String, Arc<TaskController>>>,
     /// 聚合器任务句柄（用于 shutdown 时取消）
     aggregator_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    /// 扫描缓存管理器（增量扫描用）
+    scan_cache_manager: Arc<ScanCacheManager>,
+    /// 代理配置（运行时可通过热更新变更）
+    proxy_config: Arc<RwLock<Option<ProxyConfig>>>,
+    /// 代理故障回退管理器
+    fallback_mgr: Arc<RwLock<Option<Arc<ProxyFallbackManager>>>>,
 }
 
 impl AutoBackupManager {
@@ -166,6 +174,13 @@ impl AutoBackupManager {
         let persistence_manager = Arc::new(BackupPersistenceManager::new(&db_path)?);
         tracing::info!("备份任务持久化管理器已创建");
 
+        // 创建扫描缓存管理器（增量扫描用）
+        let scan_cache_db = db_path.parent().unwrap_or(Path::new(".")).join("scan_cache.db");
+        let scan_cache_manager = Arc::new(
+            ScanCacheManager::new(&scan_cache_db)
+                .map_err(|e| anyhow!("创建扫描缓存管理器失败: {}", e))?,
+        );
+
         let manager = Self {
             configs: Arc::new(DashMap::new()),
             tasks: Arc::new(DashMap::new()),
@@ -189,6 +204,9 @@ impl AutoBackupManager {
             aggregated_rx,
             task_controllers: Arc::new(DashMap::new()),
             aggregator_handle,
+            scan_cache_manager,
+            proxy_config: Arc::new(RwLock::new(None)),
+            fallback_mgr: Arc::new(RwLock::new(None)),
         };
 
         // 加载已保存的配置
@@ -294,7 +312,7 @@ impl AutoBackupManager {
             // 服务重启后，正在执行的任务需要重置为待执行状态
             // 因为执行上下文（如文件句柄、网络连接）已经丢失
             match task.status {
-                BackupTaskStatus::Preparing | BackupTaskStatus::Transferring => {
+                BackupTaskStatus::Preparing | BackupTaskStatus::Transferring | BackupTaskStatus::Paused => {
                     task.status = BackupTaskStatus::Queued;
                     task.sub_phase = None;
                     tracing::info!(
@@ -302,7 +320,7 @@ impl AutoBackupManager {
                         task_id, old_status
                     );
                 }
-                BackupTaskStatus::Queued | BackupTaskStatus::Paused => {
+                BackupTaskStatus::Queued => {
                     // 保持原状态
                     tracing::info!(
                         "恢复备份任务: {} (状态: {:?})",
@@ -396,7 +414,15 @@ impl AutoBackupManager {
                 }
             }
 
-            self.tasks.insert(task_id, task);
+            self.tasks.insert(task_id.clone(), task.clone());
+
+            // 🔥 持久化状态变更到数据库
+            // 如果状态从 Paused/Preparing/Transferring 改为 Queued，需要更新数据库
+            if old_status != task.status {
+                if let Err(e) = self.persistence_manager.save_task(&task) {
+                    tracing::warn!("持久化恢复任务的状态变更失败: task={}, error={}", task_id, e);
+                }
+            }
         }
 
         Ok(())
@@ -644,36 +670,41 @@ impl AutoBackupManager {
         // 停止服务
         self.stop_config_services(id).await?;
 
-        // 🔥 新增：删除所有关联的底层上传/下载任务
+        // 🔥 先取消 TaskController，停止正在运行的备份任务（扫描/传输）
+        // 必须在 batch_delete 之前执行，否则 execute_backup_for_config 会继续创建新上传任务
+        if let Some(controller) = self.task_controllers.get(id) {
+            tracing::info!("取消配置 {} 的任务控制器", id);
+            controller.cancel();
+        }
+        // 等待 task_loop 响应取消信号
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 删除所有关联的底层上传/下载任务
         tracing::info!("开始清理配置 {} 的所有关联任务", id);
 
-        // 删除上传任务
+        // 批量删除上传任务
         // 使用安全获取方法，处理 Weak 引用升级
         let upload_mgr = self.get_upload_manager();
         if let Some(ref upload_mgr) = upload_mgr {
             let upload_tasks = upload_mgr.get_tasks_by_backup_config(id).await;
-            tracing::info!("找到 {} 个关联的上传任务", upload_tasks.len());
-            for task in upload_tasks {
-                if let Err(e) = upload_mgr.delete_task(&task.id).await {
-                    tracing::warn!("删除上传任务 {} 失败: {}", task.id, e);
-                } else {
-                    tracing::debug!("已删除上传任务: {}", task.id);
-                }
+            let task_ids: Vec<String> = upload_tasks.iter().map(|t| t.id.clone()).collect();
+            tracing::info!("找到 {} 个关联的上传任务，批量删除", task_ids.len());
+            if !task_ids.is_empty() {
+                let (success, failed) = upload_mgr.batch_delete_tasks(&task_ids).await;
+                tracing::info!("批量删除上传任务完成: 成功={}, 失败={}", success, failed);
             }
         }
 
-        // 删除下载任务（如果是下载备份配置）
+        // 批量删除下载任务（如果是下载备份配置）
         // 使用安全获取方法，处理 Weak 引用升级
         let download_mgr = self.get_download_manager();
         if let Some(ref download_mgr) = download_mgr {
             let download_tasks = download_mgr.get_tasks_by_backup_config(id).await;
-            tracing::info!("找到 {} 个关联的下载任务", download_tasks.len());
-            for task in download_tasks {
-                if let Err(e) = download_mgr.delete_task(&task.id, false).await {
-                    tracing::warn!("删除下载任务 {} 失败: {}", task.id, e);
-                } else {
-                    tracing::debug!("已删除下载任务: {}", task.id);
-                }
+            let task_ids: Vec<String> = download_tasks.iter().map(|t| t.id.clone()).collect();
+            tracing::info!("找到 {} 个关联的下载任务，批量删除", task_ids.len());
+            if !task_ids.is_empty() {
+                let (success, failed) = download_mgr.batch_delete_tasks(&task_ids, false).await;
+                tracing::info!("批量删除下载任务完成: 成功={}, 失败={}", success, failed);
             }
         }
 
@@ -704,6 +735,11 @@ impl AutoBackupManager {
 
         // 删除相关记录
         self.record_manager.delete_upload_records_by_config(id)?;
+
+        // 删除扫描缓存
+        if let Err(e) = self.scan_cache_manager.delete_by_config(id) {
+            tracing::warn!("删除配置 {} 的扫描缓存失败: {}", id, e);
+        }
 
         // 删除加密映射表数据
         if let Err(e) = self.record_manager.delete_snapshots_by_config(id) {
@@ -931,7 +967,7 @@ impl AutoBackupManager {
         let has_active_task = self.tasks.iter().any(|t| {
             t.config_id == config.id && matches!(
                 t.status,
-                BackupTaskStatus::Queued | BackupTaskStatus::Preparing | 
+                BackupTaskStatus::Queued | BackupTaskStatus::Preparing |
                 BackupTaskStatus::Transferring | BackupTaskStatus::Paused
             )
         });
@@ -1017,6 +1053,8 @@ impl AutoBackupManager {
             let self_record_manager = self.record_manager.clone();
             let self_configs = self.configs.clone();
             let self_encryption_config_store = self.encryption_config_store.clone();
+            let self_proxy_config = self.proxy_config.read().clone();
+            let self_fallback_mgr = self.fallback_mgr.read().clone();
 
             // 在后台任务中执行备份，根据配置方向选择上传或下载
             tokio::spawn(async move {
@@ -1043,6 +1081,8 @@ impl AutoBackupManager {
                             self_persistence_manager,
                             self_ws_manager,
                             self_record_manager,
+                            self_proxy_config,
+                            self_fallback_mgr,
                         ).await
                     }
                 };
@@ -1574,8 +1614,9 @@ impl AutoBackupManager {
         persistence_manager: Arc<BackupPersistenceManager>,
         ws_manager: Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         record_manager: Arc<BackupRecordManager>,
+        proxy_config: Option<ProxyConfig>,
+        fallback_mgr: Option<Arc<ProxyFallbackManager>>,
     ) -> Result<()> {
-        use crate::netdisk::NetdiskClient;
         use crate::auth::SessionManager;
 
         tracing::info!("开始执行下载备份任务: task={}, config={}", task_id, config.id);
@@ -1933,7 +1974,7 @@ impl AutoBackupManager {
             }
         };
 
-        let client = match NetdiskClient::new(session) {
+        let client = match crate::netdisk::NetdiskClient::new_with_proxy(session, proxy_config.as_ref(), fallback_mgr) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("创建网盘客户端失败: task={}, error={}", task_id, e);
@@ -2548,16 +2589,14 @@ impl AutoBackupManager {
             }
         };
 
-        // 用内存中的活跃任务覆盖 DB 中的对应项
+        // 用内存中的活跃任务覆盖（轻量拷贝，跳过 pending_files 等大字段）
         for task_ref in self.tasks.iter() {
             if task_ref.config_id == config_id {
-                let task = task_ref.clone();
-                // 查找并替换 DB 中的同 ID 任务
-                if let Some(pos) = db_tasks.iter().position(|t| t.id == task.id) {
-                    db_tasks[pos] = task;
+                let light = Self::lightweight_clone_task(&task_ref);
+                if let Some(pos) = db_tasks.iter().position(|t| t.id == task_ref.id) {
+                    db_tasks[pos] = light;
                 } else {
-                    // 内存中有但 DB 中还没有（刚创建的任务）
-                    db_tasks.insert(0, task);
+                    db_tasks.insert(0, light);
                 }
             }
         }
@@ -2587,14 +2626,14 @@ impl AutoBackupManager {
             }
         };
 
-        // 用内存中的活跃任务覆盖 DB 中的对应项 - 无阻塞
+        // 用内存中的活跃任务覆盖（轻量拷贝，跳过 pending_files 等大字段）
         for task_ref in self.tasks.iter() {
             if task_ref.config_id == config_id {
-                let task = task_ref.clone();
-                if let Some(pos) = db_tasks.iter().position(|t| t.id == task.id) {
-                    db_tasks[pos] = task;
+                let light = Self::lightweight_clone_task(&task_ref);
+                if let Some(pos) = db_tasks.iter().position(|t| t.id == task_ref.id) {
+                    db_tasks[pos] = light;
                 } else {
-                    db_tasks.insert(0, task);
+                    db_tasks.insert(0, light);
                 }
             }
         }
@@ -2621,13 +2660,12 @@ impl AutoBackupManager {
             Err(_) => db_tasks.len(),
         };
 
-        // 用内存中的活跃任务覆盖
+        // 用内存中的活跃任务覆盖（轻量拷贝，跳过 pending_files 等大字段）
         let mut result = db_tasks;
         for task_ref in self.tasks.iter() {
             if task_ref.config_id == config_id {
-                let task = task_ref.clone();
-                if let Some(pos) = result.iter().position(|t| t.id == task.id) {
-                    result[pos] = task;
+                if let Some(pos) = result.iter().position(|t| t.id == task_ref.id) {
+                    result[pos] = Self::lightweight_clone_task(&task_ref);
                 }
             }
         }
@@ -2635,7 +2673,66 @@ impl AutoBackupManager {
         (result, total)
     }
 
-    /// 获取单个文件任务
+    /// 获取配置的任务列表（异步分页版本）
+    pub async fn list_tasks_by_config_async(&self, config_id: &str, page: usize, page_size: usize) -> (Vec<BackupTask>, usize) {
+        let persistence_manager = self.persistence_manager.clone();
+        let config_id_owned = config_id.to_string();
+        let offset = (page.saturating_sub(1)) * page_size;
+
+        let (db_tasks, total) = match tokio::task::spawn_blocking(move || {
+            let tasks = persistence_manager.get_tasks_by_config(&config_id_owned, page_size, offset)?;
+            let total = persistence_manager.count_tasks_by_config(&config_id_owned)?;
+            Ok::<_, anyhow::Error>((tasks, total))
+        }).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                tracing::warn!("从 DB 查询任务失败: {}", e);
+                (Vec::new(), 0)
+            }
+            Err(e) => {
+                tracing::warn!("spawn_blocking 执行失败: {}", e);
+                (Vec::new(), 0)
+            }
+        };
+
+        // 用内存中的活跃任务覆盖（轻量拷贝，跳过 pending_files 等大字段）
+        let mut result = db_tasks;
+        for task_ref in self.tasks.iter() {
+            if task_ref.config_id == config_id {
+                if let Some(pos) = result.iter().position(|t| t.id == task_ref.id) {
+                    result[pos] = Self::lightweight_clone_task(&task_ref);
+                }
+            }
+        }
+
+        (result, total)
+    }
+    /// 轻量拷贝 BackupTask，跳过 pending_files 等大字段（用于 API 响应）
+    fn lightweight_clone_task(task: &BackupTask) -> BackupTask {
+        BackupTask {
+            id: task.id.clone(),
+            config_id: task.config_id.clone(),
+            status: task.status.clone(),
+            sub_phase: task.sub_phase,
+            trigger_type: task.trigger_type.clone(),
+            pending_files: Vec::new(),
+            completed_count: task.completed_count,
+            failed_count: task.failed_count,
+            skipped_count: task.skipped_count,
+            total_count: task.total_count,
+            transferred_bytes: task.transferred_bytes,
+            total_bytes: task.total_bytes,
+            scan_progress: None,
+            created_at: task.created_at,
+            started_at: task.started_at,
+            completed_at: task.completed_at,
+            error_message: task.error_message.clone(),
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        }
+    }
+
     pub fn get_file_task(&self, task_id: &str, file_task_id: &str) -> Option<BackupFileTask> {
         self.tasks.get(task_id).and_then(|task| {
             task.pending_files.iter().find(|f| f.id == file_task_id).cloned()
@@ -2877,39 +2974,31 @@ impl AutoBackupManager {
         let upload_manager = self.get_upload_manager();
         let download_manager = self.get_download_manager();
 
-        // 删除所有关联的上传任务
+        // 批量删除所有关联的上传任务（避免逐个删除导致的 O(n²) 锁竞争）
         let mut deleted_uploads = 0;
         if let Some(ref upload_mgr) = upload_manager {
-            for upload_task_id in &pending_uploads {
-                if let Err(e) = upload_mgr.delete_task(upload_task_id).await {
+            if !pending_uploads.is_empty() {
+                let (success, failed) = upload_mgr.batch_delete_tasks(&pending_uploads).await;
+                deleted_uploads = success;
+                if failed > 0 {
                     tracing::debug!(
-                        "删除上传任务失败: backup_task={}, upload_task={}, error={}",
-                        task_id, upload_task_id, e
-                    );
-                } else {
-                    deleted_uploads += 1;
-                    tracing::debug!(
-                        "已删除上传任务: backup_task={}, upload_task={}",
-                        task_id, upload_task_id
+                        "批量删除上传任务: backup_task={}, 成功={}, 失败={}",
+                        task_id, success, failed
                     );
                 }
             }
         }
 
-        // 删除所有关联的下载任务
+        // 批量删除所有关联的下载任务
         let mut deleted_downloads = 0;
         if let Some(ref download_mgr) = download_manager {
-            for download_task_id in &pending_downloads {
-                if let Err(e) = download_mgr.delete_task(download_task_id, false).await {
+            if !pending_downloads.is_empty() {
+                let (success, failed) = download_mgr.batch_delete_tasks(&pending_downloads, false).await;
+                deleted_downloads = success;
+                if failed > 0 {
                     tracing::debug!(
-                        "删除下载任务失败: backup_task={}, download_task={}, error={}",
-                        task_id, download_task_id, e
-                    );
-                } else {
-                    deleted_downloads += 1;
-                    tracing::debug!(
-                        "已删除下载任务: backup_task={}, download_task={}",
-                        task_id, download_task_id
+                        "批量删除下载任务: backup_task={}, 成功={}, 失败={}",
+                        task_id, success, failed
                     );
                 }
             }
@@ -3776,6 +3865,26 @@ impl AutoBackupManager {
         tracing::info!("自动备份管理器已设置上传管理器（Weak 引用）");
     }
 
+    /// 设置代理配置和回退管理器
+    pub fn set_proxy_config(&self, proxy: Option<ProxyConfig>, mgr: Arc<ProxyFallbackManager>) {
+        *self.proxy_config.write() = proxy;
+        *self.fallback_mgr.write() = Some(mgr);
+        tracing::info!("自动备份管理器已设置代理配置");
+    }
+
+    /// 热更新代理配置（代理变更时由 ProxyHotUpdater 调用）
+    pub fn update_proxy_config(&self, proxy: Option<&ProxyConfig>) {
+        *self.proxy_config.write() = proxy.cloned();
+        tracing::info!("自动备份管理器代理配置已热更新");
+    }
+
+    /// 创建代理感知的 NetdiskClient（内部 helper）
+    fn create_netdisk_client(&self, session: crate::auth::UserAuth) -> Result<crate::netdisk::NetdiskClient> {
+        let proxy = self.proxy_config.read().clone();
+        let fallback = self.fallback_mgr.read().clone();
+        crate::netdisk::NetdiskClient::new_with_proxy(session, proxy.as_ref(), fallback)
+    }
+
     /// 启动事件消费循环
     ///
     /// 监听聚合后的变更事件（来自文件监听或定时轮询），通过 TaskController 统一触发
@@ -4044,6 +4153,68 @@ impl AutoBackupManager {
             "开始执行配置 {} 的备份任务 (方向: {:?}, 触发: {:?})",
             config.id, config.direction, trigger_type
         );
+
+        // 🔥 【关键修复】检查是否有已恢复的 Queued 任务（服务重启后断点续传）
+        // 如果有 pending_files 且包含 related_task_id，说明是重启恢复的任务，
+        // 跳过扫描直接进入传输阶段，复用已恢复的上传/下载任务
+
+        // 🔥 修复：先找到符合条件的 task_id，避免持有锁导致后续 get_mut 失败
+        let restored_task_info = self.tasks.iter()
+            .find(|t| t.config_id == config.id && matches!(t.status, BackupTaskStatus::Queued))
+            .and_then(|t| {
+                let has_restored_files = !t.pending_files.is_empty()
+                    && t.pending_files.iter().any(|ft| ft.related_task_id.is_some());
+
+                if has_restored_files {
+                    let task_id = t.id.clone();
+                    let restored_files = t.pending_files.clone();
+                    let restored_count = restored_files.iter().filter(|f| f.related_task_id.is_some()).count();
+                    Some((task_id, restored_files, restored_count))
+                } else {
+                    None
+                }
+            });
+
+        if let Some((task_id, restored_files, restored_count)) = restored_task_info {
+            tracing::info!(
+                "检测到重启恢复的备份任务，跳过扫描直接续传: task={}, config={}, files={}, with_related_id={}",
+                task_id, config.id, restored_files.len(), restored_count
+            );
+
+            // 更新任务状态为 Preparing（execute_*_backup_with_files 内部会改为 Transferring）
+            tracing::info!("尝试更新任务状态: task={}", task_id);
+            if let Some(mut task) = self.tasks.get_mut(&task_id) {
+                tracing::info!("成功获取任务，更新状态为 Preparing: task={}", task_id);
+                task.status = BackupTaskStatus::Preparing;
+                task.started_at = Some(Utc::now());
+            } else {
+                tracing::error!("无法获取任务: task={}", task_id);
+            }
+
+            tracing::info!(
+                "准备调用 execute_*_backup_with_files: task={}, direction={:?}",
+                task_id, config.direction
+            );
+
+            match config.direction {
+                BackupDirection::Upload => {
+                    tracing::info!("调用 execute_upload_backup_with_files: task={}", task_id);
+                    self.execute_upload_backup_with_files(
+                        task_id.clone(), config.clone(), restored_files,
+                    ).await?;
+                    tracing::info!("execute_upload_backup_with_files 完成: task={}", task_id);
+                }
+                BackupDirection::Download => {
+                    tracing::info!("调用 execute_download_backup_with_files: task={}", task_id);
+                    self.execute_download_backup_with_files(
+                        task_id.clone(), config.clone(), restored_files,
+                    ).await?;
+                    tracing::info!("execute_download_backup_with_files 完成: task={}", task_id);
+                }
+            }
+
+            return Ok(());
+        }
 
         // 🔥 正确时序：先扫描，扫描完成后再判断是否有传输任务
         // 根据配置方向执行扫描
@@ -4723,6 +4894,27 @@ impl AutoBackupManager {
                             tracing::error!("写入上传去重记录失败: file={}, error={}", update.remote_path, e);
                         } else {
                             tracing::debug!("已写入上传去重记录: {}", update.remote_path);
+                        }
+
+                        // 更新扫描缓存（上传成功后同步 mtime/size）
+                        let mtime = std::fs::metadata(&update.local_path)
+                            .and_then(|m| m.modified())
+                            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                            .unwrap_or(0);
+                        let rel_path = update.local_path.strip_prefix(&cfg.local_path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let cache_entry = super::scan_cache::CachedFileEntry {
+                            config_id: cfg.id.clone(),
+                            file_path: update.local_path.to_string_lossy().to_string(),
+                            relative_path: rel_path,
+                            mtime,
+                            size: update.file_size as i64,
+                            head_md5: Some(upload_record.head_md5.clone()),
+                            last_scan_at: chrono::Utc::now().timestamp(),
+                        };
+                        if let Err(e) = self.scan_cache_manager.upsert_single(cache_entry) {
+                            tracing::warn!("更新扫描缓存失败: {}", e);
                         }
                     } else {
                         // 🔥 现在可以安全调用 .await（已释放 DashMap 锁）
@@ -6186,7 +6378,7 @@ impl AutoBackupManager {
     ///
     /// 应用过滤规则和去重检查，返回需要上传的文件任务列表
     async fn scan_local_directory_for_backup(&self, config: &BackupConfig) -> Result<Vec<BackupFileTask>> {
-        use crate::uploader::{FolderScanner, ScanOptions};
+        use crate::uploader::{BatchedScanIterator, ScanOptions};
 
         tracing::info!("扫描本地目录: config={}, path={:?}", config.id, config.local_path);
 
@@ -6201,8 +6393,34 @@ impl AutoBackupManager {
             skip_hidden: true,
         };
 
-        let scanner = FolderScanner::with_options(scan_options);
-        let scanned_files = scanner.scan(&config.local_path)?;
+        // 使用 BatchedScanIterator 分批扫描（通过 channel + spawn_blocking）
+        let local_path = config.local_path.clone();
+        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel(4);
+
+        let opts_clone = scan_options.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut iterator = match BatchedScanIterator::new(&local_path, opts_clone) {
+                Ok(it) => it,
+                Err(e) => {
+                    tracing::error!("创建备份扫描迭代器失败: {}", e);
+                    return;
+                }
+            };
+            loop {
+                match iterator.next_batch() {
+                    Ok(Some(batch)) => {
+                        if batch_tx.blocking_send(batch).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!("备份扫描批次失败: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
 
         let include_exts = &config.filter_config.include_extensions;
         let exclude_exts = &config.filter_config.exclude_extensions;
@@ -6210,101 +6428,157 @@ impl AutoBackupManager {
         let min_file_size = config.filter_config.min_file_size;
 
         let mut file_tasks = Vec::new();
+        let scan_cache = Arc::clone(&self.scan_cache_manager);
+        let config_id_for_cache = config.id.clone();
 
-        for scanned_file in scanned_files {
-            let file_ext = scanned_file.local_path.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                .unwrap_or_default();
+        while let Some(batch) = batch_rx.recv().await {
+            // 第一步：按扩展名/目录/大小过滤，同时收集 mtime
+            let mut filtered: Vec<(crate::uploader::folder::ScannedFile, i64)> = Vec::new();
+            for scanned_file in batch {
+                let file_ext = scanned_file.local_path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_default();
 
-            // 检查包含扩展名
-            if !include_exts.is_empty() && !include_exts.iter().any(|e| e.to_lowercase() == file_ext) {
-                continue;
-            }
-
-            // 检查排除扩展名
-            if exclude_exts.iter().any(|e| e.to_lowercase() == file_ext) {
-                continue;
-            }
-
-            // 检查排除目录
-            let relative_str = scanned_file.relative_path.to_string_lossy();
-            if exclude_dirs.iter().any(|d| relative_str.contains(d)) {
-                continue;
-            }
-
-            // 检查最小文件大小
-            if scanned_file.size < min_file_size {
-                continue;
-            }
-
-            // 去重检查
-            let file_name = scanned_file.local_path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let relative_path = scanned_file.local_path.strip_prefix(&config.local_path)
-                .map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let head_md5 = match calculate_head_md5(&scanned_file.local_path) {
-                Ok(md5) => md5,
-                Err(e) => {
-                    tracing::warn!("计算文件头MD5失败，跳过去重检查: {:?}, error={}", scanned_file.local_path, e);
-                    "unknown".to_string()
+                if !include_exts.is_empty() && !include_exts.iter().any(|e| e.to_lowercase() == file_ext) {
+                    continue;
                 }
-            };
-
-            let (exists, _) = match self.record_manager.check_upload_record_preliminary(
-                &config.id,
-                &relative_path,
-                &file_name,
-                scanned_file.size,
-                &head_md5,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::warn!("查询去重记录失败: {:?}, error={}", scanned_file.local_path, e);
-                    (false, None)
+                if exclude_exts.iter().any(|e| e.to_lowercase() == file_ext) {
+                    continue;
                 }
-            };
+                let relative_str = scanned_file.relative_path.to_string_lossy();
+                if exclude_dirs.iter().any(|d| relative_str.contains(d)) {
+                    continue;
+                }
+                if scanned_file.size < min_file_size {
+                    continue;
+                }
 
-            if exists {
-                tracing::debug!("文件已备份，跳过: {} (size={}, md5={})", file_name, scanned_file.size, head_md5);
-                continue;
+                // 读取 mtime 用于增量缓存比对
+                let mtime = std::fs::metadata(&scanned_file.local_path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                    .unwrap_or(0);
+                filtered.push((scanned_file, mtime));
             }
 
-            // 计算远程路径
-            let remote_path = format!("{}/{}",
-                                      config.remote_path.trim_end_matches('/'),
-                                      scanned_file.relative_path.to_string_lossy().replace('\\', "/"));
+            // 第二步：增量缓存比对（仅处理变化/新增文件）
+            let scan_metas: Vec<super::scan_cache::ScannedFileMeta> = filtered.iter()
+                .map(|(f, mtime)| super::scan_cache::ScannedFileMeta {
+                    file_path: f.local_path.to_string_lossy().to_string(),
+                    mtime: *mtime,
+                    size: f.size as i64,
+                })
+                .collect();
 
-            let file_task = BackupFileTask {
-                id: Uuid::new_v4().to_string(),
-                parent_task_id: String::new(), // 稍后设置
-                local_path: scanned_file.local_path.clone(),
-                remote_path,
-                file_size: scanned_file.size,
-                head_md5: Some(head_md5),
-                fs_id: None,
-                status: BackupFileStatus::Pending,
-                sub_phase: None,
-                skip_reason: None,
-                encrypted: config.encrypt_enabled,
-                encrypted_name: None,
-                temp_encrypted_path: None,
-                transferred_bytes: 0,
-                decrypt_progress: None,
-                error_message: None,
-                retry_count: 0,
-                related_task_id: None,
-                backup_operation_type: Some(BackupOperationType::Upload),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
+            let cache_ref = Arc::clone(&scan_cache);
+            let cfg_id = config_id_for_cache.clone();
+            let changed_set = tokio::task::spawn_blocking(move || {
+                cache_ref.find_changed_files(&cfg_id, &scan_metas)
+            }).await.unwrap_or_else(|_| Ok(Vec::new())).unwrap_or_default();
 
-            file_tasks.push(file_task);
+            let changed_paths: std::collections::HashSet<String> = changed_set.iter()
+                .map(|m| m.file_path.clone())
+                .collect();
+
+            // 第三步：仅对变化文件执行 head_md5 + 去重检查
+            let mut cache_entries = Vec::new();
+            for (scanned_file, mtime) in &filtered {
+                let file_path_str = scanned_file.local_path.to_string_lossy().to_string();
+                if !changed_paths.contains(&file_path_str) {
+                    continue;
+                }
+
+                let file_name = scanned_file.local_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let relative_path = scanned_file.local_path.strip_prefix(&config.local_path)
+                    .map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let head_md5 = match calculate_head_md5(&scanned_file.local_path) {
+                    Ok(md5) => md5,
+                    Err(e) => {
+                        tracing::warn!("计算文件头MD5失败，跳过去重检查: {:?}, error={}", scanned_file.local_path, e);
+                        "unknown".to_string()
+                    }
+                };
+
+                let (exists, _) = match self.record_manager.check_upload_record_preliminary(
+                    &config.id,
+                    &relative_path,
+                    &file_name,
+                    scanned_file.size,
+                    &head_md5,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::warn!("查询去重记录失败: {:?}, error={}", scanned_file.local_path, e);
+                        (false, None)
+                    }
+                };
+
+                // 更新缓存条目（无论是否去重命中）
+                cache_entries.push(super::scan_cache::CachedFileEntry {
+                    config_id: config_id_for_cache.clone(),
+                    file_path: file_path_str.clone(),
+                    relative_path: scanned_file.relative_path.to_string_lossy().to_string(),
+                    mtime: *mtime,
+                    size: scanned_file.size as i64,
+                    head_md5: Some(head_md5.clone()),
+                    last_scan_at: chrono::Utc::now().timestamp(),
+                });
+
+                if exists {
+                    tracing::debug!("文件已备份，跳过: {} (size={}, md5={})", file_name, scanned_file.size, head_md5);
+                    continue;
+                }
+
+                // 计算远程路径
+                let remote_path = format!("{}/{}",
+                                          config.remote_path.trim_end_matches('/'),
+                                          scanned_file.relative_path.to_string_lossy().replace('\\', "/"));
+
+                let file_task = BackupFileTask {
+                    id: Uuid::new_v4().to_string(),
+                    parent_task_id: String::new(), // 稍后设置
+                    local_path: scanned_file.local_path.clone(),
+                    remote_path,
+                    file_size: scanned_file.size,
+                    head_md5: Some(head_md5),
+                    fs_id: None,
+                    status: BackupFileStatus::Pending,
+                    sub_phase: None,
+                    skip_reason: None,
+                    encrypted: config.encrypt_enabled,
+                    encrypted_name: None,
+                    temp_encrypted_path: None,
+                    transferred_bytes: 0,
+                    decrypt_progress: None,
+                    error_message: None,
+                    retry_count: 0,
+                    related_task_id: None,
+                    backup_operation_type: Some(BackupOperationType::Upload),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                };
+
+                file_tasks.push(file_task);
+            }
+
+            // 第四步：批量更新扫描缓存
+            if !cache_entries.is_empty() {
+                let cache_ref = Arc::clone(&scan_cache);
+                let entries = cache_entries;
+                let _ = tokio::task::spawn_blocking(move || {
+                    cache_ref.batch_upsert(entries)
+                }).await;
+            }
+
+            // 让出执行权，避免长时间阻塞
+            tokio::task::yield_now().await;
         }
 
         tracing::info!("本地目录扫描完成: config={}, 发现 {} 个新文件", config.id, file_tasks.len());
@@ -6315,7 +6589,6 @@ impl AutoBackupManager {
     ///
     /// 应用过滤规则和去重检查，返回需要下载的文件任务列表
     async fn scan_remote_directory_for_backup(&self, config: &BackupConfig) -> Result<Vec<BackupFileTask>> {
-        use crate::netdisk::NetdiskClient;
         use crate::auth::SessionManager;
 
         tracing::info!("扫描远程目录: config={}, path={}", config.id, config.remote_path);
@@ -6324,7 +6597,7 @@ impl AutoBackupManager {
         let mut session_manager = SessionManager::new(None);
         let session = session_manager.load_session().await?
             .ok_or_else(|| anyhow!("未登录"))?;
-        let client = NetdiskClient::new(session)?;
+        let client = self.create_netdisk_client(session)?;
 
         let mut all_files = Vec::new();
         let mut dirs_to_scan = vec![config.remote_path.clone()];
@@ -6553,6 +6826,11 @@ impl AutoBackupManager {
         config: BackupConfig,
         mut file_tasks: Vec<BackupFileTask>,
     ) -> Result<()> {
+        tracing::info!(
+            "🔥 execute_upload_backup_with_files 开始: task={}, files={}",
+            task_id, file_tasks.len()
+        );
+
         let file_count = file_tasks.len();
         let total_bytes: u64 = file_tasks.iter().map(|f| f.file_size).sum();
 
@@ -6609,17 +6887,17 @@ impl AutoBackupManager {
 
         Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring");
 
-        // 🔥 优化：使用 std::mem::take 从 task.pending_files 取出文件任务列表，避免不必要的 clone
-        let pending_files = if let Some(mut task) = self.tasks.get_mut(&task_id) {
-            std::mem::take(&mut task.pending_files)
+        // 🔥 优化：克隆 pending_files 用于创建上传任务，保留原始数据供 API 查询
+        let pending_files_clone = if let Some(task) = self.tasks.get(&task_id) {
+            task.pending_files.clone()
         } else {
             Vec::new()
         };
 
         // 创建上传任务，返回处理后的文件任务列表
-        let processed_files = self.create_upload_tasks_for_files(&task_id, &config, pending_files).await?;
+        let processed_files = self.create_upload_tasks_for_files(&task_id, &config, pending_files_clone).await?;
 
-        // 🔥 修复：把处理后的文件任务放回 task.pending_files，否则后续无法更新状态
+        // 🔥 修复：把处理后的文件任务放回 task.pending_files，更新状态
         if let Some(mut task) = self.tasks.get_mut(&task_id) {
             task.pending_files = processed_files;
         }
@@ -6647,6 +6925,7 @@ impl AutoBackupManager {
         };
 
         let mut created_count = 0;
+        let mut reused_count = 0;
 
         for file_task in file_tasks.iter_mut() {
             if let Some(task) = self.tasks.get(task_id) {
@@ -6658,6 +6937,26 @@ impl AutoBackupManager {
             let local_path = file_task.local_path.clone();
             let remote_path = file_task.remote_path.clone();
             let file_task_id = file_task.id.clone();
+
+            // 🔥 修复：如果 related_task_id 已存在，说明是重启恢复的任务，跳过创建直接复用
+            if let Some(ref existing_upload_id) = file_task.related_task_id {
+                // 更新 task 的映射关系（重建映射）
+                if let Some(mut task) = self.tasks.get_mut(task_id) {
+                    task.pending_upload_task_ids.insert(existing_upload_id.clone());
+                    task.transfer_task_map.insert(existing_upload_id.clone(), file_task_id.clone());
+                }
+
+                // 更新文件状态为等待传输
+                file_task.status = BackupFileStatus::WaitingTransfer;
+                file_task.updated_at = Utc::now();
+
+                reused_count += 1;
+                tracing::debug!(
+                    "复用已恢复的上传任务: file_task={}, upload_task={}",
+                    file_task_id, existing_upload_id
+                );
+                continue;
+            }
 
             // 更新文件状态（直接在 file_task 上操作）
             file_task.status = BackupFileStatus::WaitingTransfer;
@@ -6704,7 +7003,10 @@ impl AutoBackupManager {
             }
         }
 
-        tracing::info!("已创建 {} 个上传任务: task={}", created_count, task_id);
+        tracing::info!(
+            "上传任务创建完成: task={}, created={}, reused={}",
+            task_id, created_count, reused_count
+        );
         Ok(file_tasks)
     }
 
@@ -6769,17 +7071,17 @@ impl AutoBackupManager {
 
         Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring");
 
-        // 🔥 优化：使用 std::mem::take 从 task.pending_files 取出文件任务列表，避免不必要的 clone
-        let pending_files = if let Some(mut task) = self.tasks.get_mut(&task_id) {
-            std::mem::take(&mut task.pending_files)
+        // 🔥 优化：克隆 pending_files 用于创建下载任务，保留原始数据供 API 查询
+        let pending_files_clone = if let Some(task) = self.tasks.get(&task_id) {
+            task.pending_files.clone()
         } else {
             Vec::new()
         };
 
         // 创建下载任务，返回处理后的文件任务列表
-        let processed_files = self.create_download_tasks_for_files(&task_id, &config, pending_files).await?;
+        let processed_files = self.create_download_tasks_for_files(&task_id, &config, pending_files_clone).await?;
 
-        // 🔥 修复：把处理后的文件任务放回 task.pending_files，否则后续无法更新状态
+        // 🔥 修复：把处理后的文件任务放回 task.pending_files，更新状态
         if let Some(mut task) = self.tasks.get_mut(&task_id) {
             task.pending_files = processed_files;
         }
@@ -6807,6 +7109,7 @@ impl AutoBackupManager {
         };
 
         let mut created_count = 0;
+        let mut reused_count = 0;
 
         for file_task in file_tasks.iter_mut() {
             if let Some(task) = self.tasks.get(task_id) {
@@ -6820,6 +7123,26 @@ impl AutoBackupManager {
             let remote_path = file_task.remote_path.clone();
             let file_size = file_task.file_size;
             let fs_id = file_task.fs_id.unwrap_or(0);
+
+            // 🔥 修复：如果 related_task_id 已存在，说明是重启恢复的任务，跳过创建直接复用
+            if let Some(ref existing_download_id) = file_task.related_task_id {
+                // 更新 task 的映射关系（重建映射）
+                if let Some(mut task) = self.tasks.get_mut(task_id) {
+                    task.pending_download_task_ids.insert(existing_download_id.clone());
+                    task.transfer_task_map.insert(existing_download_id.clone(), file_task_id.clone());
+                }
+
+                // 更新文件状态为等待传输
+                file_task.status = BackupFileStatus::WaitingTransfer;
+                file_task.updated_at = Utc::now();
+
+                reused_count += 1;
+                tracing::debug!(
+                    "复用已恢复的下载任务: file_task={}, download_task={}",
+                    file_task_id, existing_download_id
+                );
+                continue;
+            }
 
             // 确保本地目录存在
             if let Some(parent) = local_path.parent() {
@@ -6880,7 +7203,10 @@ impl AutoBackupManager {
             }
         }
 
-        tracing::info!("已创建 {} 个下载任务: task={}", created_count, task_id);
+        tracing::info!(
+            "下载任务创建完成: task={}, created={}, reused={}",
+            task_id, created_count, reused_count
+        );
         Ok(file_tasks)
     }
 
@@ -6951,6 +7277,8 @@ impl AutoBackupManager {
         for path in paths {
             // 检查文件是否存在
             if !path.exists() || !path.is_file() {
+                // 文件已删除，清理扫描缓存
+                let _ = self.scan_cache_manager.delete_by_path(&config.id, &path.to_string_lossy());
                 continue;
             }
 
@@ -7081,6 +7409,8 @@ impl AutoBackupManager {
         for path in paths {
             // 检查文件是否存在（可能已被删除）
             if !path.exists() || !path.is_file() {
+                // 文件已删除，清理扫描缓存
+                let _ = self.scan_cache_manager.delete_by_path(&config.id, &path.to_string_lossy());
                 tracing::debug!("Watch文件不存在或不是文件，跳过: {:?}", path);
                 continue;
             }

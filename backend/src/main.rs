@@ -6,6 +6,7 @@ use axum::{
 use baidu_netdisk_rust::{
     config::LogConfig, logging, server::handlers, server::websocket,
     web_auth::{self, WebAuthState},
+    common::proxy_fallback::ProxyHotUpdater,
     AppState,
 };
 use serde::Serialize;
@@ -146,8 +147,46 @@ async fn main() -> anyhow::Result<()> {
 
     // 创建应用状态
     let app_state = AppState::new().await?;
-    app_state.load_initial_session().await?;
-    info!("应用状态初始化完成");
+    // 注入热更新执行器到代理回退管理器（使回退触发时能自动执行热更新和启动探测任务）
+    app_state.fallback_mgr.set_updater(
+        Arc::new(app_state.clone()) as Arc<dyn ProxyHotUpdater>
+    ).await;
+
+    // 启动时探测代理连通性，失败则立即回退直连
+    // 必须在 load_initial_session 之前执行，否则预热和 BDUSS 验证会走死代理
+    {
+        let cfg = app_state.config.read().await;
+        let proxy = &cfg.network.proxy;
+        if proxy.proxy_type != baidu_netdisk_rust::common::ProxyType::None {
+            let proxy_clone = proxy.clone();
+            let allow_fallback = proxy.allow_fallback;
+            drop(cfg);
+
+            // 🔥 先保存用户代理配置（供探测任务恢复时使用）
+            app_state.fallback_mgr
+                .set_user_proxy_config(Some(proxy_clone.clone()))
+                .await;
+
+            match baidu_netdisk_rust::common::probe_proxy(&proxy_clone).await {
+                Ok(()) => {
+                    info!("✓ 启动代理探测成功");
+                    app_state.fallback_mgr
+                        .set_runtime_status(baidu_netdisk_rust::common::ProxyRuntimeStatus::Normal)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!("✗ 启动代理探测失败: {}，触发回退", e);
+                    if allow_fallback {
+                        app_state.fallback_mgr.execute_fallback().await;
+                    } else {
+                        app_state.fallback_mgr
+                            .set_runtime_status(baidu_netdisk_rust::common::ProxyRuntimeStatus::FallenBackToDirect)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
 
     // 获取配置
     let config = app_state.config.read().await.clone();
@@ -193,6 +232,10 @@ async fn main() -> anyhow::Result<()> {
             delete(handlers::clear_completed),
         )
         .route("/downloads/clear/failed", delete(handlers::clear_failed))
+        // 下载批量操作
+        .route("/downloads/batch/pause", post(handlers::batch_pause_downloads))
+        .route("/downloads/batch/resume", post(handlers::batch_resume_downloads))
+        .route("/downloads/batch/delete", post(handlers::batch_delete_downloads))
         // 文件夹下载API
         .route("/downloads/folder", post(handlers::create_folder_download))
         .route(
@@ -221,6 +264,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/uploads/:id", delete(handlers::delete_upload))
         .route("/uploads/folder", post(handlers::create_folder_upload))
         .route("/uploads/batch", post(handlers::create_batch_upload))
+        .route("/uploads/scan/:id", get(handlers::get_scan_status))
+        .route("/uploads/scan/:id/cancel", post(handlers::cancel_scan))
         .route(
             "/uploads/clear/completed",
             post(handlers::clear_completed_uploads),
@@ -229,6 +274,10 @@ async fn main() -> anyhow::Result<()> {
             "/uploads/clear/failed",
             post(handlers::clear_failed_uploads),
         )
+        // 上传批量操作
+        .route("/uploads/batch/pause", post(handlers::batch_pause_uploads))
+        .route("/uploads/batch/resume", post(handlers::batch_resume_uploads))
+        .route("/uploads/batch/delete", post(handlers::batch_delete_uploads))
         // 转存API
         .route("/transfers", post(handlers::create_transfer))
         .route("/transfers", get(handlers::get_all_transfers))
@@ -256,6 +305,9 @@ async fn main() -> anyhow::Result<()> {
         // 转存配置API
         .route("/config/transfer", get(handlers::get_transfer_config))
         .route("/config/transfer", put(handlers::update_transfer_config))
+        // 🔥 代理运行状态API
+        .route("/proxy/status", get(handlers::get_proxy_status))
+        .route("/proxy/test", post(handlers::test_proxy_connection))
         // 🔥 自动备份API
         .route("/autobackup/configs", get(handlers::autobackup::list_backup_configs))
         .route("/autobackup/configs", post(handlers::autobackup::create_backup_config))
@@ -352,6 +404,10 @@ async fn main() -> anyhow::Result<()> {
         })
     }
 
+    // 🔥 先加载会话和初始化所有管理器，确保前端访问时一切就绪
+    app_state.load_initial_session().await?;
+    info!("应用状态初始化完成");
+
     // 构建完整应用
     let app = Router::new()
         .nest("/api/v1", api_routes)
@@ -360,14 +416,15 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(static_service)
         .layer(middleware);
 
-    // 启动服务器
+    // 🔥 绑定端口并启动服务器
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // 🔥 所有管理器初始化完成后再打印日志，前端访问时一切就绪
     info!("服务器启动在: http://{}", addr);
     info!("API 基础路径: http://{}/api/v1", addr);
     info!("WebSocket: ws://{}/api/v1/ws", addr);
     info!("健康检查: http://{}/health", addr);
     info!("前端页面: http://{}/", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     // 🔥 使用 select! 监听关闭信号，支持优雅关闭
     let server = axum::serve(listener, app);

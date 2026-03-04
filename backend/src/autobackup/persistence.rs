@@ -21,7 +21,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 pub const MAX_PAGE_SIZE: usize = 500;
 
 /// 规范化分页参数
-/// 
+///
 /// - 如果 page_size 为 0，返回默认值 100
 /// - 如果 page_size 超过 500，截断为 500 并记录警告
 /// - 否则返回原值
@@ -42,7 +42,6 @@ pub fn normalize_pagination(page_size: usize) -> usize {
 
 /// 备份任务持久化管理器
 pub struct BackupPersistenceManager {
-    /// SQLite 连接
     conn: Mutex<Connection>,
 }
 
@@ -55,6 +54,13 @@ impl BackupPersistenceManager {
         }
 
         let conn = Connection::open(db_path)?;
+        // 启用 WAL 模式，允许读写并发
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;"
+        )?;
+
         let manager = Self {
             conn: Mutex::new(conn),
         };
@@ -104,6 +110,11 @@ impl BackupPersistenceManager {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_backup_tasks_status ON backup_tasks(status)",
+            [],
+        )?;
+        // 复合索引：加速 WHERE config_id = ? ORDER BY created_at DESC 查询
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_backup_tasks_config_time ON backup_tasks(config_id, created_at DESC)",
             [],
         )?;
 
@@ -169,7 +180,7 @@ impl BackupPersistenceManager {
             "CREATE INDEX IF NOT EXISTS idx_file_tasks_status ON backup_file_tasks(status)",
             [],
         )?;
-        
+
         // 新增索引：按关联任务ID查询（用于监听器查找备份任务）
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_file_tasks_related_task ON backup_file_tasks(related_task_id)",
@@ -516,7 +527,7 @@ impl BackupPersistenceManager {
     }
 
     /// 加载文件任务（分页）
-    /// 
+    ///
     /// 分页参数会被规范化：
     /// - page_size 为 0 时使用默认值 100
     /// - page_size 超过 500 时截断为 500
@@ -879,7 +890,7 @@ impl BackupPersistenceManager {
 
     /// 按配置查询任务列表（分页）
     /// 用于 DB + 内存合并查询
-    /// 
+    ///
     /// 分页参数会被规范化：
     /// - limit 为 0 时使用默认值 100
     /// - limit 超过 500 时截断为 500
@@ -938,7 +949,7 @@ impl BackupPersistenceManager {
 
     /// 按配置查询最近文件任务
     /// 用于历史文件查询
-    /// 
+    ///
     /// 分页参数会被规范化：
     /// - limit 为 0 时使用默认值 100
     /// - limit 超过 500 时截断为 500

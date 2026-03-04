@@ -16,6 +16,8 @@ pub use path_validator::{PathValidationResult, PathValidator};
 // Re-export WebAuthConfig from web_auth module
 pub use crate::web_auth::{AuthMode, WebAuthConfig};
 
+use crate::common::ProxyConfig;
+
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -47,6 +49,52 @@ pub struct AppConfig {
     /// 分享直下配置
     #[serde(default)]
     pub share_direct_download: ShareDirectDownloadConfig,
+    /// 网络配置（含代理）
+    #[serde(default)]
+    pub network: NetworkConfig,
+    /// 扫描配置
+    #[serde(default)]
+    pub scan: ScanConfig,
+}
+
+/// 扫描配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanConfig {
+    #[serde(default = "default_scan_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_max_pending_tasks")]
+    pub max_pending_tasks: usize,
+    #[serde(default = "default_progress_interval")]
+    pub progress_interval: usize,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1000,
+            max_pending_tasks: 5000,
+            progress_interval: 500,
+        }
+    }
+}
+
+fn default_scan_batch_size() -> usize { 1000 }
+fn default_max_pending_tasks() -> usize { 5000 }
+fn default_progress_interval() -> usize { 500 }
+
+/// 网络配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            proxy: ProxyConfig::default(),
+        }
+    }
 }
 
 /// 自动备份配置
@@ -947,6 +995,8 @@ impl Default for AppConfig {
             autobackup: AutoBackupConfig::default(),
             web_auth: WebAuthConfig::default(),
             share_direct_download: ShareDirectDownloadConfig::default(),
+            network: NetworkConfig::default(),
+            scan: ScanConfig::default(),
         }
     }
 }

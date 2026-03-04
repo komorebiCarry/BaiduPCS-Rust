@@ -625,6 +625,8 @@ pub struct UploadRecoveryInfo {
     pub encrypt_enabled: bool,
     /// 加密密钥版本
     pub encryption_key_version: Option<u32>,
+    /// 加密前的原始远程路径（用于重启后重建去重索引）
+    pub original_remote_path: Option<String>,
 }
 
 impl UploadRecoveryInfo {
@@ -652,6 +654,7 @@ impl UploadRecoveryInfo {
             // 恢复加密字段
             encrypt_enabled: metadata.encrypt_enabled,
             encryption_key_version: metadata.encryption_key_version,
+            original_remote_path: metadata.original_remote_path.clone(),
         })
     }
 

@@ -54,6 +54,7 @@ export interface DownloadConfig {
   chunk_size_mb: number            // 分片大小
   max_concurrent_tasks: number     // 最大同时下载数
   max_retries: number              // 最大重试次数
+  cdn_refresh?: CdnRefreshConfig   // CDN 刷新配置
 }
 
 /// 上传配置
@@ -73,12 +74,126 @@ export interface TransferConfig {
   recent_save_path?: string     // 最近使用的网盘目录路径
 }
 
+/// 文件系统配置
+export interface FilesystemConfig {
+  allowed_paths?: string[]
+  show_hidden?: boolean
+  follow_symlinks?: boolean
+}
+
+/// 持久化配置
+export interface PersistenceConfig {
+  wal_dir?: string
+  db_path?: string
+  wal_flush_interval_ms?: number
+  auto_recover_tasks?: boolean
+  wal_retention_days?: number
+  history_archive_hour?: number
+  history_archive_minute?: number
+  history_retention_days?: number
+}
+
+/// 日志配置
+export interface LogConfig {
+  enabled?: boolean
+  log_dir?: string
+  retention_days?: number
+  level?: string
+  max_file_size?: number
+}
+
+/// 上传备份触发配置
+export interface UploadTriggerConfig {
+  watch_enabled?: boolean
+  watch_debounce_ms?: number
+  watch_recursive?: boolean
+  fallback_interval_enabled?: boolean
+  fallback_interval_minutes?: number
+  fallback_scheduled_enabled?: boolean
+  fallback_scheduled_hour?: number
+  fallback_scheduled_minute?: number
+}
+
+/// 下载备份触发配置
+export interface DownloadTriggerConfig {
+  poll_mode?: string
+  poll_interval_minutes?: number
+  poll_scheduled_hour?: number
+  poll_scheduled_minute?: number
+}
+
+/// 自动备份配置
+export interface AutoBackupConfig {
+  enabled?: boolean
+  max_concurrent_scans?: number
+  max_concurrent_encrypts?: number
+  max_concurrent_backup_tasks?: number
+  change_aggregation_window_secs?: number
+  temp_dir?: string
+  config_path?: string
+  upload_trigger?: UploadTriggerConfig
+  download_trigger?: DownloadTriggerConfig
+}
+
+/// Web 访问认证配置
+export interface WebAuthConfig {
+  enabled?: boolean
+  mode?: string
+}
+
+/// 分享直下配置
+export interface ShareDirectDownloadConfig {
+  temp_dir?: string
+  auto_cleanup?: boolean
+  cleanup_on_failure?: boolean
+  cleanup_orphaned_on_startup?: boolean
+}
+
+/// CDN 刷新配置
+export interface CdnRefreshConfig {
+  enabled?: boolean
+  refresh_interval_minutes?: number
+  min_refresh_interval_secs?: number
+  speed_drop_threshold_percent?: number
+  speed_drop_duration_secs?: number
+  baseline_establish_secs?: number
+  stagnation_threshold_kbps?: number
+  stagnation_ratio_percent?: number
+  min_threads_for_detection?: number
+  startup_delay_secs?: number
+}
+
+/// 代理类型
+export type ProxyType = 'none' | 'http' | 'socks5'
+
+/// 代理配置
+export interface ProxyConfig {
+  proxy_type: ProxyType
+  host: string
+  port: number
+  username?: string
+  password?: string
+  allow_fallback?: boolean
+}
+
+/// 网络配置
+export interface NetworkConfig {
+  proxy: ProxyConfig
+}
+
 /// 应用配置
 export interface AppConfig {
   server: ServerConfig
   download: DownloadConfig
   upload: UploadConfig
   transfer?: TransferConfig
+  filesystem?: FilesystemConfig
+  persistence?: PersistenceConfig
+  log?: LogConfig
+  autobackup?: AutoBackupConfig
+  web_auth?: WebAuthConfig
+  share_direct_download?: ShareDirectDownloadConfig
+  network?: NetworkConfig
 }
 
 /// VIP 推荐配置
@@ -241,3 +356,38 @@ export async function updateTransferConfig(req: UpdateTransferConfigRequest): Pr
   return apiClient.put('/config/transfer', req)
 }
 
+
+// ============================================
+// 代理运行状态 API
+// ============================================
+
+/// 代理运行状态
+export type ProxyRuntimeStatus = 'normal' | 'fallen_back_to_direct' | 'probing' | 'no_proxy'
+
+/// 代理运行状态响应
+export interface ProxyStatusResponse {
+  status: ProxyRuntimeStatus
+  flap_count: number
+  next_probe_in_secs: number | null
+}
+
+/**
+ * 获取代理运行状态
+ */
+export async function getProxyStatus(): Promise<ProxyStatusResponse> {
+  return apiClient.get('/proxy/status')
+}
+
+/// 代理测试连接响应
+export interface ProxyTestResponse {
+  success: boolean
+  latency_ms: number | null
+  error: string | null
+}
+
+/**
+ * 测试代理连接（不影响当前代理状态）
+ */
+export async function testProxyConnection(config: ProxyConfig): Promise<ProxyTestResponse> {
+  return apiClient.post('/proxy/test', config, { timeout: 15000 })
+}

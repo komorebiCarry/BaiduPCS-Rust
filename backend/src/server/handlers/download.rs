@@ -213,7 +213,10 @@ pub async fn resume_download(
         }
         Err(e) => {
             error!("恢复下载任务失败: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Ok(Json(ApiResponse::error(
+                -1,
+                format!("恢复下载任务失败: {}", e),
+            )))
         }
     }
 }
@@ -397,4 +400,72 @@ pub async fn create_batch_download(
         folder_task_ids,
         failed,
     })))
+}
+
+// ==================== 批量操作 ====================
+
+use super::common::{BatchOperationRequest, BatchOperationItem, BatchOperationResponse};
+
+/// POST /api/v1/downloads/batch/pause
+pub async fn batch_pause_downloads(
+    State(app_state): State<AppState>,
+    Json(req): Json<BatchOperationRequest>,
+) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let mgr = app_state.download_manager.read().await.clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let ids = if req.all == Some(true) {
+        mgr.get_pausable_task_ids().await
+    } else {
+        req.task_ids.unwrap_or_default()
+    };
+
+    let raw = mgr.batch_pause(&ids).await;
+    let results: Vec<BatchOperationItem> = raw.into_iter()
+        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+        .collect();
+    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+}
+
+/// POST /api/v1/downloads/batch/resume
+pub async fn batch_resume_downloads(
+    State(app_state): State<AppState>,
+    Json(req): Json<BatchOperationRequest>,
+) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let mgr = app_state.download_manager.read().await.clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let ids = if req.all == Some(true) {
+        mgr.get_resumable_task_ids().await
+    } else {
+        req.task_ids.unwrap_or_default()
+    };
+
+    let raw = mgr.batch_resume(&ids).await;
+    let results: Vec<BatchOperationItem> = raw.into_iter()
+        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+        .collect();
+    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+}
+
+/// POST /api/v1/downloads/batch/delete
+pub async fn batch_delete_downloads(
+    State(app_state): State<AppState>,
+    Json(req): Json<BatchOperationRequest>,
+) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let mgr = app_state.download_manager.read().await.clone()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let delete_files = req.delete_files.unwrap_or(false);
+    let ids = if req.all == Some(true) {
+        mgr.get_all_task_ids().await
+    } else {
+        req.task_ids.unwrap_or_default()
+    };
+
+    let raw = mgr.batch_delete(&ids, delete_files).await;
+    let results: Vec<BatchOperationItem> = raw.into_iter()
+        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+        .collect();
+    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
 }

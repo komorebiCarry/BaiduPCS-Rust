@@ -21,6 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, warn};
@@ -243,8 +244,8 @@ pub type EventCallback = Arc<dyn Fn(CloudDlEvent) + Send + Sync>;
 ///
 /// 负责后台轮询离线下载任务状态，并通过回调推送事件
 pub struct CloudDlMonitor {
-    /// 网盘客户端
-    client: Arc<NetdiskClient>,
+    /// 网盘客户端（支持代理热更新）
+    client: Arc<StdRwLock<NetdiskClient>>,
     /// 轮询配置
     config: PollingConfig,
     /// 自动下载配置（task_id -> config）
@@ -272,8 +273,10 @@ pub struct CloudDlMonitor {
 impl CloudDlMonitor {
     /// 创建新的监听服务
     pub fn new(client: Arc<NetdiskClient>) -> Self {
+        let client_inner = Arc::try_unwrap(client)
+            .unwrap_or_else(|arc| (*arc).clone());
         Self {
-            client,
+            client: Arc::new(StdRwLock::new(client_inner)),
             config: PollingConfig::default(),
             auto_download_configs: Arc::new(RwLock::new(HashMap::new())),
             progress_trackers: Arc::new(RwLock::new(HashMap::new())),
@@ -290,8 +293,10 @@ impl CloudDlMonitor {
 
     /// 使用自定义配置创建监听服务
     pub fn with_config(client: Arc<NetdiskClient>, config: PollingConfig) -> Self {
+        let client_inner = Arc::try_unwrap(client)
+            .unwrap_or_else(|arc| (*arc).clone());
         Self {
-            client,
+            client: Arc::new(StdRwLock::new(client_inner)),
             config,
             auto_download_configs: Arc::new(RwLock::new(HashMap::new())),
             progress_trackers: Arc::new(RwLock::new(HashMap::new())),
@@ -304,6 +309,12 @@ impl CloudDlMonitor {
             download_manager: Arc::new(RwLock::new(None)),
             folder_download_manager: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 热更新网盘客户端（代理变更时调用）
+    pub fn update_client(&self, new_client: NetdiskClient) {
+        *self.client.write().unwrap() = new_client;
+        info!("✓ CloudDlMonitor NetdiskClient 已热更新");
     }
 
     /// 设置下载管理器（用于自动下载功能）
@@ -355,7 +366,8 @@ impl CloudDlMonitor {
                 info!("从数据库加载了 {} 个待验证的自动下载配置", config_count);
 
                 // 获取当前离线下载任务列表，验证配置是否有效
-                let current_tasks = match self.client.cloud_dl_list_task().await {
+                let client_snap = self.client.read().unwrap().clone();
+                let current_tasks = match client_snap.cloud_dl_list_task().await {
                     Ok(tasks) => tasks,
                     Err(e) => {
                         warn!("获取离线任务列表失败，跳过配置验证: {}", e);
@@ -622,7 +634,8 @@ impl CloudDlMonitor {
             }
 
             // 执行查询
-            match self.client.cloud_dl_list_task().await {
+            let client_snap = self.client.read().unwrap().clone();
+            match client_snap.cloud_dl_list_task().await {
                 Ok(mut tasks) => {
                     // 对进行中的任务查询详情以获取进度信息
                     let running_task_ids: Vec<i64> = tasks
@@ -632,7 +645,7 @@ impl CloudDlMonitor {
                         .collect();
 
                     if !running_task_ids.is_empty() {
-                        match self.client.cloud_dl_query_task(&running_task_ids).await {
+                        match client_snap.cloud_dl_query_task(&running_task_ids).await {
                             Ok(details) => {
                                 let detail_map: std::collections::HashMap<i64, CloudDlTaskInfo> =
                                     details.into_iter().map(|t| (t.task_id, t)).collect();
@@ -861,7 +874,8 @@ impl CloudDlMonitor {
                         );
 
                         // 🔥 先查询任务详情获取 file_list（因为轮询时只查询进行中的任务详情）
-                        let task_with_details = match self.client.cloud_dl_query_task(&[task.task_id]).await {
+                        let client_snap2 = self.client.read().unwrap().clone();
+                        let task_with_details = match client_snap2.cloud_dl_query_task(&[task.task_id]).await {
                             Ok(details) if !details.is_empty() => {
                                 let detail = &details[0];
                                 info!(
@@ -961,7 +975,8 @@ impl CloudDlMonitor {
             task.task_id, save_path, target_files
         );
 
-        match self.client.get_file_list(save_path, 1, 1000).await {
+        let client_snap = self.client.read().unwrap().clone();
+        match client_snap.get_file_list(save_path, 1, 1000).await {
             Ok(file_list) => {
                 let download_manager = self.download_manager.read().await;
                 let folder_download_manager = self.folder_download_manager.read().await;
@@ -1157,7 +1172,8 @@ impl CloudDlMonitor {
     ///
     /// 返回当前任务列表并推送刷新事件
     pub async fn trigger_refresh(&self) -> Result<Vec<CloudDlTaskInfo>> {
-        let tasks = self.client.cloud_dl_list_task().await?;
+        let client_snap = self.client.read().unwrap().clone();
+        let tasks = client_snap.cloud_dl_list_task().await?;
 
         let event = CloudDlEvent::TaskListRefreshed {
             tasks: tasks.clone(),
