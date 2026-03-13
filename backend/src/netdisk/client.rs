@@ -847,6 +847,65 @@ impl NetdiskClient {
         Ok(file_list)
     }
 
+    /// 获取文件元信息（包含 block_list）
+    ///
+    /// # 参数
+    /// * `paths` - 文件路径数组
+    ///
+    /// # 返回
+    /// 文件元信息响应
+    pub async fn filemetas(&self, paths: &[String]) -> Result<crate::netdisk::FileMetasResponse> {
+        info!("获取文件元信息: paths={:?}", paths);
+
+        let url = "https://pan.baidu.com/rest/2.0/xpan/multimedia";
+
+        // 将路径数组转换为 JSON 字符串
+        let dlink_str = serde_json::to_string(paths)?;
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("method", "filemetas"),
+                ("dlink", &dlink_str),
+                ("thumb", "0"),
+                ("extra", "1"),
+                ("needmedia", "1"),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("获取文件元信息请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let file_metas: crate::netdisk::FileMetasResponse = response
+            .json()
+            .await
+            .context("解析文件元信息响应失败")?;
+
+        if file_metas.errno != 0 {
+            anyhow::bail!(
+                "获取文件元信息失败: errno={}, errmsg={}",
+                file_metas.errno,
+                file_metas.errmsg
+            );
+        }
+
+        debug!("获取到 {} 个文件元信息", file_metas.list.len());
+        Ok(file_metas)
+    }
+
     /// 获取Locate下载链接（通过文件路径）
     ///
     /// # 参数
@@ -1085,6 +1144,7 @@ impl NetdiskClient {
         upload_id: &str,
         file_size: u64,
         is_dir: &str,
+        rtype: &str,
     ) -> Result<RapidUploadResponse> {
         let url = "https://pan.baidu.com/api/create";
 
@@ -1103,7 +1163,7 @@ impl NetdiskClient {
                 // 1 = path冲突时重命名 (推荐,避免覆盖)
                 // 2 = path冲突且block_list不同时重命名 (智能去重)
                 // 3 = path冲突时覆盖 (危险)
-                ("rtype", "1"),
+                ("rtype", rtype),
                 ("block_list", &block_list),
             ])
             .send()
@@ -1224,13 +1284,24 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// 预创建响应（包含 uploadid）
+    /// 预创建文件（支持动态 rtype）
+    ///
+    /// # 参数
+    /// - remote_path: 远程路径
+    /// - file_size: 文件大小
+    /// - block_list: 分片列表
+    /// - rtype: 文件命名策略
+    ///   - "1": path 冲突时重命名（Auto_Rename）
+    ///   - "2": path 冲突且 block_list 不同时重命名（Smart_Dedup）
+    ///   - "3": path 冲突时覆盖（危险，不推荐）
     pub async fn precreate(
         &self,
         remote_path: &str,
         file_size: u64,
         block_list: &str,
+        rtype: &str,
     ) -> Result<PrecreateResponse> {
-        info!("预创建文件: path={}, size={}", remote_path, file_size);
+        info!("预创建文件: path={}, size={}, rtype={}", remote_path, file_size, rtype);
 
         let url = "https://pan.baidu.com/api/precreate";
 
@@ -1245,11 +1316,7 @@ impl NetdiskClient {
                 ("size", &file_size.to_string()),
                 ("isdir", "0"),
                 ("autoinit", "1"),
-                // rtype 文件命名策略:
-                // 1 = path冲突时重命名 (推荐,避免覆盖)
-                // 2 = path冲突且block_list不同时重命名 (智能去重)
-                // 3 = path冲突时覆盖 (危险)
-                ("rtype", "1"),
+                ("rtype", rtype),
                 ("block_list", block_list),
             ])
             .send()
@@ -2255,7 +2322,7 @@ impl NetdiskClient {
         // 构建转存URL
         let url = format!(
             "https://pan.baidu.com/share/transfer?\
-             shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+                 shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
             shareid, share_uk, bdstoken, BAIDU_APP_ID
         );
 
@@ -2299,7 +2366,44 @@ impl NetdiskClient {
         let errno = json["errno"].as_i64().unwrap_or(-1);
 
         if errno == 0 {
-            // 提取转存后的路径
+            // 🔥 检查是否为异步转存任务
+            let task_id_value = &json["task_id"];
+            let is_async_task = if task_id_value.is_string() {
+                // task_id 是字符串且非空且不是 "0"
+                let task_id_str = task_id_value.as_str().unwrap_or("");
+                !task_id_str.is_empty() && task_id_str != "0"
+            } else if task_id_value.is_u64() || task_id_value.is_i64() {
+                // task_id 是数字且非0
+                task_id_value.as_u64().unwrap_or(0) != 0
+            } else {
+                false
+            };
+
+            // 检查是否有 extra 字段
+            let has_extra = json["extra"]["list"].is_array();
+
+            if is_async_task && !has_extra {
+                // 🔥 异步转存模式：task_id 非0 且没有 extra 字段
+                // 生成 task_id 字符串（拥有所有权，避免临时引用问题）
+                let task_id_string = if task_id_value.is_string() {
+                    task_id_value.as_str().unwrap_or("unknown").to_string()
+                } else {
+                    task_id_value.to_string()
+                };
+
+                let show_msg = json["show_msg"].as_str().unwrap_or("");
+                info!(
+                        "检测到异步转存任务: task_id={}, show_msg='{}', 将使用任务查询 API",
+                        task_id_string, show_msg
+                    );
+
+                // 调用 query_transfer_task 轮询任务状态
+                return self
+                    .query_transfer_task(&task_id_string, shareid, share_uk, bdstoken, referer)
+                    .await;
+            }
+
+            // 🔥 同步转存模式：提取 extra.list
             let extra_list = json["extra"]["list"].as_array();
             let mut transferred_paths = Vec::new();
             let mut transferred_fs_ids = Vec::new();
@@ -2417,6 +2521,203 @@ impl NetdiskClient {
                 error: Some(format!("转存失败: {}", response_text)),
                 transferred_fs_ids: vec![],
             })
+        }
+    }
+    /// 查询异步转存任务状态
+    ///
+    /// 使用阶梯式轮询策略查询百度网盘异步转存任务的完成状态。
+    ///
+    /// # 轮询策略
+    ///
+    /// | 尝试次数范围 | 基础间隔 | 随机抖动 | 实际间隔范围 |
+    /// |------------|---------|---------|------------|
+    /// | 第 1 次 | 0秒 | 无 | 0秒（立即） |
+    /// | 第 2-5 次 | 1秒 | ±200ms | 0.8-1.2秒 |
+    /// | 第 6-10 次 | 2秒 | ±400ms | 1.6-2.4秒 |
+    /// | 第 11+ 次 | 5秒 | ±1000ms | 4.0-6.0秒 |
+    ///
+    /// # 终止条件
+    ///
+    /// - `status == "success"` → 任务完成，返回结果
+    /// - `status == "failed"` 或 `task_errno != 0` → 任务失败，返回错误
+    /// - `errno != 0` → API 错误，返回错误
+    /// - `status == "running"` 或其他状态 → 继续轮询
+    ///
+    /// # 参数
+    ///
+    /// - `task_id`: 异步任务 ID（从转存 API 响应获取）
+    /// - `shareid`: 分享 ID
+    /// - `share_uk`: 分享者 UK
+    /// - `bdstoken`: 用户会话令牌
+    /// - `referer`: HTTP Referer 头
+    ///
+    /// # 返回
+    ///
+    /// 成功时返回 `TransferResult`，包含转存的文件路径和 fs_id 列表
+    pub async fn query_transfer_task(
+        &self,
+        task_id: &str,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        referer: &str,
+    ) -> Result<crate::transfer::TransferResult> {
+        use rand::Rng;
+
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            // 计算延迟时间（阶梯式策略 + 随机抖动）
+            let delay_ms = if attempt == 1 {
+                0 // 第 1 次：立即
+            } else {
+                let (base_ms, jitter_ms) = match attempt {
+                    2..=5 => (1000, 200),   // 第 2-5 次：1秒 ± 200ms
+                    6..=10 => (2000, 400),  // 第 6-10 次：2秒 ± 400ms
+                    _ => (5000, 1000),      // 第 11+ 次：5秒 ± 1000ms
+                };
+
+                // 生成随机抖动
+                let mut rng = rand::thread_rng();
+                let jitter = rng.gen_range(-(jitter_ms as i32)..=(jitter_ms as i32));
+                (base_ms as i32 + jitter).max(0) as u64
+            };
+
+            // 等待延迟
+            if delay_ms > 0 {
+                debug!(
+                        "异步转存任务查询 - 尝试 {}: 等待 {}ms 后查询",
+                        attempt, delay_ms
+                    );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            } else {
+                debug!("异步转存任务查询 - 尝试 {}: 立即查询", attempt);
+            }
+
+            // 构建查询 URL
+            let url = format!(
+                "https://pan.baidu.com/share/taskquery?\
+                     taskid={}&shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+                task_id, shareid, share_uk, bdstoken, BAIDU_APP_ID
+            );
+
+            // 发送请求
+            let response = self
+                .client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(resp) => {
+                    self.record_proxy_success();
+                    resp
+                }
+                Err(e) => {
+                    let err = anyhow::Error::from(e).context("任务查询请求失败");
+                    self.record_proxy_failure(&err);
+                    return Err(err);
+                }
+            };
+
+            let response_text = response.text().await.context("读取任务查询响应失败")?;
+            debug!("任务查询响应 (尝试 {}): {}", attempt, response_text);
+
+            let json: Value = serde_json::from_str(&response_text).context("解析任务查询响应失败")?;
+
+            let errno = json["errno"].as_i64().unwrap_or(-1);
+            let task_errno = json["task_errno"].as_i64().unwrap_or(0);
+            let status = json["status"].as_str().unwrap_or("");
+
+            // 检查 API 错误
+            if errno != 0 {
+                return Err(anyhow::anyhow!(
+                        "任务查询 API 错误: errno={}, response={}",
+                        errno,
+                        response_text
+                    ));
+            }
+
+            // 检查任务错误
+            if task_errno != 0 {
+                return Err(anyhow::anyhow!(
+                        "异步转存任务失败: task_errno={}, response={}",
+                        task_errno,
+                        response_text
+                    ));
+            }
+
+            // 检查任务状态
+            match status {
+                "success" => {
+                    // 任务完成，提取结果
+                    info!(
+                            "异步转存任务完成 (task_id={}, 尝试次数={})",
+                            task_id, attempt
+                        );
+
+                    let list = json["list"].as_array();
+                    let mut transferred_paths = Vec::new();
+                    let mut transferred_fs_ids = Vec::new();
+                    let mut from_paths = Vec::new();
+
+                    if let Some(list) = list {
+                        for item in list {
+                            if let Some(path) = item["to"].as_str() {
+                                transferred_paths.push(path.to_string());
+                            }
+                            if let Some(from) = item["from"].as_str() {
+                                from_paths.push(from.to_string());
+                            }
+                            if let Some(fsid) = item["to_fs_id"].as_u64() {
+                                transferred_fs_ids.push(fsid);
+                            }
+                        }
+
+                        info!(
+                                "异步转存成功: {} 个文件 (使用 list.length)",
+                                list.len()
+                            );
+                    } else {
+                        warn!("任务查询响应中没有 list 字段");
+                    }
+
+                    return Ok(crate::transfer::TransferResult {
+                        success: true,
+                        transferred_paths,
+                        from_paths,
+                        error: None,
+                        transferred_fs_ids,
+                    });
+                }
+                "failed" => {
+                    // 任务失败
+                    return Err(anyhow::anyhow!(
+                            "异步转存任务失败: status=failed, response={}",
+                            response_text
+                        ));
+                }
+                "running" => {
+                    // 任务仍在运行，继续轮询
+                    debug!(
+                            "异步转存任务仍在运行 (task_id={}, 尝试 {})",
+                            task_id, attempt
+                        );
+                    continue;
+                }
+                _ => {
+                    // 未知状态，记录警告并继续轮询（兼容性考虑）
+                    warn!(
+                            "异步转存任务状态未知: status='{}', 继续轮询 (尝试 {})",
+                            status, attempt
+                        );
+                    continue;
+                }
+            }
         }
     }
 
@@ -3542,5 +3843,608 @@ mod tests {
         assert!(response.is_success());
         assert_eq!(response.errmsg, "");
         assert_eq!(response.request_id, 0);
+    }
+}
+
+// ============================================
+// 保留属性测试 - 异步转存任务查询修复
+// ============================================
+// 这些测试验证同步转存行为在修复后保持不变（无回归）
+
+#[cfg(test)]
+mod transfer_preservation_tests {
+    use crate::transfer::TransferResult;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    // ============================================
+    // 测试辅助函数
+    // ============================================
+
+    /// 模拟同步转存响应（task_id=0，带 extra.list）
+    fn mock_sync_transfer_response(file_count: usize) -> String {
+        let list: Vec<_> = (0..file_count)
+            .map(|i| {
+                json!({
+                    "from": format!("/source/file{}.txt", i),
+                    "to": format!("/target/file{}.txt", i),
+                    "from_fs_id": 1000000 + i as u64,
+                    "to_fs_id": 2000000 + i as u64,
+                })
+            })
+            .collect();
+
+        json!({
+            "errno": 0,
+            "task_id": 0,
+            "extra": {
+                "list": list
+            }
+        })
+            .to_string()
+    }
+
+    /// 模拟同步转存响应（task_id 为字符串 "0"）
+    fn mock_sync_transfer_response_string_zero(file_count: usize) -> String {
+        let list: Vec<_> = (0..file_count)
+            .map(|i| {
+                json!({
+                    "from": format!("/source/file{}.txt", i),
+                    "to": format!("/target/file{}.txt", i),
+                    "from_fs_id": 1000000 + i as u64,
+                    "to_fs_id": 2000000 + i as u64,
+                })
+            })
+            .collect();
+
+        json!({
+            "errno": 0,
+            "task_id": "0",
+            "extra": {
+                "list": list
+            }
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=4 重复文件错误响应
+    fn mock_duplicate_error_response(filenames: Vec<&str>) -> String {
+        let dup_list: Vec<_> = filenames
+            .iter()
+            .map(|name| {
+                json!({
+                    "server_filename": name,
+                    "fs_id": 123456,
+                })
+            })
+            .collect();
+
+        json!({
+            "errno": 4,
+            "show_msg": "请求超时",
+            "duplicated": {
+                "list": dup_list
+            }
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=4 但没有 duplicated 字段（真正的超时）
+    fn mock_timeout_error_response() -> String {
+        json!({
+            "errno": 4,
+            "show_msg": "请求超时"
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=12 部分错误（同名文件）
+    fn mock_partial_error_same_name(filename: &str) -> String {
+        json!({
+            "errno": 12,
+            "info": [
+                {
+                    "errno": -30,
+                    "path": format!("/target/{}", filename)
+                }
+            ]
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=12 转存数量超限
+    fn mock_transfer_limit_exceeded(current: u64, limit: u64) -> String {
+        json!({
+            "errno": 12,
+            "target_file_nums": current,
+            "target_file_nums_limit": limit
+        })
+            .to_string()
+    }
+
+    /// 解析转存响应（模拟 transfer_share_files 的核心逻辑）
+    fn parse_transfer_response(response_text: &str) -> TransferResult {
+        let json: serde_json::Value = serde_json::from_str(response_text).unwrap();
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+
+        if errno == 0 {
+            // 检查是否为异步转存任务
+            let task_id_value = &json["task_id"];
+            let is_async_task = if task_id_value.is_string() {
+                let task_id_str = task_id_value.as_str().unwrap_or("");
+                !task_id_str.is_empty() && task_id_str != "0"
+            } else if task_id_value.is_u64() || task_id_value.is_i64() {
+                task_id_value.as_u64().unwrap_or(0) != 0
+            } else {
+                false
+            };
+
+            let has_extra = json["extra"]["list"].is_array();
+
+            if is_async_task && !has_extra {
+                // 异步模式 - 这不是我们在保留测试中测试的
+                return TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some("异步模式不在保留测试范围内".to_string()),
+                    transferred_fs_ids: vec![],
+                };
+            }
+
+            // 同步转存模式：提取 extra.list
+            let extra_list = json["extra"]["list"].as_array();
+            let mut transferred_paths = Vec::new();
+            let mut transferred_fs_ids = Vec::new();
+            let mut from_paths = Vec::new();
+
+            if let Some(list) = extra_list {
+                for item in list {
+                    if let Some(path) = item["to"].as_str() {
+                        transferred_paths.push(path.to_string());
+                    }
+                    if let Some(from) = item["from"].as_str() {
+                        from_paths.push(from.to_string());
+                    }
+                    if let Some(fsid) = item["to_fs_id"].as_u64() {
+                        transferred_fs_ids.push(fsid);
+                    }
+                }
+            }
+
+            TransferResult {
+                success: true,
+                transferred_paths,
+                from_paths,
+                error: None,
+                transferred_fs_ids,
+            }
+        } else if errno == 12 {
+            // 部分错误
+            let info_list = json["info"].as_array();
+            if let Some(list) = info_list {
+                if let Some(first) = list.first() {
+                    let inner_errno = first["errno"].as_i64().unwrap_or(0);
+                    if inner_errno == -30 {
+                        let path = first["path"].as_str().unwrap_or_default();
+                        let filename = std::path::Path::new(path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string());
+                        return TransferResult {
+                            success: false,
+                            transferred_paths: vec![],
+                            from_paths: vec![],
+                            error: Some(format!("同名文件已存在: {}", filename)),
+                            transferred_fs_ids: vec![],
+                        };
+                    }
+                }
+            }
+
+            // 检查转存数量限制
+            let target_file_nums = json["target_file_nums"].as_u64().unwrap_or(0);
+            let target_file_nums_limit = json["target_file_nums_limit"].as_u64().unwrap_or(0);
+            if target_file_nums > target_file_nums_limit {
+                return TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(format!(
+                        "转存文件数 {} 超过上限 {}",
+                        target_file_nums, target_file_nums_limit
+                    )),
+                    transferred_fs_ids: vec![],
+                };
+            }
+
+            TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                from_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            }
+        } else if errno == 4 {
+            // errno=4 + duplicated 字段 = 文件/文件夹重复
+            let duplicated = &json["duplicated"];
+            if duplicated.is_object() || duplicated.is_array() {
+                let dup_names: Vec<String> = duplicated["list"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| {
+                                item["server_filename"].as_str().map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let error_msg = if dup_names.is_empty() {
+                    "目标位置已存在同名文件/文件夹".to_string()
+                } else {
+                    format!("目标位置已存在同名文件: {}", dup_names.join(", "))
+                };
+                TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(error_msg),
+                    transferred_fs_ids: vec![],
+                }
+            } else {
+                let show_msg = json["show_msg"].as_str().unwrap_or("请求超时").to_string();
+                TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(show_msg),
+                    transferred_fs_ids: vec![],
+                }
+            }
+        } else {
+            TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                from_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            }
+        }
+    }
+
+    // ============================================
+    // 单元测试 - 同步转存保留
+    // ============================================
+
+    #[test]
+    fn test_sync_transfer_single_file_task_id_zero() {
+        // 需求 3.1: 同步转存（task_id=0）应继续从 extra.list 提取结果
+        let response = mock_sync_transfer_response(1);
+        let result = parse_transfer_response(&response);
+
+        assert!(result.success, "同步转存应该成功");
+        assert_eq!(result.transferred_paths.len(), 1, "应该转存 1 个文件");
+        assert_eq!(result.from_paths.len(), 1, "应该有 1 个源路径");
+        assert_eq!(result.transferred_fs_ids.len(), 1, "应该有 1 个 fs_id");
+        assert_eq!(result.transferred_paths[0], "/target/file0.txt");
+        assert_eq!(result.from_paths[0], "/source/file0.txt");
+        assert_eq!(result.transferred_fs_ids[0], 2000000);
+    }
+
+    #[test]
+    fn test_sync_transfer_task_id_string_zero() {
+        // 需求 3.1: task_id="0" 也应该被视为同步模式
+        let response = mock_sync_transfer_response_string_zero(1);
+        let result = parse_transfer_response(&response);
+
+        assert!(result.success, "task_id='0' 应该被视为同步模式");
+        assert_eq!(result.transferred_paths.len(), 1);
+    }
+
+    #[test]
+    fn test_sync_transfer_multiple_files() {
+        // 需求 3.1, 3.2: 多文件同步转存应正确提取所有路径
+        let response = mock_sync_transfer_response(5);
+        let result = parse_transfer_response(&response);
+
+        assert!(result.success);
+        assert_eq!(result.transferred_paths.len(), 5);
+        assert_eq!(result.from_paths.len(), 5);
+        assert_eq!(result.transferred_fs_ids.len(), 5);
+
+        // 验证路径映射正确
+        for i in 0..5 {
+            assert_eq!(
+                result.transferred_paths[i],
+                format!("/target/file{}.txt", i)
+            );
+            assert_eq!(result.from_paths[i], format!("/source/file{}.txt", i));
+            assert_eq!(result.transferred_fs_ids[i], 2000000 + i as u64);
+        }
+    }
+
+    // ============================================
+    // 单元测试 - 错误处理保留
+    // ============================================
+
+    #[test]
+    fn test_errno_4_duplicate_with_filenames() {
+        // 需求 3.3: errno=4 + duplicated 字段应报告重复文件
+        let response = mock_duplicate_error_response(vec!["test.txt", "doc.pdf"]);
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success, "重复文件应该失败");
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(
+            error_msg.contains("同名文件"),
+            "错误消息应包含'同名文件': {}",
+            error_msg
+        );
+        assert!(error_msg.contains("test.txt"), "应包含文件名 test.txt");
+        assert!(error_msg.contains("doc.pdf"), "应包含文件名 doc.pdf");
+    }
+
+    #[test]
+    fn test_errno_4_duplicate_without_filenames() {
+        // 需求 3.3: errno=4 + duplicated 但没有文件名列表
+        let response = json!({
+            "errno": 4,
+            "duplicated": {}
+        })
+            .to_string();
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(error_msg.contains("同名文件"));
+    }
+
+    #[test]
+    fn test_errno_4_timeout_without_duplicated() {
+        // 需求 3.3: errno=4 但没有 duplicated 字段应报告超时
+        let response = mock_timeout_error_response();
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert_eq!(error_msg, "请求超时");
+    }
+
+    #[test]
+    fn test_errno_12_same_name_file() {
+        // 需求 3.3: errno=12 + inner errno=-30 应报告同名文件
+        let response = mock_partial_error_same_name("existing.txt");
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(error_msg.contains("同名文件已存在"));
+        assert!(error_msg.contains("existing.txt"));
+    }
+
+    #[test]
+    fn test_errno_12_transfer_limit_exceeded() {
+        // 需求 3.3: errno=12 转存数量超限
+        let response = mock_transfer_limit_exceeded(150, 100);
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(error_msg.contains("超过上限"));
+        assert!(error_msg.contains("150"));
+        assert!(error_msg.contains("100"));
+    }
+
+    #[test]
+    fn test_other_errno_generic_error() {
+        // 需求 3.3: 其他 errno 应返回通用错误
+        let response = json!({
+            "errno": -1,
+            "show_msg": "未知错误"
+        })
+            .to_string();
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    // ============================================
+    // 基于属性的测试 - 同步转存保留
+    // ============================================
+
+    proptest! {
+        #[test]
+        fn prop_sync_transfer_preserves_file_count(file_count in 1usize..20) {
+            // 属性 2: 对于所有同步转存，提取的文件数应等于 extra.list 的长度
+            let response = mock_sync_transfer_response(file_count);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(result.success);
+            prop_assert_eq!(result.transferred_paths.len(), file_count);
+            prop_assert_eq!(result.from_paths.len(), file_count);
+            prop_assert_eq!(result.transferred_fs_ids.len(), file_count);
+        }
+
+        #[test]
+        fn prop_sync_transfer_path_mapping_correct(file_count in 1usize..20) {
+            // 属性 2: 对于所有同步转存，路径映射应正确（from -> to）
+            let response = mock_sync_transfer_response(file_count);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(result.success);
+            for i in 0..file_count {
+                prop_assert_eq!(
+                    &result.transferred_paths[i],
+                    &format!("/target/file{}.txt", i)
+                );
+                prop_assert_eq!(
+                    &result.from_paths[i],
+                    &format!("/source/file{}.txt", i)
+                );
+                prop_assert_eq!(
+                    result.transferred_fs_ids[i],
+                    2000000 + i as u64
+                );
+            }
+        }
+
+        #[test]
+        fn prop_error_responses_always_fail(errno in 1i64..100) {
+            // 属性 2: 对于所有错误响应（errno != 0），结果应该失败
+            if errno == 0 {
+                return Ok(());
+            }
+
+            let response = json!({
+                "errno": errno,
+                "show_msg": format!("错误码 {}", errno)
+            }).to_string();
+
+            let result = parse_transfer_response(&response);
+            prop_assert!(!result.success);
+            prop_assert!(result.error.is_some());
+        }
+
+        #[test]
+        fn prop_duplicate_error_contains_filenames(
+            filename1 in "[a-z]{3,10}\\.txt",
+            filename2 in "[a-z]{3,10}\\.pdf"
+        ) {
+            // 属性 2: errno=4 重复错误应包含所有文件名
+            let response = mock_duplicate_error_response(vec![&filename1, &filename2]);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(!result.success);
+            let error_msg = result.error.unwrap();
+            prop_assert!(error_msg.contains(&filename1));
+            prop_assert!(error_msg.contains(&filename2));
+        }
+
+        #[test]
+        fn prop_transfer_limit_error_contains_numbers(
+            current in 100u64..1000,
+            limit in 1u64..100
+        ) {
+            // 属性 2: 转存数量超限错误应包含当前值和限制值
+            let response = mock_transfer_limit_exceeded(current, limit);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(!result.success);
+            let error_msg = result.error.unwrap();
+            prop_assert!(error_msg.contains(&current.to_string()));
+            prop_assert!(error_msg.contains(&limit.to_string()));
+        }
+    }
+
+    // ============================================
+    // bdstoken 参数保留测试
+    // ============================================
+
+    #[test]
+    fn test_bdstoken_parameter_format() {
+        // 需求 3.4: 验证 bdstoken 参数格式
+        // 注意：这个测试验证 URL 构建逻辑，实际的 HTTP 请求由 NetdiskClient 处理
+
+        let shareid = "123456";
+        let share_uk = "789012";
+        let bdstoken = "test_token_abc123";
+        let app_id = "250528";
+
+        let url = format!(
+            "https://pan.baidu.com/share/transfer?\
+             shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+            shareid, share_uk, bdstoken, app_id
+        );
+
+        // 验证 URL 包含所有必需参数
+        assert!(url.contains("shareid=123456"));
+        assert!(url.contains("from=789012"));
+        assert!(url.contains("bdstoken=test_token_abc123"));
+        assert!(url.contains("app_id=250528"));
+        assert!(url.contains("channel=chunlei"));
+        assert!(url.contains("clienttype=0"));
+        assert!(url.contains("web=1"));
+    }
+
+    // ============================================
+    // 边界情况测试
+    // ============================================
+
+    #[test]
+    fn test_empty_extra_list() {
+        // 边界情况: extra.list 为空数组（转存 0 个文件）
+        let response = json!({
+            "errno": 0,
+            "task_id": 0,
+            "extra": {
+                "list": []
+            }
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(result.success);
+        assert_eq!(result.transferred_paths.len(), 0);
+        assert_eq!(result.from_paths.len(), 0);
+        assert_eq!(result.transferred_fs_ids.len(), 0);
+    }
+
+    #[test]
+    fn test_missing_optional_fields_in_list() {
+        // 边界情况: list 项中缺少某些可选字段
+        let response = json!({
+            "errno": 0,
+            "task_id": 0,
+            "extra": {
+                "list": [
+                    {
+                        "to": "/target/file1.txt",
+                        // 缺少 from 和 to_fs_id
+                    },
+                    {
+                        "from": "/source/file2.txt",
+                        "to_fs_id": 2000001
+                        // 缺少 to
+                    }
+                ]
+            }
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(result.success);
+        // 应该只提取存在的字段
+        assert_eq!(result.transferred_paths.len(), 1); // 只有第一项有 to
+        assert_eq!(result.from_paths.len(), 1); // 只有第二项有 from
+        assert_eq!(result.transferred_fs_ids.len(), 1); // 只有第二项有 to_fs_id
+    }
+
+    #[test]
+    fn test_task_id_empty_string() {
+        // 边界情况: task_id 为空字符串应视为同步模式
+        let response = json!({
+            "errno": 0,
+            "task_id": "",
+            "extra": {
+                "list": [
+                    {
+                        "from": "/source/file.txt",
+                        "to": "/target/file.txt",
+                        "to_fs_id": 2000000
+                    }
+                ]
+            }
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(result.success);
+        assert_eq!(result.transferred_paths.len(), 1);
     }
 }

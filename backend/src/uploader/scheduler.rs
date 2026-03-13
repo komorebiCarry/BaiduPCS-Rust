@@ -603,6 +603,10 @@ impl UploadChunkScheduler {
                                     );
 
                                     let client_snapshot = task_info.client.read().unwrap().clone();
+                                    let rtype = {
+                                        let task = task_info.task.lock().await;
+                                        crate::uploader::conflict::conflict_strategy_to_rtype(task.conflict_strategy)
+                                    };
                                     let create_result = client_snapshot
                                         .create_file(
                                             &task_info.remote_path,
@@ -610,6 +614,7 @@ impl UploadChunkScheduler {
                                             &task_info.upload_id,
                                             task_info.total_size,
                                             "0",
+                                            rtype,
                                         )
                                         .await;
 
@@ -930,6 +935,10 @@ impl UploadChunkScheduler {
 
                         // 调用 create_file 合并分片
                         let client_snapshot = task_info.client.read().unwrap().clone();
+                        let rtype = {
+                            let task = task_info.task.lock().await;
+                            crate::uploader::conflict::conflict_strategy_to_rtype(task.conflict_strategy)
+                        };
                         let create_result = client_snapshot
                             .create_file(
                                 &task_info.remote_path,
@@ -937,6 +946,7 @@ impl UploadChunkScheduler {
                                 &task_info.upload_id,
                                 task_info.total_size,
                                 "0",
+                                rtype,
                             )
                             .await;
 

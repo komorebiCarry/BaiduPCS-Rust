@@ -55,6 +55,9 @@ pub struct AppConfig {
     /// 扫描配置
     #[serde(default)]
     pub scan: ScanConfig,
+    /// 冲突策略配置
+    #[serde(default)]
+    pub conflict_strategy: ConflictStrategyConfig,
 }
 
 /// 扫描配置
@@ -81,6 +84,27 @@ impl Default for ScanConfig {
 fn default_scan_batch_size() -> usize { 1000 }
 fn default_max_pending_tasks() -> usize { 5000 }
 fn default_progress_interval() -> usize { 500 }
+
+/// 冲突策略配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictStrategyConfig {
+    /// 上传操作默认策略
+    #[serde(default)]
+    pub default_upload_strategy: crate::uploader::conflict::UploadConflictStrategy,
+
+    /// 下载操作默认策略
+    #[serde(default)]
+    pub default_download_strategy: crate::uploader::conflict::DownloadConflictStrategy,
+}
+
+impl Default for ConflictStrategyConfig {
+    fn default() -> Self {
+        Self {
+            default_upload_strategy: crate::uploader::conflict::UploadConflictStrategy::SmartDedup,
+            default_download_strategy: crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
+        }
+    }
+}
 
 /// 网络配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -997,6 +1021,7 @@ impl Default for AppConfig {
             share_direct_download: ShareDirectDownloadConfig::default(),
             network: NetworkConfig::default(),
             scan: ScanConfig::default(),
+            conflict_strategy: ConflictStrategyConfig::default(),
         }
     }
 }
@@ -1016,7 +1041,22 @@ impl AppConfig {
             .await
             .context("Failed to read config file")?;
 
+        // 检测是否为旧配置格式（没有 conflict_strategy 字段）
+        let is_legacy_config = !content.contains("conflict_strategy");
+
         let config: AppConfig = toml::from_str(&content).context("Failed to parse config file")?;
+
+        // 如果是旧配置，记录迁移事件
+        if is_legacy_config {
+            tracing::info!(
+                "检测到旧配置格式（缺少 conflict_strategy 字段），应用默认值: \
+                 上传策略=SmartDedup, 下载策略=Overwrite"
+            );
+            tracing::info!(
+                "配置迁移完成: conflict_strategy 字段已自动添加默认值。\
+                 您可以在设置页面修改默认策略。"
+            );
+        }
 
         // 验证下载路径是否为绝对路径
         config
@@ -1434,4 +1474,148 @@ mod tests {
         assert!(config.share_direct_download.cleanup_on_failure);
         assert!(!config.share_direct_download.cleanup_orphaned_on_startup);
     }
+
+    // ========== 冲突策略配置测试 ==========
+
+    use proptest::prelude::*;
+    use crate::uploader::conflict::{UploadConflictStrategy, DownloadConflictStrategy};
+
+    // 生成器：上传冲突策略
+    fn prop_upload_strategy() -> impl Strategy<Value = UploadConflictStrategy> {
+        prop_oneof![
+            Just(UploadConflictStrategy::SmartDedup),
+            Just(UploadConflictStrategy::AutoRename),
+            Just(UploadConflictStrategy::Overwrite),
+        ]
+    }
+
+    // 生成器：下载冲突策略
+    fn prop_download_strategy() -> impl Strategy<Value = DownloadConflictStrategy> {
+        prop_oneof![
+            Just(DownloadConflictStrategy::Overwrite),
+            Just(DownloadConflictStrategy::Skip),
+            Just(DownloadConflictStrategy::AutoRename),
+        ]
+    }
+
+    // Feature: file-conflict-strategy, Property 1: 配置持久化往返
+    // **Validates: Requirements 4.3**
+    proptest! {
+        #[test]
+        fn test_conflict_strategy_config_serialization_roundtrip(
+            upload_strategy in prop_upload_strategy(),
+            download_strategy in prop_download_strategy()
+        ) {
+            // 创建配置
+            let config = ConflictStrategyConfig {
+                default_upload_strategy: upload_strategy,
+                default_download_strategy: download_strategy,
+            };
+
+            // 序列化为 TOML
+            let serialized = toml::to_string(&config).unwrap();
+
+            // 反序列化
+            let deserialized: ConflictStrategyConfig = toml::from_str(&serialized).unwrap();
+
+            // 验证等价性
+            prop_assert_eq!(config.default_upload_strategy, deserialized.default_upload_strategy);
+            prop_assert_eq!(config.default_download_strategy, deserialized.default_download_strategy);
+        }
+
+        #[test]
+        fn test_app_config_with_conflict_strategy_roundtrip(
+            upload_strategy in prop_upload_strategy(),
+            download_strategy in prop_download_strategy()
+        ) {
+            // 创建包含冲突策略的 AppConfig
+            let mut config = AppConfig::default();
+            config.conflict_strategy.default_upload_strategy = upload_strategy;
+            config.conflict_strategy.default_download_strategy = download_strategy;
+
+            // 序列化为 TOML
+            let serialized = toml::to_string(&config).unwrap();
+
+            // 反序列化
+            let deserialized: AppConfig = toml::from_str(&serialized).unwrap();
+
+            // 验证冲突策略字段正确保存和加载
+            prop_assert_eq!(
+                config.conflict_strategy.default_upload_strategy,
+                deserialized.conflict_strategy.default_upload_strategy
+            );
+            prop_assert_eq!(
+                config.conflict_strategy.default_download_strategy,
+                deserialized.conflict_strategy.default_download_strategy
+            );
+        }
+    }
+
+    // Feature: file-conflict-strategy, Property 15: 向后兼容的默认值
+    // **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+    #[test]
+    fn test_conflict_strategy_backward_compatibility() {
+        // 模拟旧配置文件（没有 conflict_strategy 字段）
+        let old_config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 18888
+cors_origins = ["*"]
+
+[download]
+download_dir = "D:\\Downloads"
+max_global_threads = 10
+chunk_size_mb = 5
+max_concurrent_tasks = 5
+max_retries = 3
+ask_each_time = true
+        "#;
+
+        // 反序列化旧配置
+        let config: AppConfig = toml::from_str(old_config_toml).unwrap();
+
+        // 验证默认值正确应用
+        assert_eq!(
+            config.conflict_strategy.default_upload_strategy,
+            UploadConflictStrategy::SmartDedup,
+            "旧配置应使用 SmartDedup 作为上传默认策略"
+        );
+        assert_eq!(
+            config.conflict_strategy.default_download_strategy,
+            DownloadConflictStrategy::Overwrite,
+            "旧配置应使用 Overwrite 作为下载默认策略"
+        );
+    }
+
+    #[test]
+    fn test_conflict_strategy_config_default() {
+        let config = ConflictStrategyConfig::default();
+
+        assert_eq!(
+            config.default_upload_strategy,
+            UploadConflictStrategy::SmartDedup
+        );
+        assert_eq!(
+            config.default_download_strategy,
+            DownloadConflictStrategy::Overwrite
+        );
+    }
+
+    #[test]
+    fn test_conflict_strategy_config_serialization_format() {
+        // 测试序列化格式为 snake_case
+        let config = ConflictStrategyConfig {
+            default_upload_strategy: UploadConflictStrategy::SmartDedup,
+            default_download_strategy: DownloadConflictStrategy::Overwrite,
+        };
+
+        let toml_str = toml::to_string(&config).unwrap();
+
+        // 验证 TOML 格式
+        assert!(toml_str.contains("default_upload_strategy"));
+        assert!(toml_str.contains("default_download_strategy"));
+        assert!(toml_str.contains("smart_dedup"));
+        assert!(toml_str.contains("overwrite"));
+    }
 }
+

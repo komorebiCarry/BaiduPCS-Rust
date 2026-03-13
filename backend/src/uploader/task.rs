@@ -150,6 +150,11 @@ pub struct UploadTask {
     /// 加密密钥版本号（用于密钥轮换后解密）
     #[serde(default = "default_key_version")]
     pub encryption_key_version: u32,
+
+    // === 🔥 冲突策略字段 ===
+    /// 冲突处理策略（用于转换为百度 API 的 rtype 参数）
+    #[serde(default)]
+    pub conflict_strategy: crate::uploader::UploadConflictStrategy,
 }
 
 fn default_key_version() -> u32 {
@@ -199,6 +204,8 @@ impl UploadTask {
             encryption_algorithm: None,
             encryption_version: 0,
             encryption_key_version: 1,
+            // 冲突策略初始化
+            conflict_strategy: crate::uploader::UploadConflictStrategy::default(),
         }
     }
 

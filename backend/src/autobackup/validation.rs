@@ -563,6 +563,8 @@ mod tests {
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
         }];
 
         // 创建子配置应该冲突
@@ -595,6 +597,8 @@ mod tests {
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
         }];
 
         // 创建反向下载配置应该冲突（闭环）
@@ -624,6 +628,8 @@ mod tests {
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
         }];
 
         // 本地路径相同但云端路径不同，不冲突

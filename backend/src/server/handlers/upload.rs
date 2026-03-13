@@ -1,5 +1,5 @@
 use crate::server::AppState;
-use crate::uploader::{ScanOptions, ScanTaskStatus, UploadTask};
+use crate::uploader::{ScanOptions, ScanTaskStatus, UploadConflictStrategy, UploadTask};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -21,6 +21,9 @@ pub struct CreateUploadRequest {
     /// 是否启用加密（可选，默认 false）
     #[serde(default)]
     pub encrypt: bool,
+    /// 冲突策略（可选，未指定则使用默认值）
+    #[serde(default)]
+    pub conflict_strategy: Option<UploadConflictStrategy>,
 }
 
 /// 创建文件夹上传任务请求
@@ -36,6 +39,9 @@ pub struct CreateFolderUploadRequest {
     /// 是否启用加密（可选，默认 false）
     #[serde(default)]
     pub encrypt: bool,
+    /// 冲突策略（可选，未指定则使用默认值）
+    #[serde(default)]
+    pub conflict_strategy: Option<UploadConflictStrategy>,
 }
 
 /// 文件夹扫描选项（序列化友好版本）
@@ -76,6 +82,9 @@ pub struct CreateBatchUploadRequest {
     /// 是否启用加密（可选，默认 false）
     #[serde(default)]
     pub encrypt: bool,
+    /// 冲突策略（可选，未指定则使用默认值）
+    #[serde(default)]
+    pub conflict_strategy: Option<UploadConflictStrategy>,
 }
 
 /// 扫描启动响应
@@ -109,11 +118,17 @@ pub async fn create_upload(
         .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // 如果未指定策略，从 AppConfig 读取默认值
+    let conflict_strategy = req.conflict_strategy.or_else(|| {
+        let config = app_state.config.blocking_read();
+        Some(config.conflict_strategy.default_upload_strategy)
+    });
+
     let local_path = PathBuf::from(&req.local_path);
 
     // 🔥 传递 encrypt 参数，普通文件上传 is_folder_upload = false
     match upload_manager
-        .create_task(local_path, req.remote_path, req.encrypt, false)
+        .create_task(local_path, req.remote_path, req.encrypt, false, conflict_strategy)
         .await
     {
         Ok(task_id) => {
@@ -150,6 +165,8 @@ pub async fn create_folder_upload(
     // 获取配置
     let config = app_state.config.read().await;
     let skip_hidden_files = config.upload.skip_hidden_files;
+    // 如果未指定策略，从 AppConfig 读取默认值
+    let conflict_strategy = req.conflict_strategy.or(Some(config.conflict_strategy.default_upload_strategy));
     drop(config);
 
     let local_folder = PathBuf::from(&req.local_folder);
@@ -164,7 +181,7 @@ pub async fn create_folder_upload(
     };
 
     match scan_manager
-        .start_scan(local_folder, req.remote_folder, scan_options, req.encrypt)
+        .start_scan(local_folder, req.remote_folder, scan_options, req.encrypt, conflict_strategy)
         .await
     {
         Ok(scan_task_id) => {
@@ -192,6 +209,12 @@ pub async fn create_batch_upload(
         .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // 如果未指定策略，从 AppConfig 读取默认值
+    let conflict_strategy = req.conflict_strategy.or_else(|| {
+        let config = app_state.config.blocking_read();
+        Some(config.conflict_strategy.default_upload_strategy)
+    });
+
     // 转换为 PathBuf
     let files: Vec<(PathBuf, String)> = req
         .files
@@ -200,7 +223,7 @@ pub async fn create_batch_upload(
         .collect();
 
     // 🔥 传递 encrypt 参数
-    match upload_manager.create_batch_tasks(files, req.encrypt).await {
+    match upload_manager.create_batch_tasks(files, req.encrypt, conflict_strategy).await {
         Ok(task_ids) => {
             info!("批量创建上传任务成功: {} 个 (encrypt={})", task_ids.len(), req.encrypt);
 

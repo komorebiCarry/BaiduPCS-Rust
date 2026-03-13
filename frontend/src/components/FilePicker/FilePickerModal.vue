@@ -74,10 +74,25 @@
                 未选择
               </template>
             </span>
-            <div v-if="showEncryption" class="encrypt-switch">
-              <el-icon><Lock /></el-icon>
-              <span>加密上传</span>
-              <el-switch v-model="encryptEnabled" size="small" />
+            <div class="upload-options">
+              <div v-if="showEncryption" class="encrypt-switch">
+                <el-icon><Lock /></el-icon>
+                <span>加密上传</span>
+                <el-switch v-model="encryptEnabled" size="small" />
+              </div>
+              <div v-if="showConflictStrategy" class="conflict-strategy-inline">
+                <span class="label">冲突策略:</span>
+                <el-select
+                    v-model="uploadConflictStrategy"
+                    placeholder="选择策略"
+                    size="small"
+                    style="width: 140px"
+                >
+                  <el-option label="智能去重" value="smart_dedup" />
+                  <el-option label="自动重命名" value="auto_rename" />
+                  <el-option label="覆盖" value="overwrite" />
+                </el-select>
+              </div>
             </div>
           </div>
           <div class="actions">
@@ -119,9 +134,24 @@
               <span class="label">下载到:</span>
               <span class="path" :title="currentDownloadPath">{{ currentDownloadPath || '请选择目录' }}</span>
             </div>
-            <el-checkbox v-model="setAsDefault" class="set-default-checkbox">
-              设为默认下载目录
-            </el-checkbox>
+            <div class="download-options">
+              <el-checkbox v-model="setAsDefault" class="set-default-checkbox">
+                设为默认下载目录
+              </el-checkbox>
+              <div v-if="showConflictStrategy" class="conflict-strategy-inline">
+                <span class="label">冲突策略:</span>
+                <el-select
+                    v-model="conflictStrategy"
+                    placeholder="选择策略"
+                    size="small"
+                    style="width: 140px"
+                >
+                  <el-option label="覆盖" value="overwrite" />
+                  <el-option label="跳过" value="skip" />
+                  <el-option label="自动重命名" value="auto_rename" />
+                </el-select>
+              </div>
+            </div>
           </div>
           <div class="actions">
             <el-button @click="handleClose">取消</el-button>
@@ -169,6 +199,9 @@ const props = withDefaults(defineProps<{
   defaultDownloadDir?: string
   multiple?: boolean  // 是否支持多选（上传模式默认 true）
   showEncryption?: boolean  // 是否显示加密选项（上传模式）
+  showConflictStrategy?: boolean  // 是否显示冲突策略选择
+  defaultConflictStrategy?: string  // 默认冲突策略
+  defaultUploadConflictStrategy?: string  // 默认上传冲突策略
 }>(), {
   selectType: 'both',
   title: '选择文件',
@@ -176,24 +209,29 @@ const props = withDefaults(defineProps<{
   mode: 'upload',
   multiple: true,
   showEncryption: false,
+  showConflictStrategy: false,
+  defaultConflictStrategy: 'overwrite',
+  defaultUploadConflictStrategy: 'smart_dedup',
 })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  'select': [entry: FileEntry, encrypt: boolean]
-  'select-multiple': [entries: FileEntry[], encrypt: boolean]  // 多选确认事件
-  'confirm-download': [payload: { path: string, setAsDefault: boolean }]
+  'select': [entry: FileEntry, encrypt: boolean, conflictStrategy?: string]
+  'select-multiple': [entries: FileEntry[], encrypt: boolean, conflictStrategy?: string]  // 多选确认事件
+  'confirm-download': [payload: { path: string, setAsDefault: boolean, conflictStrategy?: string }]
   'confirm': [path: string]  // 纯目录选择模式
-  'use-default': []
+  'use-default': [conflictStrategy?: string]
 }>()
 
 const store = useFilePickerStore()
 
 // 下载模式状态
 const setAsDefault = ref(false)
+const conflictStrategy = ref(props.defaultConflictStrategy)
 
-// 加密状态（上传模式）
+// 上传模式状态
 const encryptEnabled = ref(false)
+const uploadConflictStrategy = ref(props.defaultUploadConflictStrategy)
 
 // 是否启用多选模式（上传模式 + multiple 为 true）
 const isMultiSelectMode = computed(() => {
@@ -265,6 +303,8 @@ function handleOpen() {
   store.reset()
   setAsDefault.value = false
   encryptEnabled.value = false
+  conflictStrategy.value = props.defaultConflictStrategy
+  uploadConflictStrategy.value = props.defaultUploadConflictStrategy
 
   // 根据模式确定初始路径
   if (props.mode === 'download') {
@@ -326,7 +366,11 @@ function handleConfirm() {
     // 下载模式：发射 confirm-download 事件
     const downloadPath = currentDownloadPath.value
     if (downloadPath) {
-      emit('confirm-download', { path: downloadPath, setAsDefault: setAsDefault.value })
+      emit('confirm-download', {
+        path: downloadPath,
+        setAsDefault: setAsDefault.value,
+        conflictStrategy: props.showConflictStrategy ? conflictStrategy.value : undefined
+      })
       visible.value = false
     }
   } else if (props.mode === 'select-directory') {
@@ -340,11 +384,19 @@ function handleConfirm() {
     // 上传模式
     if (isMultiSelectMode.value && store.multiSelection.length > 0) {
       // 多选模式：发射 select-multiple 事件
-      emit('select-multiple', [...store.multiSelection], encryptEnabled.value)
+      emit('select-multiple',
+          [...store.multiSelection],
+          encryptEnabled.value,
+          props.showConflictStrategy ? uploadConflictStrategy.value : undefined
+      )
       visible.value = false
     } else if (store.selection && canConfirmUpload.value) {
       // 单选模式：原有逻辑
-      emit('select', store.selection, encryptEnabled.value)
+      emit('select',
+          store.selection,
+          encryptEnabled.value,
+          props.showConflictStrategy ? uploadConflictStrategy.value : undefined
+      )
       visible.value = false
     }
   }
@@ -352,7 +404,7 @@ function handleConfirm() {
 
 // 使用默认路径下载
 function handleUseDefault() {
-  emit('use-default')
+  emit('use-default', props.showConflictStrategy ? conflictStrategy.value : undefined)
   visible.value = false
 }
 
@@ -428,6 +480,12 @@ watch(() => props.selectType, () => {
   max-width: 400px;
 }
 
+.upload-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .encrypt-switch {
   display: flex;
   align-items: center;
@@ -468,8 +526,26 @@ watch(() => props.selectType, () => {
   white-space: nowrap;
 }
 
+.download-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .set-default-checkbox {
   font-size: 13px;
+}
+
+.conflict-strategy-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.conflict-strategy-inline .label {
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
 }
 
 /* =====================

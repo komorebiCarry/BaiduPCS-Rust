@@ -1,6 +1,6 @@
 //! 文件夹下载 API 处理器
 
-use crate::downloader::{DownloadTask, FolderDownload, TaskStatus};
+use crate::downloader::{DownloadConflictStrategy, DownloadTask, FolderDownload, TaskStatus};
 use crate::server::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -19,6 +19,9 @@ pub struct CreateFolderDownloadRequest {
     /// 原始文件夹名（如果是加密文件夹，前端传入还原后的名称）
     #[serde(default)]
     pub original_name: Option<String>,
+    /// 冲突策略（可选，未指定则使用默认值）
+    #[serde(default)]
+    pub conflict_strategy: Option<DownloadConflictStrategy>,
 }
 
 /// 删除文件夹下载请求参数
@@ -63,9 +66,15 @@ pub async fn create_folder_download(
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
     info!("创建文件夹下载: {}, original_name: {:?}", req.path, req.original_name);
 
+    // 如果未指定策略，从 AppConfig 读取默认值
+    let conflict_strategy = req.conflict_strategy.or_else(|| {
+        let config = app_state.config.blocking_read();
+        Some(config.conflict_strategy.default_download_strategy)
+    });
+
     match app_state
         .folder_download_manager
-        .create_folder_download_with_name(req.path, req.original_name)
+        .create_folder_download_with_name(req.path, req.original_name, conflict_strategy)
         .await
     {
         Ok(folder_id) => Ok(Json(ApiResponse::success(folder_id))),

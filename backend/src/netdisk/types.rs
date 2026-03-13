@@ -738,3 +738,59 @@ impl DeleteFilesApiResponse {
         self.errno == 0
     }
 }
+
+/// 文件元信息（包含 block_list）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetaInfo {
+    /// 文件服务器ID
+    #[serde(rename = "fs_id")]
+    pub fs_id: u64,
+
+    /// 文件路径
+    pub path: String,
+
+    /// 服务器文件名
+    pub server_filename: String,
+
+    /// 文件大小（字节）
+    pub size: u64,
+
+    /// 是否是目录 (0=文件, 1=目录)
+    pub isdir: i32,
+
+    /// MD5（仅文件有效）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+
+    /// block_list（分片MD5列表，JSON字符串格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_list: Option<String>,
+
+    /// 服务器创建时间
+    pub server_ctime: i64,
+
+    /// 服务器修改时间
+    pub server_mtime: i64,
+}
+
+/// 文件元信息响应
+#[derive(Debug, Deserialize)]
+pub struct FileMetasResponse {
+    /// 错误码（0表示成功）
+    pub errno: i32,
+
+    /// 错误信息
+    #[serde(default)]
+    pub errmsg: String,
+
+    /// 文件元信息列表
+    #[serde(default)]
+    pub list: Vec<FileMetaInfo>,
+}
+
+impl FileMetasResponse {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        self.errno == 0
+    }
+}

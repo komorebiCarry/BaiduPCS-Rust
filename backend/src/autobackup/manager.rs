@@ -550,6 +550,8 @@ impl AutoBackupManager {
             enabled: true,
             created_at: now,
             updated_at: now,
+            upload_conflict_strategy: request.upload_conflict_strategy,
+            download_conflict_strategy: request.download_conflict_strategy,
         };
 
         // 保存配置
@@ -646,6 +648,14 @@ impl AutoBackupManager {
         }
         if let Some(enabled) = request.enabled {
             config.enabled = enabled;
+        }
+
+        // 更新冲突策略字段
+        if let Some(upload_strategy) = request.upload_conflict_strategy {
+            config.upload_conflict_strategy = Some(upload_strategy);
+        }
+        if let Some(download_strategy) = request.download_conflict_strategy {
+            config.download_conflict_strategy = Some(download_strategy);
         }
 
         config.updated_at = Utc::now();
@@ -1492,6 +1502,10 @@ impl AutoBackupManager {
 
             tracing::debug!("开始上传文件: {:?} -> {}", local_path, remote_path);
 
+            // 获取上传冲突策略（如果未指定，使用 SmartDedup 默认值）
+            let upload_strategy = config.upload_conflict_strategy
+                .unwrap_or(crate::uploader::conflict::UploadConflictStrategy::SmartDedup);
+
             // 创建并启动上传任务
             match upload_mgr.create_backup_task(
                 local_path.clone(),
@@ -1500,6 +1514,7 @@ impl AutoBackupManager {
                 config.encrypt_enabled,
                 Some(task_id.clone()),
                 Some(file_task_id.clone()),
+                Some(upload_strategy), // 传递冲突策略
             ).await {
                 Ok(upload_task_id) => {
                     tracing::debug!("备份上传任务已创建: upload_task={}, file={:?}", upload_task_id, local_path);
@@ -1766,14 +1781,32 @@ impl AutoBackupManager {
                         // 尝试使用旧任务的 fs_id 创建新任务
                         let fs_id = download_task.fs_id;
 
+                        // 获取下载冲突策略（如果未指定，使用 Overwrite 默认值）
+                        let download_strategy = config.download_conflict_strategy
+                            .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+
                         match download_mgr.create_backup_task(
                             fs_id,
                             remote_path.clone(),
                             local_path.clone(),
                             file_task.file_size,
                             config.id.clone(),
+                            Some(download_strategy), // 传递冲突策略
                         ).await {
                             Ok(new_download_task_id) => {
+                                // 检查是否为跳过标记
+                                if new_download_task_id == "skipped" {
+                                    tracing::info!("跳过备份下载（文件已存在）: file={}", remote_path);
+                                    if let Some(mut task) = tasks.get_mut(&task_id) {
+                                        task.skipped_count += 1;
+                                        if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                                            ft.status = BackupFileStatus::Skipped;
+                                            ft.error_message = Some("文件已存在".to_string());
+                                        }
+                                    }
+                                    continue;
+                                }
+
                                 if let Err(e) = download_mgr.start_task(&new_download_task_id).await {
                                     tracing::error!("启动新下载任务失败: {}", e);
                                     if let Some(mut task) = tasks.get_mut(&task_id) {
@@ -1825,14 +1858,33 @@ impl AutoBackupManager {
                     );
 
                     // 使用 fs_id 创建新的下载任务
+                    // 获取下载冲突策略（如果未指定，使用 Overwrite 默认值）
+                    let download_strategy = config.download_conflict_strategy
+                        .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+
                     match download_mgr.create_backup_task(
                         fs_id,
                         remote_path.clone(),
                         local_path.clone(),
                         file_task.file_size,
                         config.id.clone(),
+                        Some(download_strategy), // 传递冲突策略
                     ).await {
                         Ok(new_download_task_id) => {
+                            // 检查是否为跳过标记
+                            if new_download_task_id == "skipped" {
+                                tracing::info!("跳过备份下载（文件已存在）: file={}", remote_path);
+                                if let Some(mut task) = tasks.get_mut(&task_id) {
+                                    task.skipped_count += 1;
+                                    if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                                        ft.status = BackupFileStatus::Skipped;
+                                        ft.error_message = Some("文件已存在".to_string());
+                                        ft.updated_at = Utc::now();
+                                    }
+                                }
+                                continue;
+                            }
+
                             // 启动下载任务
                             if let Err(e) = download_mgr.start_task(&new_download_task_id).await {
                                 tracing::error!("启动重建的下载任务失败: download_task={}, error={}", new_download_task_id, e);
@@ -2258,6 +2310,10 @@ impl AutoBackupManager {
 
             tracing::debug!("开始下载文件: {} -> {:?}", remote_path, local_path);
 
+            // 获取下载冲突策略（如果未指定，使用 Overwrite 默认值）
+            let download_strategy = config.download_conflict_strategy
+                .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+
             // 创建并启动备份下载任务
             match download_mgr.create_backup_task(
                 fs_id,
@@ -2265,8 +2321,23 @@ impl AutoBackupManager {
                 local_path.clone(),
                 file_size,
                 config.id.clone(),
+                Some(download_strategy), // 传递冲突策略
             ).await {
                 Ok(download_task_id) => {
+                    // 检查是否为跳过标记
+                    if download_task_id == "skipped" {
+                        tracing::info!("跳过备份下载（文件已存在）: file={}", remote_path);
+                        if let Some(mut task) = tasks.get_mut(&task_id) {
+                            task.skipped_count += 1;
+                            if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                                ft.status = BackupFileStatus::Skipped;
+                                ft.error_message = Some("文件已存在".to_string());
+                                ft.updated_at = Utc::now();
+                            }
+                        }
+                        continue;
+                    }
+
                     tracing::debug!("备份下载任务已创建: download_task={}, file={}", download_task_id, remote_path);
 
                     // 启动下载任务
@@ -6962,7 +7033,19 @@ impl AutoBackupManager {
             file_task.status = BackupFileStatus::WaitingTransfer;
             file_task.updated_at = Utc::now();
 
-            match upload_mgr.create_backup_task(local_path.clone(), remote_path.clone(), config.id.clone(), config.encrypt_enabled, Some(task_id.to_string()), Some(file_task_id.clone())).await {
+            // 获取上传冲突策略（如果未指定，使用 SmartDedup 默认值）
+            let upload_strategy = config.upload_conflict_strategy
+                .unwrap_or(crate::uploader::conflict::UploadConflictStrategy::SmartDedup);
+
+            match upload_mgr.create_backup_task(
+                local_path.clone(),
+                remote_path.clone(),
+                config.id.clone(),
+                config.encrypt_enabled,
+                Some(task_id.to_string()),
+                Some(file_task_id.clone()),
+                Some(upload_strategy), // 传递冲突策略
+            ).await {
                 Ok(upload_task_id) => {
                     if let Err(e) = upload_mgr.start_task(&upload_task_id).await {
                         tracing::error!("启动上传任务失败: {}", e);
@@ -7162,8 +7245,32 @@ impl AutoBackupManager {
             file_task.status = BackupFileStatus::WaitingTransfer;
             file_task.updated_at = Utc::now();
 
-            match download_mgr.create_backup_task(fs_id, remote_path.clone(), local_path.clone(), file_size, config.id.clone()).await {
+            // 获取下载冲突策略（如果未指定，使用 Overwrite 默认值）
+            let download_strategy = config.download_conflict_strategy
+                .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+
+            match download_mgr.create_backup_task(
+                fs_id,
+                remote_path.clone(),
+                local_path.clone(),
+                file_size,
+                config.id.clone(),
+                Some(download_strategy), // 传递冲突策略
+            ).await {
                 Ok(download_task_id) => {
+                    // 检查是否为跳过标记
+                    if download_task_id == "skipped" {
+                        tracing::info!("跳过备份下载（文件已存在）: file={}", remote_path);
+                        if let Some(mut task) = self.tasks.get_mut(task_id) {
+                            task.skipped_count += 1;
+                        }
+                        // 直接在 file_task 上更新状态
+                        file_task.status = BackupFileStatus::Skipped;
+                        file_task.error_message = Some("文件已存在".to_string());
+                        file_task.updated_at = Utc::now();
+                        continue;
+                    }
+
                     if let Err(e) = download_mgr.start_task(&download_task_id).await {
                         tracing::error!("启动下载任务失败: {}", e);
                         if let Some(mut task) = self.tasks.get_mut(task_id) {
