@@ -110,6 +110,7 @@ impl FolderPersisted {
             borrowed_subtask_map: std::collections::HashMap::new(),
             encrypted_folder_mappings: std::collections::HashMap::new(),
             counted_task_ids: std::collections::HashSet::new(),
+            conflict_strategy: None,
         }
     }
 }

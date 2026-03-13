@@ -5,7 +5,7 @@ import {
   Plus, VideoPlay, VideoPause, Delete, Key,
   Upload, Download,
   Warning, CircleCheck, Loading, Refresh,
-  FolderOpened, Clock
+  FolderOpened, Clock, InfoFilled
 } from '@element-plus/icons-vue'
 import {
   listBackupConfigs, createBackupConfig, updateBackupConfig, deleteBackupConfig,
@@ -16,6 +16,9 @@ import {
   type BackupConfig, type BackupTask, type EncryptionStatus, type ManagerStatus,
   type CreateBackupConfigRequest, type BackupFileTask
 } from '@/api/autobackup'
+import { getConfig } from '@/api/config'
+import type { UploadConflictStrategy } from '@/api/upload'
+import type { DownloadConflictStrategy } from '@/api/download'
 import FilePickerModal from '@/components/FilePicker/FilePickerModal.vue'
 import NetdiskPathSelector from '@/components/NetdiskPathSelector.vue'
 import BackupTaskDetail from '@/components/BackupTaskDetail.vue'
@@ -149,7 +152,21 @@ async function handleCreateConfig() {
   }
 }
 
-function resetNewConfig() {
+async function resetNewConfig() {
+  // 加载系统默认冲突策略
+  let defaultUploadStrategy: UploadConflictStrategy = 'smart_dedup'
+  let defaultDownloadStrategy: DownloadConflictStrategy = 'overwrite'
+
+  try {
+    const config = await getConfig()
+    if (config.conflict_strategy) {
+      defaultUploadStrategy = (config.conflict_strategy.default_upload_strategy || 'smart_dedup') as UploadConflictStrategy
+      defaultDownloadStrategy = (config.conflict_strategy.default_download_strategy || 'overwrite') as DownloadConflictStrategy
+    }
+  } catch (error) {
+    console.error('加载默认冲突策略失败:', error)
+  }
+
   newConfig.value = {
     name: '',
     local_path: '',
@@ -158,8 +175,15 @@ function resetNewConfig() {
     watch_config: { enabled: true, debounce_ms: 3000, recursive: true },
     poll_config: { enabled: true, mode: 'interval', interval_minutes: 60 },
     filter_config: { include_patterns: [], exclude_patterns: ['.*', '*.tmp', '~$*'] },
-    encrypt_enabled: false
+    encrypt_enabled: false,
+    upload_conflict_strategy: defaultUploadStrategy,
+    download_conflict_strategy: defaultDownloadStrategy
   }
+}
+
+async function handleOpenCreateDialog() {
+  await resetNewConfig()
+  showCreateDialog.value = true
 }
 
 async function handleDeleteConfig(id: string) {
@@ -838,7 +862,7 @@ watch(hasActiveTask, () => {
             <el-icon><Refresh /></el-icon>
             刷新
           </el-button>
-          <el-button type="primary" @click="showCreateDialog = true">
+          <el-button type="primary" @click="handleOpenCreateDialog">
             <el-icon><Plus /></el-icon>
             新建配置
           </el-button>
@@ -847,7 +871,7 @@ watch(hasActiveTask, () => {
           <el-button circle @click="loadData">
             <el-icon><Refresh /></el-icon>
           </el-button>
-          <el-button circle type="primary" @click="showCreateDialog = true">
+          <el-button circle type="primary" @click="handleOpenCreateDialog">
             <el-icon><Plus /></el-icon>
           </el-button>
         </template>
@@ -1075,6 +1099,68 @@ watch(hasActiveTask, () => {
             <el-option value="download" label="下载备份（云端 → 本地）" />
           </el-select>
         </el-form-item>
+
+        <!-- 冲突策略选择 -->
+        <el-form-item v-if="newConfig.direction === 'upload'" label="上传冲突策略">
+          <el-select v-model="newConfig.upload_conflict_strategy" style="width: 100%">
+            <el-option value="smart_dedup" label="智能去重">
+              <div class="strategy-option">
+                <span>智能去重</span>
+                <el-tooltip content="比较文件内容，相同则秒传，不同则自动重命名" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="auto_rename" label="自动重命名">
+              <div class="strategy-option">
+                <span>自动重命名</span>
+                <el-tooltip content="如果远程路径已存在文件则自动生成新文件名" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="overwrite" label="覆盖">
+              <div class="strategy-option">
+                <span>覆盖</span>
+                <el-tooltip content="直接覆盖远程已存在的文件（危险操作）" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+          </el-select>
+          <div class="form-tip">默认使用系统设置中的策略</div>
+        </el-form-item>
+
+        <el-form-item v-if="newConfig.direction === 'download'" label="下载冲突策略">
+          <el-select v-model="newConfig.download_conflict_strategy" style="width: 100%">
+            <el-option value="overwrite" label="覆盖">
+              <div class="strategy-option">
+                <span>覆盖</span>
+                <el-tooltip content="如果本地文件已存在则覆盖" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="skip" label="跳过">
+              <div class="strategy-option">
+                <span>跳过</span>
+                <el-tooltip content="如果本地文件已存在则跳过下载" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="auto_rename" label="自动重命名">
+              <div class="strategy-option">
+                <span>自动重命名</span>
+                <el-tooltip content="如果本地文件已存在则自动生成新文件名" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+          </el-select>
+          <div class="form-tip">默认使用系统设置中的策略</div>
+        </el-form-item>
+
         <el-form-item v-if="!isDownloadBackup">
           <div class="encrypt-switch-row">
             <span class="encrypt-label">启用加密</span>
@@ -1669,5 +1755,30 @@ watch(hasActiveTask, () => {
   .stats-grid {
     grid-template-columns: 1fr;
   }
+}
+
+/* 冲突策略选择器样式 */
+.strategy-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.info-icon {
+  color: #909399;
+  font-size: 14px;
+  margin-left: 8px;
+}
+
+.info-icon:hover {
+  color: #409eff;
+}
+
+.form-tip {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 4px;
+  line-height: 1.5;
 }
 </style>

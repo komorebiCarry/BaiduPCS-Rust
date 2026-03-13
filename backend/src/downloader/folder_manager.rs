@@ -1126,7 +1126,7 @@ impl FolderDownloadManager {
 
     /// 创建文件夹下载任务
     pub async fn create_folder_download(&self, remote_path: String) -> Result<String> {
-        self.create_folder_download_with_name(remote_path, None).await
+        self.create_folder_download_with_name(remote_path, None, None).await
     }
 
     /// 创建文件夹下载任务（支持指定原始文件夹名）
@@ -1137,6 +1137,7 @@ impl FolderDownloadManager {
         &self,
         remote_path: String,
         original_name: Option<String>,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
         // 获取远程路径中的文件夹名
         let encrypted_folder_name = remote_path
@@ -1171,7 +1172,7 @@ impl FolderDownloadManager {
         let local_root = download_dir.join(&folder_name);
         drop(download_dir);
 
-        self.create_folder_download_internal(remote_path, local_root)
+        self.create_folder_download_internal(remote_path, local_root, conflict_strategy)
             .await
     }
 
@@ -1188,6 +1189,7 @@ impl FolderDownloadManager {
         remote_path: String,
         target_dir: &std::path::Path,
         original_name: Option<String>,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
         // 获取远程路径中的文件夹名
         let encrypted_folder_name = remote_path
@@ -1220,7 +1222,7 @@ impl FolderDownloadManager {
 
         let local_root = target_dir.join(&folder_name);
 
-        self.create_folder_download_internal(remote_path, local_root)
+        self.create_folder_download_internal(remote_path, local_root, conflict_strategy)
             .await
     }
 
@@ -1233,9 +1235,13 @@ impl FolderDownloadManager {
         &self,
         remote_path: String,
         local_root: PathBuf,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
         let mut folder = FolderDownload::new(remote_path.clone(), local_root);
         let folder_id = folder.id.clone();
+
+        // 🔥 设置冲突策略
+        folder.conflict_strategy = conflict_strategy;
 
         // 🔥 尝试为文件夹分配固定任务位（使用优先级分配，可抢占备份任务）
         let (mut fixed_slot_id, mut preempted_task_id) = {
@@ -2501,8 +2507,34 @@ impl FolderDownloadManager {
 
             let local_path = local_root.join(&pending_file.relative_path);
 
+            // 🔥 应用冲突策略
+            let final_local_path = {
+                let folders_guard = self.folders.read().await;
+                let strategy = folders_guard
+                    .get(folder_id)
+                    .and_then(|f| f.conflict_strategy)
+                    .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+
+                use crate::uploader::conflict_resolver::ConflictResolver;
+                match ConflictResolver::resolve_download_conflict(&local_path, strategy) {
+                    Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
+                    Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
+                        info!("跳过下载（文件已存在）: {:?}", local_path);
+                        continue; // 跳过此文件，继续下一个
+                    }
+                    Ok(crate::uploader::conflict::ConflictResolution::UseNewPath(new_path)) => {
+                        info!("自动重命名下载路径: {:?} -> {}", local_path, new_path);
+                        PathBuf::from(new_path)
+                    }
+                    Err(e) => {
+                        warn!("冲突解决失败: {}, 使用原路径", e);
+                        local_path
+                    }
+                }
+            };
+
             // 确保目录存在
-            if let Some(parent) = local_path.parent() {
+            if let Some(parent) = final_local_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .context(format!("创建目录失败: {:?}", parent))?;
@@ -2511,7 +2543,7 @@ impl FolderDownloadManager {
             let mut task = DownloadTask::new_with_group(
                 pending_file.fs_id,
                 pending_file.remote_path.clone(),
-                local_path,
+                final_local_path,
                 pending_file.size,
                 folder_id.to_string(),
                 group_root.clone(),

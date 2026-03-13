@@ -358,6 +358,104 @@
                   </el-alert>
                 </el-card>
 
+                <!-- 冲突策略配置 -->
+                <el-card id="section-conflict" class="setting-card" shadow="hover">
+                  <template #header>
+                    <div class="card-header">
+                      <el-icon :size="20" color="#f56c6c">
+                        <Warning />
+                      </el-icon>
+                      <span>冲突策略配置</span>
+                    </div>
+                  </template>
+
+                  <el-alert
+                      title="关于冲突策略"
+                      type="info"
+                      :closable="false"
+                      style="margin-bottom: 20px"
+                  >
+                    <template #default>
+                      <div style="line-height: 1.8">
+                        当上传/下载的文件路径已存在时，系统将按照您选择的策略处理冲突。<br/>
+                        这里配置的是默认策略，您也可以在每次操作时单独选择。
+                      </div>
+                    </template>
+                  </el-alert>
+
+                  <el-form-item label="上传默认策略">
+                    <el-select
+                        v-model="formData!.conflict_strategy!.default_upload_strategy"
+                        placeholder="请选择上传冲突策略"
+                        style="width: 100%"
+                    >
+                      <el-option value="smart_dedup" label="智能去重">
+                        <div class="strategy-option">
+                          <span>智能去重</span>
+                          <el-tooltip content="比较文件内容，相同则秒传，不同则自动重命名" placement="right">
+                            <el-icon class="info-icon"><InfoFilled /></el-icon>
+                          </el-tooltip>
+                        </div>
+                      </el-option>
+                      <el-option value="auto_rename" label="自动重命名">
+                        <div class="strategy-option">
+                          <span>自动重命名</span>
+                          <el-tooltip content="如果远程路径已存在文件则自动生成新文件名" placement="right">
+                            <el-icon class="info-icon"><InfoFilled /></el-icon>
+                          </el-tooltip>
+                        </div>
+                      </el-option>
+                      <el-option value="overwrite" label="覆盖">
+                        <div class="strategy-option">
+                          <span>覆盖</span>
+                          <el-tooltip content="直接覆盖远程已存在的文件（危险操作）" placement="right">
+                            <el-icon class="info-icon"><InfoFilled /></el-icon>
+                          </el-tooltip>
+                        </div>
+                      </el-option>
+                    </el-select>
+                    <div class="form-tip">
+                      上传文件时的默认冲突处理策略（推荐：智能去重）
+                    </div>
+                  </el-form-item>
+
+                  <el-form-item label="下载默认策略">
+                    <el-select
+                        v-model="formData!.conflict_strategy!.default_download_strategy"
+                        placeholder="请选择下载冲突策略"
+                        style="width: 100%"
+                    >
+                      <el-option value="overwrite" label="覆盖">
+                        <div class="strategy-option">
+                          <span>覆盖</span>
+                          <el-tooltip content="如果本地文件已存在则覆盖" placement="right">
+                            <el-icon class="info-icon"><InfoFilled /></el-icon>
+                          </el-tooltip>
+                        </div>
+                      </el-option>
+                      <el-option value="skip" label="跳过">
+                        <div class="strategy-option">
+                          <span>跳过</span>
+                          <el-tooltip content="如果本地文件已存在则跳过下载" placement="right">
+                            <el-icon class="info-icon"><InfoFilled /></el-icon>
+                          </el-tooltip>
+                        </div>
+                      </el-option>
+                      <el-option value="auto_rename" label="自动重命名">
+                        <div class="strategy-option">
+                          <span>自动重命名</span>
+                          <el-tooltip content="如果本地文件已存在则自动生成新文件名" placement="right">
+                            <el-icon class="info-icon"><InfoFilled /></el-icon>
+                          </el-tooltip>
+                        </div>
+                      </el-option>
+                    </el-select>
+                    <div class="form-tip">
+                      下载文件时的默认冲突处理策略（推荐：覆盖）
+                    </div>
+                  </el-form-item>
+                </el-card>
+
                 <!-- 转存配置 -->
                 <el-card id="section-transfer" class="setting-card" shadow="hover">
                   <template #header>
@@ -805,7 +903,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">v1.9.2</span>
+                      <span class="value">v1.11.0</span>
                     </div>
                     <div class="about-item">
                       <span class="label">后端技术:</span>
@@ -875,6 +973,8 @@ import { useIsMobile } from '@/utils/responsive'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
+import type { UploadConflictStrategy } from '@/api/upload'
+import type { DownloadConflictStrategy } from '@/api/download'
 import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import {
@@ -943,6 +1043,7 @@ const navItems = [
   { id: 'section-auth', label: '访问认证', color: '#e6a23c' },
   { id: 'section-download', label: '下载', color: '#67c23a' },
   { id: 'section-upload', label: '上传', color: '#e6a23c' },
+  { id: 'section-conflict', label: '冲突策略', color: '#f56c6c' },
   { id: 'section-transfer', label: '转存', color: '#909399' },
   { id: 'section-encryption', label: '加密', color: '#f56c6c' },
   { id: 'section-backup', label: '自动备份', color: '#67c23a' },
@@ -1082,6 +1183,14 @@ async function loadConfig() {
   try {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
+
+    // 初始化冲突策略配置（如果不存在则使用默认值）
+    if (formData.value && !formData.value.conflict_strategy) {
+      formData.value.conflict_strategy = {
+        default_upload_strategy: 'smart_dedup' as UploadConflictStrategy,
+        default_download_strategy: 'overwrite' as DownloadConflictStrategy
+      }
+    }
 
     // 初始化代理配置状态
     if (formData.value?.network?.proxy) {

@@ -5,6 +5,7 @@
 mod memory_monitor;
 pub mod proxy;
 pub mod proxy_fallback;
+pub mod path_utils;
 mod refresh_coordinator;
 mod speed_anomaly_detector;
 mod thread_stagnation_detector;
@@ -15,6 +16,7 @@ pub use proxy_fallback::{
     is_proxy_or_connection_error, perform_proxy_hot_update, probe_proxy,
     start_proxy_probe_task, ProxyFallbackManager, ProxyHotUpdater, ProxyRuntimeStatus,
 };
+pub use path_utils::generate_unique_path;
 pub use refresh_coordinator::{RefreshCoordinator, RefreshCoordinatorConfig, RefreshGuard};
 pub use speed_anomaly_detector::{SpeedAnomalyConfig, SpeedAnomalyDetector};
 pub use thread_stagnation_detector::{StagnationConfig, ThreadStagnationDetector};

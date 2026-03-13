@@ -203,10 +203,15 @@ impl UploadEngine {
             return Err(anyhow::anyhow!("上传已取消"));
         }
 
-        // 2. 预创建文件
+        // 2. 预创建文件（使用任务的冲突策略）
+        let rtype = {
+            let task = self.task.lock().await;
+            crate::uploader::conflict::conflict_strategy_to_rtype(task.conflict_strategy)
+        };
+
         let precreate_response = self
             .client
-            .precreate(&remote_path, total_size, &block_list)
+            .precreate(&remote_path, total_size, &block_list, rtype)
             .await?;
 
         // 检查是否秒传成功（precreate 也可能触发秒传）
@@ -272,8 +277,12 @@ impl UploadEngine {
         // 创建文件（合并分片）
         // ⚠️ 重要: create_file 也需要 block_list (4MB分片MD5),和上传的分片MD5无关
         info!("合并上传分片,创建文件: {}", remote_path);
+        let rtype = {
+            let task = self.task.lock().await;
+            crate::uploader::conflict::conflict_strategy_to_rtype(task.conflict_strategy)
+        };
         self.client
-            .create_file(remote_path, block_list, upload_id, total_size, "0")
+            .create_file(remote_path, block_list, upload_id, total_size, "0", rtype)
             .await?;
 
         Ok(())

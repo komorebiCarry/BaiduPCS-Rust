@@ -1,4 +1,4 @@
-use crate::downloader::DownloadTask;
+use crate::downloader::{DownloadConflictStrategy, DownloadTask};
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -17,6 +17,9 @@ pub struct CreateDownloadRequest {
     pub remote_path: String,
     pub filename: String,
     pub total_size: u64,
+    /// 冲突策略（可选，未指定则使用默认值）
+    #[serde(default)]
+    pub conflict_strategy: Option<DownloadConflictStrategy>,
 }
 
 // ============================================
@@ -47,6 +50,9 @@ pub struct CreateBatchDownloadRequest {
     pub items: Vec<BatchDownloadItem>,
     /// 本地下载目录
     pub target_dir: String,
+    /// 冲突策略（可选，未指定则使用默认值）
+    #[serde(default)]
+    pub conflict_strategy: Option<DownloadConflictStrategy>,
 }
 
 /// 批量下载响应
@@ -83,11 +89,26 @@ pub async fn create_download(
         .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // 如果未指定策略，从 AppConfig 读取默认值
+    let conflict_strategy = req.conflict_strategy.or_else(|| {
+        let config = app_state.config.blocking_read();
+        Some(config.conflict_strategy.default_download_strategy)
+    });
+
     match download_manager
-        .create_task(req.fs_id, req.remote_path, req.filename, req.total_size)
+        .create_task(req.fs_id, req.remote_path, req.filename, req.total_size, conflict_strategy)
         .await
     {
         Ok(task_id) => {
+            // 🔥 P2-2 修复：检查是否为跳过的任务
+            if task_id == "skipped" {
+                info!("文件已存在，已跳过下载");
+                return Ok(Json(ApiResponse::success_with_message(
+                    task_id,
+                    "文件已存在，已跳过"
+                )));
+            }
+
             info!("创建下载任务成功: {}", task_id);
 
             // 自动开始下载
@@ -319,6 +340,12 @@ pub async fn create_batch_download(
         info!("已创建目标目录: {:?}", target_dir);
     }
 
+    // 如果未指定策略，从 AppConfig 读取默认值
+    let conflict_strategy = req.conflict_strategy.or_else(|| {
+        let config = app_state.config.blocking_read();
+        Some(config.conflict_strategy.default_download_strategy)
+    });
+
     // 获取下载管理器
     let download_manager = app_state
         .download_manager
@@ -338,7 +365,7 @@ pub async fn create_batch_download(
         if item.is_dir {
             // 文件夹下载
             match folder_download_manager
-                .create_folder_download_with_dir(item.path.clone(), &target_dir, item.original_name.clone())
+                .create_folder_download_with_dir(item.path.clone(), &target_dir, item.original_name.clone(), conflict_strategy)
                 .await
             {
                 Ok(folder_id) => {
@@ -364,10 +391,18 @@ pub async fn create_batch_download(
                     item.name.clone(),
                     file_size,
                     &target_dir,
+                    conflict_strategy,
                 )
                 .await
             {
                 Ok(task_id) => {
+                    // 检查是否为跳过标记
+                    if task_id == "skipped" {
+                        info!("跳过下载（文件已存在）: {}", item.path);
+                        // 不添加到 task_ids，也不算失败
+                        continue;
+                    }
+
                     info!("创建下载任务成功: {}, ID: {}", item.path, task_id);
 
                     // 自动开始下载

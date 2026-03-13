@@ -181,6 +181,12 @@ export interface NetworkConfig {
   proxy: ProxyConfig
 }
 
+/// 冲突策略配置
+export interface ConflictStrategyConfig {
+  default_upload_strategy: 'smart_dedup' | 'auto_rename' | 'overwrite'
+  default_download_strategy: 'overwrite' | 'skip' | 'auto_rename'
+}
+
 /// 应用配置
 export interface AppConfig {
   server: ServerConfig
@@ -194,6 +200,7 @@ export interface AppConfig {
   web_auth?: WebAuthConfig
   share_direct_download?: ShareDirectDownloadConfig
   network?: NetworkConfig
+  conflict_strategy?: ConflictStrategyConfig
 }
 
 /// VIP 推荐配置

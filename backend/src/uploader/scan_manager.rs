@@ -107,6 +107,7 @@ impl ScanManager {
         remote_folder: String,
         scan_options: Option<ScanOptions>,
         encrypt: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<String> {
         // 验证路径
         if !local_folder.exists() || !local_folder.is_dir() {
@@ -170,6 +171,7 @@ impl ScanManager {
                 batch_rx,
                 remote_folder,
                 encrypt,
+                conflict_strategy, // Pass conflict_strategy to scan_loop
                 cancel_token,
                 active_scans,
                 upload_manager,
@@ -178,7 +180,7 @@ impl ScanManager {
                 wal_dir,
                 max_pending,
             )
-            .await;
+                .await;
         });
 
         info!("扫描任务已启动: {}", scan_task_id);
@@ -228,6 +230,7 @@ impl ScanManager {
         mut batch_rx: mpsc::Receiver<Vec<ScannedFile>>,
         remote_folder: String,
         encrypt: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
         cancel_token: CancellationToken,
         active_scans: Arc<DashMap<String, ScanTaskInfo>>,
         upload_manager: Arc<UploadManager>,
@@ -269,7 +272,7 @@ impl ScanManager {
 
             // 创建任务（带去重）
             match upload_manager
-                .create_batch_tasks_dedup(files, encrypt, true)
+                .create_batch_tasks_dedup(files, encrypt, true, conflict_strategy)
                 .await
             {
                 Ok((new_ids, existing_ids)) => {
@@ -430,6 +433,7 @@ impl ScanManager {
                         cp.remote_folder,
                         Some(cp.scan_options),
                         cp.encrypt,
+                        None, // conflict_strategy - use default for resumed scans
                     ).await {
                         warn!("恢复扫描失败 ({}): {}", name, e);
                     } else {

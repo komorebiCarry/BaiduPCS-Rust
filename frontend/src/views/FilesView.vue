@@ -105,6 +105,8 @@
         :multiple="true"
         :initial-path="uploadConfig?.recent_directory"
         :show-encryption="hasEncryptionKey"
+        :show-conflict-strategy="true"
+        :default-upload-conflict-strategy="uploadConflictStrategy"
         @select="handleFilePickerSelect"
         @select-multiple="handleFilePickerMultiSelect"
     />
@@ -289,6 +291,8 @@
         title="选择下载目录"
         :initial-path="downloadConfig?.recent_directory || downloadConfig?.default_directory || downloadConfig?.download_dir"
         :default-download-dir="downloadConfig?.default_directory || downloadConfig?.download_dir"
+        :show-conflict-strategy="true"
+        :default-conflict-strategy="downloadConflictStrategy"
         @confirm-download="handleConfirmDownload"
         @use-default="handleUseDefaultDownload"
     />
@@ -320,8 +324,8 @@ import {ref, onMounted, computed} from 'vue'
 import {ElMessage} from 'element-plus'
 import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
 import {useIsMobile} from '@/utils/responsive'
-import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem} from '@/api/download'
-import {createUpload, createFolderUpload} from '@/api/upload'
+import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem, type DownloadConflictStrategy} from '@/api/download'
+import {createUpload, createFolderUpload, type UploadConflictStrategy} from '@/api/upload'
 import {getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig, type UploadConfig} from '@/api/config'
 import {getEncryptionStatus} from '@/api/autobackup'
 import {FilePickerModal} from '@/components/FilePicker'
@@ -338,6 +342,10 @@ const downloadConfig = ref<DownloadConfig | null>(null)
 
 // 上传配置状态
 const uploadConfig = ref<UploadConfig | null>(null)
+
+// 冲突策略状态
+const uploadConflictStrategy = ref<UploadConflictStrategy>('smart_dedup')
+const downloadConflictStrategy = ref<DownloadConflictStrategy>('overwrite')
 
 // 加密密钥状态
 const hasEncryptionKey = ref(false)
@@ -494,6 +502,7 @@ async function handleDownload(file: FileItem) {
         remote_path: file.path,
         filename: file.server_filename,
         total_size: file.size,
+        conflict_strategy: downloadConflictStrategy.value,
       })
 
       ElMessage.success('下载任务已创建')
@@ -531,7 +540,7 @@ async function handleDownloadFolder(folder: FileItem) {
 
       // 创建文件夹下载任务（如果是加密文件夹，传递原始名称）
       const originalName = folder.is_encrypted_folder ? folder.original_name : undefined
-      await createFolderDownload(folder.path, originalName)
+      await createFolderDownload(folder.path, originalName, downloadConflictStrategy.value)
 
       ElMessage.success('文件夹下载任务已创建，正在扫描文件...')
 
@@ -545,7 +554,12 @@ async function handleDownloadFolder(folder: FileItem) {
 }
 
 // 处理 FilePicker 选择结果
-async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false) {
+async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false, conflictStrategy?: string) {
+  // 如果用户选择了冲突策略，更新当前策略
+  if (conflictStrategy) {
+    uploadConflictStrategy.value = conflictStrategy as any
+  }
+
   try {
     if (entry.entryType === 'file') {
       // 单文件上传
@@ -557,6 +571,7 @@ async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false
         local_path: entry.path,
         remote_path: remotePath,
         encrypt,
+        conflict_strategy: uploadConflictStrategy.value,
       })
 
       ElMessage.success(encrypt ? '已添加加密上传任务' : '已添加上传任务')
@@ -570,6 +585,7 @@ async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false
         local_folder: entry.path,
         remote_folder: remoteFolderPath,
         encrypt,
+        conflict_strategy: uploadConflictStrategy.value,
       })
 
       ElMessage.success(encrypt ? '已添加加密文件夹上传任务' : '已添加文件夹上传任务')
@@ -591,8 +607,13 @@ async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false
 }
 
 // 处理 FilePicker 多选结果
-async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolean = false) {
+async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolean = false, conflictStrategy?: string) {
   if (entries.length === 0) return
+
+  // 如果用户选择了冲突策略，更新当前策略
+  if (conflictStrategy) {
+    uploadConflictStrategy.value = conflictStrategy as any
+  }
 
   let successCount = 0
   let failedCount = 0
@@ -611,6 +632,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolea
           local_path: entry.path,
           remote_path: remotePath,
           encrypt,
+          conflict_strategy: uploadConflictStrategy.value,
         })
         successCount++
       } else {
@@ -623,6 +645,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolea
           local_folder: entry.path,
           remote_folder: remoteFolderPath,
           encrypt,
+          conflict_strategy: uploadConflictStrategy.value,
         })
         successCount++
       }
@@ -731,6 +754,12 @@ async function loadDownloadConfig() {
     const config = await getConfig()
     downloadConfig.value = config.download
     uploadConfig.value = config.upload
+
+    // 加载默认冲突策略
+    if (config.conflict_strategy) {
+      uploadConflictStrategy.value = config.conflict_strategy.default_upload_strategy || 'smart_dedup'
+      downloadConflictStrategy.value = config.conflict_strategy.default_download_strategy || 'overwrite'
+    }
   } catch (error: any) {
     console.error('加载配置失败:', error)
   }
@@ -773,9 +802,14 @@ async function handleBatchDownload() {
 }
 
 // 处理下载目录确认
-async function handleConfirmDownload(payload: { path: string; setAsDefault: boolean }) {
-  const { path, setAsDefault } = payload
+async function handleConfirmDownload(payload: { path: string; setAsDefault: boolean; conflictStrategy?: string }) {
+  const { path, setAsDefault, conflictStrategy } = payload
   showDownloadPicker.value = false
+
+  // 如果用户选择了冲突策略，更新当前策略
+  if (conflictStrategy) {
+    downloadConflictStrategy.value = conflictStrategy as any
+  }
 
   // 如果设置为默认目录
   if (setAsDefault) {
@@ -807,8 +841,13 @@ async function handleConfirmDownload(payload: { path: string; setAsDefault: bool
 }
 
 // 处理使用默认目录下载
-async function handleUseDefaultDownload() {
+async function handleUseDefaultDownload(conflictStrategy?: string) {
   showDownloadPicker.value = false
+
+  // 如果用户选择了冲突策略，更新当前策略
+  if (conflictStrategy) {
+    downloadConflictStrategy.value = conflictStrategy as any
+  }
 
   const targetDir = downloadConfig.value?.default_directory || downloadConfig.value?.download_dir || 'downloads'
 
@@ -862,7 +901,8 @@ async function executeBatchDownload(targetDir: string) {
       try {
         const response = await createBatchDownload({
           items: batchItems,
-          target_dir: targetDir
+          target_dir: targetDir,
+          conflict_strategy: downloadConflictStrategy.value,
         })
 
         // 累计结果
@@ -931,7 +971,8 @@ async function executeSingleDownload(file: FileItem, targetDir: string) {
         size: file.isdir === 0 ? file.size : undefined,
         original_name: originalName
       }],
-      target_dir: targetDir
+      target_dir: targetDir,
+      conflict_strategy: downloadConflictStrategy.value,
     })
 
     if (response.failed.length === 0) {
