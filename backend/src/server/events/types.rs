@@ -34,6 +34,12 @@ pub enum DownloadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         original_filename: Option<String>,
     },
+    /// 任务跳过（文件已存在）
+    Skipped {
+        task_id: String,
+        filename: String,
+        reason: String,
+    },
     /// 进度更新
     Progress {
         task_id: String,
@@ -131,6 +137,7 @@ impl DownloadEvent {
     pub fn task_id(&self) -> &str {
         match self {
             DownloadEvent::Created { task_id, .. } => task_id,
+            DownloadEvent::Skipped { task_id, .. } => task_id,
             DownloadEvent::Progress { task_id, .. } => task_id,
             DownloadEvent::StatusChanged { task_id, .. } => task_id,
             DownloadEvent::Completed { task_id, .. } => task_id,
@@ -147,6 +154,7 @@ impl DownloadEvent {
     pub fn group_id(&self) -> Option<&str> {
         match self {
             DownloadEvent::Created { group_id, .. } => group_id.as_deref(),
+            DownloadEvent::Skipped { .. } => None,
             DownloadEvent::Progress { group_id, .. } => group_id.as_deref(),
             DownloadEvent::StatusChanged { group_id, .. } => group_id.as_deref(),
             DownloadEvent::Completed { group_id, .. } => group_id.as_deref(),
@@ -166,6 +174,7 @@ impl DownloadEvent {
             DownloadEvent::DecryptProgress { .. } => EventPriority::Low,
             DownloadEvent::StatusChanged { .. } => EventPriority::Medium,
             DownloadEvent::Created { .. } => EventPriority::Medium,
+            DownloadEvent::Skipped { .. } => EventPriority::Medium,
             DownloadEvent::Completed { .. } => EventPriority::High,
             DownloadEvent::Failed { .. } => EventPriority::High,
             DownloadEvent::Paused { .. } => EventPriority::Medium,
@@ -179,6 +188,7 @@ impl DownloadEvent {
     pub fn event_type_name(&self) -> &'static str {
         match self {
             DownloadEvent::Created { .. } => "created",
+            DownloadEvent::Skipped { .. } => "skipped",
             DownloadEvent::Progress { .. } => "progress",
             DownloadEvent::StatusChanged { .. } => "status_changed",
             DownloadEvent::Completed { .. } => "completed",
@@ -195,6 +205,7 @@ impl DownloadEvent {
     pub fn is_backup(&self) -> bool {
         match self {
             DownloadEvent::Created { is_backup, .. } => *is_backup,
+            DownloadEvent::Skipped { .. } => false,
             DownloadEvent::Progress { is_backup, .. } => *is_backup,
             DownloadEvent::StatusChanged { is_backup, .. } => *is_backup,
             DownloadEvent::Completed { is_backup, .. } => *is_backup,
@@ -401,6 +412,13 @@ pub enum UploadEvent {
         #[serde(default)]
         is_backup: bool,
     },
+    /// 任务跳过（冲突策略）
+    Skipped {
+        task_id: String,
+        local_path: String,
+        remote_path: String,
+        reason: String,
+    },
 }
 
 impl UploadEvent {
@@ -417,6 +435,7 @@ impl UploadEvent {
             UploadEvent::Deleted { task_id, .. } => task_id,
             UploadEvent::EncryptProgress { task_id, .. } => task_id,
             UploadEvent::EncryptCompleted { task_id, .. } => task_id,
+            UploadEvent::Skipped { task_id, .. } => task_id,
         }
     }
 
@@ -432,7 +451,8 @@ impl UploadEvent {
             | UploadEvent::Paused { .. }
             | UploadEvent::Resumed { .. }
             | UploadEvent::Deleted { .. }
-            | UploadEvent::EncryptCompleted { .. } => EventPriority::High,
+            | UploadEvent::EncryptCompleted { .. }
+            | UploadEvent::Skipped { .. } => EventPriority::High,
         }
     }
 
@@ -449,6 +469,7 @@ impl UploadEvent {
             UploadEvent::Deleted { .. } => "deleted",
             UploadEvent::EncryptProgress { .. } => "encrypt_progress",
             UploadEvent::EncryptCompleted { .. } => "encrypt_completed",
+            UploadEvent::Skipped { .. } => "skipped",
         }
     }
 
@@ -465,6 +486,7 @@ impl UploadEvent {
             UploadEvent::Deleted { is_backup, .. } => *is_backup,
             UploadEvent::EncryptProgress { is_backup, .. } => *is_backup,
             UploadEvent::EncryptCompleted { is_backup, .. } => *is_backup,
+            UploadEvent::Skipped { .. } => false, // Skipped events are not backup tasks
         }
     }
 }

@@ -102,6 +102,8 @@ pub async fn enable_backup_config(
         poll_config: None,
         filter_config: None,
         enabled: Some(true),
+        upload_conflict_strategy: None,
+        download_conflict_strategy: None,
     };
     match manager.update_config(&id, request).await {
         Ok(config) => Ok(Json(ApiResponse::success(config))),
@@ -123,6 +125,8 @@ pub async fn disable_backup_config(
         poll_config: None,
         filter_config: None,
         enabled: Some(false),
+        upload_conflict_strategy: None,
+        download_conflict_strategy: None,
     };
     match manager.update_config(&id, request).await {
         Ok(config) => Ok(Json(ApiResponse::success(config))),

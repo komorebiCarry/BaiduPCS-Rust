@@ -1078,6 +1078,7 @@ impl UploadManager {
         remote_path: String,
         encrypt: bool,
         is_folder_upload: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<String> {
         // 获取文件大小
         let metadata = tokio::fs::metadata(&local_path)
@@ -1092,12 +1093,21 @@ impl UploadManager {
 
         let file_size = metadata.len();
 
+        // 获取冲突策略（如果未指定，使用默认值 SmartDedup）
+        let strategy = conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
+
         // 创建任务
         let mut task = UploadTask::new(local_path.clone(), remote_path.clone(), file_size);
+
+        // 设置冲突策略
+        task.conflict_strategy = strategy;
 
         // 🔥 设置加密标志
         task.encrypt_enabled = encrypt;
         task.original_size = file_size;
+
+        // 保存原始远程路径（用于加密逻辑中的日志）
+        let final_remote_path = remote_path.clone();
 
         // 🔥 如果启用加密，修改远程路径为加密文件名，并加密路径中的文件夹名
         if encrypt {
@@ -1205,7 +1215,7 @@ impl UploadManager {
 
             // 🔥 存储文件加密映射到 encryption_snapshots（状态为 pending）
             // 上传完成时会更新 nonce、algorithm 等字段并标记为 completed
-            let original_filename = std::path::Path::new(&remote_path)
+            let original_filename = std::path::Path::new(&final_remote_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -1249,7 +1259,7 @@ impl UploadManager {
 
             info!(
                 "启用加密上传: 原始路径={}, 加密路径={}",
-                remote_path, task.remote_path
+                final_remote_path, task.remote_path
             );
         }
 
@@ -1349,13 +1359,15 @@ impl UploadManager {
     /// # 参数
     /// * `files` - 文件列表 [(本地路径, 远程路径)]
     /// * `encrypt` - 是否启用加密
+    /// * `conflict_strategy` - 冲突策略（可选）
     pub async fn create_batch_tasks(
         &self,
         files: Vec<(PathBuf, String)>,
         encrypt: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<Vec<String>> {
         // 普通批量上传，不是文件夹上传
-        self.create_batch_tasks_internal(files, encrypt, false).await
+        self.create_batch_tasks_internal(files, encrypt, false, conflict_strategy).await
     }
 
     /// 内部批量创建上传任务
@@ -1364,21 +1376,26 @@ impl UploadManager {
     /// * `files` - 文件列表 [(本地路径, 远程路径)]
     /// * `encrypt` - 是否启用加密
     /// * `is_folder_upload` - 是否是文件夹上传的一部分
+    /// * `conflict_strategy` - 冲突策略（可选）
     async fn create_batch_tasks_internal(
         &self,
         files: Vec<(PathBuf, String)>,
         encrypt: bool,
         is_folder_upload: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<Vec<String>> {
         let mut task_ids = Vec::with_capacity(files.len());
 
         for (local_path, remote_path) in files {
             match self
-                .create_task(local_path.clone(), remote_path, encrypt, is_folder_upload)
+                .create_task(local_path.clone(), remote_path, encrypt, is_folder_upload, conflict_strategy)
                 .await
             {
                 Ok(task_id) => {
-                    task_ids.push(task_id);
+                    // Skip "skipped" tasks
+                    if task_id != "skipped" {
+                        task_ids.push(task_id);
+                    }
                 }
                 Err(e) => {
                     warn!("创建任务失败: {:?}, 错误: {}", local_path, e);
@@ -1451,7 +1468,7 @@ impl UploadManager {
         }
 
         // 批量创建任务（文件夹上传，需要加密目录结构）
-        let task_ids = self.create_batch_tasks_internal(tasks, encrypt, true).await?;
+        let task_ids = self.create_batch_tasks_internal(tasks, encrypt, true, None).await?;
 
         info!("文件夹上传任务创建完成: 成功 {} 个", task_ids.len());
 
@@ -1840,8 +1857,12 @@ impl UploadManager {
                 // 🔥 使用 actual_total_size（加密后的文件大小）
                 // 🔥 从共享引用读取最新客户端（代理热更新后自动生效）
                 let client_snapshot = client.read().unwrap().clone();
+                let rtype = {
+                    let t = task.lock().await;
+                    crate::uploader::conflict::conflict_strategy_to_rtype(t.conflict_strategy)
+                };
                 let precreate_response = match client_snapshot
-                    .precreate(&remote_path, actual_total_size, &block_list)
+                    .precreate(&remote_path, actual_total_size, &block_list, rtype)
                     .await
                 {
                     Ok(resp) => resp,
@@ -2658,6 +2679,7 @@ impl UploadManager {
     /// * `encrypt_enabled` - 是否启用加密
     /// * `backup_task_id` - 备份主任务ID（用于发送 BackupEvent）
     /// * `backup_file_task_id` - 备份文件任务ID（用于发送 BackupEvent）
+    /// * `conflict_strategy` - 冲突策略（可选，备份任务默认使用 SmartDedup）
     ///
     /// # 返回
     /// 任务ID
@@ -2669,6 +2691,7 @@ impl UploadManager {
         encrypt_enabled: bool,
         backup_task_id: Option<String>,
         backup_file_task_id: Option<String>,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<String> {
         // 获取文件大小
         let metadata = tokio::fs::metadata(&local_path)
@@ -2683,6 +2706,8 @@ impl UploadManager {
 
         let file_size = metadata.len();
 
+        // 获取冲突策略（如果未指定，使用默认值 SmartDedup）
+        let strategy = conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
 
         // 🔥 如果启用加密，修改远程路径为加密文件名（与 create_task 保持一致）
         let (actual_remote_path, encrypted_filename) = if encrypt_enabled {
@@ -2706,7 +2731,7 @@ impl UploadManager {
         };
 
         // 创建备份任务
-        let task = UploadTask::new_backup(
+        let mut task = UploadTask::new_backup(
             local_path.clone(),
             actual_remote_path.clone(),
             file_size,
@@ -2715,6 +2740,10 @@ impl UploadManager {
             backup_task_id,
             backup_file_task_id,
         );
+
+        // 设置冲突策略
+        task.conflict_strategy = strategy;
+
         let task_id = task.id.clone();
 
         // 🔥 如果启用加密，存储文件加密映射到 encryption_snapshots（状态为 pending）
@@ -2909,6 +2938,8 @@ impl UploadManager {
             encryption_version: 0,
             // 🔥 从 metadata 恢复 key_version，如果没有则使用默认值 1
             encryption_key_version: metadata.encryption_key_version.unwrap_or(1),
+            // 冲突策略（历史任务使用默认值）
+            conflict_strategy: crate::uploader::UploadConflictStrategy::default(),
         })
     }
 
@@ -3162,6 +3193,7 @@ impl UploadManager {
         files: Vec<(PathBuf, String)>,
         encrypt: bool,
         is_folder_upload: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<(Vec<String>, Vec<String>)> {
         let mut new_ids = Vec::new();
         let mut existing_ids = Vec::new();
@@ -3180,6 +3212,7 @@ impl UploadManager {
                 original_remote_path.clone(),
                 encrypt,
                 is_folder_upload,
+                conflict_strategy,
             ).await {
                 Ok(task_id) => {
                     let key = (canonical, original_remote_path.clone());
@@ -4081,8 +4114,12 @@ impl UploadManager {
                                 // 2. 预创建文件（使用实际文件大小，可能是加密后的大小）
                                 // 🔥 从共享引用读取最新客户端（代理热更新后自动生效）
                                 let client_snapshot = client_clone.read().unwrap().clone();
+                                let rtype = {
+                                    let t = task.lock().await;
+                                    crate::uploader::conflict::conflict_strategy_to_rtype(t.conflict_strategy)
+                                };
                                 let precreate_response = match client_snapshot
-                                    .precreate(&remote_path, actual_total_size, &block_list)
+                                    .precreate(&remote_path, actual_total_size, &block_list, rtype)
                                     .await
                                 {
                                     Ok(resp) => resp,
@@ -4529,6 +4566,7 @@ mod tests {
                 "/test/upload.txt".to_string(),
                 false, // encrypt
                 false, // is_folder_upload
+                None,  // conflict_strategy
             )
             .await;
 
@@ -4561,6 +4599,7 @@ mod tests {
                     format!("/test/file{}.txt", i),
                     false, // encrypt
                     false, // is_folder_upload
+                    None,  // conflict_strategy
                 )
                 .await
                 .unwrap();
@@ -4584,6 +4623,7 @@ mod tests {
                 "/test/delete.txt".to_string(),
                 false, // encrypt
                 false, // is_folder_upload
+                None,  // conflict_strategy
             )
             .await
             .unwrap();
@@ -4677,7 +4717,7 @@ mod tests {
             .collect();
 
         // 批量创建任务
-        let result = manager.create_batch_tasks(files, false).await;
+        let result = manager.create_batch_tasks(files, false, None).await;
 
         assert!(result.is_ok());
 
@@ -4713,6 +4753,7 @@ mod tests {
                 false,
                 Some("backup-task-1".to_string()),
                 Some("file-task-1".to_string()),
+                None,
             )
             .await
             .unwrap();
@@ -4724,6 +4765,7 @@ mod tests {
                 "/test/normal.txt".to_string(),
                 false, // encrypt
                 false, // is_folder_upload
+                None,
             )
             .await
             .unwrap();
@@ -4767,6 +4809,7 @@ mod tests {
                 "/test/normal.txt".to_string(),
                 false, // encrypt
                 false, // is_folder_upload
+                None,  // conflict_strategy
             )
             .await
             .unwrap();
@@ -4780,6 +4823,7 @@ mod tests {
                 false,
                 Some("backup-task-1".to_string()),
                 Some("file-task-1".to_string()),
+                None, // conflict_strategy
             )
             .await
             .unwrap();
@@ -4792,6 +4836,7 @@ mod tests {
                 false,
                 Some("backup-task-2".to_string()),
                 Some("file-task-2".to_string()),
+                None, // conflict_strategy
             )
             .await
             .unwrap();
@@ -4843,6 +4888,7 @@ mod tests {
                 false,
                 Some("backup-task-1".to_string()),
                 Some("file-task-1".to_string()),
+                None, // conflict_strategy
             )
             .await
             .unwrap();
@@ -4854,6 +4900,7 @@ mod tests {
                 "/test/normal.txt".to_string(),
                 false, // encrypt
                 false, // is_folder_upload
+                None,  // conflict_strategy
             )
             .await
             .unwrap();

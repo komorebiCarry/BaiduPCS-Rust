@@ -1009,6 +1009,7 @@ impl CloudDlMonitor {
                                 file.path.clone(),
                                 target_dir,
                                 None,
+                                None,
                             ).await {
                                 Ok(folder_id) => {
                                     info!(
@@ -1037,6 +1038,7 @@ impl CloudDlMonitor {
                             file.server_filename.clone(),
                             file.size,
                             target_dir,
+                            None,
                         ).await {
                             Ok(task_id) => {
                                 // 自动开始下载

@@ -4,6 +4,9 @@ import { formatFileSize, formatSpeed, formatETA, extractFilename } from './utils
 // 重新导出工具函数，保持向后兼容
 export { formatFileSize, formatSpeed, formatETA, extractFilename }
 
+/// 下载冲突策略
+export type DownloadConflictStrategy = 'overwrite' | 'skip' | 'auto_rename'
+
 /// 任务状态
 export type TaskStatus = 'pending' | 'downloading' | 'decrypting' | 'paused' | 'completed' | 'failed'
 
@@ -40,6 +43,7 @@ export interface CreateDownloadRequest {
   remote_path: string
   filename: string
   total_size: number
+  conflict_strategy?: DownloadConflictStrategy
 }
 
 /**
@@ -126,6 +130,8 @@ export interface CreateBatchDownloadRequest {
   items: BatchDownloadItem[]
   /// 本地下载目录
   target_dir: string
+  /// 冲突策略
+  conflict_strategy?: DownloadConflictStrategy
 }
 
 /// 批量下载错误项
@@ -269,9 +275,18 @@ export interface DownloadItem {
  * 创建文件夹下载
  * @param remotePath 远程路径
  * @param originalName 原始文件夹名（如果是加密文件夹，传入还原后的名称）
+ * @param conflictStrategy 冲突策略
  */
-export async function createFolderDownload(remotePath: string, originalName?: string): Promise<string> {
-  return apiClient.post('/downloads/folder', { path: remotePath, original_name: originalName })
+export async function createFolderDownload(
+    remotePath: string,
+    originalName?: string,
+    conflictStrategy?: DownloadConflictStrategy
+): Promise<string> {
+  return apiClient.post('/downloads/folder', {
+    path: remotePath,
+    original_name: originalName,
+    conflict_strategy: conflictStrategy
+  })
 }
 
 /**

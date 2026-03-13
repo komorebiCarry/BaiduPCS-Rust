@@ -100,6 +100,10 @@ pub struct FolderDownload {
     /// 解决问题：使用固定位的子任务完成时也需要递增 completed_count
     #[serde(default, skip)]
     pub counted_task_ids: HashSet<String>,
+
+    /// 🔥 下载冲突策略（用于子任务）
+    #[serde(default, skip)]
+    pub conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
 }
 
 impl FolderDownload {
@@ -140,6 +144,7 @@ impl FolderDownload {
             borrowed_subtask_map: HashMap::new(),
             encrypted_folder_mappings: HashMap::new(),
             counted_task_ids: HashSet::new(),
+            conflict_strategy: None,
         }
     }
 

@@ -1279,6 +1279,7 @@ impl TransferManager {
                     filename.clone(),
                     size,
                     &download_dir,
+                    None,
                 )
                 .await
             {
@@ -1323,7 +1324,7 @@ impl TransferManager {
             if let Some(ref fdm) = *fdm_lock {
                 for folder_path in download_folders {
                     match fdm
-                        .create_folder_download_with_dir(folder_path.clone(), &download_dir, None)
+                        .create_folder_download_with_dir(folder_path.clone(), &download_dir, None, None)
                         .await
                     {
                         Ok(folder_id) => {

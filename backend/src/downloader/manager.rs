@@ -251,12 +251,13 @@ impl DownloadManager {
         remote_path: String,
         filename: String,
         total_size: u64,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
         let download_dir = self.download_dir.read().await;
         let local_path = download_dir.join(&filename);
         drop(download_dir);
 
-        self.create_task_internal(fs_id, remote_path, local_path, total_size)
+        self.create_task_internal(fs_id, remote_path, local_path, total_size, conflict_strategy)
             .await
     }
 
@@ -270,9 +271,10 @@ impl DownloadManager {
         filename: String,
         total_size: u64,
         target_dir: &std::path::Path,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
         let local_path = target_dir.join(&filename);
-        self.create_task_internal(fs_id, remote_path, local_path, total_size)
+        self.create_task_internal(fs_id, remote_path, local_path, total_size, conflict_strategy)
             .await
     }
 
@@ -283,20 +285,50 @@ impl DownloadManager {
         remote_path: String,
         local_path: PathBuf,
         total_size: u64,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
+        // 获取默认策略（如果未指定）
+        let strategy = conflict_strategy.unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+
+        // 解决冲突
+        use crate::uploader::conflict_resolver::ConflictResolver;
+        let resolution = ConflictResolver::resolve_download_conflict(&local_path, strategy)?;
+
+        // 根据解决方案处理
+        let final_local_path = match resolution {
+            crate::uploader::conflict::ConflictResolution::Proceed => local_path,
+            crate::uploader::conflict::ConflictResolution::Skip => {
+                // 发送跳过事件
+                let filename = local_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                info!("跳过下载（文件已存在）: {:?}", local_path);
+
+                self.publish_event(DownloadEvent::Skipped {
+                    task_id: format!("skipped-{}", uuid::Uuid::new_v4()),
+                    filename,
+                    reason: "文件已存在".to_string(),
+                })
+                    .await;
+
+                return Ok("skipped".to_string());
+            }
+            crate::uploader::conflict::ConflictResolution::UseNewPath(new_path) => {
+                info!("自动重命名下载路径: {:?} -> {}", local_path, new_path);
+                PathBuf::from(new_path)
+            }
+        };
+
         // 确保目标目录存在
-        if let Some(parent) = local_path.parent() {
+        if let Some(parent) = final_local_path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent).context("创建下载目录失败")?;
             }
         }
 
-        // 检查文件是否已存在
-        if local_path.exists() {
-            warn!("文件已存在: {:?}，将覆盖", local_path);
-        }
-
-        let filename = local_path
+        let filename = final_local_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
@@ -304,7 +336,7 @@ impl DownloadManager {
         // 🔥 查询映射表获取原始文件名（用于加密文件显示）
         let original_filename = self.query_original_filename(&filename).await;
 
-        let mut task = DownloadTask::new(fs_id, remote_path.clone(), local_path.clone(), total_size);
+        let mut task = DownloadTask::new(fs_id, remote_path.clone(), final_local_path.clone(), total_size);
 
         // 🔥 设置原始文件名和加密标记
         if let Some(ref orig_name) = original_filename {
@@ -328,7 +360,7 @@ impl DownloadManager {
             task_id: task_id.clone(),
             fs_id,
             remote_path,
-            local_path: local_path.to_string_lossy().to_string(),
+            local_path: final_local_path.to_string_lossy().to_string(),
             total_size,
             group_id,
             is_backup: false,
@@ -3681,9 +3713,44 @@ impl DownloadManager {
         local_path: PathBuf,
         total_size: u64,
         backup_config_id: String,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
+        use crate::uploader::conflict_resolver::ConflictResolver;
+        use crate::uploader::conflict::{ConflictResolution, DownloadConflictStrategy};
+
+        // 获取默认策略（如果未指定，使用 Overwrite 默认值）
+        let strategy = conflict_strategy.unwrap_or(DownloadConflictStrategy::Overwrite);
+
+        // 解决下载冲突
+        let resolution = ConflictResolver::resolve_download_conflict(&local_path, strategy)?;
+
+        // 根据解决方案处理
+        let final_local_path = match resolution {
+            ConflictResolution::Proceed => local_path,
+            ConflictResolution::Skip => {
+                // 发送跳过事件
+                let filename = local_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                info!("跳过备份下载（文件已存在）: {:?}", local_path);
+
+                self.publish_event(DownloadEvent::Skipped {
+                    task_id: format!("backup-skipped-{}", uuid::Uuid::new_v4()),
+                    filename,
+                    reason: "文件已存在".to_string(),
+                })
+                    .await;
+
+                // 返回特殊的 skipped 标记，而不是错误
+                return Ok("skipped".to_string());
+            }
+            ConflictResolution::UseNewPath(new_path) => PathBuf::from(new_path),
+        };
+
         // 确保目标目录存在
-        if let Some(parent) = local_path.parent() {
+        if let Some(parent) = final_local_path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent).context("创建下载目录失败")?;
             }
@@ -3693,15 +3760,15 @@ impl DownloadManager {
         let task = DownloadTask::new_backup(
             fs_id,
             remote_path.clone(),
-            local_path.clone(),
+            final_local_path.clone(),
             total_size,
             backup_config_id.clone(),
         );
         let task_id = task.id.clone();
 
         info!(
-            "创建备份下载任务: id={}, remote={}, local={:?}, size={}, backup_config={}",
-            task_id, remote_path, local_path, total_size, backup_config_id
+            "创建备份下载任务: id={}, remote={}, local={:?}, size={}, backup_config={}, strategy={:?}",
+            task_id, remote_path, final_local_path, total_size, backup_config_id, strategy
         );
 
         let task_arc = Arc::new(Mutex::new(task));
@@ -3715,7 +3782,7 @@ impl DownloadManager {
             task_id: task_id.clone(),
             fs_id,
             remote_path,
-            local_path: local_path.to_string_lossy().to_string(),
+            local_path: final_local_path.to_string_lossy().to_string(),
             total_size,
             group_id: None,
             is_backup: true,
@@ -4503,6 +4570,7 @@ mod tests {
                 "/test/file.txt".to_string(),
                 "file.txt".to_string(),
                 1024,
+                None,
             )
             .await
             .unwrap();
@@ -4527,6 +4595,7 @@ mod tests {
                 "/test/file.txt".to_string(),
                 "file.txt".to_string(),
                 1024,
+                None,
             )
             .await
             .unwrap();
@@ -4545,15 +4614,15 @@ mod tests {
 
         // 创建3个任务
         let task_id1 = manager
-            .create_task(1, "/test1".to_string(), "file1.txt".to_string(), 1024)
+            .create_task(1, "/test1".to_string(), "file1.txt".to_string(), 1024, None)
             .await
             .unwrap();
         let task_id2 = manager
-            .create_task(2, "/test2".to_string(), "file2.txt".to_string(), 1024)
+            .create_task(2, "/test2".to_string(), "file2.txt".to_string(), 1024, None)
             .await
             .unwrap();
         let _task_id3 = manager
-            .create_task(3, "/test3".to_string(), "file3.txt".to_string(), 1024)
+            .create_task(3, "/test3".to_string(), "file3.txt".to_string(), 1024, None)
             .await
             .unwrap();
 

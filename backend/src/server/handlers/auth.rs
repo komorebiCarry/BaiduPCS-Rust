@@ -36,6 +36,14 @@ impl<T> ApiResponse<T> {
         }
     }
 
+    pub fn success_with_message(data: T, message: impl Into<String>) -> Self {
+        Self {
+            code: 0,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+
     pub fn error(code: i32, message: String) -> Self {
         Self {
             code,

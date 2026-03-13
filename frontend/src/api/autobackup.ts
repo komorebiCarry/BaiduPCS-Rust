@@ -56,6 +56,8 @@ export interface BackupConfig {
   enabled: boolean
   created_at: string
   updated_at: string
+  upload_conflict_strategy?: 'smart_dedup' | 'auto_rename' | 'overwrite'
+  download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
 }
 
 /** 创建备份配置请求 */
@@ -68,6 +70,8 @@ export interface CreateBackupConfigRequest {
   poll_config: PollConfig
   filter_config: FilterConfig
   encrypt_enabled: boolean
+  upload_conflict_strategy?: 'smart_dedup' | 'auto_rename' | 'overwrite'
+  download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
 }
 
 /** 更新备份配置请求 */
@@ -79,6 +83,8 @@ export interface UpdateBackupConfigRequest {
   poll_config?: PollConfig
   filter_config?: FilterConfig
   enabled?: boolean
+  upload_conflict_strategy?: 'smart_dedup' | 'auto_rename' | 'overwrite'
+  download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
 }
 
 /** 备份任务 */

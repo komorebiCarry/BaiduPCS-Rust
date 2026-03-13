@@ -1,6 +1,9 @@
 import { apiClient } from './client'
 import { formatFileSize as sharedFormatFileSize, formatSpeed as sharedFormatSpeed, formatETA as sharedFormatETA, extractFilename as sharedExtractFilename } from './utils'
 
+/// 上传冲突策略（映射百度网盘 API rtype 参数）
+export type UploadConflictStrategy = 'smart_dedup' | 'auto_rename' | 'overwrite'
+
 /// 任务状态
 export type UploadTaskStatus = 'pending' | 'checking_rapid' | 'encrypting' | 'uploading' | 'paused' | 'completed' | 'rapid_upload_success' | 'failed'
 
@@ -32,6 +35,7 @@ export interface CreateUploadRequest {
   local_path: string
   remote_path: string
   encrypt?: boolean
+  conflict_strategy?: UploadConflictStrategy
 }
 
 /// 文件夹扫描选项
@@ -48,12 +52,14 @@ export interface CreateFolderUploadRequest {
   remote_folder: string
   scan_options?: FolderScanOptions
   encrypt?: boolean
+  conflict_strategy?: UploadConflictStrategy
 }
 
 /// 批量创建上传任务请求
 export interface CreateBatchUploadRequest {
   files: [string, string][] // [(本地路径, 远程路径)]
   encrypt?: boolean
+  conflict_strategy?: UploadConflictStrategy
 }
 
 /**

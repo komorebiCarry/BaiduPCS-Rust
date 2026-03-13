@@ -15,3 +15,6 @@ pub use manager::DownloadManager;
 pub use progress::SpeedCalculator;
 pub use scheduler::{calculate_task_max_chunks, ChunkScheduler, TaskScheduleInfo};
 pub use task::{DownloadTask, TaskStatus};
+
+// Re-export conflict strategy from uploader module for convenience
+pub use crate::uploader::conflict::DownloadConflictStrategy;
