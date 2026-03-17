@@ -9,4 +9,4 @@ pub mod types;
 pub use manager::TransferManager;
 pub use manager::build_fs_ids;
 pub use task::{TransferStatus, TransferTask};
-pub use types::{ShareFileListResult, ShareLink, SharePageInfo, SharedFileInfo, TransferError, TransferResult};
+pub use types::{CleanupResult, CleanupStatus, ShareFileListResult, ShareLink, SharePageInfo, SharedFileInfo, TransferError, TransferResult};

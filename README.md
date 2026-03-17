@@ -265,7 +265,18 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v1.11.0 (当前版本)
+### v1.11.1 (当前版本)
+
+**问题修复：**
+- 🐛 **修复异步转存错误兜底**：补充百度异步转存 `taskquery` 失败场景的兜底处理
+    - 识别 `task_errno` 并返回更明确的失败原因
+    - 分享直下遇到 `task_errno=-30`（目标文件已存在）时，尝试恢复已转存结果
+    - 减少“实际已转存但任务被误判失败”的情况
+
+<details>
+<summary><b>v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
+
+#### v1.11.0
 
 **新功能：**
 - ✨ **文件冲突策略**：系统设置新增上传/下载默认策略，单次上传和下载操作也可临时覆盖
@@ -275,9 +286,6 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 **问题修复：**
 - 🐛 **修复异步转存兼容性**：兼容百度返回异步转存任务的场景
-
-<details>
-<summary><b>v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
 
 #### v1.10.0
 

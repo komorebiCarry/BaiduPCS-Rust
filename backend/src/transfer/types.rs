@@ -147,3 +147,110 @@ impl std::fmt::Display for TransferError {
 }
 
 impl std::error::Error for TransferError {}
+
+// ============================================
+// 清理结果类型定义
+// ============================================
+
+/// 临时目录清理状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupStatus {
+    /// 清理成功
+    Success,
+    /// 清理失败
+    Failed,
+    /// 被百度风控拦截（errno=132）
+    RiskControlBlocked,
+    /// 未尝试清理
+    NotAttempted,
+}
+
+/// 临时目录清理结果
+#[derive(Debug, Clone)]
+pub struct CleanupResult {
+    /// 是否成功
+    pub success: bool,
+    /// 清理状态
+    pub status: CleanupStatus,
+    /// 错误信息
+    pub error: Option<String>,
+    /// API 错误码
+    pub errno: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cleanup_status_serialize() {
+        let status = CleanupStatus::Success;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"success\"");
+
+        let status = CleanupStatus::RiskControlBlocked;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"risk_control_blocked\"");
+
+        let status = CleanupStatus::Failed;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"failed\"");
+
+        let status = CleanupStatus::NotAttempted;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"not_attempted\"");
+    }
+
+    #[test]
+    fn test_cleanup_status_deserialize() {
+        let status: CleanupStatus = serde_json::from_str("\"success\"").unwrap();
+        assert_eq!(status, CleanupStatus::Success);
+
+        let status: CleanupStatus = serde_json::from_str("\"risk_control_blocked\"").unwrap();
+        assert_eq!(status, CleanupStatus::RiskControlBlocked);
+
+        let status: CleanupStatus = serde_json::from_str("\"failed\"").unwrap();
+        assert_eq!(status, CleanupStatus::Failed);
+
+        let status: CleanupStatus = serde_json::from_str("\"not_attempted\"").unwrap();
+        assert_eq!(status, CleanupStatus::NotAttempted);
+    }
+
+    #[test]
+    fn test_cleanup_status_roundtrip() {
+        for status in &[
+            CleanupStatus::Success,
+            CleanupStatus::Failed,
+            CleanupStatus::RiskControlBlocked,
+            CleanupStatus::NotAttempted,
+        ] {
+            let json = serde_json::to_string(status).unwrap();
+            let deserialized: CleanupStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*status, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_cleanup_result_construction() {
+        let result = CleanupResult {
+            success: true,
+            status: CleanupStatus::Success,
+            error: None,
+            errno: None,
+        };
+        assert!(result.success);
+        assert_eq!(result.status, CleanupStatus::Success);
+        assert!(result.error.is_none());
+
+        let result = CleanupResult {
+            success: false,
+            status: CleanupStatus::RiskControlBlocked,
+            error: Some("风控拦截".to_string()),
+            errno: Some(132),
+        };
+        assert!(!result.success);
+        assert_eq!(result.status, CleanupStatus::RiskControlBlocked);
+        assert_eq!(result.errno, Some(132));
+    }
+}

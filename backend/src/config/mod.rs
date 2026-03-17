@@ -340,6 +340,35 @@ fn default_share_direct_cleanup_orphaned_on_startup() -> bool {
     false
 }
 
+impl ShareDirectDownloadConfig {
+    /// 校验临时目录路径是否安全
+    ///
+    /// 规则：
+    /// - 必须以 `/` 开头（网盘绝对路径）
+    /// - trim 末尾 `/` 后长度 >= 2（拒绝 `/`、空字符串等退化值）
+    ///
+    /// # 返回值
+    /// - Ok(()): 路径安全
+    /// - Err: 路径不安全，附带原因
+    pub fn validate_temp_dir(&self) -> Result<()> {
+        let trimmed = self.temp_dir.trim_end_matches('/');
+        if trimmed.is_empty() || !trimmed.starts_with('/') {
+            anyhow::bail!(
+                "share_direct_download.temp_dir 必须是绝对路径（以 / 开头），当前值: {:?}",
+                self.temp_dir
+            );
+        }
+        if trimmed.len() < 2 {
+            anyhow::bail!(
+                "share_direct_download.temp_dir 不能为根目录 /，当前值: {:?}。\
+                 请指定一个专用子目录，如 /.bpr_share_temp/",
+                self.temp_dir
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for ShareDirectDownloadConfig {
     fn default() -> Self {
         Self {
@@ -1064,6 +1093,12 @@ impl AppConfig {
             .validate_download_dir()
             .context("配置文件中的下载路径验证失败")?;
 
+        // 验证分享直下临时目录路径是否安全
+        config
+            .share_direct_download
+            .validate_temp_dir()
+            .context("配置文件中的分享直下临时目录验证失败")?;
+
         Ok(config)
     }
 
@@ -1083,6 +1118,11 @@ impl AppConfig {
         self.download
             .validate_download_dir()
             .context("保存配置失败：下载路径必须是绝对路径")?;
+
+        // 1b. 验证分享直下临时目录路径
+        self.share_direct_download
+            .validate_temp_dir()
+            .context("保存配置失败：分享直下临时目录路径不安全")?;
 
         // 2. 增强验证（存在性、可写性、可用空间）
         let validation_result = self
@@ -1473,6 +1513,35 @@ mod tests {
         assert!(config.share_direct_download.auto_cleanup);
         assert!(config.share_direct_download.cleanup_on_failure);
         assert!(!config.share_direct_download.cleanup_orphaned_on_startup);
+    }
+
+    #[test]
+    fn test_validate_temp_dir_safe_paths() {
+        let make = |dir: &str| ShareDirectDownloadConfig {
+            temp_dir: dir.to_string(),
+            ..Default::default()
+        };
+        assert!(make("/.bpr_share_temp/").validate_temp_dir().is_ok());
+        assert!(make("/.bpr_share_temp").validate_temp_dir().is_ok());
+        assert!(make("/custom_temp/").validate_temp_dir().is_ok());
+        assert!(make("/my/nested/temp/").validate_temp_dir().is_ok());
+        assert!(make("/ab").validate_temp_dir().is_ok());
+    }
+
+    #[test]
+    fn test_validate_temp_dir_unsafe_paths() {
+        let make = |dir: &str| ShareDirectDownloadConfig {
+            temp_dir: dir.to_string(),
+            ..Default::default()
+        };
+        // 根目录 — 会退化 starts_with("") 恒真
+        assert!(make("/").validate_temp_dir().is_err());
+        assert!(make("///").validate_temp_dir().is_err());
+        // 空字符串
+        assert!(make("").validate_temp_dir().is_err());
+        // 相对路径
+        assert!(make("temp").validate_temp_dir().is_err());
+        assert!(make("temp/dir").validate_temp_dir().is_err());
     }
 
     // ========== 冲突策略配置测试 ==========

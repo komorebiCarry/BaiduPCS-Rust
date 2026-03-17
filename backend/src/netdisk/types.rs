@@ -665,6 +665,22 @@ impl ShareSURLInfoResponse {
 // 删除文件相关类型定义
 // =====================================================
 
+/// 风控验证组件信息
+///
+/// 百度风控系统返回的验证信息，当 errno=132 时可能附带此字段
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthWidget {
+    /// 安全随机数
+    #[serde(default)]
+    pub saferand: String,
+    /// 安全签名
+    #[serde(default)]
+    pub safesign: String,
+    /// 安全模板
+    #[serde(default)]
+    pub safetpl: String,
+}
+
 /// 删除文件响应
 ///
 /// 百度网盘 API: POST https://pcs.baidu.com/rest/2.0/pcs/file?method=delete
@@ -680,6 +696,15 @@ pub struct DeleteFilesResponse {
     pub failed_paths: Vec<String>,
     /// 成功删除的数量
     pub deleted_count: usize,
+    /// API 错误码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errno: Option<i32>,
+    /// 风控验证组件（errno=132 时可能存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authwidget: Option<AuthWidget>,
+    /// 验证场景（风控相关）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_scene: Option<i32>,
 }
 
 impl DeleteFilesResponse {
@@ -690,6 +715,9 @@ impl DeleteFilesResponse {
             error: None,
             failed_paths: Vec::new(),
             deleted_count,
+            errno: Some(0),
+            authwidget: None,
+            verify_scene: None,
         }
     }
 
@@ -700,6 +728,9 @@ impl DeleteFilesResponse {
             error: Some(format!("部分文件删除失败: {} 个", failed_paths.len())),
             failed_paths,
             deleted_count,
+            errno: None,
+            authwidget: None,
+            verify_scene: None,
         }
     }
 
@@ -710,6 +741,22 @@ impl DeleteFilesResponse {
             error: Some(error),
             failed_paths: Vec::new(),
             deleted_count: 0,
+            errno: None,
+            authwidget: None,
+            verify_scene: None,
+        }
+    }
+
+    /// 创建带 errno 的失败响应
+    pub fn failure_with_errno(error: String, errno: i32, authwidget: Option<AuthWidget>, verify_scene: Option<i32>) -> Self {
+        Self {
+            success: false,
+            error: Some(error),
+            failed_paths: Vec::new(),
+            deleted_count: 0,
+            errno: Some(errno),
+            authwidget,
+            verify_scene,
         }
     }
 }
@@ -730,6 +777,14 @@ pub struct DeleteFilesApiResponse {
     /// 请求ID
     #[serde(default)]
     pub request_id: u64,
+
+    /// 风控验证组件（errno=132 时可能存在）
+    #[serde(default)]
+    pub authwidget: Option<AuthWidget>,
+
+    /// 验证场景（风控相关）
+    #[serde(default)]
+    pub verify_scene: Option<i32>,
 }
 
 impl DeleteFilesApiResponse {

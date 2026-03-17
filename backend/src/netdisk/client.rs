@@ -2306,7 +2306,7 @@ impl NetdiskClient {
     /// * `fs_ids` - 要转存的文件 fs_id 列表
     /// * `target_path` - 目标路径
     /// * `referer` - 来源页面
-    /// * `sekey` - 验证后的密钥（URL 编码的 randsk，可选）
+    /// * `internal_task_id` - 调用方内部任务 ID（用于日志关联）
     ///
     /// # 返回
     /// 转存结果
@@ -2318,6 +2318,7 @@ impl NetdiskClient {
         fs_ids: &[u64],
         target_path: &str,
         referer: &str,
+        internal_task_id: Option<&str>,
     ) -> Result<crate::transfer::TransferResult> {
         // 构建转存URL
         let url = format!(
@@ -2393,13 +2394,16 @@ impl NetdiskClient {
 
                 let show_msg = json["show_msg"].as_str().unwrap_or("");
                 info!(
-                        "检测到异步转存任务: task_id={}, show_msg='{}', 将使用任务查询 API",
-                        task_id_string, show_msg
+                        "检测到异步转存任务: baidu_task_id={}, internal_task_id={}, target_path={}, show_msg='{}'",
+                        task_id_string,
+                        internal_task_id.unwrap_or("N/A"),
+                        target_path,
+                        show_msg
                     );
 
                 // 调用 query_transfer_task 轮询任务状态
                 return self
-                    .query_transfer_task(&task_id_string, shareid, share_uk, bdstoken, referer)
+                    .query_transfer_task(&task_id_string, shareid, share_uk, bdstoken, referer, internal_task_id)
                     .await;
             }
 
@@ -2561,6 +2565,7 @@ impl NetdiskClient {
         share_uk: &str,
         bdstoken: &str,
         referer: &str,
+        internal_task_id: Option<&str>,
     ) -> Result<crate::transfer::TransferResult> {
         use rand::Rng;
 
@@ -2644,6 +2649,17 @@ impl NetdiskClient {
 
             // 检查任务错误
             if task_errno != 0 {
+                let show_msg = json["show_msg"].as_str().unwrap_or("");
+                let progress = json["progress"].as_str().unwrap_or("");
+                warn!(
+                        "异步转存任务失败: baidu_task_id={}, internal_task_id={}, task_errno={}, status={}, show_msg='{}', progress='{}'",
+                        task_id,
+                        internal_task_id.unwrap_or("N/A"),
+                        task_errno,
+                        status,
+                        show_msg,
+                        progress
+                    );
                 return Err(anyhow::anyhow!(
                         "异步转存任务失败: task_errno={}, response={}",
                         task_errno,
@@ -3672,14 +3688,35 @@ impl NetdiskClient {
 
             // errno 12: 文件不存在（可能已被删除），视为成功（幂等性）
             if api_response.errno == 12 {
-                warn!("文件不存在，视为删除成功");
+                warn!("文件不存在（errno=12），视为删除成功");
                 Ok(DeleteFilesResponse::success(paths.len()))
             } else {
-                error!(
-                    "删除文件失败: errno={}, errmsg={}",
-                    api_response.errno, error_msg
-                );
-                Ok(DeleteFilesResponse::failure(error_msg))
+                // 风控/删除失败诊断摘要（不打印完整 safesign 避免日志泄露）
+                if api_response.errno == 132 {
+                    let widget_summary = api_response.authwidget.as_ref().map(|w| {
+                        format!(
+                            "saferand={}, safetpl={}, safesign_len={}",
+                            w.saferand, w.safetpl, w.safesign.len()
+                        )
+                    });
+                    warn!(
+                        "删除被风控拦截(errno=132): errmsg={}, widget=[{}], verify_scene={:?}",
+                        error_msg,
+                        widget_summary.as_deref().unwrap_or("N/A"),
+                        api_response.verify_scene
+                    );
+                } else {
+                    error!(
+                        "删除文件失败: errno={}, errmsg={}, verify_scene={:?}",
+                        api_response.errno, error_msg, api_response.verify_scene
+                    );
+                }
+                Ok(DeleteFilesResponse::failure_with_errno(
+                    error_msg,
+                    api_response.errno,
+                    api_response.authwidget,
+                    api_response.verify_scene,
+                ))
             }
         }
     }
