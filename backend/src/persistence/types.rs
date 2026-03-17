@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::warn;
 
+use crate::transfer::types::CleanupStatus;
+
 /// 任务持久化状态
 ///
 /// 统一的任务状态枚举，用于持久化和历史归档
@@ -208,6 +210,10 @@ pub struct TaskMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_dir: Option<String>,
 
+    /// 临时目录清理状态（分享直下任务专用，仅后端诊断使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_status: Option<CleanupStatus>,
+
     // === 文件夹下载组信息 ===
     /// 文件夹下载组ID（单文件下载时为 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,6 +326,7 @@ impl TaskMetadata {
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
+            cleanup_status: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -390,6 +397,7 @@ impl TaskMetadata {
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
+            cleanup_status: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -456,6 +464,7 @@ impl TaskMetadata {
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
+            cleanup_status: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -524,6 +533,7 @@ impl TaskMetadata {
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
+            cleanup_status: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -586,6 +596,7 @@ impl TaskMetadata {
             // 分享直下字段
             is_share_direct_download: None,
             temp_dir: None,
+            cleanup_status: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -722,6 +733,12 @@ impl TaskMetadata {
     ) {
         self.is_share_direct_download = Some(is_share_direct_download);
         self.temp_dir = temp_dir;
+        self.touch();
+    }
+
+    /// 设置临时目录清理状态
+    pub fn set_cleanup_status(&mut self, status: CleanupStatus) {
+        self.cleanup_status = Some(status);
         self.touch();
     }
 

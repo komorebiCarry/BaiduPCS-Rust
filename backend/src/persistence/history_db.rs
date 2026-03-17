@@ -168,6 +168,8 @@ impl HistoryDbManager {
         // 兼容旧数据库：添加新列（已存在则忽略）
         let _ = conn.execute("ALTER TABLE task_history ADD COLUMN file_list_json TEXT", []);
         let _ = conn.execute("ALTER TABLE task_history ADD COLUMN is_share_direct_download INTEGER", []);
+        let _ = conn.execute("ALTER TABLE task_history ADD COLUMN temp_dir TEXT", []);
+        let _ = conn.execute("ALTER TABLE task_history ADD COLUMN cleanup_status TEXT", []);
 
         info!("历史数据库表初始化完成");
         Ok(())
@@ -206,7 +208,8 @@ impl HistoryDbManager {
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
                 transfer_task_id, download_task_ids,
-                file_list_json, is_share_direct_download
+                file_list_json, is_share_direct_download,
+                temp_dir, cleanup_status
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9,
@@ -216,7 +219,8 @@ impl HistoryDbManager {
                 ?23, ?24, ?25,
                 ?26, ?27,
                 ?28, ?29,
-                ?30, ?31
+                ?30, ?31,
+                ?32, ?33
             )
             "#,
             params![
@@ -251,6 +255,8 @@ impl HistoryDbManager {
                 download_task_ids,
                 metadata.file_list_json,
                 metadata.is_share_direct_download.map(|b| if b { 1 } else { 0 }),
+                metadata.temp_dir,
+                metadata.cleanup_status.map(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from))).flatten(),
             ],
         )?;
 
@@ -284,7 +290,8 @@ impl HistoryDbManager {
                     group_id, group_root, relative_path,
                     is_backup, backup_config_id,
                     transfer_task_id, download_task_ids,
-                    file_list_json, is_share_direct_download
+                    file_list_json, is_share_direct_download,
+                    temp_dir, cleanup_status
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9,
@@ -294,7 +301,8 @@ impl HistoryDbManager {
                     ?23, ?24, ?25,
                     ?26, ?27,
                     ?28, ?29,
-                    ?30, ?31
+                    ?30, ?31,
+                    ?32, ?33
                 )
                 "#,
             )?;
@@ -343,6 +351,8 @@ impl HistoryDbManager {
                     download_task_ids,
                     metadata.file_list_json,
                     metadata.is_share_direct_download.map(|b| if b { 1 } else { 0 }),
+                    metadata.temp_dir,
+                    metadata.cleanup_status.map(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from))).flatten(),
                 ])?;
                 count += 1;
             }
@@ -370,7 +380,8 @@ impl HistoryDbManager {
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
-                transfer_task_id, download_task_ids
+                transfer_task_id, download_task_ids,
+                temp_dir, cleanup_status
             FROM task_history
             ORDER BY completed_at DESC
             "#,
@@ -409,6 +420,8 @@ impl HistoryDbManager {
                 backup_config_id: row.get(28)?,
                 transfer_task_id: row.get(29)?,
                 download_task_ids: row.get(30)?,
+                temp_dir: row.get(31)?,
+                cleanup_status: row.get(32)?,
             })
         })?;
 
@@ -464,7 +477,8 @@ impl HistoryDbManager {
                     file_size, chunk_size, total_chunks, error_msg,
                     group_id, group_root, relative_path,
                     is_backup, backup_config_id,
-                    transfer_task_id, download_task_ids
+                    transfer_task_id, download_task_ids,
+                    temp_dir, cleanup_status
                 FROM task_history
                 WHERE task_id = ?1
                 "#,
@@ -502,6 +516,8 @@ impl HistoryDbManager {
                         backup_config_id: row.get(28)?,
                         transfer_task_id: row.get(29)?,
                         download_task_ids: row.get(30)?,
+                        temp_dir: row.get(31)?,
+                        cleanup_status: row.get(32)?,
                     })
                 },
             )
@@ -549,7 +565,8 @@ impl HistoryDbManager {
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
-                transfer_task_id, download_task_ids
+                transfer_task_id, download_task_ids,
+                temp_dir, cleanup_status
             FROM task_history
             ORDER BY completed_at DESC
             LIMIT ?1 OFFSET ?2
@@ -589,6 +606,8 @@ impl HistoryDbManager {
                 backup_config_id: row.get(28)?,
                 transfer_task_id: row.get(29)?,
                 download_task_ids: row.get(30)?,
+                temp_dir: row.get(31)?,
+                cleanup_status: row.get(32)?,
             })
         })?;
 
@@ -646,7 +665,8 @@ impl HistoryDbManager {
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
-                transfer_task_id, download_task_ids
+                transfer_task_id, download_task_ids,
+                temp_dir, cleanup_status
             FROM task_history
             WHERE task_type = ?1 AND status = ?2
             ORDER BY completed_at DESC
@@ -687,6 +707,8 @@ impl HistoryDbManager {
                 backup_config_id: row.get(28)?,
                 transfer_task_id: row.get(29)?,
                 download_task_ids: row.get(30)?,
+                temp_dir: row.get(31)?,
+                cleanup_status: row.get(32)?,
             })
         })?;
 
@@ -748,7 +770,8 @@ impl HistoryDbManager {
                 file_size, chunk_size, total_chunks, error_msg,
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
-                transfer_task_id, download_task_ids
+                transfer_task_id, download_task_ids,
+                temp_dir, cleanup_status
             FROM task_history
             WHERE task_type = ?1 AND status = ?2 {}
             ORDER BY completed_at DESC
@@ -791,6 +814,8 @@ impl HistoryDbManager {
                 backup_config_id: row.get(28)?,
                 transfer_task_id: row.get(29)?,
                 download_task_ids: row.get(30)?,
+                temp_dir: row.get(31)?,
+                cleanup_status: row.get(32)?,
             })
         })?;
 
@@ -1250,7 +1275,8 @@ impl HistoryDbManager {
             file_list_json: row.file_list_json,
             // 分享直下字段
             is_share_direct_download: row.is_share_direct_download.map(|v| v != 0),
-            temp_dir: None,
+            temp_dir: row.temp_dir,
+            cleanup_status: row.cleanup_status.and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
             group_id: row.group_id,
             group_root: row.group_root,
             relative_path: row.relative_path,
@@ -1344,6 +1370,8 @@ struct TaskHistoryRow {
     backup_config_id: Option<String>,
     transfer_task_id: Option<String>,
     download_task_ids: Option<String>,
+    temp_dir: Option<String>,
+    cleanup_status: Option<String>,
 }
 
 /// 文件夹历史行

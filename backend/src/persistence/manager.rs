@@ -1040,6 +1040,28 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 更新临时目录清理状态
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `cleanup_status` - 清理状态
+    pub fn update_cleanup_status(
+        &self,
+        task_id: &str,
+        cleanup_status: crate::transfer::types::CleanupStatus,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_cleanup_status(cleanup_status);
+        })?;
+
+        debug!(
+            "已更新清理状态: task_id={}, cleanup_status={:?}",
+            task_id, cleanup_status
+        );
+
+        Ok(())
+    }
+
     /// 更新任务状态
     ///
     /// # Arguments
