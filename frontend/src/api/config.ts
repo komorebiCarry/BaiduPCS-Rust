@@ -77,6 +77,7 @@ export interface TransferConfig {
 /// 文件系统配置
 export interface FilesystemConfig {
   allowed_paths?: string[]
+  default_path?: string
   show_hidden?: boolean
   follow_symlinks?: boolean
 }

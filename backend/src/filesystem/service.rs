@@ -248,8 +248,12 @@ impl FilesystemService {
         })
     }
 
-    /// 获取根目录列表（Windows 驱动器列表 / Unix 根目录）
+    /// 获取根目录列表（Windows 驱动器列表 / Unix 根目录 / 白名单目录）
     pub fn get_roots(&self) -> Result<Vec<FileEntry>, FsError> {
+        if self.guard.has_allowed_paths() {
+            return self.get_allowed_roots();
+        }
+
         #[cfg(target_os = "windows")]
         {
             self.get_windows_drives()
@@ -259,6 +263,14 @@ impl FilesystemService {
         {
             self.get_unix_roots()
         }
+    }
+
+    fn get_allowed_roots(&self) -> Result<Vec<FileEntry>, FsError> {
+        self.guard
+            .resolve_allowed_roots()?
+            .into_iter()
+            .map(|path| self.create_root_entry(&path))
+            .collect()
     }
 
     /// Windows: 获取驱动器列表
@@ -366,9 +378,22 @@ impl FilesystemService {
         Ok(entries)
     }
 
-    /// 创建挂载点条目
-    #[cfg(not(target_os = "windows"))]
-    fn create_mount_entry(&self, path: &PathBuf, display_name: &str) -> Result<FileEntry, FsError> {
+    /// 创建根目录/挂载点条目
+    fn create_root_entry(&self, path: &Path) -> Result<FileEntry, FsError> {
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        self.create_directory_entry(path, name)
+    }
+
+    fn create_directory_entry(
+        &self,
+        path: &Path,
+        name: impl Into<String>,
+    ) -> Result<FileEntry, FsError> {
         let metadata = fs::metadata(path).map_err(|_| {
             FsError::new(FsErrorCode::DirectoryReadFailed)
                 .with_path(path.to_string_lossy().to_string())
@@ -388,7 +413,7 @@ impl FilesystemService {
 
         Ok(FileEntry {
             id: self.path_to_id(path),
-            name: display_name.to_string(),
+            name: name.into(),
             entry_type: EntryType::Directory,
             size: None,
             created_at,
@@ -396,6 +421,12 @@ impl FilesystemService {
             icon: Some("drive".to_string()),
             path: path.to_string_lossy().to_string(),
         })
+    }
+
+    /// 创建挂载点条目
+    #[cfg(not(target_os = "windows"))]
+    fn create_mount_entry(&self, path: &PathBuf, display_name: &str) -> Result<FileEntry, FsError> {
+        self.create_directory_entry(path, display_name.to_string())
     }
 
     /// 将 DirEntry 转换为 FileEntry
@@ -526,6 +557,35 @@ mod tests {
             assert_eq!(roots.len(), 1);
             assert_eq!(roots[0].path, "/");
         }
+    }
+
+    #[test]
+    fn test_get_roots_uses_allowed_paths_and_prioritizes_default_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let alpha = temp_dir.path().join("alpha");
+        let beta = temp_dir.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![
+                alpha.to_string_lossy().to_string(),
+                beta.to_string_lossy().to_string(),
+            ],
+            default_path: Some(beta.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let roots = service.get_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(
+            roots[0].path,
+            beta.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            roots[1].path,
+            alpha.canonicalize().unwrap().to_string_lossy()
+        );
     }
 
     #[test]

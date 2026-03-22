@@ -81,9 +81,15 @@ impl Default for ScanConfig {
     }
 }
 
-fn default_scan_batch_size() -> usize { 1000 }
-fn default_max_pending_tasks() -> usize { 5000 }
-fn default_progress_interval() -> usize { 500 }
+fn default_scan_batch_size() -> usize {
+    1000
+}
+fn default_max_pending_tasks() -> usize {
+    5000
+}
+fn default_progress_interval() -> usize {
+    500
+}
 
 /// 冲突策略配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +107,8 @@ impl Default for ConflictStrategyConfig {
     fn default() -> Self {
         Self {
             default_upload_strategy: crate::uploader::conflict::UploadConflictStrategy::SmartDedup,
-            default_download_strategy: crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
+            default_download_strategy:
+                crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
         }
     }
 }
@@ -671,6 +678,9 @@ pub struct FilesystemConfig {
     /// 允许访问的路径白名单（空表示允许所有）
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+    /// 上传弹窗默认优先展示的白名单目录
+    #[serde(default)]
+    pub default_path: Option<String>,
     /// 是否显示隐藏文件
     #[serde(default)]
     pub show_hidden: bool,
@@ -683,6 +693,7 @@ impl Default for FilesystemConfig {
     fn default() -> Self {
         Self {
             allowed_paths: vec![],
+            default_path: None,
             show_hidden: false,
             follow_symlinks: false,
         }
@@ -1546,8 +1557,8 @@ mod tests {
 
     // ========== 冲突策略配置测试 ==========
 
+    use crate::uploader::conflict::{DownloadConflictStrategy, UploadConflictStrategy};
     use proptest::prelude::*;
-    use crate::uploader::conflict::{UploadConflictStrategy, DownloadConflictStrategy};
 
     // 生成器：上传冲突策略
     fn prop_upload_strategy() -> impl Strategy<Value = UploadConflictStrategy> {
@@ -1687,4 +1698,3 @@ ask_each_time = true
         assert!(toml_str.contains("overwrite"));
     }
 }
-

@@ -24,6 +24,20 @@ chunk_size_mb = 10
 # 下载失败后的最大重试次数
 max_retries = 3
 
+
+[filesystem]
+# 允许上传选择器访问的本地白名单目录（空数组表示不限制）
+allowed_paths = ["/data/uploads", "/data/media"]
+
+# 上传弹窗默认优先展示的白名单目录（需位于 allowed_paths 范围内）
+default_path = "/data/uploads"
+
+# 是否显示隐藏文件
+show_hidden = false
+
+# 是否跟随符号链接
+follow_symlinks = false
+
 # Web 访问认证配置
 # 用于保护部署在公网 VPS 上的管理界面
 [web_auth]
