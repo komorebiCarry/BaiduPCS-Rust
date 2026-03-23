@@ -18,6 +18,44 @@ impl PathGuard {
         Self { config }
     }
 
+    /// 白名单是否已启用
+    pub fn has_allowed_paths(&self) -> bool {
+        !self.config.allowed_paths.is_empty()
+    }
+
+    /// 解析并排序根目录列表。
+    ///
+    /// 当配置了 default_path 时，会优先放到返回列表第一位。
+    pub fn resolve_allowed_roots(&self) -> Result<Vec<PathBuf>, FsError> {
+        let mut roots = Vec::new();
+
+        for allowed in &self.config.allowed_paths {
+            let canonical = self.normalize_existing_directory(allowed)?;
+            Self::push_unique_path(&mut roots, canonical);
+        }
+
+        if let Some(default_path) = self.resolve_default_directory()? {
+            roots.retain(|path| path != &default_path);
+            roots.insert(0, default_path);
+        }
+
+        Ok(roots)
+    }
+
+    /// 解析默认目录，并校验其处于白名单范围内。
+    pub fn resolve_default_directory(&self) -> Result<Option<PathBuf>, FsError> {
+        let Some(default_path) = self.config.default_path.as_deref() else {
+            return Ok(None);
+        };
+
+        let canonical = self.normalize_existing_directory(default_path)?;
+        if self.has_allowed_paths() && !self.is_allowed(&canonical) {
+            return Err(FsError::new(FsErrorCode::PathNotAllowed).with_path(default_path));
+        }
+
+        Ok(Some(canonical))
+    }
+
     /// 检查路径是否在白名单内
     ///
     /// 如果白名单为空，表示允许所有路径
@@ -136,6 +174,25 @@ impl PathGuard {
         self.is_symlink(path)
     }
 
+    /// 将目录路径规范化为已存在的绝对目录
+    fn normalize_existing_directory(&self, path: &str) -> Result<PathBuf, FsError> {
+        let canonical = PathBuf::from(path)
+            .canonicalize()
+            .map_err(|_| FsError::new(FsErrorCode::DirectoryNotFound).with_path(path))?;
+
+        if !canonical.is_dir() {
+            return Err(FsError::new(FsErrorCode::NotADirectory).with_path(path));
+        }
+
+        Ok(canonical)
+    }
+
+    fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+
     /// 检查路径是否包含穿越序列
     fn contains_traversal(&self, path: &str) -> bool {
         // 检查常见的穿越模式
@@ -203,5 +260,27 @@ mod tests {
         // 当 show_hidden = true 时，不应该隐藏任何文件
         assert!(!guard.is_hidden(Path::new("/home/user/.bashrc")));
         assert!(!guard.is_hidden(Path::new(".gitignore")));
+    }
+
+    #[test]
+    fn test_resolve_allowed_roots_prioritizes_default_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let primary = temp_dir.path().join("primary");
+        let secondary = temp_dir.path().join("secondary");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&secondary).unwrap();
+
+        let guard = PathGuard::new(FilesystemConfig {
+            allowed_paths: vec![
+                primary.to_string_lossy().to_string(),
+                secondary.to_string_lossy().to_string(),
+            ],
+            default_path: Some(secondary.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let roots = guard.resolve_allowed_roots().unwrap();
+        assert_eq!(roots[0], secondary.canonicalize().unwrap());
+        assert_eq!(roots.len(), 2);
     }
 }

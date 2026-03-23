@@ -1,3 +1,5 @@
+use crate::filesystem::{FilesystemConfig, PathGuard};
+use crate::server::error::{ApiError, ApiResult};
 use crate::server::AppState;
 use crate::uploader::{ScanOptions, ScanTaskStatus, UploadConflictStrategy, UploadTask};
 use axum::{
@@ -63,6 +65,40 @@ fn default_skip_hidden() -> bool {
     true
 }
 
+fn create_path_guard(config: &FilesystemConfig) -> PathGuard {
+    PathGuard::new(config.clone())
+}
+
+fn validate_upload_file_path(guard: &PathGuard, path: &str) -> Result<PathBuf, ApiError> {
+    let normalized = guard
+        .normalize(path)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    if !normalized.is_file() {
+        return Err(ApiError::BadRequest(format!(
+            "上传源文件不存在或不是文件: {}",
+            path
+        )));
+    }
+
+    Ok(normalized)
+}
+
+fn validate_upload_directory_path(guard: &PathGuard, path: &str) -> Result<PathBuf, ApiError> {
+    let normalized = guard
+        .normalize(path)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    if !normalized.is_dir() {
+        return Err(ApiError::BadRequest(format!(
+            "上传源目录不存在或不是目录: {}",
+            path
+        )));
+    }
+
+    Ok(normalized)
+}
+
 impl From<FolderScanOptions> for ScanOptions {
     fn from(options: FolderScanOptions) -> Self {
         Self {
@@ -109,26 +145,35 @@ pub struct ScanStatusResponse {
 pub async fn create_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateUploadRequest>,
-) -> Result<Json<ApiResponse<String>>, StatusCode> {
+) -> ApiResult<Json<ApiResponse<String>>> {
     // 获取上传管理器
     let upload_manager = app_state
         .upload_manager
         .read()
         .await
         .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("上传管理器未初始化")))?;
+
+    let config = app_state.config.read().await;
+    let guard = create_path_guard(&config.filesystem);
 
     // 如果未指定策略，从 AppConfig 读取默认值
-    let conflict_strategy = req.conflict_strategy.or_else(|| {
-        let config = app_state.config.blocking_read();
-        Some(config.conflict_strategy.default_upload_strategy)
-    });
+    let conflict_strategy = req
+        .conflict_strategy
+        .or(Some(config.conflict_strategy.default_upload_strategy));
 
-    let local_path = PathBuf::from(&req.local_path);
+    let local_path = validate_upload_file_path(&guard, &req.local_path)?;
+    drop(config);
 
     // 🔥 传递 encrypt 参数，普通文件上传 is_folder_upload = false
     match upload_manager
-        .create_task(local_path, req.remote_path, req.encrypt, false, conflict_strategy)
+        .create_task(
+            local_path,
+            req.remote_path,
+            req.encrypt,
+            false,
+            conflict_strategy,
+        )
         .await
     {
         Ok(task_id) => {
@@ -143,7 +188,7 @@ pub async fn create_upload(
         }
         Err(e) => {
             error!("创建上传任务失败: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::Internal(anyhow::anyhow!(e.to_string())))
         }
     }
 }
@@ -153,23 +198,26 @@ pub async fn create_upload(
 pub async fn create_folder_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateFolderUploadRequest>,
-) -> Result<Json<ApiResponse<ScanStartResponse>>, StatusCode> {
+) -> ApiResult<Json<ApiResponse<ScanStartResponse>>> {
     // 获取扫描管理器
     let scan_manager = app_state
         .scan_manager
         .read()
         .await
         .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("扫描管理器未初始化")))?;
 
     // 获取配置
     let config = app_state.config.read().await;
+    let guard = create_path_guard(&config.filesystem);
     let skip_hidden_files = config.upload.skip_hidden_files;
     // 如果未指定策略，从 AppConfig 读取默认值
-    let conflict_strategy = req.conflict_strategy.or(Some(config.conflict_strategy.default_upload_strategy));
-    drop(config);
+    let conflict_strategy = req
+        .conflict_strategy
+        .or(Some(config.conflict_strategy.default_upload_strategy));
 
-    let local_folder = PathBuf::from(&req.local_folder);
+    let local_folder = validate_upload_directory_path(&guard, &req.local_folder)?;
+    drop(config);
 
     let scan_options = if let Some(opts) = req.scan_options {
         Some(opts.into())
@@ -181,16 +229,27 @@ pub async fn create_folder_upload(
     };
 
     match scan_manager
-        .start_scan(local_folder, req.remote_folder, scan_options, req.encrypt, conflict_strategy)
+        .start_scan(
+            local_folder,
+            req.remote_folder,
+            scan_options,
+            req.encrypt,
+            conflict_strategy,
+        )
         .await
     {
         Ok(scan_task_id) => {
-            info!("文件夹扫描任务已启动: {} (encrypt={})", scan_task_id, req.encrypt);
-            Ok(Json(ApiResponse::success(ScanStartResponse { scan_task_id })))
+            info!(
+                "文件夹扫描任务已启动: {} (encrypt={})",
+                scan_task_id, req.encrypt
+            );
+            Ok(Json(ApiResponse::success(ScanStartResponse {
+                scan_task_id,
+            })))
         }
         Err(e) => {
             error!("启动文件夹扫描失败: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::Internal(anyhow::anyhow!(e.to_string())))
         }
     }
 }
@@ -200,32 +259,42 @@ pub async fn create_folder_upload(
 pub async fn create_batch_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateBatchUploadRequest>,
-) -> Result<Json<ApiResponse<Vec<String>>>, StatusCode> {
+) -> ApiResult<Json<ApiResponse<Vec<String>>>> {
     // 获取上传管理器
     let upload_manager = app_state
         .upload_manager
         .read()
         .await
         .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("上传管理器未初始化")))?;
+
+    let config = app_state.config.read().await;
+    let guard = create_path_guard(&config.filesystem);
 
     // 如果未指定策略，从 AppConfig 读取默认值
-    let conflict_strategy = req.conflict_strategy.or_else(|| {
-        let config = app_state.config.blocking_read();
-        Some(config.conflict_strategy.default_upload_strategy)
-    });
+    let conflict_strategy = req
+        .conflict_strategy
+        .or(Some(config.conflict_strategy.default_upload_strategy));
 
-    // 转换为 PathBuf
+    // 转换为 PathBuf，并补充白名单校验
     let files: Vec<(PathBuf, String)> = req
         .files
         .into_iter()
-        .map(|(local, remote)| (PathBuf::from(local), remote))
-        .collect();
+        .map(|(local, remote)| validate_upload_file_path(&guard, &local).map(|path| (path, remote)))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(config);
 
     // 🔥 传递 encrypt 参数
-    match upload_manager.create_batch_tasks(files, req.encrypt, conflict_strategy).await {
+    match upload_manager
+        .create_batch_tasks(files, req.encrypt, conflict_strategy)
+        .await
+    {
         Ok(task_ids) => {
-            info!("批量创建上传任务成功: {} 个 (encrypt={})", task_ids.len(), req.encrypt);
+            info!(
+                "批量创建上传任务成功: {} 个 (encrypt={})",
+                task_ids.len(),
+                req.encrypt
+            );
 
             // 自动开始所有任务
             for task_id in &task_ids {
@@ -238,7 +307,7 @@ pub async fn create_batch_upload(
         }
         Err(e) => {
             error!("批量创建上传任务失败: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ApiError::Internal(anyhow::anyhow!(e.to_string())))
         }
     }
 }
@@ -448,14 +517,18 @@ pub async fn cancel_scan(
 
 // ==================== 批量操作 ====================
 
-use super::common::{BatchOperationRequest, BatchOperationItem, BatchOperationResponse};
+use super::common::{BatchOperationItem, BatchOperationRequest, BatchOperationResponse};
 
 /// POST /api/v1/uploads/batch/pause
 pub async fn batch_pause_uploads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
-    let mgr = app_state.upload_manager.read().await.clone()
+    let mgr = app_state
+        .upload_manager
+        .read()
+        .await
+        .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let ids = if req.all == Some(true) {
@@ -465,10 +538,17 @@ pub async fn batch_pause_uploads(
     };
 
     let raw = mgr.batch_pause(&ids).await;
-    let results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
 
 /// POST /api/v1/uploads/batch/resume
@@ -476,7 +556,11 @@ pub async fn batch_resume_uploads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
-    let mgr = app_state.upload_manager.read().await.clone()
+    let mgr = app_state
+        .upload_manager
+        .read()
+        .await
+        .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let ids = if req.all == Some(true) {
@@ -486,10 +570,17 @@ pub async fn batch_resume_uploads(
     };
 
     let raw = mgr.batch_resume(&ids).await;
-    let results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
 
 /// POST /api/v1/uploads/batch/delete
@@ -497,7 +588,11 @@ pub async fn batch_delete_uploads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
-    let mgr = app_state.upload_manager.read().await.clone()
+    let mgr = app_state
+        .upload_manager
+        .read()
+        .await
+        .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let ids = if req.all == Some(true) {
@@ -507,8 +602,15 @@ pub async fn batch_delete_uploads(
     };
 
     let raw = mgr.batch_delete(&ids).await;
-    let results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
