@@ -93,9 +93,9 @@ pub struct TransferResult {
 /// 分批转存组信息（用于本地下载目录规划）
 #[derive(Debug, Clone)]
 pub struct BatchGroupInfo {
-    /// 组 ID（如 "group_1"）
+    /// 组 ID：相对于 share_root 的父目录路径
     pub group_id: String,
-    /// 远端目录（temp_dir/group_N）
+    /// 远端目录（temp_dir/relative_parent）
     pub remote_dir: String,
     /// 原始分享文件信息
     pub files: Vec<SharedFileInfo>,

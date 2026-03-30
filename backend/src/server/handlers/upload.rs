@@ -106,6 +106,7 @@ impl From<FolderScanOptions> for ScanOptions {
             max_file_size: options.max_file_size,
             max_files: options.max_files,
             skip_hidden: options.skip_hidden,
+            allowed_paths: vec![],
         }
     }
 }
@@ -217,13 +218,30 @@ pub async fn create_folder_upload(
         .or(Some(config.conflict_strategy.default_upload_strategy));
 
     let local_folder = validate_upload_directory_path(&guard, &req.local_folder)?;
+
+    // 当 enforce_allowlist_on_followed_symlinks 开启时，收集规范化后的白名单路径
+    let symlink_allowed_paths = if config.filesystem.enforce_allowlist_on_followed_symlinks
+        && !config.filesystem.allowed_paths.is_empty()
+    {
+        config
+            .filesystem
+            .allowed_paths
+            .iter()
+            .filter_map(|p| std::path::PathBuf::from(p).canonicalize().ok())
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
     drop(config);
 
     let scan_options = if let Some(opts) = req.scan_options {
-        Some(opts.into())
+        let mut opts: ScanOptions = opts.into();
+        opts.allowed_paths = symlink_allowed_paths;
+        Some(opts)
     } else {
         Some(ScanOptions {
             skip_hidden: skip_hidden_files,
+            allowed_paths: symlink_allowed_paths,
             ..Default::default()
         })
     };

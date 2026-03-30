@@ -451,11 +451,12 @@ impl DownloadManager {
 
         // 🔥 尝试分配固定任务位（文件夹子任务由 FolderManager 管理槽位，这里跳过）
         if !is_folder_task {
-            // 获取任务是否为备份任务
-            let is_backup = {
+            // 获取任务是否为备份任务和 group_id（用于槽位刷新）
+            let (is_backup, start_task_group_id) = {
                 let t = task.lock().await;
-                t.is_backup
+                (t.is_backup, t.group_id.clone())
             };
+            let start_task_touch_id = start_task_group_id.unwrap_or_else(|| task_id.to_string());
 
             // 🔥 根据任务类型选择不同的槽位分配策略
             if is_backup {
@@ -469,7 +470,9 @@ impl DownloadManager {
                         t.slot_id = Some(slot_id);
                         t.is_borrowed_slot = false;
                     }
-                    info!("备份任务 {} 获得任务位: slot_id={}", task_id, slot_id);
+                    // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                    self.task_slot_pool.touch_slot(&start_task_touch_id).await;
+                    info!("备份任务 {} 获得任务位: slot_id={}，已刷新槽位时间戳", task_id, slot_id);
                 } else {
                     // 🔥 备份任务无可用槽位，加入等待队列末尾（最低优先级）
                     self.add_to_waiting_queue_by_priority(task_id, true).await;
@@ -496,9 +499,12 @@ impl DownloadManager {
                             t.is_borrowed_slot = false;
                         }
 
+                        // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                        self.task_slot_pool.touch_slot(&start_task_touch_id).await;
+
                         // 🔥 如果有被抢占的备份任务，需要暂停它并加入等待队列末尾
                         if let Some(preempted_id) = preempted_task_id {
-                            info!("普通任务 {} 抢占了备份任务 {} 的槽位: slot_id={}", task_id, preempted_id, slot_id);
+                            info!("普通任务 {} 抢占了备份任务 {} 的槽位: slot_id={}，已刷新槽位时间戳", task_id, preempted_id, slot_id);
                             // 暂停被抢占的备份任务（skip_try_start_waiting=true，避免循环）
                             if let Err(e) = self.pause_task(&preempted_id, true).await {
                                 warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
@@ -506,7 +512,7 @@ impl DownloadManager {
                             // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
                             self.add_preempted_backup_to_queue(&preempted_id).await;
                         } else {
-                            info!("普通任务 {} 获得固定任务位: slot_id={}", task_id, slot_id);
+                            info!("普通任务 {} 获得固定任务位: slot_id={}，已刷新槽位时间戳", task_id, slot_id);
                         }
                     }
                     None => {
@@ -532,14 +538,16 @@ impl DownloadManager {
                                             t.slot_id = Some(slot_id);
                                             t.is_borrowed_slot = false;
                                         }
+                                        // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                                        self.task_slot_pool.touch_slot(&start_task_touch_id).await;
                                         // 🔥 处理被抢占的备份任务
                                         if let Some(preempted_id) = preempted_task_id {
-                                            info!("普通任务 {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})", task_id, preempted_id, slot_id, reclaimed_slot_id);
+                                            info!("普通任务 {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_id, preempted_id, slot_id, reclaimed_slot_id);
                                             self.pause_preempted_task(&preempted_id).await;
                                             // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
                                             self.add_preempted_backup_to_queue(&preempted_id).await;
                                         } else {
-                                            info!("普通任务 {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})", task_id, slot_id, reclaimed_slot_id);
+                                            info!("普通任务 {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_id, slot_id, reclaimed_slot_id);
                                         }
                                     } else {
                                         warn!("回收借调槽位成功但重新分配失败，普通任务 {} 加入等待队列", task_id);
@@ -780,6 +788,12 @@ impl DownloadManager {
                         cm.chunk_count()
                     };
 
+                    // 🔥 prepare_for_scheduling 完成后立即刷新槽位，防止探测阶段耗时过长导致超时
+                    {
+                        let prepare_touch_id = group_id.clone().unwrap_or_else(|| task_id_clone.clone());
+                        task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
+                    }
+
                     // 🔥 发送状态变更事件：pending → downloading
                     // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
                     if is_backup {
@@ -911,6 +925,12 @@ impl DownloadManager {
                         (t.slot_id, t.is_borrowed_slot)
                     };
 
+                    // 🔥 创建任务级共享槽位刷新节流器（所有分片共享，防止分片切换重置计时）
+                    let touch_id = group_id.clone().unwrap_or_else(|| task_id_clone.clone());
+                    let slot_touch_throttler = Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                        task_slot_pool_clone.clone(), touch_id,
+                    ));
+
                     let task_info = TaskScheduleInfo {
                         task_id: task_id_clone.clone(),
                         task: task_clone.clone(),
@@ -947,6 +967,8 @@ impl DownloadManager {
                         max_retries,
                         // 🔥 代理故障回退管理器
                         fallback_mgr: engine.fallback_mgr.clone(),
+                        // 🔥 任务级共享槽位刷新节流器
+                        slot_touch_throttler,
                     };
 
                     // 注册到调度器
@@ -1062,17 +1084,18 @@ impl DownloadManager {
 
             match task_id {
                 Some(id) => {
-                    // 🔥 获取任务信息：是否为备份任务、是否需要槽位、是否为文件夹子任务
-                    let (is_backup, needs_slot, is_folder_subtask) = {
+                    // 🔥 获取任务信息：是否为备份任务、是否需要槽位、是否为文件夹子任务、group_id
+                    let (is_backup, needs_slot, is_folder_subtask, try_start_group_id) = {
                         if let Some(task) = self.tasks.read().await.get(&id).cloned() {
                             let t = task.lock().await;
-                            (t.is_backup, t.slot_id.is_none(), t.group_id.is_some())
+                            (t.is_backup, t.slot_id.is_none(), t.group_id.is_some(), t.group_id.clone())
                         } else {
                             // 任务不存在，跳过
                             warn!("等待队列中的任务 {} 不存在，跳过", id);
                             continue;
                         }
                     };
+                    let try_start_touch_id = try_start_group_id.unwrap_or_else(|| id.clone());
 
                     // 🔥 备份任务特殊处理：检查是否有普通任务在等待
                     if is_backup {
@@ -1099,6 +1122,8 @@ impl DownloadManager {
                                     t.is_borrowed_slot = false;
                                     info!("为备份任务 {} 分配槽位: {}", id, sid);
                                 }
+                                // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                                self.task_slot_pool.touch_slot(&try_start_touch_id).await;
                             } else {
                                 // 分配失败，放回队列末尾（备份任务优先级最低）
                                 warn!("无法为备份任务 {} 分配槽位，放回等待队列末尾", id);
@@ -1126,15 +1151,18 @@ impl DownloadManager {
                                         t.is_borrowed_slot = false;
                                     }
 
+                                    // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                                    self.task_slot_pool.touch_slot(&try_start_touch_id).await;
+
                                     // 处理被抢占的备份任务
                                     if let Some(preempted_id) = preempted_task_id {
-                                        info!("{} {} 抢占了备份任务 {} 的槽位: slot_id={}", task_type_str, id, preempted_id, sid);
+                                        info!("{} {} 抢占了备份任务 {} 的槽位: slot_id={}，已刷新槽位时间戳", task_type_str, id, preempted_id, sid);
                                         // 🔥 直接暂停被抢占的任务（不调用 pause_task 避免递归）
                                         self.pause_preempted_task(&preempted_id).await;
                                         // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
                                         self.add_preempted_backup_to_queue(&preempted_id).await;
                                     } else {
-                                        info!("为{} {} 分配槽位: {}", task_type_str, id, sid);
+                                        info!("为{} {} 分配槽位: {}，已刷新槽位时间戳", task_type_str, id, sid);
                                     }
                                 }
                                 None => {
@@ -1220,11 +1248,12 @@ impl DownloadManager {
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
                             if let Some(task) = task {
-                                // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务
-                                let (needs_slot, is_backup, is_folder_subtask) = {
+                                // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务、group_id
+                                let (needs_slot, is_backup, is_folder_subtask, monitor_group_id) = {
                                     let t = task.lock().await;
-                                    (t.slot_id.is_none(), t.is_backup, t.group_id.is_some())
+                                    (t.slot_id.is_none(), t.is_backup, t.group_id.is_some(), t.group_id.clone())
                                 };
+                                let monitor_touch_id = monitor_group_id.unwrap_or_else(|| id.clone());
 
                                 if needs_slot {
                                     // 🔥 根据任务类型选择优先级
@@ -1250,6 +1279,9 @@ impl DownloadManager {
                                         t.is_borrowed_slot = false;
                                         info!("后台监控：为任务 {} 分配槽位: {} (priority: {:?})", id, sid, priority);
                                         drop(t); // 释放锁
+
+                                        // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                                        task_slot_pool.touch_slot(&monitor_touch_id).await;
 
                                         // 🔥 处理被抢占的备份任务
                                         if let Some(preempted_id) = preempted_task_id {
@@ -1355,6 +1387,12 @@ impl DownloadManager {
                                                 let cm = chunk_manager.lock().await;
                                                 cm.chunk_count()
                                             };
+
+                                            // 🔥 prepare_for_scheduling 完成后立即刷新槽位，防止探测阶段耗时过长导致超时
+                                            {
+                                                let prepare_touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
+                                                task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
+                                            }
 
                                             // 🔥 发送状态变更事件：pending → downloading
                                             // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
@@ -1487,6 +1525,12 @@ impl DownloadManager {
                                                 (t.slot_id, t.is_borrowed_slot)
                                             };
 
+                                            // 创建任务级共享槽位刷新节流器（所有分片共享，防止分片切换重置计时）
+                                            let touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
+                                            let slot_touch_throttler = Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                                                task_slot_pool_clone.clone(), touch_id,
+                                            ));
+
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
                                                 task: task_clone.clone(),
@@ -1526,6 +1570,8 @@ impl DownloadManager {
                                                 max_retries,
                                                 // 🔥 代理故障回退管理器
                                                 fallback_mgr: engine_clone.fallback_mgr.clone(),
+                                                // 🔥 任务级共享槽位刷新节流器
+                                                slot_touch_throttler,
                                             };
 
                                             // 注册任务到调度器
@@ -1643,6 +1689,7 @@ impl DownloadManager {
         // 启动监听循环
         let tasks = self.tasks.clone();
         let ws_manager = self.ws_manager.clone();
+        let chunk_scheduler = self.chunk_scheduler.clone();
         tokio::spawn(async move {
             while let Some(task_id) = rx.recv().await {
                 info!("收到槽位超时释放通知，将任务设置为失败: {}", task_id);
@@ -1669,6 +1716,13 @@ impl DownloadManager {
                             }),
                             t.group_id.clone(),
                         );
+                    }
+                    // 🔥 通知文件夹管理器子任务失败
+                    let group_id = t.group_id.clone();
+                    let total_size = t.total_size;
+                    drop(t);
+                    if let Some(gid) = group_id {
+                        chunk_scheduler.notify_subtask_failed(gid, task_id.clone(), total_size).await;
                     }
                 }
             }
@@ -1746,11 +1800,12 @@ impl DownloadManager {
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
                             if let Some(task) = task {
-                                // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务
-                                let (needs_slot, is_backup, is_folder_subtask) = {
+                                // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务、group_id
+                                let (needs_slot, is_backup, is_folder_subtask, zero_delay_group_id) = {
                                     let t = task.lock().await;
-                                    (t.slot_id.is_none(), t.is_backup, t.group_id.is_some())
+                                    (t.slot_id.is_none(), t.is_backup, t.group_id.is_some(), t.group_id.clone())
                                 };
+                                let zero_delay_touch_id = zero_delay_group_id.unwrap_or_else(|| id.clone());
 
                                 if needs_slot {
                                     // 🔥 根据任务类型选择优先级
@@ -1776,6 +1831,9 @@ impl DownloadManager {
                                         t.is_borrowed_slot = false;
                                         info!("0延迟启动：为任务 {} 分配槽位: {} (priority: {:?})", id, sid, priority);
                                         drop(t); // 释放锁
+
+                                        // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                                        task_slot_pool.touch_slot(&zero_delay_touch_id).await;
 
                                         // 🔥 处理被抢占的备份任务
                                         if let Some(preempted_id) = preempted_task_id {
@@ -1882,6 +1940,12 @@ impl DownloadManager {
                                                 let cm = chunk_manager.lock().await;
                                                 cm.chunk_count()
                                             };
+
+                                            // 🔥 prepare_for_scheduling 完成后立即刷新槽位，防止探测阶段耗时过长导致超时
+                                            {
+                                                let prepare_touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
+                                                task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
+                                            }
 
                                             // 🔥 发送状态变更事件：pending → downloading
                                             // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
@@ -2013,6 +2077,12 @@ impl DownloadManager {
                                                 (t.slot_id, t.is_borrowed_slot)
                                             };
 
+                                            // 🔥 创建任务级共享槽位刷新节流器（所有分片共享，防止分片切换重置计时）
+                                            let touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
+                                            let slot_touch_throttler = Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                                                task_slot_pool_clone.clone(), touch_id,
+                                            ));
+
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
                                                 task: task_clone.clone(),
@@ -2052,6 +2122,8 @@ impl DownloadManager {
                                                 max_retries,
                                                 // 🔥 代理故障回退管理器
                                                 fallback_mgr: engine_clone.fallback_mgr.clone(),
+                                                // 🔥 任务级共享槽位刷新节流器
+                                                slot_touch_throttler,
                                             };
 
                                             match chunk_scheduler_clone
@@ -2138,6 +2210,13 @@ impl DownloadManager {
                                                         let mut t = task_clone.lock().await;
                                                         t.mark_failed(e.to_string());
                                                         t.slot_id = None;
+                                                        // 🔥 通知文件夹管理器子任务失败
+                                                        let group_id = t.group_id.clone();
+                                                        let total_size = t.total_size;
+                                                        drop(t);
+                                                        if let Some(gid) = group_id {
+                                                            chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), total_size).await;
+                                                        }
                                                     }
                                                     cancellation_tokens_clone
                                                         .write()
@@ -2187,6 +2266,13 @@ impl DownloadManager {
                                                 let mut t = task_clone.lock().await;
                                                 t.mark_failed(e.to_string());
                                                 t.slot_id = None;
+                                                // 🔥 通知文件夹管理器子任务失败
+                                                let group_id = t.group_id.clone();
+                                                let total_size = t.total_size;
+                                                drop(t);
+                                                if let Some(gid) = group_id {
+                                                    chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), total_size).await;
+                                                }
                                             }
                                             cancellation_tokens_clone
                                                 .write()
@@ -2902,10 +2988,11 @@ impl DownloadManager {
         // 这与 start_task 的逻辑保持一致
 
         // 检查任务是否已有槽位（文件夹子任务可能已分配）
-        let (has_slot, is_folder_subtask) = {
+        let (has_slot, is_folder_subtask, resume_group_id) = {
             let t = task.lock().await;
-            (t.slot_id.is_some(), t.group_id.is_some())
+            (t.slot_id.is_some(), t.group_id.is_some(), t.group_id.clone())
         };
+        let resume_touch_id = resume_group_id.unwrap_or_else(|| task_id.to_string());
 
         // 如果任务没有槽位（单文件任务），尝试分配或回收
         if !has_slot {
@@ -2920,7 +3007,9 @@ impl DownloadManager {
                         t.slot_id = Some(slot_id);
                         t.is_borrowed_slot = false;
                     }
-                    info!("恢复备份任务 {} 获得任务位: slot_id={}", task_id, slot_id);
+                    // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                    self.task_slot_pool.touch_slot(&resume_touch_id).await;
+                    info!("恢复备份任务 {} 获得任务位: slot_id={}，已刷新槽位时间戳", task_id, slot_id);
                 } else {
                     // 备份任务无可用槽位，加入等待队列末尾
                     self.add_to_waiting_queue_with_task_type(task_id, true, false).await;
@@ -2948,14 +3037,17 @@ impl DownloadManager {
                             t.is_borrowed_slot = false;
                         }
 
+                        // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                        self.task_slot_pool.touch_slot(&resume_touch_id).await;
+
                         // 处理被抢占的备份任务
                         if let Some(preempted_id) = preempted_task_id {
-                            info!("恢复{} {} 抢占了备份任务 {} 的槽位: slot_id={}", task_type_str, task_id, preempted_id, slot_id);
+                            info!("恢复{} {} 抢占了备份任务 {} 的槽位: slot_id={}，已刷新槽位时间戳", task_type_str, task_id, preempted_id, slot_id);
                             self.pause_preempted_task(&preempted_id).await;
                             // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
                             self.add_preempted_backup_to_queue(&preempted_id).await;
                         } else {
-                            info!("恢复{} {} 获得任务位: slot_id={}", task_type_str, task_id, slot_id);
+                            info!("恢复{} {} 获得任务位: slot_id={}，已刷新槽位时间戳", task_type_str, task_id, slot_id);
                         }
                     }
                     None => {
@@ -2981,14 +3073,16 @@ impl DownloadManager {
                                             t.slot_id = Some(slot_id);
                                             t.is_borrowed_slot = false;
                                         }
+                                        // 🔥 槽位分配后立即刷新，防止长准备阶段被误判超时
+                                        self.task_slot_pool.touch_slot(&resume_touch_id).await;
                                         // 🔥 处理被抢占的备份任务
                                         if let Some(preempted_id) = preempted_task_id {
-                                            info!("恢复{} {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})", task_type_str, task_id, preempted_id, slot_id, reclaimed_slot_id);
+                                            info!("恢复{} {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_type_str, task_id, preempted_id, slot_id, reclaimed_slot_id);
                                             self.pause_preempted_task(&preempted_id).await;
                                             // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
                                             self.add_preempted_backup_to_queue(&preempted_id).await;
                                         } else {
-                                            info!("恢复{} {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})", task_type_str, task_id, slot_id, reclaimed_slot_id);
+                                            info!("恢复{} {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_type_str, task_id, slot_id, reclaimed_slot_id);
                                         }
                                     } else {
                                         warn!("回收借调槽位成功但重新分配失败，恢复{} {} 加入等待队列", task_type_str, task_id);
@@ -4172,7 +4266,7 @@ impl DownloadManager {
     }
 
     /// 设置任务完成通知发送器（用于文件夹下载补充任务）
-    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, String)>) {
+    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, String, u64, bool)>) {
         self.chunk_scheduler.set_task_completed_sender(tx).await;
     }
 

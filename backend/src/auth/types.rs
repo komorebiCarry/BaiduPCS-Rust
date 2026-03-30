@@ -150,6 +150,15 @@ pub struct LoginRequest {
     pub ptoken: Option<String>,
 }
 
+/// Cookie 登录 API 请求体
+///
+/// 前端将从浏览器 DevTools 复制的完整 Cookie 字符串粘贴到此字段。
+#[derive(Debug, Deserialize)]
+pub struct CookieLoginApiRequest {
+    /// 原始 Cookie 字符串，例如: "BDUSS=xxx; PTOKEN=yyy; STOKEN=zzz; ..."
+    pub cookies: String,
+}
+
 /// 登录响应
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {

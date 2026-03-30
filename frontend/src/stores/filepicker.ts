@@ -29,6 +29,9 @@ export const useFilePickerStore = defineStore('filepicker', () => {
   const parentPath = ref<string | null>(null)
   const isRoot = computed(() => !parentPath.value)
 
+  // 后端返回的默认目录路径
+  const serverDefaultPath = ref<string | null>(null)
+
   // 加载目录
   async function loadDirectory(path: string, pushHistory = true) {
     if (loading.value) return
@@ -39,11 +42,12 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     try {
       // 如果是空路径，获取根目录列表
       if (!path) {
-        const roots = await getRoots()
-        entries.value = roots
+        const rootsResponse = await getRoots()
+        entries.value = rootsResponse.roots
+        serverDefaultPath.value = rootsResponse.defaultPath
         currentPath.value = ''
         parentPath.value = null
-        total.value = roots.length
+        total.value = rootsResponse.roots.length
         page.value = 0
         hasMore.value = false
       } else {
@@ -255,6 +259,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     total.value = 0
     hasMore.value = false
     parentPath.value = null
+    serverDefaultPath.value = null
   }
 
   return {
@@ -275,6 +280,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     total,
     hasMore,
     parentPath,
+    serverDefaultPath,
 
     // 计算属性
     canGoBack,

@@ -84,9 +84,17 @@ impl NetdiskClient {
             let ptoken_cookie = format!("PTOKEN={}; Domain=.baidu.com; Path=/", ptoken);
             jar.add_cookie_str(&ptoken_cookie, &url);
         }
+        if let Some(ref stoken) = user_auth.stoken {
+            let stoken_cookie = format!("STOKEN={}; Domain=.baidu.com; Path=/", stoken);
+            jar.add_cookie_str(&stoken_cookie, &url);
+        }
         if let Some(ref baiduid) = user_auth.baiduid {
             let baiduid_cookie = format!("BAIDUID={}; Domain=.baidu.com; Path=/", baiduid);
             jar.add_cookie_str(&baiduid_cookie, &url);
+        }
+        if let Some(ref passid) = user_auth.passid {
+            let passid_cookie = format!("PASSID={}; Domain=.baidu.com; Path=/", passid);
+            jar.add_cookie_str(&passid_cookie, &url);
         }
 
         // 加载预热后的 Cookie (如果有的话)
@@ -606,9 +614,27 @@ impl NetdiskClient {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAYS: [u64; 3] = [1, 3, 5]; // 指数退避：1秒、3秒、5秒
 
-        // 如果没有 PTOKEN，跳过预热
+        // 如果没有 PTOKEN，检查是否有 PANPSC（从浏览器 Cookie 直接粘贴时可能已有）
         if self.user_auth.ptoken.is_none() {
-            info!("PTOKEN 为空，跳过预热");
+            if self.user_auth.panpsc.is_some() {
+                info!("PTOKEN 为空，但检测到已有 PANPSC，尝试快捷路径直接获取 bdstoken...");
+                match self.fetch_bdstoken_with_panpsc().await {
+                    Ok(Some(bdstoken)) => {
+                        info!("✅ 快捷路径成功：通过 PANPSC 获取到 bdstoken");
+                        let panpsc = self.user_auth.panpsc.clone();
+                        let stoken = self.user_auth.stoken.clone();
+                        return Ok((panpsc, None, Some(bdstoken), stoken));
+                    }
+                    Ok(None) => {
+                        warn!("快捷路径：PANPSC 已有但 bdstoken 未能提取，跳过预热");
+                    }
+                    Err(e) => {
+                        warn!("快捷路径失败: {}，跳过预热", e);
+                    }
+                }
+            } else {
+                info!("PTOKEN 为空且无 PANPSC，跳过预热");
+            }
             return Ok((None, None, None, None));
         }
 
@@ -712,6 +738,87 @@ impl NetdiskClient {
         }
 
         info!("已恢复 BDUSS/STOKEN/PTOKEN 到 Cookie Jar");
+    }
+
+    /// 在已有 PANPSC 的情况下，直接请求 /api/loginStatus 获取 bdstoken
+    ///
+    /// 当用户从浏览器粘贴了包含 PANPSC 但不含 PTOKEN 的 Cookie 时使用。
+    /// PANPSC 已由 new_with_proxy 加入 cookie jar，直接发起请求即可。
+    /// 返回 `Ok(Some(bdstoken))` 表示成功，`Ok(None)` 表示响应中没有 bdstoken。
+    async fn fetch_bdstoken_with_panpsc(&self) -> anyhow::Result<Option<String>> {
+        info!("fetch_bdstoken_with_panpsc: 使用已有 PANPSC 请求 bdstoken...");
+
+        let ua = &self.web_user_agent;
+        let referer = "https://pan.baidu.com/disk/home";
+
+        // 1. 先尝试 /api/loginStatus（同预热步骤 2）
+        let login_status_url = format!(
+            "https://pan.baidu.com/api/loginStatus?clienttype=0&app_id={}&web=1",
+            BAIDU_APP_ID
+        );
+
+        let resp = self
+            .client
+            .get(&login_status_url)
+            .header("User-Agent", ua)
+            .header("Referer", referer)
+            .send()
+            .await
+            .context("fetch_bdstoken: /api/loginStatus 请求失败")?;
+
+        let body = resp
+            .text()
+            .await
+            .context("fetch_bdstoken: 读取响应失败")?;
+
+        info!("fetch_bdstoken: /api/loginStatus 响应 = {}", body);
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(token) = json["login_info"]["bdstoken"].as_str() {
+                if !token.is_empty() {
+                    info!("fetch_bdstoken: 从 loginStatus 获取到 bdstoken（长度={}）", token.len());
+                    let mut cached = self.bdstoken.lock().await;
+                    *cached = Some(token.to_string());
+                    return Ok(Some(token.to_string()));
+                }
+            }
+        }
+
+        // 2. 回退到 /api/gettemplatevariable（同预热步骤 3）
+        let tmpl_url = format!(
+            r#"https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id={}&web=1&fields=["bdstoken"]"#,
+            BAIDU_APP_ID
+        );
+
+        let resp2 = self
+            .client
+            .get(&tmpl_url)
+            .header("User-Agent", ua)
+            .header("Referer", referer)
+            .send()
+            .await
+            .context("fetch_bdstoken: /api/gettemplatevariable 请求失败")?;
+
+        let body2 = resp2
+            .text()
+            .await
+            .context("fetch_bdstoken: 读取 gettemplatevariable 响应失败")?;
+
+        info!("fetch_bdstoken: /api/gettemplatevariable 响应 = {}", body2);
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
+            if let Some(token) = json["result"]["bdstoken"].as_str() {
+                if !token.is_empty() {
+                    info!("fetch_bdstoken: 从 gettemplatevariable 获取到 bdstoken（长度={}）", token.len());
+                    let mut cached = self.bdstoken.lock().await;
+                    *cached = Some(token.to_string());
+                    return Ok(Some(token.to_string()));
+                }
+            }
+        }
+
+        warn!("fetch_bdstoken: 两个接口均未返回有效 bdstoken，PANPSC 可能已失效");
+        Ok(None)
     }
 
     /// 验证 BDUSS 是否有效

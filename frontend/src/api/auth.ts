@@ -103,6 +103,22 @@ export async function getCurrentUser(): Promise<UserAuth> {
   throw new Error(response.message || '获取用户信息失败')
 }
 
+export interface CookieLoginResult {
+  user: UserAuth
+  message: string
+}
+
+/**
+ * Cookie 登录
+ */
+export async function cookieLogin(cookies: string): Promise<CookieLoginResult> {
+  const response = (await apiClient.post('/auth/cookie/login', { cookies })) as ApiResponse<UserAuth>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || 'Cookie 登录失败')
+  }
+  return { user: response.data, message: response.message }
+}
+
 /**
  * 登出
  */

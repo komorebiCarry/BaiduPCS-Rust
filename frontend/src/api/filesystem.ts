@@ -177,11 +177,17 @@ export async function validatePath(req: ValidatePathRequest): Promise<ValidatePa
   return response.data.data
 }
 
+/// 根目录列表响应
+export interface RootsResponse {
+  roots: FileEntry[]
+  defaultPath: string | null
+}
+
 /**
- * 获取根目录列表
+ * 获取根目录列表（含默认目录路径）
  */
-export async function getRoots(): Promise<FileEntry[]> {
-  const response = await apiClient.get<ApiResponse<FileEntry[]>>('/fs/roots')
+export async function getRoots(): Promise<RootsResponse> {
+  const response = await apiClient.get<ApiResponse<RootsResponse>>('/fs/roots')
 
   if (response.data.code !== 0 || !response.data.data) {
     const message = getFriendlyErrorMessage(response.data.code, response.data.message)

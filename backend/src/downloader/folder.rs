@@ -104,6 +104,22 @@ pub struct FolderDownload {
     /// 🔥 下载冲突策略（用于子任务）
     #[serde(default, skip)]
     pub conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+
+    /// 🔥 已成功完成的子任务累计字节数（运行时字段，单调递增）
+    /// 每当一个子任务成功完成时 += file_size，失败的任务不计入
+    /// downloaded_size = max(downloaded_size, completed_downloaded_size + active_sum)
+    #[serde(default, skip)]
+    pub completed_downloaded_size: u64,
+
+    /// 🔥 失败的子任务数（运行时字段）
+    /// 用于判断文件夹是否应进入终态：completed_count + failed_count >= total_files
+    #[serde(default, skip)]
+    pub failed_count: u64,
+
+    /// 🔥 已失败的任务ID集合（运行时字段）
+    /// 避免同一任务多次失败时重复计数；重试成功时从此集合移除并减少 failed_count
+    #[serde(default, skip)]
+    pub failed_task_ids: HashSet<String>,
 }
 
 impl FolderDownload {
@@ -145,6 +161,9 @@ impl FolderDownload {
             encrypted_folder_mappings: HashMap::new(),
             counted_task_ids: HashSet::new(),
             conflict_strategy: None,
+            completed_downloaded_size: 0,
+            failed_count: 0,
+            failed_task_ids: HashSet::new(),
         }
     }
 
@@ -184,6 +203,15 @@ impl FolderDownload {
     /// 标记为取消
     pub fn mark_cancelled(&mut self) {
         self.status = FolderStatus::Cancelled;
+    }
+
+    /// 🔥 计算并更新 downloaded_size：已完成累计 + 当前活跃子任务已下载
+    ///
+    /// 使用 max() 保证单调性，即使完成通知和进度通知乱序也不会丢字节
+    pub fn compute_downloaded_size(&mut self, active_sum: u64) -> u64 {
+        let computed = self.completed_downloaded_size + active_sum;
+        self.downloaded_size = self.downloaded_size.max(computed);
+        self.downloaded_size
     }
 }
 
@@ -234,5 +262,34 @@ mod tests {
         folder.mark_completed();
         assert_eq!(folder.status, FolderStatus::Completed);
         assert!(folder.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_compute_downloaded_size_monotonic() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+
+        // 子任务 A(100) 和 B(200) 活跃，分别已下载 50 和 80
+        assert_eq!(folder.compute_downloaded_size(130), 130);
+
+        // A 完成，completed_downloaded_size += 100
+        folder.completed_downloaded_size += 100;
+        // B 仍在下载 80
+        assert_eq!(folder.compute_downloaded_size(80), 180);
+
+        // 乱序：完成通知先到达，active_sum 短暂变小，max() 保证不回退
+        folder.completed_downloaded_size += 200;
+        // B 已从内存移除，active_sum = 0，但 downloaded_size 不应回退
+        assert_eq!(folder.compute_downloaded_size(0), 300);
+    }
+
+    #[test]
+    fn test_compute_downloaded_size_never_regresses() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+        folder.completed_downloaded_size = 1000;
+        folder.downloaded_size = 1500; // 之前快照过 active_sum=500
+
+        // 完成通知先到达，active_sum 短暂变为 0
+        // computed = 1000 + 0 = 1000，但 max(1500, 1000) = 1500，不回退
+        assert_eq!(folder.compute_downloaded_size(0), 1500);
     }
 }

@@ -1175,6 +1175,7 @@ impl AutoBackupManager {
                 },
                 max_files: None,
                 skip_hidden: true,
+                allowed_paths: vec![],
             };
 
             let mut scanner = match BatchedScanIterator::new(&config.local_path, scan_options) {
@@ -6462,6 +6463,7 @@ impl AutoBackupManager {
             },
             max_files: None,
             skip_hidden: true,
+            allowed_paths: vec![],
         };
 
         // 使用 BatchedScanIterator 分批扫描（通过 channel + spawn_blocking）

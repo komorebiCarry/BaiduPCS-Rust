@@ -1,6 +1,6 @@
 // 认证API处理器
 
-use crate::auth::{QRCode, QRCodeStatus};
+use crate::auth::{CookieLoginAuth, CookieLoginApiRequest, QRCode, QRCodeStatus};
 use crate::common::ProxyType;
 use crate::server::AppState;
 use crate::transfer::TransferManager;
@@ -191,8 +191,12 @@ pub async fn qrcode_status(
                 match client.warmup_and_get_cookies().await {
                     Ok((panpsc, csrf_token, bdstoken, stoken)) => {
                         info!("预热成功,保存预热 Cookie 到 session.json");
-                        updated_user.panpsc = panpsc;
-                        updated_user.csrf_token = csrf_token;
+                        if panpsc.is_some() {
+                            updated_user.panpsc = panpsc;
+                        }
+                        if csrf_token.is_some() {
+                            updated_user.csrf_token = csrf_token;
+                        }
                         updated_user.bdstoken = bdstoken;
                         // 预热时下发的 STOKEN 优先于登录时获取的
                         if stoken.is_some() {
@@ -441,9 +445,21 @@ pub async fn get_current_user(
 pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     info!("API: 用户登出");
 
-    let mut session = state.session_manager.lock().await;
+    // 1. 清除持久化 session（文件 + 内存缓存）
+    let clear_result = {
+        let mut session = state.session_manager.lock().await;
+        session.clear_session().await
+    };
 
-    match session.clear_session().await {
+    // 2. 清除内存中的当前用户，确保下次登录时不携带旧状态
+    *state.current_user.write().await = None;
+
+    // 3. 清除网盘客户端（含旧 Cookie Jar），下次登录时重新创建
+    *state.netdisk_client.write().await = None;
+
+    info!("已清除 current_user 和 netdisk_client");
+
+    match clear_result {
         Ok(_) => {
             info!("登出成功");
             Ok(Json(ApiResponse::<()>::success(())))
@@ -456,4 +472,124 @@ pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, 
             )))
         }
     }
+}
+
+/// Cookie 登录
+///
+/// POST /api/v1/auth/cookie/login
+///
+/// 接受从浏览器 DevTools 复制的完整 Cookie 字符串，解析出 BDUSS / PTOKEN / STOKEN
+/// 等字段后验证有效性并初始化所有管理器（与二维码登录后流程完全一致）。
+pub async fn cookie_login(
+    State(state): State<AppState>,
+    Json(req): Json<CookieLoginApiRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    info!("API: Cookie 登录");
+
+    if req.cookies.trim().is_empty() {
+        return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+            400,
+            "cookies 字段不能为空".to_string(),
+        )));
+    }
+
+    // 读取当前代理配置
+    let proxy_config = {
+        let config_guard = state.config.read().await;
+        if config_guard.network.proxy.proxy_type != ProxyType::None {
+            Some(config_guard.network.proxy.clone())
+        } else {
+            None
+        }
+    };
+
+    // 创建 Cookie 登录客户端（复用代理配置）
+    let cookie_auth = match CookieLoginAuth::new_with_proxy(proxy_config.as_ref()) {
+        Ok(a) => a,
+        Err(e) => {
+            error!("创建 Cookie 登录客户端失败: {}", e);
+            return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+                500,
+                format!("创建客户端失败: {}", e),
+            )));
+        }
+    };
+
+    // 解析 Cookie 并验证 BDUSS
+    let user = match cookie_auth.login_with_cookies(&req.cookies).await {
+        Ok(u) => u,
+        Err(e) => {
+            error!("Cookie 登录失败: {}", e);
+            return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+                400,
+                format!("{}", e),
+            )));
+        }
+    };
+
+    info!(
+        "Cookie 验证成功: UID={}, 用户名={}，开始初始化会话...",
+        user.uid, user.username
+    );
+
+    // 保存会话（先释放锁再调用 load_initial_session，避免死锁）
+    {
+        let mut session = state.session_manager.lock().await;
+        if let Err(e) = session.save_session(&user).await {
+            error!("保存会话失败: {}", e);
+            return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+                500,
+                format!("保存会话失败: {}", e),
+            )));
+        }
+        *state.current_user.write().await = Some(user.clone());
+        info!("✅ 会话保存成功");
+    } // session 锁在此释放
+
+    // 记录 PTOKEN 是否存在（用于后续判断预热是否可能成功）
+    let has_ptoken = user.ptoken.is_some();
+
+    if !has_ptoken {
+        warn!("Cookie 中缺少 PTOKEN，预热将被跳过 → panpsc/csrf_token/bdstoken 无法获取，转存等功能不可用");
+    }
+
+    // 复用 load_initial_session 完成完整初始化：
+    //   - 创建 NetdiskClient（含代理）
+    //   - 执行预热（获取 PANPSC / csrfToken / bdstoken）
+    //   - 初始化下载/上传/转存管理器
+    //   - 恢复持久化任务
+    //   - 启动 WebSocket / 内存监控 / 自动备份 / 离线下载监听
+    if let Err(e) = state.load_initial_session().await {
+        error!("初始化用户资源失败: {}", e);
+        // 不阻断登录——会话已保存，用户可重试或刷新页面
+    } else {
+        info!("✅ Cookie 登录后初始化完成");
+    }
+
+    // 返回最新内存中的用户信息（包含预热后更新的字段）
+    let final_user = state
+        .current_user
+        .read()
+        .await
+        .clone()
+        .unwrap_or(user);
+
+    // 根据预热结果决定响应 message
+    let warmup_ok = final_user.panpsc.is_some() && final_user.csrf_token.is_some();
+    let message = if warmup_ok {
+        "登录成功，预热完成".to_string()
+    } else if !has_ptoken {
+        "登录成功（未预热）。文件浏览和下载可正常使用；创建文件夹、上传、转存到新目录等操作需要预热（bdstoken），可能失败。建议从浏览器 Network 请求头复制包含 PTOKEN 的完整 Cookie 以获得完整功能".to_string()
+    } else {
+        "登录成功（预热失败，可能为网络问题）。文件浏览和下载正常；创建文件夹、上传等操作可能受影响，可尝试重新登录".to_string()
+    };
+
+    if warmup_ok {
+        info!("✅ Cookie 登录完成，预热成功: UID={}", final_user.uid);
+    } else {
+        warn!("⚠️ Cookie 登录完成，但预热未成功: ptoken={}, panpsc={}",
+            has_ptoken, final_user.panpsc.is_some());
+    }
+
+    Ok(Json(ApiResponse::success_with_message(final_user, message)))
 }

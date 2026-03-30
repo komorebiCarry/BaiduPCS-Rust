@@ -320,7 +320,12 @@ function handleOpen() {
     if (props.initialPath) {
       store.jumpToPath(props.initialPath)
     } else {
-      store.loadDirectory('')
+      // 先加载根目录列表，再检查是否有 defaultPath 可以直接进入
+      store.loadDirectory('').then(() => {
+        if (store.serverDefaultPath) {
+          store.navigateTo(store.serverDefaultPath)
+        }
+      })
     }
   }
 }

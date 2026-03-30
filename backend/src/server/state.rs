@@ -173,6 +173,7 @@ impl AppState {
             // 检查是否需要预热：
             // 1. 预热数据不存在
             // 2. 或者预热数据已过期（超过24小时）
+            //
             let need_warmup = if user_auth.panpsc.is_none()
                 || user_auth.csrf_token.is_none()
                 || user_auth.bdstoken.is_none()
@@ -212,8 +213,12 @@ impl AppState {
                 match client.warmup_and_get_cookies().await {
                     Ok((panpsc, csrf_token, bdstoken, stoken)) => {
                         info!("预热成功,更新 session.json");
-                        user_auth.panpsc = panpsc;
-                        user_auth.csrf_token = csrf_token;
+                        if panpsc.is_some() {
+                            user_auth.panpsc = panpsc;
+                        }
+                        if csrf_token.is_some() {
+                            user_auth.csrf_token = csrf_token;
+                        }
                         user_auth.bdstoken = bdstoken;
                         user_auth.last_warmup_at = Some(chrono::Utc::now().timestamp());
                         // 预热时下发的 STOKEN 优先于之前保存的
@@ -676,8 +681,12 @@ impl AppState {
         match client.warmup_and_get_cookies().await {
             Ok((panpsc, csrf_token, bdstoken, stoken)) => {
                 info!("手动预热成功，更新 session.json");
-                user_auth.panpsc = panpsc;
-                user_auth.csrf_token = csrf_token;
+                if panpsc.is_some() {
+                    user_auth.panpsc = panpsc;
+                }
+                if csrf_token.is_some() {
+                    user_auth.csrf_token = csrf_token;
+                }
                 user_auth.bdstoken = bdstoken;
                 user_auth.last_warmup_at = Some(chrono::Utc::now().timestamp());
 
