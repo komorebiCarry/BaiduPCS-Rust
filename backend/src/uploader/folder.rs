@@ -37,6 +37,35 @@ pub struct ScanOptions {
     pub max_files: Option<usize>,
     /// 跳过隐藏文件（以.开头的文件和文件夹）
     pub skip_hidden: bool,
+    /// 当 follow_symlinks=true 且此列表非空时，符号链接目标的真实路径
+    /// 必须落在其中某个目录之下，否则跳过该条目。
+    /// 用于阻止通过白名单内的符号链接逃逸到白名单外。
+    #[serde(default)]
+    pub allowed_paths: Vec<std::path::PathBuf>,
+}
+
+/// 检查符号链接目标是否在白名单内。
+///
+/// 当 `allowed_paths` 非空且 `path` 是符号链接时，解析其真实路径并
+/// 确认落在某个白名单目录之下。非符号链接直接返回 true。
+fn is_symlink_target_allowed(path: &Path, allowed_paths: &[PathBuf]) -> bool {
+    if allowed_paths.is_empty() {
+        return true;
+    }
+    // 只对符号链接做检查
+    let is_symlink = path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return true;
+    }
+    // 解析真实路径
+    let real_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    allowed_paths.iter().any(|allowed| real_path.starts_with(allowed))
 }
 
 /// 文件夹扫描器
@@ -130,6 +159,11 @@ impl FolderScanner {
 
             // 检查符号链接
             let metadata = if self.options.follow_symlinks {
+                // 符号链接目标白名单校验
+                if !is_symlink_target_allowed(&path, &self.options.allowed_paths) {
+                    warn!("跳过符号链接（目标不在白名单内）: {}", path.display());
+                    continue;
+                }
                 std::fs::metadata(&path)
             } else {
                 std::fs::symlink_metadata(&path)
@@ -401,6 +435,11 @@ impl BatchedScanIterator {
 
             // 检查符号链接
             let metadata = if self.options.follow_symlinks {
+                // 符号链接目标白名单校验
+                if !is_symlink_target_allowed(&path, &self.options.allowed_paths) {
+                    warn!("跳过符号链接（目标不在白名单内）: {}", path.display());
+                    continue;
+                }
                 std::fs::metadata(&path)
             } else {
                 std::fs::symlink_metadata(&path)
@@ -791,5 +830,254 @@ mod tests {
         }
 
         assert!(all_files.len() <= 3, "应该最多扫描3个文件，实际: {}", all_files.len());
+    }
+
+    // ==================== 符号链接白名单校验测试 ====================
+
+    /// 辅助函数：尝试创建目录符号链接，Windows 上可能因权限不足而失败
+    fn try_symlink_dir(original: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(original, link)
+        }
+    }
+
+    /// 辅助函数：尝试创建文件符号链接
+    fn try_symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(original, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(original, link)
+        }
+    }
+
+    #[test]
+    fn test_is_symlink_target_allowed_non_symlink_always_passes() {
+        let temp_dir = TempDir::new().unwrap();
+        let regular_file = temp_dir.path().join("regular.txt");
+        fs::write(&regular_file, "content").unwrap();
+
+        let unrelated_allowed = vec![PathBuf::from("/some/unrelated/path")];
+
+        // 非符号链接始终返回 true，不受 allowed_paths 影响
+        assert!(
+            is_symlink_target_allowed(&regular_file, &unrelated_allowed),
+            "普通文件不应被 allowed_paths 拦截"
+        );
+    }
+
+    #[test]
+    fn test_is_symlink_target_allowed_empty_allowlist_passes() {
+        let temp_dir = TempDir::new().unwrap();
+        let any_path = temp_dir.path().join("anything");
+        fs::write(&any_path, "x").unwrap();
+
+        // allowed_paths 为空时始终返回 true
+        assert!(
+            is_symlink_target_allowed(&any_path, &[]),
+            "allowed_paths 为空时应放行所有路径"
+        );
+    }
+
+    #[test]
+    fn test_is_symlink_target_allowed_symlink_inside_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        let allowed_dir = temp_dir.path().join("allowed");
+        let target_file = allowed_dir.join("target.txt");
+        let link_path = allowed_dir.join("link.txt");
+
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::write(&target_file, "content").unwrap();
+
+        if try_symlink_file(&target_file, &link_path).is_err() {
+            eprintln!("跳过测试：无法创建符号链接（可能需要管理员权限）");
+            return;
+        }
+
+        let allowed_paths = vec![allowed_dir.canonicalize().unwrap()];
+        assert!(
+            is_symlink_target_allowed(&link_path, &allowed_paths),
+            "符号链接目标在白名单内应放行"
+        );
+    }
+
+    #[test]
+    fn test_is_symlink_target_allowed_symlink_outside_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        let allowed_dir = temp_dir.path().join("allowed");
+        let outside_dir = temp_dir.path().join("outside");
+        let outside_file = outside_dir.join("secret.txt");
+        let link_path = allowed_dir.join("escape_link.txt");
+
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(&outside_file, "secret").unwrap();
+
+        if try_symlink_file(&outside_file, &link_path).is_err() {
+            eprintln!("跳过测试：无法创建符号链接（可能需要管理员权限）");
+            return;
+        }
+
+        let allowed_paths = vec![allowed_dir.canonicalize().unwrap()];
+        assert!(
+            !is_symlink_target_allowed(&link_path, &allowed_paths),
+            "符号链接目标在白名单外应被拦截"
+        );
+    }
+
+    /// 回归测试：follow_symlinks=true + allowed_paths 非空时，
+    /// 白名单内指向白名单外的目录符号链接应被跳过，其内容不出现在扫描结果中。
+    ///
+    /// 目录结构：
+    /// ```text
+    /// temp/
+    /// ├── allowed/          ← 白名单目录，扫描根
+    /// │   ├── normal.txt    ← 应出现
+    /// │   └── link_out/     → ../outside/   ← 符号链接，应被跳过
+    /// └── outside/
+    ///     └── secret.txt    ← 不应出现
+    /// ```
+    #[test]
+    fn test_folder_scanner_skips_symlink_outside_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        let allowed_dir = temp_dir.path().join("allowed");
+        let outside_dir = temp_dir.path().join("outside");
+
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(allowed_dir.join("normal.txt"), "ok").unwrap();
+        fs::write(outside_dir.join("secret.txt"), "leaked").unwrap();
+
+        let link_path = allowed_dir.join("link_out");
+        if try_symlink_dir(&outside_dir, &link_path).is_err() {
+            eprintln!("跳过测试：无法创建目录符号链接（可能需要管理员权限）");
+            return;
+        }
+
+        let allowed_canonical = allowed_dir.canonicalize().unwrap();
+
+        // follow_symlinks=true + allowed_paths 包含仅 allowed_dir
+        let options = ScanOptions {
+            follow_symlinks: true,
+            allowed_paths: vec![allowed_canonical.clone()],
+            ..Default::default()
+        };
+        let scanner = FolderScanner::with_options(options);
+        let files = scanner.scan(&allowed_dir).unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.relative_path.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n.contains("normal.txt")),
+            "normal.txt 应在扫描结果中，实际结果: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("secret.txt")),
+            "secret.txt 不应在扫描结果中（符号链接目标在白名单外），实际结果: {:?}",
+            names
+        );
+    }
+
+    /// 同上场景，使用 BatchedScanIterator 覆盖分批扫描路径
+    #[test]
+    fn test_batched_scanner_skips_symlink_outside_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        let allowed_dir = temp_dir.path().join("allowed");
+        let outside_dir = temp_dir.path().join("outside");
+
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(allowed_dir.join("normal.txt"), "ok").unwrap();
+        fs::write(outside_dir.join("secret.txt"), "leaked").unwrap();
+
+        let link_path = allowed_dir.join("link_out");
+        if try_symlink_dir(&outside_dir, &link_path).is_err() {
+            eprintln!("跳过测试：无法创建目录符号链接（可能需要管理员权限）");
+            return;
+        }
+
+        let allowed_canonical = allowed_dir.canonicalize().unwrap();
+
+        let options = ScanOptions {
+            follow_symlinks: true,
+            allowed_paths: vec![allowed_canonical.clone()],
+            ..Default::default()
+        };
+        let mut iterator = BatchedScanIterator::new(&allowed_dir, options).unwrap();
+
+        let mut all_files = Vec::new();
+        while let Some(batch) = iterator.next_batch().unwrap() {
+            all_files.extend(batch);
+        }
+
+        let names: Vec<String> = all_files
+            .iter()
+            .map(|f| f.relative_path.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n.contains("normal.txt")),
+            "normal.txt 应在分批扫描结果中，实际结果: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("secret.txt")),
+            "secret.txt 不应在分批扫描结果中（符号链接目标在白名单外），实际结果: {:?}",
+            names
+        );
+    }
+
+    /// 对照组：follow_symlinks=true 但 allowed_paths 为空时，符号链接应正常跟随
+    #[test]
+    fn test_folder_scanner_follows_symlink_when_no_allowlist() {
+        let temp_dir = TempDir::new().unwrap();
+        let allowed_dir = temp_dir.path().join("allowed");
+        let outside_dir = temp_dir.path().join("outside");
+
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(allowed_dir.join("normal.txt"), "ok").unwrap();
+        fs::write(outside_dir.join("linked.txt"), "content").unwrap();
+
+        let link_path = allowed_dir.join("link_out");
+        if try_symlink_dir(&outside_dir, &link_path).is_err() {
+            eprintln!("跳过测试：无法创建目录符号链接（可能需要管理员权限）");
+            return;
+        }
+
+        // follow_symlinks=true, allowed_paths 为空 → 不做白名单校验
+        let options = ScanOptions {
+            follow_symlinks: true,
+            allowed_paths: vec![],
+            ..Default::default()
+        };
+        let scanner = FolderScanner::with_options(options);
+        let files = scanner.scan(&allowed_dir).unwrap();
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.relative_path.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n.contains("normal.txt")),
+            "normal.txt 应在结果中"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("linked.txt")),
+            "linked.txt 应在结果中（无白名单限制时符号链接应被跟随），实际结果: {:?}",
+            names
+        );
     }
 }

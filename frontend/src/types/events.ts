@@ -37,6 +37,7 @@ export interface DownloadEventCompleted {
   event_type: 'completed'
   task_id: string
   completed_at: number
+  group_id?: string
 }
 
 export interface DownloadEventFailed {
@@ -58,6 +59,7 @@ export interface DownloadEventResumed {
 export interface DownloadEventDeleted {
   event_type: 'deleted'
   task_id: string
+  group_id?: string
 }
 
 export interface DownloadEventDecryptProgress {

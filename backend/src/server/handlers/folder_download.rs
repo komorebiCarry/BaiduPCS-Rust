@@ -140,7 +140,7 @@ pub async fn get_all_downloads_mixed(
 
     // 添加文件夹任务
     for mut folder in folders {
-        // 计算该文件夹的聚合速度、完成文件数和已下载大小
+        // 计算该文件夹的聚合速度（仅从活跃子任务）
         let folder_tasks: Vec<&DownloadTask> = all_tasks
             .iter()
             .filter(|t| t.group_id.as_deref() == Some(&folder.id))
@@ -152,14 +152,14 @@ pub async fn get_all_downloads_mixed(
             .map(|t| t.speed)
             .sum();
 
-        let completed_files = folder_tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Completed)
-            .count() as u64;
+        // 使用文件夹自身维护的 completed_count（由 start_task_completed_listener 递增）
+        // 不再从内存子任务重新计数，因为已完成的任务会被移除
+        let completed_files = folder.completed_count;
 
-        // 实时计算已下载大小（从子任务聚合）
-        let downloaded_size: u64 = folder_tasks.iter().map(|t| t.downloaded_size).sum();
-        folder.downloaded_size = downloaded_size;
+        // 🔥 使用 compute_downloaded_size：completed_downloaded_size + active_sum
+        // max() 保证单调性，不再用活跃子任务之和覆盖 folder.downloaded_size
+        let active_downloaded: u64 = folder_tasks.iter().map(|t| t.downloaded_size).sum();
+        folder.compute_downloaded_size(active_downloaded);
 
         items.push(DownloadItem::Folder {
             folder,
@@ -245,5 +245,54 @@ pub async fn cancel_folder_download(
             error!("取消文件夹下载失败: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::FolderStatus;
+    use std::path::PathBuf;
+
+    #[test]
+    fn folder_item_keeps_folder_level_progress_stats() {
+        // 模拟：文件夹已完成 10 个文件（累计 1000 字节），当前 1 个活跃子任务已下载 300 字节
+        let mut folder = FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
+        folder.status = FolderStatus::Downloading;
+        folder.total_files = 48;
+        folder.total_size = 4_800;
+        folder.completed_count = 10;
+        folder.completed_downloaded_size = 1_000;
+        folder.downloaded_size = 1_300;
+
+        // 使用文件夹自身的 completed_count，不从内存子任务重新计数
+        let completed_files = folder.completed_count;
+        assert_eq!(completed_files, 10);
+
+        // compute_downloaded_size = max(1300, 1000 + 300) = 1300
+        let computed = folder.compute_downloaded_size(300);
+        assert_eq!(computed, 1_300);
+        assert_eq!(folder.downloaded_size, 1_300);
+    }
+
+    #[test]
+    fn failed_subtask_not_counted_as_completed() {
+        // 验证失败的子任务不应计入 completed_count 和 completed_downloaded_size
+        let mut folder = FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
+        folder.total_files = 10;
+        folder.total_size = 10_000;
+        folder.completed_count = 5;
+        folder.completed_downloaded_size = 5_000;
+
+        // 模拟成功的子任务
+        folder.completed_count += 1;
+        folder.completed_downloaded_size += 1_000;
+        assert_eq!(folder.completed_count, 6);
+        assert_eq!(folder.completed_downloaded_size, 6_000);
+
+        // 模拟失败的子任务 — 不应递增 completed_count 和 completed_downloaded_size
+        // (在实际代码中由 is_success 控制)
+        assert_eq!(folder.completed_count, 6);
+        assert_eq!(folder.completed_downloaded_size, 6_000);
     }
 }

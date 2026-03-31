@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { generateQRCode as apiGenerateQRCode, getQRCodeStatus, getCurrentUser, logout as apiLogout } from '@/api/auth'
-import type { QRCode, UserAuth } from '@/api/auth'
+import { generateQRCode as apiGenerateQRCode, getQRCodeStatus, getCurrentUser, logout as apiLogout, cookieLogin as apiCookieLogin } from '@/api/auth'
+import type { QRCode, UserAuth, CookieLoginResult } from '@/api/auth'
 
 export const useAuthStore = defineStore('auth', () => {
   // 状态
@@ -110,6 +110,18 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  // Cookie 登录
+  async function loginWithCookies(cookies: string): Promise<CookieLoginResult> {
+    try {
+      const result = await apiCookieLogin(cookies)
+      user.value = result.user
+      return result
+    } catch (error) {
+      console.error('Cookie 登录失败:', error)
+      throw error
+    }
+  }
+
   // 登出
   async function logout() {
     try {
@@ -137,6 +149,7 @@ export const useAuthStore = defineStore('auth', () => {
     startPolling,
     stopPolling,
     fetchUserInfo,
+    loginWithCookies,
     logout
   }
 })

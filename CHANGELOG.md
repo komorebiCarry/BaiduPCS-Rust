@@ -2,7 +2,34 @@
 
 本文档记录了 BaiduPCS-Rust 的所有版本更新历史。
 
-## v1.11.2 (当前版本)
+## v1.12.0 (当前版本)
+
+**新功能：**
+- ✨ **新增 Cookie 登录**：支持直接粘贴浏览器 DevTools 复制的完整 Cookie 字符串完成登录
+  - 新增 `POST /api/v1/auth/cookie/login` 接口，解析 `BDUSS`/`PTOKEN`/`STOKEN` 等关键字段并验证有效性
+  - 登录后完整执行初始化流程（预热、管理器创建、持久化任务恢复），与二维码登录体验一致
+  - 缺少 `PTOKEN` 时登录提示中明确说明受限功能，不阻断基础使用
+  - 登出时同时清除 `current_user` 和 `netdisk_client`，避免旧状态残留
+
+**问题修复：**
+- 🐛 **修复下载任务级槽位刷新节流器，所有分片共享**：同一任务的所有分片共享同一 `SlotTouchThrottler` 实例，防止分片切换时重置节流计时器
+  - 槽位分配后立即刷新时间戳，防止长准备阶段被误判超时
+  - 子任务失败时通过 `notify_subtask_failed()` 正确通知文件夹管理器，补全非调度器失败路径的通知逻辑
+- 🐛 **修复白名单文件夹配置不生效问题，补充校验以改进安全性**（感谢 @YYQHH PR #59）
+  - 新增 `FilesystemConfig::validate()` 方法，加载/保存配置时校验 `allowed_paths` 和 `default_path` 合法性
+  - 修复 Windows 下裸驱动器根路径（`C:`/`C:\`/`C:/`）跳过 `is_allowed()` 白名单校验的 bug
+  - 新增 `enforce_allowlist_on_followed_symlinks` 配置项，防止通过符号链接绕过白名单
+- 🐛 **白名单文件夹配置问题边界修复**：精确区分裸驱动器根路径与 drive-relative 路径/完整绝对路径，drive-relative 路径正确走 `canonicalize()` 流程
+- 🐛 **文件夹下载进度问题修复**：进度统计单调递增，失败子任务正确统计，支持从失败状态恢复
+  - 新增 `completed_downloaded_size` 字段，`downloaded_size = max(downloaded_size, completed_downloaded_size + active_sum)` 保证单调性
+  - 新增 `failed_count`/`failed_task_ids` 字段，正确统计失败任务；终态判断改为 `completed + failed >= total`
+  - 存在失败子任务时文件夹标记为 `Failed` 而非 `Completed`，支持从 `Failed` 状态恢复下载
+- 🐛 **普通转存与分享直下目录结构统一修复**：分批转存按原始父目录名分组（而非 `group_N`），本地目录结构与原始分享结构完全对应
+- 🐛 **下载目录不存在提示**：启动时检查下载目录可访问性，目录不存在或无读写权限时输出清晰提示并优雅退出（等待30秒）
+
+---
+
+## v1.11.2
 
 **问题修复：**
 - 🐛 **修复转存异步不同目录同名文件分批处理**：分享直下选择跨目录同名文件时，自动分批转存避免百度 API `-30` 冲突

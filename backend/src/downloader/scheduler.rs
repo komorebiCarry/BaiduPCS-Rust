@@ -166,6 +166,10 @@ pub struct TaskScheduleInfo {
     // 🔥 代理故障回退管理器
     /// 可选，用于记录代理失败/成功并触发自动回退
     pub fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
+
+    // 🔥 任务级槽位刷新节流器，所有分片共享
+    /// 防止分片切换时重置节流计时器，确保槽位心跳持续有效
+    pub slot_touch_throttler: Arc<crate::task_slot_pool::SlotTouchThrottler>,
 }
 
 /// 全局分片调度器
@@ -191,7 +195,7 @@ pub struct ChunkScheduler {
     /// 调度器是否正在运行
     scheduler_running: Arc<AtomicBool>,
     /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
-    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String)>>>>,
+    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
     /// 🔥 备份任务统一通知发送器（用于通知 AutoBackupManager 所有事件）
     /// 包括：进度更新、状态变更、任务完成、任务失败等
     backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
@@ -256,10 +260,22 @@ impl ChunkScheduler {
     ///
     /// FolderDownloadManager 调用此方法设置 channel sender，
     /// 当文件夹子任务完成时会发送 group_id 到 channel
-    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<(String, String)>) {
+    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<(String, String, u64, bool)>) {
         let mut sender = self.task_completed_tx.write().await;
         *sender = Some(tx);
         info!("任务完成通知 channel 已设置");
+    }
+
+    /// 🔥 通知文件夹管理器子任务失败
+    ///
+    /// 供 DownloadManager 的非调度器失败路径（槽位超时、0延迟启动失败等）调用
+    pub async fn notify_subtask_failed(&self, group_id: String, task_id: String, total_size: u64) {
+        let tx_guard = self.task_completed_tx.read().await;
+        if let Some(tx) = tx_guard.as_ref() {
+            if let Err(e) = tx.send((group_id, task_id, total_size, false)) {
+                error!("发送子任务失败通知失败: {}", e);
+            }
+        }
     }
 
     /// 🔥 设置备份任务统一通知发送器
@@ -531,6 +547,7 @@ impl ChunkScheduler {
                                 slot_pool.clone(),
                                 active_chunk_count.clone(),
                                 backup_notification_tx.clone(),
+                                task_completed_tx.clone(),
                             );
 
                             scheduled_count += 1;
@@ -621,6 +638,7 @@ impl ChunkScheduler {
         slot_pool: Arc<ChunkSlotPool>,
         global_active_count: Arc<AtomicUsize>,
         backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
+        task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
     ) {
         tokio::spawn(async move {
             let task_id = task_info.task_id.clone();
@@ -656,7 +674,7 @@ impl ChunkScheduler {
                 task_id.clone(),
                 task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
                 task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
-                task_info.task_slot_pool.clone(), // 🔥 任务槽池（用于刷新槽位时间戳）
+                Some(task_info.slot_touch_throttler.clone()), // 🔥 任务级共享槽位刷新节流器
                 task_info.max_retries, // 🔥 链接级重试次数（从配置读取）
                 task_info.fallback_mgr.clone(), // 🔥 代理故障回退管理器
             )
@@ -736,7 +754,7 @@ impl ChunkScheduler {
                                             group_id: group_id.clone(),
                                             is_backup,
                                         }),
-                                        group_id,
+                                        group_id.clone(),
                                     );
                                 }
                             }
@@ -761,6 +779,14 @@ impl ChunkScheduler {
 
                             active_tasks.write().await.remove(&task_id);
                             error!("任务 {} 因分片 #{} 重试耗尽已从调度器移除", task_id, chunk_index);
+
+                            // 🔥 通知文件夹管理器：子任务失败
+                            if let Some(gid) = group_id.clone() {
+                                let tx_guard = task_completed_tx.read().await;
+                                if let Some(tx) = tx_guard.as_ref() {
+                                    let _ = tx.send((gid, task_id.clone(), task_info.total_size, false));
+                                }
+                            }
                         }
                     }
                 }
@@ -781,7 +807,7 @@ impl ChunkScheduler {
         task_id: &str,
         task_info: &TaskScheduleInfo,
         decrypt_result: Result<()>,
-        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<(String, String)>>>>,
+        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
         backup_notification_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
         waiting_queue_trigger: &Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     ) {
@@ -871,7 +897,8 @@ impl ChunkScheduler {
         if let Some(gid) = group_id.clone() {
             let tx_guard = task_completed_tx.read().await;
             if let Some(tx) = tx_guard.as_ref() {
-                if let Err(e) = tx.send((gid.clone(), task_id.to_string())) {
+                let is_success = decrypt_error.is_none();
+                if let Err(e) = tx.send((gid.clone(), task_id.to_string(), task_info.total_size, is_success)) {
                     error!("发送任务完成通知失败: {}", e);
                 }
             }

@@ -259,6 +259,18 @@
             <div class="stat-label">待处理</div>
             <div class="stat-value info">{{ folderDetailDialog.pendingFiles }}</div>
           </div>
+          <div class="stat-card" v-if="folderDetailDialog.decryptingFiles > 0">
+            <div class="stat-label">解密中</div>
+            <div class="stat-value primary">{{ folderDetailDialog.decryptingFiles }}</div>
+          </div>
+          <div class="stat-card" v-if="folderDetailDialog.pausedFiles > 0">
+            <div class="stat-label">已暂停</div>
+            <div class="stat-value warning">{{ folderDetailDialog.pausedFiles }}</div>
+          </div>
+          <div class="stat-card" v-if="folderDetailDialog.failedFiles > 0">
+            <div class="stat-label">失败</div>
+            <div class="stat-value danger">{{ folderDetailDialog.failedFiles }}</div>
+          </div>
         </div>
 
         <!-- 子任务列表 -->
@@ -426,6 +438,9 @@ const folderDetailDialog = ref({
   completedFiles: 0,
   downloadingFiles: 0,
   pendingFiles: 0,
+  failedFiles: 0,
+  pausedFiles: 0,
+  decryptingFiles: 0,
   tasks: [] as DownloadTask[],
   searchText: '',
 })
@@ -434,12 +449,24 @@ const folderDetailDialog = ref({
 let refreshTimer: number | null = null
 // 文件夹详情弹窗刷新定时器
 let folderDetailTimer: number | null = null
+// 🔥 refreshFolderDetail 请求序号 + 最后应用序号，用于丢弃乱序旧响应
+let folderDetailRequestSeq = 0      // 每次调用递增
+let folderDetailAppliedSeq = 0      // 最后成功应用的序号
+// 🔥 记录每个子任务最后被 WS 事件更新的时间戳，用于轮询合并时保护新鲜数据
+const folderDetailTaskWsTime = new Map<string, number>()
+// 🔥 记录 WS 删除事件的时间戳，防止旧轮询响应把已删除任务带回来
+const folderDetailTaskDeletedAt = new Map<string, number>()
+// 🔥 主列表 WS 事件时间戳，用于 refreshTasks 合并时保护新鲜数据
+const mainListWsTime = new Map<string, number>()
+const mainListDeletedAt = new Map<string, number>()
 // 🔥 WebSocket 事件订阅清理函数
 let unsubscribeDownload: (() => void) | null = null
 let unsubscribeFolder: (() => void) | null = null
 let unsubscribeConnectionState: (() => void) | null = null
 // 🔥 WebSocket 连接状态
 const wsConnected = ref(false)
+// 🔥 是否已成功加载过一次任务列表，用于初始加载失败时保持重试
+let initialLoadDone = false
 
 // 是否有活跃任务（需要实时刷新）
 const hasActiveTasks = computed(() => {
@@ -531,12 +558,46 @@ async function refreshTasks() {
   }
 
   loading.value = true
+  // 🔥 记录请求发出时间，用于合并时判断 WS 事件是否比本次请求更新
+  const requestTime = Date.now()
   try {
-    downloadItems.value = await getAllDownloadsMixed()
+    const apiItems = await getAllDownloadsMixed()
+
+    // 🔥 合并而非替换：保护在 await 期间被 WS 事件更新/新增/删除过的条目
+    const existingMap = new Map<string, DownloadItemFromBackend>(
+        downloadItems.value.filter(item => item.id).map(item => [item.id!, item])
+    )
+    const apiIds = new Set(apiItems.filter(item => item.id).map(item => item.id!))
+    const merged: DownloadItemFromBackend[] = []
+
+    for (const apiItem of apiItems) {
+      const itemId = apiItem.id
+      if (!itemId) { merged.push(apiItem); continue }
+      const deletedAt = mainListDeletedAt.get(itemId)
+      if (deletedAt && deletedAt > requestTime) {
+        continue // WS 在请求发出后删除了这个条目
+      }
+      const wsTime = mainListWsTime.get(itemId)
+      if (wsTime && wsTime > requestTime && existingMap.has(itemId)) {
+        merged.push(existingMap.get(itemId)!)
+      } else {
+        merged.push(apiItem)
+      }
+    }
+    // 补充 WS 在 await 期间新增的条目
+    for (const [id, existing] of existingMap) {
+      if (!apiIds.has(id)) {
+        const wsTime = mainListWsTime.get(id)
+        if (wsTime && wsTime > requestTime) {
+          merged.unshift(existing)
+        }
+      }
+    }
+    downloadItems.value = merged
+    initialLoadDone = true
   } catch (error: any) {
     console.error('刷新任务列表失败:', error)
-    // 请求失败时，清空任务列表，避免显示过时数据
-    downloadItems.value = []
+    // 🔥 不清空列表：保留现有数据，避免临时失败导致页面变空 + 轮询停止的死锁
   } finally {
     loading.value = false
     // 无论成功还是失败，都要检查并更新自动刷新状态
@@ -557,8 +618,8 @@ function updateAutoRefresh() {
   }
 
   // 🔥 WebSocket 未连接时，回退到轮询模式
-  // 如果有活跃任务，启动或保持定时刷新
-  if (hasActiveTasks.value) {
+  // 有活跃任务 或 初始加载尚未成功时，启动或保持定时刷新
+  if (hasActiveTasks.value || !initialLoadDone) {
     if (!refreshTimer) {
       console.log('[DownloadsView] WebSocket 未连接，启动轮询模式，活跃任务数:', activeCount.value)
       refreshTimer = window.setInterval(() => {
@@ -776,6 +837,11 @@ async function showFolderDetail(item: DownloadItemFromBackend) {
   // 🔥 先停止旧的定时器和取消旧订阅（此时 folderId 还是旧值）
   stopFolderDetailTimer()
 
+  // 🔥 重置应用序号和 WS 时间戳，让上一个目录的在途异步请求失效
+  folderDetailAppliedSeq = ++folderDetailRequestSeq
+  folderDetailTaskWsTime.clear()
+  folderDetailTaskDeletedAt.clear()
+
   // 设置新的文件夹信息
   folderDetailDialog.value.visible = true
   folderDetailDialog.value.folderId = item.id
@@ -842,9 +908,22 @@ function onFolderDetailClose() {
   // 停止定时器和取消子任务订阅
   stopFolderDetailTimer()
 
-  // 清理弹窗数据
+  // 🔥 清理弹窗数据（包括统计，防止下次打开其他目录时闪现旧数据）
   folderDetailDialog.value.folderId = ''
+  folderDetailDialog.value.folderName = ''
   folderDetailDialog.value.tasks = []
+  folderDetailDialog.value.totalFiles = 0
+  folderDetailDialog.value.completedFiles = 0
+  folderDetailDialog.value.downloadingFiles = 0
+  folderDetailDialog.value.pendingFiles = 0
+  folderDetailDialog.value.failedFiles = 0
+  folderDetailDialog.value.pausedFiles = 0
+  folderDetailDialog.value.decryptingFiles = 0
+  folderDetailDialog.value.searchText = ''
+  // 🔥 重置应用序号和 WS 时间戳，让任何在途的异步请求失效
+  folderDetailAppliedSeq = ++folderDetailRequestSeq
+  folderDetailTaskWsTime.clear()
+  folderDetailTaskDeletedAt.clear()
 
   // 🔥 主列表订阅保持不变（主列表一直需要订阅）
 }
@@ -854,31 +933,79 @@ async function refreshFolderDetail() {
   const folderId = folderDetailDialog.value.folderId
   if (!folderId) return
 
+  // 🔥 每次调用分配唯一序号，await 后比较 appliedSeq 决定是否应用
+  // 不会饥死：只有当更新的响应已经落地时才跳过，不是因为有更新的请求发出
+  const mySeq = ++folderDetailRequestSeq
+  // 🔥 记录请求发出时间，用于合并时判断 WS 事件是否比本次请求更新
+  const requestTime = Date.now()
+
   try {
     // 获取所有任务，然后过滤出属于该文件夹的任务
     const allTasks = await getAllDownloads()
-    const folderTasks = allTasks.filter((task) => task.group_id === folderId)
 
-    // 计算统计数据
-    const completedFiles = folderTasks.filter((t) => t.status === 'completed').length
-    const downloadingFiles = folderTasks.filter((t) => t.status === 'downloading').length
-    const pendingFiles = folderTasks.filter((t) => t.status === 'pending').length
+    // 🔥 防止异步响应覆盖：
+    // 1. 弹窗已关/已换目录 → folderId 或 visible 不匹配
+    // 2. 同目录乱序 → 更新的响应已经应用（mySeq <= appliedSeq）
+    if (!folderDetailDialog.value.visible || folderDetailDialog.value.folderId !== folderId) return
+    if (mySeq <= folderDetailAppliedSeq) return
+    folderDetailAppliedSeq = mySeq
 
-    folderDetailDialog.value.tasks = folderTasks
-    folderDetailDialog.value.totalFiles = folderTasks.length
-    folderDetailDialog.value.completedFiles = completedFiles
-    folderDetailDialog.value.downloadingFiles = downloadingFiles
-    folderDetailDialog.value.pendingFiles = pendingFiles
+    const apiFolderTasks = allTasks.filter((task) => task.group_id === folderId)
 
-    // 同时获取文件夹的 total_files（包括 pending_files 中的）
-    const folderItem = downloadItems.value.find((i) => i.id === folderId && i.type === 'folder')
-    if (folderItem && folderItem.total_files) {
-      const notCreatedYet = (folderItem.total_files || 0) - folderTasks.length
-      if (notCreatedYet > 0) {
-        folderDetailDialog.value.pendingFiles += notCreatedYet
-        folderDetailDialog.value.totalFiles = folderItem.total_files
+    // 🔥 合并而非替换：保护在 await 期间被 WS 事件更新/新增/删除过的子任务
+    const existingMap = new Map(folderDetailDialog.value.tasks.map(t => [t.id, t]))
+    const apiTaskIds = new Set(apiFolderTasks.map(t => t.id))
+    const mergedTasks: DownloadTask[] = []
+
+    // 遍历 API 任务：跳过 WS 已删除的，保护 WS 已更新的
+    for (const apiTask of apiFolderTasks) {
+      const deletedAt = folderDetailTaskDeletedAt.get(apiTask.id)
+      if (deletedAt && deletedAt > requestTime) {
+        // WS 在请求发出后删除了这个任务，不要带回来
+        continue
+      }
+      const wsTime = folderDetailTaskWsTime.get(apiTask.id)
+      if (wsTime && wsTime > requestTime && existingMap.has(apiTask.id)) {
+        // WS 事件在请求发出后更新过这个任务，保留现有的新鲜数据
+        mergedTasks.push(existingMap.get(apiTask.id)!)
+      } else {
+        mergedTasks.push(apiTask)
       }
     }
+    // 补充 WS 在 await 期间新增的任务（API 响应中不包含）
+    for (const [id, existing] of existingMap) {
+      if (!apiTaskIds.has(id)) {
+        const wsTime = folderDetailTaskWsTime.get(id)
+        if (wsTime && wsTime > requestTime) {
+          mergedTasks.push(existing)
+        }
+      }
+    }
+
+    // 🔥 使用文件夹级别的 completed_files（后端维护的累计值）
+    // 不从内存子任务重新计数，因为已完成的子任务会被移除
+    const folderItem = downloadItems.value.find((i) => i.id === folderId && i.type === 'folder')
+    const folderCompletedFiles = folderItem?.completed_files ?? 0
+    const folderTotalFiles = folderItem?.total_files ?? mergedTasks.length
+
+    const downloadingFiles = mergedTasks.filter((t) => t.status === 'downloading').length
+    const pendingFiles = mergedTasks.filter((t) => t.status === 'pending').length
+    const failedFiles = mergedTasks.filter((t) => t.status === 'failed').length
+    const pausedFiles = mergedTasks.filter((t) => t.status === 'paused').length
+    const decryptingFiles = mergedTasks.filter((t) => t.status === 'decrypting').length
+    // 未创建任务的文件数 = 总文件数 - 已完成(文件夹级累计值) - 非完成的内存子任务数
+    // 注意：已完成子任务可能尚未从列表移除，要排除否则会被 completedFiles 和 tasks 同时计数
+    const activeTaskCount = mergedTasks.filter((t) => t.status !== 'completed').length
+    const notCreatedYet = Math.max(0, folderTotalFiles - folderCompletedFiles - activeTaskCount)
+
+    folderDetailDialog.value.tasks = mergedTasks
+    folderDetailDialog.value.totalFiles = folderTotalFiles
+    folderDetailDialog.value.completedFiles = folderCompletedFiles
+    folderDetailDialog.value.downloadingFiles = downloadingFiles
+    folderDetailDialog.value.pendingFiles = pendingFiles + notCreatedYet
+    folderDetailDialog.value.failedFiles = failedFiles
+    folderDetailDialog.value.pausedFiles = pausedFiles
+    folderDetailDialog.value.decryptingFiles = decryptingFiles
   } catch (error: any) {
     console.error('获取文件夹子任务失败:', error)
     ElMessage.error('获取文件夹子任务失败')
@@ -894,7 +1021,8 @@ function handleDownloadEvent(event: DownloadEvent) {
   switch (event.event_type) {
     case 'created':
       // 新任务创建，添加到列表
-      if (index === -1) {
+      // 🔥 有 group_id 的是文件夹子任务，不应出现在主列表（主列表只显示文件夹行）
+      if (index === -1 && !event.group_id) {
         downloadItems.value.unshift({
           id: taskId,
           type: 'file',
@@ -908,6 +1036,7 @@ function handleDownloadEvent(event: DownloadEvent) {
           original_filename: event.original_filename, // 🔥 保存原始文件名
           is_encrypted: !!event.original_filename, // 🔥 有原始文件名说明是加密文件
         } as DownloadItemFromBackend)
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 如果是文件夹详情弹窗中的子任务，也添加到弹窗
       if (event.group_id && folderDetailDialog.value.visible && event.group_id === folderDetailDialog.value.folderId) {
@@ -923,6 +1052,8 @@ function handleDownloadEvent(event: DownloadEvent) {
             speed: 0,
             group_id: event.group_id,
           } as DownloadTask)
+          // 🔥 记录 WS 新增时间戳，合并时保护不被旧轮询丢弃
+          folderDetailTaskWsTime.set(taskId, Date.now())
           updateFolderDetailStats()
         }
       }
@@ -935,6 +1066,7 @@ function handleDownloadEvent(event: DownloadEvent) {
         downloadItems.value[index].total_size = event.total_size
         downloadItems.value[index].speed = event.speed
         // 🔥 不更新状态，避免暂停后收到延迟进度事件导致状态回刷
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 实时更新文件夹详情弹窗中的子任务进度
       if (folderDetailDialog.value.visible) {
@@ -950,7 +1082,7 @@ function handleDownloadEvent(event: DownloadEvent) {
           speed: event.speed,
           // 🔥 如果文件夹是暂停状态，子任务也设为暂停；否则设为 downloading
           status: isFolderPaused ? 'paused' as TaskStatus : 'downloading' as TaskStatus,
-        })
+        }, true)
       }
       break
 
@@ -964,13 +1096,14 @@ function handleDownloadEvent(event: DownloadEvent) {
         downloadItems.value[index].decrypt_progress = event.decrypt_progress
         downloadItems.value[index].status = 'decrypting'
         downloadItems.value[index].is_encrypted = true
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务解密进度
       updateFolderDetailTask(taskId, {
         decrypt_progress: event.decrypt_progress,
         status: 'decrypting' as TaskStatus,
         is_encrypted: true,
-      })
+      }, true)
       break
 
     case 'decrypt_completed':
@@ -979,6 +1112,7 @@ function handleDownloadEvent(event: DownloadEvent) {
         downloadItems.value[index].decrypt_progress = 100
         downloadItems.value[index].local_path = event.decrypted_path
         // 状态变更会由 status_changed 或 completed 事件处理
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务解密完成
       updateFolderDetailTask(taskId, {
@@ -991,13 +1125,24 @@ function handleDownloadEvent(event: DownloadEvent) {
       // 状态变更
       if (index !== -1) {
         downloadItems.value[index].status = event.new_status as TaskStatus
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务状态
-      updateFolderDetailTask(taskId, {status: event.new_status as TaskStatus})
+      updateFolderDetailTask(taskId, {status: event.new_status as TaskStatus}, true)
       break
 
-    case 'completed':
+    case 'completed': {
       // 任务完成
+      // 🔥 乐观递增文件夹的 completed_files，避免等待 folder progress 事件
+      // 使用 event.group_id 而非主列表子任务行，因为子任务不再出现在主列表
+      const groupId = event.group_id ?? (index !== -1 ? downloadItems.value[index].group_id : undefined)
+      if (groupId) {
+        const folderIdx = downloadItems.value.findIndex(i => i.id === groupId && i.type === 'folder')
+        if (folderIdx !== -1) {
+          downloadItems.value[folderIdx].completed_files = (downloadItems.value[folderIdx].completed_files ?? 0) + 1
+          mainListWsTime.set(groupId, Date.now())
+        }
+      }
       if (index !== -1) {
         downloadItems.value[index].status = 'completed'
         downloadItems.value[index].downloaded_size = downloadItems.value[index].total_size
@@ -1006,7 +1151,9 @@ function handleDownloadEvent(event: DownloadEvent) {
         if (downloadItems.value[index].is_encrypted) {
           downloadItems.value[index].decrypt_progress = 100
         }
+        mainListWsTime.set(taskId, Date.now())
       }
+    }
       // 🔥 更新文件夹详情弹窗中的子任务完成状态（不设置 decrypt_progress，避免影响普通文件）
       updateFolderDetailTask(taskId, {status: 'completed' as TaskStatus, speed: 0}, true)
       break
@@ -1017,9 +1164,10 @@ function handleDownloadEvent(event: DownloadEvent) {
         downloadItems.value[index].status = 'failed'
         downloadItems.value[index].error = event.error
         downloadItems.value[index].speed = 0
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务失败状态
-      updateFolderDetailTask(taskId, {status: 'failed' as TaskStatus, error: event.error, speed: 0})
+      updateFolderDetailTask(taskId, {status: 'failed' as TaskStatus, error: event.error, speed: 0}, true)
       break
 
     case 'paused':
@@ -1027,9 +1175,10 @@ function handleDownloadEvent(event: DownloadEvent) {
       if (index !== -1) {
         downloadItems.value[index].status = 'paused'
         downloadItems.value[index].speed = 0
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务暂停状态
-      updateFolderDetailTask(taskId, {status: 'paused' as TaskStatus, speed: 0})
+      updateFolderDetailTask(taskId, {status: 'paused' as TaskStatus, speed: 0}, true)
       break
 
     case 'resumed':
@@ -1038,18 +1187,24 @@ function handleDownloadEvent(event: DownloadEvent) {
         // 🔥 设为 downloading 而不是 pending，这样 UI 会显示速度和剩余时间
         // 后续的 progress 事件会更新实际的速度值
         downloadItems.value[index].status = 'downloading'
+        mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务恢复状态
-      updateFolderDetailTask(taskId, {status: 'downloading' as TaskStatus})
+      updateFolderDetailTask(taskId, {status: 'downloading' as TaskStatus}, true)
       break
 
     case 'deleted':
       // 任务删除
+      // 🔥 无论本地是否已有该行，都记录删除墓碑，防止在途的旧轮询把它带回来
+      mainListDeletedAt.set(taskId, Date.now())
       if (index !== -1) {
         downloadItems.value.splice(index, 1)
       }
       // 🔥 从文件夹详情弹窗中删除子任务
-      if (folderDetailDialog.value.visible) {
+      // 使用 event.group_id 判断归属，即使任务尚未出现在弹窗列表中也能记录墓碑
+      if (folderDetailDialog.value.visible &&
+          event.group_id && event.group_id === folderDetailDialog.value.folderId) {
+        folderDetailTaskDeletedAt.set(taskId, Date.now())
         const detailIndex = folderDetailDialog.value.tasks.findIndex(t => t.id === taskId)
         if (detailIndex !== -1) {
           folderDetailDialog.value.tasks.splice(detailIndex, 1)
@@ -1067,6 +1222,8 @@ function updateFolderDetailTask(taskId: string, updates: Partial<DownloadTask>, 
   const detailIndex = folderDetailDialog.value.tasks.findIndex(t => t.id === taskId)
   if (detailIndex !== -1) {
     Object.assign(folderDetailDialog.value.tasks[detailIndex], updates)
+    // 🔥 记录 WS 更新时间戳，轮询合并时保护比请求时刻更新的数据
+    folderDetailTaskWsTime.set(taskId, Date.now())
     if (updateStats) {
       updateFolderDetailStats()
     }
@@ -1078,27 +1235,30 @@ function updateFolderDetailStats() {
   if (!folderDetailDialog.value.visible) return
 
   const tasks = folderDetailDialog.value.tasks
-  const completedFiles = tasks.filter((t) => t.status === 'completed').length
-  const downloadingFiles = tasks.filter((t) => t.status === 'downloading').length
-  const pendingFiles = tasks.filter((t) => t.status === 'pending').length
 
-  folderDetailDialog.value.completedFiles = completedFiles
-  folderDetailDialog.value.downloadingFiles = downloadingFiles
-  folderDetailDialog.value.pendingFiles = pendingFiles
-
-  // 获取文件夹的 total_files（包括尚未创建任务的）
+  // 🔥 使用文件夹级别的 completed_files（后端维护的累计值）
   const folderItem = downloadItems.value.find(
       (i) => i.id === folderDetailDialog.value.folderId && i.type === 'folder'
   )
-  if (folderItem && folderItem.total_files) {
-    const notCreatedYet = (folderItem.total_files || 0) - tasks.length
-    if (notCreatedYet > 0) {
-      folderDetailDialog.value.pendingFiles += notCreatedYet
-      folderDetailDialog.value.totalFiles = folderItem.total_files
-    } else {
-      folderDetailDialog.value.totalFiles = tasks.length
-    }
-  }
+  const folderCompletedFiles = folderItem?.completed_files ?? 0
+  const folderTotalFiles = folderItem?.total_files ?? tasks.length
+
+  const downloadingFiles = tasks.filter((t) => t.status === 'downloading').length
+  const pendingFiles = tasks.filter((t) => t.status === 'pending').length
+  const failedFiles = tasks.filter((t) => t.status === 'failed').length
+  const pausedFiles = tasks.filter((t) => t.status === 'paused').length
+  const decryptingFiles = tasks.filter((t) => t.status === 'decrypting').length
+  // 注意：已完成子任务可能尚未从列表移除，要排除否则会被 completedFiles 和 tasks 同时计数
+  const activeTaskCount = tasks.filter((t) => t.status !== 'completed').length
+  const notCreatedYet = Math.max(0, folderTotalFiles - folderCompletedFiles - activeTaskCount)
+
+  folderDetailDialog.value.completedFiles = folderCompletedFiles
+  folderDetailDialog.value.downloadingFiles = downloadingFiles
+  folderDetailDialog.value.pendingFiles = pendingFiles + notCreatedYet
+  folderDetailDialog.value.failedFiles = failedFiles
+  folderDetailDialog.value.pausedFiles = pausedFiles
+  folderDetailDialog.value.decryptingFiles = decryptingFiles
+  folderDetailDialog.value.totalFiles = folderTotalFiles
 }
 
 // 🔥 处理文件夹事件
@@ -1123,6 +1283,7 @@ function handleFolderEvent(event: FolderEvent) {
           downloaded_size: 0,
           speed: 0,
         } as DownloadItemFromBackend)
+        mainListWsTime.set(folderId, Date.now())
       }
       break
 
@@ -1131,16 +1292,23 @@ function handleFolderEvent(event: FolderEvent) {
       if (index !== -1) {
         downloadItems.value[index].downloaded_size = event.downloaded_size
         downloadItems.value[index].total_size = event.total_size
-        downloadItems.value[index].completed_files = event.completed_files
+        // 🔥 只允许递增，防止延迟到达的旧 progress 回写子任务完成时的乐观 +1
+        downloadItems.value[index].completed_files = Math.max(
+            downloadItems.value[index].completed_files ?? 0, event.completed_files ?? 0
+        )
         downloadItems.value[index].total_files = event.total_files
         downloadItems.value[index].speed = event.speed
         // 🔥 不更新状态，避免暂停后收到延迟进度事件导致状态回刷
+        mainListWsTime.set(folderId, Date.now())
       }
+      // 🔥 同步刷新详情弹窗统计（completed_files/total_files 可能已变）
+      updateFolderDetailStats()
       break
 
     case 'status_changed':
       if (index !== -1) {
         downloadItems.value[index].status = event.new_status as FolderStatus
+        mainListWsTime.set(folderId, Date.now())
       }
       break
 
@@ -1149,14 +1317,22 @@ function handleFolderEvent(event: FolderEvent) {
         downloadItems.value[index].total_files = event.total_files
         downloadItems.value[index].total_size = event.total_size
         downloadItems.value[index].status = 'downloading'
+        mainListWsTime.set(folderId, Date.now())
       }
+      // 🔥 同步刷新详情弹窗统计（total_files 已变）
+      updateFolderDetailStats()
       break
 
     case 'completed':
       if (index !== -1) {
         downloadItems.value[index].status = 'completed'
         downloadItems.value[index].speed = 0
+        // 🔥 文件夹完成 = 所有子任务都成功，将 completed_files 推到终值
+        // 防止乐观 +1 被跳过时头部统计少 1
+        downloadItems.value[index].completed_files = downloadItems.value[index].total_files
+        mainListWsTime.set(folderId, Date.now())
       }
+      updateFolderDetailStats()
       break
 
     case 'failed':
@@ -1164,23 +1340,27 @@ function handleFolderEvent(event: FolderEvent) {
         downloadItems.value[index].status = 'failed'
         downloadItems.value[index].error = event.error
         downloadItems.value[index].speed = 0
+        mainListWsTime.set(folderId, Date.now())
       }
+      updateFolderDetailStats()
       break
 
     case 'paused':
       if (index !== -1) {
         downloadItems.value[index].status = 'paused'
         downloadItems.value[index].speed = 0
+        mainListWsTime.set(folderId, Date.now())
       }
       break
 
     case 'resumed':
-      if (index !== -1) {
-        downloadItems.value[index].status = 'scanning'
-      }
+      // 🔥 不设置状态：后端先发 StatusChanged(已按 scan_completed 设为 scanning/downloading)再发 Resumed
+      // StatusChanged 已经设置了正确状态，这里不再覆盖
       break
 
     case 'deleted':
+      // 🔥 无论本地是否已有该行，都记录删除墓碑，防止在途的旧轮询把它带回来
+      mainListDeletedAt.set(folderId, Date.now())
       if (index !== -1) {
         downloadItems.value.splice(index, 1)
       }
@@ -1547,6 +1727,14 @@ onUnmounted(() => {
 
         &.info {
           color: #909399;
+        }
+
+        &.warning {
+          color: #e6a23c;
+        }
+
+        &.danger {
+          color: #f56c6c;
         }
       }
     }

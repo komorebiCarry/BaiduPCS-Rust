@@ -104,6 +104,72 @@ async fn load_log_config() -> LogConfig {
     LogConfig::default()
 }
 
+/// 检查下载目录是否可访问和可读写
+///
+/// 若目录不存在则尝试创建；若无权限则打印说明日志，延迟 30 秒后退出服务。
+async fn ensure_download_dir_accessible(download_dir: &std::path::Path) {
+    // 目录不存在时先尝试创建
+    if !download_dir.exists() {
+        match std::fs::create_dir_all(download_dir) {
+            Ok(_) => {
+                info!("✓ 下载目录已创建: {:?}", download_dir);
+                return;
+            }
+            Err(e) => {
+                info!(
+                    "\n========================================\n\
+                     [启动失败] 无法创建下载目录\n\
+                     目录路径: {:?}\n\
+                     错误原因: {}\n\
+                     \n\
+                     请前往配置文件 config/app.toml\n\
+                     将 [download] 下的 download_dir 修改为\n\
+                     一个存在且具有读写权限的目录路径。\n\
+                     \n\
+                     Windows 示例: download_dir = \"D:\\\\Downloads\"\n\
+                     Linux/macOS 示例: download_dir = \"/home/user/downloads\"\n\
+                     \n\
+                     服务将在 30 秒后自动退出...\n\
+                     ========================================",
+                    download_dir, e
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 目录存在，验证读写权限（写入测试文件）
+    let test_file = download_dir.join(".baidu_write_test");
+    match std::fs::write(&test_file, b"permission_test") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&test_file);
+            info!("✓ 下载目录权限验证通过: {:?}", download_dir);
+        }
+        Err(e) => {
+            info!(
+                "\n========================================\n\
+                 [启动失败] 下载目录没有访问或读写权限\n\
+                 目录路径: {:?}\n\
+                 错误原因: {}\n\
+                 \n\
+                 请前往配置文件 config/app.toml\n\
+                 将 [download] 下的 download_dir 修改为\n\
+                 一个存在且具有读写权限的目录路径。\n\
+                 \n\
+                 Windows 示例: download_dir = \"D:\\\\Downloads\"\n\
+                 Linux/macOS 示例: download_dir = \"/home/user/downloads\"\n\
+                 \n\
+                 服务将在 30 秒后自动退出...\n\
+                 ========================================",
+                download_dir, e
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            std::process::exit(1);
+        }
+    }
+}
+
 /// 初始化 Web 认证状态
 ///
 /// 从配置和凭证文件加载认证状态，并根据认证模式启动清理任务。
@@ -147,6 +213,14 @@ async fn main() -> anyhow::Result<()> {
 
     // 创建应用状态
     let app_state = AppState::new().await?;
+
+    // 检查下载目录访问权限
+    {
+        let config = app_state.config.read().await;
+        let download_dir = config.download.download_dir.clone();
+        drop(config);
+        ensure_download_dir_accessible(&download_dir).await;
+    }
     // 注入热更新执行器到代理回退管理器（使回退触发时能自动执行热更新和启动探测任务）
     app_state.fallback_mgr.set_updater(
         Arc::new(app_state.clone()) as Arc<dyn ProxyHotUpdater>
@@ -211,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         // 认证API
         .route("/auth/qrcode/generate", post(handlers::generate_qrcode))
         .route("/auth/qrcode/status", get(handlers::qrcode_status))
+        .route("/auth/cookie/login", post(handlers::cookie_login))
         .route("/auth/user", get(handlers::get_current_user))
         .route("/auth/logout", post(handlers::logout))
         // 文件API

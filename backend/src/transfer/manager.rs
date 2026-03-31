@@ -12,7 +12,7 @@ use crate::transfer::task::{TransferStatus, TransferTask};
 use crate::transfer::types::{BatchGroupInfo, CleanupResult, CleanupStatus, ShareLink, SharePageInfo, SharedFileInfo, TransferResult};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -925,166 +925,170 @@ impl TransferManager {
             }
         }
 
-        // ========== 跨目录同名文件检测（仅分享直下场景） ==========
-        // 普通转存不做分批，避免在用户指定目录下生成 group_N 子目录
-        let cross_dir_dups = if is_share_direct_download {
-            detect_cross_dir_duplicates(&filtered_file_list)
-        } else {
-            Vec::new()
-        };
+        // ========== 转存策略：统一按原始父目录分组，保留完整目录结构 ==========
+        let (transfer_result, batch_groups_info): (Result<TransferResult>, Option<Vec<BatchGroupInfo>>) = {
+            let share_root = infer_share_root(&filtered_file_list);
+            let groups = group_files_by_parent_dir(&filtered_file_list, &share_root);
+            let total_groups = groups.len();
 
-        let (transfer_result, batch_groups_info): (Result<TransferResult>, Option<Vec<BatchGroupInfo>>) =
-            if cross_dir_dups.is_empty() {
-                // === 快速路径：无跨目录同名文件，单次转存 ===
-                let transfer_result = client
+            // 诊断日志：跨目录同名检测（仅用于日志）
+            let cross_dir_dups = detect_cross_dir_duplicates(&filtered_file_list);
+            if !cross_dir_dups.is_empty() {
+                warn!(
+                        "检测到 {} 个跨目录同名 basename: {:?}",
+                        cross_dir_dups.len(),
+                        cross_dir_dups.iter().take(10).collect::<Vec<_>>()
+                    );
+            }
+            info!(
+                    "按父目录分组转存: {} 个目录组, share_root={}, 每组文件数: {:?}",
+                    total_groups,
+                    share_root,
+                    groups.iter().map(|(id, f)| format!("{}={}", if id.is_empty() { "<root>" } else { id }, f.len())).collect::<Vec<_>>()
+                );
+
+            let mut all_results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> = Vec::new();
+
+            // 确保 save_path 本身存在（普通转存可能复用历史路径，路径被删后会导致 errno=2）
+            // 这里提前创建一次，避免根批次 relative_parent=="" 时无法补建。
+            let save_base = save_path.trim_end_matches('/');
+            if !save_base.is_empty() {
+                let mut cumulative = String::new();
+                for seg in save_base.split('/').filter(|s| !s.is_empty()) {
+                    cumulative.push('/');
+                    cumulative.push_str(seg);
+                    let _ = client.create_folder(&cumulative).await;
+                }
+            }
+
+            for (batch_idx, (relative_parent, group_files)) in groups.into_iter().enumerate() {
+                let batch_num = batch_idx + 1;
+
+                // 检查取消
+                if cancellation_token.is_cancelled() {
+                    warn!("分批转存被取消: batch {}/{}", batch_num, total_groups);
+                    break;
+                }
+
+                let group_target_dir = if relative_parent.is_empty() {
+                    save_path.clone()
+                } else {
+                    format!("{}/{}", save_path.trim_end_matches('/'), relative_parent)
+                };
+
+                info!(
+                        "转存批次 {}/{}: {} 个文件 -> {} (原始父目录={})",
+                        batch_num, total_groups, group_files.len(), group_target_dir,
+                        if relative_parent.is_empty() { "<root>" } else { &relative_parent }
+                    );
+
+                // 预建目标目录（百度转存 API 不会自动创建目标路径）
+                if !relative_parent.is_empty() {
+                    if let Err(e) = client.create_folder(&group_target_dir).await {
+                        let err_msg = e.to_string();
+                        if !err_msg.contains("errno=-8") {
+                            warn!("预建批次目录失败（将在转存时重试）: {}, error={}", group_target_dir, err_msg);
+                        }
+                    }
+                }
+
+                // 提取该组的 fs_ids
+                let group_fs_ids: Vec<u64> = group_files.iter().map(|f| f.fs_id).collect();
+
+                // 转存该组
+                let result = client
                     .transfer_share_files(
                         &share_info.shareid,
                         &share_info.share_uk,
                         &share_info.bdstoken,
-                        &fs_ids,
-                        &save_path,
+                        &group_fs_ids,
+                        &group_target_dir,
                         &referer,
                         Some(task_id),
                     )
                     .await;
 
-                // 如果转存失败且错误是"路径不存在"(errno=2)，尝试创建目录后重试一次
-                let transfer_result = match &transfer_result {
-                    Ok(result) if !result.success => {
-                        let err_msg = result.error.as_deref().unwrap_or("");
+                // errno=2 重试：逐级创建中间目录后重试一次
+                let result = match &result {
+                    Ok(r) if !r.success => {
+                        let err_msg = r.error.as_deref().unwrap_or("");
                         if err_msg.contains("errno\":2") || err_msg.contains("路径不存在") {
-                            warn!("转存路径不存在，尝试创建目录后重试: {}", save_path);
-
-                            let parent_path = save_path.trim_end_matches('/');
-                            if let Some(parent) = parent_path.rsplit_once('/').map(|(p, _)| p) {
-                                if !parent.is_empty() {
-                                    let _ = client.create_folder(parent).await;
-                                }
+                            warn!("批次 {} 路径不存在，逐级创建目录后重试: {}", batch_num, group_target_dir);
+                            let save_base = save_path.trim_end_matches('/');
+                            let mut cumulative = String::new();
+                            for seg in save_base.split('/').filter(|s| !s.is_empty()) {
+                                cumulative.push('/');
+                                cumulative.push_str(seg);
+                                let _ = client.create_folder(&cumulative).await;
                             }
-                            let _ = client.create_folder(&save_path).await;
-
-                            info!("重试转存: {} 个文件 -> {}", fs_ids.len(), save_path);
+                            let segments: Vec<&str> = relative_parent.split('/').filter(|s| !s.is_empty()).collect();
+                            let mut cumulative = save_base.to_string();
+                            for seg in &segments {
+                                cumulative = format!("{}/{}", cumulative, seg);
+                                let _ = client.create_folder(&cumulative).await;
+                            }
                             client
                                 .transfer_share_files(
                                     &share_info.shareid,
                                     &share_info.share_uk,
                                     &share_info.bdstoken,
-                                    &fs_ids,
-                                    &save_path,
+                                    &group_fs_ids,
+                                    &group_target_dir,
                                     &referer,
                                     Some(task_id),
                                 )
                                 .await
                         } else {
-                            transfer_result
+                            result
                         }
                     }
-                    _ => transfer_result,
+                    _ => result,
                 };
 
-                (transfer_result, None)
-            } else {
-                // === 慢速路径：存在跨目录同名文件，分批转存 ===
-                warn!(
-                    "检测到 {} 个跨目录同名 basename，启用分批转存: {:?}",
-                    cross_dir_dups.len(),
-                    cross_dir_dups.iter().take(10).collect::<Vec<_>>()
-                );
-
-                let groups = group_files_by_conflict(&filtered_file_list);
-                let total_groups = groups.len();
+                let batch_ok = match &result {
+                    Ok(r) => r.success,
+                    Err(_) => false,
+                };
                 info!(
-                    "分组结果: {} 个安全组, 每组文件数: {:?}",
-                    total_groups,
-                    groups.iter().map(|(id, f)| format!("{}={}", id, f.len())).collect::<Vec<_>>()
-                );
-
-                let mut all_results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> = Vec::new();
-
-                for (batch_idx, (group_id, group_files)) in groups.into_iter().enumerate() {
-                    let batch_num = batch_idx + 1;
-
-                    // 检查取消
-                    if cancellation_token.is_cancelled() {
-                        warn!("分批转存被取消: batch {}/{}", batch_num, total_groups);
-                        break;
-                    }
-
-                    let group_target_dir = format!("{}/group_{}", save_path, batch_num);
-
-                    info!(
-                        "转存批次 {}/{}: {} 个文件 -> {}",
-                        batch_num, total_groups, group_files.len(), group_target_dir
-                    );
-
-                    // 创建组专属目标目录
-                    if let Err(e) = client.create_folder(&group_target_dir).await {
-                        let err_msg = e.to_string();
-                        if !err_msg.contains("errno=-8") {
-                            warn!("创建组目录失败: {}, error={}", group_target_dir, err_msg);
-                        }
-                    }
-
-                    // 提取该组的 fs_ids
-                    let group_fs_ids: Vec<u64> = group_files.iter().map(|f| f.fs_id).collect();
-
-                    // 转存该组
-                    let result = client
-                        .transfer_share_files(
-                            &share_info.shareid,
-                            &share_info.share_uk,
-                            &share_info.bdstoken,
-                            &group_fs_ids,
-                            &group_target_dir,
-                            &referer,
-                            Some(task_id),
-                        )
-                        .await;
-
-                    let batch_ok = match &result {
-                        Ok(r) => r.success,
-                        Err(_) => false,
-                    };
-                    info!(
                         "批次 {}/{} 结果: success={}",
                         batch_num, total_groups, batch_ok
                     );
 
-                    all_results.push((batch_num, group_id, group_files, result));
+                all_results.push((batch_num, relative_parent, group_files, result));
 
-                    // 批次之间添加防抖延时
-                    if batch_num < total_groups {
-                        tokio::time::sleep(Duration::from_millis(800)).await;
-                    }
+                // 批次之间添加防抖延时
+                if batch_num < total_groups {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
                 }
+            }
 
-                // 取消检查：如果是因为取消而 break，不走 merge 成功分支
-                if cancellation_token.is_cancelled() {
-                    warn!("分批转存已取消，跳过结果合并");
-                    (Err(anyhow::anyhow!("分批转存被用户取消")), None)
-                } else {
-                    let (merged, groups_info) = merge_batch_results(all_results, &save_path);
+            // 取消检查：如果是因为取消而 break，不走 merge 成功分支
+            if cancellation_token.is_cancelled() {
+                warn!("分批转存已取消，跳过结果合并");
+                (Err(anyhow::anyhow!("分批转存被用户取消")), None)
+            } else {
+                let (merged, groups_info) = merge_batch_results(all_results, &save_path);
 
-                    // 如果有部分失败警告，保存到内存状态并持久化
-                    if merged.success {
-                        if let Some(ref warning) = merged.error {
-                            {
-                                let mut t = task.write().await;
-                                t.error = Some(warning.clone());
-                            }
-                            // 持久化警告信息（不改变任务状态），确保重启后可见
-                            if let Some(ref pm_arc) = persistence_manager {
-                                let pm = pm_arc.lock().await;
-                                if let Err(e) = pm.update_transfer_warning(task_id, warning.clone()) {
-                                    warn!("持久化分批转存警告失败: {}", e);
-                                }
+                // 如果有部分失败警告，保存到内存状态并持久化
+                if merged.success {
+                    if let Some(ref warning) = merged.error {
+                        {
+                            let mut t = task.write().await;
+                            t.error = Some(warning.clone());
+                        }
+                        // 持久化警告信息（不改变任务状态），确保重启后可见
+                        if let Some(ref pm_arc) = persistence_manager {
+                            let pm = pm_arc.lock().await;
+                            if let Err(e) = pm.update_transfer_warning(task_id, warning.clone()) {
+                                warn!("持久化分批转存警告失败: {}", e);
                             }
                         }
                     }
-
-                    (Ok(merged), Some(groups_info))
                 }
-            };
+
+                (Ok(merged), Some(groups_info))
+            }
+        };
 
         match transfer_result {
             Ok(result) => {
@@ -1545,7 +1549,7 @@ impl TransferManager {
         task_id: &str,
         transfer_result: TransferResult,
         file_list: Vec<SharedFileInfo>,
-        _save_path: String,
+        save_path: String,
         cancellation_token: CancellationToken,
         is_share_direct_download: bool,
         batch_groups_info: Option<Vec<BatchGroupInfo>>,
@@ -1604,33 +1608,28 @@ impl TransferManager {
         let mut download_files: Vec<(u64, String, String, u64, PathBuf)> = Vec::new();
         let mut download_folders: Vec<(String, PathBuf)> = Vec::new(); // (remote_path, local_dir)
 
-        // 构建 remote_path → group_id 映射（分批转存时用于确定本地子目录）
-        let path_to_group: HashMap<String, String> = if let Some(ref groups) = batch_groups_info {
-            let mut map = HashMap::new();
-            for group in groups {
-                for path in &group.transferred_paths {
-                    map.insert(path.clone(), group.group_id.clone());
-                }
-            }
-            map
-        } else {
-            HashMap::new()
-        };
         let is_batch = batch_groups_info.is_some();
 
         // 🔥 构建两级查找映射：
         //   1. path → SharedFileInfo：用原始分享路径精确匹配（无歧义，优先使用）
-        //   2. (name, is_dir) → SharedFileInfo：名称 + 类型匹配（防止文件/文件夹错配）
+        //   2. (name, is_dir) → Vec<SharedFileInfo>：名称 + 类型匹配（多值，支持同名文件消歧）
         // 注意：transferred_fs_ids 是百度返回的转存后新 fs_id（to_fs_id），
         // 与 file_list 中的原始分享 fs_id 不同，无法直接用 fs_id 匹配。
         let file_info_by_path: std::collections::HashMap<&str, &SharedFileInfo> = file_list
             .iter()
             .map(|f| (f.path.as_str(), f))
             .collect();
-        let file_info_by_name_dir: std::collections::HashMap<(&str, bool), &SharedFileInfo> = file_list
-            .iter()
-            .map(|f| ((f.name.as_str(), f.is_dir), f))
-            .collect();
+        let mut file_info_by_name_dir: std::collections::HashMap<(&str, bool), Vec<&SharedFileInfo>> =
+            std::collections::HashMap::new();
+        for f in &file_list {
+            file_info_by_name_dir
+                .entry((f.name.as_str(), f.is_dir))
+                .or_default()
+                .push(f);
+        }
+
+        let save_prefix = save_path.trim_end_matches('/');
+        let share_root = infer_share_root(&file_list);
 
         for (idx, transferred_path) in transfer_result.transferred_paths.iter().enumerate() {
             let transferred_fs_id = transfer_result.transferred_fs_ids.get(idx).copied();
@@ -1639,34 +1638,47 @@ impl TransferManager {
                 .map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
             let to_filename = transferred_path.rsplit('/').next().unwrap_or(transferred_path);
 
-            // 确定该文件的本地下载目录
-            let local_dir = if is_batch {
-                if let Some(group_id) = path_to_group.get(transferred_path.as_str()) {
-                    download_dir.join(group_id)
-                } else {
-                    // 未找到组映射（不应发生），回退到默认目录
-                    warn!("分批转存文件未找到组映射: path={}", transferred_path);
-                    download_dir.clone()
-                }
+            // transferred_path 相对于 save_path 的父目录（用于同名消歧）
+            let transferred_relative_parent = if transferred_path.starts_with(save_prefix) {
+                let relative = transferred_path[save_prefix.len()..].trim_start_matches('/');
+                Path::new(relative).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
             } else {
-                download_dir.clone()
+                String::new()
             };
 
             // 匹配优先级：
             // 1. from_path 全路径精确匹配（最可靠，可区分同名文件）
-            // 2. from_filename + is_dir 匹配（防止文件/文件夹错配）
+            // 2. from_filename + is_dir 匹配，多候选时用 transferred_path 的父目录消歧
             // 3. to_filename + is_dir 匹配（百度可能重命名，最后手段）
             let file_info = from_path
                 .and_then(|p| file_info_by_path.get(p.as_str()).copied())
                 .or_else(|| {
                     let name = from_filename.as_deref().unwrap_or(to_filename);
-                    file_info_by_name_dir.get(&(name, false)).copied()
-                        .or_else(|| file_info_by_name_dir.get(&(name, true)).copied())
+                    Self::disambiguate_by_parent(
+                        &file_info_by_name_dir, name, &transferred_relative_parent, &share_root,
+                    )
                 })
                 .or_else(|| {
-                    file_info_by_name_dir.get(&(to_filename, false)).copied()
-                        .or_else(|| file_info_by_name_dir.get(&(to_filename, true)).copied())
+                    Self::disambiguate_by_parent(
+                        &file_info_by_name_dir, to_filename, &transferred_relative_parent, &share_root,
+                    )
                 });
+
+            // 按远端 transferred_path 相对于 save_path 的父目录来算 local_dir，
+            // 保持本地目录结构与远端一致（普通转存和分享直下统一逻辑）。
+            let local_dir = if transferred_path.starts_with(save_prefix) {
+                let relative = transferred_path[save_prefix.len()..].trim_start_matches('/');
+                match Path::new(relative).parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => download_dir.join(parent),
+                    _ => download_dir.clone(),
+                }
+            } else {
+                warn!(
+                    "transferred_path 不以 save_path 开头，回退到下载根目录: transferred_path={}, save_path={}",
+                    transferred_path, save_path
+                );
+                download_dir.clone()
+            };
 
             if let Some(file_info) = file_info {
                 info!("匹配文件信息: idx={}, name={}, is_dir={}, transferred_fs_id={:?}",
@@ -1704,7 +1716,7 @@ impl TransferManager {
         // 创建文件下载任务
         let mut download_task_ids = Vec::new();
         for (fs_id, remote_path, filename, size, local_dir) in download_files {
-            // 确保本地下载目录存在（分批模式下可能是 download_dir/group_N/）
+            // 确保本地下载目录存在（分批模式下可能是按原始结构还原出的父目录）
             if !local_dir.exists() {
                 if let Err(e) = tokio::fs::create_dir_all(&local_dir).await {
                     warn!("创建本地下载目录失败: {:?}, error={}", local_dir, e);
@@ -2381,6 +2393,56 @@ impl TransferManager {
                 }
             }
         }
+    }
+
+    /// 同名文件消歧：从多候选 SharedFileInfo 中，用精确的相对父目录匹配。
+    ///
+    /// 合并所有同名候选（不区分 is_dir），计算每个候选相对于 share_root 的父目录，
+    /// 与 transferred_relative_parent 做精确相等比较（非 ends_with），避免：
+    /// - `/root/a/b/7.mp4` 和 `/root/x/a/b/7.mp4` 因后缀相同而误配
+    /// - 空 transferred_relative_parent 盲目回退到第一个候选
+    /// - 文件/文件夹因 is_dir 固定顺序而错配
+    fn disambiguate_by_parent<'a>(
+        map: &std::collections::HashMap<(&str, bool), Vec<&'a SharedFileInfo>>,
+        name: &str,
+        transferred_relative_parent: &str,
+        share_root: &str,
+    ) -> Option<&'a SharedFileInfo> {
+        // 合并所有同名候选（文件 + 文件夹）
+        let mut all_candidates: Vec<&'a SharedFileInfo> = Vec::new();
+        if let Some(files) = map.get(&(name, false)) {
+            all_candidates.extend(files);
+        }
+        if let Some(dirs) = map.get(&(name, true)) {
+            all_candidates.extend(dirs);
+        }
+
+        if all_candidates.is_empty() {
+            return None;
+        }
+        if all_candidates.len() == 1 {
+            return Some(all_candidates[0]);
+        }
+
+        // 多候选：计算每个候选的精确相对父目录，与 transferred_relative_parent 比较
+        for c in &all_candidates {
+            let original_parent = extract_parent_dir_str(&c.path);
+            let candidate_relative = if !share_root.is_empty() && original_parent.starts_with(share_root) {
+                original_parent[share_root.len()..].trim_start_matches('/')
+            } else {
+                original_parent.trim_start_matches('/')
+            };
+            if candidate_relative == transferred_relative_parent {
+                return Some(c);
+            }
+        }
+
+        // 消歧失败，回退到第一个候选并警告
+        warn!(
+            "同名消歧失败: name={}, transferred_parent={}, candidates={}",
+            name, transferred_relative_parent, all_candidates.len()
+        );
+        Some(all_candidates[0])
     }
 
     /// 从错误消息中提取 task_errno 值
@@ -3792,63 +3854,43 @@ fn detect_cross_dir_duplicates(files: &[SharedFileInfo]) -> Vec<String> {
         .collect()
 }
 
-/// 按冲突关系分组文件（贪心策略，最小化批次数）
+/// 推导分享链接的虚拟根路径，用于计算文件的相对目录结构。
 ///
-/// 同名文件（basename 相同但父目录不同）不能在同一组。
-/// 非冲突文件尽量放入已有组，减少组数。
-fn group_files_by_conflict(files: &[SharedFileInfo]) -> Vec<(String, Vec<SharedFileInfo>)> {
-    // 找出所有冲突的 basename（跨目录同名）
-    let conflict_basenames: std::collections::HashSet<String> = {
-        let mut basename_to_parents: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-        for file in files {
-            let basename = extract_basename_str(&file.path).to_string();
-            let parent = extract_parent_dir_str(&file.path).to_string();
-            basename_to_parents.entry(basename).or_default().insert(parent);
-        }
-        basename_to_parents
-            .into_iter()
-            .filter(|(_, parents)| parents.len() > 1)
-            .map(|(basename, _)| basename)
-            .collect()
-    };
+/// 分享文件路径格式: `/sharelink{share_id}-{uk}/实际目录/文件名`
+/// 第一段 `/sharelink...` 是虚拟命名空间，后续路径是用户原始的目录结构，应完整保留。
+/// 因此 share_root 取第一个路径段，而非最长公共前缀（后者会吃掉中间层级）。
+fn infer_share_root(files: &[SharedFileInfo]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let first_path = &files[0].path;
+    let segments: Vec<&str> = first_path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return String::new();
+    }
+    format!("/{}", segments[0])
+}
 
-    // 贪心分组
-    let mut groups: Vec<Vec<SharedFileInfo>> = Vec::new();
+/// 按原始父目录分组文件，保留分享链接中的目录结构。
+///
+/// 每个组的 key 是相对于 share_root 的父目录路径（如 "抖音"、"微信"），
+/// 同一父目录下的文件天然不会有同名冲突。
+fn group_files_by_parent_dir(files: &[SharedFileInfo], share_root: &str) -> Vec<(String, Vec<SharedFileInfo>)> {
+    let mut groups: HashMap<String, Vec<SharedFileInfo>> = HashMap::new();
 
     for file in files {
-        let basename = extract_basename_str(&file.path).to_string();
-
-        let mut added = false;
-        if conflict_basenames.contains(&basename) {
-            // 冲突文件：只能加入不包含同名文件的组
-            for group in &mut groups {
-                let has_conflict = group.iter().any(|g| {
-                    extract_basename_str(&g.path) == basename
-                });
-                if !has_conflict {
-                    group.push(file.clone());
-                    added = true;
-                    break;
-                }
-            }
+        let parent = extract_parent_dir_str(&file.path);
+        let relative_parent = if !share_root.is_empty() && parent.starts_with(share_root) {
+            parent[share_root.len()..].trim_start_matches('/').to_string()
         } else {
-            // 非冲突文件：加入第一个组
-            if let Some(group) = groups.first_mut() {
-                group.push(file.clone());
-                added = true;
-            }
-        }
-
-        if !added {
-            groups.push(vec![file.clone()]);
-        }
+            parent.trim_start_matches('/').to_string()
+        };
+        groups.entry(relative_parent).or_default().push(file.clone());
     }
 
-    groups
-        .into_iter()
-        .enumerate()
-        .map(|(idx, files)| (format!("group_{}", idx + 1), files))
-        .collect()
+    let mut result: Vec<(String, Vec<SharedFileInfo>)> = groups.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
 }
 
 /// 合并分批转存结果
@@ -3880,7 +3922,11 @@ fn merge_batch_results(
 
                 batch_groups_info.push(BatchGroupInfo {
                     group_id: group_id.clone(),
-                    remote_dir: format!("{}/group_{}", temp_dir, batch_index),
+                    remote_dir: if group_id.is_empty() {
+                        temp_dir.to_string()
+                    } else {
+                        format!("{}/{}", temp_dir.trim_end_matches('/'), group_id)
+                    },
                     files: group_files,
                     transferred_paths: r.transferred_paths,
                     transferred_fs_ids: r.transferred_fs_ids,
@@ -4078,74 +4124,133 @@ mod tests {
         assert!(detect_cross_dir_duplicates(&[]).is_empty());
     }
 
-    // ========== group_files_by_conflict ==========
+    // ========== group_files_by_parent_dir ==========
 
     #[test]
-    fn test_group_no_conflict_single_group() {
+    fn test_group_by_parent_same_dir_single_group() {
         let files = vec![
-            make_file("/a/1.jpg", 1),
-            make_file("/b/2.jpg", 2),
-            make_file("/c/3.jpg", 3),
+            make_file("/root/a/1.jpg", 1),
+            make_file("/root/a/2.jpg", 2),
+            make_file("/root/a/3.jpg", 3),
         ];
-        let groups = group_files_by_conflict(&files);
-        assert_eq!(groups.len(), 1, "无冲突时应只有 1 个组");
+        let share_root = infer_share_root(&files);
+        // share_root = "/root"（第一路径段），relative_parent = "a"
+        assert_eq!(share_root, "/root");
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 1, "同目录文件应只有 1 个组");
+        assert_eq!(groups[0].0, "a");
         assert_eq!(groups[0].1.len(), 3);
     }
 
     #[test]
-    fn test_group_two_conflict_two_groups() {
+    fn test_group_by_parent_cross_dir_duplicates() {
         let files = vec![
-            make_file("/A/1.jpg", 1),
-            make_file("/B/1.jpg", 2),
+            make_file("/root/抖音/1.jpg", 1),
+            make_file("/root/微信/1.jpg", 2),
         ];
-        let groups = group_files_by_conflict(&files);
-        assert_eq!(groups.len(), 2, "2 个跨目录同名文件需要 2 个组");
-        for (_, g) in &groups {
-            assert_eq!(g.len(), 1);
-        }
+        let share_root = infer_share_root(&files);
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 2, "不同父目录应分为 2 个组");
+        // sorted by UTF-8 byte order: 微信 < 抖音
+        let keys: Vec<&str> = groups.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"抖音"));
+        assert!(keys.contains(&"微信"));
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[1].1.len(), 1);
     }
 
     #[test]
-    fn test_group_non_conflict_files_join_first_group() {
+    fn test_group_by_parent_mixed_dirs() {
         let files = vec![
-            make_file("/A/1.jpg", 1),
-            make_file("/B/1.jpg", 2),
-            make_file("/C/2.jpg", 3),
-            make_file("/D/3.jpg", 4),
+            make_file("/root/A/1.jpg", 1),
+            make_file("/root/B/1.jpg", 2),
+            make_file("/root/A/2.jpg", 3),
+            make_file("/root/C/3.jpg", 4),
         ];
-        let groups = group_files_by_conflict(&files);
-        // 1.jpg 需要 2 个组；2.jpg 和 3.jpg 无冲突可加入第一个组
-        assert_eq!(groups.len(), 2, "只有 1.jpg 冲突，共 2 个组");
+        let share_root = infer_share_root(&files);
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 3, "3 个不同父目录应分为 3 个组");
         let total: usize = groups.iter().map(|(_, g)| g.len()).sum();
         assert_eq!(total, 4, "所有文件都应被分配");
+        // A 组应有 2 个文件
+        let a_group = groups.iter().find(|(id, _)| id == "A").unwrap();
+        assert_eq!(a_group.1.len(), 2);
     }
 
     #[test]
-    fn test_group_three_way_conflict() {
+    fn test_group_by_parent_deeply_nested() {
         let files = vec![
-            make_file("/A/x.jpg", 1),
-            make_file("/B/x.jpg", 2),
-            make_file("/C/x.jpg", 3),
+            make_file("/root/a/b/file.jpg", 1),
+            make_file("/root/c/d/file.jpg", 2),
         ];
-        let groups = group_files_by_conflict(&files);
-        assert_eq!(groups.len(), 3, "3 个跨目录同名文件需要 3 个组");
+        let share_root = infer_share_root(&files);
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 2);
+        // sorted: "a/b" < "c/d"
+        assert_eq!(groups[0].0, "a/b");
+        assert_eq!(groups[1].0, "c/d");
     }
 
     #[test]
-    fn test_group_ids_are_group_1_2_etc() {
-        let files = vec![
-            make_file("/A/1.jpg", 1),
-            make_file("/B/1.jpg", 2),
-        ];
-        let groups = group_files_by_conflict(&files);
-        assert_eq!(groups[0].0, "group_1");
-        assert_eq!(groups[1].0, "group_2");
-    }
-
-    #[test]
-    fn test_group_empty_input() {
-        let groups = group_files_by_conflict(&[]);
+    fn test_group_by_parent_empty_input() {
+        let groups = group_files_by_parent_dir(&[], "");
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_infer_share_root_for_cross_dir_duplicates() {
+        let files = vec![
+            make_file("/root/dir_a/7.mp4", 1),
+            make_file("/root/dir_b/7.mp4", 2),
+        ];
+        assert_eq!(infer_share_root(&files), "/root");
+    }
+
+    // ========== local_dir derivation from transferred_path ==========
+
+    #[test]
+    fn test_local_dir_from_transferred_path_with_subdir() {
+        let download_dir = PathBuf::from("D:/Downloads");
+        let save_path = "/.bpr_share_temp/uuid123/";
+        let transferred_path = "/.bpr_share_temp/uuid123/抖音/photo.jpg";
+
+        let save_prefix = save_path.trim_end_matches('/');
+        let relative = transferred_path[save_prefix.len()..].trim_start_matches('/');
+        let local_dir = match Path::new(relative).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => download_dir.join(parent),
+            _ => download_dir.clone(),
+        };
+        assert_eq!(local_dir, download_dir.join("抖音"));
+    }
+
+    #[test]
+    fn test_local_dir_from_transferred_path_root_file() {
+        let download_dir = PathBuf::from("D:/Downloads");
+        let save_path = "/.bpr_share_temp/uuid123/";
+        let transferred_path = "/.bpr_share_temp/uuid123/photo.jpg";
+
+        let save_prefix = save_path.trim_end_matches('/');
+        let relative = transferred_path[save_prefix.len()..].trim_start_matches('/');
+        let local_dir = match Path::new(relative).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => download_dir.join(parent),
+            _ => download_dir.clone(),
+        };
+        assert_eq!(local_dir, download_dir);
+    }
+
+    #[test]
+    fn test_local_dir_from_transferred_path_deeply_nested() {
+        let download_dir = PathBuf::from("D:/Downloads");
+        let save_path = "/.bpr_share_temp/uuid123";
+        let transferred_path = "/.bpr_share_temp/uuid123/a/b/file.jpg";
+
+        let save_prefix = save_path.trim_end_matches('/');
+        let relative = transferred_path[save_prefix.len()..].trim_start_matches('/');
+        let local_dir = match Path::new(relative).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => download_dir.join(parent),
+            _ => download_dir.clone(),
+        };
+        assert_eq!(local_dir, download_dir.join("a/b"));
     }
 
     // ========== merge_batch_results ==========
@@ -4154,43 +4259,45 @@ mod tests {
     fn test_merge_all_success() {
         let r1 = TransferResult {
             success: true,
-            transferred_paths: vec!["/tmp/group_1/a.jpg".to_string()],
-            from_paths: vec!["/share/a.jpg".to_string()],
+            transferred_paths: vec!["/tmp/抖音/photo.jpg".to_string()],
+            from_paths: vec!["/share/抖音/photo.jpg".to_string()],
             transferred_fs_ids: vec![100],
             error: None,
         };
         let r2 = TransferResult {
             success: true,
-            transferred_paths: vec!["/tmp/group_2/b.jpg".to_string()],
-            from_paths: vec!["/share/b.jpg".to_string()],
+            transferred_paths: vec!["/tmp/微信/photo.jpg".to_string()],
+            from_paths: vec!["/share/微信/photo.jpg".to_string()],
             transferred_fs_ids: vec![200],
             error: None,
         };
         let results = vec![
-            (1usize, "group_1".to_string(), vec![make_file("/share/a.jpg", 1)], Ok(r1)),
-            (2usize, "group_2".to_string(), vec![make_file("/share/b.jpg", 2)], Ok(r2)),
+            (1usize, "抖音".to_string(), vec![make_file("/share/抖音/photo.jpg", 1)], Ok(r1)),
+            (2usize, "微信".to_string(), vec![make_file("/share/微信/photo.jpg", 2)], Ok(r2)),
         ];
-        let (merged, groups_info) = merge_batch_results(results, "/tmp/group");
+        let (merged, groups_info) = merge_batch_results(results, "/tmp");
         assert!(merged.success);
         assert!(merged.error.is_none());
         assert_eq!(merged.transferred_paths.len(), 2);
         assert_eq!(groups_info.len(), 2);
+        assert_eq!(groups_info[0].remote_dir, "/tmp/抖音");
+        assert_eq!(groups_info[1].remote_dir, "/tmp/微信");
     }
 
     #[test]
     fn test_merge_partial_failure_still_success() {
         let r1 = TransferResult {
             success: true,
-            transferred_paths: vec!["/tmp/group_1/a.jpg".to_string()],
-            from_paths: vec!["/share/a.jpg".to_string()],
+            transferred_paths: vec!["/tmp/抖音/a.jpg".to_string()],
+            from_paths: vec!["/share/抖音/a.jpg".to_string()],
             transferred_fs_ids: vec![100],
             error: None,
         };
         let results = vec![
-            (1usize, "group_1".to_string(), vec![make_file("/share/a.jpg", 1)], Ok(r1)),
-            (2usize, "group_2".to_string(), vec![make_file("/share/b.jpg", 2)], Err(anyhow::anyhow!("api error"))),
+            (1usize, "抖音".to_string(), vec![make_file("/share/抖音/a.jpg", 1)], Ok(r1)),
+            (2usize, "微信".to_string(), vec![make_file("/share/微信/b.jpg", 2)], Err(anyhow::anyhow!("api error"))),
         ];
-        let (merged, groups_info) = merge_batch_results(results, "/tmp/group");
+        let (merged, groups_info) = merge_batch_results(results, "/tmp");
         assert!(merged.success, "至少一个批次成功应返回 success=true");
         assert!(merged.error.is_some(), "部分失败时应记录 error 警告");
         assert_eq!(merged.transferred_paths.len(), 1);
@@ -4200,10 +4307,10 @@ mod tests {
     #[test]
     fn test_merge_all_fail() {
         let results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> = vec![
-            (1usize, "group_1".to_string(), vec![], Err(anyhow::anyhow!("fail 1"))),
-            (2usize, "group_2".to_string(), vec![], Err(anyhow::anyhow!("fail 2"))),
+            (1usize, "抖音".to_string(), vec![], Err(anyhow::anyhow!("fail 1"))),
+            (2usize, "微信".to_string(), vec![], Err(anyhow::anyhow!("fail 2"))),
         ];
-        let (merged, groups_info) = merge_batch_results(results, "/tmp/group");
+        let (merged, groups_info) = merge_batch_results(results, "/tmp");
         assert!(!merged.success, "所有批次失败应返回 success=false");
         assert!(merged.error.is_some());
         assert!(groups_info.is_empty());
@@ -4219,10 +4326,12 @@ mod tests {
             error: None,
         };
         let results = vec![
-            (1usize, "group_1".to_string(), vec![], Ok(r1)),
+            (1usize, "".to_string(), vec![], Ok(r1)),
         ];
-        let (merged, _) = merge_batch_results(results, "/tmp");
+        let (merged, groups_info) = merge_batch_results(results, "/tmp");
         assert!(merged.success);
         assert!(merged.error.is_none());
+        // empty group_id means root level, remote_dir should be temp_dir itself
+        assert_eq!(groups_info[0].remote_dir, "/tmp");
     }
 }

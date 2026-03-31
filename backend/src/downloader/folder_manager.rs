@@ -362,11 +362,6 @@ impl FolderDownloadManager {
                 continue;
             }
 
-            let completed_count = tasks
-                .iter()
-                .filter(|t| t.status == TaskStatus::Completed)
-                .count() as u64;
-
             let downloaded_size: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
 
             // 🔥 收集需要分配槽位的子任务（没有槽位且非完成状态）
@@ -382,7 +377,12 @@ impl FolderDownloadManager {
                 if let Some(folder) = folders.get_mut(&folder_id) {
                     // 🔥 注意：不再从 tasks 计算 completed_count，因为已完成的任务会从内存移除
                     // completed_count 由 start_task_completed_listener 维护
-                    folder.downloaded_size = downloaded_size;
+
+                    // 🔥 初始化 completed_downloaded_size：
+                    // folder.downloaded_size 来自持久化，已包含已完成任务的字节数
+                    // downloaded_size（此处变量）= 仅活跃任务之和
+                    // 差值即为已完成任务的累计字节数
+                    folder.completed_downloaded_size = folder.downloaded_size.saturating_sub(downloaded_size);
 
                     // 🔥 维护 borrowed_subtask_map：记录使用借调位的子任务
                     // 这样在回收借调位时才能正确找到并暂停对应的子任务
@@ -434,8 +434,8 @@ impl FolderDownloadManager {
                         "同步文件夹 {} 进度: {} 个子任务, {} 已完成, 已下载 {} bytes, 借调位映射 {} 个",
                         folder.name,
                         tasks.len(),
-                        completed_count,
-                        downloaded_size,
+                        folder.completed_count,
+                        folder.downloaded_size,
                         folder.borrowed_subtask_map.len()
                     );
                 }
@@ -630,7 +630,7 @@ impl FolderDownloadManager {
     /// 设置下载管理器
     pub async fn set_download_manager(&self, manager: Arc<DownloadManager>) {
         // 创建任务完成通知 channel（发送 group_id 和 task_id）
-        let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
+        let (tx, rx) = mpsc::unbounded_channel::<(String, String, u64, bool)>();
 
         // 设置 sender 到 download_manager
         manager.set_task_completed_sender(tx).await;
@@ -699,42 +699,36 @@ impl FolderDownloadManager {
                 let folder_info = {
                     let folders_guard = folders.read().await;
                     folders_guard.get(&folder_id).map(|f| {
-                        (f.total_files, f.total_size, f.status.clone(), f.completed_count, f.downloaded_size)
+                        (f.total_files, f.total_size, f.status.clone(), f.completed_count)
                     })
                 };
 
-                let (total_files, total_size, status, completed_files, folder_downloaded_size) = match folder_info {
+                let (total_files, total_size, status, completed_files) = match folder_info {
                     Some(info) => info,
                     None => continue,
                 };
 
-                // 获取该文件夹的所有子任务
+                // 获取该文件夹的所有活跃子任务
                 let tasks = dm.get_tasks_by_group(&folder_id).await;
 
-                // 🔥 即使 tasks 为空，如果已完成也要发送进度事件
-                // 因为已完成的任务会从内存中移除
-                let (downloaded_size, speed) = if tasks.is_empty() {
-                    // 使用 folder 中保存的 downloaded_size
-                    (folder_downloaded_size, 0)
-                } else {
-                    let downloaded: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
-                    let spd: u64 = tasks
-                        .iter()
-                        .filter(|t| t.status == TaskStatus::Downloading)
-                        .map(|t| t.speed)
-                        .sum();
-                    (downloaded, spd)
-                };
+                // 🔥 计算活跃子任务的已下载字节数和速度
+                let active_downloaded: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
+                let speed: u64 = tasks
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::Downloading)
+                    .map(|t| t.speed)
+                    .sum();
 
-                // 更新文件夹的 downloaded_size（实时同步）
-                // 🔥 注意：不再从 tasks 计算 completed_count，因为已完成的任务会从内存移除
-                // completed_count 由 start_task_completed_listener 维护
-                if !tasks.is_empty() {
+                // 🔥 使用 compute_downloaded_size：completed_downloaded_size + active_sum
+                // max() 保证即使完成通知和进度通知乱序也不会丢字节
+                let downloaded_size = {
                     let mut folders_guard = folders.write().await;
                     if let Some(folder) = folders_guard.get_mut(&folder_id) {
-                        folder.downloaded_size = downloaded_size;
+                        folder.compute_downloaded_size(active_downloaded)
+                    } else {
+                        continue;
                     }
-                }
+                };
 
                 // 发布文件夹进度事件
                 ws.send_if_subscribed(
@@ -757,7 +751,7 @@ impl FolderDownloadManager {
     ///
     /// 当收到子任务完成通知时，立即从 pending_files 补充新任务
     /// 根据文件夹可用槽位数量（借调位+固定位）动态补充，充分利用槽位资源
-    fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<(String, String)>) {
+    fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<(String, String, u64, bool)>) {
         let folders = self.folders.clone();
         let download_manager = self.download_manager.clone();
         let wal_dir = self.wal_dir.clone();
@@ -765,7 +759,7 @@ impl FolderDownloadManager {
         let cancellation_tokens = self.cancellation_tokens.clone();
 
         tokio::spawn(async move {
-            while let Some((group_id, task_id)) = rx.recv().await {
+            while let Some((group_id, task_id, file_size, is_success)) = rx.recv().await {
                 // 获取下载管理器
                 let dm = {
                     let guard = download_manager.read().await;
@@ -804,14 +798,33 @@ impl FolderDownloadManager {
                                 None
                             };
 
-                            // 🔥 对未计数的任务递增 completed_count
-                            if !already_counted {
+                            if is_success && !already_counted {
+                                // 🔥 成功且未计数：递增 completed_count
                                 folder.counted_task_ids.insert(task_id.clone());
                                 folder.completed_count += 1;
-                                info!(
-                                    "文件夹 {} 已完成 {}/{} 个文件 (task_id={})",
-                                    group_id, folder.completed_count, folder.total_files, task_id
-                                );
+                                folder.completed_downloaded_size += file_size;
+                                // 如果之前失败过（retry→success），从 failed 中移除
+                                if folder.failed_task_ids.remove(&task_id) {
+                                    folder.failed_count = folder.failed_count.saturating_sub(1);
+                                    info!(
+                                        "文件夹 {} 子任务重试成功 {}/{} (task_id={}, file_size={})",
+                                        group_id, folder.completed_count, folder.total_files, task_id, file_size
+                                    );
+                                } else {
+                                    info!(
+                                        "文件夹 {} 已完成 {}/{} 个文件 (task_id={}, file_size={})",
+                                        group_id, folder.completed_count, folder.total_files, task_id, file_size
+                                    );
+                                }
+                            } else if !is_success && !already_counted {
+                                // 🔥 失败且未成功计数：记入 failed_task_ids（去重）
+                                if folder.failed_task_ids.insert(task_id.clone()) {
+                                    folder.failed_count += 1;
+                                    info!(
+                                        "文件夹 {} 子任务失败 (failed_count={}, task_id={})",
+                                        group_id, folder.failed_count, task_id
+                                    );
+                                }
                             }
 
                             slot_id
@@ -851,10 +864,6 @@ impl FolderDownloadManager {
                     }
                 };
 
-                if available == 0 {
-                    continue;
-                }
-
                 // 获取子任务列表统计活跃任务数
                 // 🔥 注意：不再从 tasks 计算 completed_count，因为已完成的任务会从内存移除
                 // 使用文件夹自己维护的 completed_count（在子任务完成时递增）
@@ -866,21 +875,16 @@ impl FolderDownloadManager {
                     })
                     .count();
 
-                // 🔥 关键修复：收集所有子任务已占用的槽位，用于防止重复分配
-                let mut used_slot_ids: std::collections::HashSet<usize> = tasks
-                    .iter()
-                    .filter_map(|t| t.slot_id)
-                    .collect();
-
-                // 根据余量补充任务
-                let files_to_create = {
+                // 🔥 终态检查必须在 available==0 之前，否则只有借调位的文件夹
+                // 在最后一个子任务结束后 available 变成 0，会卡在 downloading
+                {
                     let mut folders_guard = folders.write().await;
                     let folder = match folders_guard.get_mut(&group_id) {
                         Some(f) => f,
                         None => continue,
                     };
 
-                    // 检查状态
+                    // 检查状态：已终止的文件夹不需要继续处理
                     if folder.status == FolderStatus::Paused
                         || folder.status == FolderStatus::Cancelled
                         || folder.status == FolderStatus::Failed
@@ -933,8 +937,6 @@ impl FolderDownloadManager {
                         drop(folders_guard_mut);
 
                         // 🔥 发布状态变更事件
-                        // 注意：文件夹事件不传 group_id，因为文件夹本身就是主任务，不是子任务
-                        // 前端订阅的是 "folder" 类别，而不是 "folder:{folder_id}"
                         let ws = ws_manager.read().await;
                         if let Some(ref ws) = *ws {
                             ws.send_if_subscribed(
@@ -943,7 +945,7 @@ impl FolderDownloadManager {
                                     old_status,
                                     new_status: "completed".to_string(),
                                 }),
-                                None,  // 🔥 修复：文件夹事件不传 group_id
+                                None,
                             );
 
                             // 🔥 发布文件夹完成事件
@@ -952,9 +954,98 @@ impl FolderDownloadManager {
                                     folder_id: group_id.clone(),
                                     completed_at: chrono::Utc::now().timestamp_millis(),
                                 }),
-                                None,  // 🔥 修复：文件夹事件不传 group_id
+                                None,
                             );
                         }
+                        continue;
+                    }
+
+                    // 🔥 检查是否所有子任务都已终结（成功 + 失败 >= 总数）且有失败
+                    if folder.pending_files.is_empty()
+                        && folder.scan_completed
+                        && active_count == 0
+                        && folder.failed_count > 0
+                        && (folder.completed_count + folder.failed_count) >= folder.total_files
+                    {
+                        let old_status = format!("{:?}", folder.status).to_lowercase();
+                        let error_msg = format!("{} 个文件下载失败", folder.failed_count);
+                        folder.mark_failed(error_msg.clone());
+                        info!(
+                            "文件夹 {} 下载完成但有 {} 个失败 (completed={}, failed={})",
+                            folder.name, folder.failed_count, folder.completed_count, folder.failed_count
+                        );
+
+                        // 持久化
+                        let wal = wal_dir.read().await;
+                        if let Some(ref wal_path) = *wal {
+                            let persisted = FolderPersisted::from_folder(folder);
+                            if let Err(e) = save_folder(wal_path, &persisted) {
+                                error!("更新文件夹持久化状态失败: {}", e);
+                            }
+                        }
+
+                        // 释放槽位
+                        drop(folders_guard);
+                        let slot_pool = dm.task_slot_pool();
+                        slot_pool.release_all_slots(&group_id).await;
+                        info!("文件夹 {} 失败，已释放所有槽位", group_id);
+
+                        cancellation_tokens.write().await.remove(&group_id);
+                        dm.try_start_waiting_tasks().await;
+
+                        // 清理槽位记录
+                        let mut folders_guard_mut = folders.write().await;
+                        if let Some(folder_mut) = folders_guard_mut.get_mut(&group_id) {
+                            folder_mut.fixed_slot_id = None;
+                            folder_mut.borrowed_slot_ids.clear();
+                            folder_mut.borrowed_subtask_map.clear();
+                        }
+                        drop(folders_guard_mut);
+
+                        // 发布事件
+                        let ws = ws_manager.read().await;
+                        if let Some(ref ws) = *ws {
+                            ws.send_if_subscribed(
+                                TaskEvent::Folder(FolderEvent::StatusChanged {
+                                    folder_id: group_id.clone(),
+                                    old_status,
+                                    new_status: "failed".to_string(),
+                                }),
+                                None,
+                            );
+                            ws.send_if_subscribed(
+                                TaskEvent::Folder(FolderEvent::Failed {
+                                    folder_id: group_id.clone(),
+                                    error: error_msg,
+                                }),
+                                None,
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                // 🔥 available==0 只阻止派发新子任务，不阻止终态检查
+                if available == 0 {
+                    continue;
+                }
+
+                // 🔥 关键修复：收集所有子任务已占用的槽位，用于防止重复分配
+                let mut used_slot_ids: std::collections::HashSet<usize> = tasks
+                    .iter()
+                    .filter_map(|t| t.slot_id)
+                    .collect();
+
+                // 根据余量补充任务
+                let files_to_create = {
+                    let mut folders_guard = folders.write().await;
+                    let folder = match folders_guard.get_mut(&group_id) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+
+                    // 再次检查状态（可能在终态检查和此处之间被改变）
+                    if folder.status != FolderStatus::Downloading {
                         continue;
                     }
 
@@ -1969,11 +2060,18 @@ impl FolderDownloadManager {
                 .get_mut(folder_id)
                 .ok_or_else(|| anyhow!("文件夹不存在"))?;
 
-            if folder.status != FolderStatus::Paused {
+            if folder.status != FolderStatus::Paused && folder.status != FolderStatus::Failed {
                 return Err(anyhow!("文件夹状态不正确，当前状态: {:?}", folder.status));
             }
 
             let old_status = format!("{:?}", folder.status).to_lowercase();
+
+            // 🔥 如果从 Failed 恢复，重置失败计数（失败的子任务将被重新调度）
+            if folder.status == FolderStatus::Failed {
+                folder.failed_count = 0;
+                folder.failed_task_ids.clear();
+                folder.error = None;
+            }
 
             // 更新状态
             if folder.scan_completed {
@@ -2104,9 +2202,9 @@ impl FolderDownloadManager {
             }
         }
 
-        // 🔥 获取暂停的子任务，为它们分配借调位后再启动
+        // 🔥 获取需要恢复的子任务（暂停 + 失败），为它们分配借调位后再启动
         let tasks = download_manager.get_tasks_by_group(folder_id).await;
-        let paused_tasks: Vec<_> = tasks.iter().filter(|t| t.status == TaskStatus::Paused).collect();
+        let paused_tasks: Vec<_> = tasks.iter().filter(|t| t.status == TaskStatus::Paused || t.status == TaskStatus::Failed).collect();
 
         // 计算可用的槽位数（固定位 + 借调位）
         let total_slots = {
@@ -2671,52 +2769,84 @@ impl FolderDownloadManager {
             let mut should_persist = false;
             let mut old_status = String::new();
             if let Some(folder) = folders.get_mut(folder_id) {
-                folder.completed_count = tasks
-                    .iter()
-                    .filter(|t| t.status == TaskStatus::Completed)
-                    .count() as u64;
+                // 🔥 不再从 tasks 重新计算 completed_count，因为已完成的任务会从内存移除
+                // completed_count 由 start_task_completed_listener 递增维护
 
-                folder.downloaded_size = tasks.iter().map(|t| t.downloaded_size).sum();
+                // 🔥 使用 compute_downloaded_size：completed_downloaded_size + active_sum
+                // max() 保证单调性
+                let active_downloaded: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
+                folder.compute_downloaded_size(active_downloaded);
 
-                // 检查是否全部完成
+                // 检查是否全部完成（成功 + 失败 >= 总数）
                 if folder.scan_completed
                     && folder.pending_files.is_empty()
-                    && folder.completed_count == folder.total_files
+                    && (folder.completed_count + folder.failed_count) >= folder.total_files
+                    && folder.status != FolderStatus::Completed
                     && folder.status != FolderStatus::Failed
                     && folder.status != FolderStatus::Cancelled
                 {
                     old_status = format!("{:?}", folder.status).to_lowercase();
-                    folder.mark_completed();
-                    info!("文件夹 {} 全部下载完成！", folder.name);
-                    should_persist = true; // 完成时持久化
+                    if folder.failed_count > 0 {
+                        folder.mark_failed(format!("{} 个文件下载失败", folder.failed_count));
+                        info!(
+                            "文件夹 {} 下载完成但有 {} 个失败 (completed={}, failed={})",
+                            folder.name, folder.failed_count, folder.completed_count, folder.failed_count
+                        );
+                    } else {
+                        folder.mark_completed();
+                        info!("文件夹 {} 全部下载完成！", folder.name);
+                    }
+                    should_persist = true;
                 }
             }
             (should_persist, old_status)
         };
 
-        // 完成时更新持久化文件（保持 Completed 状态，等待定时归档任务处理）
+        // 终态时更新持久化文件
         if should_persist {
             self.persist_folder(folder_id).await;
 
             // 🔥 清理取消令牌，避免内存泄漏
             self.cancellation_tokens.write().await.remove(folder_id);
 
+            // 🔥 读取实际的新状态
+            let new_status = {
+                let folders = self.folders.read().await;
+                folders.get(folder_id)
+                    .map(|f| format!("{:?}", f.status).to_lowercase())
+                    .unwrap_or_default()
+            };
+
             // 🔥 发布状态变更事件
             if !old_status.is_empty() {
                 self.publish_event(FolderEvent::StatusChanged {
                     folder_id: folder_id.to_string(),
                     old_status,
-                    new_status: "completed".to_string(),
+                    new_status: new_status.clone(),
                 })
                     .await;
             }
 
-            // 🔥 发布文件夹完成事件
-            self.publish_event(FolderEvent::Completed {
-                folder_id: folder_id.to_string(),
-                completed_at: chrono::Utc::now().timestamp_millis(),
-            })
-                .await;
+            // 🔥 根据实际状态发布对应事件
+            if new_status == "completed" {
+                self.publish_event(FolderEvent::Completed {
+                    folder_id: folder_id.to_string(),
+                    completed_at: chrono::Utc::now().timestamp_millis(),
+                })
+                    .await;
+            } else if new_status == "failed" {
+                let error_msg = {
+                    let folders = self.folders.read().await;
+                    folders.get(folder_id)
+                        .and_then(|f| f.error.clone())
+                        .unwrap_or_default()
+                };
+                self.publish_event(FolderEvent::Failed {
+                    folder_id: folder_id.to_string(),
+                    error: error_msg,
+                })
+                    .await;
+            }
         }
 
         // 补充任务：保持10个活跃任务（完成1个，进1个）

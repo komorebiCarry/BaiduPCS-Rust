@@ -76,23 +76,27 @@ impl FilesystemService {
             .collect();
 
         // 计算父目录
-        let parent_path = path
-            .parent()
-            .map(|p| {
-                #[cfg(target_os = "windows")]
-                {
-                    // Windows 上，如果父目录是驱动器根目录的父目录，返回 None
-                    if p.as_os_str().is_empty() {
-                        return None;
+        // 当白名单启用且当前目录恰好是白名单根目录时，parent_path 设为 None
+        // 这样前端会将其视为逻辑根，点"上级"时回到根列表而非真实父目录
+        let parent_path = if self.guard.is_allowed_root(&path) {
+            None
+        } else {
+            path.parent()
+                .map(|p| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if p.as_os_str().is_empty() {
+                            return None;
+                        }
+                        Some(p.to_string_lossy().to_string())
                     }
-                    Some(p.to_string_lossy().to_string())
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    Some(p.to_string_lossy().to_string())
-                }
-            })
-            .flatten();
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        Some(p.to_string_lossy().to_string())
+                    }
+                })
+                .flatten()
+        };
 
         Ok(ListResponse {
             entries: paginated,
@@ -265,11 +269,55 @@ impl FilesystemService {
         }
     }
 
+    /// 获取根目录列表及默认目录路径
+    pub fn get_roots_with_default(&self) -> Result<RootsResponse, FsError> {
+        let roots = self.get_roots()?;
+        let default_path = self
+            .guard
+            .resolve_default_directory()?
+            .map(|p| p.to_string_lossy().to_string());
+        Ok(RootsResponse {
+            roots,
+            default_path,
+        })
+    }
+
     fn get_allowed_roots(&self) -> Result<Vec<FileEntry>, FsError> {
-        self.guard
-            .resolve_allowed_roots()?
+        let paths = self.guard.resolve_allowed_roots()?;
+
+        // 检测同名根目录：收集所有 basename，找出重复的
+        let basenames: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| p.to_string_lossy().to_string())
+            })
+            .collect();
+
+        let mut name_count = std::collections::HashMap::new();
+        for name in &basenames {
+            *name_count.entry(name.as_str()).or_insert(0usize) += 1;
+        }
+
+        paths
             .into_iter()
-            .map(|path| self.create_root_entry(&path))
+            .enumerate()
+            .map(|(i, path)| {
+                let basename = &basenames[i];
+                if name_count.get(basename.as_str()).copied().unwrap_or(0) > 1 {
+                    // 同名冲突：使用完整路径作为显示名
+                    let display_name = format!(
+                        "{} ({})",
+                        basename,
+                        path.to_string_lossy()
+                    );
+                    self.create_directory_entry(&path, display_name)
+                } else {
+                    self.create_root_entry(&path)
+                }
+            })
             .collect()
     }
 
@@ -608,5 +656,98 @@ mod tests {
         assert_eq!(list.page, 0);
         // total 是 usize 类型，验证列表返回成功即可
         let _ = list.total;
+    }
+
+    #[test]
+    fn test_allowed_root_has_no_parent_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("myroot");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("file.txt"), "test").unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![root.to_string_lossy().to_string()],
+            ..Default::default()
+        });
+
+        // 在白名单根目录列出内容时，parent_path 应为 None
+        let req = ListRequest {
+            path: root.to_string_lossy().to_string(),
+            page: 0,
+            page_size: 100,
+            sort_field: SortField::Name,
+            sort_order: SortOrder::Asc,
+        };
+        let resp = service.list_directory(&req).unwrap();
+        assert!(
+            resp.parent_path.is_none(),
+            "白名单根目录的 parent_path 应为 None，实际: {:?}",
+            resp.parent_path
+        );
+
+        // 子目录应有 parent_path
+        let req2 = ListRequest {
+            path: child.to_string_lossy().to_string(),
+            page: 0,
+            page_size: 100,
+            sort_field: SortField::Name,
+            sort_order: SortOrder::Asc,
+        };
+        let resp2 = service.list_directory(&req2).unwrap();
+        assert!(
+            resp2.parent_path.is_some(),
+            "子目录的 parent_path 不应为 None"
+        );
+    }
+
+    #[test]
+    fn test_same_name_roots_are_disambiguated() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir_a = temp_dir.path().join("a").join("projects");
+        let dir_b = temp_dir.path().join("b").join("projects");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![
+                dir_a.to_string_lossy().to_string(),
+                dir_b.to_string_lossy().to_string(),
+            ],
+            ..Default::default()
+        });
+
+        let roots = service.get_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+
+        // 两个同名目录的 name 应该不同（包含路径信息）
+        assert_ne!(
+            roots[0].name, roots[1].name,
+            "同名白名单根目录应当被消歧：{} vs {}",
+            roots[0].name, roots[1].name
+        );
+        // 名称中应包含 "projects"
+        assert!(roots[0].name.contains("projects"));
+        assert!(roots[1].name.contains("projects"));
+    }
+
+    #[test]
+    fn test_get_roots_with_default_returns_default_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let alpha = temp_dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![alpha.to_string_lossy().to_string()],
+            default_path: Some(alpha.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let resp = service.get_roots_with_default().unwrap();
+        assert!(resp.default_path.is_some());
+        assert_eq!(
+            resp.default_path.unwrap(),
+            alpha.canonicalize().unwrap().to_string_lossy()
+        );
     }
 }

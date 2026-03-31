@@ -1,7 +1,7 @@
 <template>
   <div class="login-container" :class="{ 'is-mobile': isMobile, 'tips-expanded': !tipsCollapsed }">
-    <!-- 右上角小贴士 -->
-    <div class="tips-card" :class="{ collapsed: tipsCollapsed }">
+    <!-- 右上角小贴士（仅二维码登录时显示） -->
+    <div v-show="activeTab === 'qrcode'" class="tips-card" :class="{ collapsed: tipsCollapsed }">
       <div class="tips-header" @click="tipsCollapsed = !tipsCollapsed">
         <div class="tips-title">
           <el-icon :size="18" color="#409eff">
@@ -55,8 +55,28 @@
         <p class="subtitle">Baidu Netdisk Rust Client</p>
       </div>
 
+      <!-- 登录方式切换 Tab -->
+      <div class="login-tabs">
+        <button
+            class="tab-btn"
+            :class="{ active: activeTab === 'qrcode' }"
+            @click="switchTab('qrcode')"
+        >
+          <el-icon :size="16"><Camera /></el-icon>
+          <span>扫码登录</span>
+        </button>
+        <button
+            class="tab-btn"
+            :class="{ active: activeTab === 'cookie' }"
+            @click="switchTab('cookie')"
+        >
+          <el-icon :size="16"><Key /></el-icon>
+          <span>Cookie 登录</span>
+        </button>
+      </div>
+
       <!-- 二维码区域 -->
-      <div class="qrcode-section">
+      <div v-show="activeTab === 'qrcode'" class="qrcode-section">
         <div v-if="loading" class="loading">
           <el-icon class="is-loading" :size="32">
             <Loading />
@@ -144,6 +164,59 @@
         </div>
       </div>
 
+      <!-- Cookie 登录区域 -->
+      <div v-show="activeTab === 'cookie'" class="cookie-section">
+        <!-- 操作说明 -->
+        <div class="cookie-tips">
+          <div class="cookie-tips-title">
+            <el-icon :size="16" color="#409eff"><InfoFilled /></el-icon>
+            <span>如何一键获取完整 Cookie？</span>
+          </div>
+          <ol class="cookie-steps">
+            <li>浏览器打开 <strong>pan.baidu.com</strong> 并登录账号</li>
+            <li>按 <strong>F12</strong> → 切换到 <strong>Network（网络）</strong> 标签页</li>
+            <li>刷新页面，点击列表中任意一个请求（如 <code>netdisk</code> 或 <code>api?...</code>）</li>
+            <li>右侧 <strong>Headers → Request Headers</strong> 中找到 <code>cookie</code> 字段</li>
+            <li>点击该行右侧的复制按钮，或右键 → 复制值，粘贴到下方即可</li>
+          </ol>
+          <div class="cookie-tip-note">
+            <el-icon :size="13" color="#e6a23c"><Warning /></el-icon>
+            <span>整个 <code>cookie</code> 请求头的值就是所需格式，无需手动整理</span>
+          </div>
+        </div>
+
+        <!-- Cookie 输入框 -->
+        <div class="cookie-input-wrap">
+          <el-input
+              v-model="cookieInput"
+              type="textarea"
+              :rows="5"
+              placeholder="粘贴完整 Cookie 字符串，例如：&#10;BDUSS=xxxx; PTOKEN=yyyy; STOKEN=zzzz; BAIDUID=aaaa"
+              resize="none"
+              :disabled="cookieLoading"
+          />
+        </div>
+
+        <!-- 错误信息 -->
+        <div v-if="cookieError" class="cookie-error">
+          <el-icon :size="14" color="#f56c6c"><CircleClose /></el-icon>
+          <span>{{ cookieError }}</span>
+        </div>
+
+        <!-- 登录按钮 -->
+        <el-button
+            type="primary"
+            size="large"
+            :loading="cookieLoading"
+            :disabled="!cookieInput.trim()"
+            class="cookie-login-btn"
+            @click="loginWithCookie"
+        >
+          <el-icon v-if="!cookieLoading"><Key /></el-icon>
+          {{ cookieLoading ? '登录中...' : '使用 Cookie 登录' }}
+        </el-button>
+      </div>
+
       <!-- 底部信息 -->
       <div class="footer">
         <p>基于 Rust + Axum + Vue 3 构建</p>
@@ -170,6 +243,7 @@ import {
   Warning,
   InfoFilled,
   ArrowDown,
+  Key,
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
@@ -177,6 +251,9 @@ const authStore = useAuthStore()
 
 // 响应式检测
 const isMobile = useIsMobile()
+
+// 登录方式
+const activeTab = ref<'qrcode' | 'cookie'>('qrcode')
 
 // 状态
 const loading = ref(false)
@@ -187,6 +264,11 @@ const isExpired = ref(false)
 const countdown = ref(120)
 // 贴士折叠状态：移动端默认折叠，桌面端默认展开
 const tipsCollapsed = ref(isMobile.value)
+
+// Cookie 登录状态
+const cookieInput = ref('')
+const cookieLoading = ref(false)
+const cookieError = ref('')
 
 // 计算二维码URL
 const qrcodeUrl = computed(() => {
@@ -267,6 +349,47 @@ async function refreshQRCode() {
   authStore.stopPolling()
   stopCountdown()
   await generateQRCode()
+}
+
+// 切换登录方式
+function switchTab(tab: 'qrcode' | 'cookie') {
+  if (activeTab.value === tab) return
+  activeTab.value = tab
+  cookieError.value = ''
+  if (tab === 'cookie') {
+    // 切到 Cookie 登录时停止二维码轮询
+    authStore.stopPolling()
+    stopCountdown()
+  } else {
+    // 切回二维码时重新生成（如果还没有二维码）
+    generateQRCode()
+  }
+}
+
+// Cookie 登录
+async function loginWithCookie() {
+  cookieError.value = ''
+  if (!cookieInput.value.trim()) return
+
+  cookieLoading.value = true
+  try {
+    const result = await authStore.loginWithCookies(cookieInput.value.trim())
+    if (result.message && !result.message.includes('预热完成')) {
+      ElMessage({
+        type: 'warning',
+        message: result.message,
+        duration: 8000,
+        showClose: true,
+      })
+    } else {
+      ElMessage.success('Cookie 登录成功，预热完成')
+    }
+    router.push('/files')
+  } catch (err: any) {
+    cookieError.value = err.message || 'Cookie 登录失败，请检查 Cookie 是否完整有效'
+  } finally {
+    cookieLoading.value = false
+  }
 }
 
 // 组件挂载
@@ -900,5 +1023,147 @@ onUnmounted(() => {
     font-weight: 600;
     color: #666;
   }
+}
+
+/* ===== 登录方式 Tab ===== */
+.login-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 24px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1.5px solid #e0e0e0;
+  background: #f5f5f5;
+}
+
+.tab-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 0;
+  border: none;
+  background: transparent;
+  font-size: 14px;
+  font-weight: 500;
+  color: #888;
+  cursor: pointer;
+  transition: all 0.2s ease;
+
+  &:hover:not(.active) {
+    color: #409eff;
+    background: rgba(64, 158, 255, 0.06);
+  }
+
+  &.active {
+    background: #409eff;
+    color: white;
+  }
+}
+
+/* ===== Cookie 登录区域 ===== */
+.cookie-section {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding-bottom: 8px;
+}
+
+.cookie-tips {
+  background: #f0f9ff;
+  border: 1px solid #bae0ff;
+  border-radius: 8px;
+  padding: 14px 16px;
+
+  .cookie-tips-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #1677ff;
+    margin-bottom: 10px;
+  }
+
+  .cookie-steps {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 13px;
+    line-height: 1.9;
+    color: #555;
+
+    li {
+      strong {
+        color: #333;
+      }
+      code {
+        background: #e6f4ff;
+        border-radius: 3px;
+        padding: 1px 5px;
+        font-size: 12px;
+        color: #0958d9;
+        font-family: monospace;
+      }
+    }
+  }
+
+  .cookie-tip-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: #fffbe6;
+    border: 1px solid #ffe58f;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #7c4c00;
+    line-height: 1.5;
+
+    span {
+      flex: 1;
+      code {
+        background: #fff3cd;
+        padding: 0 4px;
+        border-radius: 3px;
+        font-family: monospace;
+      }
+    }
+  }
+}
+
+.cookie-input-wrap {
+  :deep(.el-textarea__inner) {
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    border-radius: 8px;
+  }
+}
+
+.cookie-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 12px;
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #cf1322;
+  line-height: 1.5;
+
+  span {
+    flex: 1;
+  }
+}
+
+.cookie-login-btn {
+  width: 100%;
+  height: 44px;
+  font-size: 15px;
+  border-radius: 8px;
 }
 </style>

@@ -9,8 +9,8 @@ use axum::{
 use serde::Serialize;
 
 use crate::filesystem::{
-    FileEntry, FilesystemConfig, FilesystemService, FsError, FsErrorCode, GotoRequest,
-    GotoResponse, ListRequest, ListResponse, ValidateRequest, ValidateResponse,
+    FilesystemConfig, FilesystemService, FsError, FsErrorCode, GotoRequest,
+    GotoResponse, ListRequest, ListResponse, RootsResponse, ValidateRequest, ValidateResponse,
 };
 use crate::server::state::AppState;
 
@@ -90,11 +90,11 @@ pub async fn validate_path(
 }
 
 /// GET /api/v1/fs/roots
-/// 获取根目录列表
+/// 获取根目录列表（含默认目录路径）
 pub async fn get_roots(
     State(app_state): State<AppState>,
-) -> Result<Json<ApiResponse<Vec<FileEntry>>>, FsError> {
+) -> Result<Json<ApiResponse<RootsResponse>>, FsError> {
     let service = create_fs_service(app_state.config.read().await.filesystem.clone());
-    let roots = service.get_roots()?;
-    Ok(Json(ApiResponse::success(roots)))
+    let response = service.get_roots_with_default()?;
+    Ok(Json(ApiResponse::success(response)))
 }

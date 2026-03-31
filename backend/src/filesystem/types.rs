@@ -192,6 +192,16 @@ pub struct ListResponse {
     pub has_more: bool,
 }
 
+/// 根目录列表响应
+#[derive(Debug, Serialize)]
+pub struct RootsResponse {
+    /// 根目录条目列表
+    pub roots: Vec<FileEntry>,
+    /// 默认目录路径（配置中的 default_path 解析后的绝对路径）
+    #[serde(rename = "defaultPath")]
+    pub default_path: Option<String>,
+}
+
 /// 路径跳转请求
 #[derive(Debug, Deserialize)]
 pub struct GotoRequest {
