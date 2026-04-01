@@ -126,13 +126,9 @@ impl DownloadManager {
         // 🔥 设置槽位超时释放处理器
         manager.setup_stale_release_handler();
 
-        // 启动后台任务：定期检查并启动等待队列中的任务
-        manager.start_waiting_queue_monitor();
-
-        // 🔥 设置任务完成触发器（0延迟启动等待任务）
-        manager.setup_waiting_queue_trigger();
-
         // 🔥 启动活跃计数漂移校准（每 60 秒）
+        // 注意：start_waiting_queue_monitor 和 setup_waiting_queue_trigger 已移至
+        // set_persistence_manager() 中调用，确保它们捕获到有效的 persistence_manager
         {
             let tasks_ref = manager.tasks.clone();
             let counter = manager.active_count.clone();
@@ -166,6 +162,10 @@ impl DownloadManager {
     pub fn set_persistence_manager(&mut self, pm: Arc<Mutex<PersistenceManager>>) {
         self.persistence_manager = Some(pm);
         info!("下载管理器已设置持久化管理器");
+        // 🔥 在 persistence_manager 设置完成后启动依赖它的后台任务
+        // 这样两个 monitor 捕获的 self.persistence_manager 克隆为 Some(pm) 而非 None
+        self.start_waiting_queue_monitor();
+        self.setup_waiting_queue_trigger();
     }
 
     /// 热更新代理配置（由 update_config handler 调用）
@@ -4121,6 +4121,36 @@ impl DownloadManager {
         }
 
         self.try_start_waiting_tasks().await;
+
+        // 🔥 通知 FolderDownloadManager 更新文件夹级别状态
+        // batch_pause 只更新了子任务状态，文件夹状态须同步为 Paused
+        // 否则 task_completed_listener 仍会创建新子任务，前端文件夹状态也不会变更
+        {
+            let affected_folder_ids: std::collections::HashSet<String> = {
+                let tasks_guard = self.tasks.read().await;
+                let mut ids = std::collections::HashSet::new();
+                for id in task_ids {
+                    if let Some(task_arc) = tasks_guard.get(id) {
+                        let task = task_arc.lock().await;
+                        if let Some(ref gid) = task.group_id {
+                            ids.insert(gid.clone());
+                        }
+                    }
+                }
+                ids
+            };
+            if !affected_folder_ids.is_empty() {
+                let fm_opt = self.folder_manager.read().await.clone();
+                if let Some(fm) = fm_opt {
+                    for folder_id in &affected_folder_ids {
+                        if let Err(e) = fm.pause_folder(folder_id).await {
+                            warn!("批量暂停：文件夹 {} 状态更新失败（可能已暂停）: {}", folder_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
         results
     }
 
@@ -4133,6 +4163,37 @@ impl DownloadManager {
                 Err(e) => results.push((id.clone(), false, Some(e.to_string()))),
             }
         }
+
+        // 🔥 通知 FolderDownloadManager 更新文件夹级别状态
+        // batch_resume 只恢复了子任务，文件夹状态须同步为 Downloading
+        // 保证前端文件夹状态正确推送，并允许 FolderManager 调度后续任务
+        {
+            let affected_folder_ids: std::collections::HashSet<String> = {
+                let tasks_guard = self.tasks.read().await;
+                let mut ids = std::collections::HashSet::new();
+                for id in task_ids {
+                    if let Some(task_arc) = tasks_guard.get(id) {
+                        let task = task_arc.lock().await;
+                        if let Some(ref gid) = task.group_id {
+                            ids.insert(gid.clone());
+                        }
+                    }
+                }
+                ids
+            };
+            if !affected_folder_ids.is_empty() {
+                let fm_opt = self.folder_manager.read().await.clone();
+                if let Some(fm) = fm_opt {
+                    for folder_id in &affected_folder_ids {
+                        if let Err(e) = fm.resume_folder(folder_id).await {
+                            // 文件夹可能未处于 Paused 状态（如之前未通过 pause_folder 暂停），忽略
+                            info!("批量恢复：文件夹 {} 状态更新跳过: {}", folder_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
         results
     }
 
