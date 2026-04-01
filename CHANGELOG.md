@@ -2,7 +2,16 @@
 
 本文档记录了 BaiduPCS-Rust 的所有版本更新历史。
 
-## v1.12.0 (当前版本)
+## v1.12.1 (当前版本)
+
+**问题修复：**
+- 🐛 **修复下载管理器初始化时序问题**：将等待队列监控（`start_waiting_queue_monitor`）和触发器（`setup_waiting_queue_trigger`）的启动延迟到 `set_persistence_manager()` 完成之后执行，避免后台任务捕获到 `persistence_manager = None` 导致持久化相关逻辑失败
+- 🐛 **修复下载管理批量继续/批量暂停文件夹状态未变更**：`batch_pause` 和 `batch_resume` 完成子任务状态更新后，收集受影响的 `group_id`，同步调用 `FolderDownloadManager` 的 `pause_folder` / `resume_folder` 更新文件夹级别状态为 `Paused` / `Downloading`，确保前端文件夹状态正确推送
+- 🐛 **修复分享直下临时文件夹重复创建**：分享直下模式下，临时目录已在上方正确创建（含父目录存在性检查），跳过对 `save_path` 父目录的重复 `mkdir`，避免百度静默重命名（加时间戳后缀）；重试路径创建同样跳过分享直下模式；临时目录不再写入 `recent_save_path`
+
+---
+
+## v1.12.0
 
 **新功能：**
 - ✨ **新增 Cookie 登录**：支持直接粘贴浏览器 DevTools 复制的完整 Cookie 字符串完成登录

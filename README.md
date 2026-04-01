@@ -266,7 +266,17 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v1.12.0 (当前版本)
+### v1.12.1 (当前版本)
+
+**问题修复：**
+- 🐛 **修复下载管理器初始化时序问题**：将等待队列监控和触发器的启动延迟到 `persistence_manager` 设置完成后，避免后台任务捕获到 `None` 导致持久化失败
+- 🐛 **修复下载管理批量继续/批量暂停文件夹状态未变更**：批量暂停/继续子任务后，同步更新对应文件夹的状态为 `Paused`/`Downloading`，确保前端文件夹状态正确推送
+- 🐛 **修复分享直下临时文件夹重复创建**：分享直下模式跳过对 `save_path` 父目录的重复 `mkdir`，避免百度静默重命名（加时间戳后缀）；临时目录不再写入 `recent_save_path`
+
+<details>
+<summary><b>v1.12.0 / v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
+
+#### v1.12.0
 
 **新功能：**
 - ✨ **新增 Cookie 登录**：支持直接粘贴浏览器 DevTools 复制的完整 Cookie 字符串完成登录
@@ -283,9 +293,6 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 - 🐛 **文件夹下载进度问题修复**：新增 `completed_downloaded_size` / `failed_count` 字段，进度单调递增，失败子任务正确统计，支持从 `Failed` 状态恢复下载
 - 🐛 **普通转存与分享直下目录结构统一修复**：分批转存按原始父目录名分组，本地目录结构与原始分享结构完全对应
 - 🐛 **下载目录不存在提示**：启动时检查下载目录可访问性，目录不存在或无权限时输出清晰提示并优雅退出
-
-<details>
-<summary><b>v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
 
 #### v1.11.2
 

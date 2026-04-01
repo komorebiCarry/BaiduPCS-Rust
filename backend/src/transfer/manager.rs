@@ -951,8 +951,10 @@ impl TransferManager {
 
             // 确保 save_path 本身存在（普通转存可能复用历史路径，路径被删后会导致 errno=2）
             // 这里提前创建一次，避免根批次 relative_parent=="" 时无法补建。
+            // 注意：分享直下模式下，临时目录已在上方正确创建（含父目录存在性检查），
+            // 此处跳过，避免重复 mkdir 父目录导致百度静默重命名（加时间戳后缀）。
             let save_base = save_path.trim_end_matches('/');
-            if !save_base.is_empty() {
+            if !save_base.is_empty() && !is_share_direct_download {
                 let mut cumulative = String::new();
                 for seg in save_base.split('/').filter(|s| !s.is_empty()) {
                     cumulative.push('/');
@@ -1015,11 +1017,13 @@ impl TransferManager {
                         if err_msg.contains("errno\":2") || err_msg.contains("路径不存在") {
                             warn!("批次 {} 路径不存在，逐级创建目录后重试: {}", batch_num, group_target_dir);
                             let save_base = save_path.trim_end_matches('/');
-                            let mut cumulative = String::new();
-                            for seg in save_base.split('/').filter(|s| !s.is_empty()) {
-                                cumulative.push('/');
-                                cumulative.push_str(seg);
-                                let _ = client.create_folder(&cumulative).await;
+                            if !is_share_direct_download {
+                                let mut cumulative = String::new();
+                                for seg in save_base.split('/').filter(|s| !s.is_empty()) {
+                                    cumulative.push('/');
+                                    cumulative.push_str(seg);
+                                    let _ = client.create_folder(&cumulative).await;
+                                }
                             }
                             let segments: Vec<&str> = relative_parent.split('/').filter(|s| !s.is_empty()).collect();
                             let mut cumulative = save_base.to_string();
@@ -1188,7 +1192,8 @@ impl TransferManager {
                 info!("转存成功: {} 个文件", result.transferred_paths.len());
 
                 // 更新最近使用的目录（同时保存 fs_id 和 path）并持久化
-                {
+                // 分享直下模式下 save_path 是临时目录，不应写入 recent_save_path
+                if !is_share_direct_download {
                     let mut cfg = config.write().await;
                     cfg.recent_save_fs_id = Some(save_fs_id);
                     cfg.recent_save_path = Some(save_path.clone());
