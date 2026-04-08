@@ -6,6 +6,7 @@ use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// 默认分片大小: 5MB
@@ -24,6 +25,8 @@ pub struct Chunk {
     pub downloading: bool,
     /// 重试次数
     pub retries: u32,
+    /// 已下载字节数（分片内断点续传）
+    pub bytes_downloaded: u64,
 }
 
 impl Chunk {
@@ -34,12 +37,18 @@ impl Chunk {
             completed: false,
             downloading: false,
             retries: 0,
+            bytes_downloaded: 0,
         }
     }
 
-    /// 分片大小
+    /// 分片大小（原始总大小）
     pub fn size(&self) -> u64 {
         self.range.end - self.range.start
+    }
+
+    /// 剩余未下载字节数
+    pub fn remaining(&self) -> u64 {
+        self.size().saturating_sub(self.bytes_downloaded)
     }
 
     /// 下载分片（流式读取，实时更新进度）
@@ -58,6 +67,7 @@ impl Chunk {
         timeout_secs: u64,
         chunk_thread_id: usize,
         read_timeout_secs: u64,
+        cancellation_token: &CancellationToken,
         progress_callback: F,
     ) -> Result<u64>
     where
@@ -69,20 +79,38 @@ impl Chunk {
             .unwrap_or("unnamed")
             .to_string();
 
+        // 🔥 分片内断点续传：从已下载偏移开始
+        let effective_start = self.range.start + self.bytes_downloaded;
+        let remaining = self.remaining();
+
+        if remaining == 0 {
+            debug!(
+                "[分片线程{}] 分片 #{} 已完成，跳过下载",
+                chunk_thread_id, self.index
+            );
+            self.completed = true;
+            return Ok(0);
+        }
+
         debug!(
-            "[分片线程{}] 下载分片 #{}: bytes={}-{}, timeout={}s, referer={:?}",
+            "[分片线程{}] 下载分片 #{}: bytes={}-{}, timeout={}s, referer={:?}{}",
             chunk_thread_id,
             self.index,
-            self.range.start,
+            effective_start,
             self.range.end - 1,
             timeout_secs,
-            referer
+            referer,
+            if self.bytes_downloaded > 0 {
+                format!(" (续传，已下载 {} bytes)", self.bytes_downloaded)
+            } else {
+                String::new()
+            }
         );
 
         // 1. 构建 Range 请求（使用动态超时、Cookie 和 Referer）
         let mut request = client.get(url).header("Cookie", cookie).header(
             "Range",
-            format!("bytes={}-{}", self.range.start, self.range.end - 1),
+            format!("bytes={}-{}", effective_start, self.range.end - 1),
         );
 
         if let Some(referer_val) = referer {
@@ -99,19 +127,49 @@ impl Chunk {
             .await
             .context("发送HTTP请求失败")?;
 
-        // 检查响应状态
-        if !resp.status().is_success() && resp.status().as_u16() != 206 {
-            anyhow::bail!("HTTP错误: {}", resp.status());
+        // 🔥 严格校验 Range 响应
+        let status = resp.status();
+        if status.as_u16() != 206 {
+            if status.as_u16() == 200 {
+                // 200 OK = 服务端忽略了 Range 头，返回完整文件体
+                // 对分片下载（尤其是续传偏移 > 0）这会导致数据写坏
+                anyhow::bail!(
+                    "服务端返回 200 而非 206，Range 请求被忽略 (请求 bytes={}-{})",
+                    effective_start,
+                    self.range.end - 1
+                );
+            }
+            anyhow::bail!("HTTP错误: {}", status);
         }
 
-        // 2. 打开文件并定位到起始位置
+        // 🔥 校验 Content-Range 头（防止 CDN 返回错误的字节范围）
+        if let Some(content_range) = resp.headers().get("content-range") {
+            if let Ok(cr_str) = content_range.to_str() {
+                let expected_prefix =
+                    format!("bytes {}-{}", effective_start, self.range.end - 1);
+                if !cr_str.starts_with(&expected_prefix) {
+                    anyhow::bail!(
+                        "Content-Range 不匹配: 期望以 '{}' 开头，实际 '{}'",
+                        expected_prefix,
+                        cr_str
+                    );
+                }
+            }
+        } else {
+            anyhow::bail!(
+                "分片 #{} 206 响应缺少 Content-Range 头，无法确认返回数据范围正确性",
+                self.index
+            );
+        }
+
+        // 2. 打开文件并定位到续传位置
         let mut file = File::options()
             .write(true)
             .open(output_path)
             .await
             .context("打开输出文件失败")?;
 
-        file.seek(std::io::SeekFrom::Start(self.range.start))
+        file.seek(std::io::SeekFrom::Start(effective_start))
             .await
             .context("文件定位失败")?;
 
@@ -125,28 +183,79 @@ impl Chunk {
         // 需要对每次stream.next()单独设置超时
         // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
 
+        let read_timeout_dur = std::time::Duration::from_secs(read_timeout_secs);
+
         loop {
-            let chunk_result = match tokio::time::timeout(
-                std::time::Duration::from_secs(read_timeout_secs),
-                stream.next(),
-            )
-                .await
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => break, // 流结束
-                Err(_) => {
-                    warn!(
-                        "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，已下载 {} bytes",
-                        chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded
+            // 🔥 tokio::select! 同时等待三个信号：
+            //   1. cancellation_token.cancelled()  — pause/cancel 立即中断
+            //   2. tokio::time::sleep(read_timeout) — 读取超时
+            //   3. stream.next()                    — 数据到达
+            // 这保证取消在 stream.next() 阻塞期间也能生效
+            let chunk_data = tokio::select! {
+                biased; // 优先检查取消，避免数据就绪时漏掉取消信号
+
+                _ = cancellation_token.cancelled() => {
+                    if pending_progress > 0 {
+                        progress_callback(pending_progress);
+                    }
+                    self.bytes_downloaded += total_bytes_downloaded;
+                    info!(
+                        "[分片线程{}] 分片 #{} 流式读取被取消，本次已下载 {} bytes，累计 {} bytes",
+                        chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
                     );
-                    anyhow::bail!(
-                        "读取数据流超时: {}秒内无数据到达",
-                        read_timeout_secs
-                    );
+                    anyhow::bail!("分片 #{} 下载被取消", self.index);
+                }
+
+                result = tokio::time::timeout(read_timeout_dur, stream.next()) => {
+                    match result {
+                        Ok(Some(Ok(data))) => data,
+                        Ok(Some(Err(e))) => {
+                            // 🔥 流式读取错误：保存已写入的部分进度
+                            if pending_progress > 0 {
+                                progress_callback(pending_progress);
+                            }
+                            self.bytes_downloaded += total_bytes_downloaded;
+                            warn!(
+                                "[分片线程{}] 分片 #{} 读取数据流失败，本次已下载 {} bytes，累计 {} bytes",
+                                chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
+                            );
+                            return Err(anyhow::Error::new(e).context("读取数据流失败"));
+                        }
+                        Ok(None) => break, // 流结束
+                        Err(_) => {
+                            // 🔥 读取超时：保存已写入的部分进度
+                            if pending_progress > 0 {
+                                progress_callback(pending_progress);
+                            }
+                            self.bytes_downloaded += total_bytes_downloaded;
+                            warn!(
+                                "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，本次已下载 {} bytes，累计 {} bytes",
+                                chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded, self.bytes_downloaded
+                            );
+                            anyhow::bail!(
+                                "读取数据流超时: {}秒内无数据到达",
+                                read_timeout_secs
+                            );
+                        }
+                    }
                 }
             };
-            let chunk_data = chunk_result.context("读取数据流失败")?;
             let chunk_len = chunk_data.len() as u64;
+
+            // 🔥 溢出保护：防止写入超过分片边界
+            if total_bytes_downloaded + chunk_len > remaining {
+                let safe_len = (remaining - total_bytes_downloaded) as usize;
+                warn!(
+                    "[分片线程{}] 分片 #{} 收到超量数据 (已下载 {} + 本次 {} > 剩余 {})，截断到 {} bytes",
+                    chunk_thread_id, self.index, total_bytes_downloaded, chunk_len, remaining, safe_len
+                );
+                if safe_len > 0 {
+                    file.write_all(&chunk_data[..safe_len]).await.context("写入文件失败")?;
+                    total_bytes_downloaded += safe_len as u64;
+                    pending_progress += safe_len as u64;
+                }
+                break;
+            }
 
             // 写入文件
             file.write_all(&chunk_data).await.context("写入文件失败")?;
@@ -156,7 +265,7 @@ impl Chunk {
 
             // 🔥 批量更新进度：累积到阈值或下载完成时才回调（大幅减少锁竞争）
             if pending_progress >= PROGRESS_UPDATE_THRESHOLD
-                || total_bytes_downloaded >= self.size()
+                || total_bytes_downloaded >= remaining
             {
                 progress_callback(pending_progress);
                 pending_progress = 0;
@@ -168,13 +277,24 @@ impl Chunk {
             progress_callback(pending_progress);
         }
 
+        // 🔥 校验最终字节数：流正常结束但数据不完整
+        if total_bytes_downloaded < remaining {
+            self.bytes_downloaded += total_bytes_downloaded;
+            anyhow::bail!(
+                "分片 #{} 数据不完整: 期望 {} bytes，实际收到 {} bytes (差 {} bytes)",
+                self.index, remaining, total_bytes_downloaded,
+                remaining - total_bytes_downloaded
+            );
+        }
+
         // 4. 刷新文件缓冲
         file.flush().await.context("刷新文件缓冲失败")?;
 
+        self.bytes_downloaded += total_bytes_downloaded;
         self.completed = true;
         debug!(
-            "[分片线程{}] 分片 #{} 下载完成，大小: {} bytes",
-            chunk_thread_id, self.index, total_bytes_downloaded
+            "[分片线程{}] 分片 #{} 下载完成，本次: {} bytes，总计: {} bytes",
+            chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
         );
 
         Ok(total_bytes_downloaded)
@@ -309,12 +429,25 @@ impl ChunkManager {
         }
     }
 
+    /// 更新分片的已下载字节数（分片内断点续传）
+    pub fn update_bytes_downloaded(&mut self, index: usize, bytes: u64) {
+        if let Some(chunk) = self.chunks.get_mut(index) {
+            chunk.bytes_downloaded = bytes;
+        }
+    }
+
+    /// 获取分片的已下载字节数（分片内断点续传持久化）
+    pub fn get_bytes_downloaded(&self, index: usize) -> u64 {
+        self.chunks.get(index).map(|c| c.bytes_downloaded).unwrap_or(0)
+    }
+
     /// 重置所有分片状态
     pub fn reset(&mut self) {
         for chunk in &mut self.chunks {
             chunk.completed = false;
             chunk.downloading = false;
             chunk.retries = 0;
+            chunk.bytes_downloaded = 0;
         }
     }
 }

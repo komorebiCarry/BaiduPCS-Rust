@@ -2698,11 +2698,12 @@ impl DownloadEngine {
                 chunk_thread_id, chunk_index, current_url, available_count, retries, timeout_secs
             );
 
-            // 获取分片信息
+            // 获取分片信息（含已下载偏移，支持分片内断点续传）
             let mut chunk = {
-                let mut manager = chunk_manager.lock().await;
-                manager.chunks_mut()[chunk_index].clone()
+                let manager = chunk_manager.lock().await;
+                manager.chunks()[chunk_index].clone()
             };
+            let bytes_before = chunk.bytes_downloaded;
 
             // 创建进度回调闭包（实时更新任务进度和速度，发布带节流的进度事件）
             let task_clone = task.clone();
@@ -2817,6 +2818,7 @@ impl DownloadEngine {
                     timeout_secs,
                     chunk_thread_id,
                     read_timeout,
+                    &cancellation_token,
                     progress_callback,
                 )
                 .await
@@ -2864,6 +2866,15 @@ impl DownloadEngine {
                 Err(e) => {
                     // ❌ 下载失败
 
+                    // 🔥 分片内断点续传：检查本次是否有部分数据写入
+                    let bytes_this_attempt = chunk.bytes_downloaded - bytes_before;
+
+                    // 🔥 将部分进度同步回 ChunkManager（下次循环 clone 时可继承）
+                    if bytes_this_attempt > 0 {
+                        let mut manager = chunk_manager.lock().await;
+                        manager.update_bytes_downloaded(chunk_index, chunk.bytes_downloaded);
+                    }
+
                     // 🔥 代理回退：下载失败时检测是否为代理/连接错误
                     if let Some(ref mgr) = fallback_mgr {
                         if !mgr.is_fallen_back() {
@@ -2892,43 +2903,62 @@ impl DownloadEngine {
                         }
                     }
 
-                    // 新设计中,失败会通过score机制自动处理
-                    // 这里只记录错误并切换链接重试
-
                     last_error = Some(e);
-                    retries += 1;
 
-                    // 检查是否达到重试次数上限，或所有链接都已尝试过
-                    if retries >= max_retries || tried_urls.len() >= available_count {
-                        error!(
-                            "[分片线程{}] ✗ 分片 #{} 下载失败，已尝试 {} 个链接，重试 {} 次",
+                    // 🔥 分片内断点续传：区分"有数据"和"零数据"两种失败
+                    if bytes_this_attempt > 0 {
+                        // ✅ 有部分数据：链接本身可用，只是被限速/断流
+                        // 不递增 retries，不切换链接，从断点继续
+                        // tried_urls 中已有当前 URL，需要移除以允许复用
+                        tried_urls.remove(&current_url);
+
+                        info!(
+                            "[分片线程{}] 🔄 分片 #{} 部分下载成功 (本次 {} bytes，累计 {}/{} bytes)，从断点续传",
+                            chunk_thread_id,
+                            chunk_index,
+                            bytes_this_attempt,
+                            chunk.bytes_downloaded,
+                            chunk.size(),
+                        );
+
+                        // 短暂延迟后重试（限速账号需要间隔，避免立刻被再次断流）
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    } else {
+                        // ❌ 零数据：连接本身有问题，递增 retries 并切换链接
+                        retries += 1;
+
+                        // 检查是否达到重试次数上限，或所有链接都已尝试过
+                        if retries >= max_retries || tried_urls.len() >= available_count {
+                            error!(
+                                "[分片线程{}] ✗ 分片 #{} 下载失败，已尝试 {} 个链接，重试 {} 次",
+                                chunk_thread_id,
+                                chunk_index,
+                                tried_urls.len(),
+                                retries
+                            );
+                            return Err(last_error
+                                .unwrap_or_else(|| anyhow::anyhow!("分片 #{} 下载失败", chunk_index)));
+                        }
+
+                        warn!(
+                            "[分片线程{}] ⚠ 分片 #{} 下载失败（零数据），切换链接重试 (已尝试 {}/{} 个链接，重试 {}/{}): {:?}",
                             chunk_thread_id,
                             chunk_index,
                             tried_urls.len(),
-                            retries
+                            available_count,
+                            retries,
+                            max_retries,
+                            last_error
                         );
-                        return Err(last_error
-                            .unwrap_or_else(|| anyhow::anyhow!("分片 #{} 下载失败", chunk_index)));
+
+                        // 🔥 使用指数退避延迟重试（100ms → 200ms → 400ms → ...）
+                        let backoff_ms = calculate_backoff_delay(retries);
+                        debug!(
+                            "[分片线程{}] ⏳ 分片 #{} 等待 {}ms 后重试",
+                            chunk_thread_id, chunk_index, backoff_ms
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     }
-
-                    warn!(
-                        "[分片线程{}] ⚠ 分片 #{} 下载失败，切换链接重试 (已尝试 {}/{} 个链接，重试 {}/{}): {:?}",
-                        chunk_thread_id,
-                        chunk_index,
-                        tried_urls.len(),
-                        available_count,
-                        retries,
-                        max_retries,
-                        last_error
-                    );
-
-                    // 🔥 使用指数退避延迟重试（100ms → 200ms → 400ms → ...）
-                    let backoff_ms = calculate_backoff_delay(retries);
-                    debug!(
-                        "[分片线程{}] ⏳ 分片 #{} 等待 {}ms 后重试",
-                        chunk_thread_id, chunk_index, backoff_ms
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                 }
             }
         }

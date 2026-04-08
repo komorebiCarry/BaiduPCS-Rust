@@ -6,6 +6,7 @@ use bit_set::BitSet;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -755,9 +756,9 @@ impl TaskMetadata {
 
 /// WAL 记录
 ///
-/// 每条记录占一行，格式为：`{chunk_index}[,{md5}]`
-/// - 下载任务：只记录 chunk_index
-/// - 上传任务：记录 chunk_index 和 md5（用于 create 请求）
+/// 每条记录占一行，格式为：
+/// - 完成记录：`{chunk_index},{md5},{timestamp_ms}`
+/// - 部分进度记录：`P,{chunk_index},{bytes_downloaded},{timestamp_ms}`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalRecord {
     /// 分片索引（0-based）
@@ -769,43 +770,70 @@ pub struct WalRecord {
 
     /// 记录时间戳（Unix 毫秒）
     pub timestamp_ms: i64,
+
+    /// 分片内已下载字节数（仅 partial progress 记录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_downloaded: Option<u64>,
 }
 
 impl WalRecord {
-    /// 创建下载任务的 WAL 记录
+    /// 创建下载任务的 WAL 记录（分片完成）
     pub fn new_download(chunk_index: usize) -> Self {
         Self {
             chunk_index,
             md5: None,
             timestamp_ms: Utc::now().timestamp_millis(),
+            bytes_downloaded: None,
         }
     }
 
-    /// 创建上传任务的 WAL 记录
+    /// 创建上传任务的 WAL 记录（分片完成）
     pub fn new_upload(chunk_index: usize, md5: String) -> Self {
         Self {
             chunk_index,
             md5: Some(md5),
             timestamp_ms: Utc::now().timestamp_millis(),
+            bytes_downloaded: None,
         }
+    }
+
+    /// 创建分片内部分进度 WAL 记录（用于分片内断点续传持久化）
+    pub fn new_partial(chunk_index: usize, bytes_downloaded: u64) -> Self {
+        Self {
+            chunk_index,
+            md5: None,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            bytes_downloaded: Some(bytes_downloaded),
+        }
+    }
+
+    /// 是否为部分进度记录
+    pub fn is_partial(&self) -> bool {
+        self.bytes_downloaded.is_some()
     }
 
     /// 序列化为 WAL 行格式
     ///
-    /// 格式：`{chunk_index},{md5},{timestamp_ms}` 或 `{chunk_index},,{timestamp_ms}`
+    /// 完成记录：`{chunk_index},{md5},{timestamp_ms}`
+    /// 部分进度：`P,{chunk_index},{bytes_downloaded},{timestamp_ms}`
     pub fn to_wal_line(&self) -> String {
-        format!(
-            "{},{},{}",
-            self.chunk_index,
-            self.md5.as_deref().unwrap_or(""),
-            self.timestamp_ms
-        )
+        if let Some(bytes) = self.bytes_downloaded {
+            format!("P,{},{},{}", self.chunk_index, bytes, self.timestamp_ms)
+        } else {
+            format!(
+                "{},{},{}",
+                self.chunk_index,
+                self.md5.as_deref().unwrap_or(""),
+                self.timestamp_ms
+            )
+        }
     }
 
     /// 从 WAL 行格式解析（容错）
     ///
     /// 支持格式：
-    /// - `{chunk_index},{md5},{timestamp_ms}` - 完整格式
+    /// - `P,{chunk_index},{bytes_downloaded},{timestamp_ms}` - 部分进度记录
+    /// - `{chunk_index},{md5},{timestamp_ms}` - 完整格式（分片完成）
     /// - `{chunk_index},{md5}` - 旧格式（无时间戳）
     /// - `{chunk_index}` - 最简格式
     pub fn from_wal_line(line: &str) -> Option<Self> {
@@ -814,6 +842,29 @@ impl WalRecord {
             return None;
         }
 
+        // 部分进度记录：P,{chunk_index},{bytes_downloaded},{timestamp_ms}
+        if parts[0] == "P" {
+            if parts.len() < 3 {
+                return None;
+            }
+            let chunk_index = parts[1].parse::<usize>().ok()?;
+            let bytes_downloaded = parts[2].parse::<u64>().ok()?;
+            let timestamp_ms = if parts.len() > 3 {
+                parts[3]
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| Utc::now().timestamp_millis())
+            } else {
+                Utc::now().timestamp_millis()
+            };
+            return Some(Self {
+                chunk_index,
+                md5: None,
+                timestamp_ms,
+                bytes_downloaded: Some(bytes_downloaded),
+            });
+        }
+
+        // 分片完成记录：{chunk_index},{md5},{timestamp_ms}
         let chunk_index = parts[0].parse::<usize>().ok()?;
 
         let md5 = if parts.len() > 1 && !parts[1].is_empty() {
@@ -834,6 +885,7 @@ impl WalRecord {
             chunk_index,
             md5,
             timestamp_ms,
+            bytes_downloaded: None,
         })
     }
 }
@@ -860,6 +912,10 @@ pub struct TaskPersistenceInfo {
 
     /// 元数据是否已修改（需要刷写）
     pub metadata_dirty: Mutex<bool>,
+
+    /// 分片内部分下载进度（chunk_index → bytes_downloaded）
+    /// 用于分片内断点续传的冷恢复
+    pub partial_progress: HashMap<usize, u64>,
 }
 
 impl TaskPersistenceInfo {
@@ -872,6 +928,7 @@ impl TaskPersistenceInfo {
             chunk_md5s: None,
             wal_cache: Mutex::new(Vec::new()),
             metadata_dirty: Mutex::new(false),
+            partial_progress: HashMap::new(),
         }
     }
 
@@ -884,6 +941,7 @@ impl TaskPersistenceInfo {
             chunk_md5s: Some(vec![None; total_chunks]),
             wal_cache: Mutex::new(Vec::new()),
             metadata_dirty: Mutex::new(false),
+            partial_progress: HashMap::new(),
         }
     }
 
@@ -896,6 +954,7 @@ impl TaskPersistenceInfo {
             chunk_md5s: None,
             wal_cache: Mutex::new(Vec::new()),
             metadata_dirty: Mutex::new(false),
+            partial_progress: HashMap::new(),
         }
     }
 
@@ -906,6 +965,8 @@ impl TaskPersistenceInfo {
         // 检查分片是否已经完成
         // insert() 返回 true 表示新插入，false 表示已存在
         let is_new = self.completed_chunks.insert(chunk_index);
+        // 分片已完成，清除对应的部分进度记录
+        self.partial_progress.remove(&chunk_index);
 
         if is_new {
             // 只有新完成的分片才添加到 WAL 缓存
@@ -915,6 +976,22 @@ impl TaskPersistenceInfo {
             // 分片已经完成过，可能是重复调用，记录警告
             warn!("分片 #{} 已标记为完成，跳过重复记录到 WAL", chunk_index);
         }
+    }
+
+    /// 更新分片内部分下载进度（分片内断点续传）
+    ///
+    /// 将部分进度写入内存 + WAL 缓存，待下次刷写周期持久化到磁盘
+    pub fn update_chunk_partial_progress(&mut self, chunk_index: usize, bytes_downloaded: u64) {
+        if bytes_downloaded == 0 {
+            return;
+        }
+        // 已完成的分片不需要部分进度
+        if self.completed_chunks.contains(chunk_index) {
+            return;
+        }
+        self.partial_progress.insert(chunk_index, bytes_downloaded);
+        let record = WalRecord::new_partial(chunk_index, bytes_downloaded);
+        self.wal_cache.lock().push(record);
     }
 
     /// 标记分片完成（上传任务，带 MD5）

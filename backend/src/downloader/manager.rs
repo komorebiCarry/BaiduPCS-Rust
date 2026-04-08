@@ -904,6 +904,21 @@ impl DownloadManager {
                                 );
                             }
                         }
+                        // 🔥 恢复分片内部分进度（分片内断点续传）
+                        if let Some(partial_progress) = pm.lock().await.get_partial_progress(&task_id_clone) {
+                            let mut cm = chunk_manager.lock().await;
+                            let mut partial_count = 0;
+                            for (chunk_index, bytes_downloaded) in &partial_progress {
+                                cm.update_bytes_downloaded(*chunk_index, *bytes_downloaded);
+                                partial_count += 1;
+                            }
+                            if partial_count > 0 {
+                                info!(
+                                    "任务 {} 恢复了 {} 个分片的部分进度（分片内断点续传）",
+                                    task_id_clone, partial_count
+                                );
+                            }
+                        }
                     }
 
                     // 创建任务调度信息
@@ -1502,6 +1517,21 @@ impl DownloadManager {
                                                         );
                                                     }
                                                 }
+                                                // 🔥 恢复分片内部分进度（分片内断点续传）
+                                                if let Some(partial_progress) = pm.lock().await.get_partial_progress(&id_clone) {
+                                                    let mut cm = chunk_manager.lock().await;
+                                                    let mut partial_count = 0;
+                                                    for (chunk_index, bytes_downloaded) in &partial_progress {
+                                                        cm.update_bytes_downloaded(*chunk_index, *bytes_downloaded);
+                                                        partial_count += 1;
+                                                    }
+                                                    if partial_count > 0 {
+                                                        info!(
+                                                            "后台任务 {} 恢复了 {} 个分片的部分进度（分片内断点续传）",
+                                                            id_clone, partial_count
+                                                        );
+                                                    }
+                                                }
                                             }
 
                                             let max_concurrent_chunks =
@@ -2052,6 +2082,21 @@ impl DownloadManager {
                                                         info!(
                                                             "0延迟任务 {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
                                                             id_clone, completed_count
+                                                        );
+                                                    }
+                                                }
+                                                // 🔥 恢复分片内部分进度（分片内断点续传）
+                                                if let Some(partial_progress) = pm.lock().await.get_partial_progress(&id_clone) {
+                                                    let mut cm = chunk_manager.lock().await;
+                                                    let mut partial_count = 0;
+                                                    for (chunk_index, bytes_downloaded) in &partial_progress {
+                                                        cm.update_bytes_downloaded(*chunk_index, *bytes_downloaded);
+                                                        partial_count += 1;
+                                                    }
+                                                    if partial_count > 0 {
+                                                        info!(
+                                                            "0延迟任务 {} 恢复了 {} 个分片的部分进度（分片内断点续传）",
+                                                            id_clone, partial_count
                                                         );
                                                     }
                                                 }
@@ -4555,30 +4600,25 @@ impl DownloadManager {
         // 设置为暂停状态（等待用户手动恢复）
         task.status = TaskStatus::Paused;
 
-        // 计算已下载大小
-        let completed_count = recovery_info.completed_chunks.len();
-        let downloaded_size = if completed_count > 0 {
-            // 估算已下载大小：完成的分片数 * 分片大小
-            // 注意：最后一个分片可能较小，这里是近似值
-            let full_chunks = completed_count.saturating_sub(1);
-            let full_size = (full_chunks as u64) * recovery_info.chunk_size;
-
-            // 检查最后一个分片是否完成
-            let last_chunk_index = recovery_info.total_chunks.saturating_sub(1);
-            let last_chunk_size = if recovery_info.completed_chunks.contains(last_chunk_index) {
-                // 最后一个分片的大小
-                recovery_info
-                    .file_size
-                    .saturating_sub(last_chunk_index as u64 * recovery_info.chunk_size)
-            } else {
-                0
-            };
-
-            full_size + last_chunk_size
-        } else {
-            0
-        };
-        task.downloaded_size = downloaded_size;
+        // 🔥 精确计算已下载大小：逐片累计（处理稀疏分布）
+        let last_chunk_index = recovery_info.total_chunks.saturating_sub(1);
+        let downloaded_size: u64 = recovery_info
+            .completed_chunks
+            .iter()
+            .map(|idx| {
+                if idx == last_chunk_index {
+                    // 最后一个分片可能不足 chunk_size
+                    recovery_info
+                        .file_size
+                        .saturating_sub(idx as u64 * recovery_info.chunk_size)
+                } else {
+                    recovery_info.chunk_size
+                }
+            })
+            .sum();
+        // 🔥 加上分片内部分进度（冷恢复断点续传）
+        let partial_bytes: u64 = recovery_info.partial_progress.values().sum();
+        task.downloaded_size = downloaded_size + partial_bytes;
         task.created_at = recovery_info.created_at;
 
         // 恢复文件夹下载组信息
@@ -4589,8 +4629,9 @@ impl DownloadManager {
         // 🔥 恢复跨任务跳转字段
         task.transfer_task_id = recovery_info.transfer_task_id.clone();
 
+        let completed_count = recovery_info.completed_chunks.len();
         info!(
-            "恢复下载任务: id={}, 文件={:?}, 已完成 {}/{} 分片 ({:.1}%), group_id={:?}{}",
+            "恢复下载任务: id={}, 文件={:?}, 已完成 {}/{} 分片 ({:.1}%), partial_chunks={}, group_id={:?}{}",
             task_id,
             recovery_info.local_path,
             completed_count,
@@ -4600,6 +4641,7 @@ impl DownloadManager {
             } else {
                 0.0
             },
+            recovery_info.partial_progress.len(),
             recovery_info.group_id,
             if recovery_info.is_backup { "（备份任务）" } else { "" }
         );
@@ -4792,5 +4834,168 @@ mod tests {
         let cleared = manager.clear_completed().await;
         assert_eq!(cleared, 2);
         assert_eq!(manager.get_all_tasks().await.len(), 1);
+    }
+
+    /// 回归测试：DownloadManager::restore_task 冷恢复主链路
+    ///
+    /// 验证从 DownloadRecoveryInfo 恢复任务时：
+    /// 1. task.downloaded_size = 已完成分片实际大小之和 + partial_progress 字节
+    /// 2. restore_task_state 加载的 WAL 状态不被后续 register_download_task 覆盖
+    #[tokio::test]
+    async fn test_restore_task_cold_recovery_downloaded_size() {
+        use bit_set::BitSet;
+        use std::collections::HashMap;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // --- 模拟场景 ---
+        // 文件 50MB, 分片 5MB, 10 个分片
+        // 已完成分片: #0, #3, #9（最后一个分片实际大小 = 50MB - 9*5MB = 5MB）
+        // 分片 #4 部分下载了 2MB
+        let file_size: u64 = 50 * 1024 * 1024;
+        let chunk_size: u64 = 5 * 1024 * 1024;
+        let total_chunks = 10usize;
+
+        let pm_config = crate::config::PersistenceConfig {
+            wal_dir: "wal".to_string(),
+            db_path: "config/baidu-pcs.db".to_string(),
+            wal_flush_interval_ms: 100,
+            auto_recover_tasks: true,
+            wal_retention_days: 7,
+            history_archive_hour: 2,
+            history_archive_minute: 0,
+            history_retention_days: 30,
+        };
+
+        // 第一阶段：模拟上一次运行——写入 WAL 然后“崩溃”
+        {
+            let pm_prev = crate::persistence::PersistenceManager::new(
+                pm_config.clone(),
+                temp_dir.path(),
+            );
+            pm_prev
+                .register_download_task(
+                    "dl_cold".to_string(),
+                    777,
+                    "/remote/cold.bin".to_string(),
+                    PathBuf::from(temp_dir.path().join("cold.bin")),
+                    file_size,
+                    chunk_size,
+                    total_chunks,
+                    None, None, None,
+                    false, None, None, None, None,
+                )
+                .unwrap();
+            pm_prev.on_chunk_completed("dl_cold", 0);
+            pm_prev.on_chunk_completed("dl_cold", 3);
+            pm_prev.on_chunk_completed("dl_cold", 9);
+            pm_prev.on_chunk_partial_progress("dl_cold", 4, 2 * 1024 * 1024);
+            pm_prev.flush_all().await;
+            // pm_prev 被 drop，模拟进程终止
+        }
+
+        // 第二阶段：模拟冷重启——新建 PersistenceManager（内存状态为空）
+        let pm_new = crate::persistence::PersistenceManager::new(
+            pm_config,
+            temp_dir.path(),
+        );
+        let pm_arc = Arc::new(Mutex::new(pm_new));
+
+        let user_auth = create_mock_user_auth();
+        let mut manager =
+            DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
+        manager.persistence_manager = Some(pm_arc.clone());
+
+        // 构建 DownloadRecoveryInfo
+        let mut completed = BitSet::with_capacity(total_chunks);
+        completed.insert(0);
+        completed.insert(3);
+        completed.insert(9);
+
+        let mut partial_progress = HashMap::new();
+        partial_progress.insert(4, 2 * 1024 * 1024u64);
+
+        let recovery_info = DownloadRecoveryInfo {
+            task_id: "dl_cold".to_string(),
+            fs_id: 777,
+            remote_path: "/remote/cold.bin".to_string(),
+            local_path: temp_dir.path().join("cold.bin"),
+            file_size,
+            chunk_size,
+            total_chunks,
+            completed_chunks: completed,
+            created_at: 1700000000,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            transfer_task_id: None,
+            is_backup: false,
+            backup_config_id: None,
+            is_encrypted: false,
+            encryption_key_version: None,
+            partial_progress,
+        };
+
+        // 执行冷恢复
+        let task_id = manager.restore_task(recovery_info).await.unwrap();
+        assert_eq!(task_id, "dl_cold");
+
+        // 验证 task.downloaded_size
+        let task = manager.get_task(&task_id).await.unwrap();
+        // 分片 #0 = 5MB, #3 = 5MB, #9（最后分片）= 50MB - 9*5MB = 5MB
+        let expected_completed_bytes: u64 = 3 * chunk_size; // 3 * 5MB = 15MB
+        let expected_partial_bytes: u64 = 2 * 1024 * 1024; // 2MB
+        assert_eq!(
+            task.downloaded_size,
+            expected_completed_bytes + expected_partial_bytes,
+            "downloaded_size 应 = 已完成分片大小之和 + 分片内部分进度"
+        );
+
+        // 验证持久化状态已恢复（restore_task 内部调用了 restore_task_state）
+        {
+            let pm_lock = pm_arc.lock().await;
+            assert_eq!(
+                pm_lock.get_completed_count("dl_cold"),
+                Some(3),
+                "持久化层应有 3 个已完成分片"
+            );
+            let partial = pm_lock.get_partial_progress("dl_cold").unwrap();
+            assert_eq!(
+                partial.get(&4),
+                Some(&(2 * 1024 * 1024u64)),
+                "持久化层应保留分片 #4 的 2MB 部分进度"
+            );
+        }
+
+        // 模拟 start_task_internal 再次调用 register_download_task
+        {
+            let pm_lock = pm_arc.lock().await;
+            pm_lock
+                .register_download_task(
+                    "dl_cold".to_string(),
+                    777,
+                    "/remote/cold.bin".to_string(),
+                    PathBuf::from(temp_dir.path().join("cold.bin")),
+                    file_size,
+                    chunk_size,
+                    total_chunks,
+                    None, None, None,
+                    false, None, None, None, None,
+                )
+                .unwrap();
+
+            // register 不能覆盖已恢复的状态
+            assert_eq!(
+                pm_lock.get_completed_count("dl_cold"),
+                Some(3),
+                "register 后，已完成分片数不能被清零"
+            );
+            let partial = pm_lock.get_partial_progress("dl_cold").unwrap();
+            assert_eq!(
+                partial.get(&4),
+                Some(&(2 * 1024 * 1024u64)),
+                "register 后，部分进度不能被清零"
+            );
+        }
     }
 }

@@ -712,16 +712,41 @@ impl ChunkScheduler {
                             "[分片线程{}] 分片 #{} 因任务取消而失败",
                             slot_id, chunk_index
                         );
+                        // 🔥 取消/暂停路径也要持久化分片内部分进度
+                        {
+                            let manager = task_info.chunk_manager.lock().await;
+                            let bytes_downloaded = manager.get_bytes_downloaded(chunk_index);
+                            if bytes_downloaded > 0 {
+                                if let Some(ref pm) = task_info.persistence_manager {
+                                    pm.lock().await.on_chunk_partial_progress(
+                                        &task_id,
+                                        chunk_index,
+                                        bytes_downloaded,
+                                    );
+                                }
+                            }
+                        }
                     } else {
                         error!(
                             "[分片线程{}] 分片 #{} 下载失败: {}",
                             slot_id, chunk_index, e
                         );
 
-                        // 取消下载标记 + 递增分片调度级重试计数
+                        // 取消下载标记 + 递增分片调度级重试计数 + 持久化部分进度
                         let chunk_retries = {
                             let mut manager = task_info.chunk_manager.lock().await;
                             manager.unmark_downloading(chunk_index);
+                            // 🔥 持久化分片内部分进度（分片内断点续传）
+                            let bytes_downloaded = manager.get_bytes_downloaded(chunk_index);
+                            if bytes_downloaded > 0 {
+                                if let Some(ref pm) = task_info.persistence_manager {
+                                    pm.lock().await.on_chunk_partial_progress(
+                                        &task_id,
+                                        chunk_index,
+                                        bytes_downloaded,
+                                    );
+                                }
+                            }
                             manager.increment_retry(chunk_index)
                         };
 

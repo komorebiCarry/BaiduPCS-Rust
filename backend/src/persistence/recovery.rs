@@ -13,6 +13,7 @@
 //! 4. 创建恢复任务信息
 //! 5. 由各管理器负责实际恢复
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use bit_set::BitSet;
@@ -36,6 +37,9 @@ pub struct RecoveredTask {
 
     /// 分片 MD5 列表（仅上传任务，从 WAL 恢复）
     pub chunk_md5s: Option<Vec<Option<String>>>,
+
+    /// 分片内部分下载进度（chunk_index → bytes_downloaded，从 WAL 恢复）
+    pub partial_progress: HashMap<usize, u64>,
 }
 
 impl RecoveredTask {
@@ -146,7 +150,7 @@ pub fn scan_recoverable_tasks(wal_dir: &Path) -> std::io::Result<RecoveryScanRes
             }
         };
 
-        // 构建已完成分片集合
+        // 构建已完成分片集合 + 部分进度
         let total_chunks = metadata.total_chunks.unwrap_or(0);
         let mut completed_chunks = BitSet::with_capacity(total_chunks);
         let mut chunk_md5s: Option<Vec<Option<String>>> = if metadata.task_type == TaskType::Upload
@@ -155,14 +159,25 @@ pub fn scan_recoverable_tasks(wal_dir: &Path) -> std::io::Result<RecoveryScanRes
         } else {
             None
         };
+        let mut partial_progress: HashMap<usize, u64> = HashMap::new();
 
         for record in &records {
-            completed_chunks.insert(record.chunk_index);
+            if record.is_partial() {
+                // 部分进度记录：保留最新值
+                if let Some(bytes) = record.bytes_downloaded {
+                    partial_progress.insert(record.chunk_index, bytes);
+                }
+            } else {
+                // 分片完成记录
+                completed_chunks.insert(record.chunk_index);
+                // 分片已完成，清除对应的部分进度
+                partial_progress.remove(&record.chunk_index);
 
-            // 保存上传任务的 MD5
-            if let Some(ref mut md5s) = chunk_md5s {
-                if record.chunk_index < md5s.len() {
-                    md5s[record.chunk_index] = record.md5.clone();
+                // 保存上传任务的 MD5
+                if let Some(ref mut md5s) = chunk_md5s {
+                    if record.chunk_index < md5s.len() {
+                        md5s[record.chunk_index] = record.md5.clone();
+                    }
                 }
             }
         }
@@ -171,6 +186,7 @@ pub fn scan_recoverable_tasks(wal_dir: &Path) -> std::io::Result<RecoveryScanRes
             metadata: metadata.clone(),
             completed_chunks,
             chunk_md5s,
+            partial_progress,
         };
 
         // 检查是否已完成所有分片
@@ -550,6 +566,9 @@ pub struct DownloadRecoveryInfo {
     pub is_encrypted: bool,
     /// 加密密钥版本
     pub encryption_key_version: Option<u32>,
+    // === 分片内断点续传 ===
+    /// 分片内部分下载进度（chunk_index → bytes_downloaded）
+    pub partial_progress: HashMap<usize, u64>,
 }
 
 impl DownloadRecoveryInfo {
@@ -579,6 +598,8 @@ impl DownloadRecoveryInfo {
             // 恢复加密字段
             is_encrypted: metadata.is_encrypted,
             encryption_key_version: metadata.encryption_key_version,
+            // 恢复分片内部分进度
+            partial_progress: recovered.partial_progress.clone(),
         })
     }
 
@@ -948,6 +969,7 @@ mod tests {
             metadata,
             completed_chunks,
             chunk_md5s: None,
+            partial_progress: HashMap::new(),
         };
 
         let info = DownloadRecoveryInfo::from_recovered(&recovered).unwrap();

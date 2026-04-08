@@ -544,6 +544,15 @@ impl PersistenceManager {
         encryption_key_version: Option<u32>,
         transfer_task_id: Option<String>,
     ) -> std::io::Result<()> {
+        // 🔥 已恢复的任务：跳过元数据重写和内存状态覆盖，保留原始 created_at 和 .meta 文件
+        if self.tasks.contains_key(&task_id) {
+            debug!(
+                "已注册下载任务（保留已恢复状态）: {} (is_backup={}, is_encrypted={:?}, transfer_task_id={:?})",
+                task_id, is_backup, is_encrypted, transfer_task_id
+            );
+            return Ok(());
+        }
+
         // 创建元数据
         let mut metadata = TaskMetadata::new_download(
             task_id.clone(),
@@ -575,8 +584,10 @@ impl PersistenceManager {
         // 创建内存状态
         let info = TaskPersistenceInfo::new_download(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
-
-        debug!("已注册下载任务: {} (is_backup={}, is_encrypted={:?}, transfer_task_id={:?})", task_id, is_backup, is_encrypted, transfer_task_id);
+        debug!(
+            "已注册下载任务: {} (is_backup={}, is_encrypted={:?}, transfer_task_id={:?})",
+            task_id, is_backup, is_encrypted, transfer_task_id
+        );
 
         Ok(())
     }
@@ -603,6 +614,11 @@ impl PersistenceManager {
         encrypt_enabled: Option<bool>,
         encryption_key_version: Option<u32>,
     ) -> std::io::Result<()> {
+        if self.tasks.contains_key(&task_id) {
+            debug!("已注册上传任务（保留已恢复状态）: {}", task_id);
+            return Ok(());
+        }
+
         // 创建元数据
         let metadata = TaskMetadata::new_upload(
             task_id.clone(),
@@ -618,7 +634,6 @@ impl PersistenceManager {
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
 
-        // 创建内存状态
         let info = TaskPersistenceInfo::new_upload(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
@@ -651,6 +666,11 @@ impl PersistenceManager {
         encrypt_enabled: Option<bool>,
         encryption_key_version: Option<u32>,
     ) -> std::io::Result<()> {
+        if self.tasks.contains_key(&task_id) {
+            debug!("已注册备份上传任务（保留已恢复状态）: {}", task_id);
+            return Ok(());
+        }
+
         // 创建备份任务元数据
         let metadata = TaskMetadata::new_upload_backup(
             task_id.clone(),
@@ -667,7 +687,6 @@ impl PersistenceManager {
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
 
-        // 创建内存状态
         let info = TaskPersistenceInfo::new_upload(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
@@ -702,6 +721,11 @@ impl PersistenceManager {
         is_encrypted: Option<bool>,
         encryption_key_version: Option<u32>,
     ) -> std::io::Result<()> {
+        if self.tasks.contains_key(&task_id) {
+            debug!("已注册备份下载任务（保留已恢复状态）: {}", task_id);
+            return Ok(());
+        }
+
         // 创建备份任务元数据
         let metadata = TaskMetadata::new_download_backup(
             task_id.clone(),
@@ -719,7 +743,6 @@ impl PersistenceManager {
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
 
-        // 创建内存状态
         let info = TaskPersistenceInfo::new_download(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
@@ -746,6 +769,11 @@ impl PersistenceManager {
         auto_download: bool,
         file_name: Option<String>,
     ) -> std::io::Result<()> {
+        if self.tasks.contains_key(&task_id) {
+            debug!("已注册转存任务（保留已恢复状态）: {}", task_id);
+            return Ok(());
+        }
+
         // 创建元数据
         let metadata = TaskMetadata::new_transfer(
             task_id.clone(),
@@ -759,7 +787,6 @@ impl PersistenceManager {
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
 
-        // 创建内存状态
         let info = TaskPersistenceInfo::new_transfer(task_id.clone());
         self.tasks.insert(task_id.clone(), info);
 
@@ -806,6 +833,44 @@ impl PersistenceManager {
             // 备份任务创建的临时上传任务不会注册到持久化管理器，这是预期行为
             debug!("任务不存在，跳过分片完成标记(带MD5): task_id={}", task_id);
         }
+    }
+
+    /// 更新分片内部分下载进度（分片内断点续传持久化）
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `chunk_index` - 分片索引（0-based）
+    /// * `bytes_downloaded` - 该分片内已下载字节数
+    pub fn on_chunk_partial_progress(
+        &self,
+        task_id: &str,
+        chunk_index: usize,
+        bytes_downloaded: u64,
+    ) {
+        if let Some(mut info) = self.tasks.get_mut(task_id) {
+            info.update_chunk_partial_progress(chunk_index, bytes_downloaded);
+            debug!(
+                "分片部分进度: task_id={}, chunk_index={}, bytes_downloaded={}",
+                task_id, chunk_index, bytes_downloaded
+            );
+        }
+    }
+
+    /// 获取分片内部分下载进度（冷恢复时使用）
+    ///
+    /// # Returns
+    /// chunk_index → bytes_downloaded 映射，无数据时返回 None
+    pub fn get_partial_progress(
+        &self,
+        task_id: &str,
+    ) -> Option<std::collections::HashMap<usize, u64>> {
+        self.tasks.get(task_id).and_then(|info| {
+            if info.partial_progress.is_empty() {
+                None
+            } else {
+                Some(info.partial_progress.clone())
+            }
+        })
     }
 
     // ========================================================================
@@ -1281,13 +1346,22 @@ impl PersistenceManager {
             TaskType::Transfer => TaskPersistenceInfo::new_transfer(task_id.to_string()),
         };
 
-        // 应用 WAL 记录
+        // 应用 WAL 记录（区分完成记录和部分进度记录）
         for record in records {
-            info.completed_chunks.insert(record.chunk_index);
-            if let Some(md5) = record.md5 {
-                if let Some(ref mut md5s) = info.chunk_md5s {
-                    if record.chunk_index < md5s.len() {
-                        md5s[record.chunk_index] = Some(md5);
+            if record.is_partial() {
+                // 部分进度记录：保留最新值（后写覆盖先写）
+                if let Some(bytes) = record.bytes_downloaded {
+                    info.partial_progress.insert(record.chunk_index, bytes);
+                }
+            } else {
+                // 分片完成记录：标记完成 + 清除对应的部分进度
+                info.completed_chunks.insert(record.chunk_index);
+                info.partial_progress.remove(&record.chunk_index);
+                if let Some(md5) = record.md5 {
+                    if let Some(ref mut md5s) = info.chunk_md5s {
+                        if record.chunk_index < md5s.len() {
+                            md5s[record.chunk_index] = Some(md5);
+                        }
                     }
                 }
             }
@@ -1296,10 +1370,15 @@ impl PersistenceManager {
         // 插入到内存映射
         self.tasks.insert(task_id.to_string(), info);
 
+        let partial_count = self
+            .get_partial_progress(task_id)
+            .map(|p| p.len())
+            .unwrap_or(0);
         debug!(
-            "已恢复任务状态: task_id={}, completed_chunks={}",
+            "已恢复任务状态: task_id={}, completed_chunks={}, partial_chunks={}",
             task_id,
-            self.get_completed_count(task_id).unwrap_or(0)
+            self.get_completed_count(task_id).unwrap_or(0),
+            partial_count
         );
 
         Ok(())
@@ -1365,11 +1444,11 @@ async fn flush_all_tasks(tasks: &DashMap<String, TaskPersistenceInfo>, wal_dir: 
             // 刷写到磁盘
             if let Err(e) = append_records(wal_dir, task_id, &records) {
                 error!("WAL 刷写失败: task_id={}, 错误: {}", task_id, e);
-                // 失败时将记录放回缓存
+                // 失败时将记录放回缓存**头部**，保持时序正确性
+                // 若 push 到尾部，新到达的记录会排在旧记录前面，
+                // 导致 partial-progress "last record wins" 回放产生回退
                 let mut cache = info.wal_cache.lock();
-                for record in records {
-                    cache.push(record);
-                }
+                cache.splice(0..0, records);
             } else {
                 flushed_count += 1;
             }
@@ -2066,5 +2145,184 @@ mod tests {
 
         // 验证 WAL 已刷写
         assert!(wal::wal_exists(&manager.wal_dir, "dl_006"));
+    }
+
+    /// 回归测试：restore_task_state 之后再调用 register_download_task
+    /// 不能覆盖已恢复的 completed_chunks / partial_progress，
+    /// 也不能重写 .meta 文件（保留原始 created_at）
+    #[tokio::test]
+    async fn test_register_preserves_restored_state() {
+        let temp_dir = setup_temp_dir();
+        let config = create_test_config();
+        let manager = PersistenceManager::new(config, temp_dir.path());
+
+        // 1. 首次注册 + 标记分片完成 + 记录部分进度
+        manager
+            .register_download_task(
+                "dl_resume".to_string(),
+                999,
+                "/remote/big.bin".to_string(),
+                PathBuf::from("/local/big.bin"),
+                10 * 1024 * 1024,
+                1024 * 1024,
+                10,
+                None, None, None,
+                false, None, None, None, None,
+            )
+            .unwrap();
+        manager.on_chunk_completed("dl_resume", 0);
+        manager.on_chunk_completed("dl_resume", 3);
+        manager.on_chunk_completed("dl_resume", 7);
+        manager.on_chunk_partial_progress("dl_resume", 4, 512_000);
+
+        // 2. 刷写 WAL
+        manager.flush_all().await;
+
+        // 3. 记录原始 .meta created_at
+        let original_meta = metadata::load_metadata(&manager.wal_dir, "dl_resume").unwrap();
+        let original_created_at = original_meta.created_at;
+
+        // 4. 模拟冷重启：从内存中移除
+        manager.tasks.remove("dl_resume");
+        assert!(!manager.task_exists("dl_resume"));
+
+        // 5. 恢复（模拟程序启动时的 restore_task_state）
+        manager
+            .restore_task_state("dl_resume", TaskType::Download, 10)
+            .unwrap();
+
+        // 验证恢复结果
+        assert_eq!(manager.get_completed_count("dl_resume"), Some(3));
+        assert_eq!(manager.is_chunk_completed("dl_resume", 0), Some(true));
+        assert_eq!(manager.is_chunk_completed("dl_resume", 3), Some(true));
+        assert_eq!(manager.is_chunk_completed("dl_resume", 7), Some(true));
+        assert_eq!(manager.is_chunk_completed("dl_resume", 4), Some(false));
+
+        let partial = manager.get_partial_progress("dl_resume").unwrap();
+        assert_eq!(partial.get(&4), Some(&512_000u64));
+
+        // 6. 再次调用 register_download_task（模拟 start_task_internal 的行为）
+        manager
+            .register_download_task(
+                "dl_resume".to_string(),
+                999,
+                "/remote/big.bin".to_string(),
+                PathBuf::from("/local/big.bin"),
+                10 * 1024 * 1024,
+                1024 * 1024,
+                10,
+                None, None, None,
+                false, None, None, None, None,
+            )
+            .unwrap();
+
+        // 7. 断言：register 没有覆盖已恢复的 completed_chunks 和 partial_progress
+        assert_eq!(
+            manager.get_completed_count("dl_resume"),
+            Some(3),
+            "register 不能清空已恢复的 completed_chunks"
+        );
+        assert_eq!(
+            manager.is_chunk_completed("dl_resume", 0),
+            Some(true),
+            "分片 #0 必须仍然是已完成"
+        );
+        let partial_after = manager.get_partial_progress("dl_resume").unwrap();
+        assert_eq!(
+            partial_after.get(&4),
+            Some(&512_000u64),
+            "register 不能清空已恢复的 partial_progress"
+        );
+
+        // 8. 断言：.meta 文件的 created_at 保持不变
+        let meta_after = metadata::load_metadata(&manager.wal_dir, "dl_resume").unwrap();
+        assert_eq!(
+            meta_after.created_at, original_created_at,
+            "register 不能重写 .meta 的 created_at"
+        );
+    }
+
+    /// 回归测试：部分进度 WAL 完整生命周期
+    /// 模拟限速账号场景：分片下载部分数据后断流 → 部分进度持久化 →
+    /// 后续该分片完成 → 部分进度被清除 → 冷恢复后只剩完成记录
+    #[tokio::test]
+    async fn test_partial_progress_wal_lifecycle() {
+        let temp_dir = setup_temp_dir();
+        let config = create_test_config();
+        let manager = PersistenceManager::new(config, temp_dir.path());
+
+        // 1. 注册任务
+        manager
+            .register_download_task(
+                "dl_partial".to_string(),
+                888,
+                "/remote/video.mp4".to_string(),
+                PathBuf::from("/local/video.mp4"),
+                50 * 1024 * 1024,
+                5 * 1024 * 1024,
+                10,
+                None, None, None,
+                false, None, None, None, None,
+            )
+            .unwrap();
+
+        // 2. 分片 #2 下载了 3MB 后断流
+        manager.on_chunk_partial_progress("dl_partial", 2, 3 * 1024 * 1024);
+        // 分片 #5 下载了 1MB 后断流
+        manager.on_chunk_partial_progress("dl_partial", 5, 1 * 1024 * 1024);
+
+        // 3. 刷写 WAL（部分进度记录持久化）
+        manager.flush_all().await;
+
+        // 4. 分片 #2 重试成功（完成）
+        manager.on_chunk_completed("dl_partial", 2);
+
+        // 验证：完成后部分进度被清除
+        let partial = manager.get_partial_progress("dl_partial").unwrap();
+        assert!(
+            !partial.contains_key(&2),
+            "分片 #2 完成后，其 partial_progress 应被清除"
+        );
+        assert_eq!(
+            partial.get(&5),
+            Some(&(1 * 1024 * 1024)),
+            "分片 #5 的 partial_progress 应保留"
+        );
+
+        // 5. 再次刷写（完成记录持久化）
+        manager.flush_all().await;
+
+        // 6. 模拟冷重启
+        manager.tasks.remove("dl_partial");
+
+        // 7. 恢复
+        manager
+            .restore_task_state("dl_partial", TaskType::Download, 10)
+            .unwrap();
+
+        // 8. 验证恢复结果
+        assert_eq!(
+            manager.is_chunk_completed("dl_partial", 2),
+            Some(true),
+            "分片 #2 应该是已完成"
+        );
+        assert_eq!(
+            manager.is_chunk_completed("dl_partial", 5),
+            Some(false),
+            "分片 #5 不应该是已完成"
+        );
+
+        // 分片 #2 的部分进度应被完成记录覆盖（清除）
+        let partial_recovered = manager.get_partial_progress("dl_partial").unwrap();
+        assert!(
+            !partial_recovered.contains_key(&2),
+            "冷恢复后，已完成分片 #2 不应有 partial_progress"
+        );
+        // 分片 #5 的部分进度应被恢复
+        assert_eq!(
+            partial_recovered.get(&5),
+            Some(&(1 * 1024 * 1024)),
+            "冷恢复后，分片 #5 的 partial_progress 应被恢复"
+        );
     }
 }
