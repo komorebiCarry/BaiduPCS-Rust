@@ -20,6 +20,30 @@
 
       <!-- PC端工具栏 -->
       <div v-if="!isMobile" class="toolbar-buttons">
+        <div class="search-wrapper" :class="{ expanded: searchExpanded }">
+          <el-button v-if="!searchExpanded" circle @click="searchExpanded = true">
+            <el-icon><Search /></el-icon>
+          </el-button>
+          <template v-if="searchExpanded">
+            <el-input
+                v-model="searchKeyword"
+                placeholder="搜索文件..."
+                clearable
+                @keyup.enter="handleSearch"
+                @clear="exitSearch"
+                style="width: 220px"
+            >
+              <template #prefix>
+                <el-icon><Search /></el-icon>
+              </template>
+            </el-input>
+            <el-button type="primary" :loading="searchLoading" @click="handleSearch">搜索</el-button>
+            <el-button v-if="isSearchMode" @click="exitSearch">返回</el-button>
+            <el-button v-else text @click="searchExpanded = false; searchKeyword = ''">
+              <el-icon><Close /></el-icon>
+            </el-button>
+          </template>
+        </div>
         <el-button
             v-if="selectedFiles.length > 0"
             type="warning"
@@ -61,6 +85,9 @@
 
       <!-- 移动端工具栏（图标按钮） -->
       <div v-else class="toolbar-buttons-mobile">
+        <el-button circle @click="searchExpanded = !searchExpanded">
+          <el-icon><Search /></el-icon>
+        </el-button>
         <el-button
             v-if="selectedFiles.length > 0"
             type="warning"
@@ -94,6 +121,25 @@
           <el-icon><Refresh /></el-icon>
         </el-button>
       </div>
+    </div>
+
+    <!-- 移动端搜索栏 -->
+    <div v-if="isMobile && searchExpanded" class="mobile-search-bar">
+      <el-input
+          v-model="searchKeyword"
+          placeholder="搜索文件..."
+          clearable
+          @keyup.enter="handleSearch"
+          @clear="exitSearch"
+      >
+        <template #prefix>
+          <el-icon><Search /></el-icon>
+        </template>
+        <template #append>
+          <el-button :loading="searchLoading" @click="handleSearch">搜索</el-button>
+        </template>
+      </el-input>
+      <el-button v-if="isSearchMode" text type="primary" @click="exitSearch">返回列表</el-button>
     </div>
 
     <!-- FilePicker 文件选择器弹窗 -->
@@ -241,12 +287,12 @@
         <el-icon class="is-loading"><Loading /></el-icon>
         <span>加载中...</span>
       </div>
-      <div v-else-if="!hasMore && fileList.length > 0" class="no-more">
+      <div v-else-if="!(isSearchMode ? searchHasMore : hasMore) && fileList.length > 0" class="no-more">
         没有更多了
       </div>
 
       <!-- 空状态 -->
-      <el-empty v-if="!loading && fileList.length === 0" description="当前目录为空"/>
+      <el-empty v-if="!loading && !searchLoading && fileList.length === 0" :description="isSearchMode ? '未找到匹配的文件' : '当前目录为空'"/>
     </div>
 
     <!-- 创建文件夹对话框 -->
@@ -322,7 +368,7 @@
 <script setup lang="ts">
 import {ref, onMounted, computed} from 'vue'
 import {ElMessage} from 'element-plus'
-import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
+import {getFileList, searchFiles, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
 import {useIsMobile} from '@/utils/responsive'
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem, type DownloadConflictStrategy} from '@/api/download'
 import {createUpload, createFolderUpload, type UploadConflictStrategy} from '@/api/upload'
@@ -386,6 +432,14 @@ const shareFiles = ref<FileItem[]>([])
 // 分享直下对话框状态
 const showShareDirectDownloadDialog = ref(false)
 
+// 搜索状态
+const searchExpanded = ref(false)
+const searchKeyword = ref('')
+const searchLoading = ref(false)
+const isSearchMode = ref(false)
+const searchPage = ref(1)
+const searchHasMore = ref(false)
+
 // 路径分割
 const pathParts = computed(() => {
   if (currentDir.value === '/') return []
@@ -445,12 +499,21 @@ function handleScroll(event: Event) {
 
   // 当滚动到距离底部 100px 时加载更多
   if (scrollHeight - scrollTop - clientHeight < 100) {
-    loadNextPage()
+    if (isSearchMode.value) {
+      loadMoreSearchResults()
+    } else {
+      loadNextPage()
+    }
   }
 }
 
 // 导航到目录
 function navigateToDir(dir: string) {
+  if (isSearchMode.value) {
+    isSearchMode.value = false
+    searchKeyword.value = ''
+    searchExpanded.value = false
+  }
   loadFiles(dir)
 }
 
@@ -987,6 +1050,60 @@ async function executeSingleDownload(file: FileItem, targetDir: string) {
   }
 }
 
+// ============================================
+// 搜索相关函数
+// ============================================
+
+// 执行搜索
+async function handleSearch() {
+  const keyword = searchKeyword.value.trim()
+  if (!keyword) return
+
+  searchLoading.value = true
+  isSearchMode.value = true
+  searchPage.value = 1
+
+  try {
+    const data = await searchFiles(keyword, 1, 100)
+    fileList.value = data.list as FileItem[]
+    searchHasMore.value = data.has_more
+  } catch (error: any) {
+    ElMessage.error(error.message || '搜索失败')
+    console.error('搜索失败:', error)
+  } finally {
+    searchLoading.value = false
+    loading.value = false
+  }
+}
+
+// 加载更多搜索结果
+async function loadMoreSearchResults() {
+  if (searchLoading.value || !searchHasMore.value) return
+
+  searchPage.value++
+  searchLoading.value = true
+  loadingMore.value = true
+
+  try {
+    const data = await searchFiles(searchKeyword.value.trim(), searchPage.value, 100)
+    fileList.value = [...fileList.value, ...(data.list as FileItem[])]
+    searchHasMore.value = data.has_more
+  } catch (error: any) {
+    ElMessage.error(error.message || '加载更多搜索结果失败')
+  } finally {
+    searchLoading.value = false
+    loadingMore.value = false
+  }
+}
+
+// 退出搜索模式
+function exitSearch() {
+  isSearchMode.value = false
+  searchKeyword.value = ''
+  searchExpanded.value = false
+  loadFiles(currentDir.value)
+}
+
 // 组件挂载时加载根目录和配置
 onMounted(() => {
   loadFiles('/')
@@ -1043,7 +1160,7 @@ function handleShareDirectDownloadSuccess(taskId: string) {
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link, Search, Close} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
@@ -1076,6 +1193,20 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     gap: 8px;
     flex-shrink: 0;
   }
+}
+
+.search-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mobile-search-bar {
+  padding: 8px 16px;
+  border-bottom: 1px solid #e0e0e0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .file-list {

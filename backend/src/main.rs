@@ -290,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/logout", post(handlers::logout))
         // 文件API
         .route("/files", get(handlers::get_file_list))
+        .route("/files/search", get(handlers::search_files))
         .route("/files/download", get(handlers::get_download_url))
         .route("/files/folder", post(handlers::create_folder))
         // 下载API
