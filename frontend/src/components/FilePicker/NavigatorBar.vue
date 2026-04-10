@@ -29,10 +29,34 @@
           size="small"
           @click="emit('refresh')"
       />
+      <el-button
+          :icon="Search"
+          :circle="!isMobile"
+          size="small"
+          :type="searchActive ? 'primary' : ''"
+          @click="toggleSearch"
+      />
+    </div>
+
+    <!-- 搜索输入框 -->
+    <div v-if="searchActive" class="search-input-wrapper">
+      <el-input
+          ref="searchInputRef"
+          v-model="searchInput"
+          placeholder="搜索当前目录..."
+          clearable
+          @keyup.enter="handleSearch"
+          @clear="handleClearSearch"
+          size="small"
+      >
+        <template #prefix>
+          <el-icon><Search /></el-icon>
+        </template>
+      </el-input>
     </div>
 
     <!-- 路径输入框 -->
-    <div class="path-input-wrapper">
+    <div v-else class="path-input-wrapper">
       <el-input
           v-model="inputPath"
           placeholder="输入路径并按回车跳转"
@@ -68,7 +92,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
-import { ArrowLeft, ArrowRight, Top, Refresh, FolderOpened } from '@element-plus/icons-vue'
+import { ArrowLeft, ArrowRight, Top, Refresh, FolderOpened, Search } from '@element-plus/icons-vue'
 import { useIsMobile } from '@/utils/responsive'
 
 // 响应式检测
@@ -87,10 +111,15 @@ const emit = defineEmits<{
   'forward': []
   'up': []
   'refresh': []
+  'search': [keyword: string]
+  'clear-search': []
 }>()
 
 const inputPath = ref('')
 const isEditing = ref(false)
+const searchActive = ref(false)
+const searchInput = ref('')
+const searchInputRef = ref<InstanceType<typeof import('element-plus')['ElInput']> | null>(null)
 
 // 面包屑数据
 const breadcrumbs = computed(() => {
@@ -177,6 +206,39 @@ function handleBlur() {
     inputPath.value = props.currentPath
   }, 150)
 }
+
+// 切换搜索
+function toggleSearch() {
+  searchActive.value = !searchActive.value
+  if (searchActive.value) {
+    nextTick(() => {
+      searchInputRef.value?.focus()
+    })
+  } else {
+    searchInput.value = ''
+    emit('clear-search')
+  }
+}
+
+// 执行搜索
+function handleSearch() {
+  const keyword = searchInput.value.trim()
+  if (keyword) {
+    emit('search', keyword)
+  }
+}
+
+// 清除搜索
+function handleClearSearch() {
+  searchInput.value = ''
+  emit('clear-search')
+}
+
+// 导航时关闭搜索
+watch(() => props.currentPath, () => {
+  searchActive.value = false
+  searchInput.value = ''
+})
 </script>
 
 <style scoped>
@@ -192,6 +254,10 @@ function handleBlur() {
   display: flex;
   gap: 4px;
   flex-shrink: 0;
+}
+
+.search-input-wrapper {
+  flex: 1;
 }
 
 .path-input-wrapper {
