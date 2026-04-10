@@ -89,6 +89,7 @@ export interface ListDirectoryRequest {
   page_size?: number
   sort_field?: SortField
   sort_order?: SortOrder
+  keyword?: string
 }
 
 /// 列目录响应（支持分页）

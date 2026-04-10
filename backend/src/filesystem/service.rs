@@ -44,6 +44,11 @@ impl FilesystemService {
                 .with_message(format!("读取目录失败: {}", e))
         })?;
 
+        // 搜索关键词（小写化，用于大小写不敏感匹配）
+        let keyword_lower = req.keyword.as_ref()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty());
+
         // 收集并过滤条目
         let mut entries: Vec<FileEntry> = read_dir
             .filter_map(|entry| entry.ok())
@@ -56,6 +61,13 @@ impl FilesystemService {
                 // 过滤符号链接
                 if self.guard.should_skip_symlink(&entry_path) {
                     return false;
+                }
+                // 按关键词过滤文件名
+                if let Some(ref kw) = keyword_lower {
+                    let name = entry.file_name().to_string_lossy().to_lowercase();
+                    if !name.contains(kw) {
+                        return false;
+                    }
                 }
                 true
             })

@@ -163,6 +163,9 @@ pub struct ListRequest {
     /// 排序顺序
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// 搜索关键词（按文件名过滤，大小写不敏感）
+    #[serde(default)]
+    pub keyword: Option<String>,
 }
 
 fn default_page_size() -> usize {
