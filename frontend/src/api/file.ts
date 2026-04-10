@@ -116,6 +116,31 @@ export async function createFolder(path: string): Promise<CreateFolderData> {
   return response.data.data
 }
 
+export interface SearchData {
+  list: FileItem[]
+  has_more: boolean
+}
+
+/**
+ * 搜索文件
+ */
+export async function searchFiles(
+    key: string,
+    page: number = 1,
+    num: number = 100,
+    recursion: number = 1
+): Promise<SearchData> {
+  const response = await apiClient.get<ApiResponse<SearchData>>('/files/search', {
+    params: { key, page, num, recursion }
+  })
+
+  if (response.data.code !== 0 || !response.data.data) {
+    throw new Error(response.data.message || '搜索文件失败')
+  }
+
+  return response.data.data
+}
+
 // 重新导出共享工具函数，保持向后兼容
 export const formatFileSize = sharedFormatFileSize
 export const formatTime = formatTimestamp

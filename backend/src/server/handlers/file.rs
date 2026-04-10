@@ -258,6 +258,121 @@ fn query_folder_mappings(
     result
 }
 
+/// 搜索查询参数
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// 搜索关键词
+    pub key: String,
+    /// 页码
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// 每页数量
+    #[serde(default = "default_search_num")]
+    pub num: u32,
+    /// 是否递归搜索
+    #[serde(default = "default_recursion")]
+    pub recursion: i32,
+}
+
+fn default_search_num() -> u32 {
+    100
+}
+
+fn default_recursion() -> i32 {
+    1
+}
+
+/// 搜索响应数据
+#[derive(Debug, Serialize)]
+pub struct SearchData {
+    /// 文件列表（带加密信息）
+    pub list: Vec<FileItemWithEncryption>,
+    /// 是否还有更多
+    pub has_more: bool,
+}
+
+/// 搜索文件
+///
+/// GET /api/v1/files/search?key=xxx&page=1&num=100&recursion=1
+pub async fn search_files(
+    State(state): State<AppState>,
+    Query(params): Query<SearchQuery>,
+) -> Result<Json<ApiResponse<SearchData>>, StatusCode> {
+    info!("API: 搜索文件 key={}, page={}", params.key, params.page);
+
+    if params.key.trim().is_empty() {
+        return Ok(Json(ApiResponse::error(400, "搜索关键词不能为空".to_string())));
+    }
+    if params.key.len() > 255 {
+        return Ok(Json(ApiResponse::error(400, "搜索关键词过长".to_string())));
+    }
+
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+        }
+    };
+
+    match client.search_files(&params.key, params.page, params.num, params.recursion).await {
+        Ok(search_result) => {
+            let has_more = search_result.has_more == 1;
+
+            // 使用 list 或 contentlist
+            let file_list = if !search_result.list.is_empty() {
+                search_result.list
+            } else {
+                search_result.contentlist
+            };
+
+            // 处理加密信息
+            let encrypted_names: Vec<String> = file_list
+                .iter()
+                .filter(|f| is_encrypted_filename(&f.server_filename))
+                .map(|f| f.server_filename.clone())
+                .collect();
+
+            let encryption_map = query_encryption_mappings(&state, &encrypted_names);
+
+            let list_with_encryption: Vec<FileItemWithEncryption> = file_list
+                .into_iter()
+                .map(|file| {
+                    let (is_encrypted, original_name, original_size) =
+                        if is_encrypted_filename(&file.server_filename) {
+                            match encryption_map.get(&file.server_filename) {
+                                Some((name, size)) => (true, Some(name.clone()), Some(*size)),
+                                None => (false, None, None),
+                            }
+                        } else {
+                            (false, None, None)
+                        };
+
+                    let is_encrypted_folder = file.isdir == 1 && is_encrypted_folder_name(&file.server_filename);
+
+                    FileItemWithEncryption {
+                        file,
+                        is_encrypted,
+                        is_encrypted_folder,
+                        original_name,
+                        original_size,
+                    }
+                })
+                .collect();
+
+            let data = SearchData {
+                list: list_with_encryption,
+                has_more,
+            };
+            Ok(Json(ApiResponse::success(data)))
+        }
+        Err(e) => {
+            error!("搜索文件失败: {}", e);
+            Ok(Json(ApiResponse::error(500, format!("搜索文件失败: {}", e))))
+        }
+    }
+}
+
 /// 下载链接查询参数
 #[derive(Debug, Deserialize)]
 pub struct DownloadUrlQuery {
