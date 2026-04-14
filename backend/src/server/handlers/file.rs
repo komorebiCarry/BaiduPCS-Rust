@@ -319,12 +319,9 @@ pub async fn search_files(
         Ok(search_result) => {
             let has_more = search_result.has_more == 1;
 
-            // 使用 list 或 contentlist
-            let file_list = if !search_result.list.is_empty() {
-                search_result.list
-            } else {
-                search_result.contentlist
-            };
+            // 合并 list 和 contentlist
+            let mut file_list = search_result.list;
+            file_list.extend(search_result.contentlist);
 
             // 处理加密信息
             let encrypted_names: Vec<String> = file_list

@@ -14,6 +14,7 @@
         :can-go-back="store.canGoBack"
         :can-go-forward="store.canGoForward"
         :can-go-up="!store.isRoot"
+        :mode="mode"
         @navigate="handleNavigate"
         @back="store.goBack"
         @forward="store.goForward"
