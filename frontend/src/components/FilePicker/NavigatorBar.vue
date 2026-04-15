@@ -285,7 +285,7 @@ function handleSearchEscape() {
 watch(() => props.currentPath, () => {
   if (searchInput.value.trim()) {
     searchInput.value = ''
-    emit('clear-search')
+    // 不再 emit clear-search：store 层在 navigateTo/goBack/goForward 中已自行清理搜索并加载目录
   }
 })
 </script>
