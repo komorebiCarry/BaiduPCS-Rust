@@ -129,21 +129,39 @@ export const useFilePickerStore = defineStore('filepicker', () => {
   }
 
   // 后退
-  function goBack() {
+  async function goBack() {
     if (!canGoBack.value) return
 
     forwardStack.value.push(currentPath.value)
     const prevPath = historyStack.value.pop()!
-    loadDirectory(prevPath, false)
+    const oldKeyword = searchKeyword.value
+    const oldIsSearching = isSearching.value
+    searchKeyword.value = ''
+    isSearching.value = false
+    await loadDirectory(prevPath, false)
+    // 请求失败时回滚搜索状态，保持 UI 与 store 一致
+    if (error.value) {
+      searchKeyword.value = oldKeyword
+      isSearching.value = oldIsSearching
+    }
   }
 
   // 前进
-  function goForward() {
+  async function goForward() {
     if (!canGoForward.value) return
 
     historyStack.value.push(currentPath.value)
     const nextPath = forwardStack.value.pop()!
-    loadDirectory(nextPath, false)
+    const oldKeyword = searchKeyword.value
+    const oldIsSearching = isSearching.value
+    searchKeyword.value = ''
+    isSearching.value = false
+    await loadDirectory(nextPath, false)
+    // 请求失败时回滚搜索状态，保持 UI 与 store 一致
+    if (error.value) {
+      searchKeyword.value = oldKeyword
+      isSearching.value = oldIsSearching
+    }
   }
 
   // 刷新

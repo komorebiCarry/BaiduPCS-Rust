@@ -454,6 +454,9 @@ const searchHasMore = ref(false)
 const searchInputRef = ref<InputInstance>()
 const searchWrapperRef = ref<HTMLElement | null>(null)
 
+// 请求版本号，用于取消过期的请求回调
+let fileRequestVersion = 0
+
 // 路径分割
 const pathParts = computed(() => {
   if (currentDir.value === '/') return []
@@ -468,6 +471,8 @@ function getPathUpTo(index: number): string {
 
 // 加载文件列表
 async function loadFiles(dir: string, append: boolean = false) {
+  const version = ++fileRequestVersion
+
   if (append) {
     loadingMore.value = true
   } else {
@@ -479,6 +484,7 @@ async function loadFiles(dir: string, append: boolean = false) {
   try {
     const page = append ? currentPage.value : 1
     const data = await getFileList(dir, page, 50)
+    if (version !== fileRequestVersion) return
 
     if (append) {
       fileList.value = [...fileList.value, ...data.list]
@@ -531,6 +537,9 @@ function navigateToDir(dir: string) {
 
 // 刷新文件列表
 function refreshFileList() {
+  if (isSearchMode.value) {
+    resetSearchState()
+  }
   loadFiles(currentDir.value)
 }
 
@@ -1074,9 +1083,11 @@ async function handleSearch() {
   searchLoading.value = true
   isSearchMode.value = true
   searchPage.value = 1
+  const version = ++fileRequestVersion
 
   try {
     const data = await searchFiles(keyword, 1, 100)
+    if (version !== fileRequestVersion) return
     fileList.value = data.list as FileItem[]
     searchHasMore.value = data.has_more
   } catch (error: any) {
@@ -1095,9 +1106,11 @@ async function loadMoreSearchResults() {
   searchPage.value++
   searchLoading.value = true
   loadingMore.value = true
+  const version = ++fileRequestVersion
 
   try {
     const data = await searchFiles(searchKeyword.value.trim(), searchPage.value, 100)
+    if (version !== fileRequestVersion) return
     fileList.value = [...fileList.value, ...(data.list as FileItem[])]
     searchHasMore.value = data.has_more
   } catch (error: any) {
@@ -1109,6 +1122,7 @@ async function loadMoreSearchResults() {
 }
 
 function resetSearchState(options: { keepExpanded?: boolean } = {}) {
+  fileRequestVersion++
   isSearchMode.value = false
   searchKeyword.value = ''
   searchExpanded.value = options.keepExpanded ?? false
