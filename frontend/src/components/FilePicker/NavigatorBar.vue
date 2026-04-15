@@ -501,26 +501,31 @@ watch(() => props.currentPath, () => {
     width: 100%;
     min-height: 40px;
     display: flex;
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 8px;
   }
 
   .path-stage {
-    width: 100%;
+    flex: 1;
+    width: auto;
     max-width: none;
+    min-width: 0;
   }
 
   .search-box {
-    width: 32px;
-    min-width: 32px;
+    width: 36px;
+    min-width: 36px;
     max-width: none;
     height: 36px;
-    align-self: flex-start;
+    align-self: center;
+    flex-shrink: 0;
   }
 
   .search-box.is-expanded {
     width: 100%;
+    flex: 1 0 100%;
     align-self: stretch;
   }
 
@@ -533,10 +538,11 @@ watch(() => props.currentPath, () => {
     position: relative;
     margin-top: 8px;
     padding: 8px 12px;
-    height: auto; /* 自适应高度 */
-    min-height: 32px; /* 最小高度 */
-    cursor: default; /* 移动端默认光标 */
-    z-index: auto; /* 移动端不需要层级 */
+    height: auto;
+    min-height: 32px;
+    cursor: default;
+    z-index: auto;
+    width: 100%;
   }
 
   .breadcrumb-overlay :deep(.el-breadcrumb) {
