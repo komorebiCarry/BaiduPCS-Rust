@@ -3843,21 +3843,35 @@ fn detect_cross_dir_duplicates(files: &[SharedFileInfo]) -> Vec<String> {
         .collect()
 }
 
-/// 推导分享链接的虚拟根路径，用于计算文件的相对目录结构。
+/// 推导分享文件的公共父目录，用于计算文件的相对目录结构。
 ///
-/// 分享文件路径格式: `/sharelink{share_id}-{uk}/实际目录/文件名`
-/// 第一段 `/sharelink...` 是虚拟命名空间，后续路径是用户原始的目录结构，应完整保留。
-/// 因此 share_root 取第一个路径段，而非最长公共前缀（后者会吃掉中间层级）。
+/// 取所有文件路径的最长公共父目录。例如：
+/// - 单文件 `/a/b/c/file.mp4` → share_root = `/a/b/c`
+/// - 多文件 `/root/抖音/1.jpg`, `/root/微信/2.jpg` → share_root = `/root`
+/// - `/sharelink123/dir/file` → share_root = `/sharelink123/dir`
 fn infer_share_root(files: &[SharedFileInfo]) -> String {
     if files.is_empty() {
         return String::new();
     }
-    let first_path = &files[0].path;
-    let segments: Vec<&str> = first_path.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return String::new();
+    let parents: Vec<&str> = files.iter().map(|f| extract_parent_dir_str(&f.path)).collect();
+    let first_segs: Vec<&str> = parents[0].split('/').collect();
+    let mut common_len = first_segs.len();
+    for p in &parents[1..] {
+        let segs: Vec<&str> = p.split('/').collect();
+        common_len = common_len.min(segs.len());
+        for i in 0..common_len {
+            if first_segs[i] != segs[i] {
+                common_len = i;
+                break;
+            }
+        }
     }
-    format!("/{}", segments[0])
+    let common: String = first_segs[..common_len].join("/");
+    if common.is_empty() || common == "/" {
+        String::new()
+    } else {
+        common
+    }
 }
 
 /// 按原始父目录分组文件，保留分享链接中的目录结构。
@@ -4123,11 +4137,10 @@ mod tests {
             make_file("/root/a/3.jpg", 3),
         ];
         let share_root = infer_share_root(&files);
-        // share_root = "/root"（第一路径段），relative_parent = "a"
-        assert_eq!(share_root, "/root");
+        assert_eq!(share_root, "/root/a");
         let groups = group_files_by_parent_dir(&files, &share_root);
         assert_eq!(groups.len(), 1, "同目录文件应只有 1 个组");
-        assert_eq!(groups[0].0, "a");
+        assert_eq!(groups[0].0, "");
         assert_eq!(groups[0].1.len(), 3);
     }
 
