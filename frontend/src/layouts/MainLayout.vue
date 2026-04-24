@@ -20,7 +20,12 @@
       >
         <el-menu-item index="/files">
           <el-icon><Files /></el-icon>
-          <template #title>文件管理</template>
+          <template #title>网盘管理</template>
+        </el-menu-item>
+
+        <el-menu-item index="/local">
+          <el-icon><Folder /></el-icon>
+          <template #title>本地文件</template>
         </el-menu-item>
 
         <el-menu-item index="/downloads">
@@ -94,7 +99,12 @@
         >
           <el-menu-item index="/files">
             <el-icon><Files /></el-icon>
-            <span>文件管理</span>
+            <span>网盘管理</span>
+          </el-menu-item>
+
+          <el-menu-item index="/local">
+            <el-icon><Folder /></el-icon>
+            <span>本地文件</span>
           </el-menu-item>
 
           <el-menu-item index="/downloads">
@@ -241,6 +251,7 @@ import { useIsMobile } from '@/utils/responsive'
 import UserProfileDialog from '@/components/UserProfileDialog.vue'
 import {
   FolderOpened,
+  Folder,
   Files,
   Download,
   Upload,
@@ -286,7 +297,8 @@ const userAvatar = computed(() => authStore.avatar)
 
 const pageTitle = computed(() => {
   const titles: Record<string, string> = {
-    '/files': '文件管理',
+    '/files': '网盘管理',
+    '/local': '本地文件',
     '/downloads': '下载管理',
     '/uploads': '上传管理',
     '/transfers': '转存管理',

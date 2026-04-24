@@ -9,6 +9,7 @@ pub mod download;
 pub mod encryption_export;
 pub mod file;
 pub mod filesystem;
+pub mod local_files;
 pub mod folder_download;
 pub mod share;
 pub mod transfer;

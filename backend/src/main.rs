@@ -368,6 +368,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/fs/goto", get(handlers::goto_path))
         .route("/fs/validate", get(handlers::validate_path))
         .route("/fs/roots", get(handlers::get_roots))
+        // 本地文件API
+        .route("/local-files", get(handlers::local_files::list_local_files))
+        .route("/local-files/delete", post(handlers::local_files::delete_local_files))
         // 配置API
         .route("/config", get(handlers::get_config))
         .route("/config", put(handlers::update_config))
