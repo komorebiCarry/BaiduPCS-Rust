@@ -116,6 +116,26 @@ export async function createFolder(path: string): Promise<CreateFolderData> {
   return response.data.data
 }
 
+export interface DeleteFilesData {
+  deleted_count: number
+  failed_paths: string[]
+}
+
+/**
+ * 删除文件
+ */
+export async function deleteFiles(paths: string[]): Promise<DeleteFilesData> {
+  const response = await apiClient.post<ApiResponse<DeleteFilesData>>('/files/delete', {
+    paths
+  })
+
+  if (response.data.code !== 0 || !response.data.data) {
+    throw new Error(response.data.message || '删除文件失败')
+  }
+
+  return response.data.data
+}
+
 // 重新导出共享工具函数，保持向后兼容
 export const formatFileSize = sharedFormatFileSize
 export const formatTime = formatTimestamp

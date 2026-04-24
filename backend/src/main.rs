@@ -292,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/files", get(handlers::get_file_list))
         .route("/files/download", get(handlers::get_download_url))
         .route("/files/folder", post(handlers::create_folder))
+        .route("/files/delete", post(handlers::delete_files))
         // 下载API
         .route("/downloads", post(handlers::create_download))
         .route("/downloads", get(handlers::get_all_downloads))
