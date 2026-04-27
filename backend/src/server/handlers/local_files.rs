@@ -57,6 +57,7 @@ pub async fn list_local_files(
         page_size: query.page_size,
         sort_field: query.sort_field,
         sort_order: query.sort_order,
+        keyword: None,
     };
 
     match service.list_directory(&req) {
