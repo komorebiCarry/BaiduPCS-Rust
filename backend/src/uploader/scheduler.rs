@@ -10,7 +10,7 @@
 // - 检测任务数变化，重置服务器速度窗口
 // - 🔥 任务槽位机制由 UploadManager 的 TaskSlotPool 管理
 
-use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
+use crate::autobackup::events::{BackupTransferNotification, TransferTaskType, UploadCompletionMeta};
 use crate::encryption::SnapshotManager;
 use crate::netdisk::{NetdiskClient, UploadErrorKind};
 use crate::persistence::PersistenceManager;
@@ -701,6 +701,11 @@ impl UploadChunkScheduler {
                                                         let notification = BackupTransferNotification::Completed {
                                                             task_id: task_id.to_string(),
                                                             task_type: TransferTaskType::Upload,
+                                                            upload_meta: Some(UploadCompletionMeta {
+                                                                fs_id: response.fs_id,
+                                                                mtime: response.mtime,
+                                                                size: response.size,
+                                                            }),
                                                         };
                                                         if let Err(e) = tx.send(notification) {
                                                             error!("发送备份上传任务完成通知失败: {}", e);
@@ -1033,6 +1038,11 @@ impl UploadChunkScheduler {
                                             let notification = BackupTransferNotification::Completed {
                                                 task_id: task_id.clone(),
                                                 task_type: TransferTaskType::Upload,
+                                                upload_meta: Some(UploadCompletionMeta {
+                                                    fs_id: response.fs_id,
+                                                    mtime: response.mtime,
+                                                    size: response.size,
+                                                }),
                                             };
                                             let _ = tx.send(notification);
                                         }

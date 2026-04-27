@@ -400,6 +400,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/autobackup/tasks/:id", delete(handlers::autobackup::delete_backup_task))
         .route("/autobackup/tasks/:id/files", get(handlers::autobackup::list_file_tasks))
         .route("/autobackup/tasks/:task_id/files/:file_task_id/retry", post(handlers::autobackup::retry_file_task))
+        .route("/autobackup/configs/:id/sync-state/reset", post(handlers::autobackup::reset_sync_state))
+        .route("/autobackup/configs/:id/sync-state/tombstones", get(handlers::autobackup::list_tombstones))
         .route("/autobackup/status", get(handlers::autobackup::get_manager_status))
         .route("/autobackup/stats", get(handlers::autobackup::get_record_stats))
         .route("/autobackup/cleanup", post(handlers::autobackup::cleanup_records))

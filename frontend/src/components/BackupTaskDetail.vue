@@ -7,7 +7,7 @@ import {
   Close, Check, QuestionFilled
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import type { BackupTask, BackupFileTask, BackupFileStatus, SkipReason, FilterReasonType } from '@/api/autobackup'
+import type { BackupTask, BackupFileTask, BackupFileStatus, BackupSubPhase, SkipReason, FilterReasonType } from '@/api/autobackup'
 import { listFileTasks, retryFileTask } from '@/api/autobackup'
 import { getWebSocketClient } from '@/utils/websocket'
 import type { BackupEvent, BackupEventFileProgress, BackupEventProgress } from '@/types/events'
@@ -133,6 +133,24 @@ function getTriggerTypeText(type: string): string {
     scheduled: '计划任务'
   }
   return typeMap[type] || type
+}
+
+function getSubPhaseText(phase: BackupSubPhase | undefined): string {
+  if (!phase) return ''
+  const phaseMap: Record<string, string> = {
+    dedup_checking: '去重检查中',
+    waiting_slot: '等待槽位',
+    encrypting: '加密中',
+    uploading: '上传中',
+    downloading: '下载中',
+    decrypting: '解密中',
+    preempted: '已被抢占',
+    sync_scanning: '同步扫描中',
+    sync_planning: '同步规划中',
+    sync_uploading: '同步上传中',
+    sync_downloading: '同步下载中'
+  }
+  return phaseMap[phase] || phase
 }
 
 // 操作
@@ -444,6 +462,9 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
         <div class="status-info">
           <div class="status-text" :style="{ color: getStatusColor(task.status) }">
             {{ getStatusText(task.status) }}
+            <el-tag v-if="task.sub_phase" size="small" type="info" style="margin-left: 8px">
+              {{ getSubPhaseText(task.sub_phase) }}
+            </el-tag>
           </div>
           <div class="config-name" v-if="configName">{{ configName }}</div>
         </div>

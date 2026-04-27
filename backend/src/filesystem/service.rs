@@ -580,6 +580,20 @@ impl FilesystemService {
 mod tests {
     use super::*;
 
+    /// canonicalize() 在 Windows 上返回 \\?\ 前缀，但我们的代码会剥离它。
+    /// 测试中也需要剥离后再比较。
+    fn expected_path(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap();
+        let s = canonical.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{}", rest)
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
     #[test]
     fn test_service_new() {
         let _service = FilesystemService::new(FilesystemConfig::default());
@@ -626,14 +640,8 @@ mod tests {
 
         let roots = service.get_roots().unwrap();
         assert_eq!(roots.len(), 2);
-        assert_eq!(
-            roots[0].path,
-            beta.canonicalize().unwrap().to_string_lossy()
-        );
-        assert_eq!(
-            roots[1].path,
-            alpha.canonicalize().unwrap().to_string_lossy()
-        );
+        assert_eq!(roots[0].path, expected_path(&beta));
+        assert_eq!(roots[1].path, expected_path(&alpha));
     }
 
     #[test]
@@ -745,9 +753,6 @@ mod tests {
 
         let resp = service.get_roots_with_default().unwrap();
         assert!(resp.default_path.is_some());
-        assert_eq!(
-            resp.default_path.unwrap(),
-            alpha.canonicalize().unwrap().to_string_lossy()
-        );
+        assert_eq!(resp.default_path.unwrap(), expected_path(&alpha));
     }
 }

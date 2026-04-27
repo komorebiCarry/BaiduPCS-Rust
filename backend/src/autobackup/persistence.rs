@@ -153,6 +153,9 @@ impl BackupPersistenceManager {
                 retry_count INTEGER DEFAULT 0,          -- 重试次数
                 related_task_id TEXT,                   -- 关联的任务ID（上传或下载任务ID，用于服务重启后恢复）
                 backup_operation_type TEXT,             -- 备份操作类型: upload/download
+                sync_remote_mtime INTEGER,              -- Sync 计划阶段保存的远端 mtime（秒级时间戳）
+                sync_remote_size INTEGER,               -- Sync 计划阶段保存的远端 size（字节）
+                sync_remote_fs_id INTEGER,              -- Sync 计划阶段保存的远端 fs_id
                 created_at INTEGER NOT NULL,            -- 创建时间 (Unix timestamp 秒)
                 updated_at INTEGER NOT NULL,            -- 最后更新时间
                 FOREIGN KEY (backup_task_id) REFERENCES backup_tasks(id)
@@ -192,6 +195,22 @@ impl BackupPersistenceManager {
             "CREATE INDEX IF NOT EXISTS idx_file_tasks_fs_id ON backup_file_tasks(fs_id)",
             [],
         )?;
+
+        // 迁移：为已有数据库添加 sync_remote_* 列（ALTER TABLE ADD COLUMN 如果列已存在会报错，忽略即可）
+        for col in &[
+            "sync_remote_mtime INTEGER",
+            "sync_remote_size INTEGER",
+            "sync_remote_fs_id INTEGER",
+        ] {
+            let sql = format!("ALTER TABLE backup_file_tasks ADD COLUMN {}", col);
+            if let Err(e) = conn.execute(&sql, []) {
+                // "duplicate column name" 说明列已存在，可以安全忽略
+                let msg = e.to_string();
+                if !msg.contains("duplicate column") {
+                    tracing::warn!("迁移 backup_file_tasks 添加列失败: {}", msg);
+                }
+            }
+        }
 
         tracing::info!("备份任务数据库表初始化完成");
         Ok(())
@@ -424,8 +443,9 @@ impl BackupPersistenceManager {
                 status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
                 transferred_bytes, error_message, retry_count,
                 related_task_id, backup_operation_type,
+                sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
             "#,
             params![
                 file_task.id,
@@ -449,6 +469,9 @@ impl BackupPersistenceManager {
                 file_task.retry_count as i64,
                 file_task.related_task_id,
                 file_task.backup_operation_type.map(|t| format!("{:?}", t).to_lowercase()),
+                file_task.sync_remote_mtime,
+                file_task.sync_remote_size.map(|s| s as i64),
+                file_task.sync_remote_fs_id.map(|id| id as i64),
                 file_task.created_at.timestamp(),
                 file_task.updated_at.timestamp(),
             ],
@@ -473,8 +496,9 @@ impl BackupPersistenceManager {
                     status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
                     transferred_bytes, error_message, retry_count,
                     related_task_id, backup_operation_type,
+                    sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                     created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
                 "#,
             )?;
 
@@ -516,6 +540,9 @@ impl BackupPersistenceManager {
                     file_task.retry_count as i64,
                     file_task.related_task_id,
                     file_task.backup_operation_type.map(|t| format!("{:?}", t).to_lowercase()),
+                    file_task.sync_remote_mtime,
+                    file_task.sync_remote_size.map(|s| s as i64),
+                    file_task.sync_remote_fs_id.map(|id| id as i64),
                     file_task.created_at.timestamp(),
                     file_task.updated_at.timestamp(),
                 ])?;
@@ -558,6 +585,7 @@ impl BackupPersistenceManager {
                    status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
                    transferred_bytes, error_message, retry_count,
                    related_task_id, backup_operation_type,
+                   sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                    created_at, updated_at
             FROM backup_file_tasks
             WHERE backup_task_id = ?1
@@ -589,8 +617,11 @@ impl BackupPersistenceManager {
                 retry_count: row.get(18)?,
                 related_task_id: row.get(19)?,
                 backup_operation_type: row.get(20)?,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
+                sync_remote_mtime: row.get(21)?,
+                sync_remote_size: row.get(22)?,
+                sync_remote_fs_id: row.get(23)?,
+                created_at: row.get(24)?,
+                updated_at: row.get(25)?,
             })
         })?;
 
@@ -662,6 +693,7 @@ impl BackupPersistenceManager {
                    status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
                    transferred_bytes, error_message, retry_count,
                    related_task_id, backup_operation_type,
+                   sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                    created_at, updated_at
             FROM backup_file_tasks
             WHERE backup_task_id = ?1 AND status = 'pending'
@@ -693,8 +725,11 @@ impl BackupPersistenceManager {
                 retry_count: row.get(18)?,
                 related_task_id: row.get(19)?,
                 backup_operation_type: row.get(20)?,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
+                sync_remote_mtime: row.get(21)?,
+                sync_remote_size: row.get(22)?,
+                sync_remote_fs_id: row.get(23)?,
+                created_at: row.get(24)?,
+                updated_at: row.get(25)?,
             })
         })?;
 
@@ -734,6 +769,7 @@ impl BackupPersistenceManager {
                    status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
                    transferred_bytes, error_message, retry_count,
                    related_task_id, backup_operation_type,
+                   sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                    created_at, updated_at
             FROM backup_file_tasks
             WHERE backup_task_id = ?1
@@ -765,8 +801,11 @@ impl BackupPersistenceManager {
                 retry_count: row.get(18)?,
                 related_task_id: row.get(19)?,
                 backup_operation_type: row.get(20)?,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
+                sync_remote_mtime: row.get(21)?,
+                sync_remote_size: row.get(22)?,
+                sync_remote_fs_id: row.get(23)?,
+                created_at: row.get(24)?,
+                updated_at: row.get(25)?,
             })
         })?;
 
@@ -966,6 +1005,7 @@ impl BackupPersistenceManager {
                    status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
                    transferred_bytes, error_message, retry_count,
                    related_task_id, backup_operation_type,
+                   sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                    created_at, updated_at
             FROM backup_file_tasks
             WHERE config_id = ?1
@@ -997,8 +1037,11 @@ impl BackupPersistenceManager {
                 retry_count: row.get(18)?,
                 related_task_id: row.get(19)?,
                 backup_operation_type: row.get(20)?,
-                created_at: row.get(21)?,
-                updated_at: row.get(22)?,
+                sync_remote_mtime: row.get(21)?,
+                sync_remote_size: row.get(22)?,
+                sync_remote_fs_id: row.get(23)?,
+                created_at: row.get(24)?,
+                updated_at: row.get(25)?,
             })
         })?;
 
@@ -1179,7 +1222,7 @@ impl BackupPersistenceManager {
                 SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped,
                 COALESCE(SUM(CASE WHEN status != 'skipped' THEN file_size ELSE 0 END), 0) as total_bytes,
                 COALESCE(SUM(
-                    CASE 
+                    CASE
                         WHEN status = 'completed' THEN file_size
                         WHEN status != 'skipped' THEN transferred_bytes
                         ELSE 0
@@ -1305,7 +1348,7 @@ impl BackupPersistenceManager {
         let transferred_bytes: i64 = conn.query_row(
             r#"
             SELECT COALESCE(SUM(
-                CASE 
+                CASE
                     WHEN status = 'completed' THEN file_size
                     WHEN status != 'skipped' THEN transferred_bytes
                     ELSE 0
@@ -1463,6 +1506,9 @@ impl BackupPersistenceManager {
             retry_count: row.retry_count as u32,
             related_task_id: row.related_task_id,
             backup_operation_type,
+            sync_remote_mtime: row.sync_remote_mtime,
+            sync_remote_size: row.sync_remote_size.map(|s| s as u64),
+            sync_remote_fs_id: row.sync_remote_fs_id.map(|id| id as u64),
             created_at: chrono::DateTime::from_timestamp(row.created_at, 0)
                 .unwrap_or_else(chrono::Utc::now),
             updated_at: chrono::DateTime::from_timestamp(row.updated_at, 0)
@@ -1566,6 +1612,9 @@ struct BackupFileTaskRow {
     retry_count: i64,
     related_task_id: Option<String>,
     backup_operation_type: Option<String>,
+    sync_remote_mtime: Option<i64>,
+    sync_remote_size: Option<i64>,
+    sync_remote_fs_id: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
@@ -1595,6 +1644,10 @@ fn parse_sub_phase(s: &str) -> Result<BackupSubPhase> {
         "downloading" => Ok(BackupSubPhase::Downloading),
         "decrypting" => Ok(BackupSubPhase::Decrypting),
         "preempted" => Ok(BackupSubPhase::Preempted),
+        "syncscanning" => Ok(BackupSubPhase::SyncScanning),
+        "syncplanning" => Ok(BackupSubPhase::SyncPlanning),
+        "syncuploading" => Ok(BackupSubPhase::SyncUploading),
+        "syncdownloading" => Ok(BackupSubPhase::SyncDownloading),
         _ => Err(anyhow!("未知的子阶段: {}", s)),
     }
 }
@@ -1679,5 +1732,225 @@ mod tests {
         assert_eq!(loaded.id, task.id);
         assert_eq!(loaded.config_id, task.config_id);
         assert_eq!(loaded.total_count, task.total_count);
+    }
+
+    /// 构造一个用于测试的 BackupFileTask
+    fn make_test_file_task(id: &str, parent_task_id: &str) -> BackupFileTask {
+        BackupFileTask {
+            id: id.to_string(),
+            parent_task_id: parent_task_id.to_string(),
+            local_path: std::path::PathBuf::from("/tmp/test/file.txt"),
+            remote_path: "/remote/file.txt".to_string(),
+            file_size: 12345,
+            head_md5: Some("abc123".to_string()),
+            fs_id: Some(99999),
+            status: BackupFileStatus::Pending,
+            sub_phase: None,
+            skip_reason: None,
+            encrypted: false,
+            encrypted_name: None,
+            temp_encrypted_path: None,
+            transferred_bytes: 0,
+            decrypt_progress: None,
+            error_message: None,
+            retry_count: 0,
+            related_task_id: None,
+            backup_operation_type: Some(BackupOperationType::Upload),
+            sync_remote_mtime: Some(1700000000),
+            sync_remote_size: Some(12345),
+            sync_remote_fs_id: Some(88888),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Round-trip: save_file_task → load_file_tasks 应保留 sync_remote_* 字段
+    #[test]
+    fn test_file_task_sync_remote_roundtrip_single() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_rt.db");
+        let manager = BackupPersistenceManager::new(&db_path).unwrap();
+
+        // 先创建父任务满足外键约束
+        let parent = BackupTask {
+            id: "task-1".to_string(),
+            config_id: "cfg-1".to_string(),
+            status: BackupTaskStatus::Transferring,
+            sub_phase: None,
+            trigger_type: TriggerType::Manual,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 1,
+            transferred_bytes: 0,
+            total_bytes: 12345,
+            scan_progress: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+        manager.save_task(&parent).unwrap();
+
+        let ft = make_test_file_task("ft-1", "task-1");
+        manager.save_file_task(&ft, "cfg-1").unwrap();
+
+        let (loaded, total) = manager.load_file_tasks("task-1", 1, 50).unwrap();
+        assert_eq!(total, 1);
+        let l = &loaded[0];
+        assert_eq!(l.sync_remote_mtime, Some(1700000000));
+        assert_eq!(l.sync_remote_size, Some(12345));
+        assert_eq!(l.sync_remote_fs_id, Some(88888));
+    }
+
+    /// Round-trip: save_file_tasks_batch → load_file_tasks_for_restore 应保留 sync_remote_* 字段
+    #[test]
+    fn test_file_task_sync_remote_roundtrip_batch_restore() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_batch.db");
+        let manager = BackupPersistenceManager::new(&db_path).unwrap();
+
+        // 需要先创建主任务记录（外键约束）
+        let task = BackupTask {
+            id: "task-2".to_string(),
+            config_id: "cfg-2".to_string(),
+            status: BackupTaskStatus::Transferring,
+            sub_phase: None,
+            trigger_type: TriggerType::Manual,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 2,
+            transferred_bytes: 0,
+            total_bytes: 24690,
+            scan_progress: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+        manager.save_task(&task).unwrap();
+
+        let mut ft1 = make_test_file_task("ft-batch-1", "task-2");
+        ft1.sync_remote_mtime = Some(1600000000);
+        ft1.sync_remote_size = Some(111);
+        ft1.sync_remote_fs_id = Some(222);
+
+        let mut ft2 = make_test_file_task("ft-batch-2", "task-2");
+        ft2.sync_remote_mtime = None;
+        ft2.sync_remote_size = None;
+        ft2.sync_remote_fs_id = None;
+
+        manager.save_file_tasks_batch(&[ft1, ft2], "cfg-2").unwrap();
+
+        // load_file_tasks_for_restore 加载非终态任务
+        let restored = manager.load_file_tasks_for_restore("task-2").unwrap();
+        assert_eq!(restored.len(), 2);
+
+        let r1 = restored.iter().find(|t| t.id == "ft-batch-1").unwrap();
+        assert_eq!(r1.sync_remote_mtime, Some(1600000000));
+        assert_eq!(r1.sync_remote_size, Some(111));
+        assert_eq!(r1.sync_remote_fs_id, Some(222));
+
+        let r2 = restored.iter().find(|t| t.id == "ft-batch-2").unwrap();
+        assert_eq!(r2.sync_remote_mtime, None);
+        assert_eq!(r2.sync_remote_size, None);
+        assert_eq!(r2.sync_remote_fs_id, None);
+    }
+
+    /// Migration: 在没有 sync_remote_* 列的旧数据库上打开应自动添加列
+    #[test]
+    fn test_migration_adds_sync_remote_columns() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_migrate.db");
+
+        // 1) 创建一个"旧"数据库：只有原始列，没有 sync_remote_*
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE backup_tasks (
+                    id TEXT PRIMARY KEY,
+                    config_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    sub_phase TEXT,
+                    trigger_type TEXT NOT NULL,
+                    completed_count INTEGER DEFAULT 0,
+                    failed_count INTEGER DEFAULT 0,
+                    skipped_count INTEGER DEFAULT 0,
+                    total_count INTEGER DEFAULT 0,
+                    transferred_bytes INTEGER DEFAULT 0,
+                    total_bytes INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    completed_at INTEGER
+                );
+                CREATE TABLE backup_file_tasks (
+                    id TEXT PRIMARY KEY,
+                    backup_task_id TEXT NOT NULL,
+                    config_id TEXT NOT NULL DEFAULT '',
+                    relative_path TEXT NOT NULL DEFAULT '',
+                    file_name TEXT NOT NULL DEFAULT '',
+                    local_path TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    head_md5 TEXT NOT NULL DEFAULT '',
+                    fs_id INTEGER,
+                    status TEXT NOT NULL,
+                    sub_phase TEXT,
+                    skip_reason TEXT,
+                    encrypted INTEGER DEFAULT 0,
+                    encrypted_name TEXT,
+                    temp_encrypted_path TEXT,
+                    transferred_bytes INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    retry_count INTEGER DEFAULT 0,
+                    related_task_id TEXT,
+                    backup_operation_type TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY (backup_task_id) REFERENCES backup_tasks(id)
+                );
+                "#,
+            ).unwrap();
+            // 插入一条旧格式的记录
+            conn.execute(
+                "INSERT INTO backup_tasks (id, config_id, status, trigger_type, created_at) VALUES ('t1','c1','transferring','manual',0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO backup_file_tasks (id, backup_task_id, config_id, local_path, remote_path, file_size, status, encrypted, transferred_bytes, retry_count, created_at, updated_at) VALUES ('f1','t1','c1','/a','/b',100,'pending',0,0,0,0,0)",
+                [],
+            ).unwrap();
+        }
+
+        // 2) 用 BackupPersistenceManager 打开旧库 → 触发迁移
+        let manager = BackupPersistenceManager::new(&db_path).unwrap();
+
+        // 3) 旧记录应能加载，sync_remote_* 为 None
+        let restored = manager.load_file_tasks_for_restore("t1").unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].sync_remote_mtime, None);
+        assert_eq!(restored[0].sync_remote_size, None);
+        assert_eq!(restored[0].sync_remote_fs_id, None);
+
+        // 4) 新记录可以正常写入和读取 sync_remote_*
+        let ft = make_test_file_task("f2", "t1");
+        manager.save_file_task(&ft, "c1").unwrap();
+
+        let restored2 = manager.load_file_tasks_for_restore("t1").unwrap();
+        let new_task = restored2.iter().find(|t| t.id == "f2").unwrap();
+        assert_eq!(new_task.sync_remote_mtime, Some(1700000000));
+        assert_eq!(new_task.sync_remote_size, Some(12345));
+        assert_eq!(new_task.sync_remote_fs_id, Some(88888));
     }
 }

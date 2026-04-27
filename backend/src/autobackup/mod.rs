@@ -21,6 +21,7 @@ pub mod events;
 pub mod persistence;
 pub mod validation;
 pub mod scan_cache;
+pub mod sync;
 
 pub use common::{TempFileGuard, TempFileManager};
 pub use config::*;

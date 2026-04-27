@@ -31,6 +31,18 @@ pub struct BackupConfig {
     /// 下载冲突策略（仅用于 Download 备份）
     #[serde(default)]
     pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+    /// 同步冲突策略（仅 Sync 方向使用）
+    #[serde(default)]
+    pub sync_conflict_strategy: Option<SyncConflictStrategy>,
+    /// 首次初始化模式（仅 Sync 方向使用）
+    #[serde(default)]
+    pub sync_init_mode: Option<SyncInitMode>,
+    /// 是否需要完整同步（内部状态，非用户配置）
+    ///
+    /// 创建 Sync 配置时置 true；reset API 调用后置 true；
+    /// 首次 full sync 成功完成后清 false。
+    #[serde(default)]
+    pub needs_full_sync: bool,
     /// 是否启用
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -71,6 +83,17 @@ impl BackupConfig {
             );
         }
 
+        // 检测并迁移同步策略
+        if self.direction == BackupDirection::Sync && self.sync_conflict_strategy.is_none() {
+            self.sync_conflict_strategy = Some(SyncConflictStrategy::default());
+            migrated = true;
+            tracing::info!(
+                "备份配置迁移: 备份任务 '{}' (ID: {}) 缺少同步冲突策略，应用默认值 NewerWins",
+                self.name,
+                self.id
+            );
+        }
+
         if migrated {
             self.updated_at = chrono::Utc::now();
             tracing::info!(
@@ -93,6 +116,18 @@ impl BackupConfig {
         self.download_conflict_strategy
             .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite)
     }
+
+    /// 获取有效的同步冲突策略（考虑默认值）
+    pub fn effective_sync_strategy(&self) -> SyncConflictStrategy {
+        self.sync_conflict_strategy
+            .unwrap_or(SyncConflictStrategy::default())
+    }
+
+    /// 获取有效的同步初始化模式（考虑默认值）
+    pub fn effective_sync_init_mode(&self) -> SyncInitMode {
+        self.sync_init_mode
+            .unwrap_or(SyncInitMode::default())
+    }
 }
 
 fn default_true() -> bool {
@@ -107,6 +142,50 @@ pub enum BackupDirection {
     Upload,
     /// 下载备份：云端 → 本地
     Download,
+    /// 双向同步：本地 ↔ 云端
+    Sync,
+}
+
+/// 同步冲突策略（仅 Sync 方向使用）
+///
+/// 当同一文件在本地和远端都有变更时的冲突解决策略。
+/// Sync 模式下传输层一律使用 Overwrite，冲突语义完全由此策略在 Stage 2 控制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncConflictStrategy {
+    /// 本地版本优先（本地覆盖远端）
+    LocalWins,
+    /// 远端版本优先（远端覆盖本地）
+    RemoteWins,
+    /// 较新的版本优先（按 mtime 比较，默认）
+    NewerWins,
+    /// 跳过冲突文件（不处理，记录日志）
+    Skip,
+}
+
+impl Default for SyncConflictStrategy {
+    fn default() -> Self {
+        Self::NewerWins
+    }
+}
+
+/// 首次初始化模式（仅 Sync 方向使用）
+///
+/// 大目录首次启用同步时，控制 Case A3（两端都有文件、无 SyncState）的处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncInitMode {
+    /// 自动检测：md5 可比则比对，否则走冲突策略（默认）
+    AutoDetect,
+    /// 采纳当前状态为基线：两端都有的文件直接建 SyncState，不传输
+    /// 适合"两端已基本一致"的场景，避免首次启用时大量伪冲突
+    AdoptBothSides,
+}
+
+impl Default for SyncInitMode {
+    fn default() -> Self {
+        Self::AutoDetect
+    }
 }
 
 /// 监听配置
@@ -337,6 +416,12 @@ pub struct CreateBackupConfigRequest {
     /// 下载冲突策略
     #[serde(default)]
     pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+    /// 同步冲突策略（仅 direction=Sync 时有效）
+    #[serde(default)]
+    pub sync_conflict_strategy: Option<SyncConflictStrategy>,
+    /// 首次初始化模式（仅 direction=Sync 时有效）
+    #[serde(default)]
+    pub sync_init_mode: Option<SyncInitMode>,
 }
 
 /// 更新备份配置请求
@@ -358,6 +443,10 @@ pub struct UpdateBackupConfigRequest {
     pub upload_conflict_strategy: Option<crate::uploader::conflict::UploadConflictStrategy>,
     /// 下载冲突策略
     pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+    /// 同步冲突策略
+    pub sync_conflict_strategy: Option<SyncConflictStrategy>,
+    /// 首次初始化模式
+    pub sync_init_mode: Option<SyncInitMode>,
     /// 是否启用（注意：加密选项创建后不可更改）
     pub enabled: Option<bool>,
 }
@@ -393,6 +482,7 @@ mod tests {
         prop_oneof![
             Just(BackupDirection::Upload),
             Just(BackupDirection::Download),
+            Just(BackupDirection::Sync),
         ]
     }
 
@@ -418,17 +508,20 @@ mod tests {
                 encrypt_enabled: false,
                 upload_conflict_strategy: upload_strategy,
                 download_conflict_strategy: download_strategy,
+                sync_conflict_strategy: None,
+                sync_init_mode: None,
+                needs_full_sync: false,
                 enabled: true,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
-
+            
             // 序列化为 JSON
             let serialized = serde_json::to_string(&config).unwrap();
-
+            
             // 反序列化
             let deserialized: BackupConfig = serde_json::from_str(&serialized).unwrap();
-
+            
             // 验证策略字段正确保存和加载
             prop_assert_eq!(config.upload_conflict_strategy, deserialized.upload_conflict_strategy);
             prop_assert_eq!(config.download_conflict_strategy, deserialized.download_conflict_strategy);
@@ -452,6 +545,8 @@ mod tests {
                 encrypt_enabled: false,
                 upload_conflict_strategy: upload_strategy,
                 download_conflict_strategy: download_strategy,
+                sync_conflict_strategy: None,
+                sync_init_mode: None,
             };
 
             // 序列化为 JSON
@@ -459,7 +554,7 @@ mod tests {
 
             // 反序列化
             let deserialized: CreateBackupConfigRequest = serde_json::from_str(&serialized).unwrap();
-
+            
             // 验证策略字段正确保存和加载
             prop_assert_eq!(request.upload_conflict_strategy, deserialized.upload_conflict_strategy);
             prop_assert_eq!(request.download_conflict_strategy, deserialized.download_conflict_strategy);
@@ -480,6 +575,8 @@ mod tests {
                 filter_config: None,
                 upload_conflict_strategy: upload_strategy,
                 download_conflict_strategy: download_strategy,
+                sync_conflict_strategy: None,
+                sync_init_mode: None,
                 enabled: Some(true),
             };
 
@@ -488,7 +585,7 @@ mod tests {
 
             // 反序列化
             let deserialized: UpdateBackupConfigRequest = serde_json::from_str(&serialized).unwrap();
-
+            
             // 验证策略字段正确保存和加载
             prop_assert_eq!(request.upload_conflict_strategy, deserialized.upload_conflict_strategy);
             prop_assert_eq!(request.download_conflict_strategy, deserialized.download_conflict_strategy);
@@ -550,6 +647,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: Some(UploadConflictStrategy::SmartDedup),
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -582,6 +682,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: None,
             download_conflict_strategy: Some(DownloadConflictStrategy::Overwrite),
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -617,6 +720,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -648,6 +754,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -679,6 +788,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: Some(UploadConflictStrategy::AutoRename),
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -708,6 +820,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: Some(UploadConflictStrategy::AutoRename),
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -731,6 +846,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -757,6 +875,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: None,
             download_conflict_strategy: Some(DownloadConflictStrategy::Skip),
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -780,6 +901,9 @@ mod tests {
             encrypt_enabled: false,
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

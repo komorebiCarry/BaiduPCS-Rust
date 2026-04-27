@@ -6,6 +6,31 @@ use std::path::{Path, PathBuf};
 
 use super::types::{FilesystemConfig, FsError, FsErrorCode};
 
+/// Windows 上 `canonicalize()` 会返回扩展长度路径前缀，前端无法正确解析。
+/// 此函数将其剥离为普通路径：
+///   - `\\?\C:\path`         → `C:\path`       （本地磁盘）
+///   - `\\?\UNC\server\share` → `\\server\share` （UNC 网络路径）
+///   - 其他情况原样返回
+#[cfg(target_os = "windows")]
+fn strip_extended_length_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // \\?\UNC\server\share → \\server\share
+        PathBuf::from(format!(r"\\{}", rest))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // \\?\C:\path → C:\path
+        PathBuf::from(rest)
+    } else {
+        p
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[inline]
+fn strip_extended_length_prefix(p: PathBuf) -> PathBuf {
+    p
+}
+
 /// 路径安全守卫
 #[derive(Debug, Clone)]
 pub struct PathGuard {
@@ -172,7 +197,7 @@ impl PathGuard {
                 if !self.is_allowed(&canonical) {
                     return Err(FsError::new(FsErrorCode::PathNotAllowed).with_path(path));
                 }
-                Ok(canonical)
+                Ok(strip_extended_length_prefix(canonical))
             }
             Err(_) => {
                 // 路径不存在或无法访问
@@ -236,7 +261,7 @@ impl PathGuard {
             return Err(FsError::new(FsErrorCode::NotADirectory).with_path(path));
         }
 
-        Ok(canonical)
+        Ok(strip_extended_length_prefix(canonical))
     }
 
     fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -332,7 +357,7 @@ mod tests {
         });
 
         let roots = guard.resolve_allowed_roots().unwrap();
-        assert_eq!(roots[0], secondary.canonicalize().unwrap());
+        assert_eq!(roots[0], strip_extended_length_prefix(secondary.canonicalize().unwrap()));
         assert_eq!(roots.len(), 2);
     }
 

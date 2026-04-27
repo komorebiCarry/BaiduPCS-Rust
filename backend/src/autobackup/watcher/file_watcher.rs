@@ -159,6 +159,7 @@ impl FileWatcher {
             || file_name.ends_with(".temp")
             || file_name.ends_with(".swp")
             || file_name.ends_with(".bak")
+            || file_name.ends_with(crate::downloader::engine::DOWNLOADING_EXTENSION)
         {
             return false;
         }

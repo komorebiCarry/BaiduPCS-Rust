@@ -14,6 +14,17 @@ use super::task::{BackupTaskStatus, BackupSubPhase, TriggerType};
 // 传输任务通知（上传/下载管理器 -> 自动备份管理器）
 // ============================================================================
 
+/// 上传完成后服务端返回的元数据（用于 Sync 写回 SyncState）
+#[derive(Debug, Clone)]
+pub struct UploadCompletionMeta {
+    /// 服务端分配的 fs_id
+    pub fs_id: u64,
+    /// 服务端分配的 mtime（秒级时间戳）
+    pub mtime: i64,
+    /// 服务端确认的文件大小
+    pub size: u64,
+}
+
 /// 传输任务状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferTaskStatus {
@@ -70,6 +81,8 @@ pub enum BackupTransferNotification {
     Completed {
         task_id: String,
         task_type: TransferTaskType,
+        /// 上传成功时服务端返回的元数据（仅 Upload 类型有值）
+        upload_meta: Option<UploadCompletionMeta>,
     },
     /// 任务失败
     Failed {

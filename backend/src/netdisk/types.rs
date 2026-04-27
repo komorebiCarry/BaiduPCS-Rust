@@ -391,6 +391,14 @@ pub struct RapidUploadResponse {
     #[serde(default)]
     pub size: u64,
 
+    /// 服务器创建时间（秒级时间戳，/api/create 返回）
+    #[serde(default)]
+    pub ctime: i64,
+
+    /// 服务器修改时间（秒级时间戳，/api/create 返回）
+    #[serde(default)]
+    pub mtime: i64,
+
     /// 错误信息
     #[serde(default)]
     pub errmsg: String,

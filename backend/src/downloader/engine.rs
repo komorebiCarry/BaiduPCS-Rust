@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
-use tokio::fs::File;
+use tokio::fs::OpenOptions;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,11 @@ const SPEED_WINDOW_SIZE: usize = 7;
 /// 只有窗口积累了这么多样本，才开始使用窗口 median 进行 score 判定
 /// 避免前期数据不足导致误判
 const MIN_WINDOW_SAMPLES: usize = 5;
+
+/// 下载临时文件后缀
+/// 下载过程中使用此后缀，完成后 rename 去掉后缀
+/// 避免未完成的文件被文件监听器误触发上传
+pub const DOWNLOADING_EXTENSION: &str = ".downloading";
 
 /// 🔥 计算指数退避延迟
 ///
@@ -1164,8 +1169,8 @@ impl DownloadEngine {
         // 5. 创建 URL 健康管理器（传递speeds）
         let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls, url_speeds)));
 
-        // 6. 创建本地文件（内部会加锁检查取消状态）
-        self.prepare_file(&local_path, total_size, &cancellation_token)
+        let output_path = self
+            .prepare_download_output_path(&local_path, total_size, &cancellation_token)
             .await
             .context("准备本地文件失败")?;
 
@@ -1191,7 +1196,7 @@ impl DownloadEngine {
             cookie,
             referer,
             url_health,
-            local_path,
+            output_path,
             chunk_size,
             chunk_manager,
             speed_calc,
@@ -1438,24 +1443,24 @@ impl DownloadEngine {
             10, // 10分钟刷新间隔
         );
 
-        // 4. 创建本地文件（内部会加锁检查取消状态）
-        self.prepare_file(local_path, total_size, &cancellation_token)
+        let temp_path = self
+            .prepare_download_output_path(local_path, total_size, &cancellation_token)
             .await
             .context("准备本地文件失败")?;
 
-        // 5. 创建分片管理器（使用自适应计算的 chunk_size）
+        // 6. 创建分片管理器（使用自适应计算的 chunk_size）
         let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size)));
 
-        // 6. 创建速度计算器
+        // 7. 创建速度计算器
         let speed_calc = Arc::new(Mutex::new(SpeedCalculator::with_default_window()));
 
-        // 7. 标记为下载中
+        // 8. 标记为下载中
         {
             let mut t = task.lock().await;
             t.mark_downloading();
         }
 
-        // 8. 启动链接健康检查循环（用于恢复被降权的链接）
+        // 9. 启动链接健康检查循环（用于恢复被降权的链接）
         {
             let url_health_clone = url_health.clone();
             let download_client_clone = download_client.clone();
@@ -1535,7 +1540,7 @@ impl DownloadEngine {
             });
         }
 
-        // 9. 并发下载分片（使用全局 Semaphore 和复用的 download_client，使用 URL 健康管理器）
+        // 10. 并发下载分片（使用全局 Semaphore 和复用的 download_client，使用 URL 健康管理器）
         self.download_chunks(
             task.clone(),
             chunk_manager.clone(),
@@ -1543,7 +1548,7 @@ impl DownloadEngine {
             global_semaphore,
             &download_client, // 传递复用的 client
             url_health,       // 传递 URL 健康管理器
-            local_path,
+            &temp_path,       // 使用临时路径
             chunk_size,         // 传递分片大小用于计算超时
             total_size,         // 传递文件总大小用于计算延迟
             referer.as_deref(), // 传递 Referer 头（如果存在）
@@ -1552,10 +1557,16 @@ impl DownloadEngine {
             .await
             .context("下载分片失败")?;
 
-        // 9. 校验文件大小
-        self.verify_file_size(local_path, total_size)
+        // 11. 校验临时文件大小
+        self.verify_file_size(&temp_path, total_size)
             .await
             .context("文件大小校验失败")?;
+
+        // 12. 下载完成，将临时文件重命名为最终文件名
+        tokio::fs::rename(&temp_path, local_path)
+            .await
+            .context("重命名临时下载文件失败")?;
+        info!("✅ 临时文件已重命名: {:?} -> {:?}", temp_path, local_path);
 
         Ok(())
     }
@@ -2317,12 +2328,63 @@ impl DownloadEngine {
             // 锁在此处自动释放
         }
 
-        // 创建文件并预分配空间（不需要锁，因为文件路径唯一）
-        let file = File::create(path).await.context("创建文件失败")?;
-        file.set_len(size).await.context("预分配文件空间失败")?;
+        let existed = path.exists();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .await
+            .context("创建文件失败")?;
 
-        info!("文件准备完成: {:?}, 大小: {} bytes", path, size);
+        let current_size = file.metadata().await.context("获取文件元数据失败")?.len();
+        if current_size != size {
+            file.set_len(size).await.context("预分配文件空间失败")?;
+        }
+
+        if existed {
+            info!("文件准备完成: {:?}, 大小: {} bytes (复用已有文件)", path, size);
+        } else {
+            info!("文件准备完成: {:?}, 大小: {} bytes", path, size);
+        }
         Ok(())
+    }
+
+    async fn prepare_download_output_path(
+        &self,
+        final_path: &Path,
+        size: u64,
+        cancellation_token: &CancellationToken,
+    ) -> Result<PathBuf> {
+        let temp_path = Self::build_download_temp_path(final_path);
+
+        {
+            let _guard = self.fs_lock.lock().await;
+
+            if cancellation_token.is_cancelled() {
+                debug!("准备下载输出路径时发现任务已取消: {:?}", final_path);
+                anyhow::bail!("任务已被取消");
+            }
+
+            if !temp_path.exists() && final_path.exists() {
+                tokio::fs::rename(final_path, &temp_path)
+                    .await
+                    .context("迁移旧格式下载文件失败")?;
+                info!("检测到旧格式下载文件，已迁移为临时文件: {:?} -> {:?}", final_path, temp_path);
+            }
+        }
+
+        self.prepare_file(&temp_path, size, cancellation_token)
+            .await
+            .context("准备下载输出文件失败")?;
+
+        Ok(temp_path)
+    }
+
+    fn build_download_temp_path(final_path: &Path) -> PathBuf {
+        let mut temp = final_path.as_os_str().to_os_string();
+        temp.push(DOWNLOADING_EXTENSION);
+        PathBuf::from(temp)
     }
 
     /// 校验文件大小

@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Plus, VideoPlay, VideoPause, Delete, Key,
-  Upload, Download,
+  Upload, Download, Sort,
   Warning, CircleCheck, Loading, Refresh,
   FolderOpened, Clock, InfoFilled
 } from '@element-plus/icons-vue'
@@ -14,7 +14,8 @@ import {
   getManagerStatus,
   listFileTasks,
   type BackupConfig, type BackupTask, type EncryptionStatus, type ManagerStatus,
-  type CreateBackupConfigRequest, type BackupFileTask
+  type CreateBackupConfigRequest, type BackupFileTask,
+  type SyncConflictStrategy, type SyncInitMode
 } from '@/api/autobackup'
 import { getConfig } from '@/api/config'
 import type { UploadConflictStrategy } from '@/api/upload'
@@ -68,11 +69,17 @@ const selectedConfigName = ref('')
 
 // 下载备份时禁用监听选项
 const isDownloadBackup = computed(() => newConfig.value.direction === 'download')
+// 是否同步备份
+const isSyncBackup = computed(() => newConfig.value.direction === 'sync')
 
 // 监听备份方向变化，自动禁用监听
 watch(() => newConfig.value.direction, (direction) => {
   if (direction === 'download') {
     newConfig.value.watch_config.enabled = false
+  }
+  // Sync 模式不支持加密
+  if (direction === 'sync') {
+    newConfig.value.encrypt_enabled = false
   }
 })
 
@@ -177,7 +184,9 @@ async function resetNewConfig() {
     filter_config: { include_patterns: [], exclude_patterns: ['.*', '*.tmp', '~$*'] },
     encrypt_enabled: false,
     upload_conflict_strategy: defaultUploadStrategy,
-    download_conflict_strategy: defaultDownloadStrategy
+    download_conflict_strategy: defaultDownloadStrategy,
+    sync_conflict_strategy: 'newer_wins' as SyncConflictStrategy,
+    sync_init_mode: 'auto_detect' as SyncInitMode
   }
 }
 
@@ -919,7 +928,7 @@ watch(hasActiveTask, () => {
             v-for="config in configs"
             :key="config.id"
             class="config-card"
-            :class="{ 'is-upload': config.direction === 'upload' }"
+            :class="{ 'is-upload': config.direction === 'upload', 'is-sync': config.direction === 'sync' }"
             shadow="hover"
         >
           <!-- 配置头部 -->
@@ -928,7 +937,8 @@ watch(hasActiveTask, () => {
               <div class="config-title">
                 <el-icon :size="20" class="direction-icon">
                   <Upload v-if="config.direction === 'upload'" />
-                  <Download v-else />
+                  <Download v-else-if="config.direction === 'download'" />
+                  <Sort v-else />
                 </el-icon>
                 <span class="config-name">{{ config.name }}</span>
                 <el-tag :type="config.enabled ? 'success' : 'info'" size="small">
@@ -942,8 +952,11 @@ watch(hasActiveTask, () => {
                 <template v-if="config.direction === 'upload'">
                   {{ config.local_path }} → {{ config.remote_path }}
                 </template>
-                <template v-else>
+                <template v-else-if="config.direction === 'download'">
                   {{ config.remote_path }} → {{ config.local_path }}
+                </template>
+                <template v-else>
+                  {{ config.local_path }} ⇄ {{ config.remote_path }}
                 </template>
               </div>
             </div>
@@ -1097,6 +1110,7 @@ watch(hasActiveTask, () => {
           <el-select v-model="newConfig.direction" style="width: 100%">
             <el-option value="upload" label="上传备份（本地 → 云端）" />
             <el-option value="download" label="下载备份（云端 → 本地）" />
+            <el-option value="sync" label="双向同步（本地 ⇄ 云端）" />
           </el-select>
         </el-form-item>
 
@@ -1161,7 +1175,67 @@ watch(hasActiveTask, () => {
           <div class="form-tip">默认使用系统设置中的策略</div>
         </el-form-item>
 
-        <el-form-item v-if="!isDownloadBackup">
+        <!-- 同步冲突策略 -->
+        <el-form-item v-if="isSyncBackup" label="同步冲突策略">
+          <el-select v-model="newConfig.sync_conflict_strategy" style="width: 100%">
+            <el-option value="newer_wins" label="新版本优先">
+              <div class="strategy-option">
+                <span>新版本优先</span>
+                <el-tooltip content="比较双端修改时间，较新的一方覆盖较旧的一方（推荐）" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="local_wins" label="本地优先">
+              <div class="strategy-option">
+                <span>本地优先</span>
+                <el-tooltip content="冲突时始终以本地版本覆盖云端" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="remote_wins" label="云端优先">
+              <div class="strategy-option">
+                <span>云端优先</span>
+                <el-tooltip content="冲突时始终以云端版本覆盖本地" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="skip" label="跳过冲突">
+              <div class="strategy-option">
+                <span>跳过冲突</span>
+                <el-tooltip content="双端都修改时不做任何操作，留待手动处理" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+          </el-select>
+        </el-form-item>
+
+        <!-- 首次同步模式 -->
+        <el-form-item v-if="isSyncBackup" label="首次同步模式">
+          <el-select v-model="newConfig.sync_init_mode" style="width: 100%">
+            <el-option value="auto_detect" label="自动检测">
+              <div class="strategy-option">
+                <span>自动检测</span>
+                <el-tooltip content="比对 MD5 判断文件是否相同，不同则按冲突策略处理（推荐）" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+            <el-option value="adopt_both_sides" label="采纳现状">
+              <div class="strategy-option">
+                <span>采纳现状</span>
+                <el-tooltip content="将双端已有文件直接作为基线，不做传输（适合已知双端一致的场景）" placement="right">
+                  <el-icon class="info-icon"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </div>
+            </el-option>
+          </el-select>
+        </el-form-item>
+
+        <el-form-item v-if="!isDownloadBackup && !isSyncBackup">
           <div class="encrypt-switch-row">
             <span class="encrypt-label">启用加密</span>
             <el-switch
@@ -1171,8 +1245,16 @@ watch(hasActiveTask, () => {
             <span v-if="!encryptionStatus?.has_key" class="hint-text">（需先在系统设置中配置加密密钥）</span>
           </div>
         </el-form-item>
-        <el-alert v-if="encryptionStatus?.has_key" type="warning" :closable="false" show-icon>
+        <el-alert v-if="encryptionStatus?.has_key && !isSyncBackup" type="warning" :closable="false" show-icon>
           <template #title>加密选项在创建后不可更改。请在创建前确认是否需要加密备份。</template>
+        </el-alert>
+        <el-alert v-if="isSyncBackup" type="info" :closable="false" show-icon style="margin-top: 12px">
+          <template #title>同步备份说明</template>
+          <template #default>
+            <div style="font-size: 12px; line-height: 1.8; margin-top: 4px; color: #606266;">
+              双向同步会将本地和云端目录保持一致：本地新增/修改的文件上传到云端，云端新增/修改的文件下载到本地。同步模式不支持加密。
+            </div>
+          </template>
         </el-alert>
         <el-alert type="info" :closable="false" show-icon style="margin-top: 12px">
           <template #title>
@@ -1324,7 +1406,11 @@ watch(hasActiveTask, () => {
     border-left: 4px solid #409eff;
   }
 
-  &:not(.is-upload) {
+  &.is-sync {
+    border-left: 4px solid #e6a23c;
+  }
+
+  &:not(.is-upload):not(.is-sync) {
     border-left: 4px solid #67c23a;
   }
 

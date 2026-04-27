@@ -45,6 +45,14 @@ pub enum BackupSubPhase {
     Decrypting,
     /// 被抢占（等待恢复）
     Preempted,
+    /// 同步扫描中（双向快照）
+    SyncScanning,
+    /// 同步规划中（生成同步计划）
+    SyncPlanning,
+    /// 同步上传中（执行上传动作）
+    SyncUploading,
+    /// 同步下载中（执行下载动作）
+    SyncDownloading,
 }
 
 /// 文件备份状态（更细粒度）
@@ -250,6 +258,15 @@ pub struct BackupFileTask {
     /// 备份操作类型（区分上传/下载）
     #[serde(default)]
     pub backup_operation_type: Option<BackupOperationType>,
+    /// Sync 远端修改时间（从 SyncPlan 传递，用于传输完成后精确更新 SyncState）
+    #[serde(default)]
+    pub sync_remote_mtime: Option<i64>,
+    /// Sync 远端文件大小（同上）
+    #[serde(default)]
+    pub sync_remote_size: Option<u64>,
+    /// Sync 远端文件 ID（同上）
+    #[serde(default)]
+    pub sync_remote_fs_id: Option<u64>,
     /// 创建时间
     #[serde(default = "chrono::Utc::now")]
     pub created_at: DateTime<Utc>,

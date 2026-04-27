@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::autobackup::{
-    AutoBackupManager, BackupConfig, BackupTask, CreateBackupConfigRequest,
+    AutoBackupManager, BackupConfig, BackupDirection, BackupTask, CreateBackupConfigRequest,
     EncryptionAlgorithm, UpdateBackupConfigRequest,
 };
+use crate::autobackup::config::SyncConflictStrategy;
 use crate::server::{ApiError, ApiResult, AppState};
 
 // Helper functions for ApiError
@@ -68,8 +69,20 @@ pub async fn create_backup_config(
     Json(request): Json<CreateBackupConfigRequest>,
 ) -> ApiResult<Json<ApiResponse<BackupConfig>>> {
     let manager = get_manager(&state).await?;
+    // 收集 Sync 配置的 warnings
+    let warnings = collect_sync_warnings(
+        request.direction,
+        request.watch_config.enabled,
+        request.sync_conflict_strategy,
+    );
     match manager.create_config(request).await {
-        Ok(config) => Ok(Json(ApiResponse::success(config))),
+        Ok(config) => {
+            if warnings.is_empty() {
+                Ok(Json(ApiResponse::success(config)))
+            } else {
+                Ok(Json(ApiResponse::success_with_warnings(config, warnings)))
+            }
+        }
         Err(e) => Err(bad_request_error(&e.to_string())),
     }
 }
@@ -104,6 +117,8 @@ pub async fn enable_backup_config(
         enabled: Some(true),
         upload_conflict_strategy: None,
         download_conflict_strategy: None,
+        sync_conflict_strategy: None,
+        sync_init_mode: None,
     };
     match manager.update_config(&id, request).await {
         Ok(config) => Ok(Json(ApiResponse::success(config))),
@@ -127,6 +142,8 @@ pub async fn disable_backup_config(
         enabled: Some(false),
         upload_conflict_strategy: None,
         download_conflict_strategy: None,
+        sync_conflict_strategy: None,
+        sync_init_mode: None,
     };
     match manager.update_config(&id, request).await {
         Ok(config) => Ok(Json(ApiResponse::success(config))),
@@ -430,6 +447,9 @@ pub struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,
     pub error: Option<String>,
+    /// 非致命警告信息（例如：Sync 配置 + Watch 会自动退化为 Upload-only 快速路径）
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl<T> ApiResponse<T> {
@@ -438,6 +458,16 @@ impl<T> ApiResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    pub fn success_with_warnings(data: T, warnings: Vec<String>) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+            warnings,
         }
     }
 
@@ -446,6 +476,7 @@ impl<T> ApiResponse<T> {
             success: false,
             data: None,
             error: Some(message.to_string()),
+            warnings: Vec::new(),
         }
     }
 }
@@ -1002,4 +1033,98 @@ pub async fn update_trigger_config(
             poll_scheduled_minute: config.autobackup.download_trigger.poll_scheduled_minute,
         },
     })))
+}
+
+// ==================== 同步状态 API ====================
+
+/// POST /api/v1/autobackup/configs/:config_id/sync-state/reset
+/// 重置指定 Sync 配置的同步状态
+pub async fn reset_sync_state(
+    State(state): State<AppState>,
+    Path(config_id): Path<String>,
+) -> ApiResult<Json<ApiResponse<()>>> {
+    let manager = get_manager(&state).await?;
+
+    // 校验配置存在且方向为 Sync
+    let config = manager.get_config(&config_id)
+        .ok_or_else(|| bad_request_error("配置不存在"))?;
+
+    if config.direction != BackupDirection::Sync {
+        return Err(bad_request_error("仅 Sync 方向的配置可以重置同步状态"));
+    }
+
+    // 检查是否有正在运行或暂停的同步任务
+    // 除了 active（Preparing/Transferring）外，还需排除 Paused 和 Queued 任务
+    // 否则恢复暂停的任务后会在已清空的 SyncState 上执行旧的传输计划
+    if manager.has_active_tasks(&config_id) {
+        return Err(bad_request_error("该配置有正在运行的同步任务，请等待完成后再重置"));
+    }
+    if manager.has_incomplete_sync_tasks(&config_id) {
+        return Err(bad_request_error("该配置有暂停或排队中的同步任务，请先取消这些任务后再重置"));
+    }
+
+    // 重置 SyncState 并标记 needs_full_sync
+    let deleted = manager.reset_sync_state(&config_id).await
+        .map_err(|e| bad_request_error(&format!("重置同步状态失败: {}", e)))?;
+
+    let warnings = vec![
+        format!(
+            "同步状态已重置（清除 {} 条记录），下次同步将重新建立基线。建议等待下一次完整同步自动完成后再编辑本地文件，或手动触发一次同步。",
+            deleted
+        ),
+    ];
+
+    Ok(Json(ApiResponse::success_with_warnings((), warnings)))
+}
+
+/// GET /api/v1/autobackup/configs/:config_id/sync-state/tombstones
+/// 查询 Sync 配置的 tombstone 列表
+pub async fn list_tombstones(
+    State(state): State<AppState>,
+    Path(config_id): Path<String>,
+) -> ApiResult<Json<ApiResponse<Vec<crate::autobackup::sync::types::TombstoneInfo>>>> {
+    let manager = get_manager(&state).await?;
+
+    let config = manager.get_config(&config_id)
+        .ok_or_else(|| bad_request_error("配置不存在"))?;
+
+    if config.direction != BackupDirection::Sync {
+        return Err(bad_request_error("仅 Sync 方向的配置有 tombstone 信息"));
+    }
+
+    let tombstones = manager.list_sync_tombstones(&config_id)
+        .map_err(|e| bad_request_error(&format!("查询 tombstone 列表失败: {}", e)))?;
+
+    Ok(Json(ApiResponse::success(tombstones)))
+}
+
+// ==================== 辅助函数 ====================
+
+/// 收集 Sync 配置创建/更新时的 warnings
+fn collect_sync_warnings(
+    direction: BackupDirection,
+    watch_enabled: bool,
+    sync_strategy: Option<SyncConflictStrategy>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if direction == BackupDirection::Sync && watch_enabled {
+        let strategy = sync_strategy.unwrap_or(SyncConflictStrategy::default());
+        if strategy != SyncConflictStrategy::LocalWins {
+            let strategy_name = match strategy {
+                SyncConflictStrategy::RemoteWins => "RemoteWins",
+                SyncConflictStrategy::NewerWins => "NewerWins",
+                SyncConflictStrategy::Skip => "Skip",
+                SyncConflictStrategy::LocalWins => unreachable!(),
+            };
+            warnings.push(format!(
+                "Watch 触发时使用隐式 LocalWins（不检查远端），\
+                 仅 Poll/手动触发时使用 {} 策略。\
+                 如果需要严格执行 {}，建议关闭 Watch、仅用轮询。",
+                strategy_name, strategy_name
+            ));
+        }
+    }
+
+    warnings
 }
