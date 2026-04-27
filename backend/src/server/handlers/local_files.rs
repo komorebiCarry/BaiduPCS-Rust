@@ -34,14 +34,8 @@ pub async fn list_local_files(
     State(state): State<AppState>,
     Query(query): Query<LocalFileListQuery>,
 ) -> Result<Json<ApiResponse<ListResponse>>, StatusCode> {
-    let download_dir = state
-        .config
-        .read()
-        .await
-        .download
-        .download_dir
-        .canonicalize()
-        .unwrap_or_else(|_| state.config.blocking_read().download.download_dir.clone());
+    let download_dir = state.config.read().await.download.download_dir.clone();
+    let download_dir = download_dir.canonicalize().unwrap_or(download_dir);
 
     let download_dir_str = download_dir.to_string_lossy().to_string();
 
@@ -95,14 +89,8 @@ pub async fn delete_local_files(
         return Ok(Json(ApiResponse::error(400, "路径列表不能为空".to_string())));
     }
 
-    let download_dir = state
-        .config
-        .read()
-        .await
-        .download
-        .download_dir
-        .canonicalize()
-        .unwrap_or_else(|_| state.config.blocking_read().download.download_dir.clone());
+    let download_dir = state.config.read().await.download.download_dir.clone();
+    let download_dir = download_dir.canonicalize().unwrap_or(download_dir);
 
     let mut deleted_count = 0usize;
     let mut failed_paths = Vec::new();
