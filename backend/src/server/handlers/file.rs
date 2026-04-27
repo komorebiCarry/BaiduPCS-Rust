@@ -390,6 +390,8 @@ pub async fn delete_files(
                         if let Some(ref c) = *client {
                             match c.delete_files(&request.paths).await {
                                 Ok(response) if response.success => {
+                                    // 百度异步删除，等待1秒让服务端完成处理
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                     return Ok(Json(ApiResponse::success(DeleteFilesData {
                                         deleted_count: response.deleted_count,
                                         failed_paths: response.failed_paths,
