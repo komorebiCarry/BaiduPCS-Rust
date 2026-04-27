@@ -237,6 +237,28 @@ fn check_path_overlap(norm_a: &str, norm_b: &str) -> OverlapRelation {
 
 // ==================== 冲突校验 ====================
 
+/// 判断两个方向是否属于"同类冲突"（同方向或 Sync 包含关系）
+///
+/// 返回 true 表示同类冲突（SameDirection），false 表示闭环冲突（LoopConflict）
+///
+/// 规则：
+/// - 同方向（Upload vs Upload, Download vs Download, Sync vs Sync）→ true
+/// - Sync vs Upload 或 Sync vs Download → true（Sync 包含了 Upload 和 Download）
+/// - Upload vs Download → false（闭环冲突）
+fn is_conflicting_directions(a: BackupDirection, b: BackupDirection) -> bool {
+    match (a, b) {
+        // 完全相同方向
+        (BackupDirection::Upload, BackupDirection::Upload) => true,
+        (BackupDirection::Download, BackupDirection::Download) => true,
+        (BackupDirection::Sync, BackupDirection::Sync) => true,
+        // Sync 包含 Upload 和 Download
+        (BackupDirection::Sync, _) | (_, BackupDirection::Sync) => true,
+        // Upload vs Download → 闭环
+        (BackupDirection::Upload, BackupDirection::Download)
+        | (BackupDirection::Download, BackupDirection::Upload) => false,
+    }
+}
+
 /// 校验配置冲突
 ///
 /// # 参数
@@ -284,10 +306,15 @@ pub fn validate_config_conflicts(
         }
 
         // 判断冲突类型
-        let is_same_direction = candidate_direction == config.direction;
+        // Sync 与任何方向都冲突（Sync 包含了 Upload + Download 的全部能力）：
+        //   Sync vs Sync   → 同方向冲突（SameDirection）
+        //   Sync vs Upload → 同方向冲突（Sync 包含 Upload）
+        //   Sync vs Download → 同方向冲突（Sync 包含 Download）
+        //   Upload vs Download → 闭环冲突（LoopConflict，原有逻辑）
+        let is_conflicting_directions = is_conflicting_directions(candidate_direction, config.direction);
 
-        if is_same_direction {
-            // 同方向冲突
+        if is_conflicting_directions {
+            // 同方向冲突（含 Sync 包含关系）
             // 判断是"父已存在建子"还是"子已存在建父"
             // 以本地路径为主判断（因为本地路径是扫描的起点）
             let is_parent = matches!(
@@ -318,7 +345,7 @@ pub fn validate_config_conflicts(
                 conflict_type = Some(current_conflict_type);
             }
         } else {
-            // 反方向闭环冲突
+            // 反方向闭环冲突（Upload vs Download）
             conflicting_configs.push(ConflictingConfig {
                 id: config.id.clone(),
                 name: config.name.clone(),
@@ -357,6 +384,7 @@ fn generate_conflict_message(
     let direction_str = match candidate_direction {
         BackupDirection::Upload => "上传备份",
         BackupDirection::Download => "下载备份",
+        BackupDirection::Sync => "同步备份",
     };
 
     match conflict_type {
@@ -378,10 +406,10 @@ fn generate_conflict_message(
                 parent.id,
                 parent.local_path,
                 parent.remote_path,
-                if candidate_direction == BackupDirection::Upload {
-                    "扫描和上传"
-                } else {
-                    "扫描和下载"
+                match candidate_direction {
+                    BackupDirection::Upload => "扫描和上传",
+                    BackupDirection::Download => "扫描和下载",
+                    BackupDirection::Sync => "扫描和同步",
                 }
             )
         }
@@ -401,10 +429,10 @@ fn generate_conflict_message(
                 children.len(),
                 direction_str,
                 children_list,
-                if candidate_direction == BackupDirection::Upload {
-                    "扫描和上传"
-                } else {
-                    "扫描和下载"
+                match candidate_direction {
+                    BackupDirection::Upload => "扫描和上传",
+                    BackupDirection::Download => "扫描和下载",
+                    BackupDirection::Sync => "扫描和同步",
                 }
             )
         }
@@ -413,6 +441,7 @@ fn generate_conflict_message(
             let opposite_direction = match candidate_direction {
                 BackupDirection::Upload => "下载备份",
                 BackupDirection::Download => "上传备份",
+                BackupDirection::Sync => "反向备份",
             };
 
             let configs_list: String = conflicting_configs
@@ -421,6 +450,7 @@ fn generate_conflict_message(
                     let dir = match c.direction {
                         BackupDirection::Upload => "上传",
                         BackupDirection::Download => "下载",
+                        BackupDirection::Sync => "同步",
                     };
                     format!(
                         "  - 「{}」(ID: {}, 方向: {}, 本地: {}, 云端: {})",
@@ -565,6 +595,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
         }];
 
         // 创建子配置应该冲突
@@ -599,6 +632,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
         }];
 
         // 创建反向下载配置应该冲突（闭环）
@@ -630,6 +666,9 @@ mod tests {
             updated_at: chrono::Utc::now(),
             upload_conflict_strategy: None,
             download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
         }];
 
         // 本地路径相同但云端路径不同，不冲突

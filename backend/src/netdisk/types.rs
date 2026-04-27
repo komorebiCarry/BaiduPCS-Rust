@@ -81,6 +81,25 @@ pub struct FileListResponse {
     pub guid_info: String,
 }
 
+/// 搜索响应
+#[derive(Debug, Deserialize)]
+pub struct SearchResponse {
+    /// 错误码（0表示成功）
+    pub errno: i32,
+
+    /// 文件列表
+    #[serde(default)]
+    pub list: Vec<FileItem>,
+
+    /// 是否还有更多
+    #[serde(default)]
+    pub has_more: i32,
+
+    /// 内容列表（某些接口用 contentlist）
+    #[serde(default)]
+    pub contentlist: Vec<FileItem>,
+}
+
 /// 下载链接信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadUrl {
@@ -390,6 +409,14 @@ pub struct RapidUploadResponse {
     /// 文件大小
     #[serde(default)]
     pub size: u64,
+
+    /// 服务器创建时间（秒级时间戳，/api/create 返回）
+    #[serde(default)]
+    pub ctime: i64,
+
+    /// 服务器修改时间（秒级时间戳，/api/create 返回）
+    #[serde(default)]
+    pub mtime: i64,
 
     /// 错误信息
     #[serde(default)]

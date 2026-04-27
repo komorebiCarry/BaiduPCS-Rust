@@ -20,6 +20,31 @@
 
       <!-- PC端工具栏 -->
       <div v-if="!isMobile" class="toolbar-buttons">
+        <div class="search-wrapper persistent" :class="{ active: isSearchMode }">
+          <div class="search-shell persistent">
+            <button
+                type="button"
+                class="search-trigger persistent"
+                :class="{ 'is-active': isSearchMode }"
+                :disabled="searchLoading"
+                @click="handleSearchTrigger"
+            >
+              <el-icon v-if="!searchLoading"><Search /></el-icon>
+              <el-icon v-else class="is-loading"><Loading /></el-icon>
+            </button>
+            <div class="search-input-area">
+              <el-input
+                  ref="searchInputRef"
+                  v-model="searchKeyword"
+                  placeholder="搜索文件..."
+                  clearable
+                  @keyup.enter="handleSearch"
+                  @keyup.esc="handleSearchEscape"
+                  @clear="handleSearchClear"
+              />
+            </div>
+          </div>
+        </div>
         <el-button
             v-if="selectedFiles.length > 0"
             type="warning"
@@ -36,6 +61,15 @@
         >
           <el-icon><Link /></el-icon>
           分享 ({{ selectedFiles.length }})
+        </el-button>
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="danger"
+            :loading="batchDeleting"
+            @click="handleBatchDelete"
+        >
+          <el-icon><Delete /></el-icon>
+          删除 ({{ selectedFiles.length }})
         </el-button>
         <el-button type="primary" @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
@@ -61,6 +95,38 @@
 
       <!-- 移动端工具栏（图标按钮） -->
       <div v-else class="toolbar-buttons-mobile">
+        <div
+            ref="searchWrapperRef"
+            class="search-wrapper"
+            :class="{ expanded: searchExpanded, active: isSearchMode }"
+        >
+          <div class="search-shell" :class="{ 'search-flyout-panel': searchExpanded }">
+            <div class="search-input-area">
+              <el-input
+                  ref="searchInputRef"
+                  v-model="searchKeyword"
+                  placeholder="搜索文件..."
+                  clearable
+                  @keyup.enter="handleSearch"
+                  @keyup.esc="handleSearchEscape"
+                  @clear="handleSearchClear"
+              >
+                <template #prefix>
+                  <el-icon><Search /></el-icon>
+                </template>
+              </el-input>
+            </div>
+            <el-button
+                circle
+                class="search-trigger search-flyout-toggle"
+                :class="{ 'is-active': searchExpanded || isSearchMode }"
+                :loading="searchLoading"
+                @click="handleSearchTrigger"
+            >
+              <el-icon><Search /></el-icon>
+            </el-button>
+          </div>
+        </div>
         <el-button
             v-if="selectedFiles.length > 0"
             type="warning"
@@ -77,6 +143,16 @@
             @click="handleBatchShare"
         >
           <el-icon><Link /></el-icon>
+        </el-button>
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="danger"
+            circle
+            :loading="batchDeleting"
+            @click="handleBatchDelete"
+            title="删除"
+        >
+          <el-icon><Delete /></el-icon>
         </el-button>
         <el-button type="primary" circle @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
@@ -241,12 +317,12 @@
         <el-icon class="is-loading"><Loading /></el-icon>
         <span>加载中...</span>
       </div>
-      <div v-else-if="!hasMore && fileList.length > 0" class="no-more">
+      <div v-else-if="!(isSearchMode ? searchHasMore : hasMore) && fileList.length > 0" class="no-more">
         没有更多了
       </div>
 
       <!-- 空状态 -->
-      <el-empty v-if="!loading && fileList.length === 0" description="当前目录为空"/>
+      <el-empty v-if="!loading && !searchLoading && fileList.length === 0" :description="isSearchMode ? '未找到匹配的文件' : '当前目录为空'"/>
     </div>
 
     <!-- 创建文件夹对话框 -->
@@ -320,9 +396,10 @@
 </template>
 
 <script setup lang="ts">
-import {ref, onMounted, computed} from 'vue'
-import {ElMessage} from 'element-plus'
-import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
+import {ref, onMounted, onBeforeUnmount, computed, nextTick} from 'vue'
+import {ElMessage, ElMessageBox} from 'element-plus'
+import type {InputInstance} from 'element-plus'
+import {getFileList, searchFiles, formatFileSize, formatTime, createFolder, deleteFiles, type FileItem} from '@/api/file'
 import {useIsMobile} from '@/utils/responsive'
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem, type DownloadConflictStrategy} from '@/api/download'
 import {createUpload, createFolderUpload, type UploadConflictStrategy} from '@/api/upload'
@@ -372,6 +449,7 @@ const showFilePicker = ref(false)
 const selectedFiles = ref<FileItem[]>([])
 const showDownloadPicker = ref(false)
 const batchDownloading = ref(false)
+const batchDeleting = ref(false)
 
 // 单文件下载（支持 ask_each_time）
 const pendingDownloadFile = ref<FileItem | null>(null)
@@ -385,6 +463,19 @@ const shareFiles = ref<FileItem[]>([])
 
 // 分享直下对话框状态
 const showShareDirectDownloadDialog = ref(false)
+
+// 搜索状态
+const searchExpanded = ref(false)
+const searchKeyword = ref('')
+const searchLoading = ref(false)
+const isSearchMode = ref(false)
+const searchPage = ref(1)
+const searchHasMore = ref(false)
+const searchInputRef = ref<InputInstance>()
+const searchWrapperRef = ref<HTMLElement | null>(null)
+
+// 请求版本号，用于取消过期的请求回调
+let fileRequestVersion = 0
 
 // 路径分割
 const pathParts = computed(() => {
@@ -400,6 +491,8 @@ function getPathUpTo(index: number): string {
 
 // 加载文件列表
 async function loadFiles(dir: string, append: boolean = false) {
+  const version = ++fileRequestVersion
+
   if (append) {
     loadingMore.value = true
   } else {
@@ -411,6 +504,7 @@ async function loadFiles(dir: string, append: boolean = false) {
   try {
     const page = append ? currentPage.value : 1
     const data = await getFileList(dir, page, 50)
+    if (version !== fileRequestVersion) return
 
     if (append) {
       fileList.value = [...fileList.value, ...data.list]
@@ -445,17 +539,27 @@ function handleScroll(event: Event) {
 
   // 当滚动到距离底部 100px 时加载更多
   if (scrollHeight - scrollTop - clientHeight < 100) {
-    loadNextPage()
+    if (isSearchMode.value) {
+      loadMoreSearchResults()
+    } else {
+      loadNextPage()
+    }
   }
 }
 
 // 导航到目录
 function navigateToDir(dir: string) {
+  if (isSearchMode.value) {
+    resetSearchState()
+  }
   loadFiles(dir)
 }
 
 // 刷新文件列表
 function refreshFileList() {
+  if (isSearchMode.value) {
+    resetSearchState()
+  }
   loadFiles(currentDir.value)
 }
 
@@ -987,10 +1091,165 @@ async function executeSingleDownload(file: FileItem, targetDir: string) {
   }
 }
 
+// ============================================
+// 搜索相关函数
+// ============================================
+
+// 执行搜索
+async function handleSearch() {
+  const keyword = searchKeyword.value.trim()
+  if (!keyword) {
+    if (isSearchMode.value) {
+      await exitSearch({ keepExpanded: !isMobile.value })
+    }
+    return
+  }
+
+  searchLoading.value = true
+  isSearchMode.value = true
+  searchPage.value = 1
+  const version = ++fileRequestVersion
+
+  try {
+    const data = await searchFiles(keyword, 1, 100)
+    if (version !== fileRequestVersion) return
+    fileList.value = data.list as FileItem[]
+    searchHasMore.value = data.has_more
+  } catch (error: any) {
+    ElMessage.error(error.message || '搜索失败')
+    console.error('搜索失败:', error)
+  } finally {
+    searchLoading.value = false
+    loading.value = false
+  }
+}
+
+// 加载更多搜索结果
+async function loadMoreSearchResults() {
+  if (searchLoading.value || !searchHasMore.value) return
+
+  searchPage.value++
+  searchLoading.value = true
+  loadingMore.value = true
+  const version = ++fileRequestVersion
+
+  try {
+    const data = await searchFiles(searchKeyword.value.trim(), searchPage.value, 100)
+    if (version !== fileRequestVersion) return
+    fileList.value = [...fileList.value, ...(data.list as FileItem[])]
+    searchHasMore.value = data.has_more
+  } catch (error: any) {
+    ElMessage.error(error.message || '加载更多搜索结果失败')
+  } finally {
+    searchLoading.value = false
+    loadingMore.value = false
+  }
+}
+
+function resetSearchState(options: { keepExpanded?: boolean } = {}) {
+  fileRequestVersion++
+  isSearchMode.value = false
+  searchKeyword.value = ''
+  searchExpanded.value = options.keepExpanded ?? false
+  searchPage.value = 1
+  searchHasMore.value = false
+}
+
+async function openSearch() {
+  if (!searchExpanded.value) {
+    searchExpanded.value = true
+    await nextTick()
+  }
+  searchInputRef.value?.focus()
+}
+
+async function handleSearchTrigger() {
+  if (!isMobile.value && !searchKeyword.value.trim()) {
+    if (isSearchMode.value) {
+      await exitSearch({ keepExpanded: false })
+      return
+    }
+
+    searchInputRef.value?.focus()
+    return
+  }
+
+  if (!searchExpanded.value) {
+    await openSearch()
+    return
+  }
+
+  if (!searchKeyword.value.trim()) {
+    if (isSearchMode.value) {
+      await exitSearch()
+    } else {
+      resetSearchState()
+    }
+    return
+  }
+
+  await handleSearch()
+}
+
+async function handleSearchClear() {
+  if (isSearchMode.value) {
+    await exitSearch({ keepExpanded: isMobile.value })
+    return
+  }
+
+  await nextTick()
+  searchInputRef.value?.focus()
+}
+
+async function handleSearchEscape() {
+  if (isSearchMode.value) {
+    await exitSearch({ keepExpanded: isMobile.value })
+    return
+  }
+
+  if (isMobile.value) {
+    resetSearchState()
+  } else {
+    searchKeyword.value = ''
+    await nextTick()
+    searchInputRef.value?.focus()
+  }
+}
+
+function handleSearchOutsidePointerDown(event: MouseEvent) {
+  const target = event.target as Node | null
+  if (!searchExpanded.value) return
+  if (target && searchWrapperRef.value?.contains(target)) return
+  if (searchKeyword.value.trim()) return
+
+  if (isSearchMode.value) {
+    void exitSearch()
+    return
+  }
+
+  resetSearchState()
+}
+
+// 退出搜索模式
+async function exitSearch(options: { keepExpanded?: boolean } = {}) {
+  resetSearchState(options)
+  await loadFiles(currentDir.value)
+
+  await nextTick()
+  if (!isMobile.value || searchExpanded.value) {
+    searchInputRef.value?.focus()
+  }
+}
+
 // 组件挂载时加载根目录和配置
 onMounted(() => {
+  document.addEventListener('mousedown', handleSearchOutsidePointerDown)
   loadFiles('/')
   loadDownloadConfig()
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', handleSearchOutsidePointerDown)
 })
 
 // ============================================
@@ -1024,6 +1283,46 @@ function handleBatchShare() {
   showShareDialog.value = true
 }
 
+async function handleBatchDelete() {
+  if (selectedFiles.value.length === 0) return
+  const count = selectedFiles.value.length
+  const paths = selectedFiles.value.map(f => f.path)
+  try {
+    await ElMessageBox.confirm(
+        `确定要删除选中的 ${count} 个文件/文件夹吗？删除后可在回收站找回。`,
+        '确认删除',
+        {
+          confirmButtonText: '删除',
+          cancelButtonText: '取消',
+          type: 'warning',
+          beforeClose: async (action, instance, done) => {
+            if (action !== 'confirm') { done(); return }
+            instance.confirmButtonLoading = true
+            instance.confirmButtonText = '删除中...'
+            try {
+              const result = await deleteFiles(paths)
+              done()
+              if (result.failed_paths.length > 0) {
+                ElMessage.warning(`成功删除 ${result.deleted_count} 个，失败 ${result.failed_paths.length} 个`)
+              } else {
+                ElMessage.success(`成功删除 ${result.deleted_count} 个文件/文件夹`)
+              }
+              selectedFiles.value = []
+              await refreshFileList()
+            } catch (error: any) {
+              done()
+              ElMessage.error(error.message || '删除失败')
+            } finally {
+              instance.confirmButtonLoading = false
+            }
+          }
+        }
+    )
+  } catch {
+    // 用户取消
+  }
+}
+
 // 分享成功处理
 function handleShareSuccess() {
   // 清空选择
@@ -1043,7 +1342,7 @@ function handleShareDirectDownloadSuccess(taskId: string) {
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link, Delete, Search, Close} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
@@ -1067,14 +1366,174 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
 
   .toolbar-buttons {
     display: flex;
+    align-items: center;
     gap: 12px;
     flex-shrink: 0;
   }
 
   .toolbar-buttons-mobile {
     display: flex;
+    align-items: center;
     gap: 8px;
     flex-shrink: 0;
+  }
+}
+
+.search-wrapper {
+  --toolbar-control-size: 32px;
+  --search-shell-width: var(--toolbar-control-size);
+  --search-expand-width: clamp(180px, 20vw, 232px);
+  position: relative;
+  width: var(--toolbar-control-size);
+  height: var(--toolbar-control-size);
+  flex-shrink: 0;
+  z-index: 3;
+
+  .search-shell {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    transform: translateY(-50%);
+    width: var(--search-shell-width);
+    height: var(--toolbar-control-size);
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0;
+    border-radius: 999px;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    transition:
+        width 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+        box-shadow 0.28s ease,
+        background 0.28s ease;
+    overflow: hidden;
+  }
+
+  .search-input-area {
+    flex: 1;
+    min-width: 0;
+    opacity: 0;
+    padding-left: 14px;
+    transform: translateX(16px);
+    pointer-events: none;
+    transition:
+        opacity 0.2s ease,
+        transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+
+    :deep(.el-input) {
+      width: 100%;
+    }
+
+    :deep(.el-input__wrapper) {
+      box-shadow: none;
+      background: transparent;
+      padding-left: 0;
+      padding-right: 10px;
+    }
+
+    :deep(.el-input__inner) {
+      font-size: 13px;
+    }
+  }
+
+  .search-trigger {
+    flex-shrink: 0;
+    margin: 0;
+    border: none;
+    box-shadow: none;
+    background: transparent;
+    color: #606266;
+    width: var(--toolbar-control-size);
+    height: var(--toolbar-control-size);
+    min-height: var(--toolbar-control-size);
+    padding: 0;
+    transition:
+        transform 0.22s ease,
+        color 0.22s ease,
+        background-color 0.22s ease,
+        opacity 0.22s ease;
+
+    &:hover {
+      transform: scale(1.02);
+      color: #409eff;
+      background: rgba(64, 158, 255, 0.06);
+    }
+
+    &.is-active {
+      color: #409eff;
+      background: transparent;
+    }
+  }
+
+  &.expanded,
+  &.active {
+    .search-shell {
+      width: var(--search-expand-width);
+      background: rgba(255, 255, 255, 0.98);
+      box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+    }
+
+    .search-input-area {
+      opacity: 1;
+      transform: translateX(0);
+      pointer-events: auto;
+    }
+  }
+}
+
+.search-wrapper.persistent {
+  width: clamp(190px, 20vw, 240px);
+  height: 36px;
+
+  .search-shell.persistent {
+    position: relative;
+    top: auto;
+    right: auto;
+    transform: none;
+    width: 100%;
+    height: 36px;
+    padding: 2px 8px 2px 4px;
+    gap: 4px;
+    border-radius: 999px;
+    background: #f7f8fb;
+    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+    overflow: visible;
+  }
+
+  .search-input-area {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+    padding-left: 0;
+
+    :deep(.el-input__wrapper) {
+      padding-left: 0;
+      padding-right: 0;
+    }
+
+    :deep(.el-input__inner) {
+      color: #0f172a;
+      font-weight: 500;
+    }
+  }
+
+  .search-trigger.persistent {
+    width: 30px;
+    height: 30px;
+    min-height: 30px;
+    color: #94a3b8;
+
+    &:hover {
+      color: #409eff;
+      background: rgba(64, 158, 255, 0.08);
+    }
+
+    &.is-active {
+      color: #409eff;
+      background: rgba(64, 158, 255, 0.08);
+    }
   }
 }
 
@@ -1145,6 +1604,10 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   .breadcrumb-bar {
     padding: 12px 16px;
     flex-wrap: wrap;
+  }
+
+  .search-wrapper {
+    --search-expand-width: min(200px, calc(100vw - 56px));
   }
 
   .file-list {
@@ -1245,4 +1708,3 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   }
 }
 </style>
-

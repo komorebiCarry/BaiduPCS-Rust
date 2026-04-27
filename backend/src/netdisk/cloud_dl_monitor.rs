@@ -963,11 +963,20 @@ impl CloudDlMonitor {
         // 获取离线下载保存路径下的文件列表
         let save_path = task.save_path.trim_end_matches('/');
 
-        // 🔥 构建需要下载的文件名集合（从 file_list 中获取）
-        let target_files: std::collections::HashSet<&str> = task
+        // 🔥 构建需要下载的顶级文件/文件夹名集合（从 file_list 中获取）
+        // 注意：file_list 中的 file_name 可能是带子路径的相对路径，如 "FolderName/File.mkv"
+        // 而 get_file_list 返回的 server_filename 只是 save_path 下的顶级名称 "FolderName"
+        // 因此需要提取第一级路径组件来匹配
+        let target_files: std::collections::HashSet<String> = task
             .file_list
             .iter()
-            .map(|f| f.file_name.as_str())
+            .map(|f| {
+                let name = f.file_name.as_str();
+                match name.find('/') {
+                    Some(pos) => name[..pos].to_string(),
+                    None => name.to_string(),
+                }
+            })
             .collect();
 
         info!(

@@ -157,6 +157,14 @@ impl FolderScanner {
                 }
             }
 
+            // 跳过下载临时文件（.downloading 后缀）
+            if let Some(name) = file_name.to_str() {
+                if name.ends_with(crate::downloader::engine::DOWNLOADING_EXTENSION) {
+                    debug!("跳过下载临时文件: {}", path.display());
+                    continue;
+                }
+            }
+
             // 检查符号链接
             let metadata = if self.options.follow_symlinks {
                 // 符号链接目标白名单校验
@@ -430,6 +438,14 @@ impl BatchedScanIterator {
                         debug!("跳过隐藏文件: {}", path.display());
                         continue;
                     }
+                }
+            }
+
+            // 跳过下载临时文件（.downloading 后缀）
+            if let Some(name) = file_name.to_str() {
+                if name.ends_with(crate::downloader::engine::DOWNLOADING_EXTENSION) {
+                    debug!("跳过下载临时文件: {}", path.display());
+                    continue;
                 }
             }
 

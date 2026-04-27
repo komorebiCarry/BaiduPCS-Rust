@@ -751,6 +751,17 @@
                       下载备份不支持文件系统监听，因为百度网盘API不提供目录变化通知接口。建议使用"指定时间"模式，避免频繁调用API导致限速。
                     </template>
                   </el-alert>
+
+                  <el-divider content-position="left">双向同步触发方式</el-divider>
+
+                  <el-alert type="info" :closable="false" show-icon>
+                    <template #title>同步备份复用上传备份的触发设置</template>
+                    <template #default>
+                      <div style="font-size: 12px; line-height: 1.8; color: #606266;">
+                        双向同步配置会自动使用上方「上传备份触发方式」中的文件监听和轮询兜底设置来检测本地变化，同时按相同的间隔/时间轮询云端目录以发现远端变更。无需额外配置。
+                      </div>
+                    </template>
+                  </el-alert>
                 </el-card>
 
                 <!-- 网络代理配置 -->

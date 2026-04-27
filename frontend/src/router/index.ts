@@ -29,7 +29,13 @@ const routes: RouteRecordRaw[] = [
         path: '/files',
         name: 'Files',
         component: () => import('@/views/FilesView.vue'),
-        meta: { title: '文件管理' }
+        meta: { title: '网盘管理' }
+      },
+      {
+        path: '/local',
+        name: 'LocalFiles',
+        component: () => import('@/views/LocalFilesView.vue'),
+        meta: { title: '本地文件' }
       },
       {
         path: '/downloads',

@@ -44,6 +44,11 @@ impl FilesystemService {
                 .with_message(format!("读取目录失败: {}", e))
         })?;
 
+        // 搜索关键词（小写化，用于大小写不敏感匹配）
+        let keyword_lower = req.keyword.as_ref()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty());
+
         // 收集并过滤条目
         let mut entries: Vec<FileEntry> = read_dir
             .filter_map(|entry| entry.ok())
@@ -56,6 +61,13 @@ impl FilesystemService {
                 // 过滤符号链接
                 if self.guard.should_skip_symlink(&entry_path) {
                     return false;
+                }
+                // 按关键词过滤文件名
+                if let Some(ref kw) = keyword_lower {
+                    let name = entry.file_name().to_string_lossy().to_lowercase();
+                    if !name.contains(kw) {
+                        return false;
+                    }
                 }
                 true
             })
@@ -580,6 +592,20 @@ impl FilesystemService {
 mod tests {
     use super::*;
 
+    /// canonicalize() 在 Windows 上返回 \\?\ 前缀，但我们的代码会剥离它。
+    /// 测试中也需要剥离后再比较。
+    fn expected_path(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap();
+        let s = canonical.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{}", rest)
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
     #[test]
     fn test_service_new() {
         let _service = FilesystemService::new(FilesystemConfig::default());
@@ -626,14 +652,8 @@ mod tests {
 
         let roots = service.get_roots().unwrap();
         assert_eq!(roots.len(), 2);
-        assert_eq!(
-            roots[0].path,
-            beta.canonicalize().unwrap().to_string_lossy()
-        );
-        assert_eq!(
-            roots[1].path,
-            alpha.canonicalize().unwrap().to_string_lossy()
-        );
+        assert_eq!(roots[0].path, expected_path(&beta));
+        assert_eq!(roots[1].path, expected_path(&alpha));
     }
 
     #[test]
@@ -647,6 +667,7 @@ mod tests {
             page_size: 100,
             sort_field: SortField::Name,
             sort_order: SortOrder::Asc,
+            keyword: None,
         };
 
         let response = service.list_directory(&req);
@@ -678,6 +699,7 @@ mod tests {
             page_size: 100,
             sort_field: SortField::Name,
             sort_order: SortOrder::Asc,
+            keyword: None,
         };
         let resp = service.list_directory(&req).unwrap();
         assert!(
@@ -693,6 +715,7 @@ mod tests {
             page_size: 100,
             sort_field: SortField::Name,
             sort_order: SortOrder::Asc,
+            keyword: None,
         };
         let resp2 = service.list_directory(&req2).unwrap();
         assert!(
@@ -745,9 +768,6 @@ mod tests {
 
         let resp = service.get_roots_with_default().unwrap();
         assert!(resp.default_path.is_some());
-        assert_eq!(
-            resp.default_path.unwrap(),
-            alpha.canonicalize().unwrap().to_string_lossy()
-        );
+        assert_eq!(resp.default_path.unwrap(), expected_path(&alpha));
     }
 }

@@ -6,7 +6,7 @@ use crate::downloader::{
 use crate::persistence::PersistenceManager;
 use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
 use crate::server::websocket::WebSocketManager;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -548,6 +548,7 @@ impl ChunkScheduler {
                                 active_chunk_count.clone(),
                                 backup_notification_tx.clone(),
                                 task_completed_tx.clone(),
+                                waiting_queue_trigger.clone(),
                             );
 
                             scheduled_count += 1;
@@ -580,8 +581,11 @@ impl ChunkScheduler {
                                     let _permit = decrypt_semaphore_clone.acquire().await.unwrap();
                                     debug!("任务 {} 获取解密信号量，开始解密流程", task_id_clone);
 
-                                    // 执行解密
-                                    let decrypt_result = Self::try_decrypt_if_encrypted(&task_info_clone).await;
+                                    let finalize_result = Self::finalize_download_output(&task_info_clone).await;
+                                    let decrypt_result = match finalize_result {
+                                        Ok(()) => Self::try_decrypt_if_encrypted(&task_info_clone).await,
+                                        Err(e) => Err(e),
+                                    };
 
                                     // 处理解密结果
                                     Self::handle_task_completion(
@@ -631,6 +635,7 @@ impl ChunkScheduler {
     /// * `slot_pool` - 线程槽位池
     /// * `global_active_count` - 全局活跃分片计数器
     /// * `backup_notification_tx` - 备份任务统一通知发送器
+    /// * `waiting_queue_trigger` - 等待队列触发器（失败时也要通知排队任务启动）
     fn spawn_chunk_download(
         chunk_index: usize,
         task_info: TaskScheduleInfo,
@@ -639,6 +644,7 @@ impl ChunkScheduler {
         global_active_count: Arc<AtomicUsize>,
         backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
         task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
+        waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     ) {
         tokio::spawn(async move {
             let task_id = task_info.task_id.clone();
@@ -805,11 +811,39 @@ impl ChunkScheduler {
                             active_tasks.write().await.remove(&task_id);
                             error!("任务 {} 因分片 #{} 重试耗尽已从调度器移除", task_id, chunk_index);
 
+                            // 🔥 取消 cancellation_token，停止其他还在运行的分片（避免浪费资源）
+                            task_info.cancellation_token.cancel();
+                            debug!("任务 {} 重试耗尽，cancellation_token 已取消", task_id);
+
+                            // 🔥 释放任务槽位（修复：失败路径也必须释放槽位，否则槽位泄漏导致超时报错）
+                            if let Some(task_slot_id) = task_info.slot_id {
+                                if !task_info.is_borrowed_slot {
+                                    if let Some(ref slot_pool) = task_info.task_slot_pool {
+                                        slot_pool.release_fixed_slot(&task_id).await;
+                                        info!("任务 {} 失败，释放固定槽位 {}", task_id, task_slot_id);
+                                    }
+                                }
+                            }
+
+                            // 🔥 从 Manager 任务列表中移除（避免内存泄漏）
+                            if let Some(ref manager_tasks) = task_info.manager_tasks {
+                                manager_tasks.write().await.remove(&task_id);
+                                debug!("失败任务 {} 已从 DownloadManager.tasks 中移除", task_id);
+                            }
+
                             // 🔥 通知文件夹管理器：子任务失败
                             if let Some(gid) = group_id.clone() {
                                 let tx_guard = task_completed_tx.read().await;
                                 if let Some(tx) = tx_guard.as_ref() {
                                     let _ = tx.send((gid, task_id.clone(), task_info.total_size, false));
+                                }
+                            }
+
+                            // 🔥 触发等待队列检查（让排队中的任务能立即启动）
+                            {
+                                let trigger_guard = waiting_queue_trigger.read().await;
+                                if let Some(trigger) = trigger_guard.as_ref() {
+                                    let _ = trigger.send(());
                                 }
                             }
                         }
@@ -943,6 +977,7 @@ impl ChunkScheduler {
                     BackupTransferNotification::Completed {
                         task_id: task_id.to_string(),
                         task_type: TransferTaskType::Download,
+                        upload_meta: None,
                     }
                 };
                 let _ = tx.send(notification);
@@ -956,6 +991,60 @@ impl ChunkScheduler {
                 let _ = trigger.send(());
             }
         }
+    }
+
+    /// 下载完成后：校验临时文件大小 → 重命名为最终路径
+    ///
+    /// 兼容旧任务：如果 output_path == local_path（旧任务直接写最终文件），仅做大小校验
+    async fn finalize_download_output(task_info: &TaskScheduleInfo) -> Result<()> {
+        let final_path = {
+            let task = task_info.task.lock().await;
+            task.local_path.clone()
+        };
+
+        // 旧任务兼容：output_path 等于 final_path 时，只做大小校验
+        if task_info.output_path == final_path {
+            let metadata = tokio::fs::metadata(&final_path)
+                .await
+                .context("获取最终文件元数据失败")?;
+            if metadata.len() != task_info.total_size {
+                anyhow::bail!(
+                    "文件大小不匹配: 实际 {} bytes, 期望 {} bytes (路径: {:?})",
+                    metadata.len(),
+                    task_info.total_size,
+                    final_path
+                );
+            }
+            return Ok(());
+        }
+
+        // 新任务：校验临时文件大小
+        let metadata = tokio::fs::metadata(&task_info.output_path)
+            .await
+            .context("获取临时下载文件元数据失败")?;
+        if metadata.len() != task_info.total_size {
+            anyhow::bail!(
+                "临时下载文件大小不匹配: 实际 {} bytes, 期望 {} bytes (路径: {:?})",
+                metadata.len(),
+                task_info.total_size,
+                task_info.output_path
+            );
+        }
+
+        // 如果最终路径已存在（异常残留），先删除
+        if final_path.exists() {
+            tokio::fs::remove_file(&final_path)
+                .await
+                .context("清理旧的最终文件失败")?;
+            warn!("检测到已存在的最终文件，已先删除再重命名: {:?}", final_path);
+        }
+
+        tokio::fs::rename(&task_info.output_path, &final_path)
+            .await
+            .context("重命名临时下载文件失败")?;
+        info!("✅ 临时文件已重命名: {:?} -> {:?}", task_info.output_path, final_path);
+
+        Ok(())
     }
 
     /// 🔥 检测并解密加密文件

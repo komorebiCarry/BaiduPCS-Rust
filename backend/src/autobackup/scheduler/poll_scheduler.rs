@@ -16,6 +16,8 @@ pub const GLOBAL_POLL_UPLOAD_INTERVAL: &str = "global_upload_interval";
 pub const GLOBAL_POLL_UPLOAD_SCHEDULED: &str = "global_upload_scheduled";
 pub const GLOBAL_POLL_DOWNLOAD_INTERVAL: &str = "global_download_interval";
 pub const GLOBAL_POLL_DOWNLOAD_SCHEDULED: &str = "global_download_scheduled";
+pub const GLOBAL_POLL_SYNC_INTERVAL: &str = "global_sync_interval";
+pub const GLOBAL_POLL_SYNC_SCHEDULED: &str = "global_sync_scheduled";
 
 /// 解析全局轮询 ID，返回 (方向, 轮询类型)
 fn parse_global_poll_id(config_id: &str) -> Option<(BackupDirection, GlobalPollType)> {
@@ -24,6 +26,8 @@ fn parse_global_poll_id(config_id: &str) -> Option<(BackupDirection, GlobalPollT
         GLOBAL_POLL_UPLOAD_SCHEDULED => Some((BackupDirection::Upload, GlobalPollType::Scheduled)),
         GLOBAL_POLL_DOWNLOAD_INTERVAL => Some((BackupDirection::Download, GlobalPollType::Interval)),
         GLOBAL_POLL_DOWNLOAD_SCHEDULED => Some((BackupDirection::Download, GlobalPollType::Scheduled)),
+        GLOBAL_POLL_SYNC_INTERVAL => Some((BackupDirection::Sync, GlobalPollType::Interval)),
+        GLOBAL_POLL_SYNC_SCHEDULED => Some((BackupDirection::Sync, GlobalPollType::Scheduled)),
         _ => None,
     }
 }
@@ -120,7 +124,7 @@ impl PollScheduler {
     ) {
         // 首次启动加入 0-50% 随机延迟，避免重启后立即请求
         let initial_delay = Self::add_jitter(base_interval, 0.25);
-        tracing::debug!(
+        tracing::info!(
             "Poll scheduler starting for {}, initial delay: {:?}",
             config_id,
             initial_delay
@@ -130,6 +134,22 @@ impl PollScheduler {
             _ = tokio::time::sleep(initial_delay) => {}
             _ = cancel_token.cancelled() => {
                 tracing::debug!("Poll scheduler cancelled during initial delay: {}", config_id);
+                return;
+            }
+        }
+
+        // 初始延迟结束后立即触发第一次轮询
+        {
+            let event = if let Some((direction, poll_type)) = parse_global_poll_id(&config_id) {
+                tracing::info!("Global interval poll triggered (initial): {:?} {:?}", direction, poll_type);
+                ChangeEvent::GlobalPollEvent { direction, poll_type }
+            } else {
+                tracing::debug!("Poll triggered (initial) for config: {}", config_id);
+                ChangeEvent::PollEvent { config_id: config_id.clone() }
+            };
+
+            if let Err(e) = event_tx.send(event) {
+                tracing::warn!("Failed to send initial poll event: {}", e);
                 return;
             }
         }
@@ -148,7 +168,7 @@ impl PollScheduler {
                 _ = tokio::time::sleep(jittered_interval) => {
                     // 判断是否为全局轮询
                     let event = if let Some((direction, poll_type)) = parse_global_poll_id(&config_id) {
-                        tracing::debug!("Global interval poll triggered: {:?} {:?}", direction, poll_type);
+                        tracing::info!("Global interval poll triggered: {:?} {:?}", direction, poll_type);
                         ChangeEvent::GlobalPollEvent { direction, poll_type }
                     } else {
                         tracing::debug!("Poll triggered for config: {}", config_id);

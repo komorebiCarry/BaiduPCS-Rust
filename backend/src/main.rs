@@ -290,8 +290,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/logout", post(handlers::logout))
         // 文件API
         .route("/files", get(handlers::get_file_list))
+        .route("/files/search", get(handlers::search_files))
         .route("/files/download", get(handlers::get_download_url))
         .route("/files/folder", post(handlers::create_folder))
+        .route("/files/delete", post(handlers::delete_files))
         // 下载API
         .route("/downloads", post(handlers::create_download))
         .route("/downloads", get(handlers::get_all_downloads))
@@ -367,6 +369,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/fs/goto", get(handlers::goto_path))
         .route("/fs/validate", get(handlers::validate_path))
         .route("/fs/roots", get(handlers::get_roots))
+        // 本地文件API
+        .route("/local-files", get(handlers::local_files::list_local_files))
+        .route("/local-files/delete", post(handlers::local_files::delete_local_files))
         // 配置API
         .route("/config", get(handlers::get_config))
         .route("/config", put(handlers::update_config))
@@ -400,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/autobackup/tasks/:id", delete(handlers::autobackup::delete_backup_task))
         .route("/autobackup/tasks/:id/files", get(handlers::autobackup::list_file_tasks))
         .route("/autobackup/tasks/:task_id/files/:file_task_id/retry", post(handlers::autobackup::retry_file_task))
+        .route("/autobackup/configs/:id/sync-state/reset", post(handlers::autobackup::reset_sync_state))
+        .route("/autobackup/configs/:id/sync-state/tombstones", get(handlers::autobackup::list_tombstones))
         .route("/autobackup/status", get(handlers::autobackup::get_manager_status))
         .route("/autobackup/stats", get(handlers::autobackup::get_record_stats))
         .route("/autobackup/cleanup", post(handlers::autobackup::cleanup_records))

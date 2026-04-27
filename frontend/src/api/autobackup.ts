@@ -7,7 +7,13 @@ import { rawApiClient } from './client'
 // ==================== 类型定义 ====================
 
 /** 备份方向 */
-export type BackupDirection = 'upload' | 'download'
+export type BackupDirection = 'upload' | 'download' | 'sync'
+
+/** 同步冲突策略 */
+export type SyncConflictStrategy = 'local_wins' | 'remote_wins' | 'newer_wins' | 'skip'
+
+/** 首次同步模式 */
+export type SyncInitMode = 'auto_detect' | 'adopt_both_sides'
 
 /** 轮询模式 */
 export type PollMode = 'disabled' | 'interval' | 'scheduled'
@@ -58,6 +64,8 @@ export interface BackupConfig {
   updated_at: string
   upload_conflict_strategy?: 'smart_dedup' | 'auto_rename' | 'overwrite'
   download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
+  sync_conflict_strategy?: SyncConflictStrategy
+  sync_init_mode?: SyncInitMode
 }
 
 /** 创建备份配置请求 */
@@ -72,6 +80,8 @@ export interface CreateBackupConfigRequest {
   encrypt_enabled: boolean
   upload_conflict_strategy?: 'smart_dedup' | 'auto_rename' | 'overwrite'
   download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
+  sync_conflict_strategy?: SyncConflictStrategy
+  sync_init_mode?: SyncInitMode
 }
 
 /** 更新备份配置请求 */
@@ -85,13 +95,22 @@ export interface UpdateBackupConfigRequest {
   enabled?: boolean
   upload_conflict_strategy?: 'smart_dedup' | 'auto_rename' | 'overwrite'
   download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
+  sync_conflict_strategy?: SyncConflictStrategy
+  sync_init_mode?: SyncInitMode
 }
+
+/** 备份子阶段 */
+export type BackupSubPhase =
+    | 'dedup_checking' | 'waiting_slot' | 'encrypting' | 'uploading'
+    | 'downloading' | 'decrypting' | 'preempted'
+    | 'sync_scanning' | 'sync_planning' | 'sync_uploading' | 'sync_downloading'
 
 /** 备份任务 */
 export interface BackupTask {
   id: string
   config_id: string
   status: BackupTaskStatus
+  sub_phase?: BackupSubPhase
   trigger_type: TriggerType
   completed_count: number
   failed_count: number

@@ -3419,6 +3419,20 @@ impl DownloadManager {
                     .context("删除本地文件失败")?;
                 info!("已删除本地文件: {:?}", path);
             }
+
+            // 同时清理可能残留的 .downloading 临时文件
+            let temp_path = PathBuf::from(format!(
+                "{}{}",
+                path.display(),
+                crate::downloader::engine::DOWNLOADING_EXTENSION
+            ));
+            if temp_path.exists() {
+                if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+                    warn!("清理 .downloading 临时文件失败: {:?} - {}", temp_path, e);
+                } else {
+                    info!("已清理 .downloading 临时文件: {:?}", temp_path);
+                }
+            }
         }
 
         // 🔥 清理持久化文件
@@ -3564,6 +3578,16 @@ impl DownloadManager {
         if let Some(path) = local_path {
             if should_delete && path.exists() {
                 let _ = tokio::fs::remove_file(&path).await;
+            }
+
+            // 同时清理可能残留的 .downloading 临时文件
+            let temp_path = PathBuf::from(format!(
+                "{}{}",
+                path.display(),
+                crate::downloader::engine::DOWNLOADING_EXTENSION
+            ));
+            if temp_path.exists() {
+                let _ = tokio::fs::remove_file(&temp_path).await;
             }
         }
 

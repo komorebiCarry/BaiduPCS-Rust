@@ -4174,10 +4174,40 @@ impl UploadManager {
                                     if is_backup {
                                         if let Some(ref tx) = backup_notification_tx_clone {
                                             use crate::autobackup::events::TransferTaskType;
+                                            use crate::autobackup::events::UploadCompletionMeta;
+                                            // 秒传后调 filemetas 回填 server_mtime/fs_id，失败则降级为 None
+                                            let upload_meta = match client_snapshot
+                                                .filemetas(&[remote_path.clone()])
+                                                .await
+                                            {
+                                                Ok(resp) if resp.is_success() && !resp.list.is_empty() => {
+                                                    let meta = &resp.list[0];
+                                                    Some(UploadCompletionMeta {
+                                                        fs_id: meta.fs_id,
+                                                        mtime: meta.server_mtime,
+                                                        size: meta.size,
+                                                    })
+                                                }
+                                                Ok(_) => {
+                                                    tracing::warn!(
+                                                        "秒传后 filemetas 返回空列表: {}",
+                                                        remote_path
+                                                    );
+                                                    None
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "秒传后 filemetas 回填失败(降级为 None): {} - {}",
+                                                        remote_path, e
+                                                    );
+                                                    None
+                                                }
+                                            };
                                             let notification =
                                                 BackupTransferNotification::Completed {
                                                     task_id: task_id_clone.clone(),
                                                     task_type: TransferTaskType::Upload,
+                                                    upload_meta,
                                                 };
                                             let _ = tx.send(notification);
                                         }

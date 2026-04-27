@@ -18,6 +18,8 @@ pub use poll_scheduler::{
     GLOBAL_POLL_UPLOAD_SCHEDULED,
     GLOBAL_POLL_DOWNLOAD_INTERVAL,
     GLOBAL_POLL_DOWNLOAD_SCHEDULED,
+    GLOBAL_POLL_SYNC_INTERVAL,
+    GLOBAL_POLL_SYNC_SCHEDULED,
     is_global_poll_id,
 };
 pub use task_controller::{TaskController, TriggerSource, ControllerStatus, task_loop};

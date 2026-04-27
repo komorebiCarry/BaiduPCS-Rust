@@ -258,6 +258,118 @@ fn query_folder_mappings(
     result
 }
 
+/// 搜索查询参数
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// 搜索关键词
+    pub key: String,
+    /// 页码
+    #[serde(default = "default_page")]
+    pub page: u32,
+    /// 每页数量
+    #[serde(default = "default_search_num")]
+    pub num: u32,
+    /// 是否递归搜索
+    #[serde(default = "default_recursion")]
+    pub recursion: i32,
+}
+
+fn default_search_num() -> u32 {
+    100
+}
+
+fn default_recursion() -> i32 {
+    1
+}
+
+/// 搜索响应数据
+#[derive(Debug, Serialize)]
+pub struct SearchData {
+    /// 文件列表（带加密信息）
+    pub list: Vec<FileItemWithEncryption>,
+    /// 是否还有更多
+    pub has_more: bool,
+}
+
+/// 搜索文件
+///
+/// GET /api/v1/files/search?key=xxx&page=1&num=100&recursion=1
+pub async fn search_files(
+    State(state): State<AppState>,
+    Query(params): Query<SearchQuery>,
+) -> Result<Json<ApiResponse<SearchData>>, StatusCode> {
+    info!("API: 搜索文件 key={}, page={}", params.key, params.page);
+
+    if params.key.trim().is_empty() {
+        return Ok(Json(ApiResponse::error(400, "搜索关键词不能为空".to_string())));
+    }
+    if params.key.len() > 255 {
+        return Ok(Json(ApiResponse::error(400, "搜索关键词过长".to_string())));
+    }
+
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+        }
+    };
+
+    match client.search_files(&params.key, params.page, params.num, params.recursion).await {
+        Ok(search_result) => {
+            let has_more = search_result.has_more == 1;
+
+            // 合并 list 和 contentlist
+            let mut file_list = search_result.list;
+            file_list.extend(search_result.contentlist);
+
+            // 处理加密信息
+            let encrypted_names: Vec<String> = file_list
+                .iter()
+                .filter(|f| is_encrypted_filename(&f.server_filename))
+                .map(|f| f.server_filename.clone())
+                .collect();
+
+            let encryption_map = query_encryption_mappings(&state, &encrypted_names);
+
+            let list_with_encryption: Vec<FileItemWithEncryption> = file_list
+                .into_iter()
+                .map(|file| {
+                    let (is_encrypted, original_name, original_size) =
+                        if is_encrypted_filename(&file.server_filename) {
+                            match encryption_map.get(&file.server_filename) {
+                                Some((name, size)) => (true, Some(name.clone()), Some(*size)),
+                                None => (false, None, None),
+                            }
+                        } else {
+                            (false, None, None)
+                        };
+
+                    let is_encrypted_folder = file.isdir == 1 && is_encrypted_folder_name(&file.server_filename);
+
+                    FileItemWithEncryption {
+                        file,
+                        is_encrypted,
+                        is_encrypted_folder,
+                        original_name,
+                        original_size,
+                    }
+                })
+                .collect();
+
+            let data = SearchData {
+                list: list_with_encryption,
+                has_more,
+            };
+            Ok(Json(ApiResponse::success(data)))
+        }
+        Err(e) => {
+            error!("搜索文件失败: {}", e);
+            Ok(Json(ApiResponse::error(500, format!("搜索文件失败: {}", e))))
+        }
+    }
+}
+
 /// 下载链接查询参数
 #[derive(Debug, Deserialize)]
 pub struct DownloadUrlQuery {
@@ -317,6 +429,106 @@ pub async fn get_download_url(
                 500,
                 format!("获取下载链接失败: {}", e),
             )))
+        }
+    }
+}
+
+/// 删除文件请求体
+#[derive(Debug, Deserialize)]
+pub struct DeleteFilesRequest {
+    pub paths: Vec<String>,
+}
+
+/// 删除文件响应数据
+#[derive(Debug, Serialize)]
+pub struct DeleteFilesData {
+    pub deleted_count: usize,
+    pub failed_paths: Vec<String>,
+}
+
+/// 删除文件
+///
+/// POST /api/v1/files/delete
+/// Body: { "paths": ["/path/to/file1", "/path/to/file2"] }
+pub async fn delete_files(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteFilesRequest>,
+) -> Result<Json<ApiResponse<DeleteFilesData>>, StatusCode> {
+    info!("API: 删除文件 paths={:?}", request.paths);
+
+    if request.paths.is_empty() {
+        return Ok(Json(ApiResponse::error(400, "路径列表不能为空".to_string())));
+    }
+    if let Some(p) = request.paths.iter().find(|p| !p.starts_with('/')) {
+        return Ok(Json(ApiResponse::error(
+            400,
+            format!("路径必须以 / 开头: {}", p),
+        )));
+    }
+
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
+        }
+    };
+
+    match client.delete_files(&request.paths).await {
+        Ok(response) => {
+            if response.success {
+                // 百度异步删除，等待1秒让服务端完成处理，避免前端刷新时文件仍在
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                info!("成功删除 {} 个文件", response.deleted_count);
+                Ok(Json(ApiResponse::success(DeleteFilesData {
+                    deleted_count: response.deleted_count,
+                    failed_paths: response.failed_paths,
+                })))
+            } else {
+                let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
+                Ok(Json(ApiResponse::error(500, msg)))
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            if error_msg.contains("errno=-6") {
+                warn!("删除文件遇到 errno=-6，触发预热重试...");
+                match state.trigger_warmup().await {
+                    Ok(true) => {
+                        let client = state.netdisk_client.read().await;
+                        if let Some(ref c) = *client {
+                            match c.delete_files(&request.paths).await {
+                                Ok(response) if response.success => {
+                                    // 百度异步删除，等待1秒让服务端完成处理
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    return Ok(Json(ApiResponse::success(DeleteFilesData {
+                                        deleted_count: response.deleted_count,
+                                        failed_paths: response.failed_paths,
+                                    })));
+                                }
+                                Ok(response) => {
+                                    let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
+                                    return Ok(Json(ApiResponse::error(500, msg)));
+                                }
+                                Err(retry_err) => {
+                                    error!("预热重试后仍失败: {}", retry_err);
+                                    return Ok(Json(ApiResponse::error(
+                                        500,
+                                        format!("删除文件失败（已重试）: {}", retry_err),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => warn!("预热跳过（用户未登录）"),
+                    Err(warmup_err) => error!("预热失败: {}", warmup_err),
+                }
+            }
+            error!("删除文件失败: {}", e);
+            Ok(Json(ApiResponse::error(500, format!("删除文件失败: {}", e))))
         }
     }
 }
