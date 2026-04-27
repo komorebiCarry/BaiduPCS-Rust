@@ -773,49 +773,14 @@ impl TransferManager {
             info!("分享直下模式: 创建临时目录 {}", save_path);
 
             // 先确保父目录（/.bpr_share_temp/）存在
-            // 注意：百度 create_folder API 在文件夹已存在时不报错，而是静默重命名（加时间戳后缀）
-            // 所以必须先检查父目录是否已存在，已存在就跳过创建，避免产生多余的重命名文件夹
             let parent_path = save_path.trim_end_matches('/');
             if let Some(parent) = parent_path.rsplit_once('/').map(|(p, _)| p) {
                 if !parent.is_empty() {
-                    let parent_trimmed = parent.trim_end_matches('/');
-                    // 列出根目录检查父目录是否已存在
-                    let parent_exists = match client.get_file_list("/", 1, 1000).await {
-                        Ok(list) => list.list.iter().any(|f| {
-                            f.isdir == 1 && f.path.trim_end_matches('/') == parent_trimmed
-                        }),
-                        Err(e) => {
-                            warn!("检查父目录是否存在失败，将尝试创建: {}", e);
-                            false
-                        }
-                    };
-
-                    if parent_exists {
-                        info!("分享直下模式: 父目录已存在，跳过创建 {}", parent);
-                    } else {
-                        info!("分享直下模式: 创建父目录 {}", parent);
-                        match client.create_folder(parent).await {
-                            Ok(resp) => {
-                                // 校验返回路径是否被百度重命名
-                                let actual = resp.path.trim_end_matches('/');
-                                if !actual.is_empty() && actual != parent_trimmed {
-                                    warn!("父目录被百度重命名: 期望={}, 实际={}", parent_trimmed, actual);
-                                    let _ = client.delete_files(&[actual.to_string()]).await;
-                                    anyhow::bail!("创建父目录失败: 路径被百度重命名为 {}", actual);
-                                }
-                            }
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                if !err_msg.contains("errno=-8") {
-                                    warn!("创建父目录失败（可能已存在）: {}", err_msg);
-                                }
-                            }
-                        }
-                    }
+                    ensure_dirs_exist(&client, parent).await?;
                 }
             }
 
-            // 再创建完整的临时目录（UUID子目录）
+            // 再创建完整的临时目录（UUID子目录，一定是新的）
             let expected_sub = save_path.trim_end_matches('/');
             match client.create_folder(&save_path).await {
                 Ok(resp) => {
@@ -950,16 +915,10 @@ impl TransferManager {
             let mut all_results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> = Vec::new();
 
             // 确保 save_path 本身存在（普通转存可能复用历史路径，路径被删后会导致 errno=2）
-            // 这里提前创建一次，避免根批次 relative_parent=="" 时无法补建。
-            // 注意：分享直下模式下，临时目录已在上方正确创建（含父目录存在性检查），
-            // 此处跳过，避免重复 mkdir 父目录导致百度静默重命名（加时间戳后缀）。
-            let save_base = save_path.trim_end_matches('/');
-            if !save_base.is_empty() && !is_share_direct_download {
-                let mut cumulative = String::new();
-                for seg in save_base.split('/').filter(|s| !s.is_empty()) {
-                    cumulative.push('/');
-                    cumulative.push_str(seg);
-                    let _ = client.create_folder(&cumulative).await;
+            // 分享直下模式下，临时目录已在上方正确创建，此处跳过。
+            if !save_path.trim_end_matches('/').is_empty() && !is_share_direct_download {
+                if let Err(e) = ensure_dirs_exist(&client, &save_path).await {
+                    warn!("预建 save_path 目录失败: {}", e);
                 }
             }
 
@@ -986,11 +945,8 @@ impl TransferManager {
 
                 // 预建目标目录（百度转存 API 不会自动创建目标路径）
                 if !relative_parent.is_empty() {
-                    if let Err(e) = client.create_folder(&group_target_dir).await {
-                        let err_msg = e.to_string();
-                        if !err_msg.contains("errno=-8") {
-                            warn!("预建批次目录失败（将在转存时重试）: {}, error={}", group_target_dir, err_msg);
-                        }
+                    if let Err(e) = ensure_dirs_exist(&client, &group_target_dir).await {
+                        warn!("预建批次目录失败（将在转存时重试）: {}, error={}", group_target_dir, e);
                     }
                 }
 
@@ -1016,20 +972,8 @@ impl TransferManager {
                         let err_msg = r.error.as_deref().unwrap_or("");
                         if err_msg.contains("errno\":2") || err_msg.contains("路径不存在") {
                             warn!("批次 {} 路径不存在，逐级创建目录后重试: {}", batch_num, group_target_dir);
-                            let save_base = save_path.trim_end_matches('/');
-                            if !is_share_direct_download {
-                                let mut cumulative = String::new();
-                                for seg in save_base.split('/').filter(|s| !s.is_empty()) {
-                                    cumulative.push('/');
-                                    cumulative.push_str(seg);
-                                    let _ = client.create_folder(&cumulative).await;
-                                }
-                            }
-                            let segments: Vec<&str> = relative_parent.split('/').filter(|s| !s.is_empty()).collect();
-                            let mut cumulative = save_base.to_string();
-                            for seg in &segments {
-                                cumulative = format!("{}/{}", cumulative, seg);
-                                let _ = client.create_folder(&cumulative).await;
+                            if let Err(e) = ensure_dirs_exist(&client, &group_target_dir).await {
+                                warn!("重试时创建目录失败: {}", e);
                             }
                             client
                                 .transfer_share_files(
@@ -3810,6 +3754,46 @@ impl TransferManager {
     }
 }
 
+/// 逐级确保网盘路径存在，已存在的目录跳过创建，避免百度 API 静默重命名。
+/// 一旦发现某层不存在，后续子目录直接创建不再检查（父不存在则子必不存在）。
+async fn ensure_dirs_exist(client: &NetdiskClient, path: &str) -> Result<()> {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Ok(());
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut cumulative = String::new();
+    let mut parent_missing = false;
+    for seg in &segments {
+        let parent = if cumulative.is_empty() { "/".to_string() } else { cumulative.clone() };
+        cumulative.push('/');
+        cumulative.push_str(seg);
+
+        if !parent_missing {
+            let exists = match client.get_file_list(&parent, 1, 1000).await {
+                Ok(list) => list.list.iter().any(|f| {
+                    f.isdir == 1 && f.path.trim_end_matches('/') == cumulative
+                }),
+                Err(e) => {
+                    warn!("检查目录是否存在失败，将尝试创建: {} error={}", cumulative, e);
+                    false
+                }
+            };
+            if exists {
+                info!("目录已存在，跳过创建: {}", cumulative);
+                continue;
+            }
+            parent_missing = true;
+        }
+
+        info!("创建目录: {}", cumulative);
+        if let Err(e) = client.create_folder(&cumulative).await {
+            warn!("创建目录失败: {} error={}", cumulative, e);
+        }
+    }
+    Ok(())
+}
+
 /// 根据 selected_fs_ids 构建实际要转存的 fs_id 列表
 ///
 /// - selected_fs_ids 为 None 或空数组 → 返回 file_list 中所有文件的 fs_id（向后兼容）
@@ -3859,21 +3843,35 @@ fn detect_cross_dir_duplicates(files: &[SharedFileInfo]) -> Vec<String> {
         .collect()
 }
 
-/// 推导分享链接的虚拟根路径，用于计算文件的相对目录结构。
+/// 推导分享文件的公共父目录，用于计算文件的相对目录结构。
 ///
-/// 分享文件路径格式: `/sharelink{share_id}-{uk}/实际目录/文件名`
-/// 第一段 `/sharelink...` 是虚拟命名空间，后续路径是用户原始的目录结构，应完整保留。
-/// 因此 share_root 取第一个路径段，而非最长公共前缀（后者会吃掉中间层级）。
+/// 取所有文件路径的最长公共父目录。例如：
+/// - 单文件 `/a/b/c/file.mp4` → share_root = `/a/b/c`
+/// - 多文件 `/root/抖音/1.jpg`, `/root/微信/2.jpg` → share_root = `/root`
+/// - `/sharelink123/dir/file` → share_root = `/sharelink123/dir`
 fn infer_share_root(files: &[SharedFileInfo]) -> String {
     if files.is_empty() {
         return String::new();
     }
-    let first_path = &files[0].path;
-    let segments: Vec<&str> = first_path.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return String::new();
+    let parents: Vec<&str> = files.iter().map(|f| extract_parent_dir_str(&f.path)).collect();
+    let first_segs: Vec<&str> = parents[0].split('/').collect();
+    let mut common_len = first_segs.len();
+    for p in &parents[1..] {
+        let segs: Vec<&str> = p.split('/').collect();
+        common_len = common_len.min(segs.len());
+        for i in 0..common_len {
+            if first_segs[i] != segs[i] {
+                common_len = i;
+                break;
+            }
+        }
     }
-    format!("/{}", segments[0])
+    let common: String = first_segs[..common_len].join("/");
+    if common.is_empty() || common == "/" {
+        String::new()
+    } else {
+        common
+    }
 }
 
 /// 按原始父目录分组文件，保留分享链接中的目录结构。
@@ -4139,11 +4137,10 @@ mod tests {
             make_file("/root/a/3.jpg", 3),
         ];
         let share_root = infer_share_root(&files);
-        // share_root = "/root"（第一路径段），relative_parent = "a"
-        assert_eq!(share_root, "/root");
+        assert_eq!(share_root, "/root/a");
         let groups = group_files_by_parent_dir(&files, &share_root);
         assert_eq!(groups.len(), 1, "同目录文件应只有 1 个组");
-        assert_eq!(groups[0].0, "a");
+        assert_eq!(groups[0].0, "");
         assert_eq!(groups[0].1.len(), 3);
     }
 

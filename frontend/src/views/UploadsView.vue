@@ -51,7 +51,7 @@
         <template #description>
           <p>暂无上传任务</p>
           <p style="font-size: 12px; color: #909399;">
-            前往「文件管理」页面点击"上传"按钮
+            前往「网盘管理」页面点击"上传"按钮
           </p>
         </template>
       </el-empty>

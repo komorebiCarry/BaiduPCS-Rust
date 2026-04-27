@@ -321,6 +321,104 @@ pub async fn get_download_url(
     }
 }
 
+/// 删除文件请求体
+#[derive(Debug, Deserialize)]
+pub struct DeleteFilesRequest {
+    pub paths: Vec<String>,
+}
+
+/// 删除文件响应数据
+#[derive(Debug, Serialize)]
+pub struct DeleteFilesData {
+    pub deleted_count: usize,
+    pub failed_paths: Vec<String>,
+}
+
+/// 删除文件
+///
+/// POST /api/v1/files/delete
+/// Body: { "paths": ["/path/to/file1", "/path/to/file2"] }
+pub async fn delete_files(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteFilesRequest>,
+) -> Result<Json<ApiResponse<DeleteFilesData>>, StatusCode> {
+    info!("API: 删除文件 paths={:?}", request.paths);
+
+    if request.paths.is_empty() {
+        return Ok(Json(ApiResponse::error(400, "路径列表不能为空".to_string())));
+    }
+    if let Some(p) = request.paths.iter().find(|p| !p.starts_with('/')) {
+        return Ok(Json(ApiResponse::error(
+            400,
+            format!("路径必须以 / 开头: {}", p),
+        )));
+    }
+
+    let client_lock = state.netdisk_client.read().await;
+    let client = match client_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
+        }
+    };
+
+    match client.delete_files(&request.paths).await {
+        Ok(response) => {
+            if response.success {
+                // 百度异步删除，等待1秒让服务端完成处理，避免前端刷新时文件仍在
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                info!("成功删除 {} 个文件", response.deleted_count);
+                Ok(Json(ApiResponse::success(DeleteFilesData {
+                    deleted_count: response.deleted_count,
+                    failed_paths: response.failed_paths,
+                })))
+            } else {
+                let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
+                Ok(Json(ApiResponse::error(500, msg)))
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            if error_msg.contains("errno=-6") {
+                warn!("删除文件遇到 errno=-6，触发预热重试...");
+                match state.trigger_warmup().await {
+                    Ok(true) => {
+                        let client = state.netdisk_client.read().await;
+                        if let Some(ref c) = *client {
+                            match c.delete_files(&request.paths).await {
+                                Ok(response) if response.success => {
+                                    return Ok(Json(ApiResponse::success(DeleteFilesData {
+                                        deleted_count: response.deleted_count,
+                                        failed_paths: response.failed_paths,
+                                    })));
+                                }
+                                Ok(response) => {
+                                    let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
+                                    return Ok(Json(ApiResponse::error(500, msg)));
+                                }
+                                Err(retry_err) => {
+                                    error!("预热重试后仍失败: {}", retry_err);
+                                    return Ok(Json(ApiResponse::error(
+                                        500,
+                                        format!("删除文件失败（已重试）: {}", retry_err),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => warn!("预热跳过（用户未登录）"),
+                    Err(warmup_err) => error!("预热失败: {}", warmup_err),
+                }
+            }
+            error!("删除文件失败: {}", e);
+            Ok(Json(ApiResponse::error(500, format!("删除文件失败: {}", e))))
+        }
+    }
+}
+
 /// 创建文件夹请求体
 #[derive(Debug, Deserialize)]
 pub struct CreateFolderRequest {

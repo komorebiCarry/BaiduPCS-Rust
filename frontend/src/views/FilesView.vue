@@ -37,6 +37,15 @@
           <el-icon><Link /></el-icon>
           分享 ({{ selectedFiles.length }})
         </el-button>
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="danger"
+            :loading="batchDeleting"
+            @click="handleBatchDelete"
+        >
+          <el-icon><Delete /></el-icon>
+          删除 ({{ selectedFiles.length }})
+        </el-button>
         <el-button type="primary" @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
           新建文件夹
@@ -77,6 +86,16 @@
             @click="handleBatchShare"
         >
           <el-icon><Link /></el-icon>
+        </el-button>
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="danger"
+            circle
+            :loading="batchDeleting"
+            @click="handleBatchDelete"
+            title="删除"
+        >
+          <el-icon><Delete /></el-icon>
         </el-button>
         <el-button type="primary" circle @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
@@ -321,8 +340,8 @@
 
 <script setup lang="ts">
 import {ref, onMounted, computed} from 'vue'
-import {ElMessage} from 'element-plus'
-import {getFileList, formatFileSize, formatTime, createFolder, type FileItem} from '@/api/file'
+import {ElMessage, ElMessageBox} from 'element-plus'
+import {getFileList, formatFileSize, formatTime, createFolder, deleteFiles, type FileItem} from '@/api/file'
 import {useIsMobile} from '@/utils/responsive'
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem, type DownloadConflictStrategy} from '@/api/download'
 import {createUpload, createFolderUpload, type UploadConflictStrategy} from '@/api/upload'
@@ -372,6 +391,7 @@ const showFilePicker = ref(false)
 const selectedFiles = ref<FileItem[]>([])
 const showDownloadPicker = ref(false)
 const batchDownloading = ref(false)
+const batchDeleting = ref(false)
 
 // 单文件下载（支持 ask_each_time）
 const pendingDownloadFile = ref<FileItem | null>(null)
@@ -1024,6 +1044,46 @@ function handleBatchShare() {
   showShareDialog.value = true
 }
 
+async function handleBatchDelete() {
+  if (selectedFiles.value.length === 0) return
+  const count = selectedFiles.value.length
+  const paths = selectedFiles.value.map(f => f.path)
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除选中的 ${count} 个文件/文件夹吗？删除后可在回收站找回。`,
+      '确认删除',
+      {
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        beforeClose: async (action, instance, done) => {
+          if (action !== 'confirm') { done(); return }
+          instance.confirmButtonLoading = true
+          instance.confirmButtonText = '删除中...'
+          try {
+            const result = await deleteFiles(paths)
+            done()
+            if (result.failed_paths.length > 0) {
+              ElMessage.warning(`成功删除 ${result.deleted_count} 个，失败 ${result.failed_paths.length} 个`)
+            } else {
+              ElMessage.success(`成功删除 ${result.deleted_count} 个文件/文件夹`)
+            }
+            selectedFiles.value = []
+            await refreshFileList()
+          } catch (error: any) {
+            done()
+            ElMessage.error(error.message || '删除失败')
+          } finally {
+            instance.confirmButtonLoading = false
+          }
+        }
+      }
+    )
+  } catch {
+    // 用户取消
+  }
+}
+
 // 分享成功处理
 function handleShareSuccess() {
   // 清空选择
@@ -1043,7 +1103,7 @@ function handleShareDirectDownloadSuccess(taskId: string) {
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link, Delete} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
