@@ -3756,6 +3756,7 @@ impl TransferManager {
 
 /// 逐级确保网盘路径存在，已存在的目录跳过创建，避免百度 API 静默重命名。
 /// 一旦发现某层不存在，后续子目录直接创建不再检查（父不存在则子必不存在）。
+/// 使用 get_file_list 直接对目标路径探测（page_size=1），避免列举父目录受条目数限制。
 async fn ensure_dirs_exist(client: &NetdiskClient, path: &str) -> Result<()> {
     let path = path.trim_end_matches('/');
     if path.is_empty() {
@@ -3765,20 +3766,12 @@ async fn ensure_dirs_exist(client: &NetdiskClient, path: &str) -> Result<()> {
     let mut cumulative = String::new();
     let mut parent_missing = false;
     for seg in &segments {
-        let parent = if cumulative.is_empty() { "/".to_string() } else { cumulative.clone() };
         cumulative.push('/');
         cumulative.push_str(seg);
 
         if !parent_missing {
-            let exists = match client.get_file_list(&parent, 1, 1000).await {
-                Ok(list) => list.list.iter().any(|f| {
-                    f.isdir == 1 && f.path.trim_end_matches('/') == cumulative
-                }),
-                Err(e) => {
-                    warn!("检查目录是否存在失败，将尝试创建: {} error={}", cumulative, e);
-                    false
-                }
-            };
+            // 直接对目标路径调用 get_file_list：目录存在返回 Ok，不存在返回 Err
+            let exists = client.get_file_list(&cumulative, 1, 1).await.is_ok();
             if exists {
                 info!("目录已存在，跳过创建: {}", cumulative);
                 continue;
