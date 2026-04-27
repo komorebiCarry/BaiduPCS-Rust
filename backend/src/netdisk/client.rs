@@ -954,6 +954,74 @@ impl NetdiskClient {
         Ok(file_list)
     }
 
+    /// 搜索文件
+    ///
+    /// # 参数
+    /// * `key` - 搜索关键词
+    /// * `page` - 页码（从1开始）
+    /// * `num` - 每页数量
+    /// * `recursion` - 是否递归搜索（1=递归）
+    ///
+    /// # 返回
+    /// 搜索结果文件列表
+    pub async fn search_files(
+        &self,
+        key: &str,
+        page: u32,
+        num: u32,
+        recursion: i32,
+    ) -> Result<crate::netdisk::SearchResponse> {
+        info!("搜索文件: key={}, page={}, num={}", key, page, num);
+
+        let url = "https://pan.baidu.com/api/search";
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("clienttype", "0"),
+                ("app_id", "250528"),
+                ("web", "1"),
+                ("order", "time"),
+                ("desc", "1"),
+                ("num", &num.to_string()),
+                ("page", &page.to_string()),
+                ("recursion", &recursion.to_string()),
+                ("key", key),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("Failed to search files");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let search_result: crate::netdisk::SearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse search response")?;
+
+        if search_result.errno != 0 {
+            anyhow::bail!("Search API error errno={}", search_result.errno);
+        }
+
+        debug!("搜索到 {} 个结果 (list={}, contentlist={})",
+            search_result.list.len() + search_result.contentlist.len(),
+            search_result.list.len(),
+            search_result.contentlist.len());
+        Ok(search_result)
+    }
+
     /// 获取文件元信息（包含 block_list）
     ///
     /// # 参数

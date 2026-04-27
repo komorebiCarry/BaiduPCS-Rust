@@ -31,26 +31,74 @@
       />
     </div>
 
-    <!-- 路径输入框 -->
-    <div class="path-input-wrapper">
-      <el-input
-          v-model="inputPath"
-          placeholder="输入路径并按回车跳转"
-          clearable
-          @keyup.enter="handleNavigate"
-          @focus="isEditing = true"
-          @blur="handleBlur"
+    <div class="input-stage">
+      <div class="path-stage">
+        <div class="path-input-wrapper">
+          <el-input
+              v-model="inputPath"
+              placeholder="输入路径并按回车跳转"
+              clearable
+              @keyup.enter="handleNavigate"
+              @focus="isEditing = true"
+              @blur="handleBlur"
+          >
+            <template #prefix>
+              <el-icon><FolderOpened /></el-icon>
+            </template>
+          </el-input>
+        </div>
+
+        <div
+            v-if="!isMobile && !isEditing && breadcrumbs.length > 0"
+            class="breadcrumb-overlay"
+            @click="focusInput()"
+        >
+          <el-breadcrumb separator="/">
+            <el-breadcrumb-item
+                v-for="(crumb, index) in breadcrumbs"
+                :key="index"
+                @click.stop="handleCrumbClick(crumb.path)"
+            >
+              <span class="crumb-item" :class="{ 'is-current': index === breadcrumbs.length - 1 }">
+                {{ crumb.name }}
+              </span>
+            </el-breadcrumb-item>
+          </el-breadcrumb>
+        </div>
+      </div>
+
+      <div
+          class="search-box"
+          :class="{ 'is-expanded': isSearchExpanded, 'has-text': !!searchInput.trim() }"
       >
-        <template #prefix>
-          <el-icon><FolderOpened /></el-icon>
-        </template>
-      </el-input>
+        <button
+            type="button"
+            class="search-action"
+            aria-label="搜索"
+            @click="handleSearchAction"
+        >
+          <el-icon><Search /></el-icon>
+        </button>
+        <el-input
+            ref="searchInputRef"
+            v-model="searchInput"
+            placeholder="搜索当前目录..."
+            clearable
+            @keyup.enter="handleSearch"
+            @keyup.esc="handleSearchEscape"
+            @clear="handleClearSearch"
+            @blur="handleSearchBlur"
+            size="small"
+        />
+      </div>
     </div>
 
     <!-- 面包屑（非编辑状态显示） -->
-    <!-- PC端：点击空白区域聚焦输入框 -->
-    <!-- 移动端：不绑定点击事件，让面包屑项可以正常点击 -->
-    <div v-if="!isEditing && breadcrumbs.length > 0" class="breadcrumb-overlay" :class="{ 'is-mobile': isMobile }"  @click="!isMobile && focusInput()">
+    <!-- 移动端：单独占一行，避免遮挡路径输入 -->
+    <div
+        v-if="isMobile && !isEditing && breadcrumbs.length > 0"
+        class="breadcrumb-overlay is-mobile"
+    >
       <el-breadcrumb separator="/">
         <el-breadcrumb-item
             v-for="(crumb, index) in breadcrumbs"
@@ -68,7 +116,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
-import { ArrowLeft, ArrowRight, Top, Refresh, FolderOpened } from '@element-plus/icons-vue'
+import { ArrowLeft, ArrowRight, Top, Refresh, FolderOpened, Search } from '@element-plus/icons-vue'
 import { useIsMobile } from '@/utils/responsive'
 
 // 响应式检测
@@ -79,6 +127,7 @@ const props = defineProps<{
   canGoBack: boolean
   canGoForward: boolean
   canGoUp: boolean
+  mode?: 'upload' | 'download' | 'select-directory'
 }>()
 
 const emit = defineEmits<{
@@ -87,10 +136,15 @@ const emit = defineEmits<{
   'forward': []
   'up': []
   'refresh': []
+  'search': [keyword: string]
+  'clear-search': []
 }>()
 
 const inputPath = ref('')
 const isEditing = ref(false)
+const searchInput = ref('')
+const searchInputRef = ref<InstanceType<typeof import('element-plus')['ElInput']> | null>(null)
+const isSearchExpanded = ref(props.mode !== 'upload')
 
 // 面包屑数据
 const breadcrumbs = computed(() => {
@@ -177,31 +231,195 @@ function handleBlur() {
     inputPath.value = props.currentPath
   }, 150)
 }
+
+function handleSearchAction() {
+  if (!isSearchExpanded.value) {
+    isSearchExpanded.value = true
+    nextTick(() => {
+      searchInputRef.value?.focus()
+    })
+    return
+  }
+
+  const keyword = searchInput.value.trim()
+  if (keyword) {
+    emit('search', keyword)
+    return
+  }
+
+  searchInputRef.value?.focus()
+}
+
+function handleSearchBlur() {
+  setTimeout(() => {
+    if (!searchInput.value.trim()) {
+      isSearchExpanded.value = false
+    }
+  }, 200)
+}
+
+// 执行搜索
+function handleSearch() {
+  const keyword = searchInput.value.trim()
+  if (keyword) {
+    emit('search', keyword)
+  }
+}
+
+// 清除搜索
+function handleClearSearch() {
+  searchInput.value = ''
+  emit('clear-search')
+}
+
+function handleSearchEscape() {
+  if (!searchInput.value.trim()) {
+    searchInputRef.value?.blur()
+    return
+  }
+
+  handleClearSearch()
+}
+
+// 导航时关闭搜索
+watch(() => props.currentPath, () => {
+  if (searchInput.value.trim()) {
+    searchInput.value = ''
+    // 不再 emit clear-search：store 层在 navigateTo/goBack/goForward 中已自行清理搜索并加载目录
+  }
+})
 </script>
 
 <style scoped>
 .navigator-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   padding: 8px 0;
   position: relative;
 }
 
 .nav-buttons {
   display: flex;
-  gap: 4px;
+  gap: 6px;
   flex-shrink: 0;
 }
 
-.path-input-wrapper {
+.input-stage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   flex: 1;
+  min-width: 0;
+  min-height: 32px;
+}
+
+.path-stage {
   position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.path-stage :deep(.el-input),
+.path-input-wrapper :deep(.el-input) {
+  width: 100%;
+}
+
+.path-input-wrapper {
+  width: 100%;
+  position: relative;
+}
+
+.search-box {
+  width: 32px;
+  min-width: 32px;
+  max-width: 160px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0;
+  border-radius: 10px;
+  background: #f8fafc;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.12);
+  transition: width 0.2s ease, padding 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+  overflow: hidden;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.search-box.is-expanded {
+  width: 160px;
+  padding: 2px 8px 2px 4px;
+  justify-content: flex-start;
+  cursor: default;
+}
+
+.search-box.has-text {
+  background: #f3f8ff;
+  box-shadow: inset 0 0 0 1px rgba(64, 158, 255, 0.18);
+}
+
+.search-box:focus-within {
+  background: #ffffff;
+  box-shadow:
+    inset 0 0 0 1px rgba(64, 158, 255, 0.24),
+    0 0 0 3px rgba(64, 158, 255, 0.08);
+}
+
+.search-action {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #9aa4b2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: color 0.2s ease, background-color 0.2s ease;
+}
+
+.search-action:hover {
+  color: var(--el-color-primary);
+  background: rgba(64, 158, 255, 0.07);
+}
+
+.search-box :deep(.el-input) {
+  flex: 1;
+  width: 0;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.search-box.is-expanded :deep(.el-input) {
+  width: 100%;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.search-box :deep(.el-input__wrapper) {
+  box-shadow: none;
+  background: transparent;
+  padding: 0;
+}
+
+.search-box :deep(.el-input__inner) {
+  font-size: 12px;
+  color: #334155;
+}
+
+.search-box :deep(.el-input__inner::placeholder) {
+  color: #94a3b8;
 }
 
 .breadcrumb-overlay {
   position: absolute;
-  left: 108px;
+  left: 0;
   right: 0;
   top: 50%;
   transform: translateY(-50%);
@@ -279,6 +497,38 @@ function handleBlur() {
     width: 100%;
   }
 
+  .input-stage {
+    width: 100%;
+    min-height: 40px;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .path-stage {
+    flex: 1;
+    width: auto;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .search-box {
+    width: 36px;
+    min-width: 36px;
+    max-width: none;
+    height: 36px;
+    align-self: center;
+    flex-shrink: 0;
+  }
+
+  .search-box.is-expanded {
+    width: 100%;
+    flex: 1 0 100%;
+    align-self: stretch;
+  }
+
   .breadcrumb-overlay {
     left: 0;
     right: 0;
@@ -288,10 +538,11 @@ function handleBlur() {
     position: relative;
     margin-top: 8px;
     padding: 8px 12px;
-    height: auto; /* 自适应高度 */
-    min-height: 32px; /* 最小高度 */
-    cursor: default; /* 移动端默认光标 */
-    z-index: auto; /* 移动端不需要层级 */
+    height: auto;
+    min-height: 32px;
+    cursor: default;
+    z-index: auto;
+    width: 100%;
   }
 
   .breadcrumb-overlay :deep(.el-breadcrumb) {

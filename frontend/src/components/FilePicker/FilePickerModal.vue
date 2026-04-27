@@ -14,11 +14,14 @@
         :can-go-back="store.canGoBack"
         :can-go-forward="store.canGoForward"
         :can-go-up="!store.isRoot"
+        :mode="mode"
         @navigate="handleNavigate"
         @back="store.goBack"
         @forward="store.goForward"
         @up="store.goToParent"
         @refresh="store.refresh"
+        @search="handleSearchFiles"
+        @clear-search="store.clearSearch"
     />
 
     <!-- 内容区 -->
@@ -344,6 +347,11 @@ function handleNavigate(path: string) {
   } else {
     store.jumpToPath(path)
   }
+}
+
+// 搜索文件
+function handleSearchFiles(keyword: string) {
+  store.search(keyword)
 }
 
 // 选择条目（单击）

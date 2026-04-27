@@ -23,6 +23,10 @@ export const useFilePickerStore = defineStore('filepicker', () => {
   const total = ref(0)
   const hasMore = ref(false)
 
+  // 搜索状态
+  const searchKeyword = ref('')
+  const isSearching = ref(false)
+
   // 计算属性
   const canGoBack = computed(() => historyStack.value.length > 0)
   const canGoForward = computed(() => forwardStack.value.length > 0)
@@ -57,6 +61,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
           page_size: pageSize.value,
           sort_field: sortField.value,
           sort_order: sortOrder.value,
+          keyword: searchKeyword.value.trim() || undefined,
         })
 
         entries.value = response.entries
@@ -99,6 +104,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
         page_size: pageSize.value,
         sort_field: sortField.value,
         sort_order: sortOrder.value,
+        keyword: searchKeyword.value.trim() || undefined,
       })
 
       entries.value = [...entries.value, ...response.entries]
@@ -117,25 +123,45 @@ export const useFilePickerStore = defineStore('filepicker', () => {
       historyStack.value.push(currentPath.value)
     }
     forwardStack.value = []
+    searchKeyword.value = ''
+    isSearching.value = false
     loadDirectory(path, false)
   }
 
   // 后退
-  function goBack() {
+  async function goBack() {
     if (!canGoBack.value) return
 
     forwardStack.value.push(currentPath.value)
     const prevPath = historyStack.value.pop()!
-    loadDirectory(prevPath, false)
+    const oldKeyword = searchKeyword.value
+    const oldIsSearching = isSearching.value
+    searchKeyword.value = ''
+    isSearching.value = false
+    await loadDirectory(prevPath, false)
+    // 请求失败时回滚搜索状态，保持 UI 与 store 一致
+    if (error.value) {
+      searchKeyword.value = oldKeyword
+      isSearching.value = oldIsSearching
+    }
   }
 
   // 前进
-  function goForward() {
+  async function goForward() {
     if (!canGoForward.value) return
 
     historyStack.value.push(currentPath.value)
     const nextPath = forwardStack.value.pop()!
-    loadDirectory(nextPath, false)
+    const oldKeyword = searchKeyword.value
+    const oldIsSearching = isSearching.value
+    searchKeyword.value = ''
+    isSearching.value = false
+    await loadDirectory(nextPath, false)
+    // 请求失败时回滚搜索状态，保持 UI 与 store 一致
+    if (error.value) {
+      searchKeyword.value = oldKeyword
+      isSearching.value = oldIsSearching
+    }
   }
 
   // 刷新
@@ -228,6 +254,20 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     }
   }
 
+  // 搜索当前目录
+  function search(keyword: string) {
+    searchKeyword.value = keyword
+    isSearching.value = !!keyword.trim()
+    loadDirectory(currentPath.value, false)
+  }
+
+  // 清除搜索
+  function clearSearch() {
+    searchKeyword.value = ''
+    isSearching.value = false
+    loadDirectory(currentPath.value, false)
+  }
+
   // 更改排序
   function changeSort(field: SortField, order?: SortOrder) {
     if (sortField.value === field && !order) {
@@ -260,6 +300,8 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     hasMore.value = false
     parentPath.value = null
     serverDefaultPath.value = null
+    searchKeyword.value = ''
+    isSearching.value = false
   }
 
   return {
@@ -281,6 +323,8 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     hasMore,
     parentPath,
     serverDefaultPath,
+    searchKeyword,
+    isSearching,
 
     // 计算属性
     canGoBack,
@@ -302,6 +346,8 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     selectAll,
     clearMultiSelection,
     openEntry,
+    search,
+    clearSearch,
     changeSort,
     changeViewMode,
     reset,
