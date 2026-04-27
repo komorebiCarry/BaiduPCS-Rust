@@ -667,6 +667,7 @@ mod tests {
             page_size: 100,
             sort_field: SortField::Name,
             sort_order: SortOrder::Asc,
+            keyword: None,
         };
 
         let response = service.list_directory(&req);
@@ -698,6 +699,7 @@ mod tests {
             page_size: 100,
             sort_field: SortField::Name,
             sort_order: SortOrder::Asc,
+            keyword: None,
         };
         let resp = service.list_directory(&req).unwrap();
         assert!(
@@ -713,6 +715,7 @@ mod tests {
             page_size: 100,
             sort_field: SortField::Name,
             sort_order: SortOrder::Asc,
+            keyword: None,
         };
         let resp2 = service.list_directory(&req2).unwrap();
         assert!(

@@ -263,6 +263,8 @@ function handleSearch() {
   const keyword = searchInput.value.trim()
   if (keyword) {
     emit('search', keyword)
+  } else {
+    emit('clear-search')
   }
 }
 
@@ -364,8 +366,8 @@ watch(() => props.currentPath, () => {
 .search-box:focus-within {
   background: #ffffff;
   box-shadow:
-    inset 0 0 0 1px rgba(64, 158, 255, 0.24),
-    0 0 0 3px rgba(64, 158, 255, 0.08);
+      inset 0 0 0 1px rgba(64, 158, 255, 0.24),
+      0 0 0 3px rgba(64, 158, 255, 0.08);
 }
 
 .search-action {

@@ -1098,7 +1098,12 @@ async function executeSingleDownload(file: FileItem, targetDir: string) {
 // 执行搜索
 async function handleSearch() {
   const keyword = searchKeyword.value.trim()
-  if (!keyword) return
+  if (!keyword) {
+    if (isSearchMode.value) {
+      await exitSearch({ keepExpanded: !isMobile.value })
+    }
+    return
+  }
 
   searchLoading.value = true
   isSearchMode.value = true
@@ -1284,34 +1289,34 @@ async function handleBatchDelete() {
   const paths = selectedFiles.value.map(f => f.path)
   try {
     await ElMessageBox.confirm(
-      `确定要删除选中的 ${count} 个文件/文件夹吗？删除后可在回收站找回。`,
-      '确认删除',
-      {
-        confirmButtonText: '删除',
-        cancelButtonText: '取消',
-        type: 'warning',
-        beforeClose: async (action, instance, done) => {
-          if (action !== 'confirm') { done(); return }
-          instance.confirmButtonLoading = true
-          instance.confirmButtonText = '删除中...'
-          try {
-            const result = await deleteFiles(paths)
-            done()
-            if (result.failed_paths.length > 0) {
-              ElMessage.warning(`成功删除 ${result.deleted_count} 个，失败 ${result.failed_paths.length} 个`)
-            } else {
-              ElMessage.success(`成功删除 ${result.deleted_count} 个文件/文件夹`)
+        `确定要删除选中的 ${count} 个文件/文件夹吗？删除后可在回收站找回。`,
+        '确认删除',
+        {
+          confirmButtonText: '删除',
+          cancelButtonText: '取消',
+          type: 'warning',
+          beforeClose: async (action, instance, done) => {
+            if (action !== 'confirm') { done(); return }
+            instance.confirmButtonLoading = true
+            instance.confirmButtonText = '删除中...'
+            try {
+              const result = await deleteFiles(paths)
+              done()
+              if (result.failed_paths.length > 0) {
+                ElMessage.warning(`成功删除 ${result.deleted_count} 个，失败 ${result.failed_paths.length} 个`)
+              } else {
+                ElMessage.success(`成功删除 ${result.deleted_count} 个文件/文件夹`)
+              }
+              selectedFiles.value = []
+              await refreshFileList()
+            } catch (error: any) {
+              done()
+              ElMessage.error(error.message || '删除失败')
+            } finally {
+              instance.confirmButtonLoading = false
             }
-            selectedFiles.value = []
-            await refreshFileList()
-          } catch (error: any) {
-            done()
-            ElMessage.error(error.message || '删除失败')
-          } finally {
-            instance.confirmButtonLoading = false
           }
         }
-      }
     )
   } catch {
     // 用户取消
