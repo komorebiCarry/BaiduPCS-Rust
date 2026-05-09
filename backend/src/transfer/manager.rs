@@ -2288,7 +2288,9 @@ impl TransferManager {
                             if let Some(ref widget) = result.authwidget {
                                 warn!(
                                     "风控诊断: saferand={}, safetpl={}, safesign_len={}",
-                                    widget.saferand, widget.safetpl, widget.safesign.len()
+                                    widget.saferand.as_deref().unwrap_or(""),
+                                    widget.safetpl.as_deref().unwrap_or(""),
+                                    widget.safesign.as_deref().map(|s| s.len()).unwrap_or(0)
                                 );
                             }
                             return CleanupResult {
