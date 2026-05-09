@@ -12,6 +12,18 @@ use tracing::{debug, info, warn};
 /// 默认分片大小: 5MB
 pub const DEFAULT_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
 
+/// 🔥 分片失败处理动作
+///
+/// 由 scheduler 决定 chunk 失败后采取的动作，传给 ChunkManager::fail_chunk
+/// 以便在同一次 lock 内原子完成 unmark + retries+=1 + 写入 cooldown/deferred
+#[derive(Debug, Clone)]
+pub enum ChunkFailureAction {
+    /// 设置冷却时间，调度器在到期前不会重新选中
+    Cooldown(std::time::Duration),
+    /// 标记为已推迟（重试耗尽后），等其他活跃分片完成后再解冻
+    Deferred,
+}
+
 /// 分片信息
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -27,6 +39,11 @@ pub struct Chunk {
     pub retries: u32,
     /// 已下载字节数（分片内断点续传）
     pub bytes_downloaded: u64,
+    /// 🔥 是否被推迟（重试耗尽后标记，等所有其他分片完成后再重试）
+    pub deferred: bool,
+    /// 🔥 冷却截止时间（指数退避期间调度器跳过此分片）
+    /// None = 无冷却；Some(instant) = 在此时刻之前不调度
+    pub cooldown_until: Option<std::time::Instant>,
 }
 
 impl Chunk {
@@ -38,6 +55,8 @@ impl Chunk {
             downloading: false,
             retries: 0,
             bytes_downloaded: 0,
+            deferred: false,
+            cooldown_until: None,
         }
     }
 
@@ -429,6 +448,107 @@ impl ChunkManager {
         }
     }
 
+    /// 🔥 仅读 retries（用于决定 action）
+    pub fn retries_of(&self, chunk_index: usize) -> u32 {
+        self.chunks.get(chunk_index).map(|c| c.retries).unwrap_or(0)
+    }
+
+    /// 🔥 原子地处理分片失败：unmark + retries+=1 + cooldown/deferred 一锁完成
+    ///
+    /// 返回递增后的 retries 值。
+    /// 调用方先用 `retries_of()` 决定 action，再调本方法原子写入。
+    pub fn fail_chunk(&mut self, chunk_index: usize, action: ChunkFailureAction) -> u32 {
+        if let Some(chunk) = self.chunks.get_mut(chunk_index) {
+            chunk.downloading = false;
+            chunk.retries = chunk.retries.saturating_add(1);
+            match action {
+                ChunkFailureAction::Cooldown(dur) => {
+                    chunk.cooldown_until = Some(std::time::Instant::now() + dur);
+                    // 防御：确保不残留 deferred 标志
+                    chunk.deferred = false;
+                }
+                ChunkFailureAction::Deferred => {
+                    chunk.deferred = true;
+                    // 🔥 清掉旧 cooldown，避免日志混淆
+                    chunk.cooldown_until = None;
+                }
+            }
+            chunk.retries
+        } else {
+            0
+        }
+    }
+
+    /// 🔥 标记分片为已推迟（重试耗尽）
+    pub fn mark_deferred(&mut self, index: usize) {
+        if let Some(chunk) = self.chunks.get_mut(index) {
+            chunk.deferred = true;
+            chunk.downloading = false;
+            chunk.cooldown_until = None; // deferred 后不需要冷却
+        }
+    }
+
+    /// 🔥 设置分片冷却时间（指数退避）
+    pub fn set_cooldown(&mut self, index: usize, duration: std::time::Duration) {
+        if let Some(chunk) = self.chunks.get_mut(index) {
+            chunk.cooldown_until = Some(std::time::Instant::now() + duration);
+        }
+    }
+
+    /// 🔥 判断分片是否在冷却中
+    pub fn is_cooling_down(&self, index: usize) -> bool {
+        self.chunks
+            .get(index)
+            .and_then(|c| c.cooldown_until)
+            .map(|t| std::time::Instant::now() < t)
+            .unwrap_or(false)
+    }
+
+    /// 🔥 解冻所有被推迟的分片（重置 deferred 和 retries）
+    pub fn undefer_all(&mut self) {
+        for chunk in &mut self.chunks {
+            if chunk.deferred {
+                chunk.deferred = false;
+                chunk.retries = 0;
+                chunk.cooldown_until = None;
+            }
+        }
+    }
+
+    /// 🔥 是否有非 deferred 且非冷却的待下载分片
+    pub fn has_active_pending(&self) -> bool {
+        let now = std::time::Instant::now();
+        self.chunks.iter().any(|c| {
+            !c.completed
+                && !c.downloading
+                && !c.deferred
+                && c.cooldown_until.map(|t| now >= t).unwrap_or(true)
+        })
+    }
+
+    /// 🔥 是否有正在冷却（cooldown_until 未到期）但未推迟的分片
+    ///
+    /// 用于 scheduler 死锁判定：冷却中的分片只是等待退避到期，并非真死锁。
+    pub fn has_cooling_down(&self) -> bool {
+        let now = std::time::Instant::now();
+        self.chunks.iter().any(|c| {
+            !c.completed
+                && !c.downloading
+                && !c.deferred
+                && c.cooldown_until.map(|t| now < t).unwrap_or(false)
+        })
+    }
+
+    /// 🔥 是否有被推迟的分片
+    pub fn has_deferred(&self) -> bool {
+        self.chunks.iter().any(|c| c.deferred)
+    }
+
+    /// 🔥 获取被推迟的分片数量
+    pub fn deferred_count(&self) -> usize {
+        self.chunks.iter().filter(|c| c.deferred).count()
+    }
+
     /// 更新分片的已下载字节数（分片内断点续传）
     pub fn update_bytes_downloaded(&mut self, index: usize, bytes: u64) {
         if let Some(chunk) = self.chunks.get_mut(index) {
@@ -448,6 +568,9 @@ impl ChunkManager {
             chunk.downloading = false;
             chunk.retries = 0;
             chunk.bytes_downloaded = 0;
+            // 🔥 一并重置 deferred / cooldown
+            chunk.deferred = false;
+            chunk.cooldown_until = None;
         }
     }
 }

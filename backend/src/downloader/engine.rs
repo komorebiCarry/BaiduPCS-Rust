@@ -12,7 +12,7 @@ use futures::future::join_all;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
@@ -43,6 +43,165 @@ const MIN_WINDOW_SAMPLES: usize = 5;
 /// 下载过程中使用此后缀，完成后 rename 去掉后缀
 /// 避免未完成的文件被文件监听器误触发上传
 pub const DOWNLOADING_EXTENSION: &str = ".downloading";
+
+/// 🔥 HTTP/2 降级冷却时长（秒）
+///
+/// 一旦累计满足降级条件（连续 3 次零字节失败，不要求是 HTTP/2 frame error），
+/// 全局强制使用 HTTP/1.1 多长时间。
+/// 期间所有新下载客户端都走 HTTP/1.1，避免频繁降级抖动。
+/// 冷却到期后由后台任务自动恢复 HTTP/2。
+const HTTP11_DOWNGRADE_COOLDOWN_SECS: u64 = 600; // 10 分钟
+
+/// 🔥 连续零字节失败触发 HTTP/1.1 降级的阈值
+///
+/// 与原始设计保持一致：必须"连续 3 次零字节失败"才触发降级，
+/// 单次失败不触发，避免偶发抖动误降级。
+///
+/// 零字节失败包含：HTTP/2 frame error、连接/握手失败、服务端未发数据即断流等；
+/// 只要 `download_chunk_with_retry` 本轮尝试未收到任何字节即累计 +1。
+/// 本轮收到任意字节即重置为 0。
+const HTTP2_ZERO_FAILURE_THRESHOLD: u32 = 3;
+
+/// 🔥 HTTP/2 降级信号
+///
+/// 由 `download_chunk_with_retry` 通过 `http11_trigger` 闭包向 [`DownloadEngine`] 上报：
+/// - `ZeroFailureFrameError` → 累加"连续零字节失败"计数，达到阈值时触发降级
+/// - `DataReceived`           → 重置连续计数（包括分片下载成功 / 收到部分字节）
+///
+/// 判定规则（与设计方案一致）：
+/// 本次尝试**零字节结束**即累加，不限定于 HTTP/2 frame error。
+/// 这样能涵盖 H/2 frame error、连接失败、SSL 握手失败、服务端未发数据即断流等所有零字节类失败。
+///
+/// 变体名保留 `ZeroFailureFrameError` 以保持向后兼容；语义上现在等价于"零字节失败"。
+#[derive(Debug, Clone, Copy)]
+pub enum H2DowngradeSignal {
+    /// 本次尝试零字节结束（任意失败原因，包含但不限于 HTTP/2 frame error）
+    ZeroFailureFrameError,
+    /// 本次尝试收到任意字节数据（链接正常）
+    DataReceived,
+}
+
+/// 🔥 HTTP/2 降级触发器类型
+///
+/// 由 [`DownloadManager`] 创建闭包 → 桥接到 [`DownloadEngine::report_h2_zero_failure`] /
+/// [`DownloadEngine::reset_h2_zero_failure_counter`]，传入 [`download_chunk_with_retry`] 使用。
+pub type H2DowngradeTrigger = Arc<dyn Fn(H2DowngradeSignal) + Send + Sync>;
+
+/// 🔥 分片下载失败的精细化分类
+///
+/// 由 download_chunk_with_retry 返回，scheduler 据此决定重试策略
+#[derive(Debug)]
+pub enum ChunkDownloadFailure {
+    /// 可立即重试（瞬时错误：零数据超时、网络抖动）
+    ///
+    /// scheduler 应走冷却 100ms→200ms→...→5s 路径，不标 deferred
+    Transient(anyhow::Error),
+    /// 建议加长退避（服务端限速/429/503）
+    ///
+    /// scheduler 应走冷却 1s→2s→...→10s 路径
+    ServerThrottled(anyhow::Error),
+    /// 推荐提前放弃本轮调度（所有链接全挂或全部 4xx）
+    ///
+    /// scheduler 直接 mark_deferred，等其他活跃分片完成后解冻
+    Fatal(anyhow::Error),
+    /// 🔥 R25: 任务被外部取消/暂停（用户操作或文件夹级停止）
+    ///
+    /// 调用方（scheduler）应**短路返回**：
+    /// - **不**计入零字节降级累计（不触发 `H2DowngradeSignal::ZeroFailureFrameError`）
+    /// - **不**计入连续 chunk 失败计数（不触发 auto_requeue）
+    /// - **不**走 Cooldown / Deferred 重试路径
+    /// - **不**视为 HTTP/2 协议层故障（避免误把全局 client 打到 HTTP/1.1）
+    ///
+    /// 触发场景：
+    /// - 任务级暂停 (`pause_task` / `cancel_task`) → cancellation_token 翻 cancelled
+    /// - 文件夹级暂停 (`cancel_tasks_by_group`) → 通过同一 token 传播
+    /// - 解密期间暂停 → 上层 epoch 协议接管，本变体仅作分类
+    ///
+    /// 区别于 `Fatal`：Fatal 是"链接全挂、所有 URL 都试过"等真实故障，本变体
+    /// 是"用户主动停止"的非故障性中断，语义完全不同。
+    Cancelled,
+}
+
+impl ChunkDownloadFailure {
+    /// 获取内部 anyhow::Error 的引用
+    ///
+    /// **R25 改为 Option**：`Cancelled` 变体没有内部 error，返回 `None`。
+    /// 历史调用方需要显式处理 `None` 分支或 `.map(...)` 链式操作。
+    pub fn as_error(&self) -> Option<&anyhow::Error> {
+        match self {
+            Self::Transient(e) | Self::ServerThrottled(e) | Self::Fatal(e) => Some(e),
+            Self::Cancelled => None,
+        }
+    }
+
+    /// 消费并返回 anyhow::Error
+    ///
+    /// **R25**：`Cancelled` 没有 inner error，合成一个语义明确的 anyhow 错误返回，
+    /// 让 independent 模式等不关心分类的调用方仍可用 `.map_err(|e| e.into_error())`
+    /// 平铺到 `anyhow::Error`。
+    pub fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Transient(e) | Self::ServerThrottled(e) | Self::Fatal(e) => e,
+            Self::Cancelled => anyhow::anyhow!("分片下载被取消"),
+        }
+    }
+}
+
+impl std::fmt::Display for ChunkDownloadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(e) => write!(f, "Transient: {}", e),
+            Self::ServerThrottled(e) => write!(f, "ServerThrottled: {}", e),
+            Self::Fatal(e) => write!(f, "Fatal: {}", e),
+            Self::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for ChunkDownloadFailure {}
+
+/// 从 anyhow::Error 默认转换为 Fatal（用于 `?` 操作符的兜底路径）
+///
+/// 细粒度分类请手动用 `ChunkDownloadFailure::Transient/ServerThrottled/Fatal`
+impl From<anyhow::Error> for ChunkDownloadFailure {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+/// 🔥 识别 HTTP/2 frame error，仅用于诊断日志分类（**不**作为降级门槛条件）
+///
+/// 用途：在 `download_chunk_with_retry` 的失败分支里，对零字节失败的 `anyhow::Error`
+/// 做一次模式匹配，命中时打印更醒目的 `warn!` 日志，方便事后定位是 HTTP/2 协议层
+/// 故障还是其他类型的零字节失败（连接失败 / SSL 握手失败 / 服务端未发数据即断流等）。
+///
+/// **不影响计数与降级触发**：当前 HTTP/1.1 全局降级的真正门槛是
+/// 「连续 N 次零字节失败累计达到 [`HTTP2_ZERO_FAILURE_THRESHOLD`]」，
+/// 任意失败原因导致的零字节结束都会通过 `H2DowngradeSignal::ZeroFailureFrameError`
+/// 上报到 [`DownloadEngine::report_h2_zero_failure`] 累加，与本函数返回值无关。
+/// 旧设计中它曾是降级门槛条件，现已改为纯诊断辅助。
+///
+/// 常见命中模式：
+/// - `http2 error: protocol error: invalid frame`
+/// - `h2 protocol error`
+/// - `GOAWAY`
+/// - `frame size exceeded`
+fn is_http2_frame_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{:#}", err).to_lowercase();
+    msg.contains("http2") && (msg.contains("frame") || msg.contains("protocol error"))
+        || msg.contains("h2 protocol")
+        || msg.contains("goaway")
+}
+
+/// 🔥 判断错误是否为服务端限流类（429/503/Retry-After）
+fn is_server_throttled_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{:#}", err).to_lowercase();
+    msg.contains("429")
+        || msg.contains("503")
+        || msg.contains("too many requests")
+        || msg.contains("service unavailable")
+        || msg.contains("retry-after")
+}
 
 /// 🔥 计算指数退避延迟
 ///
@@ -826,6 +985,19 @@ pub struct DownloadEngine {
     shared_download_client: Arc<StdRwLock<Client>>,
     /// 代理故障回退管理器
     pub(crate) fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
+    /// 🔥 HTTP/2 降级截止时间
+    ///
+    /// None = 正常 HTTP/2 模式
+    /// Some(instant) = 在此时刻前所有新客户端走 HTTP/1.1
+    http11_downgrade_until: Arc<StdRwLock<Option<std::time::Instant>>>,
+
+    /// 🔥 连续零字节失败计数（全局共享）
+    ///
+    /// 任意分片下载成功或获得字节数据时被重置为 0；
+    /// 出现「本次尝试零字节结束」时 +1（任意失败原因，HTTP/2 frame error 只是其中一种），
+    /// 达到阈值触发降级并重置。字段名中的 `h2` 仅为历史命名，语义上
+    /// 等价于「连续零字节失败计数」。
+    consecutive_h2_zero_failures: Arc<AtomicU32>,
 }
 
 impl DownloadEngine {
@@ -857,8 +1029,8 @@ impl DownloadEngine {
 
         let proxy_config_shared = Arc::new(StdRwLock::new(proxy_config.cloned()));
 
-        // 创建初始共享下载客户端
-        let initial_download_client = Self::build_download_client(proxy_config)
+        // 创建初始共享下载客户端（首次创建不强制 HTTP/1.1）
+        let initial_download_client = Self::build_download_client(proxy_config, false)
             .expect("初始创建下载客户端失败");
         let shared_download_client = Arc::new(StdRwLock::new(initial_download_client));
 
@@ -870,11 +1042,17 @@ impl DownloadEngine {
             proxy_config: proxy_config_shared,
             shared_download_client,
             fallback_mgr,
+            http11_downgrade_until: Arc::new(StdRwLock::new(None)),
+            consecutive_h2_zero_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
     /// 构建下载专用 HTTP 客户端（静态方法，可用于初始创建和热更新重建）
-    fn build_download_client(proxy_config: Option<&ProxyConfig>) -> Result<Client> {
+    ///
+    /// # 参数
+    /// - `proxy_config`: 代理配置
+    /// - `force_http11`: 是否强制 HTTP/1.1（HTTP/2 降级期间为 true）
+    fn build_download_client(proxy_config: Option<&ProxyConfig>, force_http11: bool) -> Result<Client> {
         // 使用 Android 客户端的 User-Agent（与 NetdiskClient 一致）
         let pan_ua = "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
 
@@ -885,13 +1063,21 @@ impl DownloadEngine {
             .pool_idle_timeout(std::time::Duration::from_secs(90)) // IdleConnTimeout: 90s
             .tcp_keepalive(std::time::Duration::from_secs(60)) // TCP Keep-Alive
             .tcp_nodelay(true) // 启用 TCP_NODELAY，减少延迟
-            .redirect(reqwest::redirect::Policy::limited(10)) // 最多 10 次重定向
+            .redirect(reqwest::redirect::Policy::limited(10)); // 最多 10 次重定向
+
+        if force_http11 {
+            // 🔥 HTTP/2 降级：强制使用 HTTP/1.1（触发原因是「连续零字节失败」，不限于 frame error）
+            builder = builder.http1_only();
+            tracing::warn!("⚠ 下载客户端使用 HTTP/1.1 模式（HTTP/2 降级冷却期）");
+        } else {
             // HTTP/2 极致优化：大幅增加窗口以消除慢启动影响
-            .http2_adaptive_window(true) // 启用HTTP/2自适应窗口
-            .http2_initial_stream_window_size(Some(1024 * 1024 * 2)) // 2MB初始流窗口（默认65KB）
-            .http2_initial_connection_window_size(Some(1024 * 1024 * 4)) // 4MB初始连接窗口（默认65KB）
-            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(20)); // HTTP/2 keep-alive超时
+            builder = builder
+                .http2_adaptive_window(true) // 启用HTTP/2自适应窗口
+                .http2_initial_stream_window_size(Some(1024 * 1024 * 2)) // 2MB初始流窗口（默认65KB）
+                .http2_initial_connection_window_size(Some(1024 * 1024 * 4)) // 4MB初始连接窗口（默认65KB）
+                .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
+                .http2_keep_alive_timeout(std::time::Duration::from_secs(20)); // HTTP/2 keep-alive超时
+        }
 
         if let Some(proxy) = proxy_config {
             builder = proxy.apply_to_builder(builder)
@@ -911,7 +1097,160 @@ impl DownloadEngine {
     /// - CheckRedirect: 删除 Referer
     fn create_download_client(&self) -> Result<Client> {
         let proxy = self.proxy_config.read().unwrap();
-        Self::build_download_client(proxy.as_ref())
+        let force_http11 = self.is_http11_downgrade_active();
+        Self::build_download_client(proxy.as_ref(), force_http11)
+    }
+
+    /// 🔥 判断当前是否处于 HTTP/2 降级冷却期
+    fn is_http11_downgrade_active(&self) -> bool {
+        self.http11_downgrade_until
+            .read()
+            .unwrap()
+            .map(|t| std::time::Instant::now() < t)
+            .unwrap_or(false)
+    }
+
+    /// 🔥 上报一次零字节失败（连续累计）
+    ///
+    /// 由 `download_chunk_with_retry` 在「本次尝试零字节结束」时调用，不限定于 HTTP/2 frame error：
+    /// 连接失败、SSL 握手失败、服务端未发数据即断流等任何本轮零字节结束的失败都会调用。
+    /// frame error 仅作为额外的诊断日志标签（见 [`is_http2_frame_error`]），不是入门门槛。
+    ///
+    /// 计数达到 [`HTTP2_ZERO_FAILURE_THRESHOLD`] 时返回 true，调用方据此触发全局降级。
+    /// 任意分片获得字节数据或下载成功时应调用 [`reset_h2_zero_failure_counter`] 重置计数。
+    pub fn report_h2_zero_failure(&self) -> bool {
+        let prev = self
+            .consecutive_h2_zero_failures
+            .fetch_add(1, Ordering::SeqCst);
+        let new_count = prev + 1;
+        debug!(
+            "HTTP/2 零字节失败连续计数: {}/{}",
+            new_count, HTTP2_ZERO_FAILURE_THRESHOLD
+        );
+        if new_count >= HTTP2_ZERO_FAILURE_THRESHOLD {
+            // 达到阈值，复位计数（避免下次再次累加进入二次降级）
+            self.consecutive_h2_zero_failures.store(0, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 🔥 重置连续零字节失败计数
+    ///
+    /// 由 `download_chunk_with_retry` 在「本次尝试收到任意字节」时调用（通过
+    /// `H2DowngradeSignal::DataReceived` 闭包），表示链路本身并未失效。
+    pub fn reset_h2_zero_failure_counter(&self) {
+        let prev = self
+            .consecutive_h2_zero_failures
+            .swap(0, Ordering::SeqCst);
+        if prev > 0 {
+            debug!("HTTP/2 零字节失败计数从 {} 重置为 0", prev);
+        }
+    }
+
+    /// 🔥 触发 HTTP/2 全局降级：置降级截止时间、立即重建共享客户端、安排自动恢复任务
+    ///
+    /// 幂等：降级期内重复调用仅刷新截止时间。
+    /// 内部会 spawn 一个后台任务，到期后自动恢复 HTTP/2 客户端。
+    pub fn trigger_http11_downgrade(&self) {
+        let cooldown = std::time::Duration::from_secs(HTTP11_DOWNGRADE_COOLDOWN_SECS);
+        let new_until = std::time::Instant::now() + cooldown;
+
+        let was_inactive = {
+            let mut guard = self.http11_downgrade_until.write().unwrap();
+            let was_inactive = guard
+                .map(|t| std::time::Instant::now() >= t)
+                .unwrap_or(true);
+            let should_log = match *guard {
+                Some(existing) if existing > new_until => false, // 已有更长的降级期
+                _ => true,
+            };
+            *guard = Some(new_until);
+            if should_log {
+                tracing::warn!(
+                    "⚠ 触发 HTTP/2 降级：未来 {} 秒内所有下载客户端走 HTTP/1.1",
+                    HTTP11_DOWNGRADE_COOLDOWN_SECS
+                );
+            }
+            was_inactive
+        };
+
+        // 立即重建共享下载客户端
+        let proxy = self.proxy_config.read().unwrap();
+        match Self::build_download_client(proxy.as_ref(), true) {
+            Ok(new_client) => {
+                *self.shared_download_client.write().unwrap() = new_client;
+                tracing::info!("✓ 下载客户端已重建为 HTTP/1.1 模式");
+            }
+            Err(e) => {
+                tracing::warn!("HTTP/1.1 降级客户端重建失败，保留旧客户端: {}", e);
+            }
+        }
+        drop(proxy); // 释放 proxy_config 读锁
+
+        // 🔥 仅在首次进入冷却时启动恢复任务，避免重复 spawn
+        if was_inactive {
+            self.spawn_http2_recovery_task();
+        }
+    }
+
+    /// 🔥 启动 HTTP/2 自动恢复后台任务
+    ///
+    /// 每 30s 检查一次 `http11_downgrade_until`，到期后清除冷却标志并重建 HTTP/2 客户端。
+    /// 期间被 `trigger_http11_downgrade` 重新触发会继续等待新截止时间。
+    fn spawn_http2_recovery_task(&self) {
+        let downgrade_until = self.http11_downgrade_until.clone();
+        let proxy_config = self.proxy_config.clone();
+        let shared_client = self.shared_download_client.clone();
+        let zero_counter = self.consecutive_h2_zero_failures.clone();
+
+        tokio::spawn(async move {
+            // 检查间隔：尽量短以减少恢复延迟，又不至于忙轮询
+            let check_interval = std::time::Duration::from_secs(30);
+            loop {
+                let now = std::time::Instant::now();
+                let until = { *downgrade_until.read().unwrap() };
+                match until {
+                    Some(t) if now < t => {
+                        // 仍在冷却期，等到截止前后再检查
+                        let wait_for = t.saturating_duration_since(now).min(check_interval);
+                        tokio::time::sleep(wait_for).await;
+                        continue;
+                    }
+                    Some(_) => {
+                        // 冷却到期，清除标志并尝试恢复 HTTP/2
+                        {
+                            let mut guard = downgrade_until.write().unwrap();
+                            *guard = None;
+                        }
+                        zero_counter.store(0, Ordering::SeqCst);
+
+                        let proxy = proxy_config.read().unwrap();
+                        match Self::build_download_client(proxy.as_ref(), false) {
+                            Ok(new_client) => {
+                                *shared_client.write().unwrap() = new_client;
+                                tracing::info!(
+                                    "✓ HTTP/1.1 降级冷却到期，已恢复 HTTP/2 下载客户端"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "HTTP/2 恢复客户端重建失败，保留 HTTP/1.1 客户端: {}",
+                                    e
+                                );
+                            }
+                        }
+                        // 恢复完成，退出后台任务
+                        break;
+                    }
+                    None => {
+                        // 在等待期间被外部清除（极少发生），直接退出
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// 获取当前共享下载客户端（分片下载时调用）
@@ -929,7 +1268,7 @@ impl DownloadEngine {
     /// 热更新：更新代理配置并重建共享下载客户端和网盘客户端（代理变更时由 DownloadManager 调用）
     pub fn update_proxy_and_rebuild_client(&self, new_proxy: Option<&ProxyConfig>) {
         *self.proxy_config.write().unwrap() = new_proxy.cloned();
-        // 重建分片下载客户端
+        // 重建分片下载客户端（自动复用当前 HTTP/2 降级状态）
         match self.create_download_client() {
             Ok(new_client) => {
                 *self.shared_download_client.write().unwrap() = new_client;
@@ -2547,8 +2886,11 @@ impl DownloadEngine {
                     None, // slot_touch_throttler（独立模式不需要）
                     3,    // max_retries（独立模式使用默认值）
                     None, // fallback_mgr（独立模式不需要）
+                    None, // http11_trigger（独立模式不需要）
                 )
-                    .await;
+                    .await
+                    // 🔥 独立模式不关心失败分类，解包为 anyhow::Error
+                    .map_err(|e| e.into_error());
 
                 drop(permit); // 🔥 释放 permit，其他等待的分片可以使用
 
@@ -2647,6 +2989,7 @@ impl DownloadEngine {
     /// * `task_id` - 任务 ID（用于进度事件）
     /// * `folder_progress_tx` - 文件夹进度通知发送器（可选，仅文件夹子任务需要）
     /// * `backup_notification_tx` - 备份任务统一通知发送器（可选，仅备份任务需要）
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_chunk_with_retry(
         chunk_index: usize,
         client: Client,
@@ -2669,7 +3012,12 @@ impl DownloadEngine {
         slot_touch_throttler: Option<Arc<crate::task_slot_pool::SlotTouchThrottler>>,
         max_retries: u32,
         fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
-    ) -> Result<()> {
+        // 🔥 HTTP/2 降级触发器（由 scheduler 传入；接收 H2DowngradeSignal）
+        // 调用方需在本轮尝试收到任意字节时发送 DataReceived；在本轮尝试零字节结束时发送
+        // ZeroFailureFrameError（任意失败原因都计数，不要求是 frame error；变体名是历史命名兼容）。
+        // 累计阈值由 DownloadEngine 内部维护。
+        http11_trigger: Option<H2DowngradeTrigger>,
+    ) -> std::result::Result<(), ChunkDownloadFailure> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
         let mut retries = 0;
@@ -2678,12 +3026,20 @@ impl DownloadEngine {
 
         loop {
             // 检查任务是否已被取消
+            //
+            // 🔥 R25: 取消/暂停归类为 Cancelled，**不**归为 Fatal
+            //
+            // 历史归 Fatal 会让 scheduler 把任务计入 deferred + 失败计数累加，
+            // 更严重的是：在循环 Err(e) 分支里若 bytes_this_attempt==0，曾经
+            // 的 Fatal 路径会触发 ZeroFailureFrameError 累计，连续 3 次后把
+            // **全局 HTTP/2 client 降级到 HTTP/1.1 600 秒**——纯属用户手动暂停
+            // 误伤其它任务的吞吐。Cancelled 变体让 scheduler 显式短路。
             if cancellation_token.is_cancelled() {
                 warn!(
                     "[分片线程{}] 分片 #{} 下载被取消",
                     chunk_thread_id, chunk_index
                 );
-                anyhow::bail!("分片下载已被取消");
+                return Err(ChunkDownloadFailure::Cancelled);
             }
 
             // 检查是否还有可用链接
@@ -2691,7 +3047,10 @@ impl DownloadEngine {
                 let health = url_health.lock().await;
                 let count = health.available_count();
                 if count == 0 {
-                    anyhow::bail!("所有下载链接都不可用");
+                    // 🔥 所有链接全挂 → Fatal（scheduler 将 mark_deferred 等其他活跃分片）
+                    return Err(ChunkDownloadFailure::Fatal(anyhow::anyhow!(
+                        "所有下载链接都不可用"
+                    )));
                 }
 
                 // 🔧 Warm 模式集成：
@@ -2919,6 +3278,11 @@ impl DownloadEngine {
                         }
                     }
 
+                    // 🔥 任意分片下载成功 → 视为链接稳定，重置 HTTP/2 零字节计数
+                    if let Some(ref trigger) = http11_trigger {
+                        trigger(H2DowngradeSignal::DataReceived);
+                    }
+
                     info!(
                         "[分片线程{}] ✓ 分片 #{} 下载成功",
                         chunk_thread_id, chunk_index
@@ -2935,6 +3299,32 @@ impl DownloadEngine {
                     if bytes_this_attempt > 0 {
                         let mut manager = chunk_manager.lock().await;
                         manager.update_bytes_downloaded(chunk_index, chunk.bytes_downloaded);
+                    }
+
+                    // 🔥 R25: 取消/暂停优先短路——必须在任何 H2 降级触发 / 代理回退记录
+                    //         / 重试归类之前判定，否则手动暂停的零字节失败会被误算成
+                    //         "服务端故障"，触发：
+                    //           - H2DowngradeSignal::ZeroFailureFrameError 累计
+                    //             → 连续 3 次后把**全局 HTTP/2 client 降级到 HTTP/1.1 600 秒**
+                    //             → 暂停操作误伤其它正在下载的任务
+                    //           - 代理 fallback_mgr.record_failure() 累计
+                    //             → 暂停操作可能错误地把代理判成不可用
+                    //
+                    //         判定逻辑：用户暂停后，cancellation_token 已翻 cancelled，
+                    //         chunk.download() 会通过 `tokio::select! cancelled() => bail!`
+                    //         返回错误（错误内容为"分片 #{} 下载被取消"）。这里捕获
+                    //         所有"token 已 cancelled 状态下的 Err"，分类为 Cancelled
+                    //         立即返回，跳过所有副作用。
+                    //
+                    //         note: bytes_this_attempt 已在上面同步给 ChunkManager（断点续传），
+                    //         这部分进度对恢复路径有用，不丢弃。
+                    if cancellation_token.is_cancelled() {
+                        info!(
+                            "[分片线程{}] 分片 #{} 失败时检测到 cancellation_token 已取消，\
+                             分类为 Cancelled 短路返回（本次 {} bytes，错误: {}）",
+                            chunk_thread_id, chunk_index, bytes_this_attempt, e
+                        );
+                        return Err(ChunkDownloadFailure::Cancelled);
                     }
 
                     // 🔥 代理回退：下载失败时检测是否为代理/连接错误
@@ -2964,6 +3354,39 @@ impl DownloadEngine {
                             }
                         }
                     }
+
+                    // 🔥 HTTP/1.1 降级触发：按"连续 N 次零字节失败"累计（N=HTTP2_ZERO_FAILURE_THRESHOLD）
+                    //
+                    // 语义（与设计方案一致）：只要本次尝试零字节失败 → 计入 HTTP/2 可能故障累计。
+                    // 任何零字节类失败都算，包括但不限于：
+                    //   - HTTP/2 frame error（GOAWAY、PROTOCOL_ERROR、INTERNAL_ERROR 等）
+                    //   - 连接建立失败 / SSL 握手失败（客户端视角也等价于"协议不可用"）
+                    //   - 服务端未开始发送字节即断流
+                    //   - 无可用 URL / 所有链接失败前最后一跳的零字节错误
+                    // 只有"本次真的收到字节"才视为 HTTP/2 链接正常，重置计数（DataReceived）。
+                    // H/2 frame error 仍单独标记日志，方便诊断，但不作为门槛条件。
+                    let is_h2_frame_err = is_http2_frame_error(&e);
+                    if let Some(ref trigger) = http11_trigger {
+                        if bytes_this_attempt > 0 {
+                            trigger(H2DowngradeSignal::DataReceived);
+                        } else {
+                            if is_h2_frame_err {
+                                warn!(
+                                    "[分片线程{}] ⚠ 分片 #{} 零字节 + HTTP/2 frame error: {}",
+                                    chunk_thread_id, chunk_index, e
+                                );
+                            } else {
+                                debug!(
+                                    "[分片线程{}] 分片 #{} 零字节失败（非 frame error），计入 HTTP/1.1 降级累计: {}",
+                                    chunk_thread_id, chunk_index, e
+                                );
+                            }
+                            trigger(H2DowngradeSignal::ZeroFailureFrameError);
+                        }
+                    }
+
+                    // 🔥 判断错误类型供后续分类用
+                    let is_throttled = is_server_throttled_error(&e);
 
                     last_error = Some(e);
 
@@ -2998,8 +3421,19 @@ impl DownloadEngine {
                                 tried_urls.len(),
                                 retries
                             );
-                            return Err(last_error
-                                .unwrap_or_else(|| anyhow::anyhow!("分片 #{} 下载失败", chunk_index)));
+                            let err = last_error
+                                .unwrap_or_else(|| anyhow::anyhow!("分片 #{} 下载失败", chunk_index));
+                            // 🔥 根据错误类型返回精细化失败分类
+                            let failure = if is_throttled {
+                                ChunkDownloadFailure::ServerThrottled(err)
+                            } else if tried_urls.len() >= available_count {
+                                // 所有链接都试过 → Fatal（scheduler mark_deferred）
+                                ChunkDownloadFailure::Fatal(err)
+                            } else {
+                                // 达到 max_retries 但还有未试链接 → Transient（可能只是本轮倒霉）
+                                ChunkDownloadFailure::Transient(err)
+                            };
+                            return Err(failure);
                         }
 
                         warn!(
@@ -3060,5 +3494,25 @@ mod tests {
         let user_auth = create_mock_user_auth();
         let engine = DownloadEngine::new(user_auth);
         assert_eq!(engine.vip_type as u32, 2); // SVIP
+    }
+
+    #[test]
+    fn test_http2_frame_error_detection() {
+        let e1 = anyhow::anyhow!("http2 protocol error: invalid frame");
+        assert!(is_http2_frame_error(&e1));
+        let e2 = anyhow::anyhow!("h2 protocol error: GOAWAY");
+        assert!(is_http2_frame_error(&e2));
+        let e3 = anyhow::anyhow!("connection refused");
+        assert!(!is_http2_frame_error(&e3));
+    }
+
+    #[test]
+    fn test_server_throttled_detection() {
+        let e1 = anyhow::anyhow!("HTTP 429 Too Many Requests");
+        assert!(is_server_throttled_error(&e1));
+        let e2 = anyhow::anyhow!("503 Service Unavailable");
+        assert!(is_server_throttled_error(&e2));
+        let e3 = anyhow::anyhow!("network timeout");
+        assert!(!is_server_throttled_error(&e3));
     }
 }

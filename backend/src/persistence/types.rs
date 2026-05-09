@@ -668,6 +668,14 @@ impl TaskMetadata {
         self.touch();
     }
 
+    /// 🔥 清空错误信息（设为 None，不是 Some("")）
+    ///
+    /// 任务被等待队列重新拉起时调用，避免持久化中残留旧的失败原因。
+    pub fn clear_error_msg(&mut self) {
+        self.error_msg = None;
+        self.touch();
+    }
+
     /// 设置文件夹下载组信息
     pub fn set_group_info(
         &mut self,

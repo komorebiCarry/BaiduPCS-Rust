@@ -61,6 +61,12 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        /// 🔥 状态变更原因（auto_requeue_task 携带退回原因，其他场景为 None）
+        ///
+        /// 必须加 `skip_serializing_if`，否则 None 会序列化成 "error":null。
+        /// 前端用 `event.error !== undefined` 判断时会把 null 当作有值。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// 任务完成
     Completed {
@@ -1291,6 +1297,7 @@ mod tests {
             new_status: "decrypting".to_string(),
             group_id: None,
             is_backup: false,
+            error: None,
         });
         assert!(decrypting_status.is_active());
     }

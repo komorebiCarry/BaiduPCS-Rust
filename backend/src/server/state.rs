@@ -270,6 +270,9 @@ impl AppState {
             let manager_arc = Arc::new(manager);
             *self.download_manager.write().await = Some(Arc::clone(&manager_arc));
 
+            // 🔥 启动 auto_requeue 消费任务（scheduler 失败时退回等待队列）
+            Arc::clone(&manager_arc).start_auto_requeue_consumer().await;
+
             // 设置文件夹下载管理器的依赖
             self.folder_download_manager
                 .set_download_manager(Arc::clone(&manager_arc))

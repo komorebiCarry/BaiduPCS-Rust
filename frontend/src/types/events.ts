@@ -31,6 +31,13 @@ export interface DownloadEventStatusChanged {
   task_id: string
   old_status: string
   new_status: string
+  group_id?: string
+  is_backup?: boolean
+  /**
+   * 状态变更原因（仅 auto_requeue_task 退回等待队列时携带）
+   * 后端 #[serde(skip_serializing_if = "Option::is_none")]，None 时整个字段不发送
+   */
+  error?: string
 }
 
 export interface DownloadEventCompleted {
