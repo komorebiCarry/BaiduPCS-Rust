@@ -694,18 +694,24 @@ impl ShareSURLInfoResponse {
 
 /// 风控验证组件信息
 ///
-/// 百度风控系统返回的验证信息，当 errno=132 时可能附带此字段
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 百度风控系统返回的验证信息，当 errno=132 时可能附带此字段。
+///
+/// 字段全部为 `Option<String>` 以兼容百度返回中字段缺失或 `null` 的情况；
+/// `extra` 通过 `#[serde(flatten)]` 接住未知字段，保证未来新字段不会导致解析失败。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthWidget {
     /// 安全随机数
-    #[serde(default)]
-    pub saferand: String,
-    /// 安全签名
-    #[serde(default)]
-    pub safesign: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saferand: Option<String>,
+    /// 安全签名（敏感，日志中需脱敏）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safesign: Option<String>,
     /// 安全模板
-    #[serde(default)]
-    pub safetpl: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safetpl: Option<String>,
+    /// 其它未识别字段透传（百度协议演化时不破坏解析）
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// 删除文件响应
@@ -875,4 +881,191 @@ impl FileMetasResponse {
     pub fn is_success(&self) -> bool {
         self.errno == 0
     }
+}
+
+// =====================================================
+// 文件管理操作（filemanager: copy / move / rename）相关类型
+// =====================================================
+
+/// 自定义 deserializer：兼容百度返回 `taskid` / `request_id` 等字段为 number 或 string 的两种形态
+///
+/// 百度网盘部分接口在不同版本下会把同一字段在 number 与 string 间漂移；本函数提供一致的 i64 输出。
+fn deserialize_i64_flexible<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Number(n) => Ok(n.as_i64().unwrap_or(0)),
+        serde_json::Value::String(s) => Ok(s.parse::<i64>().unwrap_or(0)),
+        serde_json::Value::Null => Ok(0),
+        _ => Ok(0),
+    }
+}
+
+/// 自定义 deserializer：兼容 `request_id` 等 u64 字段的 number/string 两种形态
+fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Number(n) => Ok(n.as_u64().unwrap_or(0)),
+        serde_json::Value::String(s) => Ok(s.parse::<u64>().unwrap_or(0)),
+        serde_json::Value::Null => Ok(0),
+        _ => Ok(0),
+    }
+}
+
+/// `filemanager` 接口 `opera=copy/move` 时 `filelist` JSON 数组中的单条 item
+///
+/// 百度协议形如：`[{"path":"/a/x.mp4","dest":"/b","newname":"x.mp4"}, ...]`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOperationItem {
+    /// 源文件路径（绝对路径，必须以 `/` 开头）
+    pub path: String,
+    /// 目标父目录（绝对路径，不带尾斜杠）
+    pub dest: String,
+    /// 目标文件名（与源同名 = 直接复制/移动；不同 = 复制/移动并重命名）
+    pub newname: String,
+}
+
+/// `filemanager` 接口 `opera=rename` 时 `filelist` JSON 数组中的单条 item
+///
+/// 百度协议形如：`[{"path":"/a/x.mp4","newname":"y.mp4","id":123456789}]`
+///
+/// 注意：`id` 必须是数字（fs_id），不能是字符串。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameItem {
+    /// 源文件路径
+    pub path: String,
+    /// 新文件名
+    pub newname: String,
+    /// 文件系统 ID（fs_id）
+    pub id: u64,
+}
+
+/// `share/taskquery` 完成时返回的单条结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOperationResultItem {
+    /// 源路径
+    #[serde(default)]
+    pub from: String,
+    /// 目标路径
+    #[serde(default)]
+    pub to: String,
+}
+
+/// `filemanager` 接口同步返回（POST 后立即得到）的响应体
+///
+/// 在 `async=2` 模式下，POST 仅返回 `taskid`；详细成功/失败由后续 `share/taskquery` 决定。
+#[derive(Debug, Deserialize)]
+pub struct FileManagerResponse {
+    /// 错误码（0 表示请求被接受，不等于业务最终成功）
+    #[serde(default)]
+    pub errno: i32,
+    /// 异步任务 ID（兼容 number / string）
+    #[serde(default, deserialize_with = "deserialize_i64_flexible")]
+    pub taskid: i64,
+    /// 请求 ID（仅日志用，兼容 number / string）
+    #[serde(default, deserialize_with = "deserialize_u64_flexible")]
+    pub request_id: u64,
+    /// 错误描述（百度有时把错误放在 `errmsg`）
+    #[serde(default)]
+    pub errmsg: String,
+    /// 风控验证组件（errno=132 时可能存在）
+    #[serde(default)]
+    pub authwidget: Option<AuthWidget>,
+    /// 验证场景（风控相关）
+    #[serde(default)]
+    pub verify_scene: Option<i32>,
+}
+
+/// `share/taskquery` 接口返回的响应体
+#[derive(Debug, Deserialize)]
+pub struct FileManagerTaskQueryResponse {
+    /// 百度 taskquery 响应 body 中 `errno` 不一定总是存在（running/pending 下可能缺失）。
+    /// 补 `#[serde(default)]` 将缺失视为 0，提高对百度字段波动的容忍度。
+    #[serde(default)]
+    pub errno: i32,
+    /// 任务级错误码（status="failed" 时填充）
+    #[serde(default)]
+    pub task_errno: i32,
+    /// "running" / "success" / "failed" / "pending"
+    #[serde(default)]
+    pub status: String,
+    /// 0..100，仅 running 时有意义；百度此字段在不同版本可能为 number 或 string，故用 Value 接住
+    #[serde(default)]
+    pub progress: serde_json::Value,
+    /// 完成时返回 from/to 列表
+    #[serde(default)]
+    pub list: Vec<FileOperationResultItem>,
+    /// 完成项总数
+    #[serde(default)]
+    pub total: u32,
+    /// 用户可读的失败提示
+    #[serde(default)]
+    pub show_msg: String,
+    /// taskquery 阶段也可能返回错误描述
+    #[serde(default)]
+    pub errmsg: String,
+    /// taskquery 阶段也可能遭遇 132 风控，透传 authwidget
+    #[serde(default)]
+    pub authwidget: Option<AuthWidget>,
+    /// 风控场景
+    #[serde(default)]
+    pub verify_scene: Option<i32>,
+}
+
+/// 文件管理操作的统一对外结果（成功路径）
+///
+/// 仅在内部代码路径中表示「成功」分支，由 handler 转换为 `FileOperationOutcomeDto::Success`。
+/// **不含 `success` 字段** —— 业务成败完全由 `FileOperationOutcome` enum / DTO 的 `kind` 表示。
+#[derive(Debug, Clone, Serialize)]
+pub struct FileOperationSuccess {
+    /// 百度异步任务 ID（仅作日志/排查用）
+    pub taskid: i64,
+    /// 实际处理的文件总数
+    pub total: u32,
+    /// 完成项目（from -> to）
+    pub list: Vec<FileOperationResultItem>,
+}
+
+/// 文件管理操作的失败载荷（内部类型，由 handler 转换为 DTO::Failed）
+///
+/// `errno` 与 `task_errno` 的语义：
+/// - POST `filemanager` 阶段失败：`errno = Some(resp.errno)`、`task_errno = None`
+/// - taskquery body 本身 `errno != 0`：`errno = task_errno = Some(parsed.errno)`（同步填值，便于 retry 判断）
+/// - taskquery `status="failed"`：`errno = task_errno = Some(parsed.task_errno)`（同步填值）
+#[derive(Debug, Clone, Serialize)]
+pub struct FileOperationErrorPayload {
+    /// 百度异步任务 ID（POST 失败时为 0）
+    pub taskid: i64,
+    /// POST filemanager 的 errno（taskquery 阶段也会同步写入该字段）
+    pub errno: Option<i32>,
+    /// taskquery 的 task_errno（POST 阶段为 None）
+    pub task_errno: Option<i32>,
+    /// 风控验证组件
+    pub authwidget: Option<AuthWidget>,
+    /// 风控场景
+    pub verify_scene: Option<i32>,
+    /// 60 次轮询仍未完成（仅 taskquery 阶段使用）
+    #[serde(default)]
+    pub still_running: bool,
+}
+
+/// 文件管理操作的统一内部 enum
+#[derive(Debug, Clone, Serialize)]
+pub enum FileOperationOutcome {
+    /// 业务成功
+    Success(FileOperationSuccess),
+    /// 业务失败（含风控、同名冲突、超时等所有非系统层错误）
+    ///
+    /// `message` 是用户可读的提示（来自 `show_msg` / `errmsg` 兜底默认串）。
+    Failed {
+        message: String,
+        payload: FileOperationErrorPayload,
+    },
 }

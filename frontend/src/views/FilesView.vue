@@ -45,32 +45,44 @@
             </div>
           </div>
         </div>
-        <el-button
+        <!-- 批量操作下拉：明确的"批量操作"文本按钮，所有动作在下拉内一目了然 -->
+        <el-dropdown
             v-if="selectedFiles.length > 0"
-            type="warning"
-            :loading="batchDownloading"
-            @click="handleBatchDownload"
+            trigger="click"
         >
-          <el-icon><Download /></el-icon>
-          批量下载 ({{ selectedFiles.length }})
-        </el-button>
-        <el-button
-            v-if="selectedFiles.length > 0"
-            type="info"
-            @click="handleBatchShare"
-        >
-          <el-icon><Link /></el-icon>
-          分享 ({{ selectedFiles.length }})
-        </el-button>
-        <el-button
-            v-if="selectedFiles.length > 0"
-            type="danger"
-            :loading="batchDeleting"
-            @click="handleBatchDelete"
-        >
-          <el-icon><Delete /></el-icon>
-          删除 ({{ selectedFiles.length }})
-        </el-button>
+          <el-button
+              type="warning"
+              :loading="batchDownloading || batchDeleting || batchCopying || batchMoving"
+          >
+            <el-icon><Operation /></el-icon>
+            批量操作 ({{ selectedFiles.length }})
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item @click="handleBatchDownload">
+                <el-icon><Download /></el-icon>
+                批量下载
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchCopy">
+                <el-icon><CopyDocument /></el-icon>
+                复制到...
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchMove">
+                <el-icon><Rank /></el-icon>
+                移动到...
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchShare">
+                <el-icon><Link /></el-icon>
+                分享
+              </el-dropdown-item>
+              <el-dropdown-item divided @click="handleBatchDelete">
+                <el-icon><Delete /></el-icon>
+                删除
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button type="primary" @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
           新建文件夹
@@ -127,33 +139,44 @@
             </el-button>
           </div>
         </div>
-        <el-button
+        <!-- 批量操作下拉（移动端同样合并避免工具栏溢出） -->
+        <el-dropdown
             v-if="selectedFiles.length > 0"
-            type="warning"
-            circle
-            :loading="batchDownloading"
-            @click="handleBatchDownload"
+            trigger="click"
         >
-          <el-icon><Download /></el-icon>
-        </el-button>
-        <el-button
-            v-if="selectedFiles.length > 0"
-            type="info"
-            circle
-            @click="handleBatchShare"
-        >
-          <el-icon><Link /></el-icon>
-        </el-button>
-        <el-button
-            v-if="selectedFiles.length > 0"
-            type="danger"
-            circle
-            :loading="batchDeleting"
-            @click="handleBatchDelete"
-            title="删除"
-        >
-          <el-icon><Delete /></el-icon>
-        </el-button>
+          <el-button
+              type="warning"
+              circle
+              :loading="batchDownloading || batchDeleting || batchCopying || batchMoving"
+              title="批量操作"
+          >
+            <el-icon><MoreFilled /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item @click="handleBatchDownload">
+                <el-icon><Download /></el-icon>
+                批量下载 ({{ selectedFiles.length }})
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchShare">
+                <el-icon><Link /></el-icon>
+                分享 ({{ selectedFiles.length }})
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchCopy">
+                <el-icon><CopyDocument /></el-icon>
+                复制到...
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchMove">
+                <el-icon><Rank /></el-icon>
+                移动到...
+              </el-dropdown-item>
+              <el-dropdown-item divided @click="handleBatchDelete">
+                <el-icon><Delete /></el-icon>
+                删除 ({{ selectedFiles.length }})
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button type="primary" circle @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
         </el-button>
@@ -228,7 +251,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
             <!-- 分享按钮 -->
             <el-button
@@ -256,6 +279,14 @@
                 @click.stop="handleDownloadFolder(row)"
             >
               下载
+            </el-button>
+            <!-- 重命名按钮 -->
+            <el-button
+                type="warning"
+                size="small"
+                @click.stop="handleSingleRename(row)"
+            >
+              重命名
             </el-button>
           </template>
         </el-table-column>
@@ -392,6 +423,52 @@
         v-model="showShareDirectDownloadDialog"
         @success="handleShareDirectDownloadSuccess"
     />
+
+    <!-- 网盘文件夹选择器（用于复制 / 移动） -->
+    <NetdiskFolderPickerModal
+        v-model="showFolderPicker"
+        :title="folderPickerTitle"
+        :initial-path="folderPickerInitialPath"
+        :blocked-paths="folderPickerBlockedPaths"
+        :blocked-exact-paths="folderPickerBlockedExactPaths"
+        @confirm="handleFolderPicked"
+    />
+
+    <!-- 重命名对话框 -->
+    <el-dialog
+        v-model="renameDialogVisible"
+        title="重命名"
+        width="500px"
+        @close="resetRenameDialog"
+    >
+      <el-form label-width="80px">
+        <el-form-item label="原名称">
+          <el-text>{{ renameTarget?.server_filename }}</el-text>
+        </el-form-item>
+        <el-form-item label="新名称" :error="renameNameError ?? undefined">
+          <el-input
+              v-model="renameNewName"
+              placeholder="输入新名称"
+              autofocus
+              @keyup.enter="handleRenameConfirm"
+          />
+        </el-form-item>
+        <el-form-item label="所在目录">
+          <el-text>{{ renameTarget ? dirname(renameTarget.path) : '-' }}</el-text>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="renameDialogVisible = false">取消</el-button>
+          <el-button
+              type="primary"
+              :loading="renameSubmitting"
+              :disabled="!!renameNameError"
+              @click="handleRenameConfirm"
+          >确定</el-button>
+        </span>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -399,7 +476,25 @@
 import {ref, onMounted, onBeforeUnmount, computed, nextTick} from 'vue'
 import {ElMessage, ElMessageBox} from 'element-plus'
 import type {InputInstance} from 'element-plus'
-import {getFileList, searchFiles, formatFileSize, formatTime, createFolder, deleteFiles, type FileItem} from '@/api/file'
+import {
+  getFileList,
+  searchFiles,
+  formatFileSize,
+  formatTime,
+  createFolder,
+  deleteFiles,
+  copyFiles,
+  moveFiles,
+  renameFile,
+  validateFilename,
+  joinPath,
+  basename,
+  dirname,
+  type FileItem,
+  type FileOperationItem,
+  type FileOperationOutcomeDto,
+} from '@/api/file'
+import NetdiskFolderPickerModal from '@/components/NetdiskFolderPickerModal.vue'
 import {useIsMobile} from '@/utils/responsive'
 import {createDownload, createFolderDownload, createBatchDownload, type BatchDownloadItem, type DownloadConflictStrategy} from '@/api/download'
 import {createUpload, createFolderUpload, type UploadConflictStrategy} from '@/api/upload'
@@ -450,6 +545,25 @@ const selectedFiles = ref<FileItem[]>([])
 const showDownloadPicker = ref(false)
 const batchDownloading = ref(false)
 const batchDeleting = ref(false)
+
+// 批量复制 / 批量移动 / 重命名 状态
+const batchCopying = ref(false)
+const batchMoving = ref(false)
+const showFolderPicker = ref(false)
+const folderPickerOperation = ref<'copy' | 'move'>('copy')
+const folderPickerTitle = computed(() =>
+    folderPickerOperation.value === 'copy' ? '选择复制目标文件夹' : '选择移动目标文件夹'
+)
+const folderPickerBlockedPaths = ref<string[]>([])      // 子树禁选（含子目录）
+const folderPickerBlockedExactPaths = ref<string[]>([]) // 精确禁选（仅自身）
+const folderPickerInitialPath = ref<string>('/')
+
+// 重命名对话框
+const renameDialogVisible = ref(false)
+const renameTarget = ref<FileItem | null>(null)
+const renameNewName = ref('')
+const renameSubmitting = ref(false)
+const renameNameError = computed(() => validateFilename(renameNewName.value))
 
 // 单文件下载（支持 ask_each_time）
 const pendingDownloadFile = ref<FileItem | null>(null)
@@ -1338,11 +1452,203 @@ function handleShareDirectDownloadSuccess(taskId: string) {
   console.log('分享直下任务创建成功:', taskId)
   ElMessage.success('分享直下任务已创建')
 }
+
+// =====================================================
+// 文件管理操作（filemanager: copy / move / rename）
+// =====================================================
+
+/** 选中文件中是否含加密文件/文件夹（这种禁止 copy/move） */
+function selectionContainsEncrypted(): FileItem | null {
+  return selectedFiles.value.find((f) => f.is_encrypted || f.is_encrypted_folder) ?? null
+}
+
+/** 触发批量复制：弹出文件夹选择器 */
+function handleBatchCopy() {
+  if (selectedFiles.value.length === 0) {
+    ElMessage.warning('请先选择要复制的文件或文件夹')
+    return
+  }
+  const enc = selectionContainsEncrypted()
+  if (enc) {
+    // 提示使用用户可见的原始名称（加密文件页面显示的是 original_name 而非 UUID.dat）
+    ElMessage.error(`加密文件/文件夹禁止复制：${getDisplayName(enc)}`)
+    return
+  }
+  folderPickerOperation.value = 'copy'
+  folderPickerInitialPath.value = currentDir.value
+  // 复制允许进入源文件夹自身子目录（百度支持），但禁选"目标 == 源父目录"：
+  // 目录选择器无法改 newname，默认用源 basename，若选回源父目录相当于同名复制，
+  // 百度会返回 errno=-8 这类"文件已存在"错误，提前在 UI 禁选避免误点。
+  const exactBlocked = new Set<string>()
+  for (const f of selectedFiles.value) {
+    exactBlocked.add(dirname(f.path))
+  }
+  folderPickerBlockedPaths.value = []
+  folderPickerBlockedExactPaths.value = Array.from(exactBlocked)
+  showFolderPicker.value = true
+}
+
+/** 触发批量移动：根据后端校验规则同步禁选 */
+function handleBatchMove() {
+  if (selectedFiles.value.length === 0) {
+    ElMessage.warning('请先选择要移动的文件或文件夹')
+    return
+  }
+  const enc = selectionContainsEncrypted()
+  if (enc) {
+    ElMessage.error(`加密文件/文件夹禁止移动：${getDisplayName(enc)}`)
+    return
+  }
+  folderPickerOperation.value = 'move'
+  folderPickerInitialPath.value = currentDir.value
+  // 与后端 move-only 校验对齐，分两类禁选：
+  //   1) 子树禁选（subtree）：选中的文件夹 + 其所有子目录
+  //      → 对应 ensure_not_move_into_self
+  //   2) 精确禁选（exact）：选中文件 / 文件夹的父目录（仅自身，不含其它兄弟目录）
+  //      → 对应 ensure_move_not_same_parent
+  const subtreeBlocked = new Set<string>()
+  const exactBlocked = new Set<string>()
+  for (const f of selectedFiles.value) {
+    if (f.isdir === 1) {
+      subtreeBlocked.add(f.path)
+    }
+    exactBlocked.add(dirname(f.path))
+  }
+  folderPickerBlockedPaths.value = Array.from(subtreeBlocked)
+  folderPickerBlockedExactPaths.value = Array.from(exactBlocked)
+  showFolderPicker.value = true
+}
+
+/** 文件夹选择器确认 */
+async function handleFolderPicked(destPath: string) {
+  if (folderPickerOperation.value === 'copy') {
+    await executeBatchCopy(destPath)
+  } else {
+    await executeBatchMove(destPath)
+  }
+}
+
+/** 处理 filemanager 操作的统一结果，返回是否成功 */
+function reportOutcome(action: string, outcome: FileOperationOutcomeDto): boolean {
+  if (outcome.kind === 'success') {
+    ElMessage.success(`${action}成功：共 ${outcome.total} 项`)
+    return true
+  }
+  // failed
+  if (outcome.still_running) {
+    ElMessage.warning(`${action}任务仍在后台处理，请稍后刷新查看`)
+    return false
+  }
+  // 风控判断：errno / task_errno 命中 132，或后端透传了 authwidget（含 saferand/safesign/safetpl）
+  // 任一条件命中均视为百度风控介入。
+  const hitVerifyCode = outcome.errno === 132 || outcome.task_errno === 132
+  const hasAuthWidget = !!outcome.authwidget && Object.keys(outcome.authwidget).length > 0
+  if (hitVerifyCode || hasAuthWidget) {
+    ElMessageBox.alert(
+        `百度风控拦截：${outcome.message}。请前往 pan.baidu.com 在浏览器中完成验证后再试。`,
+        `${action}被风控拦截`,
+        { type: 'warning' }
+    )
+    return false
+  }
+  ElMessage.error(`${action}失败：${outcome.message}`)
+  return false
+}
+
+async function executeBatchCopy(dest: string) {
+  const items: FileOperationItem[] = selectedFiles.value.map((f) => ({
+    path: f.path,
+    dest,
+    newname: f.server_filename,
+  }))
+  batchCopying.value = true
+  try {
+    const outcome = await copyFiles(items)
+    if (reportOutcome('复制', outcome)) {
+      selectedFiles.value = []
+      await refreshFileList()
+    }
+  } catch (e: unknown) {
+    ElMessage.error(e instanceof Error ? e.message : '复制请求失败')
+  } finally {
+    batchCopying.value = false
+  }
+}
+
+async function executeBatchMove(dest: string) {
+  const items: FileOperationItem[] = selectedFiles.value.map((f) => ({
+    path: f.path,
+    dest,
+    newname: f.server_filename,
+  }))
+  batchMoving.value = true
+  try {
+    const outcome = await moveFiles(items)
+    if (reportOutcome('移动', outcome)) {
+      selectedFiles.value = []
+      await refreshFileList()
+    }
+  } catch (e: unknown) {
+    ElMessage.error(e instanceof Error ? e.message : '移动请求失败')
+  } finally {
+    batchMoving.value = false
+  }
+}
+
+/** 单个文件/文件夹重命名入口 */
+function handleSingleRename(row: FileItem) {
+  if (row.is_encrypted || row.is_encrypted_folder) {
+    ElMessage.error(`加密${row.isdir === 1 ? '文件夹' : '文件'}禁止重命名`)
+    return
+  }
+  renameTarget.value = row
+  renameNewName.value = row.server_filename
+  renameDialogVisible.value = true
+}
+
+function resetRenameDialog() {
+  renameTarget.value = null
+  renameNewName.value = ''
+  renameSubmitting.value = false
+}
+
+async function handleRenameConfirm() {
+  if (!renameTarget.value) return
+  if (renameNameError.value) {
+    ElMessage.error(renameNameError.value)
+    return
+  }
+  if (renameNewName.value === renameTarget.value.server_filename) {
+    ElMessage.info('名称未变化')
+    renameDialogVisible.value = false
+    return
+  }
+  renameSubmitting.value = true
+  try {
+    const outcome = await renameFile({
+      path: renameTarget.value.path,
+      newname: renameNewName.value,
+      id: renameTarget.value.fs_id,
+    })
+    if (reportOutcome('重命名', outcome)) {
+      renameDialogVisible.value = false
+      await refreshFileList()
+    }
+  } catch (e: unknown) {
+    ElMessage.error(e instanceof Error ? e.message : '重命名请求失败')
+  } finally {
+    renameSubmitting.value = false
+  }
+}
+
+// 防止 import 被 tree-shake 误判 unused（basename / joinPath 在模板中未直接使用）
+void basename
+void joinPath
 </script>
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link, Delete, Search, Close} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link, Delete, Search, Close, CopyDocument, Rank, Edit, MoreFilled, Operation} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
@@ -1362,13 +1668,24 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   border-bottom: 1px solid #e0e0e0;
   background: white;
   gap: 12px;
+  flex-wrap: wrap; // 路径与工具栏可分两行，路径再长也不会被按钮挤压
 
+  // 让路径区域占据剩余空间并可收缩（含省略号）
+  .el-breadcrumb {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
 
   .toolbar-buttons {
     display: flex;
     align-items: center;
     gap: 12px;
     flex-shrink: 0;
+    flex-wrap: wrap;     // 按钮过多时换行到下一排，而不是横向溢出
+    justify-content: flex-end;
   }
 
   .toolbar-buttons-mobile {

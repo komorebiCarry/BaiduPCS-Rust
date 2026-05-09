@@ -1125,10 +1125,24 @@ function handleDownloadEvent(event: DownloadEvent) {
       // 状态变更
       if (index !== -1) {
         downloadItems.value[index].status = event.new_status as TaskStatus
+        // 🔥 退回等待队列时（pending + 携带 error），暴露退回原因便于排查
+        if (event.new_status === 'pending' && event.error) {
+          downloadItems.value[index].error = event.error
+        } else if (event.new_status !== 'failed') {
+          // 其他状态变更清空 error（避免遗留旧错误）
+          downloadItems.value[index].error = undefined
+        }
         mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务状态
-      updateFolderDetailTask(taskId, {status: event.new_status as TaskStatus}, true)
+      updateFolderDetailTask(taskId, {
+        status: event.new_status as TaskStatus,
+        ...(event.new_status === 'pending' && event.error
+            ? { error: event.error }
+            : event.new_status !== 'failed'
+                ? { error: undefined }
+                : {}),
+      }, true)
       break
 
     case 'completed': {

@@ -1085,6 +1085,47 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 🔥 清空任务的错误信息（不改变状态）
+    ///
+    /// 在任务从等待队列重新拉起时调用，避免持久化中残留旧的失败原因。
+    /// 与 update_transfer_warning 不同之处：不设状态为 failed。
+    pub fn clear_task_error(&self, task_id: &str) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, |m| {
+            m.clear_error_msg();
+        })?;
+        debug!("已清空任务错误信息: task_id={}", task_id);
+        Ok(())
+    }
+
+    /// 🔥 更新错误信息但保持指定状态（不调用 mark_failed）
+    ///
+    /// 用于 auto_requeue_task：任务被退回等待队列后，内存中是 Pending 状态，
+    /// 但保留错误原因供前端展示；如果用 update_task_error 会把持久化标成 Failed，
+    /// 与内存语义冲突。
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `error_msg` - 错误信息
+    /// * `status` - 要持久化的状态（通常为 Pending）
+    pub fn update_task_error_with_status(
+        &self,
+        task_id: &str,
+        error_msg: String,
+        status: crate::persistence::types::TaskPersistenceStatus,
+    ) -> std::io::Result<()> {
+        let error_owned = error_msg.clone();
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_error_msg(error_owned);
+            m.set_status(status);
+        })?;
+
+        debug!(
+            "已更新任务错误信息并保持状态: task_id={}, status={:?}, error={}",
+            task_id, status, error_msg
+        );
+        Ok(())
+    }
+
     /// 更新上传任务的 upload_id
     ///
     /// # Arguments

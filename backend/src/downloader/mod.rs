@@ -7,8 +7,8 @@ pub mod progress;
 pub mod scheduler;
 pub mod task;
 
-pub use chunk::{Chunk, ChunkManager};
-pub use engine::{DownloadEngine, UrlHealthManager};
+pub use chunk::{Chunk, ChunkFailureAction, ChunkManager};
+pub use engine::{ChunkDownloadFailure, DownloadEngine, UrlHealthManager};
 pub use folder::{FolderDownload, FolderStatus, PendingFile};
 pub use folder_manager::FolderDownloadManager;
 pub use manager::DownloadManager;

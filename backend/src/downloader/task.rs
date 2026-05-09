@@ -73,6 +73,16 @@ pub struct DownloadTask {
     #[serde(skip)]
     pub is_borrowed_slot: bool,
 
+    /// 🔥 是否占用文件夹固定槽位（既不占 task_slot_pool 也不占借调位）
+    ///
+    /// 当文件夹子任务被分配到所属文件夹的 fixed_slot_subtask 时为 true。
+    /// 此时 `slot_id = None`、`is_borrowed_slot = false`，但任务并不需要再申请新槽位。
+    ///
+    /// 等待队列消费点判断 `needs_slot` 时必须额外检查此字段，
+    /// 避免出现"slot_id=None → 申请槽位 → 立即又被打回等待队列"的自循环。
+    #[serde(skip)]
+    pub uses_folder_fixed_slot: bool,
+
     // === 🔥 新增：自动备份相关字段 ===
     /// 是否为自动备份任务
     #[serde(default)]
@@ -107,6 +117,69 @@ pub struct DownloadTask {
     /// 是否为分享直下任务（完成后不自动清除，由转存管理器清理）
     #[serde(default)]
     pub is_share_direct_download: bool,
+
+    /// 🔥 退回等待队列冷却时间（Unix 毫秒时间戳）
+    ///
+    /// auto_requeue_task 设置为 now + REQUEUE_COOLDOWN_SECS。
+    /// 等待队列消费点（try_start_waiting_tasks / monitor / 0 延迟 trigger）
+    /// 在拉起任务前必须检查此字段，未到期任务放回队尾。
+    ///
+    /// 任务被实际拉起（槽位分配成功）后清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<i64>,
+
+    /// 🔥 解密协程版本号（epoch / generation token）
+    ///
+    /// 用于在"暂停 Decrypting → 快速恢复 → 新一轮解密协程启动 → 旧协程跑完"
+    /// 这种 race 中，识别并失效旧协程的执行结果，防止旧协程的破坏性副作用
+    /// （删除加密文件、改写 task.local_path、持久化 update_local_path、
+    ///  以及 handle_task_completion 的 mark_completed/failed 终态写入）
+    /// 污染新一轮恢复后的状态机。
+    ///
+    /// 工作机制：
+    /// - 调度器在 `tokio::spawn` 解密协程的最开始一次 lock 任务，快照当前
+    ///   `decrypt_epoch` 到本地变量 `my_epoch`，并把它一路传到
+    ///   `try_decrypt_if_encrypted` 与 `handle_task_completion`。
+    /// - `cancel_tasks_by_group` 把 `Decrypting` 状态翻成 `Paused` 的同锁段内
+    ///   调 `invalidate_decrypt_epoch()` 递增此字段——这相当于通知
+    ///   "在我之前 spawn 的所有解密协程都过期了"。
+    /// - 解密协程在所有破坏性副作用之前（spawn_blocking 前预检 / spawn_blocking 后
+    ///   硬检查 / 进度回调内 / handle_task_completion 入口原子判定）再次 lock 任务，
+    ///   比对 `task.decrypt_epoch == my_epoch`：不一致即视为过期协程，跳过所有
+    ///   副作用 return。
+    ///
+    /// 仅 `#[serde(skip)]`：纯运行时状态，重启后从 0 开始也安全（重启不会有遗留协程）。
+    #[serde(skip)]
+    pub decrypt_epoch: u64,
+
+    /// 🔥 解密原子提交标志（不可中断的收尾标记）
+    ///
+    /// 用于闭合 R21 注释里诚实标注的剩余时序窗口：rename(attempt → final)
+    /// 成功之后到删除加密文件 / 持久化 update_local_path 之间，如果用户暂停文件夹，
+    /// `cancel_tasks_by_group` 会把 status 翻成 Paused 并 invalidate_decrypt_epoch；
+    /// 后续的破坏性操作（rm 加密文件、持久化）虽然会被本协程内的 stale check
+    /// 在某些位置拦截，但在 rename 之后已经把 final 文件就位的状态下，让任务
+    /// 走"暂停期间任务意外完成了一半（final 已就位但 task 字段未更新）"的不一致
+    /// transient state 不是好的语义。
+    ///
+    /// **协作机制**：
+    /// - `try_decrypt_if_encrypted` 在 rename 成功后的同一锁段内做最后一次 stale check：
+    ///   - stale → 不动 final，return Ok(())
+    ///   - 通过 → 锁内置位 `decrypt_committed = true`，并同步完成 `mark_decrypt_completed`
+    ///     + 改 `task.local_path = decrypted_path`（这些动作原本在锁外的 step 9，
+    ///     现在合并入锁内提交点保证原子性）
+    /// - `cancel_tasks_by_group` 在判定 active 时多看一项：`decrypt_committed=true`
+    ///   时绝不翻 Paused / 不释放槽位 / 不递增 epoch——让本协程无中断地完成
+    ///   后续锁外的删加密文件 + 持久化。这两个锁外动作即使发生 race 也只是
+    ///   warn 不返回 Err，task 字段已经在锁内提交了，最终 handle_task_completion
+    ///   会正常 mark_completed。
+    ///
+    /// 仅 `#[serde(skip)]`：与 `decrypt_epoch` 同理，纯运行时状态。重启后从 false
+    /// 开始也安全（重启不会有遗留协程）。
+    ///
+    /// 一旦置位永不回退（任务即将进入 Completed 终态，回退无意义）。
+    #[serde(skip)]
+    pub decrypt_committed: bool,
 }
 
 impl DownloadTask {
@@ -133,6 +206,7 @@ impl DownloadTask {
             // 任务位借调机制字段初始化
             slot_id: None,
             is_borrowed_slot: false,
+            uses_folder_fixed_slot: false,
             // 自动备份字段初始化
             is_backup: false,
             backup_config_id: None,
@@ -144,6 +218,12 @@ impl DownloadTask {
             original_filename: None,
             // 分享直下字段初始化
             is_share_direct_download: false,
+            // 🔥 退回等待队列冷却字段初始化
+            next_retry_at: None,
+            // 🔥 解密协程版本号字段初始化
+            decrypt_epoch: 0,
+            // 🔥 解密原子提交标志初始化
+            decrypt_committed: false,
         }
     }
 
@@ -211,6 +291,21 @@ impl DownloadTask {
     /// 标记为解密中
     pub fn mark_decrypting(&mut self) {
         self.status = TaskStatus::Decrypting;
+    }
+
+    /// 🔥 失效正在进行的解密协程
+    ///
+    /// 递增 `decrypt_epoch`，让任何已经 spawn 但还未走到检查点的解密协程
+    /// 在比对 `my_epoch` 时识别自己已过期，跳过所有破坏性副作用 return。
+    ///
+    /// 必须在与 `cancel_tasks_by_group` 把 `Decrypting → Paused` 的状态翻转
+    /// 同一把锁内调用，保证旧协程后续任何检查点都不会再看到与自身 epoch 一致
+    /// 的状态。
+    ///
+    /// 用 wrapping_add 避免理论上的 u64 溢出 panic（实际上 `2^64` 次暂停不可能达到，
+    /// 但防御性编码不增加成本）。
+    pub fn invalidate_decrypt_epoch(&mut self) {
+        self.decrypt_epoch = self.decrypt_epoch.wrapping_add(1);
     }
 
     /// 更新解密进度
@@ -412,6 +507,37 @@ mod tests {
         assert_eq!(task.decrypt_progress, 0.0); // 默认 0.0
         assert!(task.decrypted_path.is_none()); // 默认 None
         assert!(task.original_filename.is_none()); // 默认 None
+
+        // 🔥 验证 next_retry_at 字段兼容（旧 JSON 无此字段 → None）
+        assert!(task.next_retry_at.is_none());
+        // 🔥 验证 is_share_direct_download 字段兼容
+        assert!(!task.is_share_direct_download);
+    }
+
+    /// 测试 next_retry_at 的序列化/反序列化
+    #[test]
+    fn test_next_retry_at_roundtrip() {
+        let mut task = DownloadTask::new(
+            1,
+            "/remote".to_string(),
+            PathBuf::from("./local"),
+            1024,
+        );
+
+        // Case 1: None 时不应该序列化出来（skip_serializing_if）
+        let json_none = serde_json::to_string(&task).expect("序列化失败");
+        assert!(
+            !json_none.contains("next_retry_at"),
+            "None 时 next_retry_at 不应被序列化，实际 JSON: {}",
+            json_none
+        );
+
+        // Case 2: 有值时正确往返
+        task.next_retry_at = Some(1234567890123);
+        let json_some = serde_json::to_string(&task).expect("序列化失败");
+        assert!(json_some.contains("next_retry_at"));
+        let restored: DownloadTask = serde_json::from_str(&json_some).expect("反序列化失败");
+        assert_eq!(restored.next_retry_at, Some(1234567890123));
     }
 
     /// 测试新版本 JSON 数据序列化/反序列化

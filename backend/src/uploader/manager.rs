@@ -2477,6 +2477,33 @@ impl UploadManager {
         })
             .await;
 
+        // 🔥 备份任务：补送 BackupTransferNotification::Deleted。
+        //    publish_event 对 is_backup=true 的任务直接跳过，不补发的话
+        //    AutoBackupManager 看不到上传子任务被删除，父备份任务的
+        //    pending_upload_task_ids / transfer_task_map 会残留，状态机可能一直
+        //    卡在 Transferring / WaitingTransfer。与下载侧 delete_task 行为对齐。
+        if is_backup {
+            use crate::autobackup::events::TransferTaskType;
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                let notification = BackupTransferNotification::Deleted {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Upload,
+                };
+                if let Err(e) = tx.send(notification) {
+                    warn!(
+                        "delete_task: 发送备份上传任务 Deleted 通知失败 (task_id={}): {}",
+                        task_id, e
+                    );
+                }
+            } else {
+                warn!(
+                    "delete_task: 备份上传任务 {} 被删除但 backup_notification_tx 未设置",
+                    task_id
+                );
+            }
+        }
+
         // 尝试启动等待队列中的任务
         self.try_start_waiting_tasks().await;
 
@@ -2579,6 +2606,32 @@ impl UploadManager {
             is_backup,
         })
             .await;
+
+        // 🔥 备份任务：补送 BackupTransferNotification::Deleted。
+        //    与 delete_task 路径一致；批量删除经由 batch_delete_tasks 调入此函数，
+        //    若不发通知，AutoBackupManager 看不到批量取消备份时的上传子任务删除事件，
+        //    父备份任务的 pending_upload_task_ids / transfer_task_map 会残留。
+        if is_backup {
+            use crate::autobackup::events::TransferTaskType;
+            let tx_guard = self.backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                let notification = BackupTransferNotification::Deleted {
+                    task_id: task_id.to_string(),
+                    task_type: TransferTaskType::Upload,
+                };
+                if let Err(e) = tx.send(notification) {
+                    warn!(
+                        "delete_task_internal: 发送备份上传任务 Deleted 通知失败 (task_id={}): {}",
+                        task_id, e
+                    );
+                }
+            } else {
+                warn!(
+                    "delete_task_internal: 备份上传任务 {} 被删除但 backup_notification_tx 未设置",
+                    task_id
+                );
+            }
+        }
 
         Ok(())
     }

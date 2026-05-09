@@ -5,8 +5,10 @@ use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGEN
 use crate::auth::UserAuth;
 use crate::common::ProxyConfig;
 use crate::netdisk::{
-    CreateFileResponse, FileListResponse, LocateDownloadResponse, PrecreateResponse,
-    RapidUploadResponse, UploadChunkResponse, UploadErrorKind,
+    CreateFileResponse, FileListResponse, FileManagerResponse, FileManagerTaskQueryResponse,
+    FileOperationErrorPayload, FileOperationItem, FileOperationOutcome, FileOperationSuccess,
+    LocateDownloadResponse, PrecreateResponse, RapidUploadResponse, RenameItem,
+    UploadChunkResponse, UploadErrorKind,
 };
 use crate::sign::LocateSign;
 use anyhow::{Context, Result};
@@ -3871,7 +3873,9 @@ impl NetdiskClient {
                     let widget_summary = api_response.authwidget.as_ref().map(|w| {
                         format!(
                             "saferand={}, safetpl={}, safesign_len={}",
-                            w.saferand, w.safetpl, w.safesign.len()
+                            w.saferand.as_deref().unwrap_or(""),
+                            w.safetpl.as_deref().unwrap_or(""),
+                            w.safesign.as_deref().map(|s| s.len()).unwrap_or(0)
                         )
                     });
                     warn!(
@@ -3895,6 +3899,371 @@ impl NetdiskClient {
             }
         }
     }
+
+    // =====================================================
+    // 文件管理操作（filemanager: copy / move / rename）
+    // =====================================================
+
+    /// 内部辅助：向 `pan.baidu.com/api/filemanager` 发送 POST 请求
+    ///
+    /// 共用 `delete_files` 已建立的请求模式：
+    /// - `bdstoken` 锁内 clone 后立即释放
+    /// - 通过 `collect_all_baidu_cookies()` 拼装 Cookie
+    /// - 独立 `pan_client`（HTTP/2 连接池复用、代理配置）
+    /// - `application/x-www-form-urlencoded` 提交 `filelist`
+    ///
+    /// 返回响应原始 body 文本（已脱敏前的 raw body，由调用方在入日志前再脱敏）。
+    async fn filemanager_post(&self, opera: &str, filelist_json: &str) -> Result<String> {
+        let bdstoken = {
+            let token_guard = self.bdstoken.lock().await;
+            match token_guard.as_ref() {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => return Err(anyhow::anyhow!("bdstoken 尚未获取，无法调用 filemanager")),
+            }
+        };
+
+        let url = format!(
+            "https://pan.baidu.com/api/filemanager?opera={}&async=2&onnest=fail&bdstoken={}&newVerify=1&clienttype=0&app_id={}&web=1",
+            opera,
+            urlencoding::encode(&bdstoken),
+            BAIDU_APP_ID
+        );
+
+        let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+        let pan_client = self.build_temp_client_with_proxy()?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+        headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+        headers.insert(
+            "Referer",
+            HeaderValue::from_static("https://pan.baidu.com/disk/main"),
+        );
+
+        debug!("filemanager POST opera={} filelist_len={}", opera, filelist_json.len());
+
+        let response = pan_client
+            .post(&url)
+            .headers(headers)
+            .form(&[("filelist", filelist_json)])
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context(format!("filemanager {} 请求失败", opera));
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .context(format!("读取 filemanager {} 响应失败", opera))?;
+        let safe_body = redact_authwidget_in_body(&response_text);
+        info!("filemanager {} 响应: status={}, body={}", opera, status, safe_body);
+
+        Ok(response_text)
+    }
+
+    /// 解析 filemanager POST 响应，转换为 `FileOperationOutcome`
+    ///
+    /// 决策点：
+    /// - `errno != 0` → `Failed { errno=Some(resp.errno), task_errno=None, authwidget?, verify_scene? }`
+    /// - `errno == 0 && taskid == 0` → 同步完成，返回 Success（罕见）
+    /// - `errno == 0 && taskid != 0` → 进入 `query_filemanager_task` 轮询
+    async fn handle_filemanager_result(&self, body: &str) -> Result<FileOperationOutcome> {
+        let resp: FileManagerResponse = serde_json::from_str(body)
+            .with_context(|| format!("解析 filemanager 响应失败: body={}", redact_authwidget_in_body(body)))?;
+
+        if resp.errno != 0 {
+            let message = if !resp.errmsg.is_empty() {
+                resp.errmsg.clone()
+            } else {
+                format!("filemanager 失败: errno={}", resp.errno)
+            };
+            return Ok(FileOperationOutcome::Failed {
+                message,
+                payload: FileOperationErrorPayload {
+                    taskid: resp.taskid,
+                    errno: Some(resp.errno),
+                    task_errno: None,
+                    authwidget: resp.authwidget,
+                    verify_scene: resp.verify_scene,
+                    still_running: false,
+                },
+            });
+        }
+
+        if resp.taskid == 0 {
+            // 同步完成（罕见路径）：百度协议下偶尔出现 errno=0 且无 taskid
+            return Ok(FileOperationOutcome::Success(FileOperationSuccess {
+                taskid: 0,
+                total: 0,
+                list: Vec::new(),
+            }));
+        }
+
+        // 进入异步轮询
+        self.query_filemanager_task(resp.taskid).await
+    }
+
+    /// 查询 filemanager 异步任务状态（轮询 `share/taskquery`）
+    ///
+    /// 复用 `query_transfer_task` 的阶梯式退避策略；最多 60 次仍未完成时返回
+    /// `Failed { still_running=true }`。
+    async fn query_filemanager_task(&self, taskid: i64) -> Result<FileOperationOutcome> {
+        use rand::Rng;
+        const MAX_ATTEMPTS: u32 = 60;
+
+        // filemanager 的 taskquery 不需要 bdstoken / shareid / from（与 transfer 任务查询不同），
+        // 文档明确要求仅传 taskid + clienttype + app_id + web，详见
+        // docs/批量复制移动重命名功能开发文档.md §2.5。
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            if attempt > MAX_ATTEMPTS {
+                warn!("filemanager taskquery 轮询达到上限 {} 次仍未完成: taskid={}", MAX_ATTEMPTS, taskid);
+                return Ok(FileOperationOutcome::Failed {
+                    message: "任务仍在后台处理，请稍后刷新查看".to_string(),
+                    payload: FileOperationErrorPayload {
+                        taskid,
+                        errno: None,
+                        task_errno: None,
+                        authwidget: None,
+                        verify_scene: None,
+                        still_running: true,
+                    },
+                });
+            }
+
+            // 阶梯式延迟 + 抖动
+            let delay_ms: u64 = if attempt == 1 {
+                0
+            } else {
+                let (base_ms, jitter_ms) = match attempt {
+                    2..=5 => (1000u64, 200u64),
+                    6..=10 => (2000, 400),
+                    _ => (5000, 1000),
+                };
+                let mut rng = rand::thread_rng();
+                let jitter = rng.gen_range(-(jitter_ms as i64)..=(jitter_ms as i64));
+                ((base_ms as i64 + jitter).max(0)) as u64
+            };
+            if delay_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            let url = format!(
+                "https://pan.baidu.com/share/taskquery?taskid={}&clienttype=0&app_id={}&web=1",
+                taskid, BAIDU_APP_ID
+            );
+
+            let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+            let pan_client = self.build_temp_client_with_proxy()?;
+            let mut headers = HeaderMap::new();
+            headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+            headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+            headers.insert(
+                "Referer",
+                HeaderValue::from_static("https://pan.baidu.com/disk/main"),
+            );
+
+            let response = pan_client.get(&url).headers(headers).send().await;
+            let response = match response {
+                Ok(resp) => {
+                    self.record_proxy_success();
+                    resp
+                }
+                Err(e) => {
+                    let err = anyhow::Error::from(e).context("filemanager taskquery 请求失败");
+                    self.record_proxy_failure(&err);
+                    return Err(err);
+                }
+            };
+            let body = response
+                .text()
+                .await
+                .context("读取 filemanager taskquery 响应失败")?;
+            let safe_body = redact_authwidget_in_body(&body);
+            debug!("filemanager taskquery 响应 (尝试 {}): {}", attempt, safe_body);
+
+            let parsed: FileManagerTaskQueryResponse = serde_json::from_str(&body).with_context(|| {
+                format!("解析 filemanager taskquery 响应失败: body={}", safe_body)
+            })?;
+
+            // body 本身 errno != 0：透传 errno，并同步填 task_errno（与 status=failed 路径保持一致，便于 -6/111 retry 判定）
+            if parsed.errno != 0 {
+                let message = if !parsed.show_msg.is_empty() {
+                    parsed.show_msg.clone()
+                } else if !parsed.errmsg.is_empty() {
+                    parsed.errmsg.clone()
+                } else {
+                    format!("任务查询失败: errno={}", parsed.errno)
+                };
+                return Ok(FileOperationOutcome::Failed {
+                    message,
+                    payload: FileOperationErrorPayload {
+                        taskid,
+                        errno: Some(parsed.errno),
+                        task_errno: Some(parsed.errno),
+                        authwidget: parsed.authwidget,
+                        verify_scene: parsed.verify_scene,
+                        still_running: false,
+                    },
+                });
+            }
+
+            match parsed.status.as_str() {
+                "success" => {
+                    info!("filemanager 任务完成: taskid={} total={}", taskid, parsed.total);
+                    return Ok(FileOperationOutcome::Success(FileOperationSuccess {
+                        taskid,
+                        total: parsed.total,
+                        list: parsed.list,
+                    }));
+                }
+                "failed" => {
+                    let message = if !parsed.show_msg.is_empty() {
+                        parsed.show_msg.clone()
+                    } else if !parsed.errmsg.is_empty() {
+                        parsed.errmsg.clone()
+                    } else {
+                        format!("任务失败: task_errno={}", parsed.task_errno)
+                    };
+                    return Ok(FileOperationOutcome::Failed {
+                        message,
+                        payload: FileOperationErrorPayload {
+                            taskid,
+                            // status=failed 同步写 errno = task_errno，保证 should_retry_after_warmup
+                            // 在判断 -6/111 时不会因为只看 errno 而漏分支。
+                            errno: Some(parsed.task_errno),
+                            task_errno: Some(parsed.task_errno),
+                            authwidget: parsed.authwidget,
+                            verify_scene: parsed.verify_scene,
+                            still_running: false,
+                        },
+                    });
+                }
+                "running" | "pending" | "" => {
+                    // 继续轮询
+                    continue;
+                }
+                other => {
+                    // 未知状态，按容错策略继续轮询
+                    warn!("filemanager taskquery 未知状态: status='{}' (尝试 {})", other, attempt);
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// 批量复制文件（filemanager opera=copy）
+    ///
+    /// 入参 `items` 中每条 item 必须已经经过 handler 层路径归一化与校验（含
+    /// 加密保护、文件名校验、根路径拒绝）。本方法不做这些校验。
+    pub async fn copy_files(&self, items: &[FileOperationItem]) -> Result<FileOperationOutcome> {
+        if items.is_empty() {
+            return Err(anyhow::anyhow!("copy_files: items 不能为空"));
+        }
+        let filelist_json = serde_json::to_string(items).context("序列化 copy filelist 失败")?;
+        let body = self.filemanager_post("copy", &filelist_json).await?;
+        self.handle_filemanager_result(&body).await
+    }
+
+    /// 批量移动文件（filemanager opera=move）
+    pub async fn move_files(&self, items: &[FileOperationItem]) -> Result<FileOperationOutcome> {
+        if items.is_empty() {
+            return Err(anyhow::anyhow!("move_files: items 不能为空"));
+        }
+        let filelist_json = serde_json::to_string(items).context("序列化 move filelist 失败")?;
+        let body = self.filemanager_post("move", &filelist_json).await?;
+        self.handle_filemanager_result(&body).await
+    }
+
+    /// 重命名单个文件（filemanager opera=rename）
+    ///
+    /// 接收 owned `RenameItem`：rename 单条 item，调用方按需 clone 以支持 warmup 重试。
+    pub async fn rename_file(&self, item: RenameItem) -> Result<FileOperationOutcome> {
+        let filelist_json = serde_json::to_string(&[item]).context("序列化 rename filelist 失败")?;
+        let body = self.filemanager_post("rename", &filelist_json).await?;
+        self.handle_filemanager_result(&body).await
+    }
+}
+
+/// 校验文件名合法性（前后端共用规则）
+///
+/// 拒绝条件：
+/// - 空字符串
+/// - UTF-16 code units 长度 > 255（与前端 `String.length` 完全一致）
+/// - `.` / `..`
+/// - 含 `/` `\` `:` `*` `?` `"` `<` `>` `|` 任一字符
+/// - 含 ASCII 控制字符（`\x00`-`\x1F` 或 `\x7F`）
+/// - 首/尾空格
+/// - 尾部 `.`
+/// - Windows 保留名（含大小写、含扩展名、仅 stem 三种形态）：
+///   `CON` / `PRN` / `AUX` / `NUL` / `COM1`-`COM9` / `LPT1`-`LPT9`
+pub fn validate_filename(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    // UTF-16 code units 长度边界（与前端 `String.length` 对齐）
+    if name.encode_utf16().count() > 255 {
+        return Err("名称过长（最长 255 个字符）".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("名称不能为 {}", name));
+    }
+    // 非法字符
+    const ILLEGAL: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+    if let Some(c) = name.chars().find(|c| ILLEGAL.contains(c)) {
+        return Err(format!("名称含非法字符: {}", c));
+    }
+    // ASCII 控制字符
+    if name.chars().any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F) {
+        return Err("名称含控制字符".to_string());
+    }
+    // 首尾空格
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return Err("名称不能以空格开头或结尾".to_string());
+    }
+    // 尾部点
+    if name.ends_with('.') {
+        return Err("名称不能以 . 结尾".to_string());
+    }
+    // Windows 保留名（取 stem 部分对比，大小写不敏感）
+    let stem = name.split('.').next().unwrap_or(name).to_uppercase();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err(format!("名称不能使用系统保留词: {}", stem));
+    }
+    Ok(())
+}
+
+/// 脱敏响应 body 中的 `authwidget.safesign` / `safetpl` / `saferand` 后再入日志
+///
+/// 使用规约：所有可能含 `authwidget` 的接口（filemanager、share/taskquery 等）的
+/// raw body 在进入 `info!` / `debug!` / `anyhow::Context::with_context` 之前必须先经过本函数。
+pub fn redact_authwidget_in_body(body: &str) -> String {
+    if !body.contains("authwidget") {
+        return body.to_string();
+    }
+    // 静态正则缓存，避免日志路径热点上重复编译。本项目当前 rustc 1.80+ 可用 LazyLock。
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#""(safesign|safetpl|saferand)"\s*:\s*"[^"]*""#)
+            .expect("redact regex 静态字面量不会编译失败")
+    });
+    RE.replace_all(body, r#""$1":"<redacted>""#).to_string()
 }
 
 #[cfg(test)]
@@ -4658,5 +5027,212 @@ mod transfer_preservation_tests {
         let result = parse_transfer_response(&response);
         assert!(result.success);
         assert_eq!(result.transferred_paths.len(), 1);
+    }
+
+    // =====================================================
+    // filemanager（copy / move / rename）相关单元测试
+    // =====================================================
+
+    use crate::netdisk::{
+        FileManagerResponse, FileManagerTaskQueryResponse,
+    };
+    use crate::netdisk::client::{redact_authwidget_in_body, validate_filename};
+
+    #[test]
+    fn test_filemanager_response_parse_taskid_number() {
+        let json = r#"{"errno":0,"taskid":290568593300395,"request_id":12345}"#;
+        let r: FileManagerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 0);
+        assert_eq!(r.taskid, 290568593300395);
+        assert_eq!(r.request_id, 12345);
+    }
+
+    #[test]
+    fn test_filemanager_response_parse_taskid_string() {
+        let json = r#"{"errno":0,"taskid":"290568593300395"}"#;
+        let r: FileManagerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.taskid, 290568593300395);
+    }
+
+    #[test]
+    fn test_filemanager_response_parse_errno_132() {
+        let json = r#"{"errno":132,"errmsg":"风控","authwidget":{"saferand":"abc","safesign":"sig","safetpl":"tpl"},"verify_scene":1}"#;
+        let r: FileManagerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 132);
+        let aw = r.authwidget.expect("应解析出 authwidget");
+        assert_eq!(aw.saferand.as_deref(), Some("abc"));
+        assert_eq!(aw.safesign.as_deref(), Some("sig"));
+        assert_eq!(aw.safetpl.as_deref(), Some("tpl"));
+        assert_eq!(r.verify_scene, Some(1));
+    }
+
+    #[test]
+    fn test_taskquery_response_parse_running() {
+        let json = r#"{"status":"running","progress":10}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 0);
+        assert_eq!(r.status, "running");
+    }
+
+    #[test]
+    fn test_taskquery_response_parse_success() {
+        let json = r#"{"status":"success","list":[{"from":"/a/x","to":"/b/x"}],"total":1}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, "success");
+        assert_eq!(r.list.len(), 1);
+        assert_eq!(r.total, 1);
+    }
+
+    #[test]
+    fn test_taskquery_response_parse_failed() {
+        let json = r#"{"status":"failed","task_errno":-6,"show_msg":"会话过期"}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, "failed");
+        assert_eq!(r.task_errno, -6);
+        assert_eq!(r.show_msg, "会话过期");
+    }
+
+    #[test]
+    fn test_taskquery_response_errno_default_zero() {
+        let json = r#"{}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 0);
+        assert_eq!(r.status, "");
+    }
+
+    #[test]
+    fn test_file_operation_item_serialize() {
+        use crate::netdisk::FileOperationItem;
+        let items = vec![FileOperationItem {
+            path: "/a/x.mp4".into(),
+            dest: "/b".into(),
+            newname: "x.mp4".into(),
+        }];
+        let s = serde_json::to_string(&items).unwrap();
+        // 字段集合与值一致即可，不断言对象字段顺序
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"[{"path":"/a/x.mp4","dest":"/b","newname":"x.mp4"}]"#).unwrap();
+        assert_eq!(v, expected);
+        // 不出现 null / 默认字段
+        assert!(!s.contains("null"));
+    }
+
+    #[test]
+    fn test_rename_item_serialize() {
+        use crate::netdisk::RenameItem;
+        let it = RenameItem {
+            path: "/a/x.mp4".into(),
+            newname: "y.mp4".into(),
+            id: 1234567890,
+        };
+        let s = serde_json::to_string(&it).unwrap();
+        // id 必须是 number 而非 string
+        assert!(s.contains(r#""id":1234567890"#));
+        assert!(!s.contains(r#""id":"1234567890""#));
+    }
+
+    #[test]
+    fn test_validate_filename_basic() {
+        assert!(validate_filename("normal.txt").is_ok());
+        assert!(validate_filename("").is_err());
+        assert!(validate_filename(".").is_err());
+        assert!(validate_filename("..").is_err());
+        assert!(validate_filename("a/b").is_err());
+        assert!(validate_filename("a\\b").is_err());
+        assert!(validate_filename("a:b").is_err());
+        assert!(validate_filename("a*b").is_err());
+        assert!(validate_filename("a?b").is_err());
+        assert!(validate_filename("a\"b").is_err());
+        assert!(validate_filename("a<b").is_err());
+        assert!(validate_filename("a>b").is_err());
+        assert!(validate_filename("a|b").is_err());
+        assert!(validate_filename("a\x01b").is_err()); // 控制字符
+        assert!(validate_filename(" leading.txt").is_err());
+        assert!(validate_filename("trailing.txt ").is_err());
+        assert!(validate_filename("trailing.").is_err());
+    }
+
+    #[test]
+    fn test_validate_filename_utf16_boundary() {
+        let s255: String = "a".repeat(255);
+        let s256: String = "a".repeat(256);
+        assert!(validate_filename(&s255).is_ok());
+        assert!(validate_filename(&s256).is_err());
+        // emoji 占 2 个 UTF-16 code units
+        let mut emoji_long = String::new();
+        for _ in 0..127 {
+            emoji_long.push_str("😀"); // 2 cu * 127 = 254 cu
+        }
+        emoji_long.push('a'); // +1 = 255 cu
+        assert_eq!(emoji_long.encode_utf16().count(), 255);
+        assert!(validate_filename(&emoji_long).is_ok());
+        emoji_long.push('b'); // 256 cu
+        assert!(validate_filename(&emoji_long).is_err());
+    }
+
+    #[test]
+    fn test_validate_filename_windows_reserved() {
+        // 大小写、含扩展名、仅 stem 三种形态
+        for name in [
+            "CON", "con", "Con",
+            "PRN", "prn",
+            "AUX.txt", "aux.bak",
+            "NUL.bak", "nul",
+            "COM1", "com2", "COM9", "lpt1", "LPT9",
+        ] {
+            assert!(
+                validate_filename(name).is_err(),
+                "保留名 '{}' 应被拒绝",
+                name
+            );
+        }
+        // 非保留名必须通过
+        for name in ["NULL.txt", "CONSOLE.txt", "COM10", "LPT10", "comma.txt"] {
+            assert!(
+                validate_filename(name).is_ok(),
+                "非保留名 '{}' 应被接受",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_authwidget_in_body_basic() {
+        let body = r#"{"errno":132,"authwidget":{"saferand":"r1","safesign":"sig123","safetpl":"tplA"}}"#;
+        let red = redact_authwidget_in_body(body);
+        assert!(red.contains(r#""saferand":"<redacted>""#));
+        assert!(red.contains(r#""safesign":"<redacted>""#));
+        assert!(red.contains(r#""safetpl":"<redacted>""#));
+        assert!(!red.contains("sig123"));
+    }
+
+    #[test]
+    fn test_redact_authwidget_in_body_no_widget() {
+        let body = r#"{"errno":0,"taskid":1}"#;
+        let red = redact_authwidget_in_body(body);
+        assert_eq!(red, body);
+    }
+
+    #[test]
+    fn test_authwidget_extra_passthrough() {
+        use crate::netdisk::AuthWidget;
+        let json = r#"{"saferand":"r","unknown_future_field":"abc","extra_obj":{"a":1}}"#;
+        let aw: AuthWidget = serde_json::from_str(json).unwrap();
+        assert_eq!(aw.saferand.as_deref(), Some("r"));
+        assert!(aw.safesign.is_none());
+        assert!(aw.extra.contains_key("unknown_future_field"));
+        assert!(aw.extra.contains_key("extra_obj"));
+    }
+
+    #[test]
+    fn test_taskquery_failed_errno_132() {
+        // status=failed + task_errno=132 必须能解析出 authwidget
+        let json = r#"{"status":"failed","task_errno":132,"authwidget":{"safesign":"x"}}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, "failed");
+        assert_eq!(r.task_errno, 132);
+        let aw = r.authwidget.expect("authwidget 必须解析出来");
+        assert_eq!(aw.safesign.as_deref(), Some("x"));
     }
 }

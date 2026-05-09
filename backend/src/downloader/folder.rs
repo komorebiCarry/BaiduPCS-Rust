@@ -91,6 +91,13 @@ pub struct FolderDownload {
     #[serde(skip)]
     pub borrowed_subtask_map: HashMap<String, usize>,
 
+    /// 🔥 正在使用文件夹固定槽位的子任务 ID（运行时字段，重启不保留）
+    ///
+    /// 同一时刻最多只有 1 个子任务占用固定槽位；其他子任务使用借调槽位。
+    /// None = 固定槽位空闲；Some(id) = 被 id 任务占用中
+    #[serde(skip)]
+    pub fixed_slot_subtask: Option<String>,
+
     /// 🔥 加密文件夹映射（加密相对路径 -> 解密后相对路径）
     /// 用于在扫描完成后重命名文件夹并更新路径
     #[serde(default, skip)]
@@ -158,6 +165,7 @@ impl FolderDownload {
             fixed_slot_id: None,
             borrowed_slot_ids: Vec::new(),
             borrowed_subtask_map: HashMap::new(),
+            fixed_slot_subtask: None,
             encrypted_folder_mappings: HashMap::new(),
             counted_task_ids: HashSet::new(),
             conflict_strategy: None,

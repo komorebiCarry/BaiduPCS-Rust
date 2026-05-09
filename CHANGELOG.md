@@ -2,7 +2,30 @@
 
 本文档记录了 BaiduPCS-Rust 的所有版本更新历史。
 
-## v1.13.0 (当前版本)
+## v1.14.0 (当前版本)
+
+**新功能：**
+- ✨ **文件管理：重命名 / 批量复制 / 批量移动**：文件管理页面新增文件、文件夹的重命名以及批量复制 / 批量移动到目标目录
+  - 调用百度 `filemanager` 接口异步模式（`async=2`），后端 `taskquery` 长轮询直到任务终态
+  - 文件名校验：拦截 `\ / : * ? " < > |`、控制字符、Windows 保留名（CON/PRN/...）等非法输入
+  - 适配百度风控：`errno=132` / `authwidget` / `verify_scene` 透传到前端，日志中对 `authwidget.safesign` / `safetpl` / `saferand` 字段脱敏
+- ✨ **HTTP/2 → HTTP/1.1 自适应降级**：连续 3 次零字节失败（含 H2 frame error / 连接断流 / SSL 握手失败等）时，全局下载客户端自动切到 HTTP/1.1 并保持 10 分钟，到期后台任务自动重建为 HTTP/2 客户端，避免 H2 协议故障下整个下载链路长时间不可用
+- ✨ **分片失败重试策略精细化**：分片下载失败按 `Transient`（瞬时抖动）/ `ServerThrottled`（429/503 限流）/ `Fatal`（链接全挂）/ `Cancelled`（用户取消）四类分别处理，分别走 100ms→5s 指数退避、1s→10s 加长退避、`mark_deferred` 等待其他分片完成、短路返回四条路径
+  - `ChunkManager::fail_chunk` 在同一把锁内原子完成 `unmark + retries+=1 + cooldown/deferred` 写入
+  - `Cancelled` 路径不计入零字节降级计数、不计入连续失败计数、不走 cooldown/deferred，确保用户取消不会被误判为协议故障而触发 HTTP/1.1 降级
+- ✨ **任务级 auto_requeue + 退回冷却**：连续 chunk 失败累计达阈值（`CONSECUTIVE_CHUNK_FAILURE_LIMIT=6`）或调度器检测到「真死锁」（活跃分片为 0 且无冷却分片）时，主动将任务退回等待队列，冷却 `REQUEUE_COOLDOWN_SECS=60` 秒后再试，避免任务死等 deferred 解冻
+- ✨ **解密协程 epoch 并发保护**：新增 `decrypt_epoch` 版本号 + `decrypt_committed` 原子提交标志，覆盖「暂停 Decrypting → 快速恢复 → 新一轮解密协程启动 → 旧协程跑完」的 race
+  - 旧协程在每个破坏性副作用之前（spawn_blocking 前 / 后 / 进度回调 / 完成处理入口）比对 epoch，过期即跳过 rename / 删除加密文件 / 改写 `task.local_path` / 持久化 / 终态写入
+  - 闭合 rename 成功 → 持久化之间的最后时序窗口
+- ✨ **退回原因透传到前端**：`DownloadStatusChanged` 事件新增 `error: Option<String>` 字段（`#[serde(skip_serializing_if = "Option::is_none")]`），`auto_requeue_task` 携带退回原因，下载管理页面可直接看到任务为何被退回等待队列
+- ✨ **文件夹固定槽位**：新增 `fixed_slot_subtask` / `uses_folder_fixed_slot`，文件夹子任务可独占父文件夹的固定槽位，避免「`slot_id=None` → 申请槽位 → 立即又被打回等待队列」的自循环
+
+**问题修复：**
+- 🐛 **修复备份任务删除后父任务卡死**：`UploadManager::delete_task` / `delete_task_internal` 路径下，`is_backup=true` 的任务被 `publish_event` 直接跳过，`AutoBackupManager` 看不到上传子任务被删除，父备份任务的 `pending_upload_task_ids` / `transfer_task_map` 残留，状态机一直卡在 `Transferring` / `WaitingTransfer`。现在删除路径主动补发 `BackupTransferNotification::Deleted`，`AutoBackupManager` 复用 `handle_transfer_completed(success=false)` 路径完整清理
+
+---
+
+## v1.13.0
 
 **新功能：**
 - ✨ **双向同步(Sync)模式**：三阶段同步引擎，支持本地与云端双向同步，下载器健壮性同步修复

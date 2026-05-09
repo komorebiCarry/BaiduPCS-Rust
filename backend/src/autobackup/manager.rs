@@ -5039,11 +5039,33 @@ impl AutoBackupManager {
                     }
                     BackupTransferNotification::Deleted { task_id, task_type } => {
                         let is_upload = task_type == TransferTaskType::Upload;
-                        tracing::debug!(
+                        tracing::info!(
                             "备份{}任务删除: task_id={}",
                             if is_upload { "上传" } else { "下载" },
                             task_id
                         );
+                        // 🔥 删除等价于失败完成：必须做与 handle_transfer_completed(success=false) 等价的清理，
+                        // 否则父备份任务里的 pending_upload_task_ids / pending_download_task_ids /
+                        // transfer_task_map 会残留已被外部删除的 transfer_task_id，
+                        // file_task 也不会落到终态。结果是父备份任务可能一直卡在
+                        // Transferring / WaitingTransfer，直到下次恢复流程才被动修正，
+                        // 体现为 UI 上备份进度永远卡住。
+                        //
+                        // 直接复用 handle_transfer_completed(false, ..., None) 是因为它的
+                        // success=false 路径已经覆盖：
+                        //   - 从 pending_*_task_ids 移除 transfer_task_id
+                        //   - 从 transfer_task_map 移除映射
+                        //   - 把对应 file_task 标 Failed、failed_count++
+                        //   - 发送 file_status_changed WebSocket 事件
+                        //   - 检查 all_completed 后落父任务终态（Failed / PartiallyCompleted）
+                        //   - 持久化、发送进度事件
+                        // 这与"该 transfer 被外部删除导致这个文件最终没成功"的语义完全一致。
+                        // 若 transfer_task_id 不在任何 backup task 的 pending 集合里
+                        // （比如已经被处理过、或不属于备份任务），handle_transfer_completed
+                        // 会直接 no-op，不会有副作用。
+                        self_clone
+                            .handle_transfer_completed(&task_id, false, is_upload, None)
+                            .await;
                     }
                     // 🔥 解密相关通知处理
                     BackupTransferNotification::DecryptStarted { task_id, file_name } => {
