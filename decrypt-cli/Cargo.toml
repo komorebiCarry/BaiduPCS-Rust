@@ -21,9 +21,8 @@ serde_json = "1.0"
 # 错误处理
 thiserror = "1.0"
 
-# 加密算法
-aes-gcm = "0.10"
-chacha20poly1305 = "0.10"
+# 加密算法（使用 age 格式，标准 age-encryption.org/v1）
+age = "0.10"
 
 # Base64 编解码
 base64 = "0.21"

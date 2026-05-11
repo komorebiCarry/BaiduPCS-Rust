@@ -117,7 +117,7 @@ pub async fn get_file_list(
             let total = file_list.list.len();
             let has_more = total >= params.page_size as usize;
 
-            // 筛选出加密文件名（UUID.dat 格式）
+            // 筛选出加密文件名（UUID.age 格式）
             let encrypted_names: Vec<String> = file_list
                 .list
                 .iter()
@@ -765,7 +765,7 @@ fn is_root(p: &str) -> bool {
     p == "/" || p.is_empty()
 }
 
-/// 是否为加密文件命名（UUID.dat）或加密文件夹命名（UUID）
+/// 是否为加密文件命名（UUID.age）或加密文件夹命名（UUID）
 fn is_encrypted_leaf(name: &str) -> bool {
     EncryptionService::is_encrypted_filename(name)
         || EncryptionService::is_encrypted_folder_name(name)
@@ -774,7 +774,7 @@ fn is_encrypted_leaf(name: &str) -> bool {
 /// 加密保护：禁止 copy/move 的源路径为加密文件或加密文件夹
 ///
 /// 仅判断 leaf 名称（路径最后一段），避免把加密目录 / 文件作为整体 copy/move
-/// 后破坏「UUID.dat 一一对应原文件名」的元数据约束。
+/// 后破坏「UUID.age 一一对应原文件名」的元数据约束。
 fn ensure_not_encrypted_path(path: &str) -> Result<(), String> {
     let leaf = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
     if is_encrypted_leaf(leaf) {

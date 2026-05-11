@@ -349,7 +349,7 @@ mod tests {
         let config = EncryptionKeyConfig {
             current: EncryptionKeyInfo {
                 master_key: "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 1,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -374,7 +374,7 @@ mod tests {
         let config = EncryptionKeyConfig {
             current: EncryptionKeyInfo {
                 master_key: "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 1,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -401,7 +401,7 @@ mod tests {
         // 创建配置
         store.create_new_key(
             "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         let key = store.get_current_key().unwrap().unwrap();
@@ -416,13 +416,13 @@ mod tests {
         // 创建初始配置
         store.create_new_key(
             "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 轮换密钥
         store.rotate_key(
             "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 查找版本1（历史密钥）
@@ -447,19 +447,19 @@ mod tests {
         // 创建初始配置
         store.create_new_key(
             "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 轮换密钥
         let new_config = store.rotate_key(
             "new_key".to_string(),
-            EncryptionAlgorithm::ChaCha20Poly1305,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 验证新密钥
         assert_eq!(new_config.current.master_key, "new_key");
         assert_eq!(new_config.current.key_version, 2);
-        assert_eq!(new_config.current.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
+        assert_eq!(new_config.current.algorithm, EncryptionAlgorithm::Age);
 
         // 验证历史密钥
         assert_eq!(new_config.history.len(), 1);
@@ -476,7 +476,7 @@ mod tests {
         // 没有现有配置时，应该创建新密钥
         let config = store.create_new_key_safe(
             "new_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         assert_eq!(config.current.master_key, "new_key");
@@ -492,19 +492,19 @@ mod tests {
         // 先创建一个密钥
         store.create_new_key(
             "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 使用 create_new_key_safe 应该保留历史
         let config = store.create_new_key_safe(
             "new_key".to_string(),
-            EncryptionAlgorithm::ChaCha20Poly1305,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 验证新密钥
         assert_eq!(config.current.master_key, "new_key");
         assert_eq!(config.current.key_version, 2);
-        assert_eq!(config.current.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
+        assert_eq!(config.current.algorithm, EncryptionAlgorithm::Age);
 
         // 验证历史密钥被保留
         assert_eq!(config.history.len(), 1);
@@ -532,7 +532,7 @@ mod tests {
         // 创建初始密钥
         store.create_new_key(
             "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 废弃当前密钥
@@ -562,13 +562,13 @@ mod tests {
         // 创建初始密钥
         store.create_new_key(
             "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 轮换密钥（创建历史）
         store.rotate_key(
             "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 废弃当前密钥
@@ -597,7 +597,7 @@ mod tests {
         // 创建初始密钥
         store.create_new_key(
             "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 废弃当前密钥
@@ -617,11 +617,11 @@ mod tests {
         // 创建密钥并轮换
         store.create_new_key(
             "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
         store.rotate_key(
             "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
 
         // 强制删除
@@ -643,14 +643,14 @@ mod tests {
         // 创建密钥（无历史）
         store.create_new_key(
             "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
         assert!(!store.has_history_keys().unwrap());
 
         // 轮换密钥（有历史）
         store.rotate_key(
             "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::Age,
         ).unwrap();
         assert!(store.has_history_keys().unwrap());
     }

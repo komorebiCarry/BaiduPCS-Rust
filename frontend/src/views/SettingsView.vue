@@ -467,36 +467,36 @@
                   <!-- 加密状态卡片 -->
                   <div class="encryption-status-card">
                     <div class="status-header">
-                      <span class="status-label">加密密钥状态</span>
+                      <span class="status-label">加密口令状态</span>
                       <el-tag :type="encryptionStatus?.has_key ? 'success' : 'info'" size="small">
                         {{ encryptionStatus?.has_key ? '已配置' : '未配置' }}
                       </el-tag>
                     </div>
                     <div v-if="encryptionStatus?.has_key" class="status-detail">
-                      算法: {{ encryptionStatus.algorithm }}<br>
+                      格式: age-encryption.org/v1（ChaCha20-Poly1305 + scrypt）
                       创建时间: {{ encryptionStatus.key_created_at ? formatDate(encryptionStatus.key_created_at) : '-' }}
                     </div>
                   </div>
 
                   <!-- 未配置密钥时显示 -->
                   <div v-if="!encryptionStatus?.has_key" class="encryption-form">
-                    <el-form-item label="加密算法">
-                      <el-select v-model="keyAlgorithm" style="width: 100%">
-                        <el-option value="AES-256-GCM" label="AES-256-GCM（推荐）" />
-                        <el-option value="ChaCha20-Poly1305" label="ChaCha20-Poly1305" />
-                      </el-select>
-                    </el-form-item>
+                    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 16px">
+                      <template #title>
+                        加密使用 age 格式 (age-encryption.org/v1)，内部自动用 scrypt 做内存硬化，安全性同 Argon2id。<br>
+                        可直接输入一句**你能记住的口令**，age 会自动加盐并加密到文件中。别忘了备份 encryption.json。
+                      </template>
+                    </el-alert>
                     <el-button type="primary" style="width: 100%" @click="handleGenerateKey">
                       <el-icon><Key /></el-icon>
-                      生成新密钥
+                      生成随机口令
                     </el-button>
                     <el-divider>或</el-divider>
-                    <el-form-item label="导入密钥">
-                      <el-input v-model="encryptionKey" placeholder="粘贴Base64编码的密钥" />
+                    <el-form-item label="设置口令">
+                      <el-input v-model="encryptionKey" type="password" show-password placeholder="输入你记住的口令（任意长度）" />
                     </el-form-item>
                     <el-button style="width: 100%" @click="handleImportKey">
                       <el-icon><Upload /></el-icon>
-                      导入密钥
+                      设置口令
                     </el-button>
                   </div>
 
@@ -504,11 +504,11 @@
                   <div v-else class="encryption-actions">
                     <el-button @click="handleExportKey">
                       <el-icon><CopyDocument /></el-icon>
-                      导出密钥
+                      导出口令
                     </el-button>
                     <el-button type="danger" plain @click="handleDeleteKey">
                       <el-icon><Delete /></el-icon>
-                      删除密钥
+                      删除口令
                     </el-button>
                   </div>
 
@@ -539,7 +539,7 @@
                         </el-button>
                         <template #dropdown>
                           <el-dropdown-menu>
-                            <el-dropdown-item command="keys">导出密钥配置 (encryption.json)</el-dropdown-item>
+                            <el-dropdown-item command="keys">导出口令配置 (encryption.json)</el-dropdown-item>
                             <el-dropdown-item command="mapping">导出映射数据 (mapping.json)</el-dropdown-item>
                           </el-dropdown-menu>
                         </template>
@@ -553,12 +553,13 @@
 
                   <el-alert type="warning" :closable="false" show-icon style="margin-top: 16px">
                     <template #title>
-                      <strong>重要提示：</strong>请妥善保管加密密钥。如果密钥丢失，将无法解密已加密的文件！
+                      <strong>重要提示：</strong>请妥善保管口令。如果口令丢失，将无法解密已加密的文件！
                     </template>
                   </el-alert>
 
                   <div class="form-tip" style="margin-top: 12px">
-                    加密密钥用于自动备份和上传时的客户端侧加密。配置密钥后，可在创建备份任务或上传文件时选择是否启用加密。
+                    口令用于自动备份和上传时的客户端侧加密。配置口令后，可在创建备份任务或上传文件时选择是否启用加密。
+                    解密时只需同一句口令，age 格式标准通用（<code>age -d file.age</code>）。
                   </div>
                 </el-card>
 
@@ -916,7 +917,7 @@
     />
 
     <!-- 密钥显示对话框 -->
-    <el-dialog v-model="showKeyDialog" title="加密密钥" width="450px" :close-on-click-modal="false">
+    <el-dialog v-model="showKeyDialog" title="加密口令" width="450px" :close-on-click-modal="false">
       <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 16px">
         <template #title>请立即备份此密钥到安全的地方！</template>
       </el-alert>
@@ -1057,7 +1058,6 @@ let proxyStatusTimer: ReturnType<typeof setInterval> | null = null
 // 加密相关状态
 const encryptionStatus = ref<EncryptionStatus | null>(null)
 const encryptionKey = ref('')
-const keyAlgorithm = ref('AES-256-GCM')
 const showKeyDialog = ref(false)
 const showKey = ref(false)
 
@@ -1471,32 +1471,32 @@ function handleDownloadScheduledTimeChange(time: Date | null) {
   }
 }
 
-// 生成密钥
+// 生成随机口令
 async function handleGenerateKey() {
   try {
-    const key = await generateEncryptionKey(keyAlgorithm.value)
+    const key = await generateEncryptionKey()
     encryptionKey.value = key
     showKeyDialog.value = true
     await loadEncryptionStatus()
-    ElMessage.success('密钥生成成功，请妥善保管')
+    ElMessage.success('随机口令生成成功，请妥善保管')
   } catch (error: any) {
-    ElMessage.error('生成密钥失败: ' + (error.message || '未知错误'))
+    ElMessage.error('生成口令失败: ' + (error.message || '未知错误'))
   }
 }
 
-// 导入密钥
+// 设置口令
 async function handleImportKey() {
   if (!encryptionKey.value) {
-    ElMessage.warning('请输入密钥')
+    ElMessage.warning('请输入口令')
     return
   }
   try {
-    await importEncryptionKey(encryptionKey.value, keyAlgorithm.value)
+    await importEncryptionKey(encryptionKey.value)
     encryptionKey.value = ''
     await loadEncryptionStatus()
-    ElMessage.success('密钥导入成功')
+    ElMessage.success('口令设置成功（age scrypt 自动加盐硬化）')
   } catch (error: any) {
-    ElMessage.error('导入密钥失败: ' + (error.message || '未知错误'))
+    ElMessage.error('口令设置失败: ' + (error.message || '未知错误'))
   }
 }
 

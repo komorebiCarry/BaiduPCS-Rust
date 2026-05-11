@@ -29,6 +29,9 @@ sha2 = "0.10"
 md5 = "0.7"
 hex = "0.4"
 base64 = "0.21"
+# age 加密格式 (age-encryption.org/v1)，替代自定义加密
+age = "0.10"
+# 保留 AES-GCM 和 ChaCha20-Poly1305 供内部使用（如会话加密等场景）
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 rand = "0.8"

@@ -346,40 +346,31 @@ pub async fn get_encryption_status(
     Ok(Json(ApiResponse::success(EncryptionStatusResponse {
         enabled: status.enabled,
         has_key: status.has_key,
-        algorithm: format!("{:?}", status.algorithm),
+        algorithm: "age".to_string(),
         key_created_at: status.key_created_at.map(|t| t.to_rfc3339()),
     })))
 }
 
-/// 生成加密密钥
+/// 生成随机口令（生成后自动配置为加密口令）
 pub async fn generate_encryption_key(
     State(state): State<AppState>,
-    Json(request): Json<GenerateKeyRequest>,
 ) -> ApiResult<Json<ApiResponse<GenerateKeyResponse>>> {
     let manager = get_manager(&state).await?;
-    let algorithm = match request.algorithm.as_deref() {
-        Some("ChaCha20-Poly1305") => EncryptionAlgorithm::ChaCha20Poly1305,
-        _ => EncryptionAlgorithm::Aes256Gcm,
-    };
 
-    match manager.generate_encryption_key(algorithm) {
+    match manager.generate_encryption_key(EncryptionAlgorithm::Age) {
         Ok(key) => Ok(Json(ApiResponse::success(GenerateKeyResponse { key }))),
         Err(e) => Err(internal_error(&e.to_string())),
     }
 }
 
-/// 导入加密密钥
+/// 设置加密口令（age scrypt 自动做内存硬化）
 pub async fn import_encryption_key(
     State(state): State<AppState>,
     Json(request): Json<ImportKeyRequest>,
 ) -> ApiResult<Json<ApiResponse<()>>> {
     let manager = get_manager(&state).await?;
-    let algorithm = match request.algorithm.as_deref() {
-        Some("ChaCha20-Poly1305") => EncryptionAlgorithm::ChaCha20Poly1305,
-        _ => EncryptionAlgorithm::Aes256Gcm,
-    };
 
-    match manager.configure_encryption(&request.key, algorithm) {
+    match manager.configure_encryption(&request.key, EncryptionAlgorithm::Age) {
         Ok(()) => Ok(Json(ApiResponse::success(()))),
         Err(e) => Err(bad_request_error(&e.to_string())),
     }
@@ -540,7 +531,6 @@ pub struct GenerateKeyResponse {
 #[derive(Debug, Deserialize)]
 pub struct ImportKeyRequest {
     pub key: String,
-    pub algorithm: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

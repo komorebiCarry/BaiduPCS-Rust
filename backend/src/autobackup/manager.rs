@@ -3900,12 +3900,10 @@ impl AutoBackupManager {
 
     /// 删除加密密钥
     ///
-    /// 将当前密钥移到历史，保留历史密钥用于解密旧文件。
-    /// 如果需要完全删除所有密钥（包括历史），使用 `force_delete_encryption_key`。
+    /// 删除加密密钥（全部清除，包括历史）
     ///
-    /// # Requirements
-    /// - 17.1: 删除密钥时保留历史密钥
-    /// - 17.2: 只移除当前密钥，不删除历史
+    /// age 格式每个加密文件自带 scrypt 盐值和 Nonce，不需要历史密钥版本。
+    /// 删除即全部清除。如有旧格式历史密钥，也会一并删除。
     pub fn delete_encryption_key(&self) -> Result<()> {
         let mut encryption_service = self.encryption_service.write();
         *encryption_service = None;
@@ -3916,10 +3914,10 @@ impl AutoBackupManager {
         encryption_config.key_created_at = None;
         encryption_config.key_version = 0;
 
-        // 废弃当前密钥而不是删除整个配置（保留历史密钥）
-        self.encryption_config_store.deprecate_current_key()?;
+        // age 格式无需历史密钥，直接全部清除
+        self.encryption_config_store.force_delete()?;
 
-        tracing::info!("Encryption key deprecated, history preserved for decryption");
+        tracing::info!("Encryption key deleted (age format - no history needed)");
         Ok(())
     }
 
@@ -3970,7 +3968,7 @@ impl AutoBackupManager {
             None => EncryptionStatus {
                 enabled: false,
                 has_key: false,
-                algorithm: super::config::EncryptionAlgorithm::Aes256Gcm,
+                algorithm: super::config::EncryptionAlgorithm::Age,
                 key_created_at: None,
             },
         }
@@ -7201,10 +7199,8 @@ impl AutoBackupManager {
 
         // 阶段 3：创建快照记录
         let encryption_config = self.encryption_config.read();
-        let algorithm_str = match encryption_config.algorithm {
-            EncryptionAlgorithm::Aes256Gcm => "aes256gcm",
-            EncryptionAlgorithm::ChaCha20Poly1305 => "chacha20poly1305",
-        };
+        // age 固定使用 ChaCha20-Poly1305，这里存个标识供解密参考
+        let algorithm_str = "age";
         let key_version = encryption_config.key_version;
         drop(encryption_config);
 
@@ -7489,7 +7485,7 @@ impl AutoBackupManager {
                 // 没有快照信息（可能是跨设备场景）
                 // 仍然可以解密，但无法恢复原始文件名
                 let temp_download_path = self.temp_dir.join(remote_file_name);
-                // 使用 UUID 作为解密后的文件名（去掉 .dat 扩展名）
+                // 使用 UUID 作为解密后的文件名（去掉 .age 扩展名）
                 let decrypted_name = remote_file_name
                     .strip_suffix(crate::encryption::ENCRYPTED_FILE_EXTENSION)
                     .unwrap_or(remote_file_name);

@@ -384,20 +384,20 @@ export async function getEncryptionStatus(): Promise<EncryptionStatus> {
   throw new Error(response.data.error || '获取加密状态失败')
 }
 
-/** 生成加密密钥 */
-export async function generateEncryptionKey(algorithm?: string): Promise<string> {
-  const response = await rawApiClient.post<ApiResponse<{ key: string }>>('/encryption/key/generate', { algorithm })
+/** 生成加密密钥（随机口令） */
+export async function generateEncryptionKey(): Promise<string> {
+  const response = await rawApiClient.post<ApiResponse<{ key: string }>>('/encryption/key/generate')
   if (response.data.success && response.data.data) {
     return response.data.data.key
   }
   throw new Error(response.data.error || '生成密钥失败')
 }
 
-/** 导入加密密钥 */
-export async function importEncryptionKey(key: string, algorithm?: string): Promise<void> {
-  const response = await rawApiClient.post<ApiResponse<void>>('/encryption/key/import', { key, algorithm })
+/** 设置加密口令（age scrypt 自动处理内存硬化） */
+export async function importEncryptionKey(passphrase: string): Promise<void> {
+  const response = await rawApiClient.post<ApiResponse<void>>('/encryption/key/import', { key: passphrase })
   if (!response.data.success) {
-    throw new Error(response.data.error || '导入密钥失败')
+    throw new Error(response.data.error || '口令设置失败')
   }
 }
 

@@ -23,7 +23,7 @@ use crate::encryption::config_store::{EncryptionConfigStore, EncryptionKeyConfig
 pub struct MappingRecord {
     /// 备份配置 ID
     pub config_id: String,
-    /// 加密后的文件名（UUID.dat 格式）
+    /// 加密后的文件名（UUID.age 格式）
     pub encrypted_name: String,
     /// 原始文件相对路径
     pub original_path: String,
@@ -258,7 +258,7 @@ mod tests {
             config_id: "test-config".to_string(),
             original_path: "/documents".to_string(),
             original_name: "test.txt".to_string(),
-            encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat".to_string(),
+            encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
             file_size: 1024,
             nonce: "dGVzdG5vbmNl".to_string(),
             algorithm: "aes256gcm".to_string(),
@@ -277,7 +277,7 @@ mod tests {
         let record = &mapping.records[0];
         assert_eq!(record.config_id, "test-config");
         assert_eq!(record.original_name, "test.txt");
-        assert_eq!(record.encrypted_name, "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat");
+        assert_eq!(record.encrypted_name, "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age");
         assert_eq!(record.key_version, 1);
         assert!(!record.is_directory);
     }
@@ -286,7 +286,7 @@ mod tests {
     fn test_mapping_record_serialization() {
         let record = MappingRecord {
             config_id: "config-1".to_string(),
-            encrypted_name: "uuid.dat".to_string(),
+            encrypted_name: "uuid.age".to_string(),
             original_path: "/path".to_string(),
             original_name: "file.txt".to_string(),
             is_directory: false,

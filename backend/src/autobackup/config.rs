@@ -335,24 +335,13 @@ impl EncryptionConfig {
     }
 }
 
-/// 加密算法
+/// 加密算法（固定使用 age 格式）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "SCREAMING-KEBAB-CASE")]
 pub enum EncryptionAlgorithm {
-    /// AES-256-GCM（默认，推荐）
+    /// age 加密格式 (age-encryption.org/v1)
     #[default]
-    Aes256Gcm,
-    /// ChaCha20-Poly1305（备选）
-    ChaCha20Poly1305,
-}
-
-impl std::fmt::Display for EncryptionAlgorithm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncryptionAlgorithm::Aes256Gcm => write!(f, "aes-256-gcm"),
-            EncryptionAlgorithm::ChaCha20Poly1305 => write!(f, "chacha20-poly1305"),
-        }
-    }
+    #[serde(rename = "age", alias = "AES256-GCM", alias = "CHA-CHA20-POLY1305")]
+    Age,
 }
 
 /// 准备阶段资源池配置

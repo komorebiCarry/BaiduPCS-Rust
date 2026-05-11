@@ -27,23 +27,6 @@ pub enum EncryptionAlgorithm {
 }
 
 impl EncryptionAlgorithm {
-    /// 从算法标识字节创建
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::Aes256Gcm),
-            1 => Some(Self::ChaCha20Poly1305),
-            _ => None,
-        }
-    }
-
-    /// 转换为算法标识字节
-    #[allow(dead_code)]
-    pub fn to_byte(self) -> u8 {
-        match self {
-            Self::Aes256Gcm => 0,
-            Self::ChaCha20Poly1305 => 1,
-        }
-    }
 }
 
 impl fmt::Display for EncryptionAlgorithm {
@@ -152,47 +135,6 @@ pub struct MappingExport {
     pub exported_at: i64,
     /// 映射记录列表
     pub records: Vec<MappingRecord>,
-}
-
-// ============================================================================
-// 文件头结构
-// ============================================================================
-
-/// 加密文件魔数
-pub const FILE_MAGIC: [u8; 6] = [0xA3, 0x7F, 0x2C, 0x91, 0xE4, 0x5B];
-
-/// 文件头大小（字节）
-/// magic[6] + algo[1] + master_nonce[12] + original_size[8] + total_chunks[4] = 31
-pub const FILE_HEADER_SIZE: usize = 31;
-
-/// 加密文件头
-///
-/// 文件头格式：
-/// - magic[6]: 魔数 `[0xA3, 0x7F, 0x2C, 0x91, 0xE4, 0x5B]`
-/// - algo[1]: 算法标识（0 = AES-256-GCM, 1 = ChaCha20-Poly1305）
-/// - master_nonce[12]: 主 Nonce
-/// - original_size[8]: 原始文件大小（小端序）
-/// - total_chunks[4]: 分块数量（小端序）
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct FileHeader {
-    /// 魔数（6 字节）
-    pub magic: [u8; 6],
-    /// 算法标识
-    pub algorithm: EncryptionAlgorithm,
-    /// 主 Nonce（12 字节）
-    pub master_nonce: [u8; 12],
-    /// 原始文件大小
-    pub original_size: u64,
-    /// 分块数量
-    pub total_chunks: u32,
-}
-
-impl FileHeader {
-    /// 验证魔数是否正确
-    pub fn validate_magic(&self) -> bool {
-        self.magic == FILE_MAGIC
-    }
 }
 
 // ============================================================================
@@ -437,26 +379,6 @@ impl DecryptSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_encryption_algorithm_from_byte() {
-        assert_eq!(
-            EncryptionAlgorithm::from_byte(0),
-            Some(EncryptionAlgorithm::Aes256Gcm)
-        );
-        assert_eq!(
-            EncryptionAlgorithm::from_byte(1),
-            Some(EncryptionAlgorithm::ChaCha20Poly1305)
-        );
-        assert_eq!(EncryptionAlgorithm::from_byte(2), None);
-        assert_eq!(EncryptionAlgorithm::from_byte(255), None);
-    }
-
-    #[test]
-    fn test_encryption_algorithm_to_byte() {
-        assert_eq!(EncryptionAlgorithm::Aes256Gcm.to_byte(), 0);
-        assert_eq!(EncryptionAlgorithm::ChaCha20Poly1305.to_byte(), 1);
-    }
 
     #[test]
     fn test_encryption_algorithm_display() {

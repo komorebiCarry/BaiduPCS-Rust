@@ -548,11 +548,11 @@ mod tests {
 
     #[test]
     fn test_detect_encrypted_filename() {
-        // 有效的加密文件名：UUID.dat
-        assert!(DownloadTask::detect_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"));
+        // 有效的加密文件名：UUID.age
+        assert!(DownloadTask::detect_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.age"));
         // 无效的文件名
         assert!(!DownloadTask::detect_encrypted_filename("normal_file.txt"));
-        assert!(!DownloadTask::detect_encrypted_filename("not-a-uuid.dat"));
+        assert!(!DownloadTask::detect_encrypted_filename("not-a-uuid.age"));
     }
 
     /// 测试旧版本 JSON 数据反序列化兼容性

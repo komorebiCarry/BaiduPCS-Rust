@@ -657,13 +657,13 @@ impl UploadManager {
                     }
                     Err(e) => {
                         warn!("加载加密密钥失败，密钥可能已损坏: {}，将生成新密钥", e);
-                        let master_key = EncryptionService::generate_master_key();
+                        let key_str = EncryptionService::generate_master_key_base64();
                         let service =
-                            EncryptionService::new(master_key, EncryptionAlgorithm::Aes256Gcm);
+                            EncryptionService::from_string(&key_str);
                         // 使用安全方法保存新生成的密钥（保留历史密钥）
                         match encryption_config_store.create_new_key_safe(
                             service.get_key_base64(),
-                            EncryptionAlgorithm::Aes256Gcm,
+                            EncryptionAlgorithm::Age,
                         ) {
                             Ok(config) => (service, config.current.key_version),
                             Err(e) => {
@@ -676,11 +676,11 @@ impl UploadManager {
             }
             Ok(None) => {
                 info!("未找到已保存的加密密钥，生成新密钥");
-                let master_key = EncryptionService::generate_master_key();
-                let service = EncryptionService::new(master_key, EncryptionAlgorithm::Aes256Gcm);
+                let key_str = EncryptionService::generate_master_key_base64();
+                let service = EncryptionService::from_string(&key_str);
                 // 使用安全方法保存新生成的密钥（保留历史密钥）
                 match encryption_config_store
-                    .create_new_key_safe(service.get_key_base64(), EncryptionAlgorithm::Aes256Gcm)
+                    .create_new_key_safe(service.get_key_base64(), EncryptionAlgorithm::Age)
                 {
                     Ok(config) => (service, config.current.key_version),
                     Err(e) => {
@@ -691,11 +691,11 @@ impl UploadManager {
             }
             Err(e) => {
                 warn!("读取加密配置失败: {}，将生成新密钥", e);
-                let master_key = EncryptionService::generate_master_key();
-                let service = EncryptionService::new(master_key, EncryptionAlgorithm::Aes256Gcm);
+                let key_str = EncryptionService::generate_master_key_base64();
+                let service = EncryptionService::from_string(&key_str);
                 // 使用安全方法保存新生成的密钥（保留历史密钥）
                 match encryption_config_store
-                    .create_new_key_safe(service.get_key_base64(), EncryptionAlgorithm::Aes256Gcm)
+                    .create_new_key_safe(service.get_key_base64(), EncryptionAlgorithm::Age)
                 {
                     Ok(config) => (service, config.current.key_version),
                     Err(e) => {
@@ -825,13 +825,14 @@ impl UploadManager {
                 // 🔥 传递加密元数据，用于上传完成后保存到 encryption_snapshots 表
                 {
                     let mut t = task.lock().await;
+                    // age 格式不暴露内部 nonce/algorithm，使用占位值
                     t.mark_encrypt_completed(
                         encrypted_path.clone(),
                         encrypted_size,
                         encrypted_filename.clone(),
-                        metadata.nonce.clone(),
-                        metadata.algorithm.to_string(),
-                        metadata.version,
+                        "age_encrypted".to_string(),             // nonce: age 内部处理
+                        "chacha20-poly1305".to_string(),         // algorithm: 固定为 age 使用的算法
+                        1,                                       // version: age-encryption.org/v1
                     );
 
                     // 🔥 注意：remote_path 已经在 create_task/create_backup_task 时设置好了

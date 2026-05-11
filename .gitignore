@@ -45,3 +45,11 @@ logs/
 ._*
 Thumbs.db
 desktop.ini
+.Directory
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+# decrypt-cli 构建输出
+/decrypt-cli/target/
