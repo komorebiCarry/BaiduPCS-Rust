@@ -155,7 +155,7 @@ mod tests {
     fn create_test_key(version: u32, master_key: &str) -> EncryptionKeyInfo {
         EncryptionKeyInfo {
             master_key: master_key.to_string(),
-            algorithm: EncryptionAlgorithm::Aes256Gcm,
+            algorithm: EncryptionAlgorithm::Age,
             key_version: version,
             created_at: 1702454400000,
             last_used_at: None,
@@ -247,7 +247,7 @@ mod tests {
         let config = EncryptionConfig {
             current: EncryptionKeyInfo {
                 master_key: "".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 0,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -266,7 +266,7 @@ mod tests {
         let config = EncryptionConfig {
             current: EncryptionKeyInfo {
                 master_key: "c29tZWtleQ==".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 0,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -297,7 +297,7 @@ mod tests {
         let config = EncryptionConfig {
             current: EncryptionKeyInfo {
                 master_key: "".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 0,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -321,7 +321,7 @@ mod tests {
         let config = EncryptionConfig {
             current: EncryptionKeyInfo {
                 master_key: "".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 0,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -356,7 +356,7 @@ mod tests {
         let config = EncryptionConfig {
             current: EncryptionKeyInfo {
                 master_key: "".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 0,
                 created_at: 1702454400000,
                 last_used_at: None,
@@ -399,7 +399,7 @@ mod tests {
                 create_test_key(1, "dmFsaWQx"),
                 EncryptionKeyInfo {
                     master_key: "".to_string(), // 无效
-                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    algorithm: EncryptionAlgorithm::Age,
                     key_version: 3,
                     created_at: 1702454400000,
                     last_used_at: None,
@@ -407,7 +407,7 @@ mod tests {
                 },
                 EncryptionKeyInfo {
                     master_key: "c29tZWtleQ==".to_string(),
-                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    algorithm: EncryptionAlgorithm::Age,
                     key_version: 0, // 无效版本
                     created_at: 1702454400000,
                     last_used_at: None,
@@ -445,12 +445,8 @@ mod proptests {
         1u32..=100
     }
 
-    /// 生成加密算法
     fn arb_algorithm() -> impl Strategy<Value = EncryptionAlgorithm> {
-        prop_oneof![
-            Just(EncryptionAlgorithm::Aes256Gcm),
-            Just(EncryptionAlgorithm::ChaCha20Poly1305),
-        ]
+        Just(EncryptionAlgorithm::Age)
     }
 
     /// 生成有效的密钥信息
@@ -575,7 +571,7 @@ mod proptests {
             let config = EncryptionConfig {
                 current: EncryptionKeyInfo {
                     master_key: "".to_string(),
-                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    algorithm: EncryptionAlgorithm::Age,
                     key_version: 0,
                     created_at: 1702454400000,
                     last_used_at: None,
@@ -710,7 +706,7 @@ mod proptests {
             let config = EncryptionConfig {
                 current: EncryptionKeyInfo {
                     master_key: current_master_key.clone(),
-                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    algorithm: EncryptionAlgorithm::Age,
                     key_version: version,
                     created_at: 1702454400000,
                     last_used_at: None,
@@ -718,7 +714,7 @@ mod proptests {
                 },
                 history: vec![EncryptionKeyInfo {
                     master_key: history_master_key.clone(),
-                    algorithm: EncryptionAlgorithm::Aes256Gcm,
+                    algorithm: EncryptionAlgorithm::Age,
                     key_version: version, // 相同版本号
                     created_at: 1700000000000,
                     last_used_at: None,

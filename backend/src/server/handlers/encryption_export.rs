@@ -197,7 +197,7 @@ mod tests {
     fn test_key_info_serialization() {
         let key_info = KeyInfo {
             master_key: "base64key".to_string(),
-            algorithm: "aes256gcm".to_string(),
+            algorithm: "age".to_string(),
             key_version: 1,
             created_at: 1702454400000,
             last_used_at: Some(1702454500000),
@@ -206,6 +206,6 @@ mod tests {
 
         let json = serde_json::to_string(&key_info).unwrap();
         assert!(json.contains("base64key"));
-        assert!(json.contains("aes256gcm"));
+        assert!(json.contains("age"));
     }
 }

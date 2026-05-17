@@ -1,13 +1,12 @@
 /**
  * 文件工具模块
  * 参考文档 6.5.6 节
+ *
+ * 加密文件使用 age 格式，文件名为 {uuid}.age。
  */
 
-/** 加密文件名前缀 */
-export const ENCRYPTED_FILE_PREFIX = 'BPR_BKUP_'
-
-/** 加密文件扩展名 */
-export const ENCRYPTED_FILE_EXTENSION = '.bkup'
+/** 加密文件扩展名（age 格式） */
+export const ENCRYPTED_FILE_EXTENSION = '.age'
 
 /** 文件展示信息 */
 export interface FileDisplayInfo {
@@ -26,11 +25,10 @@ export interface FileDisplayInfo {
 }
 
 /**
- * 判断文件名是否为加密文件
- * 检查文件名是否以 BPR_BKUP_ 开头且以 .bkup 结尾
+ * 判断文件名是否为加密文件（{uuid}.age）
  */
 export function isEncryptedFile(filename: string): boolean {
-  return filename.startsWith(ENCRYPTED_FILE_PREFIX) && filename.endsWith(ENCRYPTED_FILE_EXTENSION)
+  return filename.endsWith(ENCRYPTED_FILE_EXTENSION)
 }
 
 /**
@@ -41,10 +39,8 @@ export function extractUuidFromEncryptedName(filename: string): string | null {
   if (!isEncryptedFile(filename)) {
     return null
   }
-  // BPR_BKUP_<uuid>.bkup -> 提取 uuid 部分
-  const withoutPrefix = filename.substring(ENCRYPTED_FILE_PREFIX.length)
-  const withoutSuffix = withoutPrefix.substring(0, withoutPrefix.length - ENCRYPTED_FILE_EXTENSION.length)
-  return withoutSuffix
+  // {uuid}.age -> 提取 uuid 部分
+  return filename.substring(0, filename.length - ENCRYPTED_FILE_EXTENSION.length)
 }
 
 /**
@@ -112,8 +108,8 @@ export function getFileIcon(filename: string): string {
     css: 'Tickets',
     json: 'Tickets',
     xml: 'Tickets',
-    // 加密文件
-    bkup: 'Lock',
+    // 加密文件（age 格式）
+    age: 'Lock',
   }
 
   return iconMap[ext] || 'Document'
@@ -167,7 +163,7 @@ export function getFileIconColor(filename: string): string {
     rs: '#DEA584',
     go: '#00ADD8',
     // 加密文件 - 红色
-    bkup: '#F56C6C',
+    age: '#F56C6C',
   }
 
   return colorMap[ext] || '#909399'

@@ -825,13 +825,12 @@ impl UploadManager {
                 // 🔥 传递加密元数据，用于上传完成后保存到 encryption_snapshots 表
                 {
                     let mut t = task.lock().await;
-                    // age 格式不暴露内部 nonce/algorithm，使用占位值
                     t.mark_encrypt_completed(
                         encrypted_path.clone(),
                         encrypted_size,
                         encrypted_filename.clone(),
-                        "age_encrypted".to_string(),             // nonce: age 内部处理
-                        "chacha20-poly1305".to_string(),         // algorithm: 固定为 age 使用的算法
+                        "age_internal".to_string(),              // nonce: age 内部处理，无需外部存储
+                        "age".to_string(),                       // algorithm: age-encryption.org/v1
                         1,                                       // version: age-encryption.org/v1
                     );
 

@@ -255,7 +255,7 @@ async fn update_encryption_mapping(
         if let (Some(_enc_name), Some(enc_nonce), Some(enc_algo)) = (encrypted_name, nonce, algorithm) {
             if let Some(ref snapshot_manager) = task_info.snapshot_manager {
                 // 从 remote_path 提取实际的加密文件名（网盘上的真实文件名）
-                // remote_path 格式如: /13/上传/BPR_BKUP_xxx.bkup
+                // remote_path 格式如: /13/上传/<uuid>.age
                 let actual_encrypted_name = std::path::Path::new(&remote_path)
                     .file_name()
                     .and_then(|n| n.to_str())

@@ -11,29 +11,19 @@ use thiserror::Error;
 // 加密算法枚举
 // ============================================================================
 
-/// 支持的加密算法
-///
-/// 与后端 `EncryptionAlgorithm` 保持一致
+/// 支持的加密算法（仅 age 格式）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "SCREAMING-KEBAB-CASE")]
 pub enum EncryptionAlgorithm {
-    /// AES-256-GCM（默认，推荐）
-    /// 算法标识：0
+    /// age 加密格式 (age-encryption.org/v1)
     #[default]
-    Aes256Gcm,
-    /// ChaCha20-Poly1305（备选）
-    /// 算法标识：1
-    ChaCha20Poly1305,
-}
-
-impl EncryptionAlgorithm {
+    #[serde(rename = "age")]
+    Age,
 }
 
 impl fmt::Display for EncryptionAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EncryptionAlgorithm::Aes256Gcm => write!(f, "aes-256-gcm"),
-            EncryptionAlgorithm::ChaCha20Poly1305 => write!(f, "chacha20-poly1305"),
+            EncryptionAlgorithm::Age => write!(f, "age"),
         }
     }
 }

@@ -340,7 +340,7 @@ impl EncryptionConfig {
 pub enum EncryptionAlgorithm {
     /// age 加密格式 (age-encryption.org/v1)
     #[default]
-    #[serde(rename = "age", alias = "AES256-GCM", alias = "CHA-CHA20-POLY1305")]
+    #[serde(rename = "age")]
     Age,
 }
 

@@ -254,10 +254,10 @@ mod tests {
             "config_1",
             "/path/to/file",
             "test.txt",
-            "BPR_BKUP_uuid-1234.bkup",
+            "uuid-1234.age",
             1024,
             "base64_nonce",
-            "aes256gcm",
+            "age",
             1,
             1,  // key_version
             "/remote/path",
@@ -271,7 +271,7 @@ mod tests {
         let record_manager = create_test_record_manager();
         let snapshot_manager = SnapshotManager::new(record_manager);
 
-        let encrypted_name = "BPR_BKUP_test-uuid.bkup";
+        let encrypted_name = "test-uuid.age";
 
         // 创建快照
         snapshot_manager.create_snapshot(
@@ -281,7 +281,7 @@ mod tests {
             encrypted_name,
             2048,
             "nonce_base64",
-            "aes256gcm",
+            "age",
             1,
             1,  // key_version
             "/remote/backup",
@@ -310,10 +310,10 @@ mod tests {
             "config_2",
             "/documents",
             "report.pdf",
-            "BPR_BKUP_report-uuid.bkup",
+            "report-uuid.age",
             4096,
             "nonce_123",
-            "chacha20poly1305",
+            "age",
             2,
             1,  // key_version
             "/backup/documents",
@@ -324,8 +324,8 @@ mod tests {
         assert!(found.is_some());
 
         let snapshot = found.unwrap();
-        assert_eq!(snapshot.encrypted_name, "BPR_BKUP_report-uuid.bkup");
-        assert_eq!(snapshot.algorithm, "chacha20poly1305");
+        assert_eq!(snapshot.encrypted_name, "report-uuid.age");
+        assert_eq!(snapshot.algorithm, "age");
         assert_eq!(snapshot.version, 2);
     }
 
@@ -334,7 +334,7 @@ mod tests {
         let record_manager = create_test_record_manager();
         let snapshot_manager = SnapshotManager::new(record_manager);
 
-        let encrypted_name = "BPR_BKUP_status-test.bkup";
+        let encrypted_name = "status-test.age";
 
         // 创建快照
         snapshot_manager.create_snapshot(
@@ -344,7 +344,7 @@ mod tests {
             encrypted_name,
             512,
             "nonce",
-            "aes256gcm",
+            "age",
             1,
             1,  // key_version
             "/remote",
@@ -375,7 +375,7 @@ mod tests {
         let record_manager = create_test_record_manager();
         let snapshot_manager = SnapshotManager::new(record_manager);
 
-        let encrypted_name = "BPR_BKUP_fail-test.bkup";
+        let encrypted_name = "fail-test.age";
 
         snapshot_manager.create_snapshot(
             "config_4",
@@ -384,7 +384,7 @@ mod tests {
             encrypted_name,
             256,
             "nonce",
-            "aes256gcm",
+            "age",
             1,
             1,  // key_version
             "/remote",
@@ -402,7 +402,7 @@ mod tests {
         let snapshot_manager = SnapshotManager::new(record_manager);
 
         // 查找不存在的快照
-        let result = snapshot_manager.find_by_encrypted_name("nonexistent.bkup").unwrap();
+        let result = snapshot_manager.find_by_encrypted_name("nonexistent.age").unwrap();
         assert!(result.is_none());
 
         let result = snapshot_manager.find_by_original("config", "/path").unwrap();
@@ -430,7 +430,7 @@ mod tests {
         let record_manager = create_test_record_manager();
         let snapshot_manager = SnapshotManager::new(record_manager);
 
-        let encrypted_name = "BPR_BKUP_display-test.bkup";
+        let encrypted_name = "display-test.age";
 
         snapshot_manager.create_snapshot(
             "config_5",
@@ -439,7 +439,7 @@ mod tests {
             encrypted_name,
             8192,
             "nonce",
-            "aes256gcm",
+            "age",
             1,
             1,  // key_version
             "/backup/work",
@@ -474,10 +474,10 @@ mod tests {
             config_id: "config".to_string(),
             original_path: "/path".to_string(),
             original_name: "file.txt".to_string(),
-            encrypted_name: "encrypted.bkup".to_string(),
+            encrypted_name: "encrypted.age".to_string(),
             file_size: 1024,
             nonce: "nonce".to_string(),
-            algorithm: "aes256gcm".to_string(),
+            algorithm: "age".to_string(),
             version: 1,
             key_version: 1,
             remote_path: "/remote".to_string(),

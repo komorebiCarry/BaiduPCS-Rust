@@ -131,7 +131,7 @@ pub struct UploadTask {
     pub original_size: u64,
 
     // === 🔥 加密映射元数据（用于保存到 encryption_snapshots 表）===
-    /// 加密后的文件名（如 BPR_BKUP_uuid.bkup）
+    /// 加密后的文件名（如 {uuid}.age）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_name: Option<String>,
 
@@ -139,7 +139,7 @@ pub struct UploadTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_nonce: Option<String>,
 
-    /// 加密算法（aes-256-gcm 或 chacha20-poly1305）
+    /// 加密算法（固定为 "age"，即 age-encryption.org/v1）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_algorithm: Option<String>,
 
@@ -314,7 +314,7 @@ impl UploadTask {
     /// # 参数
     /// * `encrypted_path` - 加密后的临时文件路径
     /// * `encrypted_size` - 加密后的文件大小
-    /// * `encrypted_name` - 加密后的文件名（如 BPR_BKUP_uuid.bkup）
+    /// * `encrypted_name` - 加密后的文件名（如 "uuid.age"）
     /// * `nonce` - 加密随机数（Base64 编码）
     /// * `algorithm` - 加密算法名称
     /// * `version` - 加密格式版本号
@@ -553,11 +553,11 @@ mod tests {
         task.encrypt_enabled = true;
         task.mark_encrypting();
         task.mark_encrypt_completed(
-            PathBuf::from("./test/file.bkup"),
+            PathBuf::from("./test/file.age"),
             1100,
             "BPR_BKUP_test-uuid.bkup".to_string(),
-            "base64_nonce_value".to_string(),
-            "aes-256-gcm".to_string(),
+            "age_internal".to_string(),
+            "age".to_string(),
             1,
         );
 
@@ -567,9 +567,9 @@ mod tests {
         // 🔥 验证加密完成后状态自动转换为 Uploading
         assert_eq!(task.status, UploadTaskStatus::Uploading);
         // 🔥 验证加密元数据已保存
-        assert_eq!(task.encrypted_name, Some("BPR_BKUP_test-uuid.bkup".to_string()));
-        assert_eq!(task.encryption_nonce, Some("base64_nonce_value".to_string()));
-        assert_eq!(task.encryption_algorithm, Some("aes-256-gcm".to_string()));
+        assert_eq!(task.encrypted_name, Some("test-uuid.age".to_string()));
+        assert_eq!(task.encryption_nonce, Some("age_internal".to_string()));
+        assert_eq!(task.encryption_algorithm, Some("age".to_string()));
         assert_eq!(task.encryption_version, 1);
     }
 

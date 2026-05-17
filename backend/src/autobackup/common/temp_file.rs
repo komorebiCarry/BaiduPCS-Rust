@@ -149,8 +149,9 @@ impl TempFileManager {
     }
 
     /// 创建新的加密临时文件（带守卫）
+    /// 临时文件后缀用于标识加密过程中的中间文件，便于清理
     pub fn create_encrypted_temp_file(&self) -> TempFileGuard {
-        self.create_temp_file(".bkup.tmp")
+        self.create_temp_file(".age.tmp")
     }
 
     /// 清理所有残留的临时文件

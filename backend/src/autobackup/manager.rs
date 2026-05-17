@@ -7199,7 +7199,7 @@ impl AutoBackupManager {
 
         // 阶段 3：创建快照记录
         let encryption_config = self.encryption_config.read();
-        // age 固定使用 ChaCha20-Poly1305，这里存个标识供解密参考
+        // 标记加密算法为 age 格式（age-encryption.org/v1），供解密参考
         let algorithm_str = "age";
         let key_version = encryption_config.key_version;
         drop(encryption_config);
@@ -7766,7 +7766,7 @@ impl AutoBackupManager {
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                             // 只清理备份相关的临时文件
-                            if name.ends_with(".bkup.tmp") || name.starts_with("backup_") {
+                            if name.ends_with(".age.tmp") || name.starts_with("backup_") {
                                 match std::fs::remove_file(&path) {
                                     Ok(_) => result.cleaned_temp_files += 1,
                                     Err(e) => {

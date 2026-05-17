@@ -1591,7 +1591,7 @@ mod tests {
         let event = BackupEvent::FileDecryptProgress {
             task_id: "backup-789".to_string(),
             file_task_id: "file-abc".to_string(),
-            file_name: "encrypted.bkup".to_string(),
+            file_name: "encrypted.age".to_string(),
             progress: 75.0,
             processed_bytes: 768000,
             total_bytes: 1024000,
@@ -1612,7 +1612,7 @@ mod tests {
         assert!(json.contains("file_decrypt_progress"));
         assert!(json.contains("backup-789"));
         assert!(json.contains("file-abc"));
-        assert!(json.contains("encrypted.bkup"));
+        assert!(json.contains("encrypted.age"));
         assert!(json.contains("768000"));
 
         // 测试反序列化
@@ -1639,7 +1639,7 @@ mod tests {
         let decrypt_progress = TaskEvent::Backup(BackupEvent::FileDecryptProgress {
             task_id: "1".to_string(),
             file_task_id: "f1".to_string(),
-            file_name: "test.bkup".to_string(),
+            file_name: "test.age".to_string(),
             progress: 75.0,
             processed_bytes: 0,
             total_bytes: 0,

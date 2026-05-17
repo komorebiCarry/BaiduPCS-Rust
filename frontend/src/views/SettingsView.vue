@@ -473,7 +473,7 @@
                       </el-tag>
                     </div>
                     <div v-if="encryptionStatus?.has_key" class="status-detail">
-                      格式: age-encryption.org/v1（ChaCha20-Poly1305 + scrypt）
+                      格式: age-encryption.org/v1
                       创建时间: {{ encryptionStatus.key_created_at ? formatDate(encryptionStatus.key_created_at) : '-' }}
                     </div>
                   </div>

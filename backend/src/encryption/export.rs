@@ -39,7 +39,7 @@ pub struct MappingRecord {
     pub file_size: u64,
     /// 加密随机数（Base64 编码）
     pub nonce: String,
-    /// 加密算法（aes256gcm 或 chacha20poly1305）
+    /// 加密算法（固定为 "age"，即 age-encryption.org/v1）
     pub algorithm: String,
     /// 网盘路径（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,7 +261,7 @@ mod tests {
             encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
             file_size: 1024,
             nonce: "dGVzdG5vbmNl".to_string(),
-            algorithm: "aes256gcm".to_string(),
+            algorithm: "age".to_string(),
             version: 1,
             key_version: 1,
             remote_path: "/backup/documents".to_string(),
@@ -294,7 +294,7 @@ mod tests {
             key_version: 1,
             file_size: 1024,
             nonce: "base64nonce".to_string(),
-            algorithm: "aes256gcm".to_string(),
+            algorithm: "age".to_string(),
             remote_path: Some("/remote/path".to_string()),
             status: Some("completed".to_string()),
         };
