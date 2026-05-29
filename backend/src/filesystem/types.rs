@@ -172,6 +172,26 @@ fn default_page_size() -> usize {
     100
 }
 
+/// 目录权限信息
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionInfo {
+    /// 目录所属用户名
+    #[serde(rename = "dirOwner")]
+    pub dir_owner: String,
+    /// 目录所属用户组名
+    #[serde(rename = "dirGroup")]
+    pub dir_group: String,
+    /// 程序运行用户名
+    #[serde(rename = "processUser")]
+    pub process_user: String,
+    /// 程序运行用户组名
+    #[serde(rename = "processGroup")]
+    pub process_group: String,
+    /// 程序是否对目录有写权限
+    #[serde(rename = "canWrite")]
+    pub can_write: bool,
+}
+
 /// 列目录响应（支持分页）
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
@@ -193,6 +213,9 @@ pub struct ListResponse {
     /// 是否还有更多
     #[serde(rename = "hasMore")]
     pub has_more: bool,
+    /// 目录权限信息
+    #[serde(rename = "permissionInfo", skip_serializing_if = "Option::is_none")]
+    pub permission_info: Option<PermissionInfo>,
 }
 
 /// 根目录列表响应

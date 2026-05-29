@@ -203,6 +203,7 @@ dependencies = [
  "hex",
  "image 0.24.9",
  "jsonwebtoken",
+ "libc",
  "md5",
  "notify",
  "parking_lot",

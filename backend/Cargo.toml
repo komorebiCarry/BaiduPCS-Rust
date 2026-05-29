@@ -91,6 +91,10 @@ zip = "0.6"
 # Windows 路径规范化
 dunce = "1.0"
 
+# Unix 系统调用（获取 uid/gid）
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # 测试工具
 tempfile = "3.8"
