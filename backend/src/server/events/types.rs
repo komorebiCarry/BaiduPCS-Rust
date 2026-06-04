@@ -927,6 +927,9 @@ pub enum TaskEvent {
     /// 扫描事件
     #[serde(rename = "scan")]
     Scan(ScanEvent),
+    /// 分享同步事件
+    #[serde(rename = "share_sync")]
+    ShareSync(crate::share_sync::events::ShareSyncEvent),
 }
 
 impl TaskEvent {
@@ -944,6 +947,7 @@ impl TaskEvent {
                 "cloud_dl"
             }
             TaskEvent::Scan(e) => e.task_id(),
+            TaskEvent::ShareSync(e) => e.subscription_id(),
         }
     }
 
@@ -965,6 +969,7 @@ impl TaskEvent {
             TaskEvent::Backup(e) => e.priority(),
             TaskEvent::CloudDl(e) => e.priority(),
             TaskEvent::Scan(e) => e.priority(),
+            TaskEvent::ShareSync(_) => EventPriority::Medium,
         }
     }
 
@@ -978,6 +983,7 @@ impl TaskEvent {
             TaskEvent::Backup(_) => "backup",
             TaskEvent::CloudDl(_) => "cloud_dl",
             TaskEvent::Scan(_) => "scan",
+            TaskEvent::ShareSync(_) => "share_sync",
         }
     }
 
@@ -991,6 +997,7 @@ impl TaskEvent {
             TaskEvent::Backup(e) => e.event_type_name(),
             TaskEvent::CloudDl(e) => e.event_type_name(),
             TaskEvent::Scan(e) => e.event_type_name(),
+            TaskEvent::ShareSync(e) => e.event_type_name(),
         }
     }
 
@@ -1029,6 +1036,8 @@ impl TaskEvent {
             }
             TaskEvent::Scan(ScanEvent::Started { .. }) => true,
             TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected { .. }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled { .. }) => true,
             _ => false,
         }
     }
@@ -1046,6 +1055,7 @@ impl TaskEvent {
             TaskEvent::Transfer(_) => false,
             TaskEvent::CloudDl(_) => false,
             TaskEvent::Scan(_) => false,
+            TaskEvent::ShareSync(_) => false,
         }
     }
 }

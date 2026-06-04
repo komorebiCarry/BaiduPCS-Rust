@@ -10,6 +10,7 @@ use crate::common::{MemoryMonitor, MemoryMonitorConfig};
 use crate::config::AppConfig;
 use crate::downloader::{DownloadManager, FolderDownloadManager};
 use crate::netdisk::{CloudDlMonitor, NetdiskClient};
+use crate::share_sync::ShareSyncManager;
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, scan_recoverable_tasks, DownloadRecoveryInfo,
     PersistenceManager, TransferRecoveryInfo, UploadRecoveryInfo,
@@ -60,6 +61,8 @@ pub struct AppState {
     pub fallback_mgr: Arc<ProxyFallbackManager>,
     /// 🔥 扫描管理器（用户登录后创建）
     pub scan_manager: Arc<RwLock<Option<Arc<ScanManager>>>>,
+    /// 🔥 分享同步管理器
+    pub share_sync_manager: Arc<RwLock<Option<Arc<crate::share_sync::ShareSyncManager>>>>,
 }
 
 impl AppState {
@@ -122,6 +125,7 @@ impl AppState {
             cloud_dl_monitor: Arc::new(RwLock::new(None)),
             fallback_mgr,
             scan_manager: Arc::new(RwLock::new(None)),
+            share_sync_manager: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -398,6 +402,9 @@ impl AppState {
         // 🔥 初始化自动备份管理器
         self.init_autobackup_manager().await;
 
+        // 🔥 初始化分享同步管理器
+        self.init_share_sync_manager().await;
+
         Ok(())
     }
 
@@ -588,6 +595,65 @@ impl AppState {
         }
     }
 
+    /// 🔥 初始化分享同步管理器
+    pub async fn init_share_sync_manager(&self) {
+        use crate::share_sync::events::{ShareSyncEvent, ShareSyncEventPublisher};
+        use crate::share_sync::manager::ManagerConfig;
+        use crate::server::events::TaskEvent;
+        use std::sync::Arc;
+
+        let config = self.config.read().await;
+
+        // 派生文件路径：<db_path 的父目录>/share_sync/
+        let db_path_buf = std::path::PathBuf::from(&config.persistence.db_path);
+        let parent = db_path_buf.parent().unwrap_or(std::path::Path::new("."));
+        let share_sync_dir = parent.join("share_sync");
+        let config_path = share_sync_dir.join("subscriptions.json");
+        let db_path = share_sync_dir.join("share_sync.db");
+        if let Some(p) = config_path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        drop(config);
+
+        // 把 WS Manager 包装为 ShareSyncEventPublisher
+        struct WsPublisher {
+            ws: Arc<crate::server::websocket::manager::WebSocketManager>,
+        }
+        impl ShareSyncEventPublisher for WsPublisher {
+            fn publish(&self, event: ShareSyncEvent) {
+                self.ws
+                    .send_if_subscribed(TaskEvent::ShareSync(event), None);
+            }
+        }
+
+        let publisher: Arc<dyn ShareSyncEventPublisher> = Arc::new(WsPublisher {
+            ws: Arc::clone(&self.ws_manager),
+        });
+
+        let netdisk_client = Arc::clone(&self.netdisk_client);
+        let transfer_manager = Arc::clone(&self.transfer_manager);
+        let download_manager = Arc::clone(&self.download_manager);
+
+        let cfg = ManagerConfig {
+            config_path,
+            db_path,
+            netdisk_client,
+            transfer_manager,
+            download_manager,
+            publisher: Some(publisher),
+        };
+
+        match ShareSyncManager::new(cfg).await {
+            Ok(manager) => {
+                info!("分享同步管理器初始化完成");
+                *self.share_sync_manager.write().await = Some(manager);
+            }
+            Err(e) => {
+                error!("分享同步管理器初始化失败: {}", e);
+            }
+        }
+    }
+
     /// 🔥 初始化离线下载监听服务
     pub async fn init_cloud_dl_monitor(&self) {
         // 获取网盘客户端
@@ -731,6 +797,12 @@ impl AppState {
         // 停止内存监控器
         self.memory_monitor.stop();
         info!("内存监控器已停止");
+
+        // 停止分享同步管理器（取消所有 scheduler）
+        if let Some(mgr) = self.share_sync_manager.read().await.as_ref() {
+            mgr.shutdown().await;
+            info!("分享同步管理器已停止");
+        }
 
         // 关闭持久化管理器
         let mut pm = self.persistence_manager.lock().await;

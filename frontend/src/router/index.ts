@@ -62,6 +62,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '自动备份' }
       },
       {
+        path: '/share-sync',
+        name: 'ShareSync',
+        component: () => import('@/views/ShareSyncView.vue'),
+        meta: { title: '分享同步' }
+      },
+      {
         path: '/cloud-dl',
         name: 'CloudDl',
         component: () => import('@/views/CloudDlView.vue'),

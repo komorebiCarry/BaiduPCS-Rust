@@ -349,6 +349,10 @@ pub async fn qrcode_status(
                         state.init_autobackup_manager().await;
                         info!("✅ 自动备份管理器初始化完成");
 
+                        // 🔥 初始化分享同步管理器
+                        state.init_share_sync_manager().await;
+                        info!("✅ 分享同步管理器初始化完成");
+
                         // 🔥 初始化离线下载监听服务
                         state.init_cloud_dl_monitor().await;
                         info!("✅ 离线下载监听服务初始化完成");

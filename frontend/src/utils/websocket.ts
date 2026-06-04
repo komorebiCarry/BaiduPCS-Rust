@@ -258,6 +258,11 @@ class WebSocketClient {
       case 'cloud_dl':
         this.cloudDlListeners.forEach((cb) => cb(event.event as CloudDlEvent))
         break
+      case 'share_sync':
+        document.dispatchEvent(
+          new CustomEvent('baidu-netdisk:share-sync', { detail: event.event })
+        )
+        break
       default:
         console.warn('[WS] 未知事件类别:', category)
     }
@@ -371,6 +376,15 @@ class WebSocketClient {
   public onBackupEvent(callback: BackupEventCallback): () => void {
     this.backupListeners.add(callback)
     return () => this.backupListeners.delete(callback)
+  }
+
+  /**
+   * 订阅分享同步事件
+   */
+  public onShareSyncEvent(callback: (event: any) => void): () => void {
+    const handler = (ev: any) => callback(ev)
+    document.addEventListener('baidu-netdisk:share-sync', handler as EventListener)
+    return () => document.removeEventListener('baidu-netdisk:share-sync', handler as EventListener)
   }
 
   /**
