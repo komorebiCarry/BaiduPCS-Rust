@@ -73,6 +73,9 @@ pub struct TransferTask {
     pub auto_download: bool,
     /// 本地下载路径（auto_download=true 时使用）
     pub local_download_path: Option<String>,
+    /// 自动下载时使用的本地文件冲突策略；None 时使用全局下载默认策略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     /// 任务状态
     pub status: TransferStatus,
     /// 错误信息
@@ -151,6 +154,7 @@ impl TransferTask {
             save_fs_id,
             auto_download,
             local_download_path,
+            download_conflict_strategy: None,
             status: TransferStatus::Queued,
             error: None,
             download_task_ids: Vec::new(),

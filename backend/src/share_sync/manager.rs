@@ -24,6 +24,7 @@ use crate::share_sync::executor::{ApplyOutcome, ExecutorHooks, ShareSyncExecutor
 use crate::share_sync::persistence::ShareSyncPersistence;
 use crate::share_sync::scheduler::SubscriptionScheduler;
 use crate::share_sync::snapshot::{CapturedShare, ShareSnapshotItem, SnapshotCollector};
+use crate::share_sync::types::{ConflictStrategy, RunStatus};
 use crate::transfer::{TransferManager, TransferStatus};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -281,14 +282,12 @@ impl ShareSyncManager {
             }
         };
 
-        // 2) 绑定 subscription_id 后，先读"上次快照"再保存当前快照，
-        //    否则 latest_snapshot 会把刚保存的 curr 当成 prev，导致 diff 永远为空。
+        // 2) 绑定 subscription_id 后，先读"上次成功应用的快照"再计算 diff。
+        //    当前快照必须等执行成功后才能推进基线；否则下载/转存失败会把
+        //    未落地的新版本标记成已同步，后续轮询 diff 变空而不再重试。
         let mut curr_snapshot = curr_snapshot;
         curr_snapshot.subscription_id = id.into();
         let prev = self.persistence.latest_snapshot(id).ok().flatten();
-        if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
-            warn!("save_snapshot 失败: {}", e);
-        }
 
         // 3) diff
         let diff = diff_snapshots(prev.as_ref(), &curr_snapshot);
@@ -309,6 +308,17 @@ impl ShareSyncManager {
         };
         let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
         let outcome = executor.apply_with_run_id(run_id.clone(), &captured, &diff).await;
+
+        if should_advance_snapshot_baseline(outcome.status) {
+            if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
+                warn!("save_snapshot 失败，下一次同步会重试本次 diff: {}", e);
+            }
+        } else {
+            warn!(
+                "share-sync: run 未完全成功，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}",
+                outcome.run_id, outcome.status, outcome.diff_summary.failed
+            );
+        }
 
         // 5) 广播
         match outcome.status {
@@ -428,6 +438,10 @@ impl ShareSyncManager {
     }
 }
 
+fn should_advance_snapshot_baseline(status: RunStatus) -> bool {
+    matches!(status, RunStatus::Completed)
+}
+
 // =====================================================
 // 生产环境 ExecutorHooks
 // =====================================================
@@ -457,6 +471,7 @@ impl ExecutorHooks for ProductionHooks {
             auto_download: Some(false),
             local_download_path: None,
             is_share_direct_download: false,
+            download_conflict_strategy: None,
             selected_fs_ids: Some(vec![fs_id]),
             selected_files: None,
         };
@@ -484,6 +499,7 @@ impl ExecutorHooks for ProductionHooks {
         &self,
         item: &ShareSnapshotItem,
         local_dir: &Path,
+        strategy: ConflictStrategy,
     ) -> Result<String, ShareSyncError> {
         let relative_path = safe_relative_download_path(&item.path)?;
         let local_parent = match Path::new(&relative_path).parent() {
@@ -507,6 +523,7 @@ impl ExecutorHooks for ProductionHooks {
             auto_download: Some(true),
             local_download_path: Some(local_parent.to_string_lossy().to_string()),
             is_share_direct_download: true,
+            download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
             selected_fs_ids: Some(vec![item.fs_id]),
             selected_files: Some(vec![SharedFileInfo {
                 fs_id: item.fs_id,
@@ -552,6 +569,12 @@ impl ExecutorHooks for ProductionHooks {
             match task.status {
                 TransferStatus::Completed => return Ok(()),
                 TransferStatus::Transferred if !require_download_completion => return Ok(()),
+                TransferStatus::Transferred => {
+                    return Err(ShareSyncError::DownloadError(format!(
+                        "转存已完成但自动下载未完成或未创建: task_id={}",
+                        task_id
+                    )))
+                }
                 TransferStatus::TransferFailed => {
                     return Err(ShareSyncError::TransferError(
                         task.error.unwrap_or_else(|| "转存失败".into()),
@@ -624,6 +647,20 @@ fn share_url_for_captured(captured: &CapturedShare) -> String {
     match captured.password.as_deref().filter(|p| !p.is_empty()) {
         Some(pwd) => format!("https://pan.baidu.com/s/{}?pwd={}", captured.short_key, pwd),
         None => format!("https://pan.baidu.com/s/{}", captured.short_key),
+    }
+}
+
+fn download_conflict_strategy_for_share_sync(
+    strategy: ConflictStrategy,
+) -> crate::uploader::conflict::DownloadConflictStrategy {
+    match strategy {
+        ConflictStrategy::Overwrite => {
+            crate::uploader::conflict::DownloadConflictStrategy::Overwrite
+        }
+        ConflictStrategy::Versioned => {
+            crate::uploader::conflict::DownloadConflictStrategy::Overwrite
+        }
+        ConflictStrategy::Skip => crate::uploader::conflict::DownloadConflictStrategy::Skip,
     }
 }
 
@@ -772,6 +809,32 @@ mod tests {
         assert!(!m.get_subscription(&s.id).unwrap().enabled);
         m.set_enabled(&s.id, true).unwrap();
         assert!(m.get_subscription(&s.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn test_snapshot_baseline_only_advances_after_clean_success() {
+        assert!(should_advance_snapshot_baseline(RunStatus::Completed));
+        assert!(!should_advance_snapshot_baseline(RunStatus::CompletedWithErrors));
+        assert!(!should_advance_snapshot_baseline(RunStatus::Failed));
+        assert!(!should_advance_snapshot_baseline(RunStatus::Running));
+    }
+
+    #[test]
+    fn test_share_sync_download_conflict_strategy_mapping() {
+        use crate::uploader::conflict::DownloadConflictStrategy;
+
+        assert_eq!(
+            download_conflict_strategy_for_share_sync(ConflictStrategy::Overwrite),
+            DownloadConflictStrategy::Overwrite
+        );
+        assert_eq!(
+            download_conflict_strategy_for_share_sync(ConflictStrategy::Versioned),
+            DownloadConflictStrategy::Overwrite
+        );
+        assert_eq!(
+            download_conflict_strategy_for_share_sync(ConflictStrategy::Skip),
+            DownloadConflictStrategy::Skip
+        );
     }
 
     #[tokio::test]

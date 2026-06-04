@@ -9,4 +9,7 @@ pub mod types;
 pub use cookie_login::CookieLoginAuth;
 pub use qrcode::QRCodeAuth;
 pub use session::SessionManager;
-pub use types::{CookieLoginApiRequest, LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
+pub use types::{
+    AccountSummary, CookieLoginApiRequest, LoginRequest, LoginResponse, QRCode, QRCodeStatus,
+    UserAuth,
+};

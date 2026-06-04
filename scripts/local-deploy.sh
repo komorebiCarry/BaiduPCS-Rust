@@ -36,6 +36,7 @@ BACKEND_PID_FILE="$PID_DIR/backend.pid"
 FRONTEND_PID_FILE="$PID_DIR/frontend.pid"
 BACKEND_PGID_FILE="$PID_DIR/backend.pgid"
 FRONTEND_PGID_FILE="$PID_DIR/frontend.pgid"
+FRONTEND_PORT_FILE="$PID_DIR/frontend.port"
 
 BACKEND_BIN_NAME="baidu-netdisk-rust"
 BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
@@ -118,6 +119,33 @@ is_running() {
     local pid
     pid=$(cat "$pid_file" 2>/dev/null || echo "")
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+detect_frontend_port() {
+    local port="$FRONTEND_PORT"
+
+    if [ -f "$FRONTEND_PORT_FILE" ]; then
+        local saved
+        saved=$(cat "$FRONTEND_PORT_FILE" 2>/dev/null || echo "")
+        case "$saved" in
+            ''|*[!0-9]*) ;;
+            *) echo "$saved"; return ;;
+        esac
+    fi
+
+    if [ -f "$FRONTEND_PID_FILE" ]; then
+        local pid detected
+        pid=$(cat "$FRONTEND_PID_FILE" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+            detected=$(tr '\0' '\n' < "/proc/$pid/cmdline" | awk 'prev=="--port"{print; exit} {prev=$0}')
+            case "$detected" in
+                ''|*[!0-9]*) ;;
+                *) port="$detected" ;;
+            esac
+        fi
+    fi
+
+    echo "$port"
 }
 
 # 释放占用某端口的所有进程（兜底）
@@ -299,7 +327,10 @@ start_backend() {
 
 start_frontend() {
     if is_running "$FRONTEND_PID_FILE"; then
-        warn "前端已在运行 (PID $(cat "$FRONTEND_PID_FILE"))，跳过启动"
+        local running_port
+        running_port=$(detect_frontend_port)
+        echo "$running_port" > "$FRONTEND_PORT_FILE"
+        warn "前端已在运行 (PID $(cat "$FRONTEND_PID_FILE"), 端口 $running_port)，跳过启动"
         return
     fi
 
@@ -321,6 +352,7 @@ start_frontend() {
     local pgid
     pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || echo "$pid")
     echo "$pgid" > "$FRONTEND_PGID_FILE"
+    echo "$FRONTEND_PORT" > "$FRONTEND_PORT_FILE"
 
     sleep 2
     if is_running "$FRONTEND_PID_FILE"; then
@@ -339,7 +371,9 @@ show_status() {
         warn "后端未运行"
     fi
     if is_running "$FRONTEND_PID_FILE"; then
-        ok "前端运行中 (PID $(cat "$FRONTEND_PID_FILE"))  http://localhost:${FRONTEND_PORT}"
+        local frontend_port
+        frontend_port=$(detect_frontend_port)
+        ok "前端运行中 (PID $(cat "$FRONTEND_PID_FILE"))  http://localhost:${frontend_port}"
     else
         warn "前端未运行"
     fi
@@ -559,7 +593,10 @@ do_start() {
 
 do_stop() {
     read_backend_port
-    stop_service "前端" "$FRONTEND_PID_FILE" "$FRONTEND_PGID_FILE" "$FRONTEND_PORT"
+    local frontend_port
+    frontend_port=$(detect_frontend_port)
+    stop_service "前端" "$FRONTEND_PID_FILE" "$FRONTEND_PGID_FILE" "$frontend_port"
+    rm -f "$FRONTEND_PORT_FILE"
     stop_service "后端" "$BACKEND_PID_FILE"  "$BACKEND_PGID_FILE"  "$BACKEND_PORT"
 }
 

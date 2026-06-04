@@ -55,6 +55,8 @@ pub struct CreateTransferRequest {
     pub save_fs_id: u64,
     pub auto_download: Option<bool>,
     pub local_download_path: Option<String>,
+    /// 自动下载时使用的本地文件冲突策略；None 时使用全局下载默认策略
+    pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     /// 是否为分享直下任务
     /// 分享直下任务会自动创建临时目录，下载完成后自动清理
     #[allow(dead_code)]
@@ -325,6 +327,7 @@ impl TransferManager {
             auto_download,
             request.local_download_path.clone(),
         );
+        task.download_conflict_strategy = request.download_conflict_strategy;
 
         // 设置分享直下相关字段
         if request.is_share_direct_download {
@@ -1544,16 +1547,24 @@ impl TransferManager {
         drop(task_info);
 
         // 获取本地下载路径配置 + 缓存的分享根路径（用于 share_root 推导）
-        let (local_download_path, ask_each_time, default_download_dir, task_share_root_path) = {
+        let (
+            local_download_path,
+            ask_each_time,
+            default_download_dir,
+            task_share_root_path,
+            download_conflict_strategy,
+        ) = {
             let t = task.read().await;
             let local_path = t.local_download_path.clone();
             let share_root_path = t.share_root_path.clone();
+            let task_strategy = t.download_conflict_strategy;
             drop(t);
 
             let cfg = app_config.read().await;
             let ask = cfg.download.ask_each_time;
             let default_dir = cfg.download.download_dir.clone();
-            (local_path, ask, default_dir, share_root_path)
+            let strategy = task_strategy.unwrap_or(cfg.conflict_strategy.default_download_strategy);
+            (local_path, ask, default_dir, share_root_path, strategy)
         };
 
         // 确定下载目录
@@ -1711,7 +1722,7 @@ impl TransferManager {
                     filename.clone(),
                     size,
                     &local_dir,
-                    None,
+                    Some(download_conflict_strategy),
                 )
                 .await
             {
@@ -1762,7 +1773,12 @@ impl TransferManager {
                         }
                     }
                     match fdm
-                        .create_folder_download_with_dir(folder_path.clone(), &local_dir, None, None)
+                        .create_folder_download_with_dir(
+                            folder_path.clone(),
+                            &local_dir,
+                            None,
+                            Some(download_conflict_strategy),
+                        )
                         .await
                     {
                         Ok(folder_id) => {
@@ -3105,6 +3121,7 @@ impl TransferManager {
             save_fs_id,
             auto_download: metadata.auto_download.unwrap_or(false),
             local_download_path: None,
+            download_conflict_strategy: None,
             status,
             error: metadata.error_msg.clone(),
             download_task_ids: metadata.download_task_ids.clone(),

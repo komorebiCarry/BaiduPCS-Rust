@@ -110,6 +110,53 @@ impl UserAuth {
     }
 }
 
+/// 已保存百度账号的安全摘要（不包含 BDUSS/STOKEN/PTOKEN 等敏感凭证）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountSummary {
+    /// 用户ID
+    pub uid: u64,
+    /// 用户名
+    pub username: String,
+    /// 昵称（显示名称）
+    pub nickname: Option<String>,
+    /// 头像URL
+    pub avatar_url: Option<String>,
+    /// VIP类型（0=普通用户，1=普通会员，2=超级会员）
+    pub vip_type: Option<u32>,
+    /// 网盘容量（字节）
+    pub total_space: Option<u64>,
+    /// 已使用空间（字节）
+    pub used_space: Option<u64>,
+    /// 登录时间戳
+    pub login_time: i64,
+    /// 是否为当前激活账号
+    pub is_active: bool,
+    /// 是否保存了 PTOKEN（影响预热和部分 Web 接口能力）
+    pub has_ptoken: bool,
+    /// 是否已经保存预热令牌
+    pub is_warmed_up: bool,
+}
+
+impl AccountSummary {
+    pub fn from_user(user: &UserAuth, active_uid: Option<u64>) -> Self {
+        Self {
+            uid: user.uid,
+            username: user.username.clone(),
+            nickname: user.nickname.clone(),
+            avatar_url: user.avatar_url.clone(),
+            vip_type: user.vip_type,
+            total_space: user.total_space,
+            used_space: user.used_space,
+            login_time: user.login_time,
+            is_active: active_uid == Some(user.uid),
+            has_ptoken: user.ptoken.is_some(),
+            is_warmed_up: user.panpsc.is_some()
+                && user.csrf_token.is_some()
+                && user.bdstoken.is_some(),
+        }
+    }
+}
+
 /// 二维码信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QRCode {

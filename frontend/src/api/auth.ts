@@ -69,6 +69,35 @@ export interface QRCodeStatus {
   reason?: string
 }
 
+export interface AccountSummary {
+  uid: number
+  username: string
+  nickname?: string
+  avatar_url?: string
+  vip_type?: number
+  total_space?: number
+  used_space?: number
+  login_time: number
+  is_active: boolean
+  has_ptoken: boolean
+  is_warmed_up: boolean
+}
+
+export interface AccountListResponse {
+  active_uid?: number
+  accounts: AccountSummary[]
+}
+
+export interface AccountSwitchResponse {
+  user: UserAuth
+  accounts: AccountSummary[]
+}
+
+export interface AccountLogoutResponse {
+  active_user?: UserAuth
+  accounts: AccountSummary[]
+}
+
 /**
  * 生成登录二维码
  */
@@ -83,8 +112,12 @@ export async function generateQRCode(): Promise<QRCode> {
 /**
  * 查询扫码状态
  */
-export async function getQRCodeStatus(sign: string): Promise<QRCodeStatus> {
-  const response = (await apiClient.get(`/auth/qrcode/status?sign=${sign}`)) as ApiResponse<QRCodeStatus>
+export async function getQRCodeStatus(sign: string, forceLogin = false): Promise<QRCodeStatus> {
+  const params = new URLSearchParams({ sign })
+  if (forceLogin) {
+    params.set('force_login', 'true')
+  }
+  const response = (await apiClient.get(`/auth/qrcode/status?${params.toString()}`)) as ApiResponse<QRCodeStatus>
   if (response.code !== 0 || !response.data) {
     throw new Error(response.message || '查询状态失败')
   }
@@ -101,6 +134,39 @@ export async function getCurrentUser(): Promise<UserAuth> {
   }
   // 如果没有数据或者返回错误码，抛出异常
   throw new Error(response.message || '获取用户信息失败')
+}
+
+/**
+ * 获取已保存账号列表
+ */
+export async function getAccounts(): Promise<AccountListResponse> {
+  const response = (await apiClient.get('/auth/accounts')) as ApiResponse<AccountListResponse>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || '获取账号列表失败')
+  }
+  return response.data
+}
+
+/**
+ * 切换当前账号
+ */
+export async function switchAccount(uid: number): Promise<AccountSwitchResponse> {
+  const response = (await apiClient.post(`/auth/accounts/${uid}/switch`)) as ApiResponse<AccountSwitchResponse>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || '切换账号失败')
+  }
+  return response.data
+}
+
+/**
+ * 移除指定账号
+ */
+export async function removeAccount(uid: number): Promise<AccountLogoutResponse> {
+  const response = (await apiClient.delete(`/auth/accounts/${uid}`)) as ApiResponse<AccountLogoutResponse>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || '移除账号失败')
+  }
+  return response.data
 }
 
 export interface CookieLoginResult {
@@ -124,4 +190,15 @@ export async function cookieLogin(cookies: string): Promise<CookieLoginResult> {
  */
 export async function logout(): Promise<void> {
   await apiClient.post('/auth/logout')
+}
+
+/**
+ * 登出当前账号
+ */
+export async function logoutCurrentAccount(): Promise<AccountLogoutResponse> {
+  const response = (await apiClient.post('/auth/logout')) as ApiResponse<AccountLogoutResponse>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || '登出失败')
+  }
+  return response.data
 }

@@ -80,6 +80,9 @@ pub struct CreateTransferRequest {
     pub auto_download: Option<bool>,
     /// 本地下载路径（auto_download=true 时可选）
     pub local_download_path: Option<String>,
+    /// 自动下载时的本地文件冲突策略；不传则使用全局下载默认策略
+    #[serde(default)]
+    pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     /// 是否为分享直下任务
     /// 分享直下任务会自动创建临时目录，下载完成后自动清理
     #[serde(default)]
@@ -153,6 +156,7 @@ pub async fn create_transfer(
         save_fs_id: req.save_fs_id,
         auto_download: req.auto_download,
         local_download_path: req.local_download_path,
+        download_conflict_strategy: req.download_conflict_strategy,
         is_share_direct_download: req.is_share_direct_download,
         selected_fs_ids: req.selected_fs_ids,
         selected_files: req.selected_files,

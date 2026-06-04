@@ -40,6 +40,14 @@ use uuid::Uuid;
 
 const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetdiskTargetEntry {
+    pub path: String,
+    pub name: String,
+    pub fs_id: u64,
+    pub is_dir: bool,
+}
+
 /// 抽象 TransferManager / DownloadManager 调用，便于单测 mock
 #[async_trait]
 pub trait ExecutorHooks: Send + Sync {
@@ -47,13 +55,32 @@ pub trait ExecutorHooks: Send + Sync {
     async fn submit_transfer(
         &self,
         captured: &CapturedShare,
-        target_path: &str,
-        fs_id: u64,
+        target_dir: &str,
+        item: &ShareSnapshotItem,
         internal_label: Option<&str>,
     ) -> Result<String, ShareSyncError>;
 
+    /// 查询网盘目标路径是否已存在。
+    async fn find_netdisk_file(
+        &self,
+        target_path: &str,
+    ) -> Result<Option<NetdiskTargetEntry>, ShareSyncError>;
+
+    /// 重命名网盘目标文件，返回重命名后的完整路径。
+    async fn rename_netdisk(
+        &self,
+        path: &str,
+        fs_id: u64,
+        new_name: &str,
+    ) -> Result<String, ShareSyncError>;
+
     /// 提交一个下载任务（单文件），返回 task_id
-    async fn submit_download(&self, item: &ShareSnapshotItem, local_dir: &Path) -> Result<String, ShareSyncError>;
+    async fn submit_download(
+        &self,
+        item: &ShareSnapshotItem,
+        local_dir: &Path,
+        strategy: ConflictStrategy,
+    ) -> Result<String, ShareSyncError>;
 
     /// 等待转存任务进入业务所需的终态
     async fn wait_transfer_task(
@@ -64,7 +91,11 @@ pub trait ExecutorHooks: Send + Sync {
     ) -> Result<(), ShareSyncError>;
 
     /// 删除网盘上的文件（按路径）
-    fn delete_netdisk(&self, target_path: &str, relative_paths: &[String]) -> Result<(), ShareSyncError>;
+    async fn delete_netdisk(
+        &self,
+        target_path: &str,
+        relative_paths: &[String],
+    ) -> Result<(), ShareSyncError>;
 
     /// 删除本地文件
     fn delete_local(&self, local_dir: &Path, relative_path: &str) -> Result<(), ShareSyncError>;
@@ -279,7 +310,7 @@ impl<'a> ShareSyncExecutor<'a> {
             }
             SyncTarget::Local(t) => {
                 self.hooks
-                    .submit_download(item, &t.local_path)
+                    .submit_download(item, &t.local_path, strategy)
                     .await
                     .map(|task_id| (task_id, true, RunItemStatus::Downloading))
             }
@@ -529,7 +560,7 @@ mod tests {
     #[derive(Default)]
     struct MockHooks {
         transfers: Mutex<Vec<(String, u64)>>,
-        downloads: Mutex<Vec<(u64, String, PathBuf)>>,
+        downloads: Mutex<Vec<(u64, String, PathBuf, ConflictStrategy)>>,
         deletes: Mutex<Vec<(PathBuf, String)>>,
     }
     #[async_trait]
@@ -550,10 +581,11 @@ mod tests {
             &self,
             item: &ShareSnapshotItem,
             dir: &Path,
+            strategy: ConflictStrategy,
         ) -> Result<String, ShareSyncError> {
             let mut g = self.downloads.lock().unwrap();
             let id = format!("dl-{}", g.len() + 1);
-            g.push((item.fs_id, item.path.clone(), dir.to_path_buf()));
+            g.push((item.fs_id, item.path.clone(), dir.to_path_buf(), strategy));
             Ok(id)
         }
         async fn wait_transfer_task(
@@ -621,6 +653,7 @@ mod tests {
         let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(hooks.downloads.lock().unwrap().len(), 1);
+        assert_eq!(hooks.downloads.lock().unwrap()[0].3, ConflictStrategy::Overwrite);
         assert_eq!(hooks.transfers.lock().unwrap().len(), 0);
     }
 
@@ -724,6 +757,7 @@ mod tests {
         assert!(entries[0].ends_with(".txt"));
         // 仍然 dispatch 了 download
         assert_eq!(hooks.downloads.lock().unwrap().len(), 1);
+        assert_eq!(hooks.downloads.lock().unwrap()[0].3, ConflictStrategy::Versioned);
     }
 
     #[test]

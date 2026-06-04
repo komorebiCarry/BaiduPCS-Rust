@@ -1260,6 +1260,23 @@ impl FolderDownloadManager {
         *nc = Some(client);
     }
 
+    /// 清理当前账号相关的运行态引用。
+    pub async fn clear_account_runtime(&self) {
+        {
+            let mut tokens = self.cancellation_tokens.write().await;
+            for token in tokens.values() {
+                token.cancel();
+            }
+            tokens.clear();
+        }
+
+        *self.download_manager.write().await = None;
+        *self.netdisk_client.write().await = None;
+        *self.folder_progress_tx.write().await = None;
+
+        info!("文件夹下载管理器账号运行态已清理");
+    }
+
     /// 更新下载目录
     ///
     /// 当配置中的 download_dir 改变时调用此方法

@@ -20,6 +20,8 @@ vi.mock('@/api/file', () => ({
   }),
   formatFileSize: vi.fn((size: number) => `${size}B`),
   formatTime: vi.fn(() => '2026-04-10 00:00:00'),
+  basename: vi.fn((path: string) => path.split('/').filter(Boolean).pop() || ''),
+  joinPath: vi.fn((parent: string, name: string) => `${parent.replace(/\/$/, '')}/${name}`),
   createFolder: vi.fn(),
 }))
 
@@ -60,8 +62,8 @@ vi.mock('@/api/autobackup', () => ({
   }),
 }))
 
-describe('FilesView 桌面端搜索浮层', () => {
-  it('展开搜索时保留图标按钮，并在空输入时点击外部自动收起', async () => {
+describe('FilesView 桌面端搜索栏', () => {
+  it('保留搜索图标按钮和输入区', async () => {
     const wrapper = mount(FilesView, {
       attachTo: document.body,
       global: {
@@ -75,6 +77,12 @@ describe('FilesView 桌面端搜索浮层', () => {
           Upload: true,
           Share: true,
           Refresh: true,
+          Operation: true,
+          ArrowDown: true,
+          CopyDocument: true,
+          Rank: true,
+          Delete: true,
+          MoreFilled: true,
           Folder: true,
           Document: true,
           Loading: true,
@@ -92,19 +100,21 @@ describe('FilesView 桌面端搜索浮层', () => {
     await Promise.resolve()
     await nextTick()
 
-    const toggle = wrapper.find('.search-flyout-toggle')
+    const toggle = wrapper.find('.search-trigger.persistent')
     expect(toggle.exists()).toBe(true)
+    expect(wrapper.find('.search-shell.persistent').exists()).toBe(true)
+    expect(wrapper.find('.search-input-area').exists()).toBe(true)
 
     await toggle.trigger('click')
     await nextTick()
 
-    expect(wrapper.find('.search-flyout-toggle').exists()).toBe(true)
-    expect(wrapper.find('.search-flyout-panel').exists()).toBe(true)
+    expect(wrapper.find('.search-trigger.persistent').exists()).toBe(true)
+    expect(wrapper.find('.search-shell.persistent').exists()).toBe(true)
 
     document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
     await nextTick()
 
-    expect(wrapper.find('.search-flyout-panel').exists()).toBe(false)
+    expect(wrapper.find('.search-shell.persistent').exists()).toBe(true)
 
     wrapper.unmount()
   })

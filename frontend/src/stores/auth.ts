@@ -1,11 +1,21 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { generateQRCode as apiGenerateQRCode, getQRCodeStatus, getCurrentUser, logout as apiLogout, cookieLogin as apiCookieLogin } from '@/api/auth'
-import type { QRCode, UserAuth, CookieLoginResult } from '@/api/auth'
+import {
+  generateQRCode as apiGenerateQRCode,
+  getQRCodeStatus,
+  getCurrentUser,
+  logoutCurrentAccount as apiLogout,
+  cookieLogin as apiCookieLogin,
+  getAccounts as apiGetAccounts,
+  switchAccount as apiSwitchAccount,
+  removeAccount as apiRemoveAccount,
+} from '@/api/auth'
+import type { AccountSummary, QRCode, UserAuth, CookieLoginResult } from '@/api/auth'
 
 export const useAuthStore = defineStore('auth', () => {
   // 状态
   const user = ref<UserAuth | null>(null)
+  const accounts = ref<AccountSummary[]>([])
   const qrcode = ref<QRCode | null>(null)
   const isPolling = ref(false)
   const pollingTimer = ref<number | null>(null)
@@ -14,6 +24,7 @@ export const useAuthStore = defineStore('auth', () => {
   const isLoggedIn = computed(() => user.value !== null)
   const username = computed(() => user.value?.nickname || user.value?.username || '')
   const avatar = computed(() => user.value?.avatar_url || '')
+  const activeUid = computed(() => user.value?.uid ?? null)
 
   // 生成二维码
   async function generateQRCode(): Promise<QRCode> {
@@ -30,7 +41,8 @@ export const useAuthStore = defineStore('auth', () => {
   function startPolling(
       onSuccess: () => void,
       onError: (error: any) => void,
-      onScanned?: () => void
+      onScanned?: () => void,
+      forceLogin = false
   ) {
     if (isPolling.value || !qrcode.value) return
 
@@ -43,7 +55,7 @@ export const useAuthStore = defineStore('auth', () => {
           return
         }
 
-        const status = await getQRCodeStatus(qrcode.value.sign)
+        const status = await getQRCodeStatus(qrcode.value.sign, forceLogin)
 
         switch (status.status) {
           case 'success':
@@ -104,8 +116,26 @@ export const useAuthStore = defineStore('auth', () => {
   async function fetchUserInfo() {
     try {
       user.value = await getCurrentUser()
+      try {
+        await fetchAccounts()
+      } catch {
+        // 账号列表失败不应覆盖“已登录”状态
+      }
     } catch (error) {
       console.error('获取用户信息失败:', error)
+      throw error
+    }
+  }
+
+  // 获取账号列表
+  async function fetchAccounts() {
+    try {
+      const result = await apiGetAccounts()
+      accounts.value = result.accounts
+      return result
+    } catch (error) {
+      console.error('获取账号列表失败:', error)
+      accounts.value = []
       throw error
     }
   }
@@ -115,6 +145,7 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const result = await apiCookieLogin(cookies)
       user.value = result.user
+      await fetchAccounts()
       return result
     } catch (error) {
       console.error('Cookie 登录失败:', error)
@@ -122,11 +153,38 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  // 切换账号
+  async function switchAccount(uid: number) {
+    try {
+      const result = await apiSwitchAccount(uid)
+      user.value = result.user
+      accounts.value = result.accounts
+      return result
+    } catch (error) {
+      console.error('切换账号失败:', error)
+      throw error
+    }
+  }
+
+  // 移除账号
+  async function removeAccount(uid: number) {
+    try {
+      const result = await apiRemoveAccount(uid)
+      user.value = result.active_user || null
+      accounts.value = result.accounts
+      return result
+    } catch (error) {
+      console.error('移除账号失败:', error)
+      throw error
+    }
+  }
+
   // 登出
   async function logout() {
     try {
-      await apiLogout()
-      user.value = null
+      const result = await apiLogout()
+      user.value = result.active_user || null
+      accounts.value = result.accounts
       qrcode.value = null
       stopPolling()
     } catch (error) {
@@ -138,18 +196,23 @@ export const useAuthStore = defineStore('auth', () => {
   return {
     // 状态
     user,
+    accounts,
     qrcode,
     isPolling,
     // 计算属性
     isLoggedIn,
     username,
     avatar,
+    activeUid,
     // 方法
     generateQRCode,
     startPolling,
     stopPolling,
     fetchUserInfo,
+    fetchAccounts,
     loginWithCookies,
+    switchAccount,
+    removeAccount,
     logout
   }
 })

@@ -10,6 +10,8 @@
 /frontend/.vite/
 /frontend/dist-ssr/
 *.local
+# 本地 vite 配置（由 scripts/local-deploy.sh 运行时生成，不入版本库）
+/frontend/vite.local.config.ts
 
 # 下载文件
 /backend/downloads/

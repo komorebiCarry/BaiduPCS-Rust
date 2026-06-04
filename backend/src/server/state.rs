@@ -1,21 +1,21 @@
 // 应用状态
 
 use crate::auth::{QRCodeAuth, SessionManager, UserAuth};
-use crate::common::ProxyType;
-use crate::common::{ProxyConfig, ProxyFallbackManager, ProxyHotUpdater};
-use crate::encryption::SnapshotManager;
 use crate::autobackup::record::BackupRecordManager;
 use crate::autobackup::AutoBackupManager;
+use crate::common::ProxyType;
 use crate::common::{MemoryMonitor, MemoryMonitorConfig};
+use crate::common::{ProxyConfig, ProxyFallbackManager, ProxyHotUpdater};
 use crate::config::AppConfig;
 use crate::downloader::{DownloadManager, FolderDownloadManager};
+use crate::encryption::SnapshotManager;
 use crate::netdisk::{CloudDlMonitor, NetdiskClient};
-use crate::share_sync::ShareSyncManager;
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, scan_recoverable_tasks, DownloadRecoveryInfo,
     PersistenceManager, TransferRecoveryInfo, UploadRecoveryInfo,
 };
 use crate::server::websocket::WebSocketManager;
+use crate::share_sync::ShareSyncManager;
 use crate::transfer::TransferManager;
 use crate::uploader::{ScanManager, UploadManager};
 use std::sync::Arc;
@@ -129,6 +129,39 @@ impl AppState {
         })
     }
 
+    /// 清理当前激活账号的运行态资源。
+    ///
+    /// 多账号切换时会重建这些资源，先显式停止能停止的后台服务，避免旧账号
+    /// 的客户端继续被后台任务持有。
+    pub async fn clear_active_runtime(&self) {
+        if let Some(monitor) = self.cloud_dl_monitor.write().await.take() {
+            monitor.stop();
+            info!("离线下载监听服务已停止");
+        }
+
+        if let Some(mgr) = self.share_sync_manager.write().await.take() {
+            mgr.shutdown().await;
+            info!("分享同步管理器已停止");
+        }
+
+        if let Some(mgr) = self.autobackup_manager.write().await.take() {
+            let result = mgr.shutdown().await;
+            if !result.success {
+                warn!("自动备份管理器关闭时出现错误: {:?}", result.errors);
+            }
+            info!("自动备份管理器已停止");
+        }
+
+        self.folder_download_manager.clear_account_runtime().await;
+
+        *self.current_user.write().await = None;
+        *self.netdisk_client.write().await = None;
+        *self.download_manager.write().await = None;
+        *self.upload_manager.write().await = None;
+        *self.transfer_manager.write().await = None;
+        *self.scan_manager.write().await = None;
+    }
+
     /// 初始化时加载会话
     pub async fn load_initial_session(&self) -> anyhow::Result<()> {
         // 🔥 获取持久化管理器的 Arc 引用（直接使用已启动的实例）
@@ -136,11 +169,13 @@ impl AppState {
 
         let mut session_manager = self.session_manager.lock().await;
         if let Some(mut user_auth) = session_manager.get_session().await? {
+            self.clear_active_runtime().await;
             *self.current_user.write().await = Some(user_auth.clone());
 
             // 初始化网盘客户端
             let config_guard = self.config.read().await;
-            let proxy_config_for_client = if config_guard.network.proxy.proxy_type != ProxyType::None
+            let proxy_config_for_client = if config_guard.network.proxy.proxy_type
+                != ProxyType::None
                 && !self.fallback_mgr.is_fallen_back()
             {
                 Some(config_guard.network.proxy.clone())
@@ -188,20 +223,14 @@ impl AppState {
                 let now = chrono::Utc::now().timestamp();
                 let elapsed = now - last_warmup;
                 if elapsed > WARMUP_EXPIRE_SECS {
-                    info!(
-                        "防止预热数据过期({}秒前),清除旧数据并重新预热...",
-                        elapsed
-                    );
+                    info!("防止预热数据过期({}秒前),清除旧数据并重新预热...", elapsed);
                     // 清除过期的预热数据
                     user_auth.panpsc = None;
                     user_auth.csrf_token = None;
                     user_auth.bdstoken = None;
                     true
                 } else {
-                    info!(
-                        "检测到已有预热 Cookie({}秒前预热),跳过预热",
-                        elapsed
-                    );
+                    info!("检测到已有预热 Cookie({}秒前预热),跳过预热", elapsed);
                     false
                 }
             } else {
@@ -287,7 +316,9 @@ impl AppState {
 
             // 🔥 设置文件夹下载管理器的 WAL 目录（用于文件夹持久化）
             let wal_dir = pm_arc.lock().await.wal_dir().clone();
-            self.folder_download_manager.set_wal_dir(wal_dir.clone()).await;
+            self.folder_download_manager
+                .set_wal_dir(wal_dir.clone())
+                .await;
 
             // 🔥 设置文件夹下载管理器的持久化管理器（用于加载历史文件夹）
             self.folder_download_manager
@@ -312,8 +343,12 @@ impl AppState {
 
             // 🔥 配置目录（用于读取 encryption.json）
             let config_dir = std::path::Path::new("config");
-            let upload_manager =
-                UploadManager::new_with_config(client.clone(), &user_auth, &upload_config, config_dir);
+            let upload_manager = UploadManager::new_with_config(
+                client.clone(),
+                &user_auth,
+                &upload_config,
+                config_dir,
+            );
             let upload_manager_arc = Arc::new(upload_manager);
 
             // 🔥 设置持久化管理器
@@ -348,8 +383,11 @@ impl AppState {
             info!("扫描管理器初始化完成");
 
             // 初始化转存管理器
-            let transfer_manager =
-                TransferManager::new(Arc::new(std::sync::RwLock::new(client)), transfer_config, Arc::clone(&self.config));
+            let transfer_manager = TransferManager::new(
+                Arc::new(std::sync::RwLock::new(client)),
+                transfer_config,
+                Arc::clone(&self.config),
+            );
             let transfer_manager_arc = Arc::new(transfer_manager);
 
             // 设置下载管理器（用于自动下载功能）
@@ -385,10 +423,12 @@ impl AppState {
                 &transfer_manager_arc,
                 &pm_arc,
             )
-                .await;
+            .await;
 
             // 🔥 启动时清理孤立临时目录（如果配置启用）
-            transfer_manager_arc.cleanup_orphaned_on_startup_if_enabled().await;
+            transfer_manager_arc
+                .cleanup_orphaned_on_startup_if_enabled()
+                .await;
         }
 
         // 🔥 启动 WebSocket 批量发送器
@@ -448,11 +488,18 @@ impl AppState {
                 }
 
                 // 🔥 先恢复文件夹任务（必须在恢复子任务之前）
-                let (restored_folders, skipped_folders) = self.folder_download_manager.restore_folders().await;
-                info!("文件夹任务恢复完成: 恢复 {} 个, 跳过 {} 个", restored_folders, skipped_folders);
+                let (restored_folders, skipped_folders) =
+                    self.folder_download_manager.restore_folders().await;
+                info!(
+                    "文件夹任务恢复完成: 恢复 {} 个, 跳过 {} 个",
+                    restored_folders, skipped_folders
+                );
 
                 // 🔥 加载历史归档的已完成文件夹到内存（用于前端显示历史记录）
-                let history_folders = self.folder_download_manager.load_history_folders_to_memory().await;
+                let history_folders = self
+                    .folder_download_manager
+                    .load_history_folders_to_memory()
+                    .await;
                 if history_folders > 0 {
                     info!("历史文件夹加载完成: {} 个", history_folders);
                 }
@@ -469,7 +516,9 @@ impl AppState {
                     info!("下载任务恢复完成: {} 成功, {} 失败", success, failed);
 
                     // 🔥 同步恢复的子任务进度到文件夹
-                    self.folder_download_manager.sync_restored_tasks_progress().await;
+                    self.folder_download_manager
+                        .sync_restored_tasks_progress()
+                        .await;
                 }
 
                 // 🔥 恢复模式补任务：从 pending_files 创建暂停状态的任务
@@ -530,7 +579,9 @@ impl AppState {
             temp_dir,
             Arc::clone(&self.backup_record_manager),
             Arc::clone(&self.snapshot_manager),
-        ).await {
+        )
+        .await
+        {
             Ok(manager) => {
                 // 设置 WebSocket 管理器
                 manager.set_ws_manager(Arc::clone(&self.ws_manager));
@@ -548,7 +599,8 @@ impl AppState {
                 // 设置代理配置（使备份任务的 NetdiskClient 走代理）
                 {
                     let config_guard = self.config.read().await;
-                    let proxy = if config_guard.network.proxy.proxy_type != crate::common::ProxyType::None
+                    let proxy = if config_guard.network.proxy.proxy_type
+                        != crate::common::ProxyType::None
                         && !self.fallback_mgr.is_fallen_back()
                     {
                         Some(config_guard.network.proxy.clone())
@@ -564,21 +616,29 @@ impl AppState {
 
                 // 注入到下载管理器（用于解密时查询原始文件名和 key_version）
                 if let Some(ref download_mgr) = *self.download_manager.read().await {
-                    download_mgr.set_snapshot_manager(Arc::clone(&self.snapshot_manager)).await;
-                    download_mgr.set_encryption_config_store(Arc::clone(&encryption_config_store)).await;
+                    download_mgr
+                        .set_snapshot_manager(Arc::clone(&self.snapshot_manager))
+                        .await;
+                    download_mgr
+                        .set_encryption_config_store(Arc::clone(&encryption_config_store))
+                        .await;
                     info!("已将 snapshot_manager 和 encryption_config_store 注入到下载管理器");
                 }
 
                 // 注入到上传管理器（用于上传完成后保存加密映射）
                 if let Some(ref upload_mgr) = *self.upload_manager.read().await {
-                    upload_mgr.set_snapshot_manager(Arc::clone(&self.snapshot_manager)).await;
+                    upload_mgr
+                        .set_snapshot_manager(Arc::clone(&self.snapshot_manager))
+                        .await;
                     info!("已将 snapshot_manager 注入到上传管理器");
                 }
 
                 let manager_arc = Arc::new(manager);
 
                 // 🔥 初始化全局轮询（使用配置文件中的触发配置）
-                manager_arc.update_trigger_config(upload_trigger, download_trigger).await;
+                manager_arc
+                    .update_trigger_config(upload_trigger, download_trigger)
+                    .await;
 
                 // 启动事件消费循环（监听文件变更和定时轮询事件）
                 manager_arc.start_event_consumer().await;
@@ -597,9 +657,9 @@ impl AppState {
 
     /// 🔥 初始化分享同步管理器
     pub async fn init_share_sync_manager(&self) {
+        use crate::server::events::TaskEvent;
         use crate::share_sync::events::{ShareSyncEvent, ShareSyncEventPublisher};
         use crate::share_sync::manager::ManagerConfig;
-        use crate::server::events::TaskEvent;
         use std::sync::Arc;
 
         let config = self.config.read().await;
@@ -685,7 +745,9 @@ impl AppState {
         }
 
         // 🔥 设置文件夹下载管理器（用于自动下载文件夹）
-        monitor.set_folder_download_manager(Arc::clone(&self.folder_download_manager)).await;
+        monitor
+            .set_folder_download_manager(Arc::clone(&self.folder_download_manager))
+            .await;
 
         // 从数据库加载未触发的自动下载配置
         let loaded = monitor.load_auto_download_configs_from_db().await;
@@ -825,11 +887,8 @@ impl ProxyHotUpdater for AppState {
     async fn update_netdisk_client(&self, proxy: Option<&ProxyConfig>) -> anyhow::Result<()> {
         let user_auth = self.current_user.read().await.clone();
         if let Some(user) = user_auth {
-            let new_client = NetdiskClient::new_with_proxy(
-                user,
-                proxy,
-                Some(Arc::clone(&self.fallback_mgr)),
-            )?;
+            let new_client =
+                NetdiskClient::new_with_proxy(user, proxy, Some(Arc::clone(&self.fallback_mgr)))?;
             *self.netdisk_client.write().await = Some(new_client);
         }
         Ok(())
@@ -908,11 +967,7 @@ impl ProxyHotUpdater for AppState {
     async fn update_folder_download_manager(&self, proxy: Option<&ProxyConfig>) {
         let user_auth = self.current_user.read().await.clone();
         if let Some(user) = user_auth {
-            match NetdiskClient::new_with_proxy(
-                user,
-                proxy,
-                Some(Arc::clone(&self.fallback_mgr)),
-            ) {
+            match NetdiskClient::new_with_proxy(user, proxy, Some(Arc::clone(&self.fallback_mgr))) {
                 Ok(new_client) => {
                     self.folder_download_manager
                         .set_netdisk_client(Arc::new(new_client))

@@ -69,6 +69,7 @@ export interface TransferTask {
   save_fs_id: number
   auto_download: boolean
   local_download_path?: string
+  download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
   status: TransferStatus
   error?: string
   download_task_ids: string[]
@@ -97,6 +98,7 @@ export interface CreateTransferRequest {
   save_fs_id: number
   auto_download?: boolean
   local_download_path?: string
+  download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
   /** 分享直下：是否为分享直下任务 */
   is_share_direct_download?: boolean
   /** 选中的文件 fs_id 列表（可选，为空或未提供时转存所有文件） */
