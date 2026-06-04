@@ -92,6 +92,15 @@ export interface ListDirectoryRequest {
   keyword?: string
 }
 
+/// 目录权限信息
+export interface PermissionInfo {
+  dirOwner: string
+  dirGroup: string
+  processUser: string
+  processGroup: string
+  canWrite: boolean
+}
+
 /// 列目录响应（支持分页）
 export interface ListDirectoryResponse {
   entries: FileEntry[]
@@ -101,6 +110,7 @@ export interface ListDirectoryResponse {
   page: number
   pageSize: number            // 后端返回 camelCase
   hasMore: boolean            // 后端返回 camelCase
+  permissionInfo: PermissionInfo | null
 }
 
 /// 路径跳转请求
