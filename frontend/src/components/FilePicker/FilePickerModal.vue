@@ -147,18 +147,18 @@
                 <span class="perm-value">{{ store.permissionInfo.processUser }}:{{ store.permissionInfo.processGroup }}</span>
               </div>
               <el-tag
-                v-if="!store.permissionInfo.canWrite"
-                type="danger"
-                size="small"
-                class="perm-warning"
+                  v-if="!store.permissionInfo.canWrite"
+                  type="danger"
+                  size="small"
+                  class="perm-warning"
               >
                 程序无写权限，下载可能失败
               </el-tag>
               <el-tag
-                v-else
-                type="success"
-                size="small"
-                class="perm-ok"
+                  v-else
+                  type="success"
+                  size="small"
+                  class="perm-ok"
               >
                 可写入
               </el-tag>

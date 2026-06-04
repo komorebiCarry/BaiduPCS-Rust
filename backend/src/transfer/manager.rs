@@ -3965,11 +3965,6 @@ fn derive_share_root(share_root_path: Option<&str>, files: &[SharedFileInfo]) ->
     }
     if let Some(title) = share_root_path {
         if !title.is_empty() {
-            if is_virtual_share_root(extract_basename_str(title)) {
-                // 虚拟根需要整体剥离，share_root 取虚拟根全路径（规范化为绝对路径
-                // 以匹配文件 path 的 `/sharelink.../` 前缀）。
-                return format!("/{}", title.trim_matches('/'));
-            }
             // dirname(title)：分享根本身需要保留在 relative_parent 里，
             // 因此 share_root 取分享根的"父目录"，正好是要剥掉的私有部分。
             return extract_parent_dir_str(title).to_string();
