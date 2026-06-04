@@ -436,7 +436,7 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
     - 确保 APP 已登录你的账号
 
 2. **扫描二维码**
-    - 在浏览器中访问应用（默认 `http://localhost:18888`）
+    - 在浏览器中访问应用（默认 `http://localhost:4924`）
     - 页面会自动显示登录二维码
     - 打开百度网盘 APP，点击"扫一扫"功能
     - 扫描网页上显示的二维码
@@ -568,7 +568,7 @@ cd baidupcs-rust
 # 2. 运行容器（使用预构建镜像）
 docker run -d \
   --name baidu-netdisk-rust \
-  -p 18888:18888 \
+  -p 4924:4924 \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/downloads:/app/downloads \
   -v $(pwd)/data:/app/data \
@@ -578,7 +578,7 @@ docker run -d \
   komorebicarry/baidupcs-rust:latest
 
 # 3. 访问应用
-open http://localhost:18888
+open http://localhost:4924
 ```
 
 **使用 docker-compose**：
@@ -595,7 +595,7 @@ cd baidupcs-rust
 docker-compose -f docker-compose.image.yml up -d
 
 # 4. 访问应用
-open http://localhost:18888
+open http://localhost:4924
 ```
 
 #### 方式二：从源码构建
@@ -609,7 +609,7 @@ cd BaiduPCS-Rust
 docker-compose up -d
 
 # 3. 访问应用
-open http://localhost:18888
+open http://localhost:4924
 ```
 
 <details>
@@ -617,9 +617,9 @@ open http://localhost:18888
 
 **说明**：
 - Docker 容器内，后端 API 服务和前端静态文件服务运行在同一个进程中
-- 只需要暴露一个端口（18888）即可访问完整应用
-- 前端页面和 API 调用都通过 `http://localhost:18888` 访问
-- 前端在容器内部通过 `http://localhost:18888/api/v1` 调用后端 API
+- 只需要暴露一个端口（4924）即可访问完整应用
+- 前端页面和 API 调用都通过 `http://localhost:4924` 访问
+- 前端在容器内部通过 `http://localhost:4924/api/v1` 调用后端 API
 - **挂载目录说明**：
     - `config`：配置文件目录，包含以下重要文件：
         - `encryption.json`：加密密钥文件
@@ -645,7 +645,7 @@ open http://localhost:18888
   # 加载后可以使用镜像运行容器
   docker run -d \
     --name baidu-netdisk-rust \
-    -p 18888:18888 \
+    -p 4924:4924 \
     -v $(pwd)/config:/app/config \
     -v $(pwd)/downloads:/app/downloads \
     -v $(pwd)/data:/app/data \
@@ -683,7 +683,7 @@ npm run build
 npm run dev
 ```
 
-访问 http://localhost:5173（开发模式）或 http://localhost:18888（生产模式）
+访问 http://localhost:5173（开发模式）或 http://localhost:4924（生产模式）
 
 ---
 

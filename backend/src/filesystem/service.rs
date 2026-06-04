@@ -14,6 +14,74 @@ use crate::config::{EnvDetector, MountDetector};
 use super::guard::PathGuard;
 use super::types::*;
 
+#[cfg(not(target_os = "windows"))]
+fn get_unix_permission_info(path: &Path) -> PermissionInfo {
+    use std::os::unix::fs::MetadataExt;
+
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+
+    let metadata = fs::metadata(path);
+    let meta = metadata.as_ref();
+
+    let dir_uid = meta.map(|m| m.uid()).unwrap_or(0);
+    let dir_gid = meta.map(|m| m.gid()).unwrap_or(0);
+
+    let dir_owner = lookup_user_name(dir_uid);
+    let dir_group = lookup_group_name(dir_gid);
+    let process_user = lookup_user_name(euid);
+    let process_group = lookup_group_name(egid);
+
+    let can_write = meta.map(|m| {
+        let mode = m.mode() & 0o777;
+        if dir_uid == euid {
+            (mode & 0o200) != 0
+        } else if dir_gid == egid {
+            (mode & 0o020) != 0
+        } else {
+            (mode & 0o002) != 0
+        }
+    }).unwrap_or(false);
+
+    PermissionInfo {
+        dir_owner,
+        dir_group,
+        process_user,
+        process_group,
+        can_write,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lookup_user_name(uid: u32) -> String {
+    let mut buf = [0i8; 256];
+    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let ret = unsafe {
+        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+    };
+    if ret == 0 && !result.is_null() {
+        unsafe { std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().to_string() }
+    } else {
+        uid.to_string()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lookup_group_name(gid: u32) -> String {
+    let mut buf = [0i8; 256];
+    let mut grp = unsafe { std::mem::zeroed::<libc::group>() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let ret = unsafe {
+        libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+    };
+    if ret == 0 && !result.is_null() {
+        unsafe { std::ffi::CStr::from_ptr(grp.gr_name).to_string_lossy().to_string() }
+    } else {
+        gid.to_string()
+    }
+}
+
 /// 文件系统服务
 pub struct FilesystemService {
     guard: PathGuard,
@@ -110,6 +178,11 @@ impl FilesystemService {
                 .flatten()
         };
 
+        #[cfg(not(target_os = "windows"))]
+        let permission_info = Some(get_unix_permission_info(&path));
+        #[cfg(target_os = "windows")]
+        let permission_info: Option<PermissionInfo> = None;
+
         Ok(ListResponse {
             entries: paginated,
             current_path: path.to_string_lossy().to_string(),
@@ -118,6 +191,7 @@ impl FilesystemService {
             page: req.page,
             page_size: req.page_size,
             has_more: offset + req.page_size < total,
+            permission_info,
         })
     }
 

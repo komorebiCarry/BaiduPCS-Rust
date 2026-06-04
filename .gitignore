@@ -2,6 +2,7 @@
 /backend/target/
 **/*.rs.bk
 *.pdb
+.pids/
 
 # Node.js / Frontend
 /frontend/node_modules/
@@ -12,11 +13,23 @@
 
 # 下载文件
 /backend/downloads/
+/downloads/
 *.tmp
 
-# 配置文件
-/backend/config.json
+# 配置与运行时数据
+/backend/config/
+/backend/wal/
+/backend/logs/
+/config/app.toml
 /backend/auth.json
+*.db
+*.db-shm
+*.db-wal
+session.json
+
+# 日志
+logs/
+*.log
 
 # IDE
 .vscode/
@@ -27,8 +40,7 @@
 
 # OS
 .DS_Store
+._.DS_Store
+._*
 Thumbs.db
 desktop.ini
-
-# 日志
-*.log

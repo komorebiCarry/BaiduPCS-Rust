@@ -137,6 +137,32 @@
               <span class="label">下载到:</span>
               <span class="path" :title="currentDownloadPath">{{ currentDownloadPath || '请选择目录' }}</span>
             </div>
+            <div v-if="store.permissionInfo" class="permission-info">
+              <div class="permission-row">
+                <span class="perm-label">目录所属:</span>
+                <span class="perm-value">{{ store.permissionInfo.dirOwner }}:{{ store.permissionInfo.dirGroup }}</span>
+              </div>
+              <div class="permission-row">
+                <span class="perm-label">程序用户:</span>
+                <span class="perm-value">{{ store.permissionInfo.processUser }}:{{ store.permissionInfo.processGroup }}</span>
+              </div>
+              <el-tag
+                v-if="!store.permissionInfo.canWrite"
+                type="danger"
+                size="small"
+                class="perm-warning"
+              >
+                程序无写权限，下载可能失败
+              </el-tag>
+              <el-tag
+                v-else
+                type="success"
+                size="small"
+                class="perm-ok"
+              >
+                可写入
+              </el-tag>
+            </div>
             <div class="download-options">
               <el-checkbox v-model="setAsDefault" class="set-default-checkbox">
                 设为默认下载目录
@@ -547,6 +573,38 @@ watch(() => props.selectType, () => {
 
 .set-default-checkbox {
   font-size: 13px;
+}
+
+.permission-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 0;
+  font-size: 13px;
+}
+
+.permission-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.perm-label {
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
+  min-width: 60px;
+}
+
+.perm-value {
+  color: var(--el-text-color-regular);
+}
+
+.perm-warning {
+  margin-top: 4px;
+}
+
+.perm-ok {
+  margin-top: 4px;
 }
 
 .conflict-strategy-inline {

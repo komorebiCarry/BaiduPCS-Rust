@@ -71,13 +71,13 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 # 暴露端口（后端 API 和前端静态文件服务都在此端口）
-EXPOSE 18888
+EXPOSE 4924
 
 # 健康检查
 # start-period=30s: 给 Rust 应用足够的启动时间（初始化 AppState、加载会话等）
 # timeout=5s: 增加超时时间，避免启动阶段的慢响应导致失败
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:18888/health || exit 1
+    CMD curl -f http://localhost:4924/health || exit 1
 
 # 启动应用
 CMD ["/app/baidu-netdisk-rust"]
