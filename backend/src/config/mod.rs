@@ -1123,7 +1123,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig {
                 host,
-                port: 4924,
+                port: 18888,
                 cors_origins: vec!["*".to_string()],
             },
             download: DownloadConfig {
@@ -1321,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_config() {
         let config = AppConfig::default();
-        assert_eq!(config.server.port, 4924); // 默认端口 4924
+        assert_eq!(config.server.port, 18888); // 默认端口 18888
         assert_eq!(config.download.max_global_threads, 10); // SVIP 默认
     }
 
@@ -1736,7 +1736,7 @@ mod tests {
         let old_config_toml = r#"
 [server]
 host = "127.0.0.1"
-port = 4924
+port = 18888
 cors_origins = ["*"]
 
 [download]

@@ -8,7 +8,7 @@ services:
     container_name: baidu-netdisk-rust
     image: baidu-netdisk-rust:latest
     ports:
-      - "4924:4924"
+      - "18888:18888"
     volumes:
       # 配置文件挂载
       - ./config:/app/config
@@ -29,7 +29,7 @@ services:
     healthcheck:
       # start_period: 30s - 给 Rust 应用足够的启动时间（初始化 AppState、加载会话等）
       # timeout: 5s - 增加超时时间，避免启动阶段的慢响应导致失败
-      test: ["CMD", "curl", "-f", "http://localhost:4924/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18888/health"]
       interval: 30s
       timeout: 5s
       retries: 3
