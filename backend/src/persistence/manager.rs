@@ -1165,6 +1165,29 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 更新转存任务的分享根路径（来自 share/list?root=1 响应的 title 字段）
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `share_root_path` - 分享根的绝对路径，None 表示 API 未返回
+    pub fn update_share_root_path(
+        &self,
+        task_id: &str,
+        share_root_path: Option<String>,
+    ) -> std::io::Result<()> {
+        let value_for_log = share_root_path.clone();
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_share_root_path(share_root_path);
+        })?;
+
+        debug!(
+            "已更新分享根路径: task_id={}, share_root_path={:?}",
+            task_id, value_for_log
+        );
+
+        Ok(())
+    }
+
     /// 更新临时目录清理状态
     ///
     /// # Arguments

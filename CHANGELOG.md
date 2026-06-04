@@ -2,7 +2,25 @@
 
 本文档记录了 BaiduPCS-Rust 的所有版本更新历史。
 
-## v1.14.0 (当前版本)
+## v1.14.1 (当前版本)
+
+**新功能：**
+- ✨ **下载目录权限提示（Linux/macOS）**：在文件选择弹窗中显示目标目录的属主/用户组、程序运行用户/组以及是否可写，帮助在下载前就发现属主/权限不匹配的问题（感谢 @hamr-hub PR #91）
+  - 可写性判断使用内核 `faccessat(.., W_OK, AT_EACCESS)`，正确覆盖 root（Docker 下常见）、附加组(supplementary groups)、ACL 等情况，避免误报
+- ✨ **本地部署脚本 `scripts/local-deploy.sh`**：不依赖 Docker，一键构建/启动/停止后端(cargo)+前端(vite)，支持 `start/stop/restart/status/logs`，并可安装为 systemd 服务开机自启
+
+**问题修复：**
+- 🐛 **修复分享转存凭空生成一层 `/sharelink<uk>-<shareid>` 目录**：`share/list?root=1` 的 `title`（分享者真实路径）与子目录文件 `path` 使用的虚拟根命名空间不一致，导致 `derive_share_root` 无法匹配前缀、`group_files_by_parent_dir` 剥离失败，转存时把虚拟根当成真实目录创建
+  - 新增 `detect_virtual_share_root_prefix`，以文件 `path` 为准识别 `/sharelink<uk>-<shareid>/` 虚拟根并整体剥离（分享根目录本身仍保留）
+  - 新增并持久化 `share_root_path`（取自 `share/list?root=1` 的 title）到任务元数据，转存恢复 / 分享直下阶段稳定推导 share_root；老数据缺字段时回退到原推导逻辑
+- 🐛 **修复开发模式前端连不上后端**：后端默认端口为 18888，但 dev 模式下 Vite 代理 `/api`、`/ws` 与 `docker-compose.dev` 仍指向 8080，统一改为 18888
+
+**其他：**
+- 🔧 默认端口保持 18888（前端本地 vite 端口对齐 5173）；`frontend/vite.local.config.ts` 改为由部署脚本运行时生成，不再纳入版本库
+
+---
+
+## v1.14.0
 
 **新功能：**
 - ✨ **文件管理：重命名 / 批量复制 / 批量移动**：文件管理页面新增文件、文件夹的重命名以及批量复制 / 批量移动到目标目录

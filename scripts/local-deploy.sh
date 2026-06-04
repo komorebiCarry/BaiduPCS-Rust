@@ -2,8 +2,8 @@
 
 # 本地部署脚本（不使用 Docker）
 # 直接在本机构建并启动后端（rust 二进制）+ 前端（vite）
-# 前端端口：4923
-# 后端端口：取自 config/app.toml（默认 4924）
+# 前端端口：5173
+# 后端端口：取自 config/app.toml（默认 18888）
 #
 # 关键设计：
 #   - 后端：cargo build 后直接 exec 出 target/release 二进制，PID 即为服务进程，避免 cargo wrapper 残留
@@ -41,9 +41,9 @@ BACKEND_BIN_NAME="baidu-netdisk-rust"
 BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
 
 # ----------------- 配置 -----------------
-FRONTEND_PORT=4923
+FRONTEND_PORT=5173
 BACKEND_HOST="127.0.0.1"
-BACKEND_PORT=4924
+BACKEND_PORT=18888
 MODE="prod"   # prod | dev
 
 # systemd
@@ -76,7 +76,7 @@ while [ $# -gt 0 ]; do
 选项:
   --dev          以开发模式启动前端（vite dev，HMR）
   --prod         以生产模式启动前端（vite build + vite preview，默认）
-  --port <port>  指定前端端口（默认 4923）
+  --port <port>  指定前端端口（默认 5173）
 
 子命令（手动模式）:
   start              启动前后端服务（默认）
@@ -96,7 +96,7 @@ while [ $# -gt 0 ]; do
   run-frontend       前台运行前端（不要手动调用）
 
 示例:
-  $0                       # 生产模式启动，前端端口 4923
+  $0                       # 生产模式启动，前端端口 5173
   $0 --dev                 # 开发模式启动
   $0 stop                  # 停止服务
   sudo $0 install-systemd  # 安装为系统服务，开机自启

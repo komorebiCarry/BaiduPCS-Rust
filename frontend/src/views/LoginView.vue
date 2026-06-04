@@ -220,7 +220,7 @@
       <!-- 底部信息 -->
       <div class="footer">
         <p>基于 Rust + Axum + Vue 3 构建</p>
-        <p class="version">v1.0.0</p>
+        <p class="version">v1.14.1</p>
       </div>
     </div>
   </div>

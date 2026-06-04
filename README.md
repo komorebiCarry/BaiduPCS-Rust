@@ -281,7 +281,20 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v1.14.0 (当前版本)
+### v1.14.1 (当前版本)
+
+**新功能：**
+- ✨ **下载目录权限提示（Linux/macOS）**：文件选择弹窗显示目录属主/运行用户/是否可写，下载前即可发现权限不匹配；可写性判断用内核 `faccessat`，正确覆盖 root/附加组/ACL（感谢 @hamr-hub PR #91）
+- ✨ **本地部署脚本 `scripts/local-deploy.sh`**：不依赖 Docker，一键构建/启停后端+前端，支持 status/logs 与 systemd 开机自启
+
+**问题修复：**
+- 🐛 **修复分享转存生成多余 `/sharelink` 目录**：以文件路径为准识别并剥离 `sharelink<uk>-<shareid>` 虚拟根，并持久化分享根路径稳定推导 share_root
+- 🐛 **修复开发模式前端连不上后端**：dev 模式 Vite 代理与 docker-compose.dev 端口统一为 18888
+
+<details>
+<summary><b>v1.14.0 / v1.13.0 / v1.12.2 / v1.12.1 / v1.12.0 / v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
+
+#### v1.14.0
 
 **新功能：**
 - ✨ **文件管理：重命名 / 批量复制 / 批量移动**：新增文件、文件夹的重命名以及批量复制、批量移动到目标目录，适配百度风控（authwidget / verify_scene）
@@ -292,9 +305,6 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 **问题修复：**
 - 🐛 **修复备份任务删除后父任务卡死在 Transferring**：上传子任务删除路径补送 `BackupTransferNotification::Deleted`，`AutoBackupManager` 收到后清理 `pending_*_task_ids` / `transfer_task_map`，父备份任务可正常落终态
-
-<details>
-<summary><b>v1.13.0 / v1.12.2 / v1.12.1 / v1.12.0 / v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
 
 #### v1.13.0
 
@@ -451,7 +461,7 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
     - 确保 APP 已登录你的账号
 
 2. **扫描二维码**
-    - 在浏览器中访问应用（默认 `http://localhost:4924`）
+    - 在浏览器中访问应用（默认 `http://localhost:18888`）
     - 页面会自动显示登录二维码
     - 打开百度网盘 APP，点击"扫一扫"功能
     - 扫描网页上显示的二维码
@@ -583,7 +593,7 @@ cd baidupcs-rust
 # 2. 运行容器（使用预构建镜像）
 docker run -d \
   --name baidu-netdisk-rust \
-  -p 4924:4924 \
+  -p 18888:18888 \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/downloads:/app/downloads \
   -v $(pwd)/data:/app/data \
@@ -593,7 +603,7 @@ docker run -d \
   komorebicarry/baidupcs-rust:latest
 
 # 3. 访问应用
-open http://localhost:4924
+open http://localhost:18888
 ```
 
 **使用 docker-compose**：
@@ -610,7 +620,7 @@ cd baidupcs-rust
 docker-compose -f docker-compose.image.yml up -d
 
 # 4. 访问应用
-open http://localhost:4924
+open http://localhost:18888
 ```
 
 #### 方式二：从源码构建
@@ -624,7 +634,7 @@ cd BaiduPCS-Rust
 docker-compose up -d
 
 # 3. 访问应用
-open http://localhost:4924
+open http://localhost:18888
 ```
 
 <details>
@@ -632,9 +642,9 @@ open http://localhost:4924
 
 **说明**：
 - Docker 容器内，后端 API 服务和前端静态文件服务运行在同一个进程中
-- 只需要暴露一个端口（4924）即可访问完整应用
-- 前端页面和 API 调用都通过 `http://localhost:4924` 访问
-- 前端在容器内部通过 `http://localhost:4924/api/v1` 调用后端 API
+- 只需要暴露一个端口（18888）即可访问完整应用
+- 前端页面和 API 调用都通过 `http://localhost:18888` 访问
+- 前端在容器内部通过 `http://localhost:18888/api/v1` 调用后端 API
 - **挂载目录说明**：
     - `config`：配置文件目录，包含以下重要文件：
         - `encryption.json`：加密密钥文件
@@ -660,7 +670,7 @@ open http://localhost:4924
   # 加载后可以使用镜像运行容器
   docker run -d \
     --name baidu-netdisk-rust \
-    -p 4924:4924 \
+    -p 18888:18888 \
     -v $(pwd)/config:/app/config \
     -v $(pwd)/downloads:/app/downloads \
     -v $(pwd)/data:/app/data \
@@ -698,7 +708,7 @@ npm run build
 npm run dev
 ```
 
-访问 http://localhost:5173（开发模式）或 http://localhost:4924（生产模式）
+访问 http://localhost:5173（开发模式）或 http://localhost:18888（生产模式）
 
 ---
 
