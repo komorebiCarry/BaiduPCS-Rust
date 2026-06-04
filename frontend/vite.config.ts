@@ -14,11 +14,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:18888',
         changeOrigin: true
       },
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: 'ws://localhost:18888',
         ws: true,
         changeOrigin: true,
         // 去掉 /ws 前缀，转发为 /api/v1/ws
@@ -26,7 +26,7 @@ export default defineConfig({
       },
       // 兼容直接访问 /api/v1/ws（部分场景可能未走 /ws 前缀）
       '/api/v1/ws': {
-        target: 'ws://localhost:8080',
+        target: 'ws://localhost:18888',
         ws: true,
         changeOrigin: true
       }

@@ -14,6 +14,20 @@ use crate::config::{EnvDetector, MountDetector};
 use super::guard::PathGuard;
 use super::types::*;
 
+/// 通过内核判断有效用户(effective uid/gid)是否对路径有写权限。
+/// 使用 faccessat + AT_EACCESS，自动覆盖 root、附加组(supplementary groups)、ACL 等情况，
+/// 避免手动解析权限位带来的误判。
+#[cfg(not(target_os = "windows"))]
+fn can_write_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+}
+
 #[cfg(not(target_os = "windows"))]
 fn get_unix_permission_info(path: &Path) -> PermissionInfo {
     use std::os::unix::fs::MetadataExt;
@@ -32,16 +46,7 @@ fn get_unix_permission_info(path: &Path) -> PermissionInfo {
     let process_user = lookup_user_name(euid);
     let process_group = lookup_group_name(egid);
 
-    let can_write = meta.map(|m| {
-        let mode = m.mode() & 0o777;
-        if dir_uid == euid {
-            (mode & 0o200) != 0
-        } else if dir_gid == egid {
-            (mode & 0o020) != 0
-        } else {
-            (mode & 0o002) != 0
-        }
-    }).unwrap_or(false);
+    let can_write = can_write_path(path);
 
     PermissionInfo {
         dir_owner,
