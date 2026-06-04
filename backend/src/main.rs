@@ -438,6 +438,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/encryption/key/export", get(handlers::autobackup::export_encryption_key))
         .route("/encryption/key", delete(handlers::autobackup::delete_encryption_key))
         .route("/encryption/key/force", delete(handlers::autobackup::force_delete_encryption_key))
+        // 🔥 分享同步 API
+        .route("/share-sync/subscriptions", get(handlers::list_subscriptions))
+        .route("/share-sync/subscriptions", post(handlers::create_subscription))
+        .route("/share-sync/subscriptions/:id", get(handlers::get_subscription))
+        .route("/share-sync/subscriptions/:id", put(handlers::update_subscription))
+        .route("/share-sync/subscriptions/:id", delete(handlers::delete_subscription))
+        .route("/share-sync/subscriptions/:id/enable", post(handlers::enable_subscription))
+        .route("/share-sync/subscriptions/:id/disable", post(handlers::disable_subscription))
+        .route("/share-sync/subscriptions/:id/trigger", post(handlers::trigger_subscription))
+        .route("/share-sync/subscriptions/:id/runs", get(handlers::list_runs))
+        .route("/share-sync/runs/:id", get(handlers::get_run))
+        .route("/share-sync/subscriptions/:id/snapshots/latest", get(handlers::latest_snapshot))
         // 🔥 加密数据导出 API
         .route("/encryption/export-bundle", post(handlers::export_bundle))
         .route("/encryption/export-mapping", get(handlers::export_mapping))
