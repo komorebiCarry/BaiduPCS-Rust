@@ -2328,7 +2328,17 @@ impl NetdiskClient {
             .or_else(|| json["share_id"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
 
-        info!("根目录响应: uk={}, share_id={}", resp_uk, resp_shareid);
+        // 从响应中提取 title（分享根的绝对路径），用于稳定推导 share_root
+        // 见 docs/share-root-fix.md
+        let share_root_path = json["title"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        info!(
+            "根目录响应: uk={}, share_id={}, share_root_path={:?}",
+            resp_uk, resp_shareid, share_root_path
+        );
 
         let list = json["list"].as_array().context("文件列表格式错误")?;
 
@@ -2378,6 +2388,7 @@ impl NetdiskClient {
             files,
             uk: resp_uk,
             shareid: resp_shareid,
+            share_root_path,
         })
     }
 

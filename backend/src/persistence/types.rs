@@ -215,6 +215,14 @@ pub struct TaskMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_status: Option<CleanupStatus>,
 
+    /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
+    ///
+    /// 用于在转存恢复 / 自动下载阶段稳定推导 share_root（剥掉分享者私有上层目录），
+    /// 避免从文件路径反推时的歧义。详见 `docs/share-root-fix.md`。
+    /// 老元数据缺该字段时反序列化为 None，调用方退化到启发式推导。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_root_path: Option<String>,
+
     // === 文件夹下载组信息 ===
     /// 文件夹下载组ID（单文件下载时为 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +336,7 @@ impl TaskMetadata {
             is_share_direct_download: None,
             temp_dir: None,
             cleanup_status: None,
+            share_root_path: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -399,6 +408,7 @@ impl TaskMetadata {
             is_share_direct_download: None,
             temp_dir: None,
             cleanup_status: None,
+            share_root_path: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -466,6 +476,7 @@ impl TaskMetadata {
             is_share_direct_download: None,
             temp_dir: None,
             cleanup_status: None,
+            share_root_path: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -535,6 +546,7 @@ impl TaskMetadata {
             is_share_direct_download: None,
             temp_dir: None,
             cleanup_status: None,
+            share_root_path: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -598,6 +610,7 @@ impl TaskMetadata {
             is_share_direct_download: None,
             temp_dir: None,
             cleanup_status: None,
+            share_root_path: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -742,6 +755,12 @@ impl TaskMetadata {
     ) {
         self.is_share_direct_download = Some(is_share_direct_download);
         self.temp_dir = temp_dir;
+        self.touch();
+    }
+
+    /// 设置分享根的绝对路径（用于稳定推导 share_root）
+    pub fn set_share_root_path(&mut self, share_root_path: Option<String>) {
+        self.share_root_path = share_root_path;
         self.touch();
     }
 

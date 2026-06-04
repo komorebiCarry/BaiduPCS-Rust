@@ -83,6 +83,8 @@ pub struct PreviewShareResult {
     pub shareid: String,
     pub uk: String,
     pub bdstoken: String,
+    /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
+    pub share_root_path: Option<String>,
 }
 
 /// handle_transfer_error 的返回值，区分恢复成功、友好失败、无法识别三种场景
@@ -238,6 +240,7 @@ impl TransferManager {
             shareid,
             uk,
             bdstoken: share_info.bdstoken,
+            share_root_path: list_result.share_root_path,
         })
     }
 
@@ -628,7 +631,7 @@ impl TransferManager {
             t.selected_fs_ids.as_ref().map_or(false, |ids| !ids.is_empty())
         };
 
-        let file_list = if has_selected_fs_ids {
+        let (file_list, share_root_path_from_api): (Vec<SharedFileInfo>, Option<String>) = if has_selected_fs_ids {
             // 用户已选择文件，只拉第一页用于展示文件名
             let result = client
                 .list_share_files(
@@ -638,10 +641,11 @@ impl TransferManager {
                     100,
                 )
                 .await?;
-            result.files
+            (result.files, result.share_root_path)
         } else {
             // 全选模式，循环分页拉取全部
             let mut all_files = Vec::new();
+            let mut share_root_path: Option<String> = None;
             let page_size: u32 = 100;
             let mut page: u32 = 1;
             loop {
@@ -654,16 +658,40 @@ impl TransferManager {
                     )
                     .await?;
                 let batch_len = result.files.len();
+                if page == 1 {
+                    share_root_path = result.share_root_path;
+                }
                 all_files.extend(result.files);
                 if (batch_len as u32) < page_size {
                     break;
                 }
                 page += 1;
             }
-            all_files
+            (all_files, share_root_path)
         };
 
-        info!("获取到 {} 个文件", file_list.len());
+        info!(
+            "获取到 {} 个文件, share_root_path={:?}",
+            file_list.len(),
+            share_root_path_from_api
+        );
+
+        // 把分享根缓存到任务，供后续转存与自动下载阶段稳定推导 share_root
+        if share_root_path_from_api.is_some() {
+            {
+                let mut t = task.write().await;
+                t.share_root_path = share_root_path_from_api.clone();
+            }
+            // 同步持久化到 WAL 元数据，确保任务恢复 / 复用历史信息时仍能拿到权威分享根
+            if let Some(ref pm_arc) = persistence_manager {
+                let pm = pm_arc.lock().await;
+                if let Err(e) =
+                    pm.update_share_root_path(task_id, share_root_path_from_api.clone())
+                {
+                    warn!("持久化分享根路径失败: task_id={}, error={}", task_id, e);
+                }
+            }
+        }
 
         // 🔥 根据 selected_fs_ids 和 selected_files 构建过滤后的文件列表
         // 优先使用前端传入的 selected_files（包含完整文件信息，支持子目录选择场景）
@@ -892,7 +920,11 @@ impl TransferManager {
 
         // ========== 转存策略：统一按原始父目录分组，保留完整目录结构 ==========
         let (transfer_result, batch_groups_info): (Result<TransferResult>, Option<Vec<BatchGroupInfo>>) = {
-            let share_root = infer_share_root(&filtered_file_list);
+            let task_share_root_path = {
+                let t = task.read().await;
+                t.share_root_path.clone()
+            };
+            let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_file_list);
             let groups = group_files_by_parent_dir(&filtered_file_list, &share_root);
             let total_groups = groups.len();
 
@@ -1511,16 +1543,17 @@ impl TransferManager {
         let task = task_info.task.clone();
         drop(task_info);
 
-        // 获取本地下载路径配置
-        let (local_download_path, ask_each_time, default_download_dir) = {
+        // 获取本地下载路径配置 + 缓存的分享根路径（用于 share_root 推导）
+        let (local_download_path, ask_each_time, default_download_dir, task_share_root_path) = {
             let t = task.read().await;
             let local_path = t.local_download_path.clone();
+            let share_root_path = t.share_root_path.clone();
             drop(t);
 
             let cfg = app_config.read().await;
             let ask = cfg.download.ask_each_time;
             let default_dir = cfg.download.download_dir.clone();
-            (local_path, ask, default_dir)
+            (local_path, ask, default_dir, share_root_path)
         };
 
         // 确定下载目录
@@ -1578,7 +1611,7 @@ impl TransferManager {
         }
 
         let save_prefix = save_path.trim_end_matches('/');
-        let share_root = infer_share_root(&file_list);
+        let share_root = derive_share_root(task_share_root_path.as_deref(), &file_list);
 
         for (idx, transferred_path) in transfer_result.transferred_paths.iter().enumerate() {
             let transferred_fs_id = transfer_result.transferred_fs_ids.get(idx).copied();
@@ -2477,7 +2510,7 @@ impl TransferManager {
         task: &Arc<RwLock<TransferTask>>,
         client: &NetdiskClient,
     ) -> Result<Vec<(String, Option<u64>, Option<String>, String)>> {
-        let (selected_files, selected_fs_ids, file_list, temp_dir) = {
+        let (selected_files, selected_fs_ids, file_list, temp_dir, task_share_root_path) = {
             let t = task.read().await;
             let td = t.temp_dir.clone().filter(|s| !s.is_empty());
             (
@@ -2485,6 +2518,7 @@ impl TransferManager {
                 t.selected_fs_ids.clone(),
                 t.file_list.clone(),
                 td,
+                t.share_root_path.clone(),
             )
         };
 
@@ -2616,33 +2650,15 @@ impl TransferManager {
         }
 
         // ========== 预计算 share_root（Phase 1/2 共用） ==========
-        // 推导 files_to_check 的公共父目录（即分享浏览目录）
-        // 按路径段（/分隔）逐段比较，避免 /share/A 错匹配 /share/AB
-        // 注意：所有文件的父目录都参与计算（包括根级文件的空父路径）
-        let share_root = {
-            let parents: Vec<Vec<&str>> = files_to_check
-                .iter()
-                .map(|f| {
-                    let parent = f.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-                    parent.split('/').collect::<Vec<_>>()
-                })
-                .collect();
-            if parents.is_empty() {
-                String::new()
-            } else {
-                let mut common_segments = parents[0].clone();
-                for segs in &parents[1..] {
-                    let match_len = common_segments
-                        .iter()
-                        .zip(segs.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    common_segments.truncate(match_len);
-                }
-                common_segments.join("/")
-            }
-        };
-        debug!("推导的分享根目录: {:?}", share_root);
+        // 优先使用任务里持久化的分享根（来自 share/list?root=1 响应的 title 字段），
+        // 与转存主链路保持一致；title 缺失时退化到最长公共父目录启发式（见 derive_share_root）。
+        // 详见 docs/share-root-fix.md。
+        let share_root = derive_share_root(task_share_root_path.as_deref(), &files_to_check);
+        debug!(
+            "推导的分享根目录: {:?} (title_available={})",
+            share_root,
+            task_share_root_path.is_some()
+        );
 
         let temp_base = temp_dir.trim_end_matches('/');
 
@@ -3106,6 +3122,8 @@ impl TransferManager {
             temp_dir: metadata.temp_dir.clone(),
             selected_fs_ids: None,
             selected_files: None,
+            // 恢复分享根路径（老元数据缺该字段时为 None，调用方退化到启发式）
+            share_root_path: metadata.share_root_path.clone(),
         })
     }
 
@@ -3388,6 +3406,9 @@ impl TransferManager {
         // 恢复任务 ID（保持原有 ID）
         task.id = task_id.clone();
         task.created_at = recovery_info.created_at;
+
+        // 恢复分享根路径，避免恢复后退化到启发式推导
+        task.share_root_path = recovery_info.share_root_path.clone();
 
         // 恢复文件列表
         if let Some(ref json) = recovery_info.file_list_json {
@@ -3838,13 +3859,17 @@ fn detect_cross_dir_duplicates(files: &[SharedFileInfo]) -> Vec<String> {
         .collect()
 }
 
-/// 推导分享文件的公共父目录，用于计算文件的相对目录结构。
+/// 在缺少 API 权威分享根（`title` 字段）时，从文件路径反推 share_root 的兜底逻辑。
 ///
 /// 取所有文件路径的最长公共父目录。例如：
 /// - 单文件 `/a/b/c/file.mp4` → share_root = `/a/b/c`
 /// - 多文件 `/root/抖音/1.jpg`, `/root/微信/2.jpg` → share_root = `/root`
 /// - `/sharelink123/dir/file` → share_root = `/sharelink123/dir`
-fn infer_share_root(files: &[SharedFileInfo]) -> String {
+///
+/// 注意：单凭文件路径无法稳定区分"分享者私有上层"和"分享根"，启发式在不同分享深度
+/// 下都会失效。优先使用 `share/list?root=1` 响应中的 `title` 字段（参见
+/// `derive_share_root` 与 `docs/share-root-fix.md`），仅在 title 缺失时回退到此函数。
+fn infer_share_root_fallback(files: &[SharedFileInfo]) -> String {
     if files.is_empty() {
         return String::new();
     }
@@ -3867,6 +3892,24 @@ fn infer_share_root(files: &[SharedFileInfo]) -> String {
     } else {
         common
     }
+}
+
+/// 推导用于剥离分享者私有上层目录的 share_root。
+///
+/// 优先使用百度 `share/list?root=1` 响应里的 `title` 字段（分享根的绝对路径），
+/// 取其父目录即为分享者私有上层；title 缺失或为空时退化到
+/// [`infer_share_root_fallback`] 的最长公共父目录启发式。
+///
+/// 详见 `docs/share-root-fix.md`。
+fn derive_share_root(share_root_path: Option<&str>, files: &[SharedFileInfo]) -> String {
+    if let Some(title) = share_root_path {
+        if !title.is_empty() {
+            // dirname(title)：分享根本身需要保留在 relative_parent 里，
+            // 因此 share_root 取分享根的"父目录"，正好是要剥掉的私有部分。
+            return extract_parent_dir_str(title).to_string();
+        }
+    }
+    infer_share_root_fallback(files)
 }
 
 /// 按原始父目录分组文件，保留分享链接中的目录结构。
@@ -4131,7 +4174,7 @@ mod tests {
             make_file("/root/a/2.jpg", 2),
             make_file("/root/a/3.jpg", 3),
         ];
-        let share_root = infer_share_root(&files);
+        let share_root = infer_share_root_fallback(&files);
         assert_eq!(share_root, "/root/a");
         let groups = group_files_by_parent_dir(&files, &share_root);
         assert_eq!(groups.len(), 1, "同目录文件应只有 1 个组");
@@ -4145,7 +4188,7 @@ mod tests {
             make_file("/root/抖音/1.jpg", 1),
             make_file("/root/微信/1.jpg", 2),
         ];
-        let share_root = infer_share_root(&files);
+        let share_root = infer_share_root_fallback(&files);
         let groups = group_files_by_parent_dir(&files, &share_root);
         assert_eq!(groups.len(), 2, "不同父目录应分为 2 个组");
         // sorted by UTF-8 byte order: 微信 < 抖音
@@ -4164,7 +4207,7 @@ mod tests {
             make_file("/root/A/2.jpg", 3),
             make_file("/root/C/3.jpg", 4),
         ];
-        let share_root = infer_share_root(&files);
+        let share_root = infer_share_root_fallback(&files);
         let groups = group_files_by_parent_dir(&files, &share_root);
         assert_eq!(groups.len(), 3, "3 个不同父目录应分为 3 个组");
         let total: usize = groups.iter().map(|(_, g)| g.len()).sum();
@@ -4180,7 +4223,7 @@ mod tests {
             make_file("/root/a/b/file.jpg", 1),
             make_file("/root/c/d/file.jpg", 2),
         ];
-        let share_root = infer_share_root(&files);
+        let share_root = infer_share_root_fallback(&files);
         let groups = group_files_by_parent_dir(&files, &share_root);
         assert_eq!(groups.len(), 2);
         // sorted: "a/b" < "c/d"
@@ -4195,12 +4238,124 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_share_root_for_cross_dir_duplicates() {
+    fn test_infer_share_root_fallback_for_cross_dir_duplicates() {
         let files = vec![
             make_file("/root/dir_a/7.mp4", 1),
             make_file("/root/dir_b/7.mp4", 2),
         ];
-        assert_eq!(infer_share_root(&files), "/root");
+        assert_eq!(infer_share_root_fallback(&files), "/root");
+    }
+
+    // ========== derive_share_root（基于 share/list title 字段） ==========
+
+    /// Case A（issue #62 后续反馈）：分享者私有上层只有 1 段，
+    /// 用户选中"纯净版"子目录下的文件，期望本地保留 `久别.../纯净版/` 两层。
+    #[test]
+    fn test_derive_share_root_from_title_case_a_pure_version() {
+        let title = "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版";
+        let files = vec![
+            make_file(
+                "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我跟妈妈1.mp4",
+                1,
+            ),
+            make_file(
+                "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我跟妈妈2.mp4",
+                2,
+            ),
+        ];
+        let share_root = derive_share_root(Some(title), &files);
+        assert_eq!(share_root, "/爸爸，别再丢下我和妈妈");
+
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "久别不成悲18集包含纯净版/纯净版");
+    }
+
+    /// Case B（PR #78 修复目标）：分享者私有上层有多段，
+    /// 用户选中分享根目录本身，期望 relative_parent 为空。
+    #[test]
+    fn test_derive_share_root_from_title_case_b_deep_private_path() {
+        let title = "/纪录片群合集/整理清晰纪录片合集/01.BBC英国广播公司/K/BBC.恐龙行星.第1季";
+        let files = vec![make_file(
+            "/纪录片群合集/整理清晰纪录片合集/01.BBC英国广播公司/K/BBC.恐龙行星.第1季",
+            1,
+        )];
+        let share_root = derive_share_root(Some(title), &files);
+        assert_eq!(
+            share_root,
+            "/纪录片群合集/整理清晰纪录片合集/01.BBC英国广播公司/K"
+        );
+
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "");
+    }
+
+    /// title 缺失（None / 空字符串）时退化到最长公共父目录启发式。
+    #[test]
+    fn test_derive_share_root_falls_back_when_title_missing() {
+        let files = vec![
+            make_file("/root/抖音/1.jpg", 1),
+            make_file("/root/微信/2.jpg", 2),
+        ];
+        assert_eq!(derive_share_root(None, &files), "/root");
+        assert_eq!(derive_share_root(Some(""), &files), "/root");
+    }
+
+    /// 回归：-30 冲突恢复路径必须用 derive_share_root，而不是文件最长公共父目录。
+    /// 在 Case A（用户选纯净版子目录里的多个文件）下，最长公共父目录会把 "纯净版"
+    /// 那一层吃掉，导致 expected_path 计算错误、临时目录回查无法命中。
+    /// 用 title 推导后 share_root = dirname(title)，relative 才能保留 "纯净版/file" 两层。
+    /// 详见 docs/share-root-fix.md。
+    #[test]
+    fn test_derive_share_root_matches_main_path_for_conflict_recovery_case_a() {
+        let title = "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版";
+        let files = vec![
+            make_file(
+                "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我跟妈妈1.mp4",
+                1,
+            ),
+            make_file(
+                "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我跟妈妈2.mp4",
+                2,
+            ),
+        ];
+
+        // 用户原意期望的 share_root（来自 title）
+        let with_title = derive_share_root(Some(title), &files);
+        assert_eq!(with_title, "/爸爸，别再丢下我和妈妈");
+
+        // 旧 fallback 启发式（最长公共父目录）会错误地把"纯净版"也吃掉
+        let fallback = derive_share_root(None, &files);
+        assert_eq!(
+            fallback,
+            "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版/纯净版"
+        );
+
+        // 因此两种推导出的 relative 不同：title 路径保留 "纯净版/" 一层；fallback 不保留。
+        let temp_base = "/.bpr_share_temp/uuid";
+        let with_title_relative = files[0]
+            .path
+            .strip_prefix(&with_title)
+            .unwrap()
+            .trim_start_matches('/');
+        let with_title_expected = format!("{}/{}", temp_base, with_title_relative);
+        assert_eq!(
+            with_title_expected,
+            "/.bpr_share_temp/uuid/久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我跟妈妈1.mp4"
+        );
+
+        let fallback_relative = files[0]
+            .path
+            .strip_prefix(&fallback)
+            .unwrap()
+            .trim_start_matches('/');
+        let fallback_expected = format!("{}/{}", temp_base, fallback_relative);
+        // 旧路径会期望临时目录直接是 basename，与主转存的目录结构不一致
+        assert_eq!(
+            fallback_expected,
+            "/.bpr_share_temp/uuid/爸爸，别再丢下我跟妈妈1.mp4"
+        );
     }
 
     // ========== local_dir derivation from transferred_path ==========
