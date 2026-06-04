@@ -19,6 +19,26 @@ fn internal_error(msg: &str) -> ApiError {
     ApiError::Internal(anyhow::anyhow!("{}", msg))
 }
 
+fn map_config_save_error(msg: &str) -> ApiError {
+    let lower = msg.to_lowercase();
+    if msg.contains("保存配置失败")
+        || msg.contains("保存下载目录")
+        || msg.contains("路径不可写")
+        || msg.contains("没有写入权限")
+        || msg.contains("写入配置文件")
+        || lower.contains("failed to create config directory")
+        || lower.contains("failed to write config file")
+        || lower.contains("permission denied")
+        || lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("invalid input")
+        || msg.contains("配置文件") {
+        ApiError::BadRequest(msg.to_string())
+    } else {
+        internal_error(msg)
+    }
+}
+
 fn not_found_error(msg: &str) -> ApiError {
     ApiError::NotFound(msg.to_string())
 }
@@ -999,7 +1019,7 @@ pub async fn update_trigger_config(
     config
         .save_to_file("config/app.toml")
         .await
-        .map_err(|e| internal_error(&e.to_string()))?;
+        .map_err(|e| map_config_save_error(&e.to_string()))?;
 
     // 更新内存中的配置
     *app_state.config.write().await = config.clone();

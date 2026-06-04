@@ -6,7 +6,8 @@
 use crate::share_sync::types::{ConflictStrategy, PollMode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 /// 网盘目标
@@ -197,6 +198,8 @@ impl ShareSubscription {
                     if t.local_path.as_os_str().is_empty() {
                         return Err(format!("目标 #{} 本地路径不能为空", idx + 1));
                     }
+                    validate_local_path(&t.local_path)
+                        .map_err(|e| format!("目标 #{} {}", idx + 1, e))?;
                 }
             }
         }
@@ -221,6 +224,42 @@ impl ShareSubscription {
         }
         Ok(())
     }
+}
+
+fn validate_local_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "本地路径必须是绝对路径: {}",
+            path.to_string_lossy()
+        ));
+    }
+    let meta = path
+        .metadata()
+        .map_err(|e| format!("本地路径不可访问: {} ({})", path.to_string_lossy(), e))?;
+    if !meta.is_dir() {
+        return Err(format!("本地路径必须是目录: {}", path.to_string_lossy()));
+    }
+    if meta.permissions().readonly() {
+        return Err(format!("本地路径不可写: {}", path.to_string_lossy()));
+    }
+
+    if let Ok(system_time) = SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let probe = path.join(format!(
+            ".baidu-pcs-rust-share-sync-probe-{}",
+            system_time.as_nanos()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| {
+                format!("本地路径不可写: {} ({})", path.to_string_lossy(), e)
+            })?;
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    Ok(())
 }
 
 // =====================================================
@@ -354,17 +393,50 @@ mod tests {
 
     #[test]
     fn test_validate_short_interval() {
+        let tmp = std::env::temp_dir();
         let mut sub = ShareSubscription::new(
             "t".into(),
             "https://pan.baidu.com/s/1abc".into(),
             vec![SyncTarget::Local(LocalTarget {
-                local_path: PathBuf::from("/tmp/x"),
+                local_path: tmp,
                 conflict_strategy: None,
             })],
         );
         sub.poll_config.interval_secs = 60;
         let err = sub.validate().unwrap_err();
         assert!(err.contains("不能小于"));
+    }
+
+    #[test]
+    fn test_validate_local_path_must_be_absolute() {
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1abc".into(),
+            vec![SyncTarget::Local(LocalTarget {
+                local_path: PathBuf::from("relative/path"),
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("本地路径必须是绝对路径"));
+    }
+
+    #[test]
+    fn test_validate_local_path_not_directory() {
+        let tmp = std::env::temp_dir().join("baidu-pcs-rust-share-sync-test-file");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"probe").unwrap();
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1abc".into(),
+            vec![SyncTarget::Local(LocalTarget {
+                local_path: tmp,
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("本地路径必须是目录"));
+        let _ = std::fs::remove_file(std::env::temp_dir().join("baidu-pcs-rust-share-sync-test-file"));
     }
 
     #[test]

@@ -2,15 +2,59 @@
 
 use crate::config::{
     AppConfig, DownloadConfig, PathValidationResult, VipRecommendedConfig, VipType,
+    PathValidator,
 };
 use crate::server::error::{ApiError, ApiResult};
 use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
+use anyhow::Error as AnyhowError;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::ApiResponse;
+
+fn map_config_save_error(err: AnyhowError) -> ApiError {
+    let msg = err.to_string();
+    let has_io_permission_error = err
+        .chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| {
+                    matches!(
+                        io_err.kind(),
+                        ErrorKind::PermissionDenied
+                            | ErrorKind::NotFound
+                            | ErrorKind::InvalidInput
+                    )
+                })
+        });
+
+    let normalized = msg.to_lowercase();
+    if msg.contains("保存配置失败")
+        || msg.contains("路径不存在")
+        || msg.contains("下载目录不存在")
+        || normalized.contains("permission denied")
+        || normalized.contains("read-only")
+        || normalized.contains("read only")
+        || normalized.contains("no such file")
+        || normalized.contains("no space")
+        || has_io_permission_error
+        || msg.contains("保存下载目录")
+        || msg.contains("写入配置文件")
+        || msg.contains("写入配置失败")
+        || msg.contains("路径不可写")
+        || msg.contains("没有写入权限")
+        || msg.contains("Failed to write config file")
+        || msg.contains("Failed to create config directory")
+    {
+        ApiError::BadRequest(msg)
+    } else {
+        ApiError::Internal(err)
+    }
+}
 
 /// 推荐配置响应
 #[derive(Debug, Serialize)]
@@ -100,7 +144,7 @@ pub async fn reset_to_recommended(
     config
         .save_to_file("config/app.toml")
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_config_save_error)?;
 
     // 更新内存中的配置
     *app_state.config.write().await = config.clone();
@@ -199,7 +243,7 @@ pub async fn update_config(
     let validation_result = new_config
         .save_to_file("config/app.toml")
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_config_save_error)?;
 
     // 更新内存中的配置
     *app_state.config.write().await = new_config.clone();
@@ -452,7 +496,7 @@ pub async fn update_recent_dir(
     config
         .save_to_file("config/app.toml")
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_config_save_error)?;
 
     // 更新内存中的配置
     *app_state.config.write().await = config;
@@ -481,9 +525,16 @@ pub async fn set_default_download_dir(
         return Err(ApiError::BadRequest("路径必须是绝对路径".to_string()));
     }
 
-    // 验证路径存在
-    if !path.exists() {
-        return Err(ApiError::BadRequest(format!("目录不存在: {}", req.path)));
+    // 验证目录可用性（存在性、可写性、目录类型）
+    let env_info = AppConfig::get_env_info();
+    let validation = PathValidator::validate_with_docker_check(&path, env_info.is_docker);
+    if !validation.valid {
+        let msg = if let Some(details) = validation.details {
+            format!("{}。详情: {}", validation.message, details)
+        } else {
+            validation.message.clone()
+        };
+        return Err(ApiError::BadRequest(format!("默认下载目录不可用: {}", msg)));
     }
 
     // 获取当前配置
@@ -497,7 +548,7 @@ pub async fn set_default_download_dir(
     config
         .save_to_file("config/app.toml")
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_config_save_error)?;
 
     // 更新内存中的配置
     *app_state.config.write().await = config.clone();
@@ -592,7 +643,7 @@ pub async fn get_transfer_config(
             write_config
                 .save_to_file("config/app.toml")
                 .await
-                .map_err(ApiError::Internal)?;
+                .map_err(map_config_save_error)?;
 
             Ok(Json(ApiResponse::success(TransferConfigResponse {
                 default_behavior: default_behavior.clone(),
@@ -650,7 +701,7 @@ pub async fn update_transfer_config(
     config
         .save_to_file("config/app.toml")
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(map_config_save_error)?;
 
     // 更新内存中的配置
     *app_state.config.write().await = config.clone();

@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
+use std::io::ErrorKind;
 use std::fmt;
 
 /// API 错误类型
@@ -53,13 +54,19 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message, details) = match self {
             ApiError::Internal(e) => {
-                tracing::error!("Internal error: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    500,
-                    "Internal server error".to_string(),
-                    Some(e.to_string()),
-                )
+                let msg = e.to_string();
+                if is_config_input_error(&e) {
+                    tracing::warn!("Config/validation error (mapped as 400): {}", msg);
+                    (StatusCode::BAD_REQUEST, 400, msg, None)
+                } else {
+                    tracing::error!("Internal error: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        500,
+                        "Internal server error".to_string(),
+                        Some(msg),
+                    )
+                }
             }
             ApiError::Unauthorized(msg) => {
                 tracing::warn!("Unauthorized: {}", msg);
@@ -91,6 +98,55 @@ impl IntoResponse for ApiError {
 
         (status, body).into_response()
     }
+}
+
+fn is_config_input_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    let lower = message.to_lowercase();
+    let is_config_related = message.contains("配置")
+        || lower.contains("config")
+        || message.contains("下载目录")
+        || lower.contains("download_dir");
+
+    if !is_config_related {
+        return false;
+    }
+
+    if message.contains("保存配置失败")
+        || message.contains("下载目录不存在")
+        || message.contains("路径不存在")
+        || message.contains("路径不可写")
+        || message.contains("没有写入权限")
+        || message.contains("保存下载目录")
+        || message.contains("Failed to create config directory")
+        || message.contains("Failed to write config file")
+        || lower.contains("permission denied")
+        || lower.contains("read-only")
+        || lower.contains("read only")
+        || lower.contains("readonly")
+        || lower.contains("invalid input")
+        || lower.contains("failed to create config directory")
+        || lower.contains("failed to write config file")
+        || lower.contains("no such file")
+        || lower.contains("not found")
+    {
+        return true;
+    }
+
+    error
+        .chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| {
+                    matches!(
+                        io_err.kind(),
+                        ErrorKind::PermissionDenied
+                            | ErrorKind::NotFound
+                            | ErrorKind::InvalidInput
+                    )
+                })
+        })
 }
 
 /// 从 anyhow::Error 转换

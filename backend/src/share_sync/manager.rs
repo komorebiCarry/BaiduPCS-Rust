@@ -250,9 +250,8 @@ impl ShareSyncManager {
             let g = self.netdisk_client.read().await;
             g.clone()
         };
-        let netdisk = netdisk.ok_or_else(|| {
-            ShareSyncError::Internal("网盘客户端未登录，请先登录百度账号".into())
-        })?;
+        let netdisk = netdisk
+            .ok_or_else(|| ShareSyncError::ConfigError("网盘客户端未登录，请先登录百度账号".into()))?;
 
         let run_id = Uuid::new_v4().to_string();
         self.publisher.publish(ShareSyncEvent::RunStarted {
@@ -283,15 +282,16 @@ impl ShareSyncManager {
             }
         };
 
-        // 2) 绑定 subscription_id 并入库
+        // 2) 绑定 subscription_id 后，先读"上次快照"再保存当前快照，
+        //    否则 latest_snapshot 会把刚保存的 curr 当成 prev，导致 diff 永远为空。
         let mut curr_snapshot = curr_snapshot;
         curr_snapshot.subscription_id = id.into();
+        let prev = self.persistence.latest_snapshot(id).ok().flatten();
         if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
             warn!("save_snapshot 失败: {}", e);
         }
 
-        // 3) diff（用上次快照）
-        let prev = self.persistence.latest_snapshot(id).ok().flatten();
+        // 3) diff
         let diff = diff_snapshots(prev.as_ref(), &curr_snapshot);
 
         self.publisher.publish(ShareSyncEvent::DiffDetected {
@@ -522,6 +522,14 @@ impl ExecutorHooks for ProductionHooks {
                             "share-sync: download submitted task_id={} actual={}",
                             task_id_clone, dl_task_id
                         );
+                        // 🔥 关键修复：create_task_with_dir 只把任务设为 Pending，
+                        // 必须显式 start_task 才会真正开始下载。
+                        if let Err(e) = dm.start_task(&dl_task_id).await {
+                            error!(
+                                "share-sync: download start_task 失败: task={} err={}",
+                                dl_task_id, e
+                            );
+                        }
                     }
                     Err(e) => {
                         error!("share-sync: download 创建失败: {}", e);
@@ -577,7 +585,7 @@ mod tests {
             name.into(),
             "https://pan.baidu.com/s/1abc".into(),
             vec![SyncTarget::Local(LocalTarget {
-                local_path: PathBuf::from("/tmp/x"),
+                local_path: std::env::temp_dir(),
                 conflict_strategy: None,
             })],
         )

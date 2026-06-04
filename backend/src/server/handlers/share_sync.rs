@@ -7,6 +7,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::pin::Pin;
+use std::future::Future;
 use tracing::error;
 
 use crate::server::error::ApiError;
@@ -42,9 +44,9 @@ async fn get_manager(state: &AppState) -> Result<Arc<ShareSyncManager>, ApiError
     let g = state.share_sync_manager.read().await;
     match &*g {
         Some(m) => Ok(Arc::clone(m)),
-        None => Err(ApiError::Internal(anyhow::anyhow!(
-            "ShareSyncManager 未初始化"
-        ))),
+        None => Err(ApiError::BadRequest(
+            "ShareSyncManager 未初始化，请先登录并重试".to_string(),
+        )),
     }
 }
 
@@ -66,8 +68,30 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
         ShareSyncError::SubscriptionExists(m) => ApiError::Conflict(m),
         ShareSyncError::ConfigError(m) => err_bad(&m),
         ShareSyncError::ShareLinkError(m) => err_bad(&m),
-        other => err_internal(&other.to_string()),
+        ShareSyncError::FileSystemError(m) => err_bad(&m),
+        ShareSyncError::NetworkError(m) => err_bad(&format!("网络错误: {}", m)),
+        ShareSyncError::PersistenceError(m) => {
+            if m.contains("读取配置") || m.contains("保存配置") || m.contains("路径") || m.contains("目录") || m.contains("权限") {
+                err_bad(&m)
+            } else {
+                err_internal(&m)
+            }
+        }
+        ShareSyncError::TransferError(m) => err_bad(&m),
+        ShareSyncError::DownloadError(m) => err_bad(&m),
+        ShareSyncError::SchedulerError(m) => err_bad(&m),
+        ShareSyncError::Internal(m) => err_internal(&m),
     }
+}
+
+fn ensure_subscription_exists(
+    manager: &Arc<ShareSyncManager>,
+    id: &str,
+) -> ApiResult<()> {
+    if manager.get_subscription(id).is_none() {
+        return Err(err_not_found("订阅不存在"));
+    }
+    Ok(())
 }
 
 // =====================================================
@@ -206,14 +230,13 @@ pub async fn list_runs(
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<ApiResponse<Vec<RunRecord>>>> {
     let m = get_manager(&state).await?;
+    ensure_subscription_exists(&m, &id)?;
     let (page, ps) = normalize_pagination(q.page, q.page_size);
-    match m.persistence().list_runs(&id, page, ps) {
-        Ok(list) => Ok(Json(ApiResponse::success(list))),
-        Err(e) => {
-            error!("list_runs 失败: {}", e);
-            Err(err_internal(&e.to_string()))
-        }
-    }
+    let list = m
+        .persistence()
+        .list_runs(&id, page, ps)
+        .map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(list)))
 }
 
 /// GET /api/v1/share-sync/runs/:id
@@ -225,12 +248,12 @@ pub async fn get_run(
     let rec = m
         .persistence()
         .get_run(&id)
-        .map_err(|e| err_internal(&e.to_string()))?
+        .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
     let items = m
         .persistence()
         .list_run_items(&id)
-        .map_err(|e| err_internal(&e.to_string()))?;
+        .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(RunDetailDto {
         run: rec,
         items,
@@ -250,14 +273,202 @@ pub async fn latest_snapshot(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
+    ensure_subscription_exists(&m, &id)?;
     match m
         .persistence()
         .latest_snapshot(&id)
-        .map_err(|e| err_internal(&e.to_string()))?
+        .map_err(map_share_err)?
     {
-        Some(snap) => Ok(Json(ApiResponse::success(serde_json::to_value(&snap).unwrap()))),
+        Some(snap) => Ok(Json(ApiResponse::success(
+            serde_json::to_value(&snap)
+                .map_err(|e| err_internal(&format!("快照序列化失败: {}", e)))?,
+        ))),
         None => Err(err_not_found("该订阅暂无快照")),
     }
+}
+
+// =====================================================
+// 预览分享目录树（用于前端选择 include_paths）
+// =====================================================
+
+#[derive(Debug, Deserialize)]
+pub struct PreviewTreeRequest {
+    pub share_url: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// 展开深度（1 = 仅根，2 = 根 + 1 层子目录，默认 2）
+    #[serde(default = "default_tree_depth")]
+    pub depth: u32,
+}
+
+fn default_tree_depth() -> u32 {
+    2
+}
+
+#[derive(Debug, Serialize)]
+pub struct TreeNode {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub fs_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<TreeNode>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreviewTreeResponse {
+    pub root: Vec<TreeNode>,
+    pub short_key: String,
+    pub shareid: String,
+}
+
+/// POST /api/v1/share-sync/preview-tree
+///
+/// 输入：分享链接 + 提取码 + 深度
+/// 输出：根节点直接 children 的目录树（每项含 `path` 用于回填 include_paths）
+pub async fn preview_tree(
+    State(state): State<AppState>,
+    Json(req): Json<PreviewTreeRequest>,
+) -> ApiResult<Json<ApiResponse<PreviewTreeResponse>>> {
+    if req.share_url.trim().is_empty() {
+        return Err(err_bad("share_url 不能为空"));
+    }
+    let depth = req.depth.clamp(1, 4);
+
+    // 取 NetdiskClient（必须已登录）
+    let client = {
+        let g = state.netdisk_client.read().await;
+        match &*g {
+            Some(c) => c.clone(),
+            None => return Err(err_bad("网盘客户端未初始化，请先登录百度账号")),
+        }
+    };
+
+    // 解析链接
+    let share_link = client
+        .parse_share_link(&req.share_url)
+        .map_err(|e| err_bad(&format!("解析分享链接失败: {}", e)))?;
+    let effective_pwd = req.password.or(share_link.password.clone());
+
+    // 访问分享页取 bdstoken
+    let page = client
+        .access_share_page(&share_link.short_key, &effective_pwd, true)
+        .await
+        .map_err(|e| err_bad(&format!("访问分享页失败: {}", e)))?;
+    if page.shareid.is_empty() {
+        return Err(err_bad("分享页面返回的 shareid 为空"));
+    }
+
+    // 🔥 关键：如有密码，先 verify_share_password 拿到 randsk 写入 Cookie，
+    // 否则 list_share_files 会返回 errno=-9 "提取码验证失败"。
+    if let Some(ref pwd) = effective_pwd {
+        if !pwd.is_empty() {
+            let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+            if let Err(e) = client
+                .verify_share_password(
+                    &page.shareid,
+                    &page.share_uk,
+                    &page.bdstoken,
+                    pwd,
+                    &referer,
+                )
+                .await
+            {
+                return Err(err_bad(&format!("验证提取码失败: {}", e)));
+            }
+        }
+    }
+
+    // 列根
+    let root = client
+        .list_share_files(&share_link.short_key, &page.bdstoken, 1, 100)
+        .await
+        .map_err(|e| err_bad(&format!("列根失败: {}", e)))?;
+    let root_shareid = if !root.shareid.is_empty() {
+        root.shareid
+    } else {
+        page.shareid.clone()
+    };
+    let root_uk = if !root.uk.is_empty() {
+        root.uk
+    } else {
+        page.uk.clone()
+    };
+
+    // 展开为 TreeNode（异步递归 → 用 Box::Future 显式签名）
+    let mut out: Vec<TreeNode> = Vec::with_capacity(root.files.len());
+    for f in root.files {
+        let node = build_tree_node(
+            &client,
+            &share_link.short_key,
+            &root_shareid,
+            &root_uk,
+            &page.bdstoken,
+            f,
+            depth - 1,
+        )
+        .await;
+        out.push(node);
+    }
+
+    Ok(Json(ApiResponse::success(PreviewTreeResponse {
+        root: out,
+        short_key: share_link.short_key,
+        shareid: root_shareid,
+    })))
+}
+
+/// 递归构造 TreeNode。返回 `Pin<Box<dyn Future>>` 以支持 async 递归。
+fn build_tree_node<'a>(
+    client: &'a crate::netdisk::client::NetdiskClient,
+    short_key: &'a str,
+    shareid: &'a str,
+    uk: &'a str,
+    bdstoken: &'a str,
+    info: crate::transfer::SharedFileInfo,
+    remaining_depth: u32,
+) -> Pin<Box<dyn Future<Output = TreeNode> + Send + 'a>> {
+    Box::pin(async move {
+        let mut node = TreeNode {
+            path: info.path.clone(),
+            name: info.name.clone(),
+            is_dir: info.is_dir,
+            size: info.size,
+            fs_id: info.fs_id,
+            children: None,
+        };
+        if info.is_dir && remaining_depth > 0 {
+            match client
+                .list_share_files_in_dir(short_key, shareid, uk, bdstoken, &info.path, 1, 100)
+                .await
+            {
+                Ok(files) => {
+                    let mut kids: Vec<TreeNode> = Vec::with_capacity(files.len());
+                    for f in files {
+                        kids.push(
+                            build_tree_node(
+                                client,
+                                short_key,
+                                shareid,
+                                uk,
+                                bdstoken,
+                                f,
+                                remaining_depth - 1,
+                            )
+                            .await,
+                        );
+                    }
+                    node.children = Some(kids);
+                }
+                Err(e) => {
+                    // 子目录展开失败时仍返回当前节点，前端可见"加载失败"
+                    tracing::warn!("展开子目录 {} 失败: {}", info.path, e);
+                }
+            }
+        }
+        node
+    })
 }
 
 #[allow(dead_code)]

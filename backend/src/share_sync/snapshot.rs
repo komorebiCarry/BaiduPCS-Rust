@@ -156,6 +156,29 @@ impl<'a> SnapshotCollector<'a> {
             ));
         }
 
+        // 🔥 关键：如有密码，必须先 verify_share_password 拿到 randsk 写入 Cookie，
+        // 否则 list_share_files 会返回 errno=-9 "提取码验证失败"。
+        if let Some(ref pwd) = effective_pwd {
+            if !pwd.is_empty() {
+                let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+                if let Err(e) = client
+                    .verify_share_password(
+                        &page.shareid,
+                        &page.share_uk,
+                        &page.bdstoken,
+                        pwd,
+                        &referer,
+                    )
+                    .await
+                {
+                    return Err(ShareSyncError::ShareLinkError(format!(
+                        "验证提取码失败: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             client,
             short_key: share_link.short_key,
@@ -163,7 +186,10 @@ impl<'a> SnapshotCollector<'a> {
             uk: page.uk,
             bdstoken: page.bdstoken,
             password: effective_pwd,
-            include_paths: include_paths.into_iter().collect(),
+            include_paths: include_paths
+                .into_iter()
+                .filter_map(normalize_snapshot_path)
+                .collect(),
             exclude_patterns,
         })
     }
@@ -283,9 +309,14 @@ impl<'a> SnapshotCollector<'a> {
         if self.include_paths.is_empty() {
             return true;
         }
+        // dir 允许遍历当：
+        //   - dir 自身就是 include_path（include 一个目录），或
+        //   - dir 是某个 include_path 的祖先（include 一个具体文件，需要 descend 进去才能找到它）。
+        // 之前只看 `is_path_ancestor_or_self(dir, inc)`，会把 `/monthly` 在 inc=`/monthly/300426.SZ.csv` 时过滤掉，
+        // 导致文件无法被发现。
         self.include_paths
             .iter()
-            .any(|inc| dir == inc || dir.starts_with(inc))
+            .any(|inc| dir == inc || is_path_ancestor_or_self(inc, dir))
     }
 
     fn item_allowed(&self, item: &ShareSnapshotItem) -> bool {
@@ -293,7 +324,7 @@ impl<'a> SnapshotCollector<'a> {
             && !self
                 .include_paths
                 .iter()
-                .any(|inc| item.path == *inc || item.path.starts_with(inc))
+                .any(|inc| is_path_ancestor_or_self(&item.path, inc))
         {
             return false;
         }
@@ -346,6 +377,37 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
             }
         }
     }
+}
+
+fn normalize_snapshot_path(path: String) -> Option<String> {
+    let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let prefixed = if trimmed.starts_with('/') {
+        trimmed
+    } else {
+        format!("/{}", trimmed)
+    };
+    if prefixed == "/" {
+        return Some("/".to_string());
+    }
+    let normalized = prefixed.trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn is_path_ancestor_or_self(path: &str, ancestor: &str) -> bool {
+    if ancestor == "/" {
+        return true;
+    }
+    if path == ancestor {
+        return true;
+    }
+    path.starts_with(ancestor) && path.as_bytes().get(ancestor.len()) == Some(&b'/')
 }
 
 fn push_unique(
@@ -475,5 +537,21 @@ mod tests {
         // 典型用法：扩展名排除
         assert!(glob_match("*.tmp", "anything.tmp"));
         assert!(!glob_match("*.tmp", "anything.txt"));
+    }
+
+    #[test]
+    fn test_is_path_ancestor_or_self() {
+        assert!(is_path_ancestor_or_self("/foo/bar", "/foo"));
+        assert!(is_path_ancestor_or_self("/foo", "/foo"));
+        assert!(!is_path_ancestor_or_self("/foobar", "/foo"));
+        assert!(is_path_ancestor_or_self("/foobar", "/"));
+    }
+
+    #[test]
+    fn test_normalize_snapshot_path() {
+        assert_eq!(normalize_snapshot_path("/foo/".to_string()), Some("/foo".to_string()));
+        assert_eq!(normalize_snapshot_path("foo".to_string()), Some("/foo".to_string()));
+        assert_eq!(normalize_snapshot_path("   /bar//".to_string()), Some("/bar".to_string()));
+        assert_eq!(normalize_snapshot_path("".to_string()), None);
     }
 }
