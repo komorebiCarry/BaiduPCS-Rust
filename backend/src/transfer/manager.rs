@@ -3894,16 +3894,82 @@ fn infer_share_root_fallback(files: &[SharedFileInfo]) -> String {
     }
 }
 
+/// 判断分享根名是否为百度生成的虚拟根目录。
+///
+/// 当一次分享包含多个顶层文件/文件夹时，百度不会有真实的分享根目录，而是生成一个
+/// 形如 `sharelink<uk>-<shareid>` 的虚拟根（例如 `sharelink1100862997704-6168417644`，
+/// 前段是 uk、后段是 shareid），并把它作为 `share/list?root=1` 响应的 `title`，
+/// 同时所有文件 `path` 都带上 `/sharelink<uk>-<shareid>/` 前缀。
+///
+/// 这个虚拟根不是真实目录，转存/下载时应整体剥离，否则会凭空多出一层
+/// `/sharelink...` 前缀目录。
+fn is_virtual_share_root(name: &str) -> bool {
+    let rest = match name.trim_start_matches('/').strip_prefix("sharelink") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    match rest.split_once('-') {
+        Some((uk, shareid)) => {
+            !uk.is_empty()
+                && !shareid.is_empty()
+                && uk.bytes().all(|b| b.is_ascii_digit())
+                && shareid.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// 从文件路径中识别百度多文件分享的虚拟根前缀 `/sharelink<uk>-<shareid>`。
+///
+/// 百度在"多文件/多文件夹分享"以及子目录导航时，会用虚拟根
+/// `sharelink<uk>-<shareid>` 作为文件 `path` 的顶层段——即使
+/// `share/list?root=1` 的 `title` 给的是分享者的真实上层路径。此时 `title` 与文件
+/// 路径处于不同命名空间，基于 title 推导的 share_root 无法匹配文件路径前缀，
+/// 导致虚拟根被当成目录名转存出来（生成多余的 `/sharelink...` 目录）。
+///
+/// 若所有文件路径都位于同一个 `/sharelink<uk>-<shareid>/` 之下，返回该虚拟根
+/// （不含尾部斜杠），否则返回 None。
+fn detect_virtual_share_root_prefix(files: &[SharedFileInfo]) -> Option<String> {
+    let first = files.first()?;
+    let top = first.path.trim_start_matches('/').split('/').next().unwrap_or("");
+    if !is_virtual_share_root(top) {
+        return None;
+    }
+    let prefix = format!("/{}", top);
+    let prefix_with_slash = format!("{}/", prefix);
+    if files
+        .iter()
+        .all(|f| f.path == prefix || f.path.starts_with(&prefix_with_slash))
+    {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
 /// 推导用于剥离分享者私有上层目录的 share_root。
 ///
 /// 优先使用百度 `share/list?root=1` 响应里的 `title` 字段（分享根的绝对路径），
 /// 取其父目录即为分享者私有上层；title 缺失或为空时退化到
 /// [`infer_share_root_fallback`] 的最长公共父目录启发式。
 ///
-/// 详见 `docs/share-root-fix.md`。
+/// 特例：当文件路径位于虚拟根 `/sharelink<uk>-<shareid>/` 下时（多文件分享 / 子目录
+/// 导航），title 可能是分享者真实路径，与文件路径命名空间不一致，无法用来匹配剥离；
+/// 此时必须以文件路径为准，直接把虚拟根作为 share_root 剥掉（见
+/// [`detect_virtual_share_root_prefix`]），分享根目录本身仍保留在 relative_parent 里。
 fn derive_share_root(share_root_path: Option<&str>, files: &[SharedFileInfo]) -> String {
+    // 最优先：文件路径带虚拟根前缀时以文件路径为准，因为 group_files_by_parent_dir
+    // 是按文件 path 来剥离的，title 的命名空间可能与之不一致。
+    if let Some(virtual_root) = detect_virtual_share_root_prefix(files) {
+        return virtual_root;
+    }
     if let Some(title) = share_root_path {
         if !title.is_empty() {
+            if is_virtual_share_root(extract_basename_str(title)) {
+                // 虚拟根需要整体剥离，share_root 取虚拟根全路径（规范化为绝对路径
+                // 以匹配文件 path 的 `/sharelink.../` 前缀）。
+                return format!("/{}", title.trim_matches('/'));
+            }
             // dirname(title)：分享根本身需要保留在 relative_parent 里，
             // 因此 share_root 取分享根的"父目录"，正好是要剥掉的私有部分。
             return extract_parent_dir_str(title).to_string();
@@ -4356,6 +4422,114 @@ mod tests {
             fallback_expected,
             "/.bpr_share_temp/uuid/爸爸，别再丢下我跟妈妈1.mp4"
         );
+    }
+
+    // ========== is_virtual_share_root / 多文件分享虚拟根 ==========
+
+    #[test]
+    fn test_is_virtual_share_root() {
+        assert!(is_virtual_share_root("sharelink1100862997704-6168417644"));
+        assert!(is_virtual_share_root("/sharelink1100862997704-6168417644"));
+        // 真实文件夹名不应被误判
+        assert!(!is_virtual_share_root("纯净版"));
+        assert!(!is_virtual_share_root("sharelink"));
+        assert!(!is_virtual_share_root("sharelink123"));
+        assert!(!is_virtual_share_root("sharelink-123"));
+        assert!(!is_virtual_share_root("sharelink123-"));
+        assert!(!is_virtual_share_root("sharelinkabc-123"));
+        assert!(!is_virtual_share_root("my-sharelink123-456"));
+    }
+
+    /// 多文件分享：title 为虚拟根 `sharelink<uk>-<shareid>`，文件 path 带该前缀。
+    /// 期望整段虚拟根被剥离，不再生成 `/sharelink...` 前缀目录。
+    #[test]
+    fn test_derive_share_root_strips_virtual_sharelink_root() {
+        let title = "sharelink1100862997704-6168417644";
+        let files = vec![
+            make_file("/sharelink1100862997704-6168417644/抖音/1.jpg", 1),
+            make_file("/sharelink1100862997704-6168417644/微信/2.jpg", 2),
+            make_file("/sharelink1100862997704-6168417644/top.mp4", 3),
+        ];
+        let share_root = derive_share_root(Some(title), &files);
+        assert_eq!(share_root, "/sharelink1100862997704-6168417644");
+
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        let keys: Vec<&str> = groups.iter().map(|(k, _)| k.as_str()).collect();
+        // 顶层文件落到根（""），子目录保留真实结构，均不含 sharelink 前缀
+        assert!(keys.contains(&""));
+        assert!(keys.contains(&"抖音"));
+        assert!(keys.contains(&"微信"));
+        assert!(
+            keys.iter().all(|k| !k.contains("sharelink")),
+            "relative_parent 不应再包含虚拟根: {:?}",
+            keys
+        );
+    }
+
+    /// title 带前导斜杠的虚拟根也应正确剥离。
+    #[test]
+    fn test_derive_share_root_strips_virtual_sharelink_root_with_slash() {
+        let title = "/sharelink1100862997704-6168417644";
+        let files = vec![make_file(
+            "/sharelink1100862997704-6168417644/影视/a.mkv",
+            1,
+        )];
+        let share_root = derive_share_root(Some(title), &files);
+        assert_eq!(share_root, "/sharelink1100862997704-6168417644");
+
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "影视");
+    }
+
+    /// 复现真实日志场景：`title` 是分享者真实路径，但文件 `path` 用虚拟根
+    /// `/sharelink<uk>-<shareid>/` 命名空间（子目录导航时百度如此返回）。
+    /// 此前 share_root = dirname(title) 与文件路径不在同一命名空间，剥离失败，
+    /// 转存出多余的 `/sharelink...` 目录。修复后应以文件路径的虚拟根为准。
+    #[test]
+    fn test_derive_share_root_virtual_prefix_with_real_title() {
+        // 来自用户日志：title=/爸爸.../久别...，文件 path 带 /sharelink1102557053903-51347437953/
+        let title = "/爸爸，别再丢下我和妈妈/久别不成悲18集包含纯净版";
+        let files = vec![make_file(
+            "/sharelink1102557053903-51347437953/久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我和妈妈/抖音/1.mp4",
+            1,
+        )];
+        let share_root = derive_share_root(Some(title), &files);
+        assert_eq!(share_root, "/sharelink1102557053903-51347437953");
+
+        let groups = group_files_by_parent_dir(&files, &share_root);
+        assert_eq!(groups.len(), 1);
+        // 分享根目录本身（久别...）保留，sharelink 虚拟根被剥离
+        assert_eq!(
+            groups[0].0,
+            "久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我和妈妈/抖音"
+        );
+        assert!(!groups[0].0.contains("sharelink"));
+    }
+
+    #[test]
+    fn test_detect_virtual_share_root_prefix() {
+        let files = vec![
+            make_file("/sharelink123-456/a/1.mp4", 1),
+            make_file("/sharelink123-456/b/2.mp4", 2),
+        ];
+        assert_eq!(
+            detect_virtual_share_root_prefix(&files),
+            Some("/sharelink123-456".to_string())
+        );
+
+        // 真实路径，无虚拟根前缀
+        let real = vec![make_file("/影视/a/1.mp4", 1)];
+        assert_eq!(detect_virtual_share_root_prefix(&real), None);
+
+        // 混合（部分不在虚拟根下）不应误判
+        let mixed = vec![
+            make_file("/sharelink123-456/a/1.mp4", 1),
+            make_file("/其他/2.mp4", 2),
+        ];
+        assert_eq!(detect_virtual_share_root_prefix(&mixed), None);
+
+        assert_eq!(detect_virtual_share_root_prefix(&[]), None);
     }
 
     // ========== local_dir derivation from transferred_path ==========
