@@ -8,7 +8,7 @@
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// 单个订阅的调度状态
 pub struct SubscriptionScheduler {
