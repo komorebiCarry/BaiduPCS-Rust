@@ -58,6 +58,11 @@ pub struct ShareFileListResult {
     pub uk: String,
     /// 分享 ID（从响应 JSON 提取）
     pub shareid: String,
+    /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
+    ///
+    /// 用于推导 share_root，避免从文件路径反推时的歧义。
+    /// 老接口或异常响应可能为 None，此时退化到启发式推导。
+    pub share_root_path: Option<String>,
 }
 
 /// 分享文件信息

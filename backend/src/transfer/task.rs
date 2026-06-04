@@ -122,6 +122,14 @@ pub struct TransferTask {
     /// 解决子目录选择场景下后端无法从根目录文件列表中匹配到子文件信息的问题
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_files: Option<Vec<SharedFileInfo>>,
+
+    /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
+    ///
+    /// 用于在转存/自动下载阶段稳定推导 share_root（剥掉分享者私有上层目录），
+    /// 避免从文件路径反推时的歧义。详见 `docs/share-root-fix.md`。
+    /// 老任务或异常响应可能为 None，此时由调用方退化到启发式推导。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_root_path: Option<String>,
 }
 
 impl TransferTask {
@@ -160,6 +168,7 @@ impl TransferTask {
             temp_dir: None,
             selected_fs_ids: None,
             selected_files: None,
+            share_root_path: None,
         }
     }
 

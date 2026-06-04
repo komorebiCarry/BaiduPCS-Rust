@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { FileEntry, SortField, SortOrder } from '@/api/filesystem'
+import type { FileEntry, SortField, SortOrder, PermissionInfo } from '@/api/filesystem'
 import { listDirectory, getRoots, gotoPath } from '@/api/filesystem'
 
 export const useFilePickerStore = defineStore('filepicker', () => {
@@ -26,6 +26,9 @@ export const useFilePickerStore = defineStore('filepicker', () => {
   // 搜索状态
   const searchKeyword = ref('')
   const isSearching = ref(false)
+
+  // 权限信息
+  const permissionInfo = ref<PermissionInfo | null>(null)
 
   // 计算属性
   const canGoBack = computed(() => historyStack.value.length > 0)
@@ -70,6 +73,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
         total.value = response.total
         page.value = response.page
         hasMore.value = response.hasMore
+        permissionInfo.value = response.permissionInfo || null
       }
 
       // 清除选择
@@ -302,6 +306,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     serverDefaultPath.value = null
     searchKeyword.value = ''
     isSearching.value = false
+    permissionInfo.value = null
   }
 
   return {
@@ -325,6 +330,7 @@ export const useFilePickerStore = defineStore('filepicker', () => {
     serverDefaultPath,
     searchKeyword,
     isSearching,
+    permissionInfo,
 
     // 计算属性
     canGoBack,

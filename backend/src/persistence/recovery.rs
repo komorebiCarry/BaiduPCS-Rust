@@ -501,6 +501,11 @@ pub struct TransferRecoveryInfo {
     pub is_share_direct_download: bool,
     /// 文件列表 JSON
     pub file_list_json: Option<String>,
+    /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
+    ///
+    /// 用于在恢复后稳定推导 share_root，避免回退到启发式时再次出现目录结构错乱。
+    /// 详见 `docs/share-root-fix.md`。
+    pub share_root_path: Option<String>,
 }
 
 impl TransferRecoveryInfo {
@@ -519,6 +524,7 @@ impl TransferRecoveryInfo {
             temp_dir: metadata.temp_dir.clone(),
             is_share_direct_download: metadata.is_share_direct_download.unwrap_or(false),
             file_list_json: metadata.file_list_json.clone(),
+            share_root_path: metadata.share_root_path.clone(),
         })
     }
 }
@@ -848,6 +854,30 @@ mod tests {
         let recovered = &result.transfer_tasks[0];
         assert_eq!(recovered.task_id(), "tr_001");
         assert_eq!(recovered.task_type(), TaskType::Transfer);
+    }
+    
+
+    /// 旧 WAL（缺 share_root_path 字段）反序列化兼容：恢复时退化为 None，不会引发错误。
+    #[test]
+    fn test_share_root_path_missing_in_legacy_metadata() {
+        let temp_dir = setup_temp_dir();
+        let wal_dir = temp_dir.path();
+
+        // 不调用 set_share_root_path，模拟老版本 WAL
+        let metadata = TaskMetadata::new_transfer(
+            "tr_legacy".to_string(),
+            "https://pan.baidu.com/s/yyy".to_string(),
+            None,
+            "/save/path".to_string(),
+            false,
+            None,
+        );
+        save_metadata(wal_dir, &metadata).unwrap();
+
+        let result = scan_recoverable_tasks(wal_dir).unwrap();
+        assert_eq!(result.transfer_tasks.len(), 1);
+        let info = TransferRecoveryInfo::from_recovered(&result.transfer_tasks[0]).unwrap();
+        assert!(info.share_root_path.is_none());
     }
 
     #[test]

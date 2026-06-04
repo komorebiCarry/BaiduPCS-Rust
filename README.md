@@ -266,7 +266,20 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v1.14.0 (当前版本)
+### v1.14.1 (当前版本)
+
+**新功能：**
+- ✨ **下载目录权限提示（Linux/macOS）**：文件选择弹窗显示目录属主/运行用户/是否可写，下载前即可发现权限不匹配；可写性判断用内核 `faccessat`，正确覆盖 root/附加组/ACL（感谢 @hamr-hub PR #91）
+- ✨ **本地部署脚本 `scripts/local-deploy.sh`**：不依赖 Docker，一键构建/启停后端+前端，支持 status/logs 与 systemd 开机自启
+
+**问题修复：**
+- 🐛 **修复分享转存生成多余 `/sharelink` 目录**：以文件路径为准识别并剥离 `sharelink<uk>-<shareid>` 虚拟根，并持久化分享根路径稳定推导 share_root
+- 🐛 **修复开发模式前端连不上后端**：dev 模式 Vite 代理与 docker-compose.dev 端口统一为 18888
+
+<details>
+<summary><b>v1.14.0 / v1.13.0 / v1.12.2 / v1.12.1 / v1.12.0 / v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
+
+#### v1.14.0
 
 **新功能：**
 - ✨ **文件管理：重命名 / 批量复制 / 批量移动**：新增文件、文件夹的重命名以及批量复制、批量移动到目标目录，适配百度风控（authwidget / verify_scene）
@@ -277,9 +290,6 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 **问题修复：**
 - 🐛 **修复备份任务删除后父任务卡死在 Transferring**：上传子任务删除路径补送 `BackupTransferNotification::Deleted`，`AutoBackupManager` 收到后清理 `pending_*_task_ids` / `transfer_task_map`，父备份任务可正常落终态
-
-<details>
-<summary><b>v1.13.0 / v1.12.2 / v1.12.1 / v1.12.0 / v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
 
 #### v1.13.0
 
