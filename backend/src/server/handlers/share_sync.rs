@@ -9,12 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::pin::Pin;
 use std::future::Future;
-use tracing::error;
 
 use crate::server::error::ApiError;
 use crate::server::AppState;
 use crate::share_sync::{
-    normalize_pagination, CreateShareSubscriptionRequest, RunItemRecord, RunRecord,
+    infer_share_root, normalize_pagination, normalize_share_path, CreateShareSubscriptionRequest, RunItemRecord, RunRecord,
     ShareSubscription, ShareSyncError, ShareSyncManager, UpdateShareSubscriptionRequest,
 };
 
@@ -397,6 +396,7 @@ pub async fn preview_tree(
     };
 
     // 展开为 TreeNode（异步递归 → 用 Box::Future 显式签名）
+    let share_root = infer_share_root(&root.files);
     let mut out: Vec<TreeNode> = Vec::with_capacity(root.files.len());
     for f in root.files {
         let node = build_tree_node(
@@ -405,6 +405,7 @@ pub async fn preview_tree(
             &root_shareid,
             &root_uk,
             &page.bdstoken,
+            &share_root,
             f,
             depth - 1,
         )
@@ -426,12 +427,13 @@ fn build_tree_node<'a>(
     shareid: &'a str,
     uk: &'a str,
     bdstoken: &'a str,
+    share_root: &'a str,
     info: crate::transfer::SharedFileInfo,
     remaining_depth: u32,
 ) -> Pin<Box<dyn Future<Output = TreeNode> + Send + 'a>> {
     Box::pin(async move {
         let mut node = TreeNode {
-            path: info.path.clone(),
+            path: normalize_share_path(&info.path, &info.name, share_root),
             name: info.name.clone(),
             is_dir: info.is_dir,
             size: info.size,
@@ -453,6 +455,7 @@ fn build_tree_node<'a>(
                                 shareid,
                                 uk,
                                 bdstoken,
+                                share_root,
                                 f,
                                 remaining_depth - 1,
                             )

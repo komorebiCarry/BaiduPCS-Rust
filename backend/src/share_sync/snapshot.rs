@@ -13,6 +13,9 @@ use uuid::Uuid;
 pub struct ShareSnapshotItem {
     /// 相对分享根的路径（如 `/剧集/01.mp4`）；根级条目 path 为 `/<name>`
     pub path: String,
+    /// 百度返回的原始分享路径，用于后续转存/下载定位；老快照缺失时回退到 `path`
+    #[serde(default)]
+    pub raw_path: String,
     /// 百度 fs_id（目录也分配）
     pub fs_id: u64,
     /// 文件大小（目录固定 0）
@@ -31,8 +34,28 @@ impl ShareSnapshotItem {
         size: u64,
         is_dir: bool,
     ) -> Self {
+        let path = path.into();
+        Self {
+            raw_path: path.clone(),
+            path,
+            name: name.into(),
+            fs_id,
+            size,
+            is_dir,
+        }
+    }
+
+    pub fn with_raw_path(
+        path: impl Into<String>,
+        name: impl Into<String>,
+        fs_id: u64,
+        size: u64,
+        is_dir: bool,
+        raw_path: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
+            raw_path: raw_path.into(),
             name: name.into(),
             fs_id,
             size,
@@ -219,24 +242,32 @@ impl<'a> SnapshotCollector<'a> {
             self.uk.clone()
         };
 
+        let share_root = infer_share_root(&root.files);
         let mut all_items: Vec<ShareSnapshotItem> = Vec::new();
         let mut seen: HashSet<(String, u64)> = HashSet::new();
+        let mut queued_dirs: HashSet<String> = HashSet::new();
+        let mut found_included_files: BTreeSet<String> = BTreeSet::new();
 
         // 推入 root
         for f in root.files {
-            push_unique(&mut all_items, &mut seen, f);
-        }
-
-        // Step 2: BFS 子目录
-        let mut queue: VecDeque<String> = VecDeque::new();
-        for it in &all_items {
-            if it.is_dir {
-                queue.push_back(it.path.clone());
+            let is_dir = f.is_dir;
+            let raw_path = f.path.clone();
+            let normalized_path = normalize_share_path(&f.path, &f.name, &share_root);
+            if !is_dir && self.include_paths.contains(&normalized_path) {
+                found_included_files.insert(normalized_path.clone());
+            }
+            push_unique(&mut all_items, &mut seen, &share_root, f);
+            if is_dir && self.dir_allowed(&normalized_path) {
+                queued_dirs.insert(raw_path);
             }
         }
 
+        // Step 2: BFS 子目录
+        let mut queue: VecDeque<String> = queued_dirs.iter().cloned().collect();
+
         while let Some(dir) = queue.pop_front() {
-            if !self.dir_allowed(&dir) {
+            let normalized_dir = normalize_share_path(&dir, dir.rsplit('/').next().unwrap_or(&dir), &share_root);
+            if !self.dir_allowed(&normalized_dir) {
                 continue;
             }
             let mut page: u32 = 1;
@@ -262,13 +293,20 @@ impl<'a> SnapshotCollector<'a> {
                 let batch_len = batch.len();
                 for f in batch {
                     let is_dir = f.is_dir;
-                    let path = f.path.clone();
-                    push_unique(&mut all_items, &mut seen, f);
-                    if is_dir && !queue.contains(&path) {
-                        queue.push_back(path);
+                    let raw_path = f.path.clone();
+                    let normalized_path = normalize_share_path(&f.path, &f.name, &share_root);
+                    if !is_dir && self.include_paths.contains(&normalized_path) {
+                        found_included_files.insert(normalized_path.clone());
+                    }
+                    push_unique(&mut all_items, &mut seen, &share_root, f);
+                    if is_dir && self.dir_allowed(&normalized_path) && queued_dirs.insert(raw_path.clone()) {
+                        queue.push_back(raw_path);
                     }
                 }
 
+                if !self.dir_needs_more_pages(&normalized_dir, &found_included_files) {
+                    break;
+                }
                 if batch_len < page_size as usize {
                     break;
                 }
@@ -316,7 +354,7 @@ impl<'a> SnapshotCollector<'a> {
         // 导致文件无法被发现。
         self.include_paths
             .iter()
-            .any(|inc| dir == inc || is_path_ancestor_or_self(inc, dir))
+            .any(|inc| is_path_ancestor_or_self(dir, inc) || is_path_ancestor_or_self(inc, dir))
     }
 
     fn item_allowed(&self, item: &ShareSnapshotItem) -> bool {
@@ -334,6 +372,29 @@ impl<'a> SnapshotCollector<'a> {
             }
         }
         true
+    }
+
+    fn dir_needs_more_pages(&self, dir: &str, found_included_files: &BTreeSet<String>) -> bool {
+        if self.include_paths.is_empty() {
+            return true;
+        }
+
+        // If the selected include path is this directory or an ancestor of it,
+        // the user selected a whole subtree, so we must scan all pages.
+        if self
+            .include_paths
+            .iter()
+            .any(|inc| is_path_ancestor_or_self(dir, inc))
+        {
+            return true;
+        }
+
+        // Otherwise this directory is only being scanned to find exact file
+        // include paths below it. Once every requested descendant file has been
+        // found, continuing to page through thousands of siblings is wasted work.
+        self.include_paths
+            .iter()
+            .any(|inc| is_path_ancestor_or_self(inc, dir) && !found_included_files.contains(inc))
     }
 }
 
@@ -379,6 +440,66 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
     }
 }
 
+pub fn infer_share_root(files: &[SharedFileInfo]) -> String {
+    let parents: Vec<String> = files
+        .iter()
+        .filter_map(|f| normalize_snapshot_path(f.path.clone()))
+        .map(|p| parent_dir(&p))
+        .collect();
+    if parents.is_empty() {
+        return String::new();
+    }
+
+    let mut common: Vec<String> = path_components(&parents[0]);
+    for parent in parents.iter().skip(1) {
+        let parts = path_components(parent);
+        let keep = common
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(keep);
+        if common.is_empty() {
+            break;
+        }
+    }
+
+    if common.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", common.join("/"))
+    }
+}
+
+pub fn normalize_share_path(raw_path: &str, name: &str, share_root: &str) -> String {
+    let raw = normalize_snapshot_path(raw_path.to_string()).unwrap_or_default();
+    let root = normalize_snapshot_path(share_root.to_string()).unwrap_or_default();
+    let relative = if raw.is_empty() {
+        String::new()
+    } else if root.is_empty() || root == "/" {
+        raw.trim_start_matches('/').to_string()
+    } else if raw == root {
+        String::new()
+    } else if raw.starts_with(&root) && raw.as_bytes().get(root.len()) == Some(&b'/') {
+        raw[root.len() + 1..].to_string()
+    } else {
+        raw.trim_start_matches('/').to_string()
+    };
+
+    let fallback = if name.trim().is_empty() {
+        raw.rsplit('/').next().unwrap_or("").to_string()
+    } else {
+        name.trim().to_string()
+    };
+    let candidate = if relative.trim().is_empty() {
+        fallback
+    } else {
+        relative
+    };
+
+    normalize_snapshot_path(candidate).unwrap_or_else(|| "/".to_string())
+}
+
 fn normalize_snapshot_path(path: String) -> Option<String> {
     let trimmed = path.trim().replace('\\', "/");
     if trimmed.is_empty() {
@@ -389,15 +510,49 @@ fn normalize_snapshot_path(path: String) -> Option<String> {
     } else {
         format!("/{}", trimmed)
     };
-    if prefixed == "/" {
+    let mut collapsed = String::with_capacity(prefixed.len());
+    let mut prev_slash = false;
+    for ch in prefixed.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    if collapsed == "/" {
         return Some("/".to_string());
     }
-    let normalized = prefixed.trim_end_matches('/').to_string();
+    let normalized = collapsed.trim_end_matches('/').to_string();
     if normalized.is_empty() {
         None
     } else {
         Some(normalized)
     }
+}
+
+fn parent_dir(path: &str) -> String {
+    let path = normalize_snapshot_path(path.to_string()).unwrap_or_else(|| "/".to_string());
+    if path == "/" {
+        return "/".to_string();
+    }
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) if parent.is_empty() => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn path_components(path: &str) -> Vec<String> {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn is_path_ancestor_or_self(path: &str, ancestor: &str) -> bool {
@@ -413,16 +568,19 @@ fn is_path_ancestor_or_self(path: &str, ancestor: &str) -> bool {
 fn push_unique(
     out: &mut Vec<ShareSnapshotItem>,
     seen: &mut HashSet<(String, u64)>,
+    share_root: &str,
     info: SharedFileInfo,
 ) {
-    let key = (info.path.clone(), info.fs_id);
+    let normalized_path = normalize_share_path(&info.path, &info.name, share_root);
+    let key = (normalized_path.clone(), info.fs_id);
     if seen.insert(key) {
-        out.push(ShareSnapshotItem::new(
-            info.path,
+        out.push(ShareSnapshotItem::with_raw_path(
+            normalized_path,
             info.name,
             info.fs_id,
             info.size,
             info.is_dir,
+            info.path,
         ));
     }
 }
@@ -444,6 +602,16 @@ mod tests {
     fn item(path: &str, fs_id: u64, size: u64) -> ShareSnapshotItem {
         let name = path.rsplit('/').next().unwrap_or(path).to_string();
         ShareSnapshotItem::new(path, name, fs_id, size, false)
+    }
+
+    fn shared_file(path: &str, name: &str, fs_id: u64, is_dir: bool) -> SharedFileInfo {
+        SharedFileInfo {
+            fs_id,
+            is_dir,
+            path: path.to_string(),
+            size: if is_dir { 0 } else { 123 },
+            name: name.to_string(),
+        }
     }
 
     #[test]
@@ -489,6 +657,46 @@ mod tests {
         assert_eq!(sorted[0].path, "/a.txt");
         assert_eq!(sorted[1].path, "/b.txt");
         assert_eq!(sorted[2].path, "/c.txt");
+    }
+
+    #[test]
+    fn test_normalize_single_file_share_to_root_file() {
+        let files = vec![shared_file(
+            "/_pcs_.workspace/curated/report.csv",
+            "report.csv",
+            1,
+            false,
+        )];
+        let root = infer_share_root(&files);
+
+        assert_eq!(root, "/_pcs_.workspace/curated");
+        assert_eq!(
+            normalize_share_path(&files[0].path, &files[0].name, &root),
+            "/report.csv"
+        );
+    }
+
+    #[test]
+    fn test_normalize_multi_folder_share_keeps_folder_prefixes() {
+        let files = vec![
+            shared_file("/_pcs_.workspace/curated/fina_indicator", "fina_indicator", 1, true),
+            shared_file("/_pcs_.workspace/curated/stock_basic", "stock_basic", 2, true),
+        ];
+        let root = infer_share_root(&files);
+
+        assert_eq!(root, "/_pcs_.workspace/curated");
+        assert_eq!(
+            normalize_share_path(&files[0].path, &files[0].name, &root),
+            "/fina_indicator"
+        );
+        assert_eq!(
+            normalize_share_path(
+                "/_pcs_.workspace/curated/fina_indicator/000004.SZ.csv",
+                "000004.SZ.csv",
+                &root,
+            ),
+            "/fina_indicator/000004.SZ.csv"
+        );
     }
 
     #[test]

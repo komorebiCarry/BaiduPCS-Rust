@@ -278,6 +278,7 @@ impl ShareSyncPersistence {
                 let is_dir: i32 = row.get(3)?;
                 let name: String = row.get(4)?;
                 Ok(ShareSnapshotItem {
+                    raw_path: path.clone(),
                     path,
                     fs_id: fs_id as u64,
                     size: size as u64,

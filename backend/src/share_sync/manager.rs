@@ -23,11 +23,13 @@ use crate::share_sync::events::{NoopShareSyncEventPublisher, ShareSyncEvent, Sha
 use crate::share_sync::executor::{ApplyOutcome, ExecutorHooks, ShareSyncExecutor};
 use crate::share_sync::persistence::ShareSyncPersistence;
 use crate::share_sync::scheduler::SubscriptionScheduler;
-use crate::share_sync::snapshot::{CapturedShare, ShareSnapshot, ShareSnapshotItem, SnapshotCollector};
-use crate::transfer::TransferManager;
+use crate::share_sync::snapshot::{CapturedShare, ShareSnapshotItem, SnapshotCollector};
+use crate::transfer::{TransferManager, TransferStatus};
+use async_trait::async_trait;
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -47,8 +49,6 @@ pub struct ShareSyncManager {
     netdisk_client: Arc<tokio::sync::RwLock<Option<NetdiskClient>>>,
     /// TransferManager（同上）
     transfer_manager: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
-    /// DownloadManager
-    download_manager: Arc<tokio::sync::RwLock<Option<Arc<DownloadManager>>>>,
 }
 
 impl std::fmt::Debug for ShareSyncManager {
@@ -97,7 +97,6 @@ impl ShareSyncManager {
                 .unwrap_or_else(|| Arc::new(NoopShareSyncEventPublisher)),
             netdisk_client: cfg.netdisk_client,
             transfer_manager: cfg.transfer_manager,
-            download_manager: cfg.download_manager,
         });
 
         for sub in subs {
@@ -297,20 +296,19 @@ impl ShareSyncManager {
         self.publisher.publish(ShareSyncEvent::DiffDetected {
             run_id: run_id.clone(),
             subscription_id: id.into(),
-            added: diff.added.len(),
-            modified: diff.modified.len(),
-            removed: diff.removed.len(),
+            added: diff.added.iter().filter(|i| !i.is_dir).count(),
+            modified: diff.modified.iter().filter(|i| !i.new.is_dir).count(),
+            removed: diff.removed.iter().filter(|i| !i.is_dir).count(),
         });
 
         // 4) 执行
         let hooks = ProductionHooks {
             netdisk: Arc::new(netdisk.clone()),
             transfer: self.transfer_manager.clone(),
-            download: self.download_manager.clone(),
             captured: captured.clone(),
         };
         let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
-        let outcome = executor.apply(&captured, &diff).await;
+        let outcome = executor.apply_with_run_id(run_id.clone(), &captured, &diff).await;
 
         // 5) 广播
         match outcome.status {
@@ -342,9 +340,11 @@ impl ShareSyncManager {
 
     fn fail_run(&self, run_id: &str, sub_id: &str, err: &str) {
         use crate::share_sync::types::{DiffSummary, RunStatus};
+        let now = chrono::Utc::now().timestamp();
+        let _ = self.persistence.start_run(run_id, sub_id, now);
         let _ = self.persistence.finish_run(
             run_id,
-            chrono::Utc::now().timestamp(),
+            now,
             RunStatus::Failed,
             &DiffSummary::default(),
             Some(err),
@@ -435,109 +435,146 @@ impl ShareSyncManager {
 struct ProductionHooks {
     netdisk: Arc<NetdiskClient>,
     transfer: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
-    download: Arc<tokio::sync::RwLock<Option<Arc<DownloadManager>>>>,
     captured: CapturedShare,
 }
 
+#[async_trait]
 impl ExecutorHooks for ProductionHooks {
-    fn submit_transfer(
+    async fn submit_transfer(
         &self,
         captured: &CapturedShare,
         target_path: &str,
         fs_id: u64,
         internal_label: Option<&str>,
     ) -> Result<String, ShareSyncError> {
-        // 异步逻辑：调用 TransferManager
-        let transfer_g = self.transfer.clone();
-        let captured = captured.clone();
-        let target = target_path.to_string();
-        let label = internal_label.map(|s| s.to_string());
-        let fs_id_str = format!("{}", fs_id);
-        let task_id = Uuid::new_v4().to_string();
-        // 立即返回 task_id；真正的 transfer 在 spawn 后台执行
-        let task_id_clone = task_id.clone();
-        tokio::spawn(async move {
-            let transfer_opt = { transfer_g.read().await.clone() };
-            if let Some(tm) = transfer_opt {
-                use crate::transfer::manager::CreateTransferRequest;
-                let req = CreateTransferRequest {
-                    share_url: format!(
-                        "https://pan.baidu.com/s/{}?pwd={}",
-                        captured.short_key,
-                        captured.password.as_deref().unwrap_or("")
-                    ),
-                    password: captured.password.clone(),
-                    save_path: target,
-                    save_fs_id: 0,
-                    auto_download: Some(false),
-                    local_download_path: None,
-                    is_share_direct_download: false,
-                    selected_fs_ids: Some(vec![fs_id]),
-                    selected_files: None,
-                };
-                match tm.create_task(req).await {
-                    Ok(resp) => {
-                        info!(
-                            "share-sync: transfer submitted label={:?} task_id={:?} resp.task_id={:?}",
-                            label, task_id_clone, resp.task_id
-                        );
-                    }
-                    Err(e) => {
-                        error!("share-sync: transfer 创建失败: {}", e);
-                    }
-                }
-            }
-        });
-        let _ = fs_id_str;
+        let tm = self.transfer_manager() .await?;
+        use crate::transfer::manager::CreateTransferRequest;
+        let req = CreateTransferRequest {
+            share_url: share_url_for_captured(captured),
+            password: captured.password.clone(),
+            save_path: target_path.to_string(),
+            save_fs_id: 0,
+            auto_download: Some(false),
+            local_download_path: None,
+            is_share_direct_download: false,
+            selected_fs_ids: Some(vec![fs_id]),
+            selected_files: None,
+        };
+        let resp = tm
+            .create_task(req)
+            .await
+            .map_err(|e| ShareSyncError::TransferError(e.to_string()))?;
+        if resp.need_password {
+            return Err(ShareSyncError::ShareLinkError("需要提取码".into()));
+        }
+        if let Some(err) = resp.error {
+            return Err(ShareSyncError::TransferError(err));
+        }
+        let task_id = resp
+            .task_id
+            .ok_or_else(|| ShareSyncError::TransferError("TransferManager 未返回任务 ID".into()))?;
+        info!(
+            "share-sync: transfer submitted label={:?} task_id={}",
+            internal_label, task_id
+        );
         Ok(task_id)
     }
 
-    fn submit_download(
+    async fn submit_download(
         &self,
-        fs_id: u64,
-        remote_name_hint: &str,
+        item: &ShareSnapshotItem,
         local_dir: &Path,
     ) -> Result<String, ShareSyncError> {
-        let download_g = self.download.clone();
-        let dir = local_dir.to_path_buf();
-        let name = remote_name_hint.to_string();
-        let task_id = Uuid::new_v4().to_string();
-        let task_id_clone = task_id.clone();
-        tokio::spawn(async move {
-            let dl_opt = { download_g.read().await.clone() };
-            if let Some(dm) = dl_opt {
-                match dm
-                    .create_task_with_dir(
-                        fs_id,
-                        name.clone(),  // remote_path
-                        name.clone(),  // filename
-                        0,             // total_size（未知，分享侧拿不到准确值）
-                        &dir,
-                        None,          // conflict_strategy: 由 DownloadConflictStrategy::Overwrite 默认
-                    )
-                    .await
-                {
-                    Ok(dl_task_id) => {
-                        info!(
-                            "share-sync: download submitted task_id={} actual={}",
-                            task_id_clone, dl_task_id
-                        );
-                        // 🔥 关键修复：create_task_with_dir 只把任务设为 Pending，
-                        // 必须显式 start_task 才会真正开始下载。
-                        if let Err(e) = dm.start_task(&dl_task_id).await {
-                            error!(
-                                "share-sync: download start_task 失败: task={} err={}",
-                                dl_task_id, e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        error!("share-sync: download 创建失败: {}", e);
-                    }
-                }
-            }
-        });
+        let relative_path = safe_relative_download_path(&item.path)?;
+        let local_parent = match Path::new(&relative_path).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => local_dir.join(parent),
+            _ => local_dir.to_path_buf(),
+        };
+        let tm = self.transfer_manager().await?;
+        use crate::transfer::manager::CreateTransferRequest;
+        use crate::transfer::types::SharedFileInfo;
+
+        let raw_path = if item.raw_path.trim().is_empty() {
+            item.path.clone()
+        } else {
+            item.raw_path.clone()
+        };
+        let req = CreateTransferRequest {
+            share_url: share_url_for_captured(&self.captured),
+            password: self.captured.password.clone(),
+            save_path: String::new(),
+            save_fs_id: 0,
+            auto_download: Some(true),
+            local_download_path: Some(local_parent.to_string_lossy().to_string()),
+            is_share_direct_download: true,
+            selected_fs_ids: Some(vec![item.fs_id]),
+            selected_files: Some(vec![SharedFileInfo {
+                fs_id: item.fs_id,
+                is_dir: false,
+                path: raw_path.clone(),
+                size: item.size,
+                name: item.name.clone(),
+            }]),
+        };
+
+        let resp = tm
+            .create_task(req)
+            .await
+            .map_err(|e| ShareSyncError::DownloadError(e.to_string()))?;
+        if resp.need_password {
+            return Err(ShareSyncError::ShareLinkError("需要提取码".into()));
+        }
+        if let Some(err) = resp.error {
+            return Err(ShareSyncError::DownloadError(err));
+        }
+        let task_id = resp
+            .task_id
+            .ok_or_else(|| ShareSyncError::DownloadError("TransferManager 未返回任务 ID".into()))?;
+        info!(
+            "share-sync: share-direct download submitted task_id={} path={} local_parent={:?}",
+            task_id, raw_path, local_parent
+        );
         Ok(task_id)
+    }
+
+    async fn wait_transfer_task(
+        &self,
+        task_id: &str,
+        require_download_completion: bool,
+        timeout: Duration,
+    ) -> Result<(), ShareSyncError> {
+        let tm = self.transfer_manager().await?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let task = tm.get_task(task_id).await.ok_or_else(|| {
+                ShareSyncError::TransferError(format!("转存任务不存在: {}", task_id))
+            })?;
+            match task.status {
+                TransferStatus::Completed => return Ok(()),
+                TransferStatus::Transferred if !require_download_completion => return Ok(()),
+                TransferStatus::TransferFailed => {
+                    return Err(ShareSyncError::TransferError(
+                        task.error.unwrap_or_else(|| "转存失败".into()),
+                    ))
+                }
+                TransferStatus::DownloadFailed => {
+                    return Err(ShareSyncError::DownloadError(
+                        task.error.unwrap_or_else(|| "下载失败".into()),
+                    ))
+                }
+                _ => {}
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let msg = format!("等待任务完成超时: task_id={}, status={:?}", task_id, task.status);
+                return if require_download_completion {
+                    Err(ShareSyncError::DownloadError(msg))
+                } else {
+                    Err(ShareSyncError::TransferError(msg))
+                };
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     fn delete_netdisk(
@@ -570,6 +607,51 @@ impl ExecutorHooks for ProductionHooks {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(ShareSyncError::FileSystemError(e.to_string())),
         }
+    }
+}
+
+impl ProductionHooks {
+    async fn transfer_manager(&self) -> Result<Arc<TransferManager>, ShareSyncError> {
+        self.transfer
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| ShareSyncError::ConfigError("TransferManager 未初始化".into()))
+    }
+}
+
+fn share_url_for_captured(captured: &CapturedShare) -> String {
+    match captured.password.as_deref().filter(|p| !p.is_empty()) {
+        Some(pwd) => format!("https://pan.baidu.com/s/{}?pwd={}", captured.short_key, pwd),
+        None => format!("https://pan.baidu.com/s/{}", captured.short_key),
+    }
+}
+
+fn safe_relative_download_path(path: &str) -> Result<String, ShareSyncError> {
+    let normalized = path.trim().replace('\\', "/");
+    let trimmed = normalized.trim_start_matches('/').trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(ShareSyncError::ConfigError("本地下载相对路径为空".into()));
+    }
+
+    let mut parts = Vec::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err(ShareSyncError::ConfigError(format!(
+                "非法同步路径（包含 ..）: {}",
+                path
+            )));
+        }
+        parts.push(part);
+    }
+
+    if parts.is_empty() {
+        Err(ShareSyncError::ConfigError("本地下载相对路径为空".into()))
+    } else {
+        Ok(parts.join("/"))
     }
 }
 

@@ -117,7 +117,7 @@
               <span v-else>无</span>
             </el-descriptions-item>
             <el-descriptions-item label="轮询">
-              <span v-if="selected.poll_config.enabled">
+              <span v-if="isPollEnabled(selected.poll_config)">
                 {{ describeInterval(selected.poll_config) }}
               </span>
               <span v-else>已禁用</span>
@@ -410,7 +410,7 @@ import {
 import { getWebSocketClient, connectWebSocket } from '@/utils/websocket'
 
 const subscriptions = ref<ShareSubscription[]>([])
-const DEFAULT_LOCAL_TARGET_PATH = '/tmp'
+const DEFAULT_LOCAL_TARGET_PATH = '/home/hyx/codespace/one-family/data'
 const selected = ref<ShareSubscription | null>(null)
 const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
@@ -457,6 +457,58 @@ const defaultForm = () => ({
 })
 
 const form = ref(defaultForm())
+
+function normalizePollConfigForUi(p?: PollConfig | null): PollConfig {
+  const rawMode = p?.mode || 'interval'
+  const enabled = p?.enabled !== false
+  const mode = (!enabled || rawMode === 'disabled' ? 'disabled' : rawMode) as PollConfig['mode']
+  const intervalSecs = Number.isFinite(Number(p?.interval_secs))
+    ? Math.max(600, Number(p?.interval_secs))
+    : 1800
+
+  return {
+    enabled: mode !== 'disabled',
+    mode,
+    interval_secs: intervalSecs,
+    schedule_hour: mode === 'scheduled' ? (p?.schedule_hour ?? 3) : null,
+    schedule_minute: mode === 'scheduled' ? (p?.schedule_minute ?? 0) : null,
+  }
+}
+
+function normalizePollConfigForSubmit(p: PollConfig): PollConfig {
+  const mode = (p.mode || 'interval') as PollConfig['mode']
+  const intervalSecs = Number.isFinite(Number(p.interval_secs))
+    ? Math.max(600, Number(p.interval_secs))
+    : 1800
+
+  if (mode === 'disabled') {
+    return {
+      enabled: false,
+      mode: 'disabled',
+      interval_secs: intervalSecs,
+      schedule_hour: null,
+      schedule_minute: null,
+    }
+  }
+
+  if (mode === 'interval') {
+    return {
+      enabled: true,
+      mode: 'interval',
+      interval_secs: intervalSecs,
+      schedule_hour: null,
+      schedule_minute: null,
+    }
+  }
+
+  return {
+    enabled: true,
+    mode: 'scheduled',
+    interval_secs: intervalSecs,
+    schedule_hour: p.schedule_hour ?? 3,
+    schedule_minute: p.schedule_minute ?? 0,
+  }
+}
 
 const formRules = {
   name: [{ required: true, message: '请输入名称', trigger: 'blur' }],
@@ -516,11 +568,11 @@ function openEdit() {
     targets: selected.value.targets.map(t => ({ ...t })) as any,
     conflict_strategy: selected.value.conflict_strategy,
     delete_missing: selected.value.delete_missing,
-    poll_config: { ...selected.value.poll_config },
+    poll_config: normalizePollConfigForUi(selected.value.poll_config),
   }
-  if (selected.value.poll_config.mode === 'scheduled') {
-    const h = String(selected.value.poll_config.schedule_hour || 0).padStart(2, '0')
-    const m = String(selected.value.poll_config.schedule_minute || 0).padStart(2, '0')
+  if (form.value.poll_config.mode === 'scheduled') {
+    const h = String(form.value.poll_config.schedule_hour || 0).padStart(2, '0')
+    const m = String(form.value.poll_config.schedule_minute || 0).padStart(2, '0')
     scheduledTime.value = `${h}:${m}`
   } else {
     scheduledTime.value = '03:00'
@@ -550,11 +602,11 @@ async function saveForm() {
   } catch {
     return
   }
+  syncScheduledTimeFromPicker()
   buildSanitizedPayload()
   if (!validateForm()) {
     return
   }
-  syncScheduledTimeFromPicker()
   saving.value = true
   try {
     if (dialogMode.value === 'create') {
@@ -633,6 +685,14 @@ function validateForm(): boolean {
 }
 
 function syncScheduledTimeFromPicker() {
+  if (form.value.poll_config.mode === 'disabled') {
+    form.value.poll_config.enabled = false
+    form.value.poll_config.schedule_hour = null
+    form.value.poll_config.schedule_minute = null
+    return
+  }
+
+  form.value.poll_config.enabled = true
   if (form.value.poll_config.mode !== 'scheduled') {
     form.value.poll_config.schedule_hour = null
     form.value.poll_config.schedule_minute = null
@@ -711,6 +771,7 @@ function buildSanitizedPayload() {
     }
   }
   form.value.targets = nextTargets
+  form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
 }
 
 async function removeSubscription() {
@@ -885,15 +946,20 @@ function onScheduledChange(val: string | null) {
 
 // ==================== 辅助显示 ====================
 
+function isPollEnabled(p: PollConfig): boolean {
+  return normalizePollConfigForUi(p).mode !== 'disabled'
+}
+
 function describeInterval(p: PollConfig): string {
-  if (!p.enabled) return '已禁用'
-  if (p.mode === 'interval') {
-    const m = Math.floor(p.interval_secs / 60)
+  const normalized = normalizePollConfigForUi(p)
+  if (normalized.mode === 'disabled') return '已禁用'
+  if (normalized.mode === 'interval') {
+    const m = Math.floor(normalized.interval_secs / 60)
     return `每 ${m} 分钟`
   }
-  if (p.mode === 'scheduled') {
-    const h = String(p.schedule_hour || 0).padStart(2, '0')
-    const m = String(p.schedule_minute || 0).padStart(2, '0')
+  if (normalized.mode === 'scheduled') {
+    const h = String(normalized.schedule_hour || 0).padStart(2, '0')
+    const m = String(normalized.schedule_minute || 0).padStart(2, '0')
     return `每日 ${h}:${m}`
   }
   return '已禁用'

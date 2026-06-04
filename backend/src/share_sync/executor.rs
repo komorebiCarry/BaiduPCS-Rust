@@ -31,15 +31,20 @@ use crate::share_sync::snapshot::{CapturedShare, ShareSnapshotItem};
 use crate::share_sync::types::{
     ConflictStrategy, DiffSummary, RunItemStatus, RunStatus, SyncAction, TargetKind,
 };
+use async_trait::async_trait;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// 抽象 TransferManager / DownloadManager 调用，便于单测 mock
+#[async_trait]
 pub trait ExecutorHooks: Send + Sync {
     /// 提交一个转存任务（单文件），返回 task_id
-    fn submit_transfer(
+    async fn submit_transfer(
         &self,
         captured: &CapturedShare,
         target_path: &str,
@@ -48,12 +53,15 @@ pub trait ExecutorHooks: Send + Sync {
     ) -> Result<String, ShareSyncError>;
 
     /// 提交一个下载任务（单文件），返回 task_id
-    fn submit_download(
+    async fn submit_download(&self, item: &ShareSnapshotItem, local_dir: &Path) -> Result<String, ShareSyncError>;
+
+    /// 等待转存任务进入业务所需的终态
+    async fn wait_transfer_task(
         &self,
-        fs_id: u64,
-        remote_name_hint: &str,
-        local_dir: &Path,
-    ) -> Result<String, ShareSyncError>;
+        task_id: &str,
+        require_download_completion: bool,
+        timeout: Duration,
+    ) -> Result<(), ShareSyncError>;
 
     /// 删除网盘上的文件（按路径）
     fn delete_netdisk(&self, target_path: &str, relative_paths: &[String]) -> Result<(), ShareSyncError>;
@@ -97,6 +105,16 @@ impl<'a> ShareSyncExecutor<'a> {
         diff: &ShareDiff,
     ) -> ApplyOutcome {
         let run_id = Uuid::new_v4().to_string();
+        self.apply_with_run_id(run_id, captured, diff).await
+    }
+
+    /// 应用一次 diff 到所有目标（使用调用方提供的 run_id，便于事件与持久化一致）
+    pub async fn apply_with_run_id(
+        &self,
+        run_id: String,
+        captured: &CapturedShare,
+        diff: &ShareDiff,
+    ) -> ApplyOutcome {
         let started_at = Utc::now().timestamp();
         if let Err(e) = self.persistence.start_run(&run_id, &self.subscription.id, started_at) {
             return ApplyOutcome {
@@ -108,11 +126,14 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         let mut summary = DiffSummary::default();
-        let mut error: Option<String> = None;
+        let error: Option<String> = None;
         let mut any_failure = false;
 
         // 处理 added
         for item in &diff.added {
+            if item.is_dir {
+                continue;
+            }
             for target in &self.subscription.targets {
                 let _ = self
                     .process_added_or_modified(
@@ -129,6 +150,9 @@ impl<'a> ShareSyncExecutor<'a> {
 
         // 处理 modified
         for ShareModifiedItem { old: _, new } in &diff.modified {
+            if new.is_dir {
+                continue;
+            }
             for target in &self.subscription.targets {
                 let _ = self
                     .process_added_or_modified(
@@ -145,6 +169,9 @@ impl<'a> ShareSyncExecutor<'a> {
 
         // 处理 removed
         for item in &diff.removed {
+            if item.is_dir {
+                continue;
+            }
             if !self.subscription.delete_missing {
                 for target in &self.subscription.targets {
                     let target_kind = match target {
@@ -234,39 +261,69 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         // 3) 提交 transfer / download
-        let result = match target {
-            SyncTarget::Netdisk(t) => self
-                .hooks
-                .submit_transfer(
-                    captured,
-                    &format!("{}/{}", t.remote_path.trim_end_matches('/'), item.path.trim_start_matches('/')),
-                    item.fs_id,
-                    Some(&format!("share-sync/{}/{}", self.subscription.id, run_id)),
-                )
-                .map(|tid| (Some(tid), None)),
-            SyncTarget::Local(t) => self
-                .hooks
-                .submit_download(item.fs_id, &item.name, &t.local_path)
-                .map(|did| (None, Some(did))),
+        let result: Result<(String, bool, RunItemStatus), ShareSyncError> = match target {
+            SyncTarget::Netdisk(t) => {
+                self.hooks
+                    .submit_transfer(
+                        captured,
+                        &format!(
+                            "{}/{}",
+                            t.remote_path.trim_end_matches('/'),
+                            item.path.trim_start_matches('/')
+                        ),
+                        item.fs_id,
+                        Some(&format!("share-sync/{}/{}", self.subscription.id, run_id)),
+                    )
+                    .await
+                    .map(|task_id| (task_id, false, RunItemStatus::Transferring))
+            }
+            SyncTarget::Local(t) => {
+                self.hooks
+                    .submit_download(item, &t.local_path)
+                    .await
+                    .map(|task_id| (task_id, true, RunItemStatus::Downloading))
+            }
         };
 
         match result {
-            Ok((transfer_id, download_id)) => {
-                self.persistence.add_run_item(
+            Ok((task_id, require_download_completion, initial_status)) => {
+                let run_item_id = self.persistence.add_run_item(
                     run_id,
                     &item.path,
                     action,
                     target_kind,
-                    transfer_id.as_deref(),
-                    download_id.as_deref(),
-                    RunItemStatus::Transferring,
+                    Some(task_id.as_str()),
+                    None,
+                    initial_status,
                     versioned_old.as_deref(),
                 )?;
                 info!(
-                    "executor: 已调度 {}/{} -> target={:?}, transfer={:?}, download={:?}",
-                    action, item.path, target_kind, transfer_id, download_id
+                    "executor: 已调度 {}/{} -> target={:?}, task_id={}",
+                    action, item.path, target_kind, task_id
                 );
-                Ok(())
+                match self
+                    .hooks
+                    .wait_transfer_task(&task_id, require_download_completion, TASK_WAIT_TIMEOUT)
+                    .await
+                {
+                    Ok(()) => {
+                        self.persistence.update_run_item_status(
+                            run_item_id,
+                            RunItemStatus::Completed,
+                            None,
+                        )?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        summary.failed += 1;
+                        self.persistence.update_run_item_status(
+                            run_item_id,
+                            RunItemStatus::Failed,
+                            Some(&e.to_string()),
+                        )?;
+                        Err(e)
+                    }
+                }
             }
             Err(e) => {
                 summary.failed += 1;
@@ -475,8 +532,9 @@ mod tests {
         downloads: Mutex<Vec<(u64, String, PathBuf)>>,
         deletes: Mutex<Vec<(PathBuf, String)>>,
     }
+    #[async_trait]
     impl ExecutorHooks for MockHooks {
-        fn submit_transfer(
+        async fn submit_transfer(
             &self,
             _c: &CapturedShare,
             target: &str,
@@ -488,16 +546,23 @@ mod tests {
             g.push((target.to_string(), fs_id));
             Ok(id)
         }
-        fn submit_download(
+        async fn submit_download(
             &self,
-            fs_id: u64,
-            name: &str,
+            item: &ShareSnapshotItem,
             dir: &Path,
         ) -> Result<String, ShareSyncError> {
             let mut g = self.downloads.lock().unwrap();
             let id = format!("dl-{}", g.len() + 1);
-            g.push((fs_id, name.to_string(), dir.to_path_buf()));
+            g.push((item.fs_id, item.path.clone(), dir.to_path_buf()));
             Ok(id)
+        }
+        async fn wait_transfer_task(
+            &self,
+            _task_id: &str,
+            _require_download_completion: bool,
+            _timeout: Duration,
+        ) -> Result<(), ShareSyncError> {
+            Ok(())
         }
         fn delete_netdisk(
             &self,
