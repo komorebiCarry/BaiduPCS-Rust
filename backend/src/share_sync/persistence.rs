@@ -111,10 +111,14 @@ impl ShareSyncPersistence {
                 started_at INTEGER NOT NULL,
                 finished_at INTEGER,
                 status TEXT NOT NULL,
+                total_count INTEGER NOT NULL DEFAULT 0,
                 added_count INTEGER NOT NULL DEFAULT 0,
                 modified_count INTEGER NOT NULL DEFAULT 0,
                 removed_count INTEGER NOT NULL DEFAULT 0,
+                unchanged_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                overwritten_count INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 FOREIGN KEY (subscription_id) REFERENCES share_subscriptions(id) ON DELETE CASCADE
             );
@@ -153,6 +157,19 @@ impl ShareSyncPersistence {
                     "迁移 share_sync_run_items.reason 列失败（已存在可忽略）: {}",
                     e
                 );
+            }
+        }
+        for ddl in [
+            "ALTER TABLE share_sync_runs ADD COLUMN total_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE share_sync_runs ADD COLUMN unchanged_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE share_sync_runs ADD COLUMN skipped_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE share_sync_runs ADD COLUMN overwritten_count INTEGER NOT NULL DEFAULT 0",
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    warn!("迁移 share_sync_runs 统计列失败（已存在可忽略）: {}", e);
+                }
             }
         }
         Ok(())
@@ -370,17 +387,24 @@ impl ShareSyncPersistence {
         conn.execute(
             "UPDATE share_sync_runs
              SET finished_at = ?1, status = ?2,
-                 added_count = ?3, modified_count = ?4,
-                 removed_count = ?5, failed_count = ?6,
-                 error = ?7
-             WHERE id = ?8",
+                 total_count = ?3,
+                 added_count = ?4, modified_count = ?5,
+                 removed_count = ?6, unchanged_count = ?7,
+                 failed_count = ?8, skipped_count = ?9,
+                 overwritten_count = ?10,
+                 error = ?11
+             WHERE id = ?12",
             params![
                 finished_at,
                 status.to_string(),
+                diff.total as i64,
                 diff.added as i64,
                 diff.modified as i64,
                 diff.removed as i64,
+                diff.unchanged as i64,
                 diff.failed as i64,
+                diff.skipped as i64,
+                diff.overwritten as i64,
                 error,
                 run_id
             ],
@@ -472,7 +496,8 @@ impl ShareSyncPersistence {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, started_at, finished_at, status,
-                    added_count, modified_count, removed_count, failed_count, error
+                    total_count, added_count, modified_count, removed_count,
+                    unchanged_count, failed_count, skipped_count, overwritten_count, error
              FROM share_sync_runs
              WHERE subscription_id = ?1
              ORDER BY started_at DESC
@@ -484,11 +509,15 @@ impl ShareSyncPersistence {
                 started_at: row.get::<_, i64>(1)?,
                 finished_at: row.get::<_, Option<i64>>(2)?,
                 status: row.get(3)?,
-                added_count: row.get::<_, i64>(4)? as usize,
-                modified_count: row.get::<_, i64>(5)? as usize,
-                removed_count: row.get::<_, i64>(6)? as usize,
-                failed_count: row.get::<_, i64>(7)? as usize,
-                error: row.get(8)?,
+                total_count: row.get::<_, i64>(4)? as usize,
+                added_count: row.get::<_, i64>(5)? as usize,
+                modified_count: row.get::<_, i64>(6)? as usize,
+                removed_count: row.get::<_, i64>(7)? as usize,
+                unchanged_count: row.get::<_, i64>(8)? as usize,
+                failed_count: row.get::<_, i64>(9)? as usize,
+                skipped_count: row.get::<_, i64>(10)? as usize,
+                overwritten_count: row.get::<_, i64>(11)? as usize,
+                error: row.get(12)?,
             })
         })?;
         let mut out = Vec::new();
@@ -504,7 +533,8 @@ impl ShareSyncPersistence {
         let rec = conn
             .query_row(
                 "SELECT id, started_at, finished_at, status,
-                        added_count, modified_count, removed_count, failed_count, error
+                        total_count, added_count, modified_count, removed_count,
+                        unchanged_count, failed_count, skipped_count, overwritten_count, error
                  FROM share_sync_runs WHERE id = ?1",
                 params![run_id],
                 |row| {
@@ -513,11 +543,15 @@ impl ShareSyncPersistence {
                         started_at: row.get::<_, i64>(1)?,
                         finished_at: row.get::<_, Option<i64>>(2)?,
                         status: row.get(3)?,
-                        added_count: row.get::<_, i64>(4)? as usize,
-                        modified_count: row.get::<_, i64>(5)? as usize,
-                        removed_count: row.get::<_, i64>(6)? as usize,
-                        failed_count: row.get::<_, i64>(7)? as usize,
-                        error: row.get(8)?,
+                        total_count: row.get::<_, i64>(4)? as usize,
+                        added_count: row.get::<_, i64>(5)? as usize,
+                        modified_count: row.get::<_, i64>(6)? as usize,
+                        removed_count: row.get::<_, i64>(7)? as usize,
+                        unchanged_count: row.get::<_, i64>(8)? as usize,
+                        failed_count: row.get::<_, i64>(9)? as usize,
+                        skipped_count: row.get::<_, i64>(10)? as usize,
+                        overwritten_count: row.get::<_, i64>(11)? as usize,
+                        error: row.get(12)?,
                     })
                 },
             )
@@ -564,10 +598,14 @@ pub struct RunRecord {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub status: String,
+    pub total_count: usize,
     pub added_count: usize,
     pub modified_count: usize,
     pub removed_count: usize,
+    pub unchanged_count: usize,
     pub failed_count: usize,
+    pub skipped_count: usize,
+    pub overwritten_count: usize,
     pub error: Option<String>,
 }
 
@@ -727,10 +765,13 @@ mod tests {
             1100,
             RunStatus::CompletedWithErrors,
             &DiffSummary {
+                total: 1,
                 added: 1,
                 modified: 0,
                 removed: 0,
+                unchanged: 0,
                 failed: 0,
+                overwritten: 0,
                 skipped: 0,
             },
             None,

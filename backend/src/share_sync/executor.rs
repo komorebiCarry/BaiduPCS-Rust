@@ -57,6 +57,14 @@ fn quota_skip_reason(err: &ShareSyncError) -> Option<&'static str> {
     }
 }
 
+fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
+    let added = diff.added.iter().filter(|item| !item.is_dir).count();
+    let modified = diff.modified.iter().filter(|item| !item.new.is_dir).count();
+    let removed = diff.removed.iter().filter(|item| !item.is_dir).count();
+    summary.total = added + modified + removed + diff.unchanged_count;
+    summary.unchanged = diff.unchanged_count;
+}
+
 /// v1：整批 submit 触发的最小组内文件数
 ///
 /// 当 `apply_with_run_id_grouped` 把 added/modified 项按"目录根"分组后，
@@ -231,6 +239,7 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         let mut summary = DiffSummary::default();
+        seed_diff_summary(&mut summary, diff);
         let error: Option<String> = None;
         let mut any_failure = false;
         // 资源类错误（quota / local_disk_full）单独计数——
@@ -327,6 +336,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         None,
                         None,
                     );
+                    summary.skipped += 1;
                 }
                 summary.removed += 1; // 也计入 removed（虽然 skipped）
                 continue;
@@ -369,10 +379,13 @@ impl<'a> ShareSyncExecutor<'a> {
             error
         };
         let finished_at = Utc::now().timestamp();
-        if let Err(e) =
-            self.persistence
-                .finish_run(&run_id, finished_at, status, &summary, run_error.as_deref())
-        {
+        if let Err(e) = self.persistence.finish_run(
+            &run_id,
+            finished_at,
+            status,
+            &summary,
+            run_error.as_deref(),
+        ) {
             warn!("finish_run 失败: {}", e);
         }
 
@@ -428,13 +441,13 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         let mut summary = DiffSummary::default();
+        seed_diff_summary(&mut summary, diff);
         let mut any_failure = false;
         let mut run_failure_reason: Option<&'static str> = None;
 
         // 1) 把 added + modified.new 合并为"待处理候选"
-        let mut candidates: Vec<(SyncAction, ShareSnapshotItem)> = Vec::with_capacity(
-            diff.added.len() + diff.modified.len(),
-        );
+        let mut candidates: Vec<(SyncAction, ShareSnapshotItem)> =
+            Vec::with_capacity(diff.added.len() + diff.modified.len());
         for item in &diff.added {
             if item.is_dir {
                 continue;
@@ -470,10 +483,8 @@ impl<'a> ShareSyncExecutor<'a> {
                             .await
                         {
                             any_failure = true;
-                            run_failure_reason = update_run_failure_reason(
-                                run_failure_reason,
-                                e.category(),
-                            );
+                            run_failure_reason =
+                                update_run_failure_reason(run_failure_reason, e.category());
                             warn!("added/modified 处理失败: path={}, err={}", item.path, e);
                         }
                     }
@@ -639,7 +650,8 @@ impl<'a> ShareSyncExecutor<'a> {
                     Err(e) => {
                         any_failure = true;
                         let category = e.category();
-                        run_failure_reason = update_run_failure_reason(run_failure_reason, category);
+                        run_failure_reason =
+                            update_run_failure_reason(run_failure_reason, category);
                         warn!(
                             "batch submit 提交阶段失败: root={}, items={}, err={}",
                             root_path,
@@ -721,6 +733,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         None,
                         None,
                     );
+                    summary.skipped += 1;
                 }
                 summary.removed += 1;
                 continue;
@@ -765,9 +778,9 @@ impl<'a> ShareSyncExecutor<'a> {
         };
 
         let finished_at = Utc::now().timestamp();
-        if let Err(e) = self
-            .persistence
-            .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
+        if let Err(e) =
+            self.persistence
+                .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
         {
             warn!("finish_run 失败: {}", e);
         }
@@ -795,6 +808,7 @@ impl<'a> ShareSyncExecutor<'a> {
             SyncTarget::Netdisk(_) => TargetKind::Netdisk,
             SyncTarget::Local(_) => TargetKind::Local,
         };
+        let mut overwrote_existing = false;
 
         // 1) 按目标处理冲突策略。
         let mut versioned_old: Option<String> = None;
@@ -838,6 +852,7 @@ impl<'a> ShareSyncExecutor<'a> {
 
                 match (strategy, existing) {
                     (ConflictStrategy::Skip, Some(_)) => {
+                        summary.skipped += 1;
                         self.persistence.add_run_item(
                             run_id,
                             &item.path,
@@ -891,13 +906,20 @@ impl<'a> ShareSyncExecutor<'a> {
                             );
                             return Err(e);
                         }
+                        overwrote_existing = true;
                     }
                     _ => {}
+                }
+            }
+            SyncTarget::Local(t) if strategy == ConflictStrategy::Overwrite => {
+                if local_file_exists(&t.local_path, &item.path) {
+                    overwrote_existing = true;
                 }
             }
             SyncTarget::Local(_) if strategy == ConflictStrategy::Skip => {
                 if let SyncTarget::Local(t) = target {
                     if local_file_exists(&t.local_path, &item.path) {
+                        summary.skipped += 1;
                         self.persistence.add_run_item(
                             run_id,
                             &item.path,
@@ -983,6 +1005,9 @@ impl<'a> ShareSyncExecutor<'a> {
                             RunItemStatus::Completed,
                             None,
                         )?;
+                        if overwrote_existing {
+                            summary.overwritten += 1;
+                        }
                         Ok(())
                     }
                     Err(e) => {
@@ -996,10 +1021,9 @@ impl<'a> ShareSyncExecutor<'a> {
                             )?;
                             // 用 reason 列显式标记"为什么跳过"，便于前端
                             // 区分"策略跳过"（reason=NULL）与"quota 跳过"
-                            let _ = self.persistence.set_run_item_reason(
-                                run_item_id,
-                                Some(reason),
-                            );
+                            let _ = self
+                                .persistence
+                                .set_run_item_reason(run_item_id, Some(reason));
                             info!(
                                 "executor: 因 {} 跳过 item path={}, task_id={}",
                                 reason, item.path, task_id
@@ -1310,14 +1334,15 @@ pub(crate) fn group_by_dir_root(
 
     let mut groups: BTreeMap<String, Vec<(SyncAction, ShareSnapshotItem)>> = BTreeMap::new();
     for (action, item) in candidates {
-        let root = find_included_ancestor(&item.path, &includes)
-            .unwrap_or_else(|| String::new());
-        groups.entry(root).or_default().push((*action, item.clone()));
+        let root = find_included_ancestor(&item.path, &includes).unwrap_or_else(|| String::new());
+        groups
+            .entry(root)
+            .or_default()
+            .push((*action, item.clone()));
     }
 
     // 组内按 item.path 排序，便于调试和测试
-    let mut out: Vec<(String, Vec<(SyncAction, ShareSnapshotItem)>)> =
-        groups.into_iter().collect();
+    let mut out: Vec<(String, Vec<(SyncAction, ShareSnapshotItem)>)> = groups.into_iter().collect();
     for (_, group) in &mut out {
         group.sort_by(|a, b| a.1.path.cmp(&b.1.path));
     }
@@ -1987,10 +2012,7 @@ mod tests {
         pm.upsert_subscription(&s).unwrap();
         let prev = ShareSnapshot::with_items(&s.id, vec![]);
         pm.save_snapshot(&prev).unwrap();
-        let curr = ShareSnapshot::with_items(
-            &s.id,
-            vec![item("/big.zip", 100, 999_999_999)],
-        );
+        let curr = ShareSnapshot::with_items(&s.id, vec![item("/big.zip", 100, 999_999_999)]);
         let diff = diff_snapshots(Some(&prev), &curr);
         let hooks = MockHooks::default();
         // 注入 quota 错误到 fs_id=100
@@ -2143,10 +2165,8 @@ mod tests {
         let prev = ShareSnapshot::with_items(&s.id, vec![]);
         pm.save_snapshot(&prev).unwrap();
         // item 500: quota 跳过；item 600: 触发真实失败（用 -7 errmsg 不是 quota）
-        let curr = ShareSnapshot::with_items(
-            &s.id,
-            vec![item("/quota", 500, 1), item("/fail", 600, 1)],
-        );
+        let curr =
+            ShareSnapshot::with_items(&s.id, vec![item("/quota", 500, 1), item("/fail", 600, 1)]);
         let diff = diff_snapshots(Some(&prev), &curr);
         let hooks = MockHooks::default();
         hooks
@@ -2154,10 +2174,11 @@ mod tests {
             .lock()
             .unwrap()
             .insert(500, quota_err());
-        hooks.download_submit_errors.lock().unwrap().insert(
-            600,
-            ShareSyncError::TransferError("API error 31066".into()),
-        );
+        hooks
+            .download_submit_errors
+            .lock()
+            .unwrap()
+            .insert(600, ShareSyncError::TransferError("API error 31066".into()));
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
         let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
         // 存在非 quota 失败 → CompletedWithErrors
@@ -2217,9 +2238,11 @@ mod tests {
             .unwrap()
             .insert(702, quota_err());
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(
-            ex.apply_with_run_id_grouped("r1".into(), &captured(), &diff),
-        );
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_grouped(
+            "r1".into(),
+            &captured(),
+            &diff,
+        ));
         // 仅 quota 跳过 → Completed（不是 Failed / CompletedWithErrors）
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(outcome.diff_summary.skipped, 2);
@@ -2230,7 +2253,11 @@ mod tests {
             .iter()
             .filter(|i| i.status == "skipped" && i.reason.as_deref() == Some("quota_full"))
             .count();
-        assert!(skipped_count >= 2, "skipped/quota_full count = {}", skipped_count);
+        assert!(
+            skipped_count >= 2,
+            "skipped/quota_full count = {}",
+            skipped_count
+        );
     }
 
     #[test]
@@ -2275,9 +2302,11 @@ mod tests {
             .unwrap()
             .insert(802, quota_err());
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(
-            ex.apply_with_run_id_grouped("r2".into(), &captured(), &diff),
-        );
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_grouped(
+            "r2".into(),
+            &captured(),
+            &diff,
+        ));
         // 仍然 Completed（quota 类不算业务失败）
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(outcome.diff_summary.skipped, 1);
@@ -2291,6 +2320,9 @@ mod tests {
         );
         // 那条成功的 download 应该是 small.csv
         let downloads = hooks.downloads.lock().unwrap();
-        assert_eq!(downloads[0].0, 801, "successful fallback should be small.csv");
+        assert_eq!(
+            downloads[0].0, 801,
+            "successful fallback should be small.csv"
+        );
     }
 }

@@ -1312,7 +1312,6 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn test_default_config() {
@@ -1323,10 +1322,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_load() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path().to_str().unwrap();
+        // 用 TempDir 作为 download_dir（默认 <cwd>/downloads 在 CI 上不存在会导致
+        // validate_download_dir_enhanced 失败）。TempDir 保证目录存在且可写。
+        let download_dir = tempfile::tempdir().unwrap();
+        let config_path = download_dir.path().join("app.toml");
+        let path = config_path.to_str().unwrap();
 
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        // 覆盖默认 download_dir（绝对路径、存在、可写）以通过 save_to_file 的增强验证
+        config.download.download_dir = download_dir.path().to_path_buf();
+
         config.save_to_file(path).await.unwrap();
 
         let loaded = AppConfig::load_from_file(path).await.unwrap();

@@ -100,7 +100,13 @@ pub enum ErrorCategory {
 ///   `backend/src/transfer/manager.rs:2740` 的 `handle_transfer_error`）
 /// - 少数中文 errmsg 透传场景可能用 "空间不足" 短串
 /// - task_errno 数字串 "errno=-32" 兼容未走 `handle_transfer_error` 的路径
-const QUOTA_KEYWORDS: &[&str] = &["网盘空间不足", "空间不足", "errno=-32", "errno=-7", "errno=-12"];
+const QUOTA_KEYWORDS: &[&str] = &[
+    "网盘空间不足",
+    "空间不足",
+    "errno=-32",
+    "errno=-7",
+    "errno=-12",
+];
 
 /// 触发 `ErrorCategory::LocalDiskFull` 判定的关键字
 /// - `std::io::Error` 的 `StorageFull`/`Other` 都会被 `From<io::Error>` 归为

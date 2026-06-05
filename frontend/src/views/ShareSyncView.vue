@@ -148,8 +148,12 @@
               <div @click="openRun(r.id)" class="run-item">
                 <strong>{{ describeRunStatus(r.status) }}</strong>
                 <div class="run-stats">
-                  +{{ r.added_count }} ~{{ r.modified_count }} −{{ r.removed_count }}
-                  <span v-if="r.failed_count > 0" style="color: #f56c6c"> ✗{{ r.failed_count }}</span>
+                  总 {{ runTotalCount(r) }} / 需处理 {{ runChangedCount(r) }}
+                  <span> +{{ r.added_count }}</span>
+                  <span> 覆盖 {{ runOverwrittenCount(r) }}</span>
+                  <span> 一致跳过 {{ runUnchangedCount(r) }}</span>
+                  <span v-if="runSkippedCount(r) > 0" style="color: #e6a23c"> 跳过 {{ runSkippedCount(r) }}</span>
+                  <span v-if="r.failed_count > 0" style="color: #f56c6c"> 失败 {{ r.failed_count }}</span>
                 </div>
               </div>
             </el-timeline-item>
@@ -371,6 +375,15 @@
           <el-descriptions-item label="结束时间">
             {{ currentRun.finished_at ? formatTime(currentRun.finished_at) : '—' }}
           </el-descriptions-item>
+          <el-descriptions-item label="总文件">{{ runTotalCount(currentRun) }}</el-descriptions-item>
+          <el-descriptions-item label="需处理">{{ runChangedCount(currentRun) }}</el-descriptions-item>
+          <el-descriptions-item label="新增">{{ currentRun.added_count }}</el-descriptions-item>
+          <el-descriptions-item label="修改">{{ currentRun.modified_count }}</el-descriptions-item>
+          <el-descriptions-item label="删除">{{ currentRun.removed_count }}</el-descriptions-item>
+          <el-descriptions-item label="覆盖">{{ runOverwrittenCount(currentRun) }}</el-descriptions-item>
+          <el-descriptions-item label="一致跳过">{{ runUnchangedCount(currentRun) }}</el-descriptions-item>
+          <el-descriptions-item label="其它跳过">{{ runSkippedCount(currentRun) }}</el-descriptions-item>
+          <el-descriptions-item label="失败">{{ currentRun.failed_count }}</el-descriptions-item>
           <el-descriptions-item label="错误" v-if="currentRun.error">
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
@@ -381,6 +394,7 @@
           <el-table-column prop="action" label="动作" width="80" />
           <el-table-column prop="target" label="目标" width="80" />
           <el-table-column prop="status" label="状态" width="100" />
+          <el-table-column prop="reason" label="跳过原因" width="120" />
           <el-table-column prop="error" label="错误" />
         </el-table>
       </div>
@@ -1010,6 +1024,26 @@ function runStatusType(s: string): 'success' | 'warning' | 'danger' | 'info' {
   return s === 'completed' ? 'success' :
     s === 'completed_with_errors' ? 'warning' :
     s === 'failed' ? 'danger' : 'info'
+}
+
+function runTotalCount(r: RunRecord | RunDetail): number {
+  return r.total_count || (r.added_count + r.modified_count + r.removed_count + runUnchangedCount(r))
+}
+
+function runChangedCount(r: RunRecord | RunDetail): number {
+  return r.added_count + r.modified_count + r.removed_count
+}
+
+function runUnchangedCount(r: RunRecord | RunDetail): number {
+  return r.unchanged_count ?? 0
+}
+
+function runSkippedCount(r: RunRecord | RunDetail): number {
+  return r.skipped_count ?? 0
+}
+
+function runOverwrittenCount(r: RunRecord | RunDetail): number {
+  return r.overwritten_count ?? 0
 }
 
 function formatTime(ts: number): string {
