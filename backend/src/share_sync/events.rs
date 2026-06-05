@@ -65,6 +65,13 @@ pub enum ShareSyncEvent {
         run_id: String,
         subscription_id: String,
         error: String,
+        /// v1 新增：失败原因分类，便于前端红色高亮
+        /// - `"quota_full"`        : 网盘空间不足
+        /// - `"local_disk_full"`  : 本地磁盘满
+        /// - `"unknown"`          : 其它（向后兼容，老数据 / 兜底）
+        /// 老事件无此字段时反序列化为 `None`（用 `serde(default)`），前端按 `error` 字符串展示。
+        #[serde(default)]
+        reason: Option<String>,
     },
 }
 
@@ -166,5 +173,38 @@ mod tests {
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"run_completed\""));
+    }
+
+    #[test]
+    fn test_run_failed_with_reason() {
+        // v1 新增：带 reason 的 RunFailed 序列化
+        let e = ShareSyncEvent::RunFailed {
+            run_id: "r".into(),
+            subscription_id: "s".into(),
+            error: "网盘空间不足".into(),
+            reason: Some("quota_full".into()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"reason\":\"quota_full\""));
+    }
+
+    #[test]
+    fn test_run_failed_backward_compat_no_reason_field() {
+        // 老事件流（无 reason 字段）反序列化时 `reason == None`，
+        // 靠 `#[serde(default)]` 保证不报错
+        let legacy_json = r#"{
+            "type": "run_failed",
+            "run_id": "r",
+            "subscription_id": "s",
+            "error": "some old error"
+        }"#;
+        let e: ShareSyncEvent = serde_json::from_str(legacy_json).unwrap();
+        match e {
+            ShareSyncEvent::RunFailed { reason, error, .. } => {
+                assert!(reason.is_none());
+                assert_eq!(error, "some old error");
+            }
+            _ => panic!("expected RunFailed"),
+        }
     }
 }

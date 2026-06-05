@@ -132,12 +132,29 @@ impl ShareSyncPersistence {
                 status TEXT NOT NULL,
                 versioned_old_path TEXT,
                 error TEXT,
+                reason TEXT,
                 FOREIGN KEY (run_id) REFERENCES share_sync_runs(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_share_run_items_run
               ON share_sync_run_items(run_id);
             "#,
         )?;
+        // 兼容老库：老版本的 share_sync_run_items 表没有 reason 列。
+        // SQLite 的 `ADD COLUMN` 在列已存在时会报 "duplicate column" 错误，
+        // 这里用 `try_exec` 风格的 "忽略特定错误" 模式做幂等迁移。
+        // 失败时只记 warn，不影响表结构初始化。
+        if let Err(e) = conn.execute(
+            "ALTER TABLE share_sync_run_items ADD COLUMN reason TEXT",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                warn!(
+                    "迁移 share_sync_run_items.reason 列失败（已存在可忽略）: {}",
+                    e
+                );
+            }
+        }
         Ok(())
     }
 
@@ -372,6 +389,10 @@ impl ShareSyncPersistence {
     }
 
     /// 单个 run_item 入库
+    ///
+    /// `reason` 是 v1 新增字段，用于说明"为什么这条 item 没被真正执行"——
+    /// 当前主要给 quota / local_disk_full 早停场景用，记录"skip_due_to_quota_full"
+    /// 之类的语义化原因。普通成功 / 正常失败的 item 传 `None`。
     #[allow(clippy::too_many_arguments)]
     pub fn add_run_item(
         &self,
@@ -383,16 +404,17 @@ impl ShareSyncPersistence {
         download_task_id: Option<&str>,
         status: RunItemStatus,
         versioned_old_path: Option<&str>,
+        reason: Option<&str>,
     ) -> Result<i64, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO share_sync_run_items
-             (run_id, path, action, target, transfer_task_id, download_task_id, status, versioned_old_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (run_id, path, action, target, transfer_task_id, download_task_id, status, versioned_old_path, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 run_id, path, action.to_string(), target.to_string(),
                 transfer_task_id, download_task_id,
-                status.to_string(), versioned_old_path
+                status.to_string(), versioned_old_path, reason
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -409,6 +431,31 @@ impl ShareSyncPersistence {
         conn.execute(
             "UPDATE share_sync_run_items SET status = ?1, error = ?2 WHERE id = ?3",
             params![status.to_string(), error, run_item_id],
+        )?;
+        Ok(())
+    }
+
+    /// 单独更新 run_item 的 reason 字段（v1 新增）
+    ///
+    /// 用于"submit/wait 阶段因 quota 跳过"——此时 `add_run_item` 已经把 status
+    /// 写为 `Transferring`/`Downloading`，事后 `update_run_item_status` 改成
+    /// `Skipped` 时如果只更新 status 会丢失"为什么跳"的语义信息，所以这里
+    /// 单独写 reason 列。
+    ///
+    /// reason 取值约定：
+    /// - `quota_full`        : 网盘空间不足
+    /// - `local_disk_full`  : 本地磁盘满
+    /// - `skip_due_to_quota_full` / `skip_due_to_local_disk_full` : 早停场景下
+    ///   整组未提交的子项（见 `apply_with_run_id_grouped`）
+    pub fn set_run_item_reason(
+        &self,
+        run_item_id: i64,
+        reason: Option<&str>,
+    ) -> Result<(), ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE share_sync_run_items SET reason = ?1 WHERE id = ?2",
+            params![reason, run_item_id],
         )?;
         Ok(())
     }
@@ -483,7 +530,7 @@ impl ShareSyncPersistence {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, path, action, target, transfer_task_id, download_task_id,
-                    status, versioned_old_path, error
+                    status, versioned_old_path, error, reason
              FROM share_sync_run_items
              WHERE run_id = ?1
              ORDER BY id ASC",
@@ -499,6 +546,7 @@ impl ShareSyncPersistence {
                 status: row.get(6)?,
                 versioned_old_path: row.get(7)?,
                 error: row.get(8)?,
+                reason: row.get(9)?,
             })
         })?;
         let mut out = Vec::new();
@@ -535,6 +583,9 @@ pub struct RunItemRecord {
     pub status: String,
     pub versioned_old_path: Option<String>,
     pub error: Option<String>,
+    /// v1 新增：说明 item 为什么没被执行（如 `skip_due_to_quota_full`），普通成功/失败为 `None`
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // 把 ShareSnapshotItem 在 persistence 内部用别名重新引用，避免循环 import
@@ -644,6 +695,7 @@ mod tests {
             None,
             RunItemStatus::Pending,
             None,
+            None,
         )
         .unwrap();
 
@@ -667,6 +719,7 @@ mod tests {
             None,
             RunItemStatus::Transferring,
             None,
+            None,
         )
         .unwrap();
         mgr.finish_run(
@@ -678,6 +731,7 @@ mod tests {
                 modified: 0,
                 removed: 0,
                 failed: 0,
+                skipped: 0,
             },
             None,
         )
