@@ -2,7 +2,7 @@
 
 # 本地部署脚本（不使用 Docker）
 # 直接在本机构建并启动后端（rust 二进制）+ 前端（vite）
-# 前端端口：5173
+# 前端端口：4923（vite preview，绑定 0.0.0.0）
 # 后端端口：取自 config/app.toml（默认 18888）
 #
 # 关键设计：
@@ -42,7 +42,8 @@ BACKEND_BIN_NAME="baidu-netdisk-rust"
 BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
 
 # ----------------- 配置 -----------------
-FRONTEND_PORT=5173
+FRONTEND_PORT=4923
+FRONTEND_HOST="0.0.0.0"
 BACKEND_HOST="127.0.0.1"
 BACKEND_PORT=18888
 MODE="prod"   # prod | dev
@@ -77,7 +78,7 @@ while [ $# -gt 0 ]; do
 选项:
   --dev          以开发模式启动前端（vite dev，HMR）
   --prod         以生产模式启动前端（vite build + vite preview，默认）
-  --port <port>  指定前端端口（默认 5173）
+  --port <port>  指定前端端口（默认 4923）
 
 子命令（手动模式）:
   start              启动前后端服务（默认）
@@ -97,7 +98,7 @@ while [ $# -gt 0 ]; do
   run-frontend       前台运行前端（不要手动调用）
 
 示例:
-  $0                       # 生产模式启动，前端端口 5173
+  $0                       # 生产模式启动，前端端口 4923
   $0 --dev                 # 开发模式启动
   $0 stop                  # 停止服务
   sudo $0 install-systemd  # 安装为系统服务，开机自启
@@ -255,7 +256,7 @@ import base from './vite.config'
 
 export default mergeConfig(base, defineConfig({
   server: {
-    host: '0.0.0.0',
+    host: '${FRONTEND_HOST}',
     port: ${FRONTEND_PORT},
     strictPort: true,
     allowedHosts: true,
@@ -266,7 +267,7 @@ export default mergeConfig(base, defineConfig({
     }
   },
   preview: {
-    host: '0.0.0.0',
+    host: '${FRONTEND_HOST}',
     port: ${FRONTEND_PORT},
     strictPort: true,
     allowedHosts: true,
@@ -345,7 +346,7 @@ start_frontend() {
         setsid nohup "$vite_bin" --config vite.local.config.ts >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     else
         log "启动前端 (vite preview) 端口 $FRONTEND_PORT -> $FRONTEND_LOG"
-        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host 0.0.0.0 >>"$FRONTEND_LOG" 2>&1 < /dev/null &
+        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host "$FRONTEND_HOST" >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     fi
     local pid=$!
     echo "$pid" > "$FRONTEND_PID_FILE"
@@ -356,7 +357,7 @@ start_frontend() {
 
     sleep 2
     if is_running "$FRONTEND_PID_FILE"; then
-        ok "前端已启动 (PID $pid, PGID $pgid)，监听 0.0.0.0:${FRONTEND_PORT}"
+        ok "前端已启动 (PID $pid, PGID $pgid)，监听 ${FRONTEND_HOST}:${FRONTEND_PORT}"
     else
         err "前端启动失败，查看 $FRONTEND_LOG"
         exit 1
