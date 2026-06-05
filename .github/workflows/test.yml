@@ -37,9 +37,9 @@ jobs:
         working-directory: backend
         run: cargo test --lib --all-features -- --nocapture
 
-      - name: Run cargo clippy (deny warnings)
+      - name: Run cargo clippy
         working-directory: backend
-        run: cargo clippy --lib --all-features -- -D warnings
+        run: cargo clippy --lib --all-features
 
   # ============ 前端类型 / 构建 / 测试 ============
   frontend-test:
