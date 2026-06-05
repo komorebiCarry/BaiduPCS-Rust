@@ -381,8 +381,10 @@ class WebSocketClient {
   /**
    * 订阅分享同步事件
    */
-  public onShareSyncEvent(callback: (event: any) => void): () => void {
-    const handler = (ev: any) => callback(ev)
+  public onShareSyncEvent(
+    callback: (event: CustomEvent<import('@/api/shareSync').ShareSyncWsEvent>) => void
+  ): () => void {
+    const handler = (ev: Event) => callback(ev as CustomEvent<import('@/api/shareSync').ShareSyncWsEvent>)
     document.addEventListener('baidu-netdisk:share-sync', handler as EventListener)
     return () => document.removeEventListener('baidu-netdisk:share-sync', handler as EventListener)
   }

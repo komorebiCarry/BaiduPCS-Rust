@@ -638,22 +638,13 @@ pub enum BackupEvent {
         skipped_count: usize,
     },
     /// 任务失败
-    Failed {
-        task_id: String,
-        error: String,
-    },
+    Failed { task_id: String, error: String },
     /// 任务暂停
-    Paused {
-        task_id: String,
-    },
+    Paused { task_id: String },
     /// 任务恢复
-    Resumed {
-        task_id: String,
-    },
+    Resumed { task_id: String },
     /// 任务取消
-    Cancelled {
-        task_id: String,
-    },
+    Cancelled { task_id: String },
     /// 文件加密开始
     FileEncrypting {
         task_id: String,
@@ -807,9 +798,7 @@ pub enum CloudDlEvent {
         progress_percent: f32,
     },
     /// 任务列表刷新（初始加载或手动刷新）
-    TaskListRefreshed {
-        tasks: Vec<serde_json::Value>,
-    },
+    TaskListRefreshed { tasks: Vec<serde_json::Value> },
 }
 
 impl CloudDlEvent {
@@ -1036,8 +1025,12 @@ impl TaskEvent {
             }
             TaskEvent::Scan(ScanEvent::Started { .. }) => true,
             TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled { .. }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected {
+                ..
+            }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled {
+                ..
+            }) => true,
             _ => false,
         }
     }

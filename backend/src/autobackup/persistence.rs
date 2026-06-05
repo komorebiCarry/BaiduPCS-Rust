@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use super::task::{
-    BackupFileStatus, BackupFileTask, BackupOperationType, BackupTask, BackupTaskStatus,
-    BackupSubPhase, SkipReason, TriggerType,
+    BackupFileStatus, BackupFileTask, BackupOperationType, BackupSubPhase, BackupTask,
+    BackupTaskStatus, SkipReason, TriggerType,
 };
 
 // ==================== 分页常量 ====================
@@ -58,7 +58,7 @@ impl BackupPersistenceManager {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;"
+             PRAGMA busy_timeout=5000;",
         )?;
 
         let manager = Self {
@@ -73,7 +73,10 @@ impl BackupPersistenceManager {
 
     /// 初始化数据库表
     fn init_tables(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 创建主任务表
         conn.execute(
@@ -220,11 +223,14 @@ impl BackupPersistenceManager {
 
     /// 保存备份任务
     pub fn save_task(&self, task: &BackupTask) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
-        let status = format!("{:?}", task.status).to_lowercase();
-        let sub_phase = task.sub_phase.map(|p| format!("{:?}", p).to_lowercase());
-        let trigger_type = format!("{:?}", task.trigger_type).to_lowercase();
+        let status = task.status.as_str();
+        let sub_phase = task.sub_phase.map(|p| p.as_str());
+        let trigger_type = task.trigger_type.as_str();
 
         conn.execute(
             r#"
@@ -259,7 +265,10 @@ impl BackupPersistenceManager {
 
     /// 加载备份任务
     pub fn load_task(&self, task_id: &str) -> Result<Option<BackupTask>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let result = conn
             .query_row(
@@ -306,10 +315,13 @@ impl BackupPersistenceManager {
         status: BackupTaskStatus,
         sub_phase: Option<BackupSubPhase>,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
-        let status_str = format!("{:?}", status).to_lowercase();
-        let sub_phase_str = sub_phase.map(|p| format!("{:?}", p).to_lowercase());
+        let status_str = status.as_str();
+        let sub_phase_str = sub_phase.map(|p| p.as_str());
 
         conn.execute(
             "UPDATE backup_tasks SET status = ?1, sub_phase = ?2 WHERE id = ?3",
@@ -328,7 +340,10 @@ impl BackupPersistenceManager {
         skipped_count: usize,
         transferred_bytes: u64,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         conn.execute(
             r#"
@@ -350,7 +365,10 @@ impl BackupPersistenceManager {
 
     /// 加载未完成的任务
     pub fn load_incomplete_tasks(&self) -> Result<Vec<BackupTask>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -400,7 +418,10 @@ impl BackupPersistenceManager {
 
     /// 删除任务
     pub fn delete_task(&self, task_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 先删除子任务
         conn.execute(
@@ -418,20 +439,27 @@ impl BackupPersistenceManager {
 
     /// 保存文件任务
     pub fn save_file_task(&self, file_task: &BackupFileTask, config_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
-        let status = format!("{:?}", file_task.status).to_lowercase();
+        let status = file_task.status.as_str();
         let skip_reason = file_task
             .skip_reason
             .as_ref()
             .map(|r| serde_json::to_string(r).unwrap_or_default());
 
         // 提取文件名和相对路径
-        let file_name = file_task.local_path.file_name()
+        let file_name = file_task
+            .local_path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let relative_path = file_task.local_path.parent()
+        let relative_path = file_task
+            .local_path
+            .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -459,7 +487,7 @@ impl BackupPersistenceManager {
                 file_task.head_md5.as_deref().unwrap_or(""),
                 file_task.fs_id.map(|id| id as i64),
                 status,
-                file_task.sub_phase.map(|p| format!("{:?}", p).to_lowercase()),
+                file_task.sub_phase.map(|p| p.as_str()),
                 skip_reason,
                 file_task.encrypted,
                 file_task.encrypted_name,
@@ -468,7 +496,7 @@ impl BackupPersistenceManager {
                 file_task.error_message,
                 file_task.retry_count as i64,
                 file_task.related_task_id,
-                file_task.backup_operation_type.map(|t| format!("{:?}", t).to_lowercase()),
+                file_task.backup_operation_type.map(|t| t.as_str()),
                 file_task.sync_remote_mtime,
                 file_task.sync_remote_size.map(|s| s as i64),
                 file_task.sync_remote_fs_id.map(|id| id as i64),
@@ -481,8 +509,15 @@ impl BackupPersistenceManager {
     }
 
     /// 批量保存文件任务（使用事务，满足内存优化要求）
-    pub fn save_file_tasks_batch(&self, file_tasks: &[BackupFileTask], config_id: &str) -> Result<()> {
-        let mut conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn save_file_tasks_batch(
+        &self,
+        file_tasks: &[BackupFileTask],
+        config_id: &str,
+    ) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 使用事务批量插入，提高性能
         let tx = conn.transaction()?;
@@ -503,18 +538,22 @@ impl BackupPersistenceManager {
             )?;
 
             for file_task in file_tasks {
-                let status = format!("{:?}", file_task.status).to_lowercase();
+                let status = file_task.status.as_str();
                 let skip_reason = file_task
                     .skip_reason
                     .as_ref()
                     .map(|r| serde_json::to_string(r).unwrap_or_default());
 
                 // 提取文件名和相对路径
-                let file_name = file_task.local_path.file_name()
+                let file_name = file_task
+                    .local_path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let relative_path = file_task.local_path.parent()
+                let relative_path = file_task
+                    .local_path
+                    .parent()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
 
@@ -530,16 +569,19 @@ impl BackupPersistenceManager {
                     file_task.head_md5.as_deref().unwrap_or(""),
                     file_task.fs_id.map(|id| id as i64),
                     status,
-                    file_task.sub_phase.map(|p| format!("{:?}", p).to_lowercase()),
+                    file_task.sub_phase.map(|p| p.as_str()),
                     skip_reason,
                     file_task.encrypted,
                     file_task.encrypted_name,
-                    file_task.temp_encrypted_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    file_task
+                        .temp_encrypted_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string()),
                     file_task.transferred_bytes as i64,
                     file_task.error_message,
                     file_task.retry_count as i64,
                     file_task.related_task_id,
-                    file_task.backup_operation_type.map(|t| format!("{:?}", t).to_lowercase()),
+                    file_task.backup_operation_type.map(|t| t.as_str()),
                     file_task.sync_remote_mtime,
                     file_task.sync_remote_size.map(|s| s as i64),
                     file_task.sync_remote_fs_id.map(|id| id as i64),
@@ -564,7 +606,10 @@ impl BackupPersistenceManager {
         page: usize,
         page_size: usize,
     ) -> Result<(Vec<BackupFileTask>, usize)> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 规范化分页参数
         let normalized_page_size = normalize_pagination(page_size);
@@ -594,36 +639,39 @@ impl BackupPersistenceManager {
             "#,
         )?;
 
-        let rows = stmt.query_map(params![task_id, normalized_page_size as i64, offset as i64], |row| {
-            Ok(BackupFileTaskRow {
-                id: row.get(0)?,
-                backup_task_id: row.get(1)?,
-                config_id: row.get(2)?,
-                relative_path: row.get(3)?,
-                file_name: row.get(4)?,
-                local_path: row.get(5)?,
-                remote_path: row.get(6)?,
-                file_size: row.get(7)?,
-                head_md5: row.get(8)?,
-                fs_id: row.get(9)?,
-                status: row.get(10)?,
-                sub_phase: row.get(11)?,
-                skip_reason: row.get(12)?,
-                encrypted: row.get(13)?,
-                encrypted_name: row.get(14)?,
-                temp_encrypted_path: row.get(15)?,
-                transferred_bytes: row.get(16)?,
-                error_message: row.get(17)?,
-                retry_count: row.get(18)?,
-                related_task_id: row.get(19)?,
-                backup_operation_type: row.get(20)?,
-                sync_remote_mtime: row.get(21)?,
-                sync_remote_size: row.get(22)?,
-                sync_remote_fs_id: row.get(23)?,
-                created_at: row.get(24)?,
-                updated_at: row.get(25)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![task_id, normalized_page_size as i64, offset as i64],
+            |row| {
+                Ok(BackupFileTaskRow {
+                    id: row.get(0)?,
+                    backup_task_id: row.get(1)?,
+                    config_id: row.get(2)?,
+                    relative_path: row.get(3)?,
+                    file_name: row.get(4)?,
+                    local_path: row.get(5)?,
+                    remote_path: row.get(6)?,
+                    file_size: row.get(7)?,
+                    head_md5: row.get(8)?,
+                    fs_id: row.get(9)?,
+                    status: row.get(10)?,
+                    sub_phase: row.get(11)?,
+                    skip_reason: row.get(12)?,
+                    encrypted: row.get(13)?,
+                    encrypted_name: row.get(14)?,
+                    temp_encrypted_path: row.get(15)?,
+                    transferred_bytes: row.get(16)?,
+                    error_message: row.get(17)?,
+                    retry_count: row.get(18)?,
+                    related_task_id: row.get(19)?,
+                    backup_operation_type: row.get(20)?,
+                    sync_remote_mtime: row.get(21)?,
+                    sync_remote_size: row.get(22)?,
+                    sync_remote_fs_id: row.get(23)?,
+                    created_at: row.get(24)?,
+                    updated_at: row.get(25)?,
+                })
+            },
+        )?;
 
         let mut tasks = Vec::new();
         for row in rows {
@@ -647,10 +695,13 @@ impl BackupPersistenceManager {
         sub_phase: Option<BackupSubPhase>,
         error_message: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
-        let status_str = format!("{:?}", status).to_lowercase();
-        let sub_phase_str = sub_phase.map(|p| format!("{:?}", p).to_lowercase());
+        let status_str = status.as_str();
+        let sub_phase_str = sub_phase.map(|p| p.as_str());
         let now = chrono::Utc::now().timestamp();
 
         conn.execute(
@@ -667,7 +718,10 @@ impl BackupPersistenceManager {
         file_task_id: &str,
         transferred_bytes: u64,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let now = chrono::Utc::now().timestamp();
 
@@ -683,8 +737,15 @@ impl BackupPersistenceManager {
 
     /// 获取下一批待处理的文件任务（用于内存优化）
     /// 只加载指定数量的待处理文件，避免一次性加载全部
-    pub fn get_next_pending_files(&self, task_id: &str, limit: usize) -> Result<Vec<BackupFileTask>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn get_next_pending_files(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackupFileTask>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -759,7 +820,10 @@ impl BackupPersistenceManager {
     /// - Skipped: 已跳过（去重等原因）
     /// - 注：Cancelled 状态不在 BackupFileStatus 中，但如有需要可扩展
     pub fn load_file_tasks_for_restore(&self, backup_task_id: &str) -> Result<Vec<BackupFileTask>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 非终态条件：排除 completed, failed, skipped, cancelled
         let mut stmt = conn.prepare(
@@ -825,7 +889,10 @@ impl BackupPersistenceManager {
 
     /// 获取待处理文件数量（不加载文件内容）
     pub fn count_pending_files(&self, task_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM backup_file_tasks WHERE backup_task_id = ?1 AND status = 'pending'",
@@ -838,7 +905,10 @@ impl BackupPersistenceManager {
 
     /// 获取各状态文件数量统计
     pub fn get_file_stats(&self, task_id: &str) -> Result<FileTaskStats> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let mut stmt = conn.prepare(
             r#"
@@ -850,7 +920,11 @@ impl BackupPersistenceManager {
         )?;
 
         let rows = stmt.query_map(params![task_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
 
         let mut stats = FileTaskStats::default();
@@ -889,12 +963,19 @@ impl BackupPersistenceManager {
             return Ok(());
         }
 
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
-        let status_str = format!("{:?}", status).to_lowercase();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let status_str = status.as_str();
         let now = chrono::Utc::now().timestamp();
 
         // 使用事务批量更新
-        let placeholders: Vec<String> = file_task_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 3)).collect();
+        let placeholders: Vec<String> = file_task_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 3))
+            .collect();
         let query = format!(
             "UPDATE backup_file_tasks SET status = ?1, updated_at = ?2 WHERE id IN ({})",
             placeholders.join(", ")
@@ -907,7 +988,8 @@ impl BackupPersistenceManager {
             params_vec.push(Box::new(id.to_string()));
         }
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         conn.execute(&query, params_refs.as_slice())?;
 
         Ok(())
@@ -915,7 +997,10 @@ impl BackupPersistenceManager {
 
     /// 删除已完成/已跳过的文件任务（释放数据库空间）
     pub fn cleanup_completed_file_tasks(&self, task_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let deleted = conn.execute(
             "DELETE FROM backup_file_tasks WHERE backup_task_id = ?1 AND status IN ('completed', 'skipped')",
@@ -933,8 +1018,16 @@ impl BackupPersistenceManager {
     /// 分页参数会被规范化：
     /// - limit 为 0 时使用默认值 100
     /// - limit 超过 500 时截断为 500
-    pub fn get_tasks_by_config(&self, config_id: &str, limit: usize, offset: usize) -> Result<Vec<BackupTask>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn get_tasks_by_config(
+        &self,
+        config_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BackupTask>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 规范化分页参数
         let normalized_limit = normalize_pagination(limit);
@@ -952,25 +1045,28 @@ impl BackupPersistenceManager {
             "#,
         )?;
 
-        let rows = stmt.query_map(params![config_id, normalized_limit as i64, offset as i64], |row| {
-            Ok(BackupTaskRow {
-                id: row.get(0)?,
-                config_id: row.get(1)?,
-                status: row.get(2)?,
-                sub_phase: row.get(3)?,
-                trigger_type: row.get(4)?,
-                completed_count: row.get(5)?,
-                failed_count: row.get(6)?,
-                skipped_count: row.get(7)?,
-                total_count: row.get(8)?,
-                transferred_bytes: row.get(9)?,
-                total_bytes: row.get(10)?,
-                error_message: row.get(11)?,
-                created_at: row.get(12)?,
-                started_at: row.get(13)?,
-                completed_at: row.get(14)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![config_id, normalized_limit as i64, offset as i64],
+            |row| {
+                Ok(BackupTaskRow {
+                    id: row.get(0)?,
+                    config_id: row.get(1)?,
+                    status: row.get(2)?,
+                    sub_phase: row.get(3)?,
+                    trigger_type: row.get(4)?,
+                    completed_count: row.get(5)?,
+                    failed_count: row.get(6)?,
+                    skipped_count: row.get(7)?,
+                    total_count: row.get(8)?,
+                    transferred_bytes: row.get(9)?,
+                    total_bytes: row.get(10)?,
+                    error_message: row.get(11)?,
+                    created_at: row.get(12)?,
+                    started_at: row.get(13)?,
+                    completed_at: row.get(14)?,
+                })
+            },
+        )?;
 
         let mut tasks = Vec::new();
         for row in rows {
@@ -992,8 +1088,15 @@ impl BackupPersistenceManager {
     /// 分页参数会被规范化：
     /// - limit 为 0 时使用默认值 100
     /// - limit 超过 500 时截断为 500
-    pub fn load_file_tasks_by_config(&self, config_id: &str, limit: usize) -> Result<Vec<BackupFileTask>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn load_file_tasks_by_config(
+        &self,
+        config_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackupFileTask>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 规范化分页参数
         let normalized_limit = normalize_pagination(limit);
@@ -1061,7 +1164,10 @@ impl BackupPersistenceManager {
 
     /// 按配置统计任务数量
     pub fn count_tasks_by_config(&self, config_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM backup_tasks WHERE config_id = ?1",
@@ -1077,8 +1183,14 @@ impl BackupPersistenceManager {
     /// 根据关联的上传/下载任务ID查找备份文件任务
     ///
     /// 用于服务重启时，根据已归档的上传/下载任务ID找到对应的备份文件任务
-    pub fn find_file_task_by_related_task_id(&self, related_task_id: &str) -> Result<Option<(String, String)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn find_file_task_by_related_task_id(
+        &self,
+        related_task_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let result = conn
             .query_row(
@@ -1100,7 +1212,10 @@ impl BackupPersistenceManager {
         related_task_id: &str,
         transferred_bytes: u64,
     ) -> Result<Option<String>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let now = chrono::Utc::now().timestamp();
 
@@ -1149,7 +1264,10 @@ impl BackupPersistenceManager {
             return Ok(Vec::new());
         }
 
-        let mut conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
         let tx = conn.transaction()?;
 
         let now = chrono::Utc::now().timestamp();
@@ -1208,7 +1326,10 @@ impl BackupPersistenceManager {
     /// 根据文件任务的实际状态重新计算主任务的 completed_count, failed_count 等
     /// 同时计算 total_bytes（排除 skipped）和 transferred_bytes（已完成文件用 file_size，其他用 transferred_bytes）
     pub fn recalculate_task_progress(&self, backup_task_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 统计各状态的文件数量和字节数
         // total_bytes: 排除 skipped 状态的文件大小总和
@@ -1249,7 +1370,15 @@ impl BackupPersistenceManager {
                 transferred_bytes = ?6
             WHERE id = ?7
             "#,
-            params![completed, failed, skipped, total, total_bytes, transferred_bytes, backup_task_id],
+            params![
+                completed,
+                failed,
+                skipped,
+                total,
+                total_bytes,
+                transferred_bytes,
+                backup_task_id
+            ],
         )?;
 
         // 检查是否所有文件都已处理完成（终态）
@@ -1298,16 +1427,19 @@ impl BackupPersistenceManager {
     ///
     /// 返回当前任务中所有文件的本地路径集合（包括已完成、失败、跳过的）
     /// 用于增量合并时判断文件是否已在当前任务中
-    pub fn get_task_file_local_paths(&self, task_id: &str) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn get_task_file_local_paths(
+        &self,
+        task_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT local_path FROM backup_file_tasks WHERE backup_task_id = ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT local_path FROM backup_file_tasks WHERE backup_task_id = ?1")?;
 
-        let rows = stmt.query_map(params![task_id], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(params![task_id], |row| row.get::<_, String>(0))?;
 
         let mut paths = std::collections::HashSet::new();
         for row in rows {
@@ -1323,7 +1455,10 @@ impl BackupPersistenceManager {
     ///
     /// 用于增量合并新文件后重新计算 total_bytes
     pub fn calculate_total_bytes_by_task(&self, task_id: &str) -> Result<u64> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let total_bytes: i64 = conn.query_row(
             r#"
@@ -1343,7 +1478,10 @@ impl BackupPersistenceManager {
     /// 已完成文件用 file_size，其他用 transferred_bytes
     /// 用于从数据库重新计算 transferred_bytes，确保包含所有文件
     pub fn calculate_transferred_bytes_by_task(&self, task_id: &str) -> Result<u64> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let transferred_bytes: i64 = conn.query_row(
             r#"
@@ -1368,7 +1506,10 @@ impl BackupPersistenceManager {
     ///
     /// exclude_skipped: 是否排除 skipped 状态的文件
     pub fn count_files_by_task(&self, task_id: &str, exclude_skipped: bool) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let count: i64 = if exclude_skipped {
             conn.query_row(
@@ -1390,8 +1531,16 @@ impl BackupPersistenceManager {
     /// 更新任务的 total_bytes 和 transferred_bytes
     ///
     /// 用于增量合并新文件后更新任务统计
-    pub fn update_task_bytes(&self, task_id: &str, total_bytes: u64, transferred_bytes: u64) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn update_task_bytes(
+        &self,
+        task_id: &str,
+        total_bytes: u64,
+        transferred_bytes: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         conn.execute(
             "UPDATE backup_tasks SET total_bytes = ?1, transferred_bytes = ?2 WHERE id = ?3",
@@ -1405,7 +1554,10 @@ impl BackupPersistenceManager {
     ///
     /// 用于增量合并新文件后更新任务统计
     pub fn update_task_total_count(&self, task_id: &str, total_count: usize) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         conn.execute(
             "UPDATE backup_tasks SET total_count = ?1 WHERE id = ?2",
@@ -1418,16 +1570,19 @@ impl BackupPersistenceManager {
     /// 获取任务的所有文件远程路径（用于下载备份增量对比）
     ///
     /// 返回当前任务中所有文件的远程路径集合，用于判断新文件是否已在任务中
-    pub fn get_task_remote_paths(&self, task_id: &str) -> Result<std::collections::HashSet<String>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+    pub fn get_task_remote_paths(
+        &self,
+        task_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT remote_path FROM backup_file_tasks WHERE backup_task_id = ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT remote_path FROM backup_file_tasks WHERE backup_task_id = ?1")?;
 
-        let paths = stmt.query_map(params![task_id], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let paths = stmt.query_map(params![task_id], |row| row.get::<_, String>(0))?;
 
         let mut result = std::collections::HashSet::new();
         for path in paths {
@@ -1444,7 +1599,11 @@ impl BackupPersistenceManager {
     /// 将数据库行转换为 BackupTask
     fn row_to_task(&self, row: BackupTaskRow) -> Result<BackupTask> {
         let status = parse_task_status(&row.status)?;
-        let sub_phase = row.sub_phase.as_ref().map(|s| parse_sub_phase(s)).transpose()?;
+        let sub_phase = row
+            .sub_phase
+            .as_ref()
+            .map(|s| parse_sub_phase(s))
+            .transpose()?;
         let trigger_type = parse_trigger_type(&row.trigger_type)?;
 
         Ok(BackupTask {
@@ -1463,8 +1622,12 @@ impl BackupPersistenceManager {
             scan_progress: None,
             created_at: chrono::DateTime::from_timestamp(row.created_at, 0)
                 .unwrap_or_else(chrono::Utc::now),
-            started_at: row.started_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
-            completed_at: row.completed_at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+            started_at: row
+                .started_at
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+            completed_at: row
+                .completed_at
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
             error_message: row.error_message,
             pending_upload_task_ids: std::collections::HashSet::new(),
             pending_download_task_ids: std::collections::HashSet::new(),
@@ -1475,7 +1638,11 @@ impl BackupPersistenceManager {
     /// 将数据库行转换为 BackupFileTask
     fn row_to_file_task(&self, row: BackupFileTaskRow) -> Result<BackupFileTask> {
         let status = parse_file_status(&row.status)?;
-        let sub_phase = row.sub_phase.as_ref().map(|s| parse_sub_phase(s)).transpose()?;
+        let sub_phase = row
+            .sub_phase
+            .as_ref()
+            .map(|s| parse_sub_phase(s))
+            .transpose()?;
         let skip_reason: Option<SkipReason> = row
             .skip_reason
             .as_ref()
@@ -1492,7 +1659,11 @@ impl BackupPersistenceManager {
             local_path: std::path::PathBuf::from(row.local_path),
             remote_path: row.remote_path,
             file_size: row.file_size as u64,
-            head_md5: if row.head_md5.is_empty() { None } else { Some(row.head_md5) },
+            head_md5: if row.head_md5.is_empty() {
+                None
+            } else {
+                Some(row.head_md5)
+            },
             fs_id: row.fs_id.map(|id| id as u64),
             status,
             sub_phase,
@@ -1921,7 +2092,8 @@ mod tests {
                     FOREIGN KEY (backup_task_id) REFERENCES backup_tasks(id)
                 );
                 "#,
-            ).unwrap();
+            )
+            .unwrap();
             // 插入一条旧格式的记录
             conn.execute(
                 "INSERT INTO backup_tasks (id, config_id, status, trigger_type, created_at) VALUES ('t1','c1','transferring','manual',0)",

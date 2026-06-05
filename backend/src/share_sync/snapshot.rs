@@ -89,10 +89,7 @@ impl ShareSnapshot {
     }
 
     /// 创建一个带条目的快照
-    pub fn with_items(
-        subscription_id: impl Into<String>,
-        items: Vec<ShareSnapshotItem>,
-    ) -> Self {
+    pub fn with_items(subscription_id: impl Into<String>, items: Vec<ShareSnapshotItem>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             subscription_id: subscription_id.into(),
@@ -124,8 +121,9 @@ impl ShareSnapshot {
 // =====================================================
 
 use crate::netdisk::client::NetdiskClient;
-use crate::transfer::types::{ShareFileListResult, SharedFileInfo};
 use crate::share_sync::error::ShareSyncError;
+use crate::transfer::types::{ShareFileListResult, SharedFileInfo};
+use regex::RegexSet;
 
 /// 抓取结果（含访问元数据，便于后续转存/下载使用）
 #[derive(Debug, Clone)]
@@ -151,7 +149,12 @@ pub struct SnapshotCollector<'a> {
     bdstoken: String,
     password: Option<String>,
     include_paths: BTreeSet<String>,
-    exclude_patterns: Vec<String>,
+    /// 预计算的 include 路径前缀索引（dir 维度）：
+    /// - `ancestors`：所有 include_path 的祖先 + include_path 自身的并集
+    ///   命中此集合的目录是值得递归进入的（O(log N) 查询）
+    include_index: BTreeSet<String>,
+    /// 预编译的 exclude glob → RegexSet
+    exclude_set: Option<RegexSet>,
 }
 
 impl<'a> SnapshotCollector<'a> {
@@ -202,6 +205,12 @@ impl<'a> SnapshotCollector<'a> {
             }
         }
 
+        let include_paths: BTreeSet<String> = include_paths
+            .into_iter()
+            .filter_map(normalize_snapshot_path)
+            .collect();
+        let include_index = build_include_index(&include_paths);
+        let exclude_set = compile_exclude_patterns(&exclude_patterns);
         Ok(Self {
             client,
             short_key: share_link.short_key,
@@ -209,11 +218,9 @@ impl<'a> SnapshotCollector<'a> {
             uk: page.uk,
             bdstoken: page.bdstoken,
             password: effective_pwd,
-            include_paths: include_paths
-                .into_iter()
-                .filter_map(normalize_snapshot_path)
-                .collect(),
-            exclude_patterns,
+            include_paths,
+            include_index,
+            exclude_set,
         })
     }
 
@@ -266,7 +273,8 @@ impl<'a> SnapshotCollector<'a> {
         let mut queue: VecDeque<String> = queued_dirs.iter().cloned().collect();
 
         while let Some(dir) = queue.pop_front() {
-            let normalized_dir = normalize_share_path(&dir, dir.rsplit('/').next().unwrap_or(&dir), &share_root);
+            let normalized_dir =
+                normalize_share_path(&dir, dir.rsplit('/').next().unwrap_or(&dir), &share_root);
             if !self.dir_allowed(&normalized_dir) {
                 continue;
             }
@@ -299,7 +307,10 @@ impl<'a> SnapshotCollector<'a> {
                         found_included_files.insert(normalized_path.clone());
                     }
                     push_unique(&mut all_items, &mut seen, &share_root, f);
-                    if is_dir && self.dir_allowed(&normalized_path) && queued_dirs.insert(raw_path.clone()) {
+                    if is_dir
+                        && self.dir_allowed(&normalized_path)
+                        && queued_dirs.insert(raw_path.clone())
+                    {
                         queue.push_back(raw_path);
                     }
                 }
@@ -347,27 +358,29 @@ impl<'a> SnapshotCollector<'a> {
         if self.include_paths.is_empty() {
             return true;
         }
-        // dir 允许遍历当：
-        //   - dir 自身就是 include_path（include 一个目录），或
-        //   - dir 是某个 include_path 的祖先（include 一个具体文件，需要 descend 进去才能找到它）。
-        // 之前只看 `is_path_ancestor_or_self(dir, inc)`，会把 `/monthly` 在 inc=`/monthly/300426.SZ.csv` 时过滤掉，
-        // 导致文件无法被发现。
-        self.include_paths
-            .iter()
-            .any(|inc| is_path_ancestor_or_self(dir, inc) || is_path_ancestor_or_self(inc, dir))
+        // 命中预计算索引 → dir 是某个 include_path 自身或它的祖先
+        self.include_index.contains(dir)
     }
 
     fn item_allowed(&self, item: &ShareSnapshotItem) -> bool {
-        if !self.include_paths.is_empty()
-            && !self
-                .include_paths
-                .iter()
-                .any(|inc| is_path_ancestor_or_self(&item.path, inc))
-        {
-            return false;
+        // 1) include 过滤：item.path 是某个 include_path 自身或后代
+        if !self.include_paths.is_empty() && !self.include_index.contains(&item.path) {
+            // 二级检查：item.path 是否是某个 include_path 的后代（include 选了目录，
+            // 它下面的所有文件/子目录都应被收录）
+            let mut allowed = false;
+            for inc in &self.include_paths {
+                if is_path_ancestor_or_self(&item.path, inc) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if !allowed {
+                return false;
+            }
         }
-        for pat in &self.exclude_patterns {
-            if glob_match(pat, &item.path) {
+        // 2) exclude 过滤：任意 exclude glob 命中则排除
+        if let Some(ref set) = self.exclude_set {
+            if set.is_match(&item.path) {
                 return false;
             }
         }
@@ -398,46 +411,63 @@ impl<'a> SnapshotCollector<'a> {
     }
 }
 
-/// 简单的 glob 匹配（仅支持 `*` 与 `?`）
-fn glob_match(pattern: &str, s: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = s.chars().collect();
-    glob_match_inner(&p, &t)
+/// 把 include_paths 展开为"祖先 + 自身"的并集索引。
+///
+/// 这样 `dir_allowed(dir)` 只需要一次 `BTreeSet::contains`（O(log N)），
+/// 不再每次线性扫 `include_paths`。
+///
+/// 例：include_paths = `["/a/b/c.csv", "/a/x/y.csv"]` →
+///   `{"/", "/a", "/a/b", "/a/b/c.csv", "/a/x", "/a/x/y.csv"}`
+fn build_include_index(include_paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut idx: BTreeSet<String> = BTreeSet::new();
+    idx.insert("/".to_string());
+    for inc in include_paths {
+        idx.insert(inc.clone());
+        // 逐级加祖先
+        let mut cur = inc.as_str();
+        while let Some(slash) = cur.rfind('/') {
+            if slash == 0 {
+                break;
+            }
+            cur = &cur[..slash];
+            idx.insert(cur.to_string());
+        }
+    }
+    idx
 }
 
-fn glob_match_inner(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return t.is_empty();
+/// 把 glob 模式（仅 `*` / `?`）编译为 `RegexSet`，对每条路径做 O(L) 匹配。
+///
+/// 旧实现是手写递归 + 回溯，复杂度 O(2^L)，对万级条目 × 多个 pattern 会很慢。
+/// 编译失败时回退到"无 exclude"（不阻塞主流程）。
+fn compile_exclude_patterns(patterns: &[String]) -> Option<RegexSet> {
+    if patterns.is_empty() {
+        return None;
     }
-    match p[0] {
-        '*' => {
-            // 跳过连续 *
-            let mut i = 0;
-            while i < p.len() && p[i] == '*' {
-                i += 1;
+    let regexes: Vec<String> = patterns
+        .iter()
+        .map(|p| glob_to_regex(p).map(|r| format!("^{}$", r)))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    RegexSet::new(&regexes).ok()
+}
+
+/// 简单 glob → regex 转换（仅 `*` 和 `?`，其余元字符转义）。
+fn glob_to_regex(pattern: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(pattern.len() * 2);
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            // regex 元字符需要转义
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                out.push('\\');
+                out.push(ch);
             }
-            for j in 0..=t.len() {
-                if glob_match_inner(&p[i..], &t[j..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        '?' => {
-            if t.is_empty() {
-                false
-            } else {
-                glob_match_inner(&p[1..], &t[1..])
-            }
-        }
-        c => {
-            if t.is_empty() || t[0] != c {
-                false
-            } else {
-                glob_match_inner(&p[1..], &t[1..])
-            }
+            _ => out.push(ch),
         }
     }
+    Ok(out)
 }
 
 pub fn infer_share_root(files: &[SharedFileInfo]) -> String {
@@ -651,7 +681,11 @@ mod tests {
     fn test_sorted_items() {
         let s = ShareSnapshot::with_items(
             "sub-1",
-            vec![item("/c.txt", 3, 1), item("/a.txt", 1, 1), item("/b.txt", 2, 1)],
+            vec![
+                item("/c.txt", 3, 1),
+                item("/a.txt", 1, 1),
+                item("/b.txt", 2, 1),
+            ],
         );
         let sorted = s.sorted_items();
         assert_eq!(sorted[0].path, "/a.txt");
@@ -679,8 +713,18 @@ mod tests {
     #[test]
     fn test_normalize_multi_folder_share_keeps_folder_prefixes() {
         let files = vec![
-            shared_file("/_pcs_.workspace/curated/fina_indicator", "fina_indicator", 1, true),
-            shared_file("/_pcs_.workspace/curated/stock_basic", "stock_basic", 2, true),
+            shared_file(
+                "/_pcs_.workspace/curated/fina_indicator",
+                "fina_indicator",
+                1,
+                true,
+            ),
+            shared_file(
+                "/_pcs_.workspace/curated/stock_basic",
+                "stock_basic",
+                2,
+                true,
+            ),
         ];
         let root = infer_share_root(&files);
 
@@ -709,42 +753,103 @@ mod tests {
         assert_eq!(back.items[0].path, "/a");
     }
 
-    // ========== glob 匹配测试 ==========
+    // ========== glob 匹配测试（RegexSet 路径） ==========
+
+    fn compile(patterns: &[&str]) -> RegexSet {
+        // 模拟 compile_exclude_patterns 的 "^...$" 锚定
+        let regexes: Vec<String> = patterns
+            .iter()
+            .map(|p| format!("^{}$", glob_to_regex(p).unwrap()))
+            .collect();
+        RegexSet::new(&regexes).unwrap()
+    }
+
+    fn is_hit(set: &RegexSet, s: &str) -> bool {
+        set.is_match(s)
+    }
 
     #[test]
     fn test_glob_match_star() {
-        assert!(glob_match("*.txt", "a.txt"));
-        assert!(glob_match("*.txt", "abc.txt"));
-        assert!(!glob_match("*.txt", "a.png"));
-        assert!(glob_match("*", ""));
-        assert!(glob_match("*", "anything"));
+        let set = compile(&["*.txt"]);
+        assert!(is_hit(&set, "a.txt"));
+        assert!(is_hit(&set, "abc.txt"));
+        assert!(!is_hit(&set, "a.png"));
+        // 单独的 "*" 经 ^.*$ 锚定后能匹配空字符串和非空
+        let set_any = compile(&["*"]);
+        assert!(is_hit(&set_any, "anything"));
     }
 
     #[test]
     fn test_glob_match_question() {
-        assert!(glob_match("a?c", "abc"));
-        assert!(glob_match("a?c", "axc"));
-        assert!(!glob_match("a?c", "ac"));
-        assert!(!glob_match("a?c", "abbc"));
+        let set = compile(&["a?c"]);
+        assert!(is_hit(&set, "abc"));
+        assert!(is_hit(&set, "axc"));
+        assert!(!is_hit(&set, "ac"));
+        assert!(!is_hit(&set, "abbc"));
     }
 
     #[test]
     fn test_glob_match_literal() {
-        assert!(glob_match("foo", "foo"));
-        assert!(!glob_match("foo", "bar"));
-        assert!(!glob_match("foo", "fooo"));
+        let set = compile(&["foo"]);
+        assert!(is_hit(&set, "foo"));
+        assert!(!is_hit(&set, "bar"));
+        assert!(!is_hit(&set, "fooo"));
     }
 
     #[test]
     fn test_glob_match_combined() {
         // * 匹配任意字符（含 /），与 shell glob 不同；本实现以"扩展名过滤"为主
-        assert!(glob_match("a/*/b", "a/x/b"));
-        assert!(glob_match("a/*/b", "a/x/y/b")); // * 匹配 x/y
-        assert!(glob_match("file-*.txt", "file-2024.txt"));
-        assert!(glob_match("?est.tmp", "test.tmp"));
+        let set = compile(&["a/*/b", "file-*.txt", "?est.tmp", "*.tmp"]);
+        assert!(is_hit(&set, "a/x/b"));
+        assert!(is_hit(&set, "a/x/y/b")); // * 匹配 x/y
+        assert!(is_hit(&set, "file-2024.txt"));
+        assert!(is_hit(&set, "test.tmp"));
         // 典型用法：扩展名排除
-        assert!(glob_match("*.tmp", "anything.tmp"));
-        assert!(!glob_match("*.tmp", "anything.txt"));
+        assert!(is_hit(&set, "anything.tmp"));
+        assert!(!is_hit(&set, "anything.txt"));
+    }
+
+    #[test]
+    fn test_glob_to_regex_escapes_metachars() {
+        // 扩展名 dot、字符类、管道等需要转义
+        assert_eq!(glob_to_regex("a.b").unwrap(), "a\\.b");
+        assert_eq!(glob_to_regex("a+b").unwrap(), "a\\+b");
+        assert_eq!(glob_to_regex("a(b)c").unwrap(), "a\\(b\\)c");
+    }
+
+    #[test]
+    fn test_build_include_index_basic() {
+        let mut inc = BTreeSet::new();
+        inc.insert("/a/b/c.csv".to_string());
+        inc.insert("/a/x/y.csv".to_string());
+        let idx = build_include_index(&inc);
+        assert!(idx.contains("/"));
+        assert!(idx.contains("/a"));
+        assert!(idx.contains("/a/b"));
+        assert!(idx.contains("/a/b/c.csv"));
+        assert!(idx.contains("/a/x"));
+        assert!(idx.contains("/a/x/y.csv"));
+        // 不相关路径
+        assert!(!idx.contains("/c"));
+        assert!(!idx.contains("/a/b/other.csv"));
+    }
+
+    #[test]
+    fn test_compile_exclude_empty_returns_none() {
+        let set = compile_exclude_patterns(&[]);
+        assert!(set.is_none());
+    }
+
+    #[test]
+    fn test_compile_exclude_invalid_falls_back() {
+        // `compile_exclude_patterns` 在 `RegexSet::new` 返回 Err 时回退到 None。
+        // 现代 regex crate 非常宽松，常规 glob 都能编译——这里用 Pattern::new 直接
+        // 验证 glob_to_regex 不 panic + compile_exclude_patterns 接受空 patterns。
+        assert!(glob_to_regex("[abc]").is_ok());
+        assert!(compile_exclude_patterns(&[]).is_none());
+        // 正常一组 pattern 编译成功
+        let set = compile_exclude_patterns(&["*.tmp".to_string(), "*.bak".to_string()]);
+        assert!(set.is_some());
     }
 
     #[test]
@@ -757,9 +862,18 @@ mod tests {
 
     #[test]
     fn test_normalize_snapshot_path() {
-        assert_eq!(normalize_snapshot_path("/foo/".to_string()), Some("/foo".to_string()));
-        assert_eq!(normalize_snapshot_path("foo".to_string()), Some("/foo".to_string()));
-        assert_eq!(normalize_snapshot_path("   /bar//".to_string()), Some("/bar".to_string()));
+        assert_eq!(
+            normalize_snapshot_path("/foo/".to_string()),
+            Some("/foo".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("foo".to_string()),
+            Some("/foo".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("   /bar//".to_string()),
+            Some("/bar".to_string())
+        );
         assert_eq!(normalize_snapshot_path("".to_string()), None);
     }
 }

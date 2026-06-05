@@ -9,8 +9,8 @@ pub mod download;
 pub mod encryption_export;
 pub mod file;
 pub mod filesystem;
-pub mod local_files;
 pub mod folder_download;
+pub mod local_files;
 pub mod share;
 pub mod share_sync;
 pub mod transfer;
@@ -27,9 +27,9 @@ pub use folder_download::*;
 pub use share::*;
 // 显式列出 share_sync 里的 handler 函数，避免导入 ApiResponse（避免与 auth/autobackup 冲突）
 pub use share_sync::{
-    create_subscription, delete_subscription, disable_subscription, enable_subscription,
-    get_run, get_subscription, latest_snapshot, list_runs, list_subscriptions,
-    trigger_subscription, update_subscription,
+    create_subscription, delete_subscription, disable_subscription, enable_subscription, get_run,
+    get_subscription, latest_snapshot, list_runs, list_subscriptions, trigger_subscription,
+    update_subscription,
 };
 pub use transfer::*;
 pub use upload::*;

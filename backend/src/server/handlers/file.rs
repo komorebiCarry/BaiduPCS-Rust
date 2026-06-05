@@ -211,7 +211,10 @@ fn query_encryption_mappings(
     info!("查询加密映射，文件名列表: {:?}", encrypted_names);
 
     // 直接使用 AppState 中的 snapshot_manager
-    match state.snapshot_manager.find_by_encrypted_names(encrypted_names) {
+    match state
+        .snapshot_manager
+        .find_by_encrypted_names(encrypted_names)
+    {
         Ok(snapshots) => {
             info!("查询到 {} 条加密映射记录", snapshots.len());
             snapshots
@@ -236,14 +239,20 @@ fn query_folder_mappings(
         return HashMap::new();
     }
 
-    info!("查询文件夹映射，父路径: {}, 文件夹列表: {:?}", parent_path, encrypted_folder_names);
+    info!(
+        "查询文件夹映射，父路径: {}, 文件夹列表: {:?}",
+        parent_path, encrypted_folder_names
+    );
 
     let mut result = HashMap::new();
 
     // 遍历所有加密文件夹名，查找映射
     for encrypted_name in encrypted_folder_names {
         // 查询所有配置的映射（返回 EncryptionSnapshot）
-        if let Ok(snapshots) = state.backup_record_manager.get_all_folder_mappings_by_encrypted_name(encrypted_name) {
+        if let Ok(snapshots) = state
+            .backup_record_manager
+            .get_all_folder_mappings_by_encrypted_name(encrypted_name)
+        {
             for snapshot in snapshots {
                 // original_path 存储的是父路径
                 if snapshot.original_path == parent_path {
@@ -301,7 +310,10 @@ pub async fn search_files(
     info!("API: 搜索文件 key={}, page={}", params.key, params.page);
 
     if params.key.trim().is_empty() {
-        return Ok(Json(ApiResponse::error(400, "搜索关键词不能为空".to_string())));
+        return Ok(Json(ApiResponse::error(
+            400,
+            "搜索关键词不能为空".to_string(),
+        )));
     }
     if params.key.len() > 255 {
         return Ok(Json(ApiResponse::error(400, "搜索关键词过长".to_string())));
@@ -311,11 +323,17 @@ pub async fn search_files(
     let client = match client_lock.as_ref() {
         Some(c) => c,
         None => {
-            return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 
-    match client.search_files(&params.key, params.page, params.num, params.recursion).await {
+    match client
+        .search_files(&params.key, params.page, params.num, params.recursion)
+        .await
+    {
         Ok(search_result) => {
             let has_more = search_result.has_more == 1;
 
@@ -345,7 +363,8 @@ pub async fn search_files(
                             (false, None, None)
                         };
 
-                    let is_encrypted_folder = file.isdir == 1 && is_encrypted_folder_name(&file.server_filename);
+                    let is_encrypted_folder =
+                        file.isdir == 1 && is_encrypted_folder_name(&file.server_filename);
 
                     FileItemWithEncryption {
                         file,
@@ -365,7 +384,10 @@ pub async fn search_files(
         }
         Err(e) => {
             error!("搜索文件失败: {}", e);
-            Ok(Json(ApiResponse::error(500, format!("搜索文件失败: {}", e))))
+            Ok(Json(ApiResponse::error(
+                500,
+                format!("搜索文件失败: {}", e),
+            )))
         }
     }
 }
@@ -457,7 +479,10 @@ pub async fn delete_files(
     info!("API: 删除文件 paths={:?}", request.paths);
 
     if request.paths.is_empty() {
-        return Ok(Json(ApiResponse::error(400, "路径列表不能为空".to_string())));
+        return Ok(Json(ApiResponse::error(
+            400,
+            "路径列表不能为空".to_string(),
+        )));
     }
     if let Some(p) = request.paths.iter().find(|p| !p.starts_with('/')) {
         return Ok(Json(ApiResponse::error(
@@ -510,7 +535,8 @@ pub async fn delete_files(
                                     })));
                                 }
                                 Ok(response) => {
-                                    let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
+                                    let msg =
+                                        response.error.unwrap_or_else(|| "删除失败".to_string());
                                     return Ok(Json(ApiResponse::error(500, msg)));
                                 }
                                 Err(retry_err) => {
@@ -528,7 +554,10 @@ pub async fn delete_files(
                 }
             }
             error!("删除文件失败: {}", e);
-            Ok(Json(ApiResponse::error(500, format!("删除文件失败: {}", e))))
+            Ok(Json(ApiResponse::error(
+                500,
+                format!("删除文件失败: {}", e),
+            )))
         }
     }
 }
@@ -790,7 +819,10 @@ fn ensure_not_move_into_self(path: &str, dest: &str) -> Result<(), String> {
     // 拒绝 dest 在 path 之下（含 path 自身作为前缀且后接 `/`）
     let prefix = format!("{}/", path_norm);
     if dest_norm.starts_with(&prefix) {
-        return Err(format!("不能把文件夹移动到自己的子目录: {} -> {}", path, dest));
+        return Err(format!(
+            "不能把文件夹移动到自己的子目录: {} -> {}",
+            path, dest
+        ));
     }
     Ok(())
 }
@@ -836,7 +868,11 @@ fn ensure_move_not_same_parent(path: &str, dest: &str) -> Result<(), String> {
 /// 会返回 `errno=-8`（文件已存在）。前端目录选择器无法修改 newname，因此这种
 /// 情况是纯 UI 错点，必须提前拦截；但 copy 保留「同父目录 + 改名」语义（副本创建），
 /// 所以这里**只**拒绝「同父目录 + 同名」。
-fn ensure_copy_not_same_parent_same_name(path: &str, dest: &str, newname: &str) -> Result<(), String> {
+fn ensure_copy_not_same_parent_same_name(
+    path: &str,
+    dest: &str,
+    newname: &str,
+) -> Result<(), String> {
     let parent = parent_dir_of(path);
     let dest_norm = if dest.is_empty() { "/" } else { dest };
     if parent == dest_norm && basename_of(path) == newname {
@@ -875,9 +911,7 @@ fn normalize_copy_move_item(item: &FileOperationItem) -> Result<FileOperationIte
 /// 132 风控不重试（需要用户主观介入）。
 fn should_retry_after_warmup(payload: &FileOperationErrorPayload) -> bool {
     let candidates = [payload.errno, payload.task_errno];
-    candidates
-        .iter()
-        .any(|e| matches!(e, Some(-6) | Some(111)))
+    candidates.iter().any(|e| matches!(e, Some(-6) | Some(111)))
 }
 
 /// 批量复制文件
@@ -905,7 +939,9 @@ pub async fn copy_files(
     // copy 专属校验：拒绝「同父目录 + 同名」（百度 filemanager 会返回 errno=-8 文件已存在）
     // 允许「同父目录 + 改名」以保留副本创建语义。
     for item in &normalized {
-        if let Err(msg) = ensure_copy_not_same_parent_same_name(&item.path, &item.dest, &item.newname) {
+        if let Err(msg) =
+            ensure_copy_not_same_parent_same_name(&item.path, &item.dest, &item.newname)
+        {
             return Ok(Json(ApiResponse::error(400, msg)));
         }
     }
@@ -928,7 +964,10 @@ pub async fn copy_files(
         Ok(o) => o,
         Err(e) => {
             error!("复制文件请求失败: {}", e);
-            return Ok(Json(ApiResponse::error(500, format!("复制文件失败: {}", e))));
+            return Ok(Json(ApiResponse::error(
+                500,
+                format!("复制文件失败: {}", e),
+            )));
         }
     };
 
@@ -1022,7 +1061,10 @@ pub async fn move_files(
         Ok(o) => o,
         Err(e) => {
             error!("移动文件请求失败: {}", e);
-            return Ok(Json(ApiResponse::error(500, format!("移动文件失败: {}", e))));
+            return Ok(Json(ApiResponse::error(
+                500,
+                format!("移动文件失败: {}", e),
+            )));
         }
     };
 
@@ -1091,10 +1133,7 @@ pub async fn rename_file(
     }
     // 拒绝 fs_id == 0：百度 filemanager rename 接口对 id=0 的行为不可预期，提前拦截
     if request.item.id == 0 {
-        return Ok(Json(ApiResponse::error(
-            400,
-            "fs_id 不能为 0".to_string(),
-        )));
+        return Ok(Json(ApiResponse::error(400, "fs_id 不能为 0".to_string())));
     }
     if let Err(msg) = crate::netdisk::client::validate_filename(&request.item.newname) {
         return Ok(Json(ApiResponse::error(400, msg)));
@@ -1209,7 +1248,11 @@ mod filemanager_validation_tests {
     fn test_ensure_move_not_same_parent_same_name_rejected() {
         // /a/x.txt → 移动到 /a：no-op，必须拒绝
         let err = ensure_move_not_same_parent("/a/x.txt", "/a").unwrap_err();
-        assert!(err.contains("目标目录与源父目录相同"), "应拒绝同父目录: {}", err);
+        assert!(
+            err.contains("目标目录与源父目录相同"),
+            "应拒绝同父目录: {}",
+            err
+        );
     }
 
     #[test]
@@ -1228,7 +1271,11 @@ mod filemanager_validation_tests {
     fn test_ensure_move_not_same_parent_root_child_rejected() {
         // /x.txt → 移动到 /：根目录同父
         let err = ensure_move_not_same_parent("/x.txt", "/").unwrap_err();
-        assert!(err.contains("目标目录与源父目录相同"), "应拒绝根目录同父: {}", err);
+        assert!(
+            err.contains("目标目录与源父目录相同"),
+            "应拒绝根目录同父: {}",
+            err
+        );
     }
 
     #[test]
@@ -1243,7 +1290,11 @@ mod filemanager_validation_tests {
     fn test_ensure_move_not_same_parent_dest_empty_treated_as_root() {
         // 容错：空 dest 视为根
         let err = ensure_move_not_same_parent("/x.txt", "").unwrap_err();
-        assert!(err.contains("目标目录与源父目录相同"), "空 dest 应视为根: {}", err);
+        assert!(
+            err.contains("目标目录与源父目录相同"),
+            "空 dest 应视为根: {}",
+            err
+        );
     }
 
     #[test]

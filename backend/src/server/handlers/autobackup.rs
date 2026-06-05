@@ -7,11 +7,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use crate::autobackup::config::SyncConflictStrategy;
 use crate::autobackup::{
     AutoBackupManager, BackupConfig, BackupDirection, BackupTask, CreateBackupConfigRequest,
     EncryptionAlgorithm, UpdateBackupConfigRequest,
 };
-use crate::autobackup::config::SyncConflictStrategy;
 use crate::server::{ApiError, ApiResult, AppState};
 
 // Helper functions for ApiError
@@ -32,7 +32,8 @@ fn map_config_save_error(msg: &str) -> ApiError {
         || lower.contains("no such file")
         || lower.contains("not found")
         || lower.contains("invalid input")
-        || msg.contains("配置文件") {
+        || msg.contains("配置文件")
+    {
         ApiError::BadRequest(msg.to_string())
     } else {
         internal_error(msg)
@@ -120,7 +121,6 @@ pub async fn update_backup_config(
     }
 }
 
-
 /// 启用备份配置
 pub async fn enable_backup_config(
     State(state): State<AppState>,
@@ -180,7 +180,9 @@ pub async fn trigger_backup(
 ) -> ApiResult<Json<ApiResponse<TriggerBackupResponse>>> {
     let manager = get_manager(&state).await?;
     match manager.trigger_backup(&config_id).await {
-        Ok(task_id) => Ok(Json(ApiResponse::success(TriggerBackupResponse { task_id }))),
+        Ok(task_id) => Ok(Json(ApiResponse::success(TriggerBackupResponse {
+            task_id,
+        }))),
         Err(e) => Err(bad_request_error(&e.to_string())),
     }
 }
@@ -211,7 +213,9 @@ pub async fn list_backup_tasks(
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
 
-    let (mut tasks, total) = manager.list_tasks_by_config_async(&config_id, page, page_size).await;
+    let (mut tasks, total) = manager
+        .list_tasks_by_config_async(&config_id, page, page_size)
+        .await;
     // 清除大型内部追踪字段，减少响应体积
     for task in &mut tasks {
         task.pending_upload_task_ids.clear();
@@ -299,7 +303,10 @@ pub async fn list_file_tasks(
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
 
-    match manager.get_file_tasks_async(&task_id, page, page_size).await {
+    match manager
+        .get_file_tasks_async(&task_id, page, page_size)
+        .await
+    {
         Some((file_tasks, total)) => Ok(Json(ApiResponse::success(FileTasksResponse {
             file_tasks,
             total,
@@ -450,11 +457,13 @@ pub async fn cleanup_records(
     let manager = get_manager(&state).await?;
     let days = request.days.unwrap_or(30);
     match manager.cleanup_old_records(days) {
-        Ok((upload, download, snapshot)) => Ok(Json(ApiResponse::success(CleanupRecordsResponse {
-            upload_deleted: upload,
-            download_deleted: download,
-            snapshot_deleted: snapshot,
-        }))),
+        Ok((upload, download, snapshot)) => {
+            Ok(Json(ApiResponse::success(CleanupRecordsResponse {
+                upload_deleted: upload,
+                download_deleted: download,
+                snapshot_deleted: snapshot,
+            })))
+        }
         Err(e) => Err(internal_error(&e.to_string())),
     }
 }
@@ -669,12 +678,14 @@ pub async fn get_file_state(
         Some(info) => Ok(Json(ApiResponse::success(FileStateResponse {
             path: params.path,
             current_state: Some(info.current_state),
-            state_history: info.state_history.into_iter().map(|(state, ts)| {
-                FileStateHistory {
+            state_history: info
+                .state_history
+                .into_iter()
+                .map(|(state, ts)| FileStateHistory {
                     state,
                     timestamp: ts,
-                }
-            }).collect(),
+                })
+                .collect(),
             dedup_result: info.dedup_result,
             encryption_enabled: info.encryption_enabled,
             retry_count: info.retry_count,
@@ -805,9 +816,7 @@ pub async fn get_watch_capability() -> ApiResult<Json<ApiResponse<WatchCapabilit
             available = false;
             reason = Some(format!("无法创建文件监听器: {}", e));
             if platform == "linux" {
-                suggestion = Some(
-                    "可能是 inotify 资源不足，请检查系统限制".to_string()
-                );
+                suggestion = Some("可能是 inotify 资源不足，请检查系统限制".to_string());
             }
         }
     }
@@ -939,7 +948,7 @@ pub async fn update_trigger_config(
         if let Some(ref mode) = download.poll_mode {
             if mode != "interval" && mode != "scheduled" {
                 return Err(bad_request_error(
-                    "无效的轮询模式，必须是 'interval' 或 'scheduled'"
+                    "无效的轮询模式，必须是 'interval' 或 'scheduled'",
                 ));
             }
         }
@@ -1026,10 +1035,12 @@ pub async fn update_trigger_config(
 
     // 通知自动备份管理器更新调度器配置
     if let Ok(manager) = get_manager(&app_state).await {
-        manager.update_trigger_config(
-            config.autobackup.upload_trigger.clone(),
-            config.autobackup.download_trigger.clone(),
-        ).await;
+        manager
+            .update_trigger_config(
+                config.autobackup.upload_trigger.clone(),
+                config.autobackup.download_trigger.clone(),
+            )
+            .await;
         tracing::info!("✓ 自动备份管理器触发配置已更新");
     }
 
@@ -1066,7 +1077,8 @@ pub async fn reset_sync_state(
     let manager = get_manager(&state).await?;
 
     // 校验配置存在且方向为 Sync
-    let config = manager.get_config(&config_id)
+    let config = manager
+        .get_config(&config_id)
         .ok_or_else(|| bad_request_error("配置不存在"))?;
 
     if config.direction != BackupDirection::Sync {
@@ -1077,14 +1089,20 @@ pub async fn reset_sync_state(
     // 除了 active（Preparing/Transferring）外，还需排除 Paused 和 Queued 任务
     // 否则恢复暂停的任务后会在已清空的 SyncState 上执行旧的传输计划
     if manager.has_active_tasks(&config_id) {
-        return Err(bad_request_error("该配置有正在运行的同步任务，请等待完成后再重置"));
+        return Err(bad_request_error(
+            "该配置有正在运行的同步任务，请等待完成后再重置",
+        ));
     }
     if manager.has_incomplete_sync_tasks(&config_id) {
-        return Err(bad_request_error("该配置有暂停或排队中的同步任务，请先取消这些任务后再重置"));
+        return Err(bad_request_error(
+            "该配置有暂停或排队中的同步任务，请先取消这些任务后再重置",
+        ));
     }
 
     // 重置 SyncState 并标记 needs_full_sync
-    let deleted = manager.reset_sync_state(&config_id).await
+    let deleted = manager
+        .reset_sync_state(&config_id)
+        .await
         .map_err(|e| bad_request_error(&format!("重置同步状态失败: {}", e)))?;
 
     let warnings = vec![
@@ -1105,14 +1123,16 @@ pub async fn list_tombstones(
 ) -> ApiResult<Json<ApiResponse<Vec<crate::autobackup::sync::types::TombstoneInfo>>>> {
     let manager = get_manager(&state).await?;
 
-    let config = manager.get_config(&config_id)
+    let config = manager
+        .get_config(&config_id)
         .ok_or_else(|| bad_request_error("配置不存在"))?;
 
     if config.direction != BackupDirection::Sync {
         return Err(bad_request_error("仅 Sync 方向的配置有 tombstone 信息"));
     }
 
-    let tombstones = manager.list_sync_tombstones(&config_id)
+    let tombstones = manager
+        .list_sync_tombstones(&config_id)
         .map_err(|e| bad_request_error(&format!("查询 tombstone 列表失败: {}", e)))?;
 
     Ok(Json(ApiResponse::success(tombstones)))

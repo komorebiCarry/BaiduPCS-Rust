@@ -41,9 +41,7 @@ impl BackupRecordManager {
         }
 
         let manager = SqliteConnectionManager::file(db_path);
-        let pool = Pool::builder()
-            .max_size(10)
-            .build(manager)?;
+        let pool = Pool::builder().max_size(10).build(manager)?;
 
         let record_manager = Self {
             pool: Arc::new(pool),
@@ -57,7 +55,9 @@ impl BackupRecordManager {
 
     /// 获取数据库连接
     fn get_conn(&self) -> Result<DbConnection> {
-        self.pool.get().map_err(|e| anyhow!("Failed to get db connection: {}", e))
+        self.pool
+            .get()
+            .map_err(|e| anyhow!("Failed to get db connection: {}", e))
     }
 
     /// 获取数据库连接（用于导出功能）
@@ -216,7 +216,13 @@ impl BackupRecordManager {
                 "SELECT 1, full_md5 FROM upload_records
                  WHERE config_id = ?1 AND relative_path = ?2 AND file_name = ?3
                  AND file_size = ?4 AND head_md5 = ?5",
-                params![config_id, relative_path, file_name, file_size as i64, head_md5],
+                params![
+                    config_id,
+                    relative_path,
+                    file_name,
+                    file_size as i64,
+                    head_md5
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -288,7 +294,12 @@ impl BackupRecordManager {
     }
 
     /// 删除上传记录
-    pub fn delete_upload_record(&self, config_id: &str, relative_path: &str, file_name: &str) -> Result<bool> {
+    pub fn delete_upload_record(
+        &self,
+        config_id: &str,
+        relative_path: &str,
+        file_name: &str,
+    ) -> Result<bool> {
         let conn = self.get_conn()?;
         let rows = conn.execute(
             "DELETE FROM upload_records
@@ -423,7 +434,10 @@ impl BackupRecordManager {
     }
 
     /// 根据加密文件名查找快照
-    pub fn find_snapshot_by_encrypted_name(&self, encrypted_name: &str) -> Result<Option<EncryptionSnapshot>> {
+    pub fn find_snapshot_by_encrypted_name(
+        &self,
+        encrypted_name: &str,
+    ) -> Result<Option<EncryptionSnapshot>> {
         let conn = self.get_conn()?;
 
         let result = conn
@@ -529,7 +543,10 @@ impl BackupRecordManager {
 
     /// 批量根据加密文件名查找快照
     /// 用于文件列表显示时批量查询原始文件名
-    pub fn find_snapshots_by_encrypted_names(&self, encrypted_names: &[String]) -> Result<Vec<EncryptionSnapshot>> {
+    pub fn find_snapshots_by_encrypted_names(
+        &self,
+        encrypted_names: &[String],
+    ) -> Result<Vec<EncryptionSnapshot>> {
         if encrypted_names.is_empty() {
             return Ok(vec![]);
         }
@@ -537,9 +554,7 @@ impl BackupRecordManager {
         let conn = self.get_conn()?;
 
         // 构建 IN 子句的占位符
-        let placeholders: Vec<String> = encrypted_names.iter()
-            .map(|_| "?".to_string())
-            .collect();
+        let placeholders: Vec<String> = encrypted_names.iter().map(|_| "?".to_string()).collect();
         let placeholders_str = placeholders.join(", ");
 
         let sql = format!(
@@ -637,7 +652,11 @@ impl BackupRecordManager {
         )?;
 
         if deleted > 0 {
-            tracing::info!("已删除配置 {} 的 {} 条未完成加密快照记录", config_id, deleted);
+            tracing::info!(
+                "已删除配置 {} 的 {} 条未完成加密快照记录",
+                config_id,
+                deleted
+            );
         }
         Ok(deleted)
     }
@@ -653,9 +672,7 @@ impl BackupRecordManager {
         let conn = self.get_conn()?;
 
         // 构建 IN 子句的占位符
-        let placeholders: Vec<String> = encrypted_names.iter()
-            .map(|_| "?".to_string())
-            .collect();
+        let placeholders: Vec<String> = encrypted_names.iter().map(|_| "?".to_string()).collect();
         let placeholders_str = placeholders.join(", ");
 
         let sql = format!(
@@ -680,23 +697,18 @@ impl BackupRecordManager {
     pub fn get_stats(&self) -> Result<RecordStats> {
         let conn = self.get_conn()?;
 
-        let upload_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM upload_records",
-            [],
-            |row| row.get(0),
-        )?;
+        let upload_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM upload_records", [], |row| row.get(0))?;
 
-        let download_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM download_records",
-            [],
-            |row| row.get(0),
-        )?;
+        let download_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM download_records", [], |row| {
+                row.get(0)
+            })?;
 
-        let snapshot_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM encryption_snapshots",
-            [],
-            |row| row.get(0),
-        )?;
+        let snapshot_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM encryption_snapshots", [], |row| {
+                row.get(0)
+            })?;
 
         Ok(RecordStats {
             upload_count: upload_count as usize,
@@ -730,7 +742,14 @@ impl BackupRecordManager {
              (config_id, original_path, original_name, encrypted_name, file_size, nonce, algorithm,
               version, key_version, remote_path, is_directory, status, created_at, updated_at)
              VALUES ('', ?1, ?2, ?3, 0, '', '', 1, ?4, ?5, 1, 'completed', ?6, ?6)",
-            params![parent_path, original_name, encrypted_name, key_version as i64, remote_path, now],
+            params![
+                parent_path,
+                original_name,
+                encrypted_name,
+                key_version as i64,
+                remote_path,
+                now
+            ],
         )?;
 
         Ok(conn.last_insert_rowid())
@@ -757,10 +776,7 @@ impl BackupRecordManager {
     }
 
     /// 根据加密文件夹名查找原始名
-    pub fn find_original_folder_name(
-        &self,
-        encrypted_folder_name: &str,
-    ) -> Result<Option<String>> {
+    pub fn find_original_folder_name(&self, encrypted_folder_name: &str) -> Result<Option<String>> {
         let conn = self.get_conn()?;
 
         let result: Option<String> = conn
@@ -776,13 +792,16 @@ impl BackupRecordManager {
     }
 
     /// 根据加密文件夹名查找所有映射（跨配置，用于文件列表显示）
-    pub fn get_all_folder_mappings_by_encrypted_name(&self, encrypted_name: &str) -> Result<Vec<EncryptionSnapshot>> {
+    pub fn get_all_folder_mappings_by_encrypted_name(
+        &self,
+        encrypted_name: &str,
+    ) -> Result<Vec<EncryptionSnapshot>> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn.prepare(
             "SELECT config_id, original_path, original_name, encrypted_name, file_size, nonce,
                     algorithm, version, key_version, remote_path, is_directory, status
-             FROM encryption_snapshots WHERE encrypted_name = ?1 AND is_directory = 1"
+             FROM encryption_snapshots WHERE encrypted_name = ?1 AND is_directory = 1",
         )?;
 
         let rows = stmt.query_map(params![encrypted_name], |row| {
@@ -843,16 +862,16 @@ pub struct DownloadRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptionSnapshot {
     pub config_id: String,
-    pub original_path: String,      // 原始路径（文件夹时为父路径）
-    pub original_name: String,      // 原始文件名/文件夹名
-    pub encrypted_name: String,     // 加密后的名称
-    pub file_size: u64,             // 文件大小（文件夹为0）
-    pub nonce: String,              // 加密随机数（文件夹为空）
-    pub algorithm: String,          // 加密算法（文件夹为空）
+    pub original_path: String,  // 原始路径（文件夹时为父路径）
+    pub original_name: String,  // 原始文件名/文件夹名
+    pub encrypted_name: String, // 加密后的名称
+    pub file_size: u64,         // 文件大小（文件夹为0）
+    pub nonce: String,          // 加密随机数（文件夹为空）
+    pub algorithm: String,      // 加密算法（文件夹为空）
     pub version: i32,
     pub key_version: u32,
-    pub remote_path: String,        // 远程完整路径
-    pub is_directory: bool,         // 是否为文件夹
+    pub remote_path: String, // 远程完整路径
+    pub is_directory: bool,  // 是否为文件夹
     pub status: String,
 }
 

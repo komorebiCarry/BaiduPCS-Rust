@@ -12,14 +12,12 @@
 // - 预注册机制
 
 use crate::auth::UserAuth;
-use crate::encryption::{EncryptionConfigStore, SnapshotManager};
 use crate::autobackup::events::BackupTransferNotification;
 use crate::autobackup::record::BackupRecordManager;
 use crate::config::{UploadConfig, VipType};
+use crate::encryption::{EncryptionConfigStore, SnapshotManager};
 use crate::netdisk::NetdiskClient;
-use crate::persistence::{
-    PersistenceManager, TaskMetadata, UploadRecoveryInfo,
-};
+use crate::persistence::{PersistenceManager, TaskMetadata, UploadRecoveryInfo};
 use crate::server::events::{ProgressThrottler, TaskEvent, UploadEvent};
 use crate::server::websocket::WebSocketManager;
 use crate::task_slot_pool::{TaskPriority, TaskSlotPool};
@@ -272,10 +270,7 @@ impl UploadManager {
                     }
                     let stored = counter.load(Ordering::SeqCst);
                     if stored != real {
-                        tracing::warn!(
-                            "active_count 漂移校准: {} -> {}",
-                            stored, real
-                        );
+                        tracing::warn!("active_count 漂移校准: {} -> {}", stored, real);
                         counter.store(real, Ordering::SeqCst);
                     }
                 }
@@ -355,7 +350,11 @@ impl UploadManager {
 
     /// 🔥 加密路径中的文件夹名（用于手动上传）
     /// 使用 "manual_upload" 作为 config_id
-    async fn encrypt_folder_path_for_upload(&self, base_path: &str, relative_path: &str) -> Result<String> {
+    async fn encrypt_folder_path_for_upload(
+        &self,
+        base_path: &str,
+        relative_path: &str,
+    ) -> Result<String> {
         use crate::encryption::service::EncryptionService;
 
         let record_manager = self.backup_record_manager.read().await;
@@ -363,7 +362,11 @@ impl UploadManager {
             Some(rm) => rm,
             None => {
                 // 没有设置 record_manager，返回原始路径
-                return Ok(format!("{}/{}", base_path.trim_end_matches('/'), relative_path));
+                return Ok(format!(
+                    "{}/{}",
+                    base_path.trim_end_matches('/'),
+                    relative_path
+                ));
             }
         };
 
@@ -375,13 +378,19 @@ impl UploadManager {
                 1u32
             }
             Err(e) => {
-                warn!("encrypt_folder_path_for_upload: 获取密钥版本失败: {}，使用默认版本 1", e);
+                warn!(
+                    "encrypt_folder_path_for_upload: 获取密钥版本失败: {}，使用默认版本 1",
+                    e
+                );
                 1u32
             }
         };
 
         let normalized_path = relative_path.replace('\\', "/");
-        let path_parts: Vec<&str> = normalized_path.split('/').filter(|s| !s.is_empty()).collect();
+        let path_parts: Vec<&str> = normalized_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
 
         if path_parts.is_empty() {
             return Ok(base_path.trim_end_matches('/').to_string());
@@ -395,22 +404,24 @@ impl UploadManager {
         let mut encrypted_parts = Vec::new();
 
         for folder_name in folder_parts {
-            let encrypted_name = match record_manager.find_encrypted_folder_name(
-                &current_parent, folder_name,
-            )? {
-                Some(name) => name,
-                None => {
-                    let new_name = EncryptionService::generate_encrypted_folder_name();
-                    record_manager.add_folder_mapping(
-                        &current_parent,
-                        folder_name,
-                        &new_name,
-                        current_key_version,
-                    )?;
-                    debug!("创建文件夹映射: {} -> {} (parent={}, key_version={})", folder_name, new_name, current_parent, current_key_version);
-                    new_name
-                }
-            };
+            let encrypted_name =
+                match record_manager.find_encrypted_folder_name(&current_parent, folder_name)? {
+                    Some(name) => name,
+                    None => {
+                        let new_name = EncryptionService::generate_encrypted_folder_name();
+                        record_manager.add_folder_mapping(
+                            &current_parent,
+                            folder_name,
+                            &new_name,
+                            current_key_version,
+                        )?;
+                        debug!(
+                            "创建文件夹映射: {} -> {} (parent={}, key_version={})",
+                            folder_name, new_name, current_parent, current_key_version
+                        );
+                        new_name
+                    }
+                };
             encrypted_parts.push(encrypted_name.clone());
             current_parent = format!("{}/{}", current_parent, encrypted_name);
         }
@@ -418,7 +429,11 @@ impl UploadManager {
         let encrypted_folder_path = if encrypted_parts.is_empty() {
             base_path.trim_end_matches('/').to_string()
         } else {
-            format!("{}/{}", base_path.trim_end_matches('/'), encrypted_parts.join("/"))
+            format!(
+                "{}/{}",
+                base_path.trim_end_matches('/'),
+                encrypted_parts.join("/")
+            )
         };
 
         Ok(format!("{}/{}", encrypted_folder_path, file_name))
@@ -465,7 +480,9 @@ impl UploadManager {
         task_slot_pool: &Arc<TaskSlotPool>,
         persistence_manager: Option<&Arc<Mutex<PersistenceManager>>>,
         encryption_config_store: &Arc<EncryptionConfigStore>,
-        backup_notification_tx: Option<&tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>>,
+        backup_notification_tx: Option<
+            &tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>,
+        >,
     ) -> Result<PathBuf> {
         use crate::autobackup::config::EncryptionAlgorithm;
         use crate::encryption::service::EncryptionService;
@@ -515,7 +532,9 @@ impl UploadManager {
                             // 🔥 发送加密完成事件（与正常流程一致）
                             if is_backup {
                                 // 🔥 备份任务：发送 BackupEvent::FileEncrypted
-                                if let (Some(ref b_task_id), Some(ref b_file_task_id)) = (&backup_task_id, &backup_file_task_id) {
+                                if let (Some(ref b_task_id), Some(ref b_file_task_id)) =
+                                    (&backup_task_id, &backup_file_task_id)
+                                {
                                     if let Some(ws) = ws_manager {
                                         ws.send_if_subscribed(
                                             TaskEvent::Backup(BackupEvent::FileEncrypted {
@@ -583,7 +602,9 @@ impl UploadManager {
         // 2. 发送状态变更事件 (Pending -> Encrypting)
         if is_backup {
             // 🔥 备份任务：发送 BackupEvent::FileEncrypting
-            if let (Some(ref b_task_id), Some(ref b_file_task_id)) = (&backup_task_id, &backup_file_task_id) {
+            if let (Some(ref b_task_id), Some(ref b_file_task_id)) =
+                (&backup_task_id, &backup_file_task_id)
+            {
                 if let Some(ws) = ws_manager {
                     ws.send_if_subscribed(
                         TaskEvent::Backup(BackupEvent::FileEncrypting {
@@ -650,7 +671,10 @@ impl UploadManager {
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
-                    warn!("无法从 remote_path 提取加密文件名，生成新的: remote_path={}", t.remote_path);
+                    warn!(
+                        "无法从 remote_path 提取加密文件名，生成新的: remote_path={}",
+                        t.remote_path
+                    );
                     EncryptionService::generate_encrypted_filename()
                 })
         };
@@ -660,7 +684,10 @@ impl UploadManager {
         // 🔥 同时获取 key_version，用于保存到任务中（支持密钥轮换后解密）
         let (encryption_service, current_key_version) = match encryption_config_store.load() {
             Ok(Some(key_config)) => {
-                info!("从 encryption.json 加载加密密钥成功, key_version={}", key_config.current.key_version);
+                info!(
+                    "从 encryption.json 加载加密密钥成功, key_version={}",
+                    key_config.current.key_version
+                );
                 match EncryptionService::from_base64_key(
                     &key_config.current.master_key,
                     key_config.current.algorithm,
@@ -740,7 +767,7 @@ impl UploadManager {
         let ws_for_progress = ws_manager.cloned();
         let is_backup_for_progress = is_backup;
         let task_for_progress = task.clone(); // 🔥 克隆任务引用用于更新进度字段
-        // 🔥 克隆备份相关 ID 用于进度事件
+                                              // 🔥 克隆备份相关 ID 用于进度事件
         let backup_task_id_for_progress = backup_task_id.clone();
         let backup_file_task_id_for_progress = backup_file_task_id.clone();
         let file_name_for_progress = file_name.clone();
@@ -762,7 +789,10 @@ impl UploadManager {
 
                 if is_backup_for_progress {
                     // 🔥 备份任务：发送 BackupEvent::FileEncryptProgress
-                    if let (Some(ref b_task_id), Some(ref b_file_task_id)) = (&backup_task_id_for_progress, &backup_file_task_id_for_progress) {
+                    if let (Some(ref b_task_id), Some(ref b_file_task_id)) = (
+                        &backup_task_id_for_progress,
+                        &backup_file_task_id_for_progress,
+                    ) {
                         if let Some(ref ws) = ws_for_progress {
                             ws.send_if_subscribed(
                                 TaskEvent::Backup(BackupEvent::FileEncryptProgress {
@@ -824,8 +854,8 @@ impl UploadManager {
                 },
             )
         })
-            .await
-            .map_err(|e| anyhow::anyhow!("加密任务执行失败: {}", e))?;
+        .await
+        .map_err(|e| anyhow::anyhow!("加密任务执行失败: {}", e))?;
 
         // 🔥 等待进度监听任务结束（加密完成后 channel 会关闭）
         let _ = progress_handle.await;
@@ -867,12 +897,16 @@ impl UploadManager {
                     let pm_guard = pm.lock().await;
 
                     // 更新任务状态
-                    if let Err(e) = pm_guard.update_task_status(task_id, TaskPersistenceStatus::Uploading) {
+                    if let Err(e) =
+                        pm_guard.update_task_status(task_id, TaskPersistenceStatus::Uploading)
+                    {
                         warn!("持久化加密完成状态失败: {}", e);
                     }
 
                     // 🔥 更新加密信息（encrypt_enabled 和 key_version）
-                    if let Err(e) = pm_guard.update_encryption_info(task_id, true, Some(current_key_version)) {
+                    if let Err(e) =
+                        pm_guard.update_encryption_info(task_id, true, Some(current_key_version))
+                    {
                         warn!("持久化加密信息失败: {}", e);
                     } else {
                         debug!(
@@ -885,7 +919,9 @@ impl UploadManager {
                 // 8. 发送加密完成事件和状态变更通知
                 if is_backup {
                     // 🔥 备份任务：发送 BackupEvent::FileEncrypted
-                    if let (Some(ref b_task_id), Some(ref b_file_task_id)) = (&backup_task_id, &backup_file_task_id) {
+                    if let (Some(ref b_task_id), Some(ref b_file_task_id)) =
+                        (&backup_task_id, &backup_file_task_id)
+                    {
                         if let Some(ws) = ws_manager {
                             ws.send_if_subscribed(
                                 TaskEvent::Backup(BackupEvent::FileEncrypted {
@@ -1094,7 +1130,8 @@ impl UploadManager {
         let file_size = metadata.len();
 
         // 获取冲突策略（如果未指定，使用默认值 SmartDedup）
-        let strategy = conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
+        let strategy =
+            conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
 
         // 创建任务
         let mut task = UploadTask::new(local_path.clone(), remote_path.clone(), file_size);
@@ -1130,19 +1167,17 @@ impl UploadManager {
                 // 文件夹上传：需要加密目录结构
                 // local_path 例如：C:\Users\xxx\你好2\子目录\file.txt
                 // 本地文件夹名（你好2）在 remote_path 中的位置就是需要开始加密的位置
-                let local_folder_name = local_path
-                    .parent()
-                    .and_then(|p| {
-                        let mut current = p;
-                        while let Some(name) = current.file_name() {
-                            let name_str = name.to_string_lossy();
-                            if parent.contains(&*name_str) {
-                                return Some(name_str.to_string());
-                            }
-                            current = current.parent()?;
+                let local_folder_name = local_path.parent().and_then(|p| {
+                    let mut current = p;
+                    while let Some(name) = current.file_name() {
+                        let name_str = name.to_string_lossy();
+                        if parent.contains(&*name_str) {
+                            return Some(name_str.to_string());
                         }
-                        None
-                    });
+                        current = current.parent()?;
+                    }
+                    None
+                });
 
                 if let Some(folder_name) = local_folder_name {
                     let parent_normalized = parent.replace('\\', "/");
@@ -1151,10 +1186,17 @@ impl UploadManager {
                         let relative_path = &parent_normalized[pos..];
 
                         if !relative_path.is_empty() {
-                            match self.encrypt_folder_path_for_upload(base_path, &format!("{}/dummy", relative_path)).await {
-                                Ok(encrypted_path) => {
-                                    encrypted_path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or(encrypted_path)
-                                }
+                            match self
+                                .encrypt_folder_path_for_upload(
+                                    base_path,
+                                    &format!("{}/dummy", relative_path),
+                                )
+                                .await
+                            {
+                                Ok(encrypted_path) => encrypted_path
+                                    .rsplit_once('/')
+                                    .map(|(p, _)| p.to_string())
+                                    .unwrap_or(encrypted_path),
                                 Err(e) => {
                                     warn!("加密文件夹路径失败，使用原始路径: {}", e);
                                     parent.clone()
@@ -1165,14 +1207,24 @@ impl UploadManager {
                         }
                     } else {
                         // 找不到文件夹名，使用原始逻辑
-                        let parts: Vec<&str> = parent_normalized.split('/').filter(|s| !s.is_empty()).collect();
+                        let parts: Vec<&str> = parent_normalized
+                            .split('/')
+                            .filter(|s| !s.is_empty())
+                            .collect();
                         if parts.len() > 1 {
                             let base = format!("/{}", parts[0]);
                             let relative = parts[1..].join("/");
-                            match self.encrypt_folder_path_for_upload(&base, &format!("{}/dummy", relative)).await {
-                                Ok(encrypted_path) => {
-                                    encrypted_path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or(encrypted_path)
-                                }
+                            match self
+                                .encrypt_folder_path_for_upload(
+                                    &base,
+                                    &format!("{}/dummy", relative),
+                                )
+                                .await
+                            {
+                                Ok(encrypted_path) => encrypted_path
+                                    .rsplit_once('/')
+                                    .map(|(p, _)| p.to_string())
+                                    .unwrap_or(encrypted_path),
                                 Err(e) => {
                                     warn!("加密文件夹路径失败，使用原始路径: {}", e);
                                     parent.clone()
@@ -1185,14 +1237,21 @@ impl UploadManager {
                 } else {
                     // 无法确定本地文件夹名，使用原始逻辑
                     let parent_normalized = parent.replace('\\', "/");
-                    let parts: Vec<&str> = parent_normalized.split('/').filter(|s| !s.is_empty()).collect();
+                    let parts: Vec<&str> = parent_normalized
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     if parts.len() > 1 {
                         let base = format!("/{}", parts[0]);
                         let relative = parts[1..].join("/");
-                        match self.encrypt_folder_path_for_upload(&base, &format!("{}/dummy", relative)).await {
-                            Ok(encrypted_path) => {
-                                encrypted_path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or(encrypted_path)
-                            }
+                        match self
+                            .encrypt_folder_path_for_upload(&base, &format!("{}/dummy", relative))
+                            .await
+                        {
+                            Ok(encrypted_path) => encrypted_path
+                                .rsplit_once('/')
+                                .map(|(p, _)| p.to_string())
+                                .unwrap_or(encrypted_path),
                             Err(e) => {
                                 warn!("加密文件夹路径失败，使用原始路径: {}", e);
                                 parent.clone()
@@ -1228,7 +1287,10 @@ impl UploadManager {
                     1u32
                 }
                 Err(e) => {
-                    warn!("创建快照时读取加密密钥配置失败: {}，使用默认 key_version=1", e);
+                    warn!(
+                        "创建快照时读取加密密钥配置失败: {}，使用默认 key_version=1",
+                        e
+                    );
                     1u32
                 }
             };
@@ -1238,12 +1300,12 @@ impl UploadManager {
                 use crate::autobackup::record::EncryptionSnapshot;
                 let snapshot = EncryptionSnapshot {
                     config_id: "manual_upload".to_string(),
-                    original_path: encrypted_parent.clone(),  // 父路径（已加密）
+                    original_path: encrypted_parent.clone(), // 父路径（已加密）
                     original_name: original_filename.clone(),
                     encrypted_name: encrypted_filename.clone(),
                     file_size,
-                    nonce: String::new(),      // 上传时还没有 nonce，上传完成后更新
-                    algorithm: String::new(),  // 上传时还没有算法，上传完成后更新
+                    nonce: String::new(), // 上传时还没有 nonce，上传完成后更新
+                    algorithm: String::new(), // 上传时还没有算法，上传完成后更新
                     version: 1,
                     key_version: snapshot_key_version,
                     remote_path: task.remote_path.clone(),
@@ -1253,7 +1315,10 @@ impl UploadManager {
                 if let Err(e) = rm.add_snapshot(&snapshot) {
                     warn!("存储文件加密映射失败: {}", e);
                 } else {
-                    debug!("存储文件加密映射: {} -> {}", original_filename, encrypted_filename);
+                    debug!(
+                        "存储文件加密映射: {} -> {}",
+                        original_filename, encrypted_filename
+                    );
                 }
             }
 
@@ -1316,8 +1381,8 @@ impl UploadManager {
                 file_size,
                 chunk_size,
                 total_chunks,
-                Some(encrypt),  // 🔥 传递 encrypt_enabled
-                current_key_version,  // 🔥 使用从 encryption.json 读取的正确 key_version
+                Some(encrypt),       // 🔥 传递 encrypt_enabled
+                current_key_version, // 🔥 使用从 encryption.json 读取的正确 key_version
             ) {
                 warn!("注册上传任务到持久化管理器失败: {}", e);
             }
@@ -1349,7 +1414,7 @@ impl UploadManager {
             total_size: file_size,
             is_backup: false,
         })
-            .await;
+        .await;
 
         Ok(task_id)
     }
@@ -1367,7 +1432,8 @@ impl UploadManager {
         conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
     ) -> Result<Vec<String>> {
         // 普通批量上传，不是文件夹上传
-        self.create_batch_tasks_internal(files, encrypt, false, conflict_strategy).await
+        self.create_batch_tasks_internal(files, encrypt, false, conflict_strategy)
+            .await
     }
 
     /// 内部批量创建上传任务
@@ -1388,7 +1454,13 @@ impl UploadManager {
 
         for (local_path, remote_path) in files {
             match self
-                .create_task(local_path.clone(), remote_path, encrypt, is_folder_upload, conflict_strategy)
+                .create_task(
+                    local_path.clone(),
+                    remote_path,
+                    encrypt,
+                    is_folder_upload,
+                    conflict_strategy,
+                )
                 .await
             {
                 Ok(task_id) => {
@@ -1468,7 +1540,9 @@ impl UploadManager {
         }
 
         // 批量创建任务（文件夹上传，需要加密目录结构）
-        let task_ids = self.create_batch_tasks_internal(tasks, encrypt, true, None).await?;
+        let task_ids = self
+            .create_batch_tasks_internal(tasks, encrypt, true, None)
+            .await?;
 
         info!("文件夹上传任务创建完成: 成功 {} 个", task_ids.len());
 
@@ -1619,7 +1693,9 @@ impl UploadManager {
         let scheduler = self.scheduler.as_ref().unwrap();
 
         // 🔥 从 DashMap 获取任务信息并立即克隆所需字段，避免长时间持有 shard 锁
-        let task_info = self.tasks.get(task_id)
+        let task_info = self
+            .tasks
+            .get(task_id)
             .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
 
         let (is_backup, has_slot) = {
@@ -1692,7 +1768,7 @@ impl UploadManager {
                     &encryption_config_store,
                     backup_notification_tx.as_ref(),
                 )
-                    .await
+                .await
                 {
                     Ok(encrypted_path) => encrypted_path,
                     Err(e) => {
@@ -1806,7 +1882,7 @@ impl UploadManager {
                 &actual_local_path,
                 vip_type,
             )
-                .await
+            .await
             {
                 Ok(bl) => bl,
                 Err(e) => {
@@ -2027,10 +2103,12 @@ impl UploadManager {
                 // 🔥 传入任务槽池引用，用于任务完成/失败时释放槽位
                 task_slot_pool: Some(task_slot_pool.clone()),
                 // 🔥 槽位刷新节流器（30秒间隔，防止槽位超时释放）
-                slot_touch_throttler: Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
-                    task_slot_pool.clone(),
-                    task_id_string.clone(),
-                ))),
+                slot_touch_throttler: Some(Arc::new(
+                    crate::task_slot_pool::SlotTouchThrottler::new(
+                        task_slot_pool.clone(),
+                        task_id_string.clone(),
+                    ),
+                )),
                 // 🔥 传入加密快照管理器，用于上传完成后保存加密映射
                 snapshot_manager,
                 // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
@@ -2055,12 +2133,11 @@ impl UploadManager {
     }
 
     /// 独立模式启动任务
-    async fn start_task_standalone(
-        &self,
-        task_id: &str,
-    ) -> Result<()> {
+    async fn start_task_standalone(&self, task_id: &str) -> Result<()> {
         // 🔥 从 DashMap 获取并立即克隆所需字段，避免长时间持有 shard 锁
-        let task_info = self.tasks.get(task_id)
+        let task_info = self
+            .tasks
+            .get(task_id)
             .ok_or_else(|| anyhow::anyhow!("任务不存在: {}", task_id))?;
 
         let task = task_info.task.clone();
@@ -2174,14 +2251,14 @@ impl UploadManager {
                     new_status: "paused".to_string(),
                     is_backup,
                 })
-                    .await;
+                .await;
 
                 // 🔥 发送暂停事件
                 self.publish_event(UploadEvent::Paused {
                     task_id: task_id.to_string(),
                     is_backup,
                 })
-                    .await;
+                .await;
 
                 // 🔥 如果是备份任务，发送暂停通知到 AutoBackupManager
                 if is_backup {
@@ -2228,14 +2305,14 @@ impl UploadManager {
                     new_status: "paused".to_string(),
                     is_backup,
                 })
-                    .await;
+                .await;
 
                 // 发送暂停事件
                 self.publish_event(UploadEvent::Paused {
                     task_id: task_id.to_string(),
                     is_backup,
                 })
-                    .await;
+                .await;
 
                 // 如果是备份任务，发送暂停通知到 AutoBackupManager
                 if is_backup {
@@ -2281,10 +2358,7 @@ impl UploadManager {
                         task.error = None;
                     }
                     _ => {
-                        return Err(anyhow::anyhow!(
-                            "任务当前状态不支持恢复: {:?}",
-                            task.status
-                        ));
+                        return Err(anyhow::anyhow!("任务当前状态不支持恢复: {:?}", task.status));
                     }
                 }
                 task.status = UploadTaskStatus::Pending;
@@ -2305,14 +2379,14 @@ impl UploadManager {
             new_status: "pending".to_string(),
             is_backup,
         })
-            .await;
+        .await;
 
         // 🔥 发送恢复事件
         self.publish_event(UploadEvent::Resumed {
             task_id: task_id.to_string(),
             is_backup,
         })
-            .await;
+        .await;
 
         // 🔥 如果是备份任务，发送状态变更和恢复通知到 AutoBackupManager
         if is_backup {
@@ -2374,8 +2448,10 @@ impl UploadManager {
                 let mut task = task_info.task.lock().await;
                 let active = matches!(
                     task.status,
-                    UploadTaskStatus::Pending | UploadTaskStatus::Uploading
-                    | UploadTaskStatus::Encrypting | UploadTaskStatus::CheckingRapid
+                    UploadTaskStatus::Pending
+                        | UploadTaskStatus::Uploading
+                        | UploadTaskStatus::Encrypting
+                        | UploadTaskStatus::CheckingRapid
                 );
                 let sid = task.slot_id;
                 task.slot_id = None;
@@ -2425,8 +2501,10 @@ impl UploadManager {
             let task = task_info.task.lock().await;
             let active = matches!(
                 task.status,
-                UploadTaskStatus::Pending | UploadTaskStatus::Uploading
-                | UploadTaskStatus::Encrypting | UploadTaskStatus::CheckingRapid
+                UploadTaskStatus::Pending
+                    | UploadTaskStatus::Uploading
+                    | UploadTaskStatus::Encrypting
+                    | UploadTaskStatus::CheckingRapid
             );
             (task.is_backup, task.slot_id, active)
         } else {
@@ -2475,7 +2553,7 @@ impl UploadManager {
             task_id: task_id.to_string(),
             is_backup,
         })
-            .await;
+        .await;
 
         // 🔥 备份任务：补送 BackupTransferNotification::Deleted。
         //    publish_event 对 is_backup=true 的任务直接跳过，不补发的话
@@ -2556,8 +2634,10 @@ impl UploadManager {
             let task = task_info.task.lock().await;
             let active = matches!(
                 task.status,
-                UploadTaskStatus::Pending | UploadTaskStatus::Uploading
-                | UploadTaskStatus::Encrypting | UploadTaskStatus::CheckingRapid
+                UploadTaskStatus::Pending
+                    | UploadTaskStatus::Uploading
+                    | UploadTaskStatus::Encrypting
+                    | UploadTaskStatus::CheckingRapid
             );
             (task.is_backup, task.slot_id, active)
         } else {
@@ -2594,7 +2674,10 @@ impl UploadManager {
             .map(|pm| pm.clone())
         {
             if let Err(e) = pm_arc.lock().await.on_task_deleted(task_id) {
-                warn!("清理上传任务持久化文件失败: task_id={}, 错误: {}", task_id, e);
+                warn!(
+                    "清理上传任务持久化文件失败: task_id={}, 错误: {}",
+                    task_id, e
+                );
                 // 🔥 持久化清理失败不应该导致整个删除操作失败
                 // return Err(anyhow::anyhow!("清理持久化文件失败: {}", e));
             }
@@ -2605,7 +2688,7 @@ impl UploadManager {
             task_id: task_id.to_string(),
             is_backup,
         })
-            .await;
+        .await;
 
         // 🔥 备份任务：补送 BackupTransferNotification::Deleted。
         //    与 delete_task 路径一致；批量删除经由 batch_delete_tasks 调入此函数，
@@ -2669,9 +2752,9 @@ impl UploadManager {
             if let Some((history_tasks, _total)) = pm.get_history_tasks_by_type_and_status(
                 "upload",
                 "completed",
-                true,  // exclude_backup
+                true, // exclude_backup
                 0,
-                500,   // 限制最多500条
+                500, // 限制最多500条
             ) {
                 for metadata in history_tasks {
                     // 排除已在当前任务中的（避免重复）
@@ -2760,7 +2843,8 @@ impl UploadManager {
         let file_size = metadata.len();
 
         // 获取冲突策略（如果未指定，使用默认值 SmartDedup）
-        let strategy = conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
+        let strategy =
+            conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
 
         // 🔥 如果启用加密，修改远程路径为加密文件名（与 create_task 保持一致）
         let (actual_remote_path, encrypted_filename) = if encrypt_enabled {
@@ -2820,7 +2904,10 @@ impl UploadManager {
                     1u32
                 }
                 Err(e) => {
-                    warn!("创建备份快照时读取加密密钥配置失败: {}，使用默认 key_version=1", e);
+                    warn!(
+                        "创建备份快照时读取加密密钥配置失败: {}，使用默认 key_version=1",
+                        e
+                    );
                     1u32
                 }
             };
@@ -2833,8 +2920,8 @@ impl UploadManager {
                     original_name: original_filename.clone(),
                     encrypted_name: enc_filename.clone(),
                     file_size,
-                    nonce: String::new(),      // 上传时还没有 nonce，上传完成后更新
-                    algorithm: String::new(),  // 上传时还没有算法，上传完成后更新
+                    nonce: String::new(), // 上传时还没有 nonce，上传完成后更新
+                    algorithm: String::new(), // 上传时还没有算法，上传完成后更新
                     version: 1,
                     key_version: snapshot_key_version,
                     remote_path: actual_remote_path.clone(),
@@ -2844,7 +2931,10 @@ impl UploadManager {
                 if let Err(e) = rm.add_snapshot(&snapshot) {
                     warn!("存储备份文件加密映射失败: {}", e);
                 } else {
-                    debug!("存储备份文件加密映射: {} -> {}", original_filename, enc_filename);
+                    debug!(
+                        "存储备份文件加密映射: {} -> {}",
+                        original_filename, enc_filename
+                    );
                 }
             }
 
@@ -2906,7 +2996,7 @@ impl UploadManager {
                 total_chunks,
                 backup_config_id.clone(),
                 Some(encrypt_enabled),
-                current_key_version,  // 🔥 使用从 encryption.json 读取的正确 key_version
+                current_key_version, // 🔥 使用从 encryption.json 读取的正确 key_version
             ) {
                 warn!("注册备份上传任务到持久化管理器失败: {}", e);
             }
@@ -2934,11 +3024,11 @@ impl UploadManager {
         self.publish_event(UploadEvent::Created {
             task_id: task_id.clone(),
             local_path: local_path.to_string_lossy().to_string(),
-            remote_path:actual_remote_path,
+            remote_path: actual_remote_path,
             total_size: file_size,
             is_backup: true,
         })
-            .await;
+        .await;
 
         Ok(task_id)
     }
@@ -2974,7 +3064,7 @@ impl UploadManager {
             // 自动备份字段（从 metadata 恢复）
             is_backup: metadata.is_backup,
             backup_config_id: metadata.backup_config_id.clone(),
-            backup_task_id: None, // 历史任务无备份任务ID
+            backup_task_id: None,      // 历史任务无备份任务ID
             backup_file_task_id: None, // 历史任务无文件任务ID
             // 任务槽位字段（历史任务无槽位信息）
             slot_id: None,
@@ -3149,7 +3239,9 @@ impl UploadManager {
 
         info!(
             "批量恢复上传任务完成: 成功 {}, 失败 {}, 总计 {}",
-            success_count, fail_count, task_ids.len()
+            success_count,
+            fail_count,
+            task_ids.len()
         );
 
         // 🔥 关键修复：批量恢复后尝试启动等待队列中的任务
@@ -3176,7 +3268,14 @@ impl UploadManager {
         for entry in self.tasks.iter() {
             let task = entry.task.lock().await;
             // 🔥 只返回非备份任务（上传管理页面不应操作自动备份任务）
-            if !task.is_backup && matches!(task.status, UploadTaskStatus::Uploading | UploadTaskStatus::CheckingRapid | UploadTaskStatus::Pending) {
+            if !task.is_backup
+                && matches!(
+                    task.status,
+                    UploadTaskStatus::Uploading
+                        | UploadTaskStatus::CheckingRapid
+                        | UploadTaskStatus::Pending
+                )
+            {
                 ids.push(entry.key().clone());
             }
         }
@@ -3189,11 +3288,19 @@ impl UploadManager {
         for entry in self.tasks.iter() {
             let task = entry.task.lock().await;
             // 🔥 只返回非备份任务（上传管理页面不应操作自动备份任务）
-            if !task.is_backup && matches!(task.status, UploadTaskStatus::Paused | UploadTaskStatus::Failed) {
+            if !task.is_backup
+                && matches!(
+                    task.status,
+                    UploadTaskStatus::Paused | UploadTaskStatus::Failed
+                )
+            {
                 ids.push(entry.key().clone());
             }
         }
-        tracing::info!("获取可恢复的上传任务: 找到 {} 个非备份任务（Paused 或 Failed 状态）", ids.len());
+        tracing::info!(
+            "获取可恢复的上传任务: 找到 {} 个非备份任务（Paused 或 Failed 状态）",
+            ids.len()
+        );
         ids
     }
 
@@ -3210,8 +3317,8 @@ impl UploadManager {
         local_path: &Path,
         original_remote_path: &str,
     ) -> Option<String> {
-        let canonical = dunce::canonicalize(local_path)
-            .unwrap_or_else(|_| local_path.to_path_buf());
+        let canonical =
+            dunce::canonicalize(local_path).unwrap_or_else(|_| local_path.to_path_buf());
         let key = (canonical, original_remote_path.to_string());
         self.dedup_index.get(&key).map(|v| v.value().clone())
     }
@@ -3223,11 +3330,14 @@ impl UploadManager {
         local_path: &Path,
         original_remote_path: &str,
     ) {
-        let canonical = dunce::canonicalize(local_path)
-            .unwrap_or_else(|e| {
-                warn!("canonicalize failed for {}: {}, using raw path", local_path.display(), e);
-                local_path.to_path_buf()
-            });
+        let canonical = dunce::canonicalize(local_path).unwrap_or_else(|e| {
+            warn!(
+                "canonicalize failed for {}: {}, using raw path",
+                local_path.display(),
+                e
+            );
+            local_path.to_path_buf()
+        });
         let key = (canonical, original_remote_path.to_string());
         self.dedup_index.insert(key.clone(), task_id.to_string());
         self.dedup_reverse.insert(task_id.to_string(), key);
@@ -3252,28 +3362,31 @@ impl UploadManager {
         let mut existing_ids = Vec::new();
 
         for (local_path, original_remote_path) in files {
-            let canonical = dunce::canonicalize(&local_path)
-                .unwrap_or_else(|_| local_path.clone());
+            let canonical = dunce::canonicalize(&local_path).unwrap_or_else(|_| local_path.clone());
 
             if let Some(existing_id) = self.find_duplicate_task(&canonical, &original_remote_path) {
                 existing_ids.push(existing_id);
                 continue;
             }
 
-            match self.create_task(
-                canonical.clone(),
-                original_remote_path.clone(),
-                encrypt,
-                is_folder_upload,
-                conflict_strategy,
-            ).await {
+            match self
+                .create_task(
+                    canonical.clone(),
+                    original_remote_path.clone(),
+                    encrypt,
+                    is_folder_upload,
+                    conflict_strategy,
+                )
+                .await
+            {
                 Ok(task_id) => {
                     let key = (canonical, original_remote_path.clone());
                     self.dedup_index.insert(key.clone(), task_id.clone());
                     self.dedup_reverse.insert(task_id.clone(), key);
 
                     // 更新 metadata 的 original_remote_path
-                    self.update_task_original_remote_path(&task_id, &original_remote_path).await;
+                    self.update_task_original_remote_path(&task_id, &original_remote_path)
+                        .await;
 
                     if let Err(e) = self.start_task(&task_id).await {
                         warn!("启动上传任务 {} 失败: {}", task_id, e);
@@ -3299,10 +3412,9 @@ impl UploadManager {
             .map(|pm| pm.clone())
         {
             let pm = pm_arc.lock().await;
-            if let Err(e) = pm.update_original_remote_path(
-                task_id,
-                original_remote_path.to_string(),
-            ) {
+            if let Err(e) =
+                pm.update_original_remote_path(task_id, original_remote_path.to_string())
+            {
                 warn!("更新 original_remote_path 失败: {}", e);
             }
         }
@@ -3364,7 +3476,7 @@ impl UploadManager {
                 new_status: "paused".to_string(),
                 is_backup: true,
             })
-                .await;
+            .await;
         }
 
         // 2. 从调度器移除（如果已注册）
@@ -3394,7 +3506,7 @@ impl UploadManager {
                 new_status: "pending".to_string(),
                 is_backup,
             })
-                .await;
+            .await;
 
             // 🔥 如果是备份任务，发送通知到 AutoBackupManager
             if is_backup {
@@ -3548,12 +3660,9 @@ impl UploadManager {
                 new_status: "paused".to_string(),
                 is_backup,
             })
-                .await;
+            .await;
 
-            self.publish_event(UploadEvent::Paused {
-                task_id,
-                is_backup,
-            })
+            self.publish_event(UploadEvent::Paused { task_id, is_backup })
                 .await;
         }
 
@@ -3710,12 +3819,7 @@ impl UploadManager {
                             // 🔥 调用 start_task_internal（不再传递 DashMap ref）
                             if let Some((local_path, remote_path, total_size)) = task_params {
                                 if let Err(e) = self
-                                    .start_task_internal(
-                                        &id,
-                                        local_path,
-                                        remote_path,
-                                        total_size,
-                                    )
+                                    .start_task_internal(&id, local_path, remote_path, total_size)
                                     .await
                                 {
                                     error!("启动等待上传任务失败: {}, 错误: {}", id, e);
@@ -3854,7 +3958,7 @@ impl UploadManager {
                                         task.remote_path.clone(),
                                         task.total_size,
                                         task.is_backup,
-                                        task.encrypt_enabled,  // 🔥 新增：获取加密启用状态
+                                        task.encrypt_enabled, // 🔥 新增：获取加密启用状态
                                     ))
                                 } else {
                                     None
@@ -4080,21 +4184,32 @@ impl UploadManager {
                                         &encryption_config_store_clone,
                                         backup_notification_tx_clone.as_ref(),
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(encrypted_path) => {
                                             // 获取加密后文件大小
-                                            let encrypted_size = match tokio::fs::metadata(&encrypted_path).await {
+                                            let encrypted_size = match tokio::fs::metadata(
+                                                &encrypted_path,
+                                            )
+                                            .await
+                                            {
                                                 Ok(m) => m.len(),
                                                 Err(e) => {
-                                                    let error_msg = format!("后台监控：获取加密文件大小失败: {}", e);
+                                                    let error_msg = format!(
+                                                        "后台监控：获取加密文件大小失败: {}",
+                                                        e
+                                                    );
                                                     error!("{}", error_msg);
-                                                    task_slot_pool_clone.release_fixed_slot(&task_id_clone).await;
+                                                    task_slot_pool_clone
+                                                        .release_fixed_slot(&task_id_clone)
+                                                        .await;
                                                     let mut t = task.lock().await;
                                                     t.mark_failed(error_msg.clone());
                                                     drop(t);
                                                     if is_backup {
-                                                        if let Some(ref tx) = backup_notification_tx_clone {
+                                                        if let Some(ref tx) =
+                                                            backup_notification_tx_clone
+                                                        {
                                                             use crate::autobackup::events::TransferTaskType;
                                                             let _ = tx.send(BackupTransferNotification::Failed {
                                                                 task_id: task_id_clone.clone(),
@@ -4106,7 +4221,10 @@ impl UploadManager {
                                                     return;
                                                 }
                                             };
-                                            info!("后台监控：加密完成，使用加密文件: {:?}, size={}", encrypted_path, encrypted_size);
+                                            info!(
+                                                "后台监控：加密完成，使用加密文件: {:?}, size={}",
+                                                encrypted_path, encrypted_size
+                                            );
                                             (encrypted_path, encrypted_size)
                                         }
                                         Err(e) => {
@@ -4125,7 +4243,7 @@ impl UploadManager {
                                         &actual_local_path,
                                         vip_type,
                                     )
-                                        .await
+                                    .await
                                     {
                                         Ok(bl) => bl,
                                         Err(e) => {
@@ -4169,7 +4287,9 @@ impl UploadManager {
                                 let client_snapshot = client_clone.read().unwrap().clone();
                                 let rtype = {
                                     let t = task.lock().await;
-                                    crate::uploader::conflict::conflict_strategy_to_rtype(t.conflict_strategy)
+                                    crate::uploader::conflict::conflict_strategy_to_rtype(
+                                        t.conflict_strategy,
+                                    )
                                 };
                                 let precreate_response = match client_snapshot
                                     .precreate(&remote_path, actual_total_size, &block_list, rtype)
@@ -4233,7 +4353,10 @@ impl UploadManager {
                                                 .filemetas(&[remote_path.clone()])
                                                 .await
                                             {
-                                                Ok(resp) if resp.is_success() && !resp.list.is_empty() => {
+                                                Ok(resp)
+                                                    if resp.is_success()
+                                                        && !resp.list.is_empty() =>
+                                                {
                                                     let meta = &resp.list[0];
                                                     Some(UploadCompletionMeta {
                                                         fs_id: meta.fs_id,
@@ -4327,8 +4450,10 @@ impl UploadManager {
                                 // 3. 🔥 延迟创建分片管理器（只有预注册成功后才创建，节省内存）
                                 // 使用实际文件大小（可能是加密后的大小）
                                 let chunk_manager = {
-                                    let mut cm =
-                                        UploadChunkManager::with_vip_type(actual_total_size, vip_type);
+                                    let mut cm = UploadChunkManager::with_vip_type(
+                                        actual_total_size,
+                                        vip_type,
+                                    );
 
                                     // 如果是恢复的任务，标记已完成的分片
                                     if let Some(ref restored_info) = restored_completed_chunks {
@@ -4387,10 +4512,12 @@ impl UploadManager {
                                     // 🔥 传入任务槽池引用，用于任务完成/失败时释放槽位
                                     task_slot_pool: Some(task_slot_pool_clone.clone()),
                                     // 🔥 槽位刷新节流器（30秒间隔，防止槽位超时释放）
-                                    slot_touch_throttler: Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
-                                        task_slot_pool_clone.clone(),
-                                        task_id_clone.clone(),
-                                    ))),
+                                    slot_touch_throttler: Some(Arc::new(
+                                        crate::task_slot_pool::SlotTouchThrottler::new(
+                                            task_slot_pool_clone.clone(),
+                                            task_id_clone.clone(),
+                                        ),
+                                    )),
                                     // 🔥 传入加密快照管理器，用于上传完成后保存加密映射
                                     snapshot_manager: snapshot_manager_clone,
                                     // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
@@ -4581,7 +4708,8 @@ impl UploadManager {
         }
 
         // 重建去重索引
-        let dedup_path = recovery_info.original_remote_path
+        let dedup_path = recovery_info
+            .original_remote_path
             .as_deref()
             .unwrap_or(&recovery_info.target_path);
         self.rebuild_dedup_index_entry(&task_id, &recovery_info.source_path, dedup_path);

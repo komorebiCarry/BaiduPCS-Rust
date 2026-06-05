@@ -12,7 +12,7 @@ pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const DEFAULT_POOL_CAPACITY: usize = 4;
 
 /// 缓冲区池
-/// 
+///
 /// 用于复用大型缓冲区，避免每次加密/解密操作都分配新的内存。
 /// 线程安全，可在多个加密任务之间共享。
 #[derive(Clone)]
@@ -53,11 +53,13 @@ impl BufferPool {
     }
 
     /// 获取一个缓冲区
-    /// 
+    ///
     /// 如果池中有可用缓冲区，则复用；否则分配新的。
     /// 返回的缓冲区已清零并调整到正确大小。
     pub fn acquire(&self) -> PooledBuffer {
-        self.inner.acquire_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .acquire_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let buffer = {
             let mut buffers = self.inner.buffers.lock();
@@ -66,7 +68,9 @@ impl BufferPool {
 
         let buffer = match buffer {
             Some(mut buf) => {
-                self.inner.hit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner
+                    .hit_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // 确保大小正确
                 buf.resize(self.inner.buffer_size, 0);
                 buf
@@ -84,7 +88,7 @@ impl BufferPool {
     }
 
     /// 获取指定大小的缓冲区
-    /// 
+    ///
     /// 如果请求大小与池缓冲区大小一致，则尝试复用；否则分配新的。
     pub fn acquire_sized(&self, size: usize) -> PooledBuffer {
         if size == self.inner.buffer_size {
@@ -130,9 +134,15 @@ impl BufferPool {
 
     /// 获取统计信息
     pub fn stats(&self) -> BufferPoolStats {
-        let acquire_count = self.inner.acquire_count.load(std::sync::atomic::Ordering::Relaxed);
-        let hit_count = self.inner.hit_count.load(std::sync::atomic::Ordering::Relaxed);
-        
+        let acquire_count = self
+            .inner
+            .acquire_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let hit_count = self
+            .inner
+            .hit_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+
         BufferPoolStats {
             acquire_count,
             hit_count,
@@ -156,7 +166,7 @@ impl BufferPool {
     pub fn warm_up(&self, count: usize) {
         let count = count.min(self.inner.capacity);
         let mut buffers = self.inner.buffers.lock();
-        
+
         while buffers.len() < count {
             buffers.push(vec![0u8; self.inner.buffer_size]);
         }
@@ -170,7 +180,7 @@ impl Default for BufferPool {
 }
 
 /// 池化缓冲区
-/// 
+///
 /// 自动归还缓冲区到池中（RAII 模式）
 pub struct PooledBuffer {
     buffer: Option<Vec<u8>>,
@@ -180,7 +190,10 @@ pub struct PooledBuffer {
 impl PooledBuffer {
     /// 获取缓冲区的可变切片
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer.as_mut().map(|b| b.as_mut_slice()).unwrap_or(&mut [])
+        self.buffer
+            .as_mut()
+            .map(|b| b.as_mut_slice())
+            .unwrap_or(&mut [])
     }
 
     /// 获取缓冲区的不可变切片
@@ -257,16 +270,16 @@ mod tests {
     #[test]
     fn test_buffer_pool_basic() {
         let pool = BufferPool::new(1024, 2);
-        
+
         // 获取第一个缓冲区
         let buf1 = pool.acquire();
         assert_eq!(buf1.len(), 1024);
         assert_eq!(pool.available(), 0);
-        
+
         // 归还后应该在池中
         drop(buf1);
         assert_eq!(pool.available(), 1);
-        
+
         // 再次获取应该复用
         let _buf2 = pool.acquire();
         assert_eq!(pool.available(), 0);
@@ -275,16 +288,16 @@ mod tests {
     #[test]
     fn test_buffer_pool_capacity() {
         let pool = BufferPool::new(1024, 2);
-        
+
         // 获取并归还3个缓冲区
         let buf1 = pool.acquire();
         let buf2 = pool.acquire();
         let buf3 = pool.acquire();
-        
+
         drop(buf1);
         drop(buf2);
         drop(buf3);
-        
+
         // 池容量是2，只能保留2个
         assert_eq!(pool.available(), 2);
     }
@@ -292,12 +305,12 @@ mod tests {
     #[test]
     fn test_buffer_pool_stats() {
         let pool = BufferPool::new(1024, 2);
-        
+
         let _buf1 = pool.acquire(); // miss
         drop(_buf1);
-        
+
         let _buf2 = pool.acquire(); // hit
-        
+
         let stats = pool.stats();
         assert_eq!(stats.acquire_count, 2);
         assert_eq!(stats.hit_count, 1);
@@ -307,10 +320,10 @@ mod tests {
     #[test]
     fn test_pooled_buffer_take() {
         let pool = BufferPool::new(1024, 2);
-        
+
         let buf = pool.acquire();
         let vec = buf.take();
-        
+
         assert_eq!(vec.len(), 1024);
         // 因为使用了 take，缓冲区不会归还到池中
         assert_eq!(pool.available(), 0);
@@ -319,10 +332,10 @@ mod tests {
     #[test]
     fn test_buffer_pool_warm_up() {
         let pool = BufferPool::new(1024, 4);
-        
+
         pool.warm_up(3);
         assert_eq!(pool.available(), 3);
-        
+
         // 预热超过容量不会超出
         pool.warm_up(10);
         assert_eq!(pool.available(), 4);

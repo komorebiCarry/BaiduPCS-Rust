@@ -125,7 +125,10 @@ impl WebSocketManager {
     /// - `connection_id`: 连接 ID
     /// - `patterns`: 订阅模式列表
     pub fn subscribe(&self, connection_id: &str, patterns: Vec<String>) {
-        let mut conn_subs = self.subscriptions.entry(connection_id.to_string()).or_default();
+        let mut conn_subs = self
+            .subscriptions
+            .entry(connection_id.to_string())
+            .or_default();
 
         for pattern in patterns {
             // 规范化订阅模式，生成所有通配符版本，实现 O(1) 匹配
@@ -164,7 +167,11 @@ impl WebSocketManager {
                     }
                 }
             }
-            info!("连接 {} 取消订阅，剩余: {:?}", connection_id, conn_subs.value());
+            info!(
+                "连接 {} 取消订阅，剩余: {:?}",
+                connection_id,
+                conn_subs.value()
+            );
         }
     }
 
@@ -262,7 +269,6 @@ impl WebSocketManager {
 
         false
     }
-
 
     /// 获取节流 key
     ///
@@ -409,7 +415,10 @@ impl WebSocketManager {
                     let last_sent_map = self.last_sent.get(connection_id);
                     match last_sent_map {
                         Some(map) => match map.get(&throttle_key) {
-                            Some(last) => now.duration_since(*last) >= Duration::from_millis(MIN_PUSH_INTERVAL_MS / 2),
+                            Some(last) => {
+                                now.duration_since(*last)
+                                    >= Duration::from_millis(MIN_PUSH_INTERVAL_MS / 2)
+                            }
                             None => true,
                         },
                         None => true,
@@ -447,14 +456,16 @@ impl WebSocketManager {
 
             // 低/中优先级事件暂存，等待批量发送
             // 检查并限制 pending_events 大小（Requirements: 13.3）
-            let mut pending_map = self.pending_events
+            let mut pending_map = self
+                .pending_events
                 .entry(connection_id.to_string())
                 .or_default();
 
             // 如果超过限制，丢弃最旧的事件
             if pending_map.len() >= MAX_PENDING_EVENTS_PER_CONNECTION {
                 // 找到最旧的事件（按 event_id 排序）
-                if let Some(oldest_key) = pending_map.iter()
+                if let Some(oldest_key) = pending_map
+                    .iter()
                     .min_by_key(|(_, pe)| pe.event.event_id)
                     .map(|(k, _)| k.clone())
                 {
@@ -466,10 +477,13 @@ impl WebSocketManager {
                 }
             }
 
-            pending_map.insert(throttle_key.clone(), PendingEvent {
-                event: timestamped.clone(),
-                group_id: group_id.clone(),
-            });
+            pending_map.insert(
+                throttle_key.clone(),
+                PendingEvent {
+                    event: timestamped.clone(),
+                    group_id: group_id.clone(),
+                },
+            );
         }
     }
 
@@ -528,7 +542,9 @@ impl WebSocketManager {
         let max_batch_size = self.get_dynamic_batch_size();
 
         // 遍历所有有 pending 事件的连接
-        let connection_ids: Vec<String> = self.pending_events.iter()
+        let connection_ids: Vec<String> = self
+            .pending_events
+            .iter()
             .map(|entry| entry.key().clone())
             .collect();
 
@@ -549,14 +565,20 @@ impl WebSocketManager {
 
                 for (throttle_key, pending_event) in pending_map.iter() {
                     // 重新检查订阅状态（用户可能在事件进入 pending 后取消订阅）
-                    if !self.should_send_event(&connection_id, &pending_event.event.event, pending_event.group_id.as_deref()) {
+                    if !self.should_send_event(
+                        &connection_id,
+                        &pending_event.event.event,
+                        pending_event.group_id.as_deref(),
+                    ) {
                         keys_to_remove.push(throttle_key.clone());
                         continue;
                     }
 
                     // 检查频率限制
                     let should_send = match last_sent_map.get(throttle_key) {
-                        Some(last) => now.duration_since(*last) >= Duration::from_millis(MIN_PUSH_INTERVAL_MS),
+                        Some(last) => {
+                            now.duration_since(*last) >= Duration::from_millis(MIN_PUSH_INTERVAL_MS)
+                        }
                         None => true,
                     };
 

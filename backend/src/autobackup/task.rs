@@ -1,9 +1,9 @@
 //! 备份任务数据结构
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::collections::{HashSet, HashMap};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// 备份任务状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,11 +352,13 @@ impl BackupTaskRuntime {
     }
 
     pub fn increment_completed(&self) {
-        self.completed_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn add_transferred_bytes(&self, bytes: u64) {
-        self.transferred_bytes.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.transferred_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -368,7 +370,8 @@ impl BackupTaskRuntime {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn pause(&self) {
@@ -376,6 +379,165 @@ impl BackupTaskRuntime {
     }
 
     pub fn resume(&self) {
-        self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// ==================== enum → &str 转换 ====================
+//
+// 这些方法提供零分配的 enum → 字符串转换，用于 SQL 持久化等场景。
+// 返回的字符串与原 `format!("{:?}", x).to_lowercase()` 输出一致。
+// 每个映射都是 exhaustive（编译期覆盖检查），新增变体时编译器会强制更新。
+
+impl BackupTaskStatus {
+    /// 返回小写 CamelCase 形式（SQL 持久化格式）
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackupTaskStatus::Queued => "queued",
+            BackupTaskStatus::Preparing => "preparing",
+            BackupTaskStatus::Transferring => "transferring",
+            BackupTaskStatus::Completed => "completed",
+            BackupTaskStatus::PartiallyCompleted => "partiallycompleted",
+            BackupTaskStatus::Cancelled => "cancelled",
+            BackupTaskStatus::Failed => "failed",
+            BackupTaskStatus::Paused => "paused",
+        }
+    }
+}
+
+impl BackupSubPhase {
+    /// 返回小写 CamelCase 形式（SQL 持久化格式）
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackupSubPhase::DedupChecking => "dedupchecking",
+            BackupSubPhase::WaitingSlot => "waitingslot",
+            BackupSubPhase::Encrypting => "encrypting",
+            BackupSubPhase::Uploading => "uploading",
+            BackupSubPhase::Downloading => "downloading",
+            BackupSubPhase::Decrypting => "decrypting",
+            BackupSubPhase::Preempted => "preempted",
+            BackupSubPhase::SyncScanning => "syncscanning",
+            BackupSubPhase::SyncPlanning => "syncplanning",
+            BackupSubPhase::SyncUploading => "syncuploading",
+            BackupSubPhase::SyncDownloading => "syncdownloading",
+        }
+    }
+}
+
+impl TriggerType {
+    /// 返回小写形式（SQL 持久化格式）
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TriggerType::Watch => "watch",
+            TriggerType::Poll => "poll",
+            TriggerType::Manual => "manual",
+        }
+    }
+}
+
+impl BackupOperationType {
+    /// 返回小写形式（SQL 持久化格式）
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackupOperationType::Upload => "upload",
+            BackupOperationType::Download => "download",
+        }
+    }
+}
+
+impl BackupFileStatus {
+    /// 返回小写 CamelCase 形式（SQL 持久化格式）
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackupFileStatus::Pending => "pending",
+            BackupFileStatus::Checking => "checking",
+            BackupFileStatus::Skipped => "skipped",
+            BackupFileStatus::Encrypting => "encrypting",
+            BackupFileStatus::WaitingTransfer => "waitingtransfer",
+            BackupFileStatus::Transferring => "transferring",
+            BackupFileStatus::Completed => "completed",
+            BackupFileStatus::Failed => "failed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod enum_str_tests {
+    use super::*;
+
+    /// 防回归：保证 as_str() 与旧 format!("{:?}", x).to_lowercase() 输出完全一致。
+    /// 任何修改都应同步更新两侧。
+    #[test]
+    fn backup_task_status_as_str_matches_debug_lowercase() {
+        let all = [
+            BackupTaskStatus::Queued,
+            BackupTaskStatus::Preparing,
+            BackupTaskStatus::Transferring,
+            BackupTaskStatus::Completed,
+            BackupTaskStatus::PartiallyCompleted,
+            BackupTaskStatus::Cancelled,
+            BackupTaskStatus::Failed,
+            BackupTaskStatus::Paused,
+        ];
+        for v in all {
+            assert_eq!(v.as_str(), format!("{:?}", v).to_lowercase());
+        }
+    }
+
+    #[test]
+    fn backup_sub_phase_as_str_matches_debug_lowercase() {
+        let all = [
+            BackupSubPhase::DedupChecking,
+            BackupSubPhase::WaitingSlot,
+            BackupSubPhase::Encrypting,
+            BackupSubPhase::Uploading,
+            BackupSubPhase::Downloading,
+            BackupSubPhase::Decrypting,
+            BackupSubPhase::Preempted,
+            BackupSubPhase::SyncScanning,
+            BackupSubPhase::SyncPlanning,
+            BackupSubPhase::SyncUploading,
+            BackupSubPhase::SyncDownloading,
+        ];
+        for v in all {
+            assert_eq!(v.as_str(), format!("{:?}", v).to_lowercase());
+        }
+    }
+
+    #[test]
+    fn trigger_type_as_str_matches_debug_lowercase() {
+        for v in [TriggerType::Watch, TriggerType::Poll, TriggerType::Manual] {
+            assert_eq!(v.as_str(), format!("{:?}", v).to_lowercase());
+        }
+    }
+
+    #[test]
+    fn backup_operation_type_as_str_matches_debug_lowercase() {
+        for v in [BackupOperationType::Upload, BackupOperationType::Download] {
+            assert_eq!(v.as_str(), format!("{:?}", v).to_lowercase());
+        }
+    }
+
+    #[test]
+    fn backup_file_status_as_str_matches_debug_lowercase() {
+        let all = [
+            BackupFileStatus::Pending,
+            BackupFileStatus::Checking,
+            BackupFileStatus::Skipped,
+            BackupFileStatus::Encrypting,
+            BackupFileStatus::WaitingTransfer,
+            BackupFileStatus::Transferring,
+            BackupFileStatus::Completed,
+            BackupFileStatus::Failed,
+        ];
+        for v in all {
+            assert_eq!(v.as_str(), format!("{:?}", v).to_lowercase());
+        }
     }
 }

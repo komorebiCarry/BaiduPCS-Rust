@@ -499,7 +499,6 @@ impl UploadErrorKind {
     }
 }
 
-
 // =====================================================
 // 分享相关类型定义
 // =====================================================
@@ -687,7 +686,6 @@ impl ShareSURLInfoResponse {
     }
 }
 
-
 // =====================================================
 // 删除文件相关类型定义
 // =====================================================
@@ -781,7 +779,12 @@ impl DeleteFilesResponse {
     }
 
     /// 创建带 errno 的失败响应
-    pub fn failure_with_errno(error: String, errno: i32, authwidget: Option<AuthWidget>, verify_scene: Option<i32>) -> Self {
+    pub fn failure_with_errno(
+        error: String,
+        errno: i32,
+        authwidget: Option<AuthWidget>,
+        verify_scene: Option<i32>,
+    ) -> Self {
         Self {
             success: false,
             error: Some(error),

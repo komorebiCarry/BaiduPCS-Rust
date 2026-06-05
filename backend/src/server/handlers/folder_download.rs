@@ -64,7 +64,10 @@ pub async fn create_folder_download(
     State(app_state): State<AppState>,
     Json(req): Json<CreateFolderDownloadRequest>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    info!("创建文件夹下载: {}, original_name: {:?}", req.path, req.original_name);
+    info!(
+        "创建文件夹下载: {}, original_name: {:?}",
+        req.path, req.original_name
+    );
 
     // 如果未指定策略，从 AppConfig 读取默认值
     let conflict_strategy = req.conflict_strategy.or_else(|| {
@@ -127,7 +130,10 @@ pub async fn get_all_downloads_mixed(
     };
 
     // 获取所有文件夹任务（内存 + 历史数据库）
-    let folders = app_state.folder_download_manager.get_all_folders_with_history().await;
+    let folders = app_state
+        .folder_download_manager
+        .get_all_folders_with_history()
+        .await;
 
     let mut items: Vec<DownloadItem> = Vec::new();
 
@@ -257,7 +263,8 @@ mod tests {
     #[test]
     fn folder_item_keeps_folder_level_progress_stats() {
         // 模拟：文件夹已完成 10 个文件（累计 1000 字节），当前 1 个活跃子任务已下载 300 字节
-        let mut folder = FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
+        let mut folder =
+            FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
         folder.status = FolderStatus::Downloading;
         folder.total_files = 48;
         folder.total_size = 4_800;
@@ -278,7 +285,8 @@ mod tests {
     #[test]
     fn failed_subtask_not_counted_as_completed() {
         // 验证失败的子任务不应计入 completed_count 和 completed_downloaded_size
-        let mut folder = FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
+        let mut folder =
+            FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
         folder.total_files = 10;
         folder.total_size = 10_000;
         folder.completed_count = 5;

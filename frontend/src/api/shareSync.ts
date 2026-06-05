@@ -11,19 +11,19 @@ export type PollMode = 'disabled' | 'interval' | 'scheduled'
 export type TargetKind = 'netdisk' | 'local'
 
 export interface NetdiskTarget {
+  kind: 'netdisk'
   remote_path: string
   save_fs_id: number
   conflict_strategy?: ConflictStrategy | null
 }
 
 export interface LocalTarget {
+  kind: 'local'
   local_path: string
   conflict_strategy?: ConflictStrategy | null
 }
 
-export type SyncTarget =
-  | { kind: 'netdisk'; remote_path: string; save_fs_id: number; conflict_strategy?: ConflictStrategy | null }
-  | { kind: 'local'; local_path: string; conflict_strategy?: ConflictStrategy | null }
+export type SyncTarget = NetdiskTarget | LocalTarget
 
 export interface PollConfig {
   enabled: boolean
@@ -111,6 +111,35 @@ export interface RunDetail {
   items: RunItemRecord[]
 }
 
+export interface ShareSnapshotItem {
+  path: string
+  raw_path?: string
+  fs_id: number
+  size: number
+  name: string
+  is_dir: boolean
+}
+
+export interface ShareSnapshot {
+  id: string
+  subscription_id: string
+  captured_at: string
+  items: ShareSnapshotItem[]
+}
+
+/**
+ * 分享同步 WS 事件载荷（与后端 ShareSyncEvent 对齐）
+ */
+export type ShareSyncWsEvent =
+  | { type: 'subscription_created'; subscription_id: string; name: string }
+  | { type: 'subscription_updated'; subscription_id: string }
+  | { type: 'subscription_deleted'; subscription_id: string }
+  | { type: 'status_changed'; subscription_id: string; enabled: boolean }
+  | { type: 'diff_detected'; run_id: string; subscription_id: string; added: number; modified: number; removed: number }
+  | { type: 'run_started'; run_id: string; subscription_id: string }
+  | { type: 'run_completed'; run_id: string; subscription_id: string; added: number; modified: number; removed: number; failed: number }
+  | { type: 'run_failed'; run_id: string; subscription_id: string; error: string }
+
 // ==================== API ====================
 
 const BASE = '/share-sync'
@@ -160,8 +189,8 @@ export async function getRun(runId: string): Promise<RunDetail> {
   return r.data.data
 }
 
-export async function getLatestSnapshot(id: string): Promise<any> {
-  const r = await rawApiClient.get<{ success: boolean; data: any }>(`${BASE}/subscriptions/${id}/snapshots/latest`)
+export async function getLatestSnapshot(id: string): Promise<ShareSnapshot> {
+  const r = await rawApiClient.get<{ success: boolean; data: ShareSnapshot }>(`${BASE}/subscriptions/${id}/snapshots/latest`)
   return r.data.data
 }
 

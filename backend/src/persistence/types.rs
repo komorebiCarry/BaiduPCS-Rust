@@ -598,7 +598,7 @@ impl TaskMetadata {
             upload_id: None,
             upload_id_created_at: None,
             share_link: Some(share_link),
-            share_pwd: share_pwd,
+            share_pwd,
             transfer_target_path: Some(target_path),
             transfer_status: Some("checking_share".to_string()),
             download_task_ids: vec![],
@@ -1192,8 +1192,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
 
         assert_eq!(metadata.task_type, TaskType::Download);
@@ -1210,8 +1210,8 @@ mod tests {
             2 * 1024 * 1024,
             512 * 1024,
             4,
-            None,  // encrypt_enabled
-            None,  // encryption_key_version
+            None, // encrypt_enabled
+            None, // encryption_key_version
         );
 
         assert_eq!(metadata.task_type, TaskType::Upload);
@@ -1230,14 +1230,17 @@ mod tests {
             "https://pan.baidu.com/s/xxx".to_string(),
             Some("1234".to_string()),
             "/save/path".to_string(),
-            true, // auto_download
+            true,                              // auto_download
             Some("test_file.zip".to_string()), // file_name
         );
 
         assert_eq!(metadata.task_type, TaskType::Transfer);
         assert_eq!(metadata.transfer_status, Some("checking_share".to_string()));
         assert_eq!(metadata.auto_download, Some(true));
-        assert_eq!(metadata.transfer_file_name, Some("test_file.zip".to_string()));
+        assert_eq!(
+            metadata.transfer_file_name,
+            Some("test_file.zip".to_string())
+        );
 
         // 设置转存状态
         metadata.set_transfer_status("downloading");
@@ -1252,7 +1255,10 @@ mod tests {
         assert_eq!(metadata.auto_download, Some(false));
 
         metadata.set_transfer_file_name("new_file.zip".to_string());
-        assert_eq!(metadata.transfer_file_name, Some("new_file.zip".to_string()));
+        assert_eq!(
+            metadata.transfer_file_name,
+            Some("new_file.zip".to_string())
+        );
 
         metadata.set_transfer_task_id("transfer_001".to_string());
         assert_eq!(metadata.transfer_task_id, Some("transfer_001".to_string()));

@@ -82,22 +82,22 @@ impl TokenService {
     /// 仅当认证模式不为 `None` 时应调用此方法。
     pub async fn start_cleanup_task(self: &Arc<Self>) {
         let mut guard = self.cleanup_cancel_token.write().await;
-        
+
         // 如果已有清理任务在运行，先停止它
         if let Some(token) = guard.take() {
             token.cancel();
         }
-        
+
         let cancel_token = CancellationToken::new();
         *guard = Some(cancel_token.clone());
         drop(guard);
-        
+
         let service = Arc::clone(self);
-        
+
         tokio::spawn(async move {
             debug!("TokenService cleanup task started");
             let interval = Duration::from_secs(TOKEN_CLEANUP_INTERVAL_SECS);
-            
+
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -108,7 +108,7 @@ impl TokenService {
                         let before_count = service.active_token_count();
                         service.cleanup_expired();
                         let after_count = service.active_token_count();
-                        
+
                         if before_count != after_count {
                             debug!(
                                 "TokenService cleanup: removed {} expired tokens ({} -> {})",
@@ -196,10 +196,12 @@ impl TokenService {
         let mut validation = Validation::default();
         validation.set_required_spec_claims(&["sub", "iat", "exp", "jti"]);
 
-        let token_data = decode::<TokenClaims>(token, &self.decoding_key, &validation)
-            .map_err(|e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => WebAuthError::InvalidToken,
-                _ => WebAuthError::InvalidToken,
+        let token_data =
+            decode::<TokenClaims>(token, &self.decoding_key, &validation).map_err(|e| {
+                match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => WebAuthError::InvalidToken,
+                    _ => WebAuthError::InvalidToken,
+                }
             })?;
 
         Ok(token_data.claims)
@@ -269,7 +271,9 @@ impl TokenService {
     /// 生成 Refresh Token
     fn generate_refresh_token(&self) -> String {
         let mut rng = rand::thread_rng();
-        let random_bytes: Vec<u8> = (0..REFRESH_TOKEN_RANDOM_LENGTH).map(|_| rng.gen()).collect();
+        let random_bytes: Vec<u8> = (0..REFRESH_TOKEN_RANDOM_LENGTH)
+            .map(|_| rng.gen())
+            .collect();
         format!("{}{}", REFRESH_TOKEN_PREFIX, hex::encode(random_bytes))
     }
 
@@ -394,7 +398,7 @@ mod tests {
     fn test_is_at_capacity() {
         let service = TokenService::new(Some("test_secret".to_string()));
         assert!(!service.is_at_capacity());
-        
+
         // We can't easily test MAX_TOKENS without creating that many entries,
         // but we can verify the method works
         assert_eq!(service.active_token_count(), 0);

@@ -19,8 +19,12 @@ use crate::netdisk::client::NetdiskClient;
 use crate::share_sync::config::ShareSubscription;
 use crate::share_sync::diff::diff_snapshots;
 use crate::share_sync::error::ShareSyncError;
-use crate::share_sync::events::{NoopShareSyncEventPublisher, ShareSyncEvent, ShareSyncEventPublisher};
-use crate::share_sync::executor::{ApplyOutcome, ExecutorHooks, ShareSyncExecutor};
+use crate::share_sync::events::{
+    NoopShareSyncEventPublisher, ShareSyncEvent, ShareSyncEventPublisher,
+};
+use crate::share_sync::executor::{
+    ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
+};
 use crate::share_sync::persistence::ShareSyncPersistence;
 use crate::share_sync::scheduler::SubscriptionScheduler;
 use crate::share_sync::snapshot::{CapturedShare, ShareSnapshotItem, SnapshotCollector};
@@ -132,7 +136,10 @@ impl ShareSyncManager {
         self.subscriptions.get(id).map(|kv| kv.value().clone())
     }
 
-    pub fn create_subscription(self: &Arc<Self>, sub: ShareSubscription) -> Result<ShareSubscription, ShareSyncError> {
+    pub fn create_subscription(
+        self: &Arc<Self>,
+        sub: ShareSubscription,
+    ) -> Result<ShareSubscription, ShareSyncError> {
         sub.validate().map_err(ShareSyncError::ConfigError)?;
         if self.subscriptions.contains_key(&sub.id) {
             return Err(ShareSyncError::SubscriptionExists(sub.id.clone()));
@@ -250,8 +257,9 @@ impl ShareSyncManager {
             let g = self.netdisk_client.read().await;
             g.clone()
         };
-        let netdisk = netdisk
-            .ok_or_else(|| ShareSyncError::ConfigError("网盘客户端未登录，请先登录百度账号".into()))?;
+        let netdisk = netdisk.ok_or_else(|| {
+            ShareSyncError::ConfigError("网盘客户端未登录，请先登录百度账号".into())
+        })?;
 
         let run_id = Uuid::new_v4().to_string();
         self.publisher.publish(ShareSyncEvent::RunStarted {
@@ -307,7 +315,9 @@ impl ShareSyncManager {
             captured: captured.clone(),
         };
         let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
-        let outcome = executor.apply_with_run_id(run_id.clone(), &captured, &diff).await;
+        let outcome = executor
+            .apply_with_run_id(run_id.clone(), &captured, &diff)
+            .await;
 
         if should_advance_snapshot_baseline(outcome.status) {
             if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
@@ -457,23 +467,32 @@ impl ExecutorHooks for ProductionHooks {
     async fn submit_transfer(
         &self,
         captured: &CapturedShare,
-        target_path: &str,
-        fs_id: u64,
+        target_dir: &str,
+        item: &ShareSnapshotItem,
         internal_label: Option<&str>,
     ) -> Result<String, ShareSyncError> {
-        let tm = self.transfer_manager() .await?;
+        let tm = self.transfer_manager().await?;
         use crate::transfer::manager::CreateTransferRequest;
+        use crate::transfer::types::SharedFileInfo;
+
+        let selected_path = netdisk_transfer_selected_path(item);
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
-            save_path: target_path.to_string(),
+            save_path: target_dir.to_string(),
             save_fs_id: 0,
             auto_download: Some(false),
             local_download_path: None,
             is_share_direct_download: false,
             download_conflict_strategy: None,
-            selected_fs_ids: Some(vec![fs_id]),
-            selected_files: None,
+            selected_fs_ids: Some(vec![item.fs_id]),
+            selected_files: Some(vec![SharedFileInfo {
+                fs_id: item.fs_id,
+                is_dir: false,
+                path: selected_path.clone(),
+                size: item.size,
+                name: item.name.clone(),
+            }]),
         };
         let resp = tm
             .create_task(req)
@@ -489,10 +508,90 @@ impl ExecutorHooks for ProductionHooks {
             .task_id
             .ok_or_else(|| ShareSyncError::TransferError("TransferManager 未返回任务 ID".into()))?;
         info!(
-            "share-sync: transfer submitted label={:?} task_id={}",
-            internal_label, task_id
+            "share-sync: transfer submitted label={:?} task_id={} target_dir={} selected_path={}",
+            internal_label, task_id, target_dir, selected_path
         );
         Ok(task_id)
+    }
+
+    async fn find_netdisk_file(
+        &self,
+        target_path: &str,
+    ) -> Result<Option<NetdiskTargetEntry>, ShareSyncError> {
+        let target_path = normalize_netdisk_path(target_path);
+        let parent = parent_netdisk_dir(&target_path);
+        let name = basename_netdisk_path(&target_path);
+        let mut page = 1;
+        let page_size = 1000;
+
+        loop {
+            let resp = match self.netdisk.get_file_list(&parent, page, page_size).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_netdisk_not_found_error(&msg) {
+                        return Ok(None);
+                    }
+                    return Err(ShareSyncError::TransferError(format!(
+                        "查询网盘目标失败: path={}, error={}",
+                        target_path, msg
+                    )));
+                }
+            };
+
+            if let Some(found) = resp.list.iter().find(|f| {
+                normalize_netdisk_path(&f.path) == target_path || f.server_filename == name
+            }) {
+                return Ok(Some(NetdiskTargetEntry {
+                    path: normalize_netdisk_path(&found.path),
+                    name: found.server_filename.clone(),
+                    fs_id: found.fs_id,
+                    is_dir: found.isdir == 1,
+                }));
+            }
+
+            if resp.list.len() < page_size as usize {
+                return Ok(None);
+            }
+            page += 1;
+            if page > 10_000 {
+                return Err(ShareSyncError::TransferError(format!(
+                    "查询网盘目标分页超过安全上限: parent={}",
+                    parent
+                )));
+            }
+        }
+    }
+
+    async fn rename_netdisk(
+        &self,
+        path: &str,
+        fs_id: u64,
+        new_name: &str,
+    ) -> Result<String, ShareSyncError> {
+        use crate::netdisk::{FileOperationOutcome, RenameItem};
+
+        let path = normalize_netdisk_path(path);
+        let outcome = self
+            .netdisk
+            .rename_file(RenameItem {
+                path: path.clone(),
+                newname: new_name.to_string(),
+                id: fs_id,
+            })
+            .await
+            .map_err(|e| ShareSyncError::TransferError(format!("网盘重命名失败: {}", e)))?;
+
+        match outcome {
+            FileOperationOutcome::Success(_) => {
+                let new_path = join_netdisk_path(&parent_netdisk_dir(&path), new_name);
+                info!("share-sync: netdisk rename 成功 {} -> {}", path, new_path);
+                Ok(new_path)
+            }
+            FileOperationOutcome::Failed { message, .. } => Err(ShareSyncError::TransferError(
+                format!("网盘重命名失败: {}", message),
+            )),
+        }
     }
 
     async fn submit_download(
@@ -589,7 +688,10 @@ impl ExecutorHooks for ProductionHooks {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                let msg = format!("等待任务完成超时: task_id={}, status={:?}", task_id, task.status);
+                let msg = format!(
+                    "等待任务完成超时: task_id={}, status={:?}",
+                    task_id, task.status
+                );
                 return if require_download_completion {
                     Err(ShareSyncError::DownloadError(msg))
                 } else {
@@ -600,24 +702,35 @@ impl ExecutorHooks for ProductionHooks {
         }
     }
 
-    fn delete_netdisk(
+    async fn delete_netdisk(
         &self,
         target_path: &str,
         relative_paths: &[String],
     ) -> Result<(), ShareSyncError> {
-        let netdisk = self.netdisk.clone();
-        let target = target_path.to_string();
-        let paths = relative_paths.to_vec();
-        tokio::spawn(async move {
-            match netdisk.delete_files(&paths).await {
-                Ok(resp) => info!(
-                    "share-sync: netdisk delete 成功 {}/{} from {}",
-                    resp.deleted_count, paths.len(), target
-                ),
-                Err(e) => error!("share-sync: netdisk delete 失败: {}", e),
-            }
-        });
-        Ok(())
+        let paths: Vec<String> = relative_paths
+            .iter()
+            .map(|p| normalize_netdisk_path(p))
+            .collect();
+        let resp = self
+            .netdisk
+            .delete_files(&paths)
+            .await
+            .map_err(|e| ShareSyncError::TransferError(format!("网盘删除失败: {}", e)))?;
+        if resp.success {
+            info!(
+                "share-sync: netdisk delete 成功 {}/{} from {}",
+                resp.deleted_count,
+                paths.len(),
+                target_path
+            );
+            Ok(())
+        } else {
+            Err(ShareSyncError::TransferError(format!(
+                "网盘删除失败: {}; failed_paths={:?}",
+                resp.error.unwrap_or_else(|| "未知错误".into()),
+                resp.failed_paths
+            )))
+        }
     }
 
     fn delete_local(&self, local_dir: &Path, relative_path: &str) -> Result<(), ShareSyncError> {
@@ -692,17 +805,98 @@ fn safe_relative_download_path(path: &str) -> Result<String, ShareSyncError> {
     }
 }
 
+fn netdisk_transfer_selected_path(item: &ShareSnapshotItem) -> String {
+    let name = if item.name.trim().is_empty() {
+        item.path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("file")
+    } else {
+        item.name.trim()
+    };
+    format!("/sharelink1-1/{}", name.trim_start_matches('/'))
+}
+
+fn normalize_netdisk_path(path: &str) -> String {
+    let replaced = path.trim().replace('\\', "/");
+    let prefixed = if replaced.starts_with('/') {
+        replaced
+    } else {
+        format!("/{}", replaced)
+    };
+    let mut collapsed = String::with_capacity(prefixed.len());
+    let mut prev_slash = false;
+    for ch in prefixed.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    if collapsed.len() > 1 {
+        collapsed.trim_end_matches('/').to_string()
+    } else {
+        collapsed
+    }
+}
+
+fn parent_netdisk_dir(path: &str) -> String {
+    let normalized = normalize_netdisk_path(path);
+    if normalized == "/" {
+        return "/".to_string();
+    }
+    match normalized.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) if parent.is_empty() => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn basename_netdisk_path(path: &str) -> String {
+    normalize_netdisk_path(path)
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn join_netdisk_path(base: &str, name: &str) -> String {
+    let base = normalize_netdisk_path(base);
+    let name = name.trim_start_matches('/');
+    if base == "/" {
+        format!("/{}", name)
+    } else if name.is_empty() {
+        base
+    } else {
+        format!("{}/{}", base, name)
+    }
+}
+
+fn is_netdisk_not_found_error(msg: &str) -> bool {
+    msg.contains("API error 2")
+        || msg.contains("errno=2")
+        || msg.contains("errno 2")
+        || msg.contains("路径不存在")
+        || msg.contains("文件不存在")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::share_sync::config::{LocalTarget, NetdiskTarget, SyncTarget};
+    use crate::share_sync::config::{LocalTarget, SyncTarget};
     use crate::share_sync::events::NoopShareSyncEventPublisher;
     use tempfile::tempdir;
 
     fn sub(name: &str) -> ShareSubscription {
         ShareSubscription::new(
             name.into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![SyncTarget::Local(LocalTarget {
                 local_path: std::env::temp_dir(),
                 conflict_strategy: None,
@@ -814,7 +1008,9 @@ mod tests {
     #[test]
     fn test_snapshot_baseline_only_advances_after_clean_success() {
         assert!(should_advance_snapshot_baseline(RunStatus::Completed));
-        assert!(!should_advance_snapshot_baseline(RunStatus::CompletedWithErrors));
+        assert!(!should_advance_snapshot_baseline(
+            RunStatus::CompletedWithErrors
+        ));
         assert!(!should_advance_snapshot_baseline(RunStatus::Failed));
         assert!(!should_advance_snapshot_baseline(RunStatus::Running));
     }

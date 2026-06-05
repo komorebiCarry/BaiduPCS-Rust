@@ -112,7 +112,13 @@ impl TaskSlot {
     }
 
     /// 分配给任务（带优先级）
-    fn allocate_with_priority(&mut self, task_id: &str, slot_type: TaskSlotType, is_folder_main: bool, priority: TaskPriority) {
+    fn allocate_with_priority(
+        &mut self,
+        task_id: &str,
+        slot_type: TaskSlotType,
+        is_folder_main: bool,
+        priority: TaskPriority,
+    ) {
         let now = Instant::now();
         self.task_id = Some(task_id.to_string());
         self.slot_type = slot_type;
@@ -210,7 +216,10 @@ impl TaskSlotPool {
             for i in old_max..new_max {
                 slots.push(TaskSlot::new(i));
             }
-            info!("✅ 任务位池扩容: {} -> {} (+{}个槽位)", old_max, new_max, additional);
+            info!(
+                "✅ 任务位池扩容: {} -> {} (+{}个槽位)",
+                old_max, new_max, additional
+            );
         } else {
             let occupied_beyond_limit = slots
                 .iter()
@@ -224,7 +233,10 @@ impl TaskSlotPool {
                 );
             } else {
                 slots.retain(|s| s.id < new_max);
-                info!("✅ 任务位池缩容: {} -> {} (已清理空闲槽位)", old_max, new_max);
+                info!(
+                    "✅ 任务位池缩容: {} -> {} (已清理空闲槽位)",
+                    old_max, new_max
+                );
             }
         }
 
@@ -306,7 +318,10 @@ impl TaskSlotPool {
             }
         }
 
-        debug!("无可用固定任务位（优先级={:?}）: task_id={}", priority, task_id);
+        debug!(
+            "无可用固定任务位（优先级={:?}）: task_id={}",
+            priority, task_id
+        );
         None
     }
 
@@ -323,11 +338,13 @@ impl TaskSlotPool {
 
         for slot in slots.iter_mut() {
             if slot.id < max_slots && slot.is_free() {
-                slot.allocate_with_priority(task_id, TaskSlotType::Fixed, false, TaskPriority::Backup);
-                info!(
-                    "分配备份任务位: slot_id={}, task_id={}",
-                    slot.id, task_id
+                slot.allocate_with_priority(
+                    task_id,
+                    TaskSlotType::Fixed,
+                    false,
+                    TaskPriority::Backup,
                 );
+                info!("分配备份任务位: slot_id={}, task_id={}", slot.id, task_id);
                 return Some(slot.id);
             }
         }
@@ -339,7 +356,10 @@ impl TaskSlotPool {
     pub async fn backup_slots_count(&self) -> usize {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
         let slots = self.slots.read().await;
-        slots.iter().filter(|s| s.id < max_slots && s.priority == TaskPriority::Backup && !s.is_free()).count()
+        slots
+            .iter()
+            .filter(|s| s.id < max_slots && s.priority == TaskPriority::Backup && !s.is_free())
+            .count()
     }
 
     /// 查找可被抢占的备份任务槽位
@@ -367,7 +387,10 @@ impl TaskSlotPool {
     pub async fn available_borrow_slots(&self) -> usize {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
         let slots = self.slots.read().await;
-        slots.iter().filter(|s| s.id < max_slots && (s.is_free() || s.is_preemptable())).count()
+        slots
+            .iter()
+            .filter(|s| s.id < max_slots && (s.is_free() || s.is_preemptable()))
+            .count()
     }
 
     /// 获取可用槽位数（包括固定位和可借调位）
@@ -376,14 +399,20 @@ impl TaskSlotPool {
     pub async fn available_slots(&self) -> usize {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
         let slots = self.slots.read().await;
-        slots.iter().filter(|s| s.id < max_slots && s.is_free()).count()
+        slots
+            .iter()
+            .filter(|s| s.id < max_slots && s.is_free())
+            .count()
     }
 
     /// 获取当前已使用槽位数
     pub async fn used_slots(&self) -> usize {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
         let slots = self.slots.read().await;
-        slots.iter().filter(|s| s.id < max_slots && !s.is_free()).count()
+        slots
+            .iter()
+            .filter(|s| s.id < max_slots && !s.is_free())
+            .count()
     }
 
     /// 为文件夹分配借调位（支持抢占备份任务）
@@ -397,7 +426,11 @@ impl TaskSlotPool {
     ///
     /// # Returns
     /// (实际分配的借调位ID列表, 被抢占的备份任务ID列表)
-    pub async fn allocate_borrowed_slots(&self, folder_id: &str, count: usize) -> (Vec<usize>, Vec<String>) {
+    pub async fn allocate_borrowed_slots(
+        &self,
+        folder_id: &str,
+        count: usize,
+    ) -> (Vec<usize>, Vec<String>) {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
         let mut allocated = Vec::new();
         let mut preempted_tasks = Vec::new();
@@ -462,7 +495,11 @@ impl TaskSlotPool {
     ///
     /// # Returns
     /// 实际分配的借调位ID列表
-    pub async fn allocate_borrowed_slots_no_preempt(&self, folder_id: &str, count: usize) -> Vec<usize> {
+    pub async fn allocate_borrowed_slots_no_preempt(
+        &self,
+        folder_id: &str,
+        count: usize,
+    ) -> Vec<usize> {
         let max_slots = self.max_slots.load(Ordering::SeqCst);
         let mut allocated = Vec::new();
         let mut slots = self.slots.write().await;
@@ -557,10 +594,7 @@ impl TaskSlotPool {
         }
 
         if released_count > 0 {
-            info!(
-                "释放任务 {} 的所有槽位: 共 {} 个",
-                task_id, released_count
-            );
+            info!("释放任务 {} 的所有槽位: 共 {} 个", task_id, released_count);
         }
 
         drop(slots);
@@ -712,7 +746,8 @@ impl TaskSlotPool {
 
                     error!(
                         "槽位过期自动释放: slot_id={}, task_id={}, 已占用时间={:?}, 最后更新={:?}",
-                        slot.id, task_id,
+                        slot.id,
+                        task_id,
                         allocated_at.map(|t| now.duration_since(t)),
                         elapsed
                     );
@@ -744,10 +779,7 @@ impl TaskSlotPool {
                 borrowed_map.remove(task_id);
             }
 
-            info!(
-                "清理过期槽位完成: 释放了 {} 个槽位",
-                released_tasks.len()
-            );
+            info!("清理过期槽位完成: 释放了 {} 个槽位", released_tasks.len());
 
             // 🔥 通知任务管理器将任务状态设置为失败
             let tx_guard = self.stale_release_tx.read().await;
@@ -790,11 +822,7 @@ impl TaskSlotPool {
                 let released = self.cleanup_stale_slots().await;
 
                 if !released.is_empty() {
-                    warn!(
-                        "定期清理发现 {} 个过期槽位: {:?}",
-                        released.len(),
-                        released
-                    );
+                    warn!("定期清理发现 {} 个过期槽位: {:?}", released.len(), released);
                 }
             }
         })
@@ -808,7 +836,10 @@ impl TaskSlotPool {
     /// # Arguments
     /// * `self` - Arc 包装的 TaskSlotPool 实例
     pub async fn start_cleanup_task_managed(self: Arc<Self>) {
-        info!("启动槽位清理后台任务（托管模式），间隔: {:?}", CLEANUP_INTERVAL);
+        info!(
+            "启动槽位清理后台任务（托管模式），间隔: {:?}",
+            CLEANUP_INTERVAL
+        );
 
         let pool = self.clone();
         let handle = tokio::spawn(async move {
@@ -820,11 +851,7 @@ impl TaskSlotPool {
                 let released = pool.cleanup_stale_slots().await;
 
                 if !released.is_empty() {
-                    warn!(
-                        "定期清理发现 {} 个过期槽位: {:?}",
-                        released.len(),
-                        released
-                    );
+                    warn!("定期清理发现 {} 个过期槽位: {:?}", released.len(), released);
                 }
             }
         });
@@ -1349,7 +1376,9 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let available = pool_clone.available_slots().await;
                 if available > 0 {
-                    pool_clone.allocate_fixed_slot(&format!("task{}", i), false).await
+                    pool_clone
+                        .allocate_fixed_slot(&format!("task{}", i), false)
+                        .await
                 } else {
                     None
                 }

@@ -38,7 +38,7 @@ pub struct EncryptionKeyConfig {
     /// 当前使用的密钥
     #[serde(rename = "current_key")]
     pub current: EncryptionKeyInfo,
-    
+
     /// 历史密钥（已废弃但保留用于解密旧文件）
     #[serde(rename = "key_history", default)]
     pub history: Vec<EncryptionKeyInfo>,
@@ -77,8 +77,8 @@ impl EncryptionConfigStore {
         let content = std::fs::read_to_string(&self.config_path)
             .map_err(|e| anyhow!("读取加密配置失败: {}", e))?;
 
-        let config: EncryptionKeyConfig = serde_json::from_str(&content)
-            .map_err(|e| anyhow!("解析加密配置失败: {}", e))?;
+        let config: EncryptionKeyConfig =
+            serde_json::from_str(&content).map_err(|e| anyhow!("解析加密配置失败: {}", e))?;
 
         Ok(Some(config))
     }
@@ -87,8 +87,7 @@ impl EncryptionConfigStore {
     pub fn save(&self, config: &EncryptionKeyConfig) -> Result<()> {
         // 确保父目录存在
         if let Some(parent) = self.config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("创建配置目录失败: {}", e))?;
+            std::fs::create_dir_all(parent).map_err(|e| anyhow!("创建配置目录失败: {}", e))?;
         }
 
         let content = serde_json::to_string_pretty(config)
@@ -161,7 +160,9 @@ impl EncryptionConfigStore {
         }
 
         // 再查历史密钥
-        Ok(config.history.iter()
+        Ok(config
+            .history
+            .iter()
             .find(|k| k.key_version == version)
             .cloned())
     }
@@ -172,8 +173,7 @@ impl EncryptionConfigStore {
         new_master_key: String,
         new_algorithm: EncryptionAlgorithm,
     ) -> Result<EncryptionKeyConfig> {
-        let mut config = self.load()?
-            .ok_or_else(|| anyhow!("当前没有密钥配置"))?;
+        let mut config = self.load()?.ok_or_else(|| anyhow!("当前没有密钥配置"))?;
 
         // 将当前密钥移到历史
         let mut old_key = config.current.clone();
@@ -200,10 +200,10 @@ impl EncryptionConfigStore {
     }
 
     /// 安全创建新密钥（保留历史）
-    /// 
+    ///
     /// 如果已有有效配置（当前密钥非空），将当前密钥移到历史，版本号递增
     /// 如果没有配置或当前密钥已废弃（为空），创建新的密钥配置但保留历史
-    /// 
+    ///
     /// 此方法用于密钥加载失败或需要重新配置加密时，确保不会丢失历史密钥
     pub fn create_new_key_safe(
         &self,
@@ -220,14 +220,16 @@ impl EncryptionConfigStore {
                         "当前密钥已废弃，创建新密钥并保留 {} 个历史密钥",
                         existing.history.len()
                     );
-                    
+
                     // 计算新版本号：取历史密钥中最大版本号 + 1
-                    let max_history_version = existing.history.iter()
+                    let max_history_version = existing
+                        .history
+                        .iter()
                         .map(|k| k.key_version)
                         .max()
                         .unwrap_or(0);
                     let new_version = max_history_version + 1;
-                    
+
                     let config = EncryptionKeyConfig {
                         current: EncryptionKeyInfo {
                             master_key,
@@ -237,9 +239,9 @@ impl EncryptionConfigStore {
                             last_used_at: None,
                             deprecated_at: None,
                         },
-                        history: existing.history,  // 保留历史密钥
+                        history: existing.history, // 保留历史密钥
                     };
-                    
+
                     self.save(&config)?;
                     Ok(config)
                 } else {
@@ -257,13 +259,13 @@ impl EncryptionConfigStore {
     }
 
     /// 废弃当前密钥（保留历史）
-    /// 
+    ///
     /// 将当前密钥移到历史，但不设置新的当前密钥。
     /// 用于用户删除加密密钥时，保留历史密钥以便解密旧文件。
-    /// 
+    ///
     /// 返回 Ok(true) 表示成功废弃当前密钥
     /// 返回 Ok(false) 表示没有当前密钥可废弃
-    /// 
+    ///
     /// # Requirements
     /// - 17.1: 删除密钥时保留历史密钥
     /// - 17.2: 只移除当前密钥，不删除历史
@@ -285,16 +287,16 @@ impl EncryptionConfigStore {
         // 将当前密钥移到历史
         let mut old_key = config.current.clone();
         old_key.deprecated_at = Some(chrono::Utc::now().timestamp_millis());
-        
+
         let mut new_history = config.history;
         new_history.push(old_key);
 
         // 保存只有历史密钥的配置（当前密钥设为空）
         let new_config = EncryptionKeyConfig {
             current: EncryptionKeyInfo {
-                master_key: String::new(),  // 空密钥表示无当前密钥
+                master_key: String::new(), // 空密钥表示无当前密钥
                 algorithm: EncryptionAlgorithm::default(),
-                key_version: 0,  // 版本 0 表示无效
+                key_version: 0, // 版本 0 表示无效
                 created_at: 0,
                 last_used_at: None,
                 deprecated_at: None,
@@ -311,9 +313,9 @@ impl EncryptionConfigStore {
     }
 
     /// 强制删除所有密钥（包括历史）
-    /// 
+    ///
     /// 警告：这将导致无法解密任何已加密的文件
-    /// 
+    ///
     /// # Requirements
     /// - 17.3: 提供完全删除所有密钥的选项
     pub fn force_delete(&self) -> Result<()> {
@@ -399,10 +401,12 @@ mod tests {
         assert!(store.get_current_key().unwrap().is_none());
 
         // 创建配置
-        store.create_new_key(
-            "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key(
+                "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
+                EncryptionAlgorithm::Aes256Gcm,
+            )
+            .unwrap();
 
         let key = store.get_current_key().unwrap().unwrap();
         assert_eq!(key.key_version, 1);
@@ -414,16 +418,14 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 创建初始配置
-        store.create_new_key(
-            "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("key1".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 轮换密钥
-        store.rotate_key(
-            "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .rotate_key("key2".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 查找版本1（历史密钥）
         let key1 = store.get_key_by_version(1).unwrap().unwrap();
@@ -445,21 +447,22 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 创建初始配置
-        store.create_new_key(
-            "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("original_key".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 轮换密钥
-        let new_config = store.rotate_key(
-            "new_key".to_string(),
-            EncryptionAlgorithm::ChaCha20Poly1305,
-        ).unwrap();
+        let new_config = store
+            .rotate_key("new_key".to_string(), EncryptionAlgorithm::ChaCha20Poly1305)
+            .unwrap();
 
         // 验证新密钥
         assert_eq!(new_config.current.master_key, "new_key");
         assert_eq!(new_config.current.key_version, 2);
-        assert_eq!(new_config.current.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
+        assert_eq!(
+            new_config.current.algorithm,
+            EncryptionAlgorithm::ChaCha20Poly1305
+        );
 
         // 验证历史密钥
         assert_eq!(new_config.history.len(), 1);
@@ -474,10 +477,9 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 没有现有配置时，应该创建新密钥
-        let config = store.create_new_key_safe(
-            "new_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        let config = store
+            .create_new_key_safe("new_key".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         assert_eq!(config.current.master_key, "new_key");
         assert_eq!(config.current.key_version, 1);
@@ -490,21 +492,22 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 先创建一个密钥
-        store.create_new_key(
-            "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("original_key".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 使用 create_new_key_safe 应该保留历史
-        let config = store.create_new_key_safe(
-            "new_key".to_string(),
-            EncryptionAlgorithm::ChaCha20Poly1305,
-        ).unwrap();
+        let config = store
+            .create_new_key_safe("new_key".to_string(), EncryptionAlgorithm::ChaCha20Poly1305)
+            .unwrap();
 
         // 验证新密钥
         assert_eq!(config.current.master_key, "new_key");
         assert_eq!(config.current.key_version, 2);
-        assert_eq!(config.current.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
+        assert_eq!(
+            config.current.algorithm,
+            EncryptionAlgorithm::ChaCha20Poly1305
+        );
 
         // 验证历史密钥被保留
         assert_eq!(config.history.len(), 1);
@@ -530,10 +533,9 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 创建初始密钥
-        store.create_new_key(
-            "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("original_key".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 废弃当前密钥
         let result = store.deprecate_current_key().unwrap();
@@ -560,16 +562,14 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 创建初始密钥
-        store.create_new_key(
-            "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("key1".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 轮换密钥（创建历史）
-        store.rotate_key(
-            "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .rotate_key("key2".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 废弃当前密钥
         let result = store.deprecate_current_key().unwrap();
@@ -578,11 +578,11 @@ mod tests {
         // 验证历史密钥都被保留
         let config = store.load().unwrap().unwrap();
         assert_eq!(config.history.len(), 2);
-        
+
         // 第一个历史密钥
         assert_eq!(config.history[0].master_key, "key1");
         assert_eq!(config.history[0].key_version, 1);
-        
+
         // 第二个历史密钥（刚废弃的）
         assert_eq!(config.history[1].master_key, "key2");
         assert_eq!(config.history[1].key_version, 2);
@@ -595,10 +595,9 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 创建初始密钥
-        store.create_new_key(
-            "original_key".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("original_key".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 废弃当前密钥
         store.deprecate_current_key().unwrap();
@@ -615,14 +614,12 @@ mod tests {
         let store = EncryptionConfigStore::new(dir.path());
 
         // 创建密钥并轮换
-        store.create_new_key(
-            "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
-        store.rotate_key(
-            "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("key1".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
+        store
+            .rotate_key("key2".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
 
         // 强制删除
         store.force_delete().unwrap();
@@ -641,17 +638,15 @@ mod tests {
         assert!(!store.has_history_keys().unwrap());
 
         // 创建密钥（无历史）
-        store.create_new_key(
-            "key1".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .create_new_key("key1".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
         assert!(!store.has_history_keys().unwrap());
 
         // 轮换密钥（有历史）
-        store.rotate_key(
-            "key2".to_string(),
-            EncryptionAlgorithm::Aes256Gcm,
-        ).unwrap();
+        store
+            .rotate_key("key2".to_string(), EncryptionAlgorithm::Aes256Gcm)
+            .unwrap();
         assert!(store.has_history_keys().unwrap());
     }
 }

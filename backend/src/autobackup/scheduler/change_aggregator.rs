@@ -47,11 +47,12 @@ impl EventSender {
     }
 
     /// 发送事件（根据策略处理背压）
-    pub async fn send(&self, event: ChangeEvent) -> Result<(), mpsc::error::SendError<ChangeEvent>> {
+    pub async fn send(
+        &self,
+        event: ChangeEvent,
+    ) -> Result<(), mpsc::error::SendError<ChangeEvent>> {
         match self.strategy {
-            BackpressureStrategy::Block => {
-                self.inner.send(event).await
-            }
+            BackpressureStrategy::Block => self.inner.send(event).await,
             BackpressureStrategy::DropNewest => {
                 match self.inner.try_send(event) {
                     Ok(()) => Ok(()),
@@ -60,9 +61,7 @@ impl EventSender {
                         tracing::warn!("事件通道已满，丢弃新事件（策略: DropNewest）");
                         Ok(()) // 丢弃但不返回错误
                     }
-                    Err(mpsc::error::TrySendError::Closed(e)) => {
-                        Err(mpsc::error::SendError(e))
-                    }
+                    Err(mpsc::error::TrySendError::Closed(e)) => Err(mpsc::error::SendError(e)),
                 }
             }
             BackpressureStrategy::DropOldest => {
@@ -73,7 +72,10 @@ impl EventSender {
     }
 
     /// 尝试发送事件（非阻塞）
-    pub fn try_send(&self, event: ChangeEvent) -> Result<(), mpsc::error::TrySendError<ChangeEvent>> {
+    pub fn try_send(
+        &self,
+        event: ChangeEvent,
+    ) -> Result<(), mpsc::error::TrySendError<ChangeEvent>> {
         match self.inner.try_send(event) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -134,9 +136,7 @@ pub enum ChangeEvent {
         paths: Vec<PathBuf>,
     },
     /// 轮询事件（单个配置）
-    PollEvent {
-        config_id: String,
-    },
+    PollEvent { config_id: String },
     /// 全局轮询事件（触发所有匹配方向的配置）
     GlobalPollEvent {
         direction: BackupDirection,
@@ -221,14 +221,15 @@ impl ChangeAggregator {
         match event {
             ChangeEvent::WatchEvent { config_id, paths } => {
                 let mut pending_events = self.pending_events.lock();
-                let pending = pending_events
-                    .entry(config_id.clone())
-                    .or_insert_with(|| PendingEvent {
-                        config_id: config_id.clone(),
-                        paths: HashSet::new(),
-                        is_poll: false,
-                        first_seen: Instant::now(),
-                    });
+                let pending =
+                    pending_events
+                        .entry(config_id.clone())
+                        .or_insert_with(|| PendingEvent {
+                            config_id: config_id.clone(),
+                            paths: HashSet::new(),
+                            is_poll: false,
+                            first_seen: Instant::now(),
+                        });
 
                 // 合并路径（去重）
                 for path in paths {
@@ -253,9 +254,15 @@ impl ChangeAggregator {
                     tracing::warn!("Failed to send poll event: {}", e);
                 }
             }
-            ChangeEvent::GlobalPollEvent { direction, poll_type } => {
+            ChangeEvent::GlobalPollEvent {
+                direction,
+                poll_type,
+            } => {
                 // 全局轮询事件直接转发，不聚合
-                let global_event = ChangeEvent::GlobalPollEvent { direction, poll_type };
+                let global_event = ChangeEvent::GlobalPollEvent {
+                    direction,
+                    poll_type,
+                };
                 if let Err(e) = self.aggregated_tx.send(global_event) {
                     tracing::warn!("Failed to send global poll event: {}", e);
                 }
@@ -517,7 +524,11 @@ mod tests {
             poll_type: GlobalPollType::Interval,
         };
 
-        if let ChangeEvent::GlobalPollEvent { direction, poll_type } = upload_interval {
+        if let ChangeEvent::GlobalPollEvent {
+            direction,
+            poll_type,
+        } = upload_interval
+        {
             assert_eq!(direction, BackupDirection::Upload);
             assert_eq!(poll_type, GlobalPollType::Interval);
         } else {
@@ -530,7 +541,11 @@ mod tests {
             poll_type: GlobalPollType::Scheduled,
         };
 
-        if let ChangeEvent::GlobalPollEvent { direction, poll_type } = download_scheduled {
+        if let ChangeEvent::GlobalPollEvent {
+            direction,
+            poll_type,
+        } = download_scheduled
+        {
             assert_eq!(direction, BackupDirection::Download);
             assert_eq!(poll_type, GlobalPollType::Scheduled);
         } else {
@@ -603,11 +618,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (aggregated_tx, _aggregated_rx) = mpsc::unbounded_channel();
 
-        let aggregator = ChangeAggregator::new(
-            event_rx,
-            aggregated_tx,
-            Duration::from_secs(1),
-        );
+        let aggregator = ChangeAggregator::new(event_rx, aggregated_tx, Duration::from_secs(1));
 
         assert_eq!(aggregator.pending_count(), 0);
         assert!(aggregator.pending_configs().is_empty());
@@ -642,27 +653,29 @@ mod tests {
         });
 
         // Send a watch event first
-        event_tx.send(ChangeEvent::WatchEvent {
-            config_id: "config-1".to_string(),
-            paths: vec![PathBuf::from("/test/file1.txt")],
-        }).unwrap();
+        event_tx
+            .send(ChangeEvent::WatchEvent {
+                config_id: "config-1".to_string(),
+                paths: vec![PathBuf::from("/test/file1.txt")],
+            })
+            .unwrap();
 
         // Give time for event to be processed
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Send a poll event - this should flush pending watch events
-        event_tx.send(ChangeEvent::PollEvent {
-            config_id: "config-1".to_string(),
-        }).unwrap();
+        event_tx
+            .send(ChangeEvent::PollEvent {
+                config_id: "config-1".to_string(),
+            })
+            .unwrap();
 
         // Give time for flush
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Should receive the flushed watch event first
-        let first_event = tokio::time::timeout(
-            Duration::from_millis(100),
-            aggregated_rx.recv()
-        ).await;
+        let first_event =
+            tokio::time::timeout(Duration::from_millis(100), aggregated_rx.recv()).await;
 
         assert!(first_event.is_ok());
         if let Ok(Some(ChangeEvent::WatchEvent { config_id, paths })) = first_event {
@@ -671,10 +684,8 @@ mod tests {
         }
 
         // Then receive the poll event
-        let second_event = tokio::time::timeout(
-            Duration::from_millis(100),
-            aggregated_rx.recv()
-        ).await;
+        let second_event =
+            tokio::time::timeout(Duration::from_millis(100), aggregated_rx.recv()).await;
 
         assert!(second_event.is_ok());
         if let Ok(Some(ChangeEvent::PollEvent { config_id })) = second_event {
@@ -705,20 +716,19 @@ mod tests {
         // Send multiple events with same path
         let path = PathBuf::from("/test/file.txt");
         for _ in 0..3 {
-            event_tx.send(ChangeEvent::WatchEvent {
-                config_id: "config-1".to_string(),
-                paths: vec![path.clone()],
-            }).unwrap();
+            event_tx
+                .send(ChangeEvent::WatchEvent {
+                    config_id: "config-1".to_string(),
+                    paths: vec![path.clone()],
+                })
+                .unwrap();
         }
 
         // Wait for aggregation window
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Should receive only one aggregated event with deduplicated paths
-        let event = tokio::time::timeout(
-            Duration::from_millis(100),
-            aggregated_rx.recv()
-        ).await;
+        let event = tokio::time::timeout(Duration::from_millis(100), aggregated_rx.recv()).await;
 
         assert!(event.is_ok());
         if let Ok(Some(ChangeEvent::WatchEvent { paths, .. })) = event {

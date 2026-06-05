@@ -153,7 +153,13 @@ impl ScanManager {
         let opts_clone = options.clone();
         let token_clone = cancel_token.clone();
         tokio::task::spawn_blocking(move || {
-            Self::scan_producer(scan_id_clone, local_clone, opts_clone, batch_tx, token_clone);
+            Self::scan_producer(
+                scan_id_clone,
+                local_clone,
+                opts_clone,
+                batch_tx,
+                token_clone,
+            );
         });
 
         // tokio::spawn: 消费端（异步任务创建）
@@ -180,7 +186,7 @@ impl ScanManager {
                 wal_dir,
                 max_pending,
             )
-                .await;
+            .await;
         });
 
         info!("扫描任务已启动: {}", scan_task_id);
@@ -428,13 +434,16 @@ impl ScanManager {
             match load_checkpoint(&path) {
                 Some(cp) => {
                     info!("恢复中断的扫描: {}", cp.scan_task_id);
-                    if let Err(e) = self.start_scan(
-                        cp.local_folder,
-                        cp.remote_folder,
-                        Some(cp.scan_options),
-                        cp.encrypt,
-                        None, // conflict_strategy - use default for resumed scans
-                    ).await {
+                    if let Err(e) = self
+                        .start_scan(
+                            cp.local_folder,
+                            cp.remote_folder,
+                            Some(cp.scan_options),
+                            cp.encrypt,
+                            None, // conflict_strategy - use default for resumed scans
+                        )
+                        .await
+                    {
                         warn!("恢复扫描失败 ({}): {}", name, e);
                     } else {
                         resumed += 1;

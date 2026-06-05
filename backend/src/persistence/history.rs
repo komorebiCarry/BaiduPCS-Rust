@@ -297,7 +297,10 @@ pub fn remove_from_history_file(wal_dir: &Path, task_id: &str) -> std::io::Resul
 /// # Returns
 /// - `Ok(usize)` - 删除的任务数量
 /// - `Err` - 删除过程中发生错误
-pub fn remove_tasks_by_group_from_history(wal_dir: &Path, group_id: &str) -> std::io::Result<usize> {
+pub fn remove_tasks_by_group_from_history(
+    wal_dir: &Path,
+    group_id: &str,
+) -> std::io::Result<usize> {
     let history_path = get_history_path(wal_dir);
 
     if !history_path.exists() {
@@ -470,8 +473,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
 
         if completed {

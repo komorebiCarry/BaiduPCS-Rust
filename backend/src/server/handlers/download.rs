@@ -96,7 +96,13 @@ pub async fn create_download(
     });
 
     match download_manager
-        .create_task(req.fs_id, req.remote_path, req.filename, req.total_size, conflict_strategy)
+        .create_task(
+            req.fs_id,
+            req.remote_path,
+            req.filename,
+            req.total_size,
+            conflict_strategy,
+        )
         .await
     {
         Ok(task_id) => {
@@ -105,7 +111,7 @@ pub async fn create_download(
                 info!("文件已存在，已跳过下载");
                 return Ok(Json(ApiResponse::success_with_message(
                     task_id,
-                    "文件已存在，已跳过"
+                    "文件已存在，已跳过",
                 )));
             }
 
@@ -160,8 +166,7 @@ pub async fn get_active_downloads(
         .filter(|t| {
             matches!(
                 t.status,
-                crate::downloader::TaskStatus::Downloading
-                    | crate::downloader::TaskStatus::Pending
+                crate::downloader::TaskStatus::Downloading | crate::downloader::TaskStatus::Pending
             )
         })
         .collect();
@@ -365,7 +370,12 @@ pub async fn create_batch_download(
         if item.is_dir {
             // 文件夹下载
             match folder_download_manager
-                .create_folder_download_with_dir(item.path.clone(), &target_dir, item.original_name.clone(), conflict_strategy)
+                .create_folder_download_with_dir(
+                    item.path.clone(),
+                    &target_dir,
+                    item.original_name.clone(),
+                    conflict_strategy,
+                )
                 .await
             {
                 Ok(folder_id) => {
@@ -439,14 +449,18 @@ pub async fn create_batch_download(
 
 // ==================== 批量操作 ====================
 
-use super::common::{BatchOperationRequest, BatchOperationItem, BatchOperationResponse};
+use super::common::{BatchOperationItem, BatchOperationRequest, BatchOperationResponse};
 
 /// POST /api/v1/downloads/batch/pause
 pub async fn batch_pause_downloads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
-    let mgr = app_state.download_manager.read().await.clone()
+    let mgr = app_state
+        .download_manager
+        .read()
+        .await
+        .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let ids = if req.all == Some(true) {
@@ -456,10 +470,17 @@ pub async fn batch_pause_downloads(
     };
 
     let raw = mgr.batch_pause(&ids).await;
-    let results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
 
 /// POST /api/v1/downloads/batch/resume
@@ -467,7 +488,11 @@ pub async fn batch_resume_downloads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
-    let mgr = app_state.download_manager.read().await.clone()
+    let mgr = app_state
+        .download_manager
+        .read()
+        .await
+        .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let ids = if req.all == Some(true) {
@@ -477,10 +502,17 @@ pub async fn batch_resume_downloads(
     };
 
     let raw = mgr.batch_resume(&ids).await;
-    let results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
 
 /// POST /api/v1/downloads/batch/delete
@@ -488,7 +520,11 @@ pub async fn batch_delete_downloads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
-    let mgr = app_state.download_manager.read().await.clone()
+    let mgr = app_state
+        .download_manager
+        .read()
+        .await
+        .clone()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let delete_files = req.delete_files.unwrap_or(false);
@@ -499,8 +535,15 @@ pub async fn batch_delete_downloads(
     };
 
     let raw = mgr.batch_delete(&ids, delete_files).await;
-    let results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }

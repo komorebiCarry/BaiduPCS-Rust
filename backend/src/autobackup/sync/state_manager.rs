@@ -51,7 +51,7 @@ impl SyncStateManager {
 
                 UNIQUE(config_id, relative_path)
             );
-            CREATE INDEX IF NOT EXISTS idx_sync_state_config ON sync_state(config_id);"
+            CREATE INDEX IF NOT EXISTS idx_sync_state_config ON sync_state(config_id);",
         )?;
 
         Ok(Self {
@@ -61,13 +61,16 @@ impl SyncStateManager {
 
     /// 获取指定配置的所有 SyncState 行
     pub fn get_all_states(&self, config_id: &str) -> Result<Vec<SyncStateRow>> {
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, config_id, relative_path,
                     local_mtime, local_size, local_exists,
                     remote_mtime, remote_size, remote_fs_id, remote_exists,
                     last_sync_at, last_sync_direction, c5_detected, tombstoned_at
-             FROM sync_state WHERE config_id = ?"
+             FROM sync_state WHERE config_id = ?",
         )?;
 
         let rows = stmt.query_map(params![config_id], |row| {
@@ -98,33 +101,38 @@ impl SyncStateManager {
 
     /// 获取指定文件的 SyncState
     pub fn get_state(&self, config_id: &str, relative_path: &str) -> Result<Option<SyncStateRow>> {
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
-        let result = conn.query_row(
-            "SELECT id, config_id, relative_path,
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let result = conn
+            .query_row(
+                "SELECT id, config_id, relative_path,
                     local_mtime, local_size, local_exists,
                     remote_mtime, remote_size, remote_fs_id, remote_exists,
                     last_sync_at, last_sync_direction, c5_detected, tombstoned_at
              FROM sync_state WHERE config_id = ? AND relative_path = ?",
-            params![config_id, relative_path],
-            |row| {
-                Ok(SyncStateRow {
-                    id: row.get(0)?,
-                    config_id: row.get(1)?,
-                    relative_path: row.get(2)?,
-                    local_mtime: row.get(3)?,
-                    local_size: row.get(4)?,
-                    local_exists: row.get::<_, i32>(5)? != 0,
-                    remote_mtime: row.get(6)?,
-                    remote_size: row.get(7)?,
-                    remote_fs_id: row.get(8)?,
-                    remote_exists: row.get::<_, i32>(9)? != 0,
-                    last_sync_at: row.get(10)?,
-                    last_sync_direction: row.get(11)?,
-                    c5_detected: row.get::<_, i32>(12)? != 0,
-                    tombstoned_at: row.get(13)?,
-                })
-            },
-        ).optional()?;
+                params![config_id, relative_path],
+                |row| {
+                    Ok(SyncStateRow {
+                        id: row.get(0)?,
+                        config_id: row.get(1)?,
+                        relative_path: row.get(2)?,
+                        local_mtime: row.get(3)?,
+                        local_size: row.get(4)?,
+                        local_exists: row.get::<_, i32>(5)? != 0,
+                        remote_mtime: row.get(6)?,
+                        remote_size: row.get(7)?,
+                        remote_fs_id: row.get(8)?,
+                        remote_exists: row.get::<_, i32>(9)? != 0,
+                        last_sync_at: row.get(10)?,
+                        last_sync_direction: row.get(11)?,
+                        c5_detected: row.get::<_, i32>(12)? != 0,
+                        tombstoned_at: row.get(13)?,
+                    })
+                },
+            )
+            .optional()?;
         Ok(result)
     }
 
@@ -138,7 +146,10 @@ impl SyncStateManager {
         relative_path: &str,
         observed: &ObservedFileState,
     ) -> Result<()> {
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
         let now = chrono::Utc::now().timestamp();
 
         // COALESCE: 如果传入 None，保留已有值（上传后远端信息未知时避免覆盖）
@@ -190,7 +201,10 @@ impl SyncStateManager {
             return Ok(());
         }
 
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
         let now = chrono::Utc::now().timestamp();
         let batch_size = 500;
 
@@ -208,11 +222,13 @@ impl SyncStateManager {
                 }
 
                 // 计算元字段值
-                let c5_val: Option<i32> = update.meta.as_ref()
+                let c5_val: Option<i32> = update
+                    .meta
+                    .as_ref()
                     .and_then(|m| m.c5_detected)
                     .map(|v| v as i32);
-                let tombstoned_val: Option<Option<i64>> = update.meta.as_ref()
-                    .and_then(|m| m.tombstoned_at);
+                let tombstoned_val: Option<Option<i64>> =
+                    update.meta.as_ref().and_then(|m| m.tombstoned_at);
 
                 // UPSERT 操作
                 let obs = &update.observed;
@@ -313,7 +329,10 @@ impl SyncStateManager {
 
     /// 清除配置的所有同步状态（用于策略切换后重新建基线）
     pub fn reset_by_config(&self, config_id: &str) -> Result<usize> {
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
         let deleted = conn.execute(
             "DELETE FROM sync_state WHERE config_id = ?",
             params![config_id],
@@ -329,14 +348,17 @@ impl SyncStateManager {
 
     /// 查询配置的 tombstone 列表
     pub fn list_tombstones(&self, config_id: &str) -> Result<Vec<TombstoneInfo>> {
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT relative_path, local_exists, remote_exists,
                     tombstoned_at, c5_detected,
                     local_mtime, local_size, remote_mtime, remote_size
              FROM sync_state
              WHERE config_id = ? AND (local_exists = 0 OR remote_exists = 0)
-             ORDER BY tombstoned_at DESC"
+             ORDER BY tombstoned_at DESC",
         )?;
 
         let rows = stmt.query_map(params![config_id], |row| {
@@ -346,9 +368,17 @@ impl SyncStateManager {
             let c5_detected: bool = row.get::<_, i32>(4)? != 0;
 
             let (missing_side, surviving_mtime, surviving_size) = if !local_exists {
-                ("local".to_string(), row.get::<_, Option<i64>>(7)?, row.get::<_, Option<i64>>(8)?)
+                (
+                    "local".to_string(),
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                )
             } else {
-                ("remote".to_string(), row.get::<_, Option<i64>>(5)?, row.get::<_, Option<i64>>(6)?)
+                (
+                    "remote".to_string(),
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                )
             };
 
             Ok(TombstoneInfo {
@@ -370,7 +400,10 @@ impl SyncStateManager {
 
     /// 获取配置的同步状态统计
     pub fn get_stats(&self, config_id: &str) -> Result<SyncStats> {
-        let conn = self.db.lock().map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
+        let conn = self
+            .db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock failed: {}", e))?;
 
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sync_state WHERE config_id = ?",
@@ -434,7 +467,8 @@ mod tests {
             direction: SyncDirection::Upload,
         };
 
-        mgr.update_after_sync("cfg1", "test/file.txt", &observed).unwrap();
+        mgr.update_after_sync("cfg1", "test/file.txt", &observed)
+            .unwrap();
 
         let state = mgr.get_state("cfg1", "test/file.txt").unwrap();
         assert!(state.is_some());
@@ -471,7 +505,8 @@ mod tests {
                 tombstoned_at: Some(Some(1234567890)),
             }),
         };
-        mgr.batch_write_state_updates("cfg1", &[tombstone_update]).unwrap();
+        mgr.batch_write_state_updates("cfg1", &[tombstone_update])
+            .unwrap();
 
         let state = mgr.get_state("cfg1", "deleted.txt").unwrap().unwrap();
         assert!(!state.local_exists);
@@ -488,7 +523,8 @@ mod tests {
             remote_exists: true,
             direction: SyncDirection::Upload,
         };
-        mgr.update_after_sync("cfg1", "deleted.txt", &recovered).unwrap();
+        mgr.update_after_sync("cfg1", "deleted.txt", &recovered)
+            .unwrap();
 
         let state = mgr.get_state("cfg1", "deleted.txt").unwrap().unwrap();
         assert!(state.local_exists);
@@ -512,7 +548,8 @@ mod tests {
             remote_exists: true,
             direction: SyncDirection::Upload,
         };
-        mgr.update_after_sync("cfg1", "to_delete.txt", &observed).unwrap();
+        mgr.update_after_sync("cfg1", "to_delete.txt", &observed)
+            .unwrap();
         assert!(mgr.get_state("cfg1", "to_delete.txt").unwrap().is_some());
 
         // BothDeleted 应该删除该行
@@ -551,7 +588,8 @@ mod tests {
                 remote_exists: true,
                 direction: SyncDirection::Upload,
             };
-            mgr.update_after_sync("cfg1", &format!("file_{}.txt", i), &obs).unwrap();
+            mgr.update_after_sync("cfg1", &format!("file_{}.txt", i), &obs)
+                .unwrap();
         }
 
         let states = mgr.get_all_states("cfg1").unwrap();
@@ -579,7 +617,8 @@ mod tests {
             remote_exists: true,
             direction: SyncDirection::Upload,
         };
-        mgr.update_after_sync("cfg1", "normal.txt", &normal).unwrap();
+        mgr.update_after_sync("cfg1", "normal.txt", &normal)
+            .unwrap();
 
         // Tombstone (local deleted)
         let tombstone = SyncStateUpdate {

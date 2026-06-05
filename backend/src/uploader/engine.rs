@@ -234,7 +234,7 @@ impl UploadEngine {
             &block_list,
             &upload_id,
         )
-            .await?;
+        .await?;
 
         // 4. 标记完成
         self.task.lock().await.mark_completed();
@@ -272,7 +272,7 @@ impl UploadEngine {
             upload_id,
             max_concurrent,
         )
-            .await?;
+        .await?;
 
         // 创建文件（合并分片）
         // ⚠️ 重要: create_file 也需要 block_list (4MB分片MD5),和上传的分片MD5无关
@@ -377,7 +377,10 @@ impl UploadEngine {
 
                             // 等待一个任务完成
                             if let Some(result) = join_set.join_next().await {
-                                if let Err(e) = self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await {
+                                if let Err(e) = self
+                                    .handle_chunk_result(result, &chunk_md5s, &active_chunks)
+                                    .await
+                                {
                                     if self.cancel_token.is_cancelled() {
                                         join_set.abort_all();
                                         return Err(e);
@@ -430,7 +433,7 @@ impl UploadEngine {
                             last_speed_bytes,
                             max_retries,
                         )
-                            .await;
+                        .await;
 
                         // 减少活跃分片计数
                         active_chunks_clone.fetch_sub(1, Ordering::SeqCst);
@@ -449,7 +452,10 @@ impl UploadEngine {
 
             // 非阻塞检查是否有任务完成
             while let Some(result) = join_set.try_join_next() {
-                if let Err(e) = self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await {
+                if let Err(e) = self
+                    .handle_chunk_result(result, &chunk_md5s, &active_chunks)
+                    .await
+                {
                     if self.cancel_token.is_cancelled() {
                         join_set.abort_all();
                         return Err(e);
@@ -464,7 +470,10 @@ impl UploadEngine {
 
         // 等待所有剩余任务完成
         while let Some(result) = join_set.join_next().await {
-            if let Err(e) = self.handle_chunk_result(result, &chunk_md5s, &active_chunks).await {
+            if let Err(e) = self
+                .handle_chunk_result(result, &chunk_md5s, &active_chunks)
+                .await
+            {
                 if self.cancel_token.is_cancelled() {
                     join_set.abort_all();
                     return Err(e);
@@ -536,7 +545,7 @@ async fn read_chunk_data_standalone(local_path: &Path, chunk: &UploadChunk) -> R
 
         Ok(buffer)
     })
-        .await?
+    .await?
 }
 
 /// 错误分类（独立函数）

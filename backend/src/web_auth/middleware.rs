@@ -61,9 +61,9 @@ impl AuthErrorResponse {
 /// 需要绕过认证的路径前缀
 /// 注意：由于中间件应用在嵌套路由上，路径是相对于 /api/v1 的
 const AUTH_BYPASS_PREFIXES: &[&str] = &[
-    "/web-auth/",  // Web 认证相关端点（相对路径）
-    "/auth/",      // 百度认证相关端点（二维码登录等）
-    "/ws",         // WebSocket 端点
+    "/web-auth/", // Web 认证相关端点（相对路径）
+    "/auth/",     // 百度认证相关端点（二维码登录等）
+    "/ws",        // WebSocket 端点
     // 完整路径（用于非嵌套路由）
     "/api/v1/web-auth/",
     "/api/v1/auth/",
@@ -103,17 +103,23 @@ fn should_bypass_auth(path: &str) -> bool {
         // 检查是否是嵌套路由的相对路径（以 / 开头的 API 端点）
         // 这些路径应该需要认证
         let api_relative_paths = [
-            "/files", "/downloads", "/uploads", "/transfers",
-            "/fs/", "/config", "/autobackup/", "/encryption/",
+            "/files",
+            "/downloads",
+            "/uploads",
+            "/transfers",
+            "/fs/",
+            "/config",
+            "/autobackup/",
+            "/encryption/",
             "/system/",
         ];
-        
+
         for api_path in api_relative_paths {
             if path.starts_with(api_path) {
                 return false;
             }
         }
-        
+
         // 其他非 API 路径（静态资源）
         return true;
     }
@@ -210,7 +216,9 @@ pub async fn web_auth_middleware(
             );
             // 将认证信息注入请求扩展
             let mut request = request;
-            request.extensions_mut().insert(AuthenticatedUser { claims });
+            request
+                .extensions_mut()
+                .insert(AuthenticatedUser { claims });
             next.run(request).await
         }
         Err(e) => {
@@ -292,7 +300,8 @@ where
             .cloned()
             .ok_or_else(|| {
                 (
-                    StatusCode::from_u16(WEB_AUTH_EXPIRED_STATUS).unwrap_or(StatusCode::UNAUTHORIZED),
+                    StatusCode::from_u16(WEB_AUTH_EXPIRED_STATUS)
+                        .unwrap_or(StatusCode::UNAUTHORIZED),
                     Json(AuthErrorResponse::web_auth_expired("未认证")),
                 )
             })
@@ -387,7 +396,10 @@ mod tests {
 
         let request = Request::builder()
             .uri("/api/v1/files")
-            .header(header::COOKIE, "web_auth_access_token=cookie_token_456; other=value")
+            .header(
+                header::COOKIE,
+                "web_auth_access_token=cookie_token_456; other=value",
+            )
             .body(Body::empty())
             .unwrap();
 

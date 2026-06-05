@@ -28,10 +28,10 @@
 pub fn share_surl_info_sign(share_id: u64) -> String {
     // 构建待签名字符串: shareID + "_sharesurlinfo!@#"
     let data = format!("{}_sharesurlinfo!@#", share_id);
-    
+
     // 计算 MD5
     let digest = md5::compute(data.as_bytes());
-    
+
     // 返回小写16进制字符串
     format!("{:x}", digest)
 }
@@ -43,10 +43,10 @@ mod tests {
     #[test]
     fn test_share_surl_info_sign_format() {
         let sign = share_surl_info_sign(123456);
-        
+
         // 验证长度为32位
         assert_eq!(sign.len(), 32);
-        
+
         // 验证是小写16进制
         assert!(sign.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(sign, sign.to_lowercase());

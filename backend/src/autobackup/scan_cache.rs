@@ -310,9 +310,11 @@ mod tests {
     #[test]
     fn test_empty_cache_all_changed() {
         let (_dir, mgr) = setup();
-        let files = vec![
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ];
+        let files = vec![ScannedFileMeta {
+            file_path: "/a.txt".into(),
+            mtime: 100,
+            size: 50,
+        }];
         let changed = mgr.find_changed_files("cfg1", &files).unwrap();
         assert_eq!(changed.len(), 1);
     }
@@ -320,12 +322,15 @@ mod tests {
     #[test]
     fn test_cached_no_change() {
         let (_dir, mgr) = setup();
-        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)]).unwrap();
+        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)])
+            .unwrap();
         mgr.flush().unwrap();
 
-        let files = vec![
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ];
+        let files = vec![ScannedFileMeta {
+            file_path: "/a.txt".into(),
+            mtime: 100,
+            size: 50,
+        }];
         let changed = mgr.find_changed_files("cfg1", &files).unwrap();
         assert!(changed.is_empty());
     }
@@ -333,12 +338,15 @@ mod tests {
     #[test]
     fn test_mtime_changed() {
         let (_dir, mgr) = setup();
-        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)]).unwrap();
+        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)])
+            .unwrap();
         mgr.flush().unwrap();
 
-        let files = vec![
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 200, size: 50 },
-        ];
+        let files = vec![ScannedFileMeta {
+            file_path: "/a.txt".into(),
+            mtime: 200,
+            size: 50,
+        }];
         let changed = mgr.find_changed_files("cfg1", &files).unwrap();
         assert_eq!(changed.len(), 1);
     }
@@ -346,12 +354,15 @@ mod tests {
     #[test]
     fn test_size_changed() {
         let (_dir, mgr) = setup();
-        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)]).unwrap();
+        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)])
+            .unwrap();
         mgr.flush().unwrap();
 
-        let files = vec![
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 99 },
-        ];
+        let files = vec![ScannedFileMeta {
+            file_path: "/a.txt".into(),
+            mtime: 100,
+            size: 99,
+        }];
         let changed = mgr.find_changed_files("cfg1", &files).unwrap();
         assert_eq!(changed.len(), 1);
     }
@@ -362,32 +373,55 @@ mod tests {
         mgr.batch_upsert(vec![
             make_entry("cfg1", "/a.txt", 100, 50),
             make_entry("cfg2", "/b.txt", 200, 60),
-        ]).unwrap();
+        ])
+        .unwrap();
         mgr.flush().unwrap();
 
         mgr.delete_by_config("cfg1").unwrap();
 
         // cfg1 deleted → file shows as changed
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/a.txt".into(),
+                    mtime: 100,
+                    size: 50,
+                }],
+            )
+            .unwrap();
         assert_eq!(changed.len(), 1);
 
         // cfg2 unaffected
-        let changed = mgr.find_changed_files("cfg2", &[
-            ScannedFileMeta { file_path: "/b.txt".into(), mtime: 200, size: 60 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg2",
+                &[ScannedFileMeta {
+                    file_path: "/b.txt".into(),
+                    mtime: 200,
+                    size: 60,
+                }],
+            )
+            .unwrap();
         assert!(changed.is_empty());
     }
 
     #[test]
     fn test_upsert_single() {
         let (_dir, mgr) = setup();
-        mgr.upsert_single(make_entry("cfg1", "/a.txt", 100, 50)).unwrap();
+        mgr.upsert_single(make_entry("cfg1", "/a.txt", 100, 50))
+            .unwrap();
 
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/a.txt".into(),
+                    mtime: 100,
+                    size: 50,
+                }],
+            )
+            .unwrap();
         assert!(changed.is_empty());
     }
 
@@ -418,21 +452,36 @@ mod tests {
         mgr.batch_upsert(vec![
             make_entry("cfg1", "/a.txt", 100, 50),
             make_entry("cfg1", "/b.txt", 200, 60),
-        ]).unwrap();
+        ])
+        .unwrap();
         mgr.flush().unwrap();
 
         mgr.delete_by_path("cfg1", "/a.txt").unwrap();
 
         // /a.txt deleted → changed
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/a.txt".into(),
+                    mtime: 100,
+                    size: 50,
+                }],
+            )
+            .unwrap();
         assert_eq!(changed.len(), 1);
 
         // /b.txt still cached
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/b.txt".into(), mtime: 200, size: 60 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/b.txt".into(),
+                    mtime: 200,
+                    size: 60,
+                }],
+            )
+            .unwrap();
         assert!(changed.is_empty());
     }
 
@@ -440,17 +489,26 @@ mod tests {
     fn test_delete_by_path_flushes_pending() {
         let (_dir, mgr) = setup();
         // batch_upsert adds to pending buffer (threshold=500, won't auto-flush)
-        mgr.batch_upsert(vec![
-            make_entry("cfg1", "/pending.txt", 100, 50),
-        ]).unwrap();
+        mgr.batch_upsert(vec![make_entry("cfg1", "/pending.txt", 100, 50)])
+            .unwrap();
         // Don't call flush() — delete_by_path should flush internally
         let deleted = mgr.delete_by_path("cfg1", "/pending.txt").unwrap();
-        assert!(deleted, "should delete entry that was still in pending buffer");
+        assert!(
+            deleted,
+            "should delete entry that was still in pending buffer"
+        );
 
         // Verify it's gone
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/pending.txt".into(), mtime: 100, size: 50 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/pending.txt".into(),
+                    mtime: 100,
+                    size: 50,
+                }],
+            )
+            .unwrap();
         assert_eq!(changed.len(), 1, "deleted entry should appear as changed");
     }
 
@@ -471,21 +529,41 @@ mod tests {
     #[test]
     fn test_upsert_single_overwrites() {
         let (_dir, mgr) = setup();
-        mgr.upsert_single(make_entry("cfg1", "/a.txt", 100, 50)).unwrap();
+        mgr.upsert_single(make_entry("cfg1", "/a.txt", 100, 50))
+            .unwrap();
 
         // 用新 mtime 覆盖
-        mgr.upsert_single(make_entry("cfg1", "/a.txt", 200, 50)).unwrap();
+        mgr.upsert_single(make_entry("cfg1", "/a.txt", 200, 50))
+            .unwrap();
 
         // 用旧 mtime 查询应报告变化
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ]).unwrap();
-        assert_eq!(changed.len(), 1, "old mtime should differ from updated cache");
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/a.txt".into(),
+                    mtime: 100,
+                    size: 50,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            changed.len(),
+            1,
+            "old mtime should differ from updated cache"
+        );
 
         // 用新 mtime 查询应无变化
-        let changed = mgr.find_changed_files("cfg1", &[
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 200, size: 50 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg1",
+                &[ScannedFileMeta {
+                    file_path: "/a.txt".into(),
+                    mtime: 200,
+                    size: 50,
+                }],
+            )
+            .unwrap();
         assert!(changed.is_empty(), "new mtime should match updated cache");
     }
 
@@ -496,7 +574,8 @@ mod tests {
             make_entry("cfg1", "/a.txt", 100, 50),
             make_entry("cfg1", "/b.txt", 200, 60),
             make_entry("cfg2", "/c.txt", 300, 70),
-        ]).unwrap();
+        ])
+        .unwrap();
         mgr.flush().unwrap();
 
         let deleted = mgr.delete_by_config("cfg1").unwrap();
@@ -539,13 +618,21 @@ mod tests {
     #[test]
     fn test_find_changed_files_config_isolation() {
         let (_dir, mgr) = setup();
-        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)]).unwrap();
+        mgr.batch_upsert(vec![make_entry("cfg1", "/a.txt", 100, 50)])
+            .unwrap();
         mgr.flush().unwrap();
 
         // 用 cfg2 查询同路径 → 缓存隔离，应报告变化
-        let changed = mgr.find_changed_files("cfg2", &[
-            ScannedFileMeta { file_path: "/a.txt".into(), mtime: 100, size: 50 },
-        ]).unwrap();
+        let changed = mgr
+            .find_changed_files(
+                "cfg2",
+                &[ScannedFileMeta {
+                    file_path: "/a.txt".into(),
+                    mtime: 100,
+                    size: 50,
+                }],
+            )
+            .unwrap();
         assert_eq!(changed.len(), 1, "different config_id should not hit cache");
     }
 
@@ -562,16 +649,33 @@ mod tests {
         mgr.batch_upsert(vec![
             make_entry("cfg1", "/cached.txt", 100, 50),
             make_entry("cfg1", "/changed.txt", 100, 50),
-        ]).unwrap();
+        ])
+        .unwrap();
         mgr.flush().unwrap();
 
         let files = vec![
-            ScannedFileMeta { file_path: "/cached.txt".into(), mtime: 100, size: 50 },  // 未变
-            ScannedFileMeta { file_path: "/changed.txt".into(), mtime: 200, size: 50 }, // mtime 变了
-            ScannedFileMeta { file_path: "/new.txt".into(), mtime: 300, size: 70 },     // 新文件
+            ScannedFileMeta {
+                file_path: "/cached.txt".into(),
+                mtime: 100,
+                size: 50,
+            }, // 未变
+            ScannedFileMeta {
+                file_path: "/changed.txt".into(),
+                mtime: 200,
+                size: 50,
+            }, // mtime 变了
+            ScannedFileMeta {
+                file_path: "/new.txt".into(),
+                mtime: 300,
+                size: 70,
+            }, // 新文件
         ];
         let changed = mgr.find_changed_files("cfg1", &files).unwrap();
-        assert_eq!(changed.len(), 2, "changed + new = 2, cached should be skipped");
+        assert_eq!(
+            changed.len(),
+            2,
+            "changed + new = 2, cached should be skipped"
+        );
 
         let paths: Vec<&str> = changed.iter().map(|f| f.file_path.as_str()).collect();
         assert!(paths.contains(&"/changed.txt"));

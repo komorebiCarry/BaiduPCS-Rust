@@ -6,8 +6,8 @@ use axum::{
     Json,
 };
 use serde::Serialize;
-use std::io::ErrorKind;
 use std::fmt;
+use std::io::ErrorKind;
 
 /// API 错误类型
 #[derive(Debug)]
@@ -133,20 +133,16 @@ fn is_config_input_error(error: &anyhow::Error) -> bool {
         return true;
     }
 
-    error
-        .chain()
-        .any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_err| {
-                    matches!(
-                        io_err.kind(),
-                        ErrorKind::PermissionDenied
-                            | ErrorKind::NotFound
-                            | ErrorKind::InvalidInput
-                    )
-                })
-        })
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::NotFound | ErrorKind::InvalidInput
+                )
+            })
+    })
 }
 
 /// 从 anyhow::Error 转换

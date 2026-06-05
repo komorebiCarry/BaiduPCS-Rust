@@ -76,9 +76,9 @@ impl RecoveryCodeManager {
     pub fn verify_code(code: &str, stored_codes: &[RecoveryCode]) -> Option<usize> {
         let input_hash = Self::hash_code(code);
 
-        stored_codes.iter().position(|stored| {
-            !stored.used && stored.code_hash == input_hash
-        })
+        stored_codes
+            .iter()
+            .position(|stored| !stored.used && stored.code_hash == input_hash)
     }
 
     /// 格式化恢复码用于显示

@@ -2,9 +2,9 @@
 //!
 //! 负责定时触发备份任务
 
+use rand::Rng;
 use std::collections::HashMap;
 use std::time::Duration;
-use rand::Rng;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -24,8 +24,12 @@ fn parse_global_poll_id(config_id: &str) -> Option<(BackupDirection, GlobalPollT
     match config_id {
         GLOBAL_POLL_UPLOAD_INTERVAL => Some((BackupDirection::Upload, GlobalPollType::Interval)),
         GLOBAL_POLL_UPLOAD_SCHEDULED => Some((BackupDirection::Upload, GlobalPollType::Scheduled)),
-        GLOBAL_POLL_DOWNLOAD_INTERVAL => Some((BackupDirection::Download, GlobalPollType::Interval)),
-        GLOBAL_POLL_DOWNLOAD_SCHEDULED => Some((BackupDirection::Download, GlobalPollType::Scheduled)),
+        GLOBAL_POLL_DOWNLOAD_INTERVAL => {
+            Some((BackupDirection::Download, GlobalPollType::Interval))
+        }
+        GLOBAL_POLL_DOWNLOAD_SCHEDULED => {
+            Some((BackupDirection::Download, GlobalPollType::Scheduled))
+        }
         GLOBAL_POLL_SYNC_INTERVAL => Some((BackupDirection::Sync, GlobalPollType::Interval)),
         GLOBAL_POLL_SYNC_SCHEDULED => Some((BackupDirection::Sync, GlobalPollType::Scheduled)),
         _ => None,
@@ -141,11 +145,20 @@ impl PollScheduler {
         // 初始延迟结束后立即触发第一次轮询
         {
             let event = if let Some((direction, poll_type)) = parse_global_poll_id(&config_id) {
-                tracing::info!("Global interval poll triggered (initial): {:?} {:?}", direction, poll_type);
-                ChangeEvent::GlobalPollEvent { direction, poll_type }
+                tracing::info!(
+                    "Global interval poll triggered (initial): {:?} {:?}",
+                    direction,
+                    poll_type
+                );
+                ChangeEvent::GlobalPollEvent {
+                    direction,
+                    poll_type,
+                }
             } else {
                 tracing::debug!("Poll triggered (initial) for config: {}", config_id);
-                ChangeEvent::PollEvent { config_id: config_id.clone() }
+                ChangeEvent::PollEvent {
+                    config_id: config_id.clone(),
+                }
             };
 
             if let Err(e) = event_tx.send(event) {
@@ -370,8 +383,8 @@ impl DirectoryScanner {
             };
             scanner.scan_collect()
         })
-            .await
-            .map_err(|e| anyhow::anyhow!("Scan task failed: {}", e))
+        .await
+        .map_err(|e| anyhow::anyhow!("Scan task failed: {}", e))
     }
 }
 
@@ -448,7 +461,10 @@ mod tests {
             config_id: "test-config".to_string(),
             enabled: true,
             interval: Duration::from_secs(0),
-            scheduled_time: Some(ScheduledTime { hour: 3, minute: 30 }),
+            scheduled_time: Some(ScheduledTime {
+                hour: 3,
+                minute: 30,
+            }),
         };
 
         assert!(config.scheduled_time.is_some());
@@ -459,7 +475,10 @@ mod tests {
 
     #[test]
     fn test_scheduled_time() {
-        let time = ScheduledTime { hour: 14, minute: 30 };
+        let time = ScheduledTime {
+            hour: 14,
+            minute: 30,
+        };
         assert_eq!(time.hour, 14);
         assert_eq!(time.minute, 30);
     }
@@ -504,7 +523,9 @@ mod tests {
 
         scheduler.add_schedule(config);
         assert_eq!(scheduler.schedule_count(), 1);
-        assert!(scheduler.scheduled_configs().contains(&"test-config".to_string()));
+        assert!(scheduler
+            .scheduled_configs()
+            .contains(&"test-config".to_string()));
 
         scheduler.remove_schedule("test-config");
         assert_eq!(scheduler.schedule_count(), 0);
@@ -672,16 +693,13 @@ mod tests {
         // Create test files with different extensions
         let txt_file = dir.path().join("test.txt");
         let md_file = dir.path().join("test.md");
-        File::create(&txt_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&txt_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         File::create(&md_file).unwrap().write_all(b"world").unwrap();
 
-        let filter = FilterService::new(
-            vec!["txt".to_string()],
-            vec![],
-            vec![],
-            0,
-            0,
-        );
+        let filter = FilterService::new(vec!["txt".to_string()], vec![], vec![], 0, 0);
 
         let scanner = DirectoryScanner::new(dir.path().to_path_buf()).with_filter(filter);
         let files = scanner.scan_collect();
@@ -709,4 +727,3 @@ mod tests {
         assert_eq!(files.len(), 2);
     }
 }
-

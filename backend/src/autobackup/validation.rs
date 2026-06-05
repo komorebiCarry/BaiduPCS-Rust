@@ -311,7 +311,8 @@ pub fn validate_config_conflicts(
         //   Sync vs Upload → 同方向冲突（Sync 包含 Upload）
         //   Sync vs Download → 同方向冲突（Sync 包含 Download）
         //   Upload vs Download → 闭环冲突（LoopConflict，原有逻辑）
-        let is_conflicting_directions = is_conflicting_directions(candidate_direction, config.direction);
+        let is_conflicting_directions =
+            is_conflicting_directions(candidate_direction, config.direction);
 
         if is_conflicting_directions {
             // 同方向冲突（含 Sync 包含关系）
@@ -340,7 +341,10 @@ pub fn validate_config_conflicts(
 
             // 设置冲突类型（优先级：父存在 > 子存在）
             if conflict_type.is_none()
-                || matches!(current_conflict_type, ConflictType::SameDirectionParentExists)
+                || matches!(
+                    current_conflict_type,
+                    ConflictType::SameDirectionParentExists
+                )
             {
                 conflict_type = Some(current_conflict_type);
             }
@@ -415,10 +419,18 @@ fn generate_conflict_message(
         }
         ConflictType::SameDirectionChildExists => {
             // 子配置已存在，正在创建父配置
-            let children: Vec<_> = conflicting_configs.iter().filter(|c| !c.is_parent).collect();
+            let children: Vec<_> = conflicting_configs
+                .iter()
+                .filter(|c| !c.is_parent)
+                .collect();
             let children_list: String = children
                 .iter()
-                .map(|c| format!("  - 「{}」(ID: {}, 本地: {}, 云端: {})", c.name, c.id, c.local_path, c.remote_path))
+                .map(|c| {
+                    format!(
+                        "  - 「{}」(ID: {}, 本地: {}, 云端: {})",
+                        c.name, c.id, c.local_path, c.remote_path
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -466,9 +478,7 @@ fn generate_conflict_message(
                  建议：\n\
                  1. 保留单向备份（删除其中一个方向的配置）\n\
                  2. 调整本地或云端路径，使其不再重叠",
-                direction_str,
-                opposite_direction,
-                configs_list
+                direction_str, opposite_direction, configs_list
             )
         }
     }
@@ -519,16 +529,21 @@ pub fn validate_for_execute(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_normalize_local_path() {
         // Windows 路径
         let path = Path::new("C:\\Users\\test\\Documents");
-        let normalized = normalize_local_path(path);
         #[cfg(windows)]
-        assert!(normalized.contains("users/test/documents") || normalized.ends_with("users/test/documents"));
+        {
+            let normalized = normalize_local_path(path);
+            assert!(
+                normalized.contains("users/test/documents")
+                    || normalized.ends_with("users/test/documents")
+            );
+        }
 
         // 去尾斜杠
         let path = Path::new("/home/user/");
@@ -548,10 +563,7 @@ mod tests {
     #[test]
     fn test_path_overlap() {
         // 相等
-        assert_eq!(
-            check_path_overlap("/a/b", "/a/b"),
-            OverlapRelation::Equal
-        );
+        assert_eq!(check_path_overlap("/a/b", "/a/b"), OverlapRelation::Equal);
 
         // A 是 B 的祖先
         assert_eq!(
@@ -566,16 +578,10 @@ mod tests {
         );
 
         // 无重叠（路径段边界）
-        assert_eq!(
-            check_path_overlap("/a/b", "/a/bc"),
-            OverlapRelation::None
-        );
+        assert_eq!(check_path_overlap("/a/b", "/a/bc"), OverlapRelation::None);
 
         // 无重叠（完全不同）
-        assert_eq!(
-            check_path_overlap("/a/b", "/c/d"),
-            OverlapRelation::None
-        );
+        assert_eq!(check_path_overlap("/a/b", "/c/d"), OverlapRelation::None);
     }
 
     #[test]

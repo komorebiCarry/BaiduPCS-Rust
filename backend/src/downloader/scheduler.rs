@@ -1,9 +1,9 @@
-use crate::encryption::service::EncryptionService;
 use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
 use crate::downloader::{
     ChunkDownloadFailure, ChunkFailureAction, ChunkManager, DownloadEngine, DownloadTask,
     SpeedCalculator, UrlHealthManager,
 };
+use crate::encryption::service::EncryptionService;
 use crate::persistence::PersistenceManager;
 use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
 use crate::server::websocket::WebSocketManager;
@@ -193,7 +193,9 @@ pub struct TaskScheduleInfo {
 
     // 🔥 Manager 任务列表引用（用于任务完成时立即清理，避免内存泄漏）
     /// DownloadManager.tasks 的引用，任务完成后从中移除
-    pub manager_tasks: Option<Arc<RwLock<std::collections::HashMap<String, Arc<Mutex<crate::downloader::DownloadTask>>>>>>,
+    pub manager_tasks: Option<
+        Arc<RwLock<std::collections::HashMap<String, Arc<Mutex<crate::downloader::DownloadTask>>>>>,
+    >,
 
     // 🔥 链接级重试次数（单次调度内换链接重试的上限）
     /// 从配置 DownloadConfig.max_retries 读取
@@ -283,7 +285,10 @@ impl ChunkScheduler {
             .map(|p| p.get())
             .unwrap_or(4); // 获取失败时默认 4 核
         let concurrency = (available_cpus / 2).max(2).min(8);
-        info!("解密并发数: {} (可用并行度: {})", concurrency, available_cpus);
+        info!(
+            "解密并发数: {} (可用并行度: {})",
+            concurrency, available_cpus
+        );
         concurrency
     }
 
@@ -321,7 +326,10 @@ impl ChunkScheduler {
     ///
     /// FolderDownloadManager 调用此方法设置 channel sender，
     /// 当文件夹子任务完成时会发送 group_id 到 channel
-    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<(String, String, u64, bool)>) {
+    pub async fn set_task_completed_sender(
+        &self,
+        tx: mpsc::UnboundedSender<(String, String, u64, bool)>,
+    ) {
         let mut sender = self.task_completed_tx.write().await;
         *sender = Some(tx);
         info!("任务完成通知 channel 已设置");
@@ -343,7 +351,10 @@ impl ChunkScheduler {
     ///
     /// AutoBackupManager 调用此方法设置 channel sender，
     /// 所有备份相关事件（进度、状态、完成、失败等）都通过此 channel 发送
-    pub async fn set_backup_notification_sender(&self, tx: mpsc::UnboundedSender<BackupTransferNotification>) {
+    pub async fn set_backup_notification_sender(
+        &self,
+        tx: mpsc::UnboundedSender<BackupTransferNotification>,
+    ) {
         let mut sender = self.backup_notification_tx.write().await;
         *sender = Some(tx);
         info!("备份下载任务统一通知 channel 已设置");
@@ -410,8 +421,7 @@ impl ChunkScheduler {
         let active_count = self.active_tasks.read().await.len();
         info!(
             "任务 {} 已注册到调度器 (当前活跃任务数: {})",
-            task_id,
-            active_count
+            task_id, active_count
         );
         Ok(())
     }
@@ -575,15 +585,12 @@ impl ChunkScheduler {
                         let now = std::time::Instant::now();
 
                         // 第一轮：跳过 completed / downloading / deferred / cooling_down
-                        let mut index = manager
-                            .chunks()
-                            .iter()
-                            .position(|chunk| {
-                                !chunk.completed
-                                    && !chunk.downloading
-                                    && !chunk.deferred
-                                    && chunk.cooldown_until.map(|t| now >= t).unwrap_or(true)
-                            });
+                        let mut index = manager.chunks().iter().position(|chunk| {
+                            !chunk.completed
+                                && !chunk.downloading
+                                && !chunk.deferred
+                                && chunk.cooldown_until.map(|t| now >= t).unwrap_or(true)
+                        });
 
                         // 若没有可调度且存在已推迟分片 → 解冻后重挑
                         if index.is_none() && manager.has_deferred() {
@@ -593,12 +600,9 @@ impl ChunkScheduler {
                                 task_id, deferred_count
                             );
                             manager.undefer_all();
-                            index = manager
-                                .chunks()
-                                .iter()
-                                .position(|chunk| {
-                                    !chunk.completed && !chunk.downloading && !chunk.deferred
-                                });
+                            index = manager.chunks().iter().position(|chunk| {
+                                !chunk.completed && !chunk.downloading && !chunk.deferred
+                            });
                         }
 
                         // 如果找到，立即标记为"正在下载"，防止其他线程重复调度
@@ -686,11 +690,8 @@ impl ChunkScheduler {
                                         let (chunks_total, chunks_done) = {
                                             let m = task_info.chunk_manager.lock().await;
                                             let total = m.chunks().len();
-                                            let done = m
-                                                .chunks()
-                                                .iter()
-                                                .filter(|c| c.completed)
-                                                .count();
+                                            let done =
+                                                m.chunks().iter().filter(|c| c.completed).count();
                                             (total, done)
                                         };
                                         warn!(
@@ -763,9 +764,16 @@ impl ChunkScheduler {
                                         t.decrypt_epoch
                                     };
 
-                                    let finalize_result = Self::finalize_download_output(&task_info_clone).await;
+                                    let finalize_result =
+                                        Self::finalize_download_output(&task_info_clone).await;
                                     let decrypt_result = match finalize_result {
-                                        Ok(()) => Self::try_decrypt_if_encrypted(&task_info_clone, my_epoch).await,
+                                        Ok(()) => {
+                                            Self::try_decrypt_if_encrypted(
+                                                &task_info_clone,
+                                                my_epoch,
+                                            )
+                                            .await
+                                        }
                                         Err(e) => Err(e),
                                     };
 
@@ -778,7 +786,8 @@ impl ChunkScheduler {
                                         &task_completed_tx_clone,
                                         &backup_notification_tx_clone,
                                         &waiting_queue_trigger_clone,
-                                    ).await;
+                                    )
+                                    .await;
 
                                     debug!("任务 {} 解密流程完成，释放解密信号量", task_id_clone);
                                     // _permit 在这里自动释放
@@ -828,7 +837,9 @@ impl ChunkScheduler {
         _active_tasks: Arc<RwLock<HashMap<String, TaskScheduleInfo>>>,
         slot_pool: Arc<ChunkSlotPool>,
         global_active_count: Arc<AtomicUsize>,
-        _backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
+        _backup_notification_tx: Arc<
+            RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>,
+        >,
         _task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
         _waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     ) {
@@ -867,11 +878,11 @@ impl ChunkScheduler {
                 task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
                 task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
                 Some(task_info.slot_touch_throttler.clone()), // 🔥 任务级共享槽位刷新节流器
-                task_info.max_retries, // 🔥 链接级重试次数（从配置读取）
-                task_info.fallback_mgr.clone(), // 🔥 代理故障回退管理器
-                task_info.http11_trigger.clone(), // 🔥 HTTP/2 降级触发器
+                task_info.max_retries,                // 🔥 链接级重试次数（从配置读取）
+                task_info.fallback_mgr.clone(),       // 🔥 代理故障回退管理器
+                task_info.http11_trigger.clone(),     // 🔥 HTTP/2 降级触发器
             )
-                .await;
+            .await;
 
             // 释放全局活跃分片计数
             global_active_count.fetch_sub(1, Ordering::SeqCst);
@@ -993,7 +1004,9 @@ impl ChunkScheduler {
                                     "[分片线程{}] 分片 #{} Transient 失败，冷却 {}ms 后重试: {}",
                                     slot_id, chunk_index, capped, e
                                 );
-                                ChunkFailureAction::Cooldown(std::time::Duration::from_millis(capped))
+                                ChunkFailureAction::Cooldown(std::time::Duration::from_millis(
+                                    capped,
+                                ))
                             }
                             ChunkDownloadFailure::ServerThrottled(_) => {
                                 // 服务端限流：更长退避 1s → 10s
@@ -1003,7 +1016,9 @@ impl ChunkScheduler {
                                     "[分片线程{}] 分片 #{} ServerThrottled 失败，冷却 {}ms 后重试: {}",
                                     slot_id, chunk_index, capped, e
                                 );
-                                ChunkFailureAction::Cooldown(std::time::Duration::from_millis(capped))
+                                ChunkFailureAction::Cooldown(std::time::Duration::from_millis(
+                                    capped,
+                                ))
                             }
                             ChunkDownloadFailure::Fatal(_) => {
                                 warn!(
@@ -1027,7 +1042,8 @@ impl ChunkScheduler {
                         // 才 mark_deferred（让它等其他分片完成）
                         let should_defer_now = matches!(
                             e,
-                            ChunkDownloadFailure::Transient(_) | ChunkDownloadFailure::ServerThrottled(_)
+                            ChunkDownloadFailure::Transient(_)
+                                | ChunkDownloadFailure::ServerThrottled(_)
                         ) && chunk_retries >= max_schedule_retries;
 
                         if should_defer_now {
@@ -1081,15 +1097,14 @@ impl ChunkScheduler {
                                 );
 
                                 if let Some(ref tx) = task_info.requeue_tx {
-                                    let _ = tx.send(
-                                        crate::downloader::manager::AutoRequeueRequest {
+                                    let _ =
+                                        tx.send(crate::downloader::manager::AutoRequeueRequest {
                                             task_id: task_id.clone(),
                                             reason: format!(
                                                 "连续 {} 次 chunk 失败",
                                                 task_fail_count
                                             ),
-                                        },
-                                    );
+                                        });
                                 } else {
                                     error!(
                                         "任务 {} 达连续失败阈值但 requeue_tx 缺失，无法退回等待队列",
@@ -1119,7 +1134,9 @@ impl ChunkScheduler {
         decrypt_result: Result<()>,
         my_epoch: u64,
         task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
-        backup_notification_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
+        backup_notification_tx: &Arc<
+            RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>,
+        >,
         waiting_queue_trigger: &Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     ) {
         // 🔥 原子判定：在同一把锁内完成"Paused / epoch 短路检查"+"写终态"两件事，
@@ -1190,9 +1207,7 @@ impl ChunkScheduler {
         let outcome = {
             let mut t = task_info.task.lock().await;
 
-            if t.status == crate::downloader::TaskStatus::Paused
-                || t.decrypt_epoch != my_epoch
-            {
+            if t.status == crate::downloader::TaskStatus::Paused || t.decrypt_epoch != my_epoch {
                 CompletionOutcome::Stale
             } else if let Err(ref e) = decrypt_result {
                 let error_msg = format!("解密失败: {}", e);
@@ -1279,14 +1294,18 @@ impl ChunkScheduler {
                     debug!("下载任务 {} 已从 DownloadManager.tasks 中移除", task_id);
                 }
             } else {
-                debug!("分享直下任务 {} 完成，保留在内存中等待转存管理器清理", task_id);
+                debug!(
+                    "分享直下任务 {} 完成，保留在内存中等待转存管理器清理",
+                    task_id
+                );
             }
         } else {
             if let Some(ref pm) = task_info.persistence_manager {
-                if let Err(e) = pm.lock().await.update_task_error(
-                    task_id,
-                    decrypt_error.clone().unwrap_or_default()
-                ) {
+                if let Err(e) = pm
+                    .lock()
+                    .await
+                    .update_task_error(task_id, decrypt_error.clone().unwrap_or_default())
+                {
                     warn!("更新下载任务错误信息失败: {}", e);
                 }
             }
@@ -1307,7 +1326,12 @@ impl ChunkScheduler {
             let tx_guard = task_completed_tx.read().await;
             if let Some(tx) = tx_guard.as_ref() {
                 let is_success = decrypt_error.is_none();
-                if let Err(e) = tx.send((gid.clone(), task_id.to_string(), task_info.total_size, is_success)) {
+                if let Err(e) = tx.send((
+                    gid.clone(),
+                    task_id.to_string(),
+                    task_info.total_size,
+                    is_success,
+                )) {
                     error!("发送任务完成通知失败: {}", e);
                 }
             }
@@ -1392,7 +1416,10 @@ impl ChunkScheduler {
         tokio::fs::rename(&task_info.output_path, &final_path)
             .await
             .context("重命名临时下载文件失败")?;
-        info!("✅ 临时文件已重命名: {:?} -> {:?}", task_info.output_path, final_path);
+        info!(
+            "✅ 临时文件已重命名: {:?} -> {:?}",
+            task_info.output_path, final_path
+        );
 
         Ok(())
     }
@@ -1433,7 +1460,8 @@ impl ChunkScheduler {
             .unwrap_or("")
             .to_string(); // 转换为 String 避免借用问题
 
-        let is_encrypted_by_name = crate::downloader::task::DownloadTask::detect_encrypted_filename(&filename);
+        let is_encrypted_by_name =
+            crate::downloader::task::DownloadTask::detect_encrypted_filename(&filename);
 
         // 检查文件头魔数
         let is_encrypted_by_content = if local_path.exists() {
@@ -1476,14 +1504,19 @@ impl ChunkScheduler {
             };
 
             // 如果有 key_version 且有 encryption_config_store，尝试获取对应版本的密钥
-            if let (Some(version), Some(ref config_store)) = (key_version, &task_info.encryption_config_store) {
+            if let (Some(version), Some(ref config_store)) =
+                (key_version, &task_info.encryption_config_store)
+            {
                 match config_store.get_key_by_version(version) {
                     Ok(Some(key_info)) => {
                         info!(
                             "任务 {} 使用 key_version={} 的密钥进行解密",
                             task_id, version
                         );
-                        match EncryptionService::from_base64_key(&key_info.master_key, key_info.algorithm) {
+                        match EncryptionService::from_base64_key(
+                            &key_info.master_key,
+                            key_info.algorithm,
+                        ) {
                             Ok(service) => Arc::new(service),
                             Err(e) => {
                                 warn!(
@@ -1494,7 +1527,10 @@ impl ChunkScheduler {
                                 match &task_info.encryption_service {
                                     Some(service) => service.clone(),
                                     None => {
-                                        warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
+                                        warn!(
+                                            "任务 {} 是加密文件但没有配置加密服务，跳过解密",
+                                            task_id
+                                        );
                                         return Ok(());
                                     }
                                 }
@@ -1722,8 +1758,8 @@ impl ChunkScheduler {
                 },
             )
         })
-            .await
-            .map_err(|e| anyhow::anyhow!("解密任务执行失败: {}", e))??;
+        .await
+        .map_err(|e| anyhow::anyhow!("解密任务执行失败: {}", e))??;
 
         // 🔥 7.5 spawn_blocking 后的硬检查：删除加密文件 / 改 local_path / 持久化
         //         三大破坏性操作前的最后防线，同时校验 Paused 与 epoch。
@@ -1970,7 +2006,11 @@ impl ChunkScheduler {
 
         // 10. 🔥 更新持久化文件中的本地路径（解密后的路径）
         if let Some(ref pm) = task_info.persistence_manager {
-            if let Err(e) = pm.lock().await.update_local_path(&task_id, decrypted_path.clone()) {
+            if let Err(e) = pm
+                .lock()
+                .await
+                .update_local_path(&task_id, decrypted_path.clone())
+            {
                 warn!("更新持久化本地路径失败: {}", e);
             } else {
                 debug!("已更新持久化本地路径: {:?}", decrypted_path);
@@ -1996,7 +2036,10 @@ impl ChunkScheduler {
             }
         }
 
-        info!("✅ 任务 {} 解密完成，原始大小: {} bytes", task_id, original_size);
+        info!(
+            "✅ 任务 {} 解密完成，原始大小: {} bytes",
+            task_id, original_size
+        );
 
         Ok(())
     }
@@ -2033,8 +2076,8 @@ impl ChunkScheduler {
         // 如果没有映射信息，使用默认命名规则（向后兼容）
         if crate::downloader::task::DownloadTask::detect_encrypted_filename(filename) {
             // 从加密文件名提取 UUID
-            let uuid = EncryptionService::extract_uuid_from_encrypted_name(filename)
-                .unwrap_or("unknown");
+            let uuid =
+                EncryptionService::extract_uuid_from_encrypted_name(filename).unwrap_or("unknown");
             parent.join(format!("decrypted_{}", uuid))
         } else {
             // 移除 .bkup 扩展名
@@ -2084,13 +2127,18 @@ impl ChunkScheduler {
             // 获取任务状态和进度
             let (status, progress_bytes, total_bytes) = {
                 let task = task_info.task.lock().await;
-                (task.status.clone(), task.downloaded_size, task_info.total_size)
+                (
+                    task.status.clone(),
+                    task.downloaded_size,
+                    task_info.total_size,
+                )
             };
 
             // 过滤：只包含正在下载且未完成的任务
             // status == Downloading: 任务正在下载中（包括 progress = 0 的情况）
             // progress < total: 尚未完成
-            if status == crate::downloader::TaskStatus::Downloading && progress_bytes < total_bytes {
+            if status == crate::downloader::TaskStatus::Downloading && progress_bytes < total_bytes
+            {
                 let speed = {
                     let calc = task_info.speed_calc.lock().await;
                     calc.speed()

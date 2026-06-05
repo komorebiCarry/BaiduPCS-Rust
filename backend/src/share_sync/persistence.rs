@@ -18,7 +18,9 @@ pub const MAX_PAGE_SIZE: usize = 500;
 
 pub fn normalize_pagination(page: Option<usize>, page_size: Option<usize>) -> (usize, usize) {
     let p = page.unwrap_or(1).max(1);
-    let ps = page_size.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
+    let ps = page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
     (p, ps)
 }
 
@@ -163,8 +165,14 @@ impl ShareSyncPersistence {
                  enabled=excluded.enabled,
                  updated_at=excluded.updated_at"#,
             params![
-                sub.id, sub.name, sub.share_url, password, config_json,
-                enabled, created, updated
+                sub.id,
+                sub.name,
+                sub.share_url,
+                password,
+                config_json,
+                enabled,
+                created,
+                updated
             ],
         )?;
         Ok(())
@@ -189,9 +197,8 @@ impl ShareSyncPersistence {
     /// 列出所有订阅（按 created_at DESC）
     pub fn list_subscriptions(&self) -> Result<Vec<ShareSubscription>, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT config_json FROM share_subscriptions ORDER BY created_at DESC",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT config_json FROM share_subscriptions ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], |row| {
             let s: String = row.get(0)?;
             Ok(s)
@@ -227,12 +234,17 @@ impl ShareSyncPersistence {
              (id, subscription_id, captured_at, item_count)
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                snap.id, snap.subscription_id,
-                snap.captured_at.timestamp(), snap.items.len() as i64
+                snap.id,
+                snap.subscription_id,
+                snap.captured_at.timestamp(),
+                snap.items.len() as i64
             ],
         )?;
         // 简化：每次保存前先清空该 snapshot 的 items（防止 ON CONFLICT 触发 unique 冲突）
-        tx.execute("DELETE FROM share_snapshot_items WHERE snapshot_id = ?1", params![snap.id])?;
+        tx.execute(
+            "DELETE FROM share_snapshot_items WHERE snapshot_id = ?1",
+            params![snap.id],
+        )?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO share_snapshot_items
@@ -241,8 +253,12 @@ impl ShareSyncPersistence {
             )?;
             for item in &snap.items {
                 stmt.execute(params![
-                    snap.id, item.path, item.fs_id as i64,
-                    item.size as i64, item.is_dir as i32, item.name
+                    snap.id,
+                    item.path,
+                    item.fs_id as i64,
+                    item.size as i64,
+                    item.is_dir as i32,
+                    item.name
                 ])?;
             }
         }
@@ -265,7 +281,9 @@ impl ShareSyncPersistence {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some((id, captured_at)) = row else { return Ok(None) };
+        let Some((id, captured_at)) = row else {
+            return Ok(None);
+        };
         let mut stmt = conn.prepare(
             "SELECT path, fs_id, size, is_dir, name
              FROM share_snapshot_items WHERE snapshot_id = ?1",
@@ -312,7 +330,12 @@ impl ShareSyncPersistence {
             "INSERT INTO share_sync_runs
              (id, subscription_id, started_at, status)
              VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, subscription_id, started_at, RunStatus::Running.to_string()],
+            params![
+                run_id,
+                subscription_id,
+                started_at,
+                RunStatus::Running.to_string()
+            ],
         )?;
         Ok(())
     }
@@ -335,10 +358,14 @@ impl ShareSyncPersistence {
                  error = ?7
              WHERE id = ?8",
             params![
-                finished_at, status.to_string(),
-                diff.added as i64, diff.modified as i64,
-                diff.removed as i64, diff.failed as i64,
-                error, run_id
+                finished_at,
+                status.to_string(),
+                diff.added as i64,
+                diff.modified as i64,
+                diff.removed as i64,
+                diff.failed as i64,
+                error,
+                run_id
             ],
         )?;
         Ok(())
@@ -529,7 +556,7 @@ mod tests {
     fn sub(name: &str) -> ShareSubscription {
         let mut s = ShareSubscription::new(
             name.into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![SyncTarget::Netdisk(NetdiskTarget {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
@@ -569,8 +596,10 @@ mod tests {
     #[test]
     fn test_list_subscriptions() {
         let (_dir, mgr) = fresh();
-        let mut a = sub("a"); a.touch();
-        let mut b = sub("b"); b.touch();
+        let mut a = sub("a");
+        a.touch();
+        let mut b = sub("b");
+        b.touch();
         mgr.upsert_subscription(&a).unwrap();
         mgr.upsert_subscription(&b).unwrap();
         let list = mgr.list_subscriptions().unwrap();
@@ -602,14 +631,21 @@ mod tests {
         let (_dir, mgr) = fresh();
         let s = sub("a");
         mgr.upsert_subscription(&s).unwrap();
-        let snap = ShareSnapshot::with_items(&s.id, vec![ShareSnapshotItem::new("/x", "x", 1, 1, false)]);
+        let snap =
+            ShareSnapshot::with_items(&s.id, vec![ShareSnapshotItem::new("/x", "x", 1, 1, false)]);
         mgr.save_snapshot(&snap).unwrap();
         mgr.start_run("run-1", &s.id, 1).unwrap();
         mgr.add_run_item(
-            "run-1", "/x",
-            SyncAction::Added, TargetKind::Netdisk,
-            None, None, RunItemStatus::Pending, None,
-        ).unwrap();
+            "run-1",
+            "/x",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Pending,
+            None,
+        )
+        .unwrap();
 
         mgr.delete_subscription(&s.id).unwrap();
         assert!(mgr.latest_snapshot(&s.id).unwrap().is_none());
@@ -623,15 +659,29 @@ mod tests {
         mgr.upsert_subscription(&s).unwrap();
         mgr.start_run("run-1", &s.id, 1000).unwrap();
         mgr.add_run_item(
-            "run-1", "/a",
-            SyncAction::Added, TargetKind::Netdisk,
-            Some("tx-1"), None, RunItemStatus::Transferring, None,
-        ).unwrap();
-        mgr.finish_run(
-            "run-1", 1100, RunStatus::CompletedWithErrors,
-            &DiffSummary { added: 1, modified: 0, removed: 0, failed: 0 },
+            "run-1",
+            "/a",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            Some("tx-1"),
             None,
-        ).unwrap();
+            RunItemStatus::Transferring,
+            None,
+        )
+        .unwrap();
+        mgr.finish_run(
+            "run-1",
+            1100,
+            RunStatus::CompletedWithErrors,
+            &DiffSummary {
+                added: 1,
+                modified: 0,
+                removed: 0,
+                failed: 0,
+            },
+            None,
+        )
+        .unwrap();
 
         let rec = mgr.get_run("run-1").unwrap().unwrap();
         assert_eq!(rec.status, "completed_with_errors");
@@ -646,16 +696,25 @@ mod tests {
     fn test_normalize_pagination() {
         assert_eq!(normalize_pagination(None, None), (1, DEFAULT_PAGE_SIZE));
         assert_eq!(normalize_pagination(Some(0), Some(0)), (1, 1));
-        assert_eq!(normalize_pagination(Some(2), Some(1000)), (2, MAX_PAGE_SIZE));
+        assert_eq!(
+            normalize_pagination(Some(2), Some(1000)),
+            (2, MAX_PAGE_SIZE)
+        );
     }
 
     #[test]
     fn test_diff_serde_for_persistence() {
-        let prev = ShareSnapshot::with_items("sub", vec![ShareSnapshotItem::new("/a", "a", 1, 100, false)]);
-        let curr = ShareSnapshot::with_items("sub", vec![
-            ShareSnapshotItem::new("/a", "a", 1, 100, false),
-            ShareSnapshotItem::new("/b", "b", 2, 50, false),
-        ]);
+        let prev = ShareSnapshot::with_items(
+            "sub",
+            vec![ShareSnapshotItem::new("/a", "a", 1, 100, false)],
+        );
+        let curr = ShareSnapshot::with_items(
+            "sub",
+            vec![
+                ShareSnapshotItem::new("/a", "a", 1, 100, false),
+                ShareSnapshotItem::new("/b", "b", 2, 50, false),
+            ],
+        );
         let diff = crate::share_sync::diff::diff_snapshots(Some(&prev), &curr);
         let summary = diff.summary();
         assert_eq!(summary.added, 1);

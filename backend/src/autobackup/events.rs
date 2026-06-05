@@ -3,12 +3,12 @@
 //! 定义备份相关的 WebSocket 事件和进度节流器
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 
-use super::task::{BackupTaskStatus, BackupSubPhase, TriggerType};
+use super::task::{BackupSubPhase, BackupTaskStatus, TriggerType};
 
 // ============================================================================
 // 传输任务通知（上传/下载管理器 -> 自动备份管理器）
@@ -106,10 +106,7 @@ pub enum BackupTransferNotification {
         task_type: TransferTaskType,
     },
     /// 解密开始（仅下载任务）
-    DecryptStarted {
-        task_id: String,
-        file_name: String,
-    },
+    DecryptStarted { task_id: String, file_name: String },
     /// 解密进度（仅下载任务）
     DecryptProgress {
         task_id: String,

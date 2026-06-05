@@ -130,7 +130,9 @@ fn process_file(
         // ═══ Case B/C: sync_state 存在 ═══
         (Some(state), local_opt, remote_opt) => {
             let local_present = local_opt.is_some();
-            let remote_present = if has_remote { remote_opt.is_some() } else {
+            let remote_present = if has_remote {
+                remote_opt.is_some()
+            } else {
                 // Watch 路径：无远端快照，假设远端状态未知（不处理远端变更）
                 // 使用 SyncState 中的 remote_exists 作为参考
                 state.remote_exists
@@ -248,7 +250,11 @@ fn handle_case_a3(
                         // MD5 不同：真正的冲突，继续走冲突策略
                     }
                     Err(e) => {
-                        tracing::warn!("计算本地 MD5 失败，回退到冲突策略: path={}, err={}", path, e);
+                        tracing::warn!(
+                            "计算本地 MD5 失败，回退到冲突策略: path={}, err={}",
+                            path,
+                            e
+                        );
                         // 计算失败时保守处理，走冲突策略
                     }
                 }
@@ -414,7 +420,11 @@ fn handle_case_c1(
     let remote_state = if let Some(remote) = remote_file {
         (Some(remote.mtime), Some(remote.size), Some(remote.fs_id))
     } else {
-        (state.remote_mtime, state.remote_size.map(|s| s as u64), state.remote_fs_id.map(|id| id as u64))
+        (
+            state.remote_mtime,
+            state.remote_size.map(|s| s as u64),
+            state.remote_fs_id.map(|id| id as u64),
+        )
     };
 
     plan.state_updates.push(SyncStateUpdate {
@@ -447,8 +457,7 @@ fn handle_case_c2(
     // 幂等检查
     if !state.remote_exists {
         if let Some(local) = local_file {
-            if state.local_mtime == Some(local.mtime)
-                && state.local_size == Some(local.size as i64)
+            if state.local_mtime == Some(local.mtime) && state.local_size == Some(local.size as i64)
             {
                 plan.skipped += 1;
                 return;
@@ -644,8 +653,7 @@ fn is_local_changed(local: &LocalScannedFile, state: &SyncStateRow) -> bool {
     if state.local_mtime.is_none() {
         return true; // 之前未记录
     }
-    local.mtime != state.local_mtime.unwrap()
-        || local.size as i64 != state.local_size.unwrap_or(-1)
+    local.mtime != state.local_mtime.unwrap() || local.size as i64 != state.local_size.unwrap_or(-1)
 }
 
 /// 检测远端文件是否相对于 SyncState 发生变更
@@ -746,9 +754,14 @@ mod tests {
         let local = vec![local_file("new.txt", 1000, 100)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&[]),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&[]),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert_eq!(plan.uploads.len(), 1);
         assert_eq!(plan.uploads[0].relative_path, "new.txt");
@@ -761,9 +774,14 @@ mod tests {
         let remote = vec![remote_file("cloud.txt", 2000, 200, 42)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &[], Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &[],
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert!(plan.uploads.is_empty());
         assert_eq!(plan.downloads.len(), 1);
@@ -777,14 +795,22 @@ mod tests {
         let remote = vec![remote_file("shared.txt", 1001, 100, 55)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AdoptBothSides,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AdoptBothSides,
+        )
+        .unwrap();
 
         assert!(plan.uploads.is_empty());
         assert!(plan.downloads.is_empty());
         assert_eq!(plan.state_updates.len(), 1);
-        assert_eq!(plan.state_updates[0].reason, StateUpdateReason::AdoptBaseline);
+        assert_eq!(
+            plan.state_updates[0].reason,
+            StateUpdateReason::AdoptBaseline
+        );
     }
 
     #[test]
@@ -792,20 +818,35 @@ mod tests {
         let (mgr, _tmp) = create_test_env();
 
         // 先建立基线
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         // 本地修改了
         let local = vec![local_file("file.txt", 2000, 200)];
         let remote = vec![remote_file("file.txt", 1000, 100, 1)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert_eq!(plan.uploads.len(), 1);
         assert!(plan.downloads.is_empty());
@@ -815,19 +856,34 @@ mod tests {
     fn test_case_b2_remote_changed() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         let local = vec![local_file("file.txt", 1000, 100)];
         let remote = vec![remote_file("file.txt", 2000, 200, 2)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert!(plan.uploads.is_empty());
         assert_eq!(plan.downloads.len(), 1);
@@ -837,20 +893,35 @@ mod tests {
     fn test_case_b3_conflict_newer_wins() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         // 双端都变化，远端更新
         let local = vec![local_file("file.txt", 1500, 150)];
         let remote = vec![remote_file("file.txt", 2000, 200, 2)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         // 远端 mtime 更大，应该 Download
         assert!(plan.uploads.is_empty());
@@ -861,19 +932,34 @@ mod tests {
     fn test_case_b3_conflict_local_wins() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         let local = vec![local_file("file.txt", 2000, 200)];
         let remote = vec![remote_file("file.txt", 1500, 150, 2)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::LocalWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::LocalWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert_eq!(plan.uploads.len(), 1);
         assert!(plan.downloads.is_empty());
@@ -883,44 +969,77 @@ mod tests {
     fn test_case_b3_conflict_skip() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         let local = vec![local_file("file.txt", 2000, 200)];
         let remote = vec![remote_file("file.txt", 1500, 150, 2)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::Skip, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::Skip,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert!(plan.uploads.is_empty());
         assert!(plan.downloads.is_empty());
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.state_updates.len(), 1);
-        assert_eq!(plan.state_updates[0].reason, StateUpdateReason::ConflictSkipped);
+        assert_eq!(
+            plan.state_updates[0].reason,
+            StateUpdateReason::ConflictSkipped
+        );
     }
 
     #[test]
     fn test_case_b4_no_change() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         let local = vec![local_file("file.txt", 1000, 100)];
         let remote = vec![remote_file("file.txt", 1000, 100, 1)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert!(plan.uploads.is_empty());
         assert!(plan.downloads.is_empty());
@@ -931,20 +1050,35 @@ mod tests {
     fn test_case_c1_local_deleted() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "deleted.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "deleted.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         // 本地已删除
         let local: Vec<LocalScannedFile> = vec![];
         let remote = vec![remote_file("deleted.txt", 1000, 100, 1)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, Some(&remote),
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            Some(&remote),
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         assert!(plan.uploads.is_empty());
         assert!(plan.downloads.is_empty());
@@ -957,19 +1091,34 @@ mod tests {
     fn test_watch_path_upload_only() {
         let (mgr, _tmp) = create_test_env();
 
-        mgr.update_after_sync("cfg1", "file.txt", &ObservedFileState {
-            local_mtime: Some(1000), local_size: Some(100), local_exists: true,
-            remote_mtime: Some(1000), remote_size: Some(100), remote_fs_id: Some(1), remote_exists: true,
-            direction: SyncDirection::Upload,
-        }).unwrap();
+        mgr.update_after_sync(
+            "cfg1",
+            "file.txt",
+            &ObservedFileState {
+                local_mtime: Some(1000),
+                local_size: Some(100),
+                local_exists: true,
+                remote_mtime: Some(1000),
+                remote_size: Some(100),
+                remote_fs_id: Some(1),
+                remote_exists: true,
+                direction: SyncDirection::Upload,
+            },
+        )
+        .unwrap();
 
         // Watch 路径：无远端快照
         let local = vec![local_file("file.txt", 2000, 200)];
 
         let plan = generate_sync_plan(
-            &mgr, "cfg1", &local, None, // remote_snapshot = None
-            SyncConflictStrategy::NewerWins, SyncInitMode::AutoDetect,
-        ).unwrap();
+            &mgr,
+            "cfg1",
+            &local,
+            None, // remote_snapshot = None
+            SyncConflictStrategy::NewerWins,
+            SyncInitMode::AutoDetect,
+        )
+        .unwrap();
 
         // 应该只有上传，没有下载
         assert_eq!(plan.uploads.len(), 1);

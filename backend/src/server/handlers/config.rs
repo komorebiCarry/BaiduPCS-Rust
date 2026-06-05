@@ -1,13 +1,12 @@
 // 配置管理 API
 
 use crate::config::{
-    AppConfig, DownloadConfig, PathValidationResult, VipRecommendedConfig, VipType,
-    PathValidator,
+    AppConfig, DownloadConfig, PathValidationResult, PathValidator, VipRecommendedConfig, VipType,
 };
 use crate::server::error::{ApiError, ApiResult};
+use anyhow::Error as AnyhowError;
 use axum::{extract::State, response::Json};
 use serde::{Deserialize, Serialize};
-use anyhow::Error as AnyhowError;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,20 +16,16 @@ use super::ApiResponse;
 
 fn map_config_save_error(err: AnyhowError) -> ApiError {
     let msg = err.to_string();
-    let has_io_permission_error = err
-        .chain()
-        .any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_err| {
-                    matches!(
-                        io_err.kind(),
-                        ErrorKind::PermissionDenied
-                            | ErrorKind::NotFound
-                            | ErrorKind::InvalidInput
-                    )
-                })
-        });
+    let has_io_permission_error = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::NotFound | ErrorKind::InvalidInput
+                )
+            })
+    });
 
     let normalized = msg.to_lowercase();
     if msg.contains("保存配置失败")
@@ -97,7 +92,7 @@ pub async fn get_recommended_config(
         VipType::Vip => "普通会员",
         VipType::Svip => "超级会员",
     }
-        .to_string();
+    .to_string();
 
     // 获取推荐配置
     let recommended = DownloadConfig::recommended_for_vip(vip_type);
@@ -179,7 +174,9 @@ pub async fn reset_to_recommended(
     let upload_manager_guard = app_state.upload_manager.read().await;
     if let Some(upload_manager) = upload_manager_guard.as_ref() {
         upload_manager.update_max_threads(config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(config.upload.max_concurrent_tasks).await;
+        upload_manager
+            .update_max_concurrent_tasks(config.upload.max_concurrent_tasks)
+            .await;
         upload_manager.update_max_retries(config.upload.max_retries);
         info!(
             "✓ 上传管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 最大重试={}",
@@ -284,7 +281,9 @@ pub async fn update_config(
     let upload_manager_guard = app_state.upload_manager.read().await;
     if let Some(upload_manager) = upload_manager_guard.as_ref() {
         upload_manager.update_max_threads(new_config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks).await;
+        upload_manager
+            .update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks)
+            .await;
         upload_manager.update_max_retries(new_config.upload.max_retries);
         info!(
             "✓ 上传管理器配置已动态更新: 线程数={}, 最大任务数={}, 最大重试={}",
@@ -308,7 +307,10 @@ pub async fn update_config(
         } else {
             None
         };
-        app_state.fallback_mgr.on_user_config_change(new_proxy_config.as_ref()).await;
+        app_state
+            .fallback_mgr
+            .on_user_config_change(new_proxy_config.as_ref())
+            .await;
 
         // 准备代理参数（QRCodeAuth、NetdiskClient、DownloadEngine 共用）
         let proxy_for_client = if proxy.proxy_type != crate::common::ProxyType::None {
@@ -334,7 +336,11 @@ pub async fn update_config(
         // 2. 重建 NetdiskClient（如果已登录）
         let user_auth = app_state.current_user.read().await.clone();
         if let Some(user) = user_auth {
-            match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+            match crate::netdisk::NetdiskClient::new_with_proxy(
+                user,
+                proxy_for_client,
+                fallback_for_client.clone(),
+            ) {
                 Ok(new_client) => {
                     *app_state.netdisk_client.write().await = Some(new_client);
                     info!("✓ NetdiskClient 已热更新");
@@ -356,7 +362,11 @@ pub async fn update_config(
         if let Some(um) = um_guard.as_ref() {
             let user_auth = app_state.current_user.read().await.clone();
             if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user,
+                    proxy_for_client,
+                    fallback_for_client.clone(),
+                ) {
                     Ok(new_client) => {
                         um.update_netdisk_client(new_client);
                         info!("✓ UploadManager NetdiskClient 已热更新");
@@ -372,7 +382,11 @@ pub async fn update_config(
         if let Some(tm) = tm_guard.as_ref() {
             let user_auth = app_state.current_user.read().await.clone();
             if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user,
+                    proxy_for_client,
+                    fallback_for_client.clone(),
+                ) {
                     Ok(new_client) => {
                         tm.update_netdisk_client(new_client);
                         info!("✓ TransferManager NetdiskClient 已热更新");
@@ -388,7 +402,11 @@ pub async fn update_config(
         if let Some(monitor) = monitor_guard.as_ref() {
             let user_auth = app_state.current_user.read().await.clone();
             if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user,
+                    proxy_for_client,
+                    fallback_for_client.clone(),
+                ) {
                     Ok(new_client) => {
                         monitor.update_client(new_client);
                         info!("✓ CloudDlMonitor NetdiskClient 已热更新");
@@ -403,9 +421,14 @@ pub async fn update_config(
         {
             let user_auth = app_state.current_user.read().await.clone();
             if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user,
+                    proxy_for_client,
+                    fallback_for_client.clone(),
+                ) {
                     Ok(new_client) => {
-                        app_state.folder_download_manager
+                        app_state
+                            .folder_download_manager
                             .set_netdisk_client(Arc::new(new_client))
                             .await;
                         info!("✓ FolderDownloadManager NetdiskClient 已热更新");
@@ -429,8 +452,11 @@ pub async fn update_config(
                         app_state.fallback_mgr.execute_fallback().await;
                     } else {
                         // 不允许回退：仅标记状态为异常，不切直连
-                        app_state.fallback_mgr
-                            .set_runtime_status(crate::common::ProxyRuntimeStatus::FallenBackToDirect)
+                        app_state
+                            .fallback_mgr
+                            .set_runtime_status(
+                                crate::common::ProxyRuntimeStatus::FallenBackToDirect,
+                            )
                             .await;
                     }
                 }

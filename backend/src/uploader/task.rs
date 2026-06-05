@@ -533,8 +533,14 @@ mod tests {
         // 🔥 验证加密完成后状态自动转换为 Uploading
         assert_eq!(task.status, UploadTaskStatus::Uploading);
         // 🔥 验证加密元数据已保存
-        assert_eq!(task.encrypted_name, Some("BPR_BKUP_test-uuid.bkup".to_string()));
-        assert_eq!(task.encryption_nonce, Some("base64_nonce_value".to_string()));
+        assert_eq!(
+            task.encrypted_name,
+            Some("BPR_BKUP_test-uuid.bkup".to_string())
+        );
+        assert_eq!(
+            task.encryption_nonce,
+            Some("base64_nonce_value".to_string())
+        );
         assert_eq!(task.encryption_algorithm, Some("aes-256-gcm".to_string()));
         assert_eq!(task.encryption_version, 1);
     }

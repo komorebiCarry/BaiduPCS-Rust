@@ -59,10 +59,7 @@ impl PathGuard {
             match self.normalize_existing_directory(allowed) {
                 Ok(canonical) => Self::push_unique_path(&mut roots, canonical),
                 Err(_) => {
-                    tracing::warn!(
-                        "白名单路径不存在或无法访问，已跳过: {:?}",
-                        allowed
-                    );
+                    tracing::warn!("白名单路径不存在或无法访问，已跳过: {:?}", allowed);
                 }
             }
         }
@@ -86,10 +83,7 @@ impl PathGuard {
         let canonical = match self.normalize_existing_directory(default_path) {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!(
-                    "默认目录不存在或无法访问，已忽略: {:?}",
-                    default_path
-                );
+                tracing::warn!("默认目录不存在或无法访问，已忽略: {:?}", default_path);
                 return Ok(None);
             }
         };
@@ -171,7 +165,7 @@ impl PathGuard {
                 && bytes[0].is_ascii_alphabetic()
                 && bytes[1] == b':'
                 && (bytes.len() == 2
-                || (bytes.len() == 3 && (bytes[2] == b'\\' || bytes[2] == b'/')));
+                    || (bytes.len() == 3 && (bytes[2] == b'\\' || bytes[2] == b'/')));
 
             if is_bare_drive_root {
                 let drive_path = if bytes.len() == 2 {
@@ -357,7 +351,10 @@ mod tests {
         });
 
         let roots = guard.resolve_allowed_roots().unwrap();
-        assert_eq!(roots[0], strip_extended_length_prefix(secondary.canonicalize().unwrap()));
+        assert_eq!(
+            roots[0],
+            strip_extended_length_prefix(secondary.canonicalize().unwrap())
+        );
         assert_eq!(roots.len(), 2);
     }
 
@@ -454,10 +451,7 @@ mod tests {
                     s
                 );
                 // 不能是原样返回 "C:Windows"
-                assert_ne!(
-                    s, "C:Windows",
-                    "drive-relative 路径不应被原样返回"
-                );
+                assert_ne!(s, "C:Windows", "drive-relative 路径不应被原样返回");
             }
             Err(_) => {
                 // 路径不存在也是可接受的（canonicalize 会报错），
@@ -475,21 +469,13 @@ mod tests {
         // "C:" → "C:\"
         let result = guard.normalize("C:");
         if let Ok(p) = result {
-            assert_eq!(
-                p.to_string_lossy().as_ref(),
-                "C:\\",
-                "C: 应被规范化为 C:\\"
-            );
+            assert_eq!(p.to_string_lossy().as_ref(), "C:\\", "C: 应被规范化为 C:\\");
         }
 
         // "C:\" → "C:\"
         let result = guard.normalize("C:\\");
         if let Ok(p) = result {
-            assert_eq!(
-                p.to_string_lossy().as_ref(),
-                "C:\\",
-                "C:\\ 应保持不变"
-            );
+            assert_eq!(p.to_string_lossy().as_ref(), "C:\\", "C:\\ 应保持不变");
         }
 
         // "C:/" → "C:\"
@@ -514,11 +500,7 @@ mod tests {
             Ok(p) => {
                 // canonicalize 的结果应是以 \\?\ 前缀或 X:\ 开头的规范路径
                 let s = p.to_string_lossy().to_string();
-                assert!(
-                    s.contains("Users"),
-                    "C:\\Users 应被正确解析，实际: {}",
-                    s
-                );
+                assert!(s.contains("Users"), "C:\\Users 应被正确解析，实际: {}", s);
             }
             Err(_) => {
                 // 白名单拦截也是正确行为

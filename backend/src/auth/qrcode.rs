@@ -22,17 +22,13 @@ impl QRCodeAuth {
 
     /// 创建新的二维码登录客户端（支持代理配置）
     pub fn new_with_proxy(proxy_config: Option<&ProxyConfig>) -> Result<Self> {
-        let mut builder = Client::builder()
-            .cookie_store(true)
-            .user_agent(USER_AGENT);
+        let mut builder = Client::builder().cookie_store(true).user_agent(USER_AGENT);
 
         if let Some(proxy) = proxy_config {
             builder = proxy.apply_to_builder(builder)?;
         }
 
-        let client = builder
-            .build()
-            .context("Failed to create HTTP client")?;
+        let client = builder.build().context("Failed to create HTTP client")?;
 
         Ok(Self {
             client,

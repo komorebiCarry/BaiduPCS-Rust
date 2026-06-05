@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 临时文件守卫
-/// 
+///
 /// 使用 RAII 模式自动清理临时文件。
 /// 当守卫被丢弃时，会自动删除对应的临时文件。
 pub struct TempFileGuard {
@@ -87,11 +87,7 @@ impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if self.auto_cleanup && !self.is_persisted() {
             if let Err(e) = self.remove() {
-                tracing::warn!(
-                    "清理临时文件失败: {} - {}",
-                    self.path.display(),
-                    e
-                );
+                tracing::warn!("清理临时文件失败: {} - {}", self.path.display(), e);
             } else if self.path.exists() {
                 tracing::debug!("已清理临时文件: {}", self.path.display());
             }
@@ -110,7 +106,7 @@ impl std::fmt::Debug for TempFileGuard {
 }
 
 /// 临时文件管理器
-/// 
+///
 /// 管理临时文件目录，提供创建和清理功能
 pub struct TempFileManager {
     /// 临时文件目录
@@ -124,7 +120,7 @@ impl TempFileManager {
     pub fn new(temp_dir: PathBuf, prefix: &str) -> std::io::Result<Self> {
         // 确保临时目录存在
         std::fs::create_dir_all(&temp_dir)?;
-        
+
         Ok(Self {
             temp_dir,
             prefix: prefix.to_string(),
@@ -138,12 +134,7 @@ impl TempFileManager {
 
     /// 创建新的临时文件（带守卫）
     pub fn create_temp_file(&self, extension: &str) -> TempFileGuard {
-        let filename = format!(
-            "{}{}{}",
-            self.prefix,
-            uuid::Uuid::new_v4(),
-            extension
-        );
+        let filename = format!("{}{}{}", self.prefix, uuid::Uuid::new_v4(), extension);
         let path = self.temp_dir.join(filename);
         TempFileGuard::new(path)
     }
@@ -154,11 +145,11 @@ impl TempFileManager {
     }
 
     /// 清理所有残留的临时文件
-    /// 
+    ///
     /// 扫描临时目录，删除所有匹配前缀的文件
     pub fn cleanup_all(&self) -> std::io::Result<usize> {
         let mut cleaned = 0;
-        
+
         if let Ok(entries) = std::fs::read_dir(&self.temp_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -198,9 +189,16 @@ impl TempFileManager {
                                     if let Ok(age) = now.duration_since(modified) {
                                         if age > max_age {
                                             if let Err(e) = std::fs::remove_file(&path) {
-                                                tracing::warn!("删除过期临时文件失败: {} - {}", path.display(), e);
+                                                tracing::warn!(
+                                                    "删除过期临时文件失败: {} - {}",
+                                                    path.display(),
+                                                    e
+                                                );
                                             } else {
-                                                tracing::info!("已清理过期临时文件: {}", path.display());
+                                                tracing::info!(
+                                                    "已清理过期临时文件: {}",
+                                                    path.display()
+                                                );
                                                 cleaned += 1;
                                             }
                                         }
@@ -219,7 +217,7 @@ impl TempFileManager {
     /// 获取临时目录占用空间
     pub fn get_temp_dir_size(&self) -> std::io::Result<u64> {
         let mut total = 0u64;
-        
+
         if let Ok(entries) = std::fs::read_dir(&self.temp_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -237,7 +235,7 @@ impl TempFileManager {
     /// 获取临时文件数量
     pub fn get_temp_file_count(&self) -> std::io::Result<usize> {
         let mut count = 0;
-        
+
         if let Ok(entries) = std::fs::read_dir(&self.temp_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -264,17 +262,17 @@ mod tests {
     fn test_temp_file_guard_auto_cleanup() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_temp.tmp");
-        
+
         // 创建文件
         std::fs::write(&file_path, "test content").unwrap();
         assert!(file_path.exists());
-        
+
         // 创建守卫
         {
             let _guard = TempFileGuard::new(file_path.clone());
             assert!(file_path.exists());
         }
-        
+
         // 守卫丢弃后文件应被删除
         assert!(!file_path.exists());
     }
@@ -283,14 +281,14 @@ mod tests {
     fn test_temp_file_guard_persist() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test_persist.tmp");
-        
+
         std::fs::write(&file_path, "test content").unwrap();
-        
+
         {
             let guard = TempFileGuard::new(file_path.clone());
             guard.persist();
         }
-        
+
         // 持久化后文件不应被删除
         assert!(file_path.exists());
     }
@@ -299,15 +297,15 @@ mod tests {
     fn test_temp_file_manager() {
         let dir = tempdir().unwrap();
         let manager = TempFileManager::new(dir.path().to_path_buf(), "test_").unwrap();
-        
+
         // 创建临时文件
         let guard = manager.create_temp_file(".tmp");
         std::fs::write(guard.path(), "test").unwrap();
         assert!(guard.exists());
-        
+
         let path = guard.path().to_path_buf();
         drop(guard);
-        
+
         // 文件应被清理
         assert!(!path.exists());
     }
@@ -316,17 +314,17 @@ mod tests {
     fn test_cleanup_all() {
         let dir = tempdir().unwrap();
         let manager = TempFileManager::new(dir.path().to_path_buf(), "backup_").unwrap();
-        
+
         // 创建一些临时文件
         for i in 0..3 {
             let path = dir.path().join(format!("backup_test{}.tmp", i));
             std::fs::write(&path, "test").unwrap();
         }
-        
+
         // 创建一个不匹配前缀的文件
         let other = dir.path().join("other_file.txt");
         std::fs::write(&other, "other").unwrap();
-        
+
         let cleaned = manager.cleanup_all().unwrap();
         assert_eq!(cleaned, 3);
         assert!(other.exists()); // 不匹配前缀的文件不应被删除

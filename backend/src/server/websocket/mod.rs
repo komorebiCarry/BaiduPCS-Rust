@@ -7,5 +7,5 @@ pub mod manager;
 mod message;
 
 pub use handler::handle_websocket;
-pub use manager::{WebSocketManager, PendingEvent, MAX_PENDING_EVENTS_PER_CONNECTION};
+pub use manager::{PendingEvent, WebSocketManager, MAX_PENDING_EVENTS_PER_CONNECTION};
 pub use message::{WsClientMessage, WsServerMessage};

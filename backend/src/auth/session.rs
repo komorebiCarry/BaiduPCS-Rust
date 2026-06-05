@@ -4,6 +4,7 @@ use crate::auth::{AccountSummary, UserAuth};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs;
 use tracing::{info, warn};
@@ -18,8 +19,19 @@ struct SessionStore {
 
 impl SessionStore {
     fn normalize(&mut self) {
+        let mut by_uid: HashMap<u64, UserAuth> = HashMap::new();
+        for account in self.accounts.drain(..) {
+            let keep_new = by_uid
+                .get(&account.uid)
+                .map(|existing| account.login_time >= existing.login_time)
+                .unwrap_or(true);
+            if keep_new {
+                by_uid.insert(account.uid, account);
+            }
+        }
+
+        self.accounts = by_uid.into_values().collect();
         self.accounts.sort_by_key(|u| u.login_time);
-        self.accounts.dedup_by_key(|u| u.uid);
 
         if let Some(active_uid) = self.active_uid {
             if self.accounts.iter().all(|u| u.uid != active_uid) {
@@ -382,6 +394,62 @@ mod tests {
         let accounts = manager.list_accounts().await.unwrap();
         assert_eq!(accounts.len(), 1);
         assert!(accounts[0].is_active);
+
+        let _ = manager.clear_session().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_session_upgrades_when_adding_second_account() {
+        let path = session_path();
+        let legacy = user(9, "legacy");
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let mut manager = SessionManager::new(Some(path.clone()));
+        manager
+            .save_session(&user(10, "new_account"))
+            .await
+            .unwrap();
+
+        let accounts = manager.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(manager.active_uid().await.unwrap(), Some(10));
+        assert!(accounts.iter().any(|a| a.uid == 9 && !a.is_active));
+        assert!(accounts.iter().any(|a| a.uid == 10 && a.is_active));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["active_uid"].as_u64(), Some(10));
+        assert_eq!(value["accounts"].as_array().unwrap().len(), 2);
+
+        let _ = manager.clear_session().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_multi_account_session_deduplicates_by_uid() {
+        let path = session_path();
+        let mut older = user(1, "older");
+        older.login_time = 10;
+        let mut other = user(2, "other");
+        other.login_time = 20;
+        let mut newer = user(1, "newer");
+        newer.login_time = 30;
+
+        let content = serde_json::json!({
+            "active_uid": 1,
+            "accounts": [older, other, newer],
+        });
+        std::fs::write(&path, serde_json::to_string(&content).unwrap()).unwrap();
+
+        let mut manager = SessionManager::new(Some(path.clone()));
+        let loaded = manager.load_session().await.unwrap().unwrap();
+        assert_eq!(loaded.uid, 1);
+        assert_eq!(loaded.username, "newer");
+
+        let accounts = manager.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|a| a.uid == 1 && a.username == "newer"));
 
         let _ = manager.clear_session().await;
         let _ = std::fs::remove_file(path);

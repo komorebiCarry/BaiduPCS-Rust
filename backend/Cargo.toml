@@ -99,3 +99,21 @@ libc = "0.2"
 # 测试工具
 tempfile = "3.8"
 proptest = "1.4"
+
+# ============ 优化配置 ============
+# release 构建：瘦二进制 + 略好的运行时
+#  - lto = "thin" 在跨 crate 优化与编译时间间取平衡（fat LTO 收益边际小）
+#  - codegen-units = 1 允许内联跨模块，但代价是首次编译更慢
+#  - strip = "symbols" 删除符号表，二进制可小 30~50%
+#  - panic = "abort" 减小 panic 展开表（与 unwinding 依赖对齐：项目未用 catch_unwind）
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# dev 构建：保留完整调试信息，编译尽量快
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true

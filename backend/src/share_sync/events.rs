@@ -14,13 +14,9 @@ pub enum ShareSyncEvent {
         name: String,
     },
     /// 订阅更新
-    SubscriptionUpdated {
-        subscription_id: String,
-    },
+    SubscriptionUpdated { subscription_id: String },
     /// 订阅删除
-    SubscriptionDeleted {
-        subscription_id: String,
-    },
+    SubscriptionDeleted { subscription_id: String },
     /// 订阅启用/停用
     StatusChanged {
         subscription_id: String,
@@ -76,16 +72,32 @@ impl ShareSyncEvent {
     /// 关联的 subscription_id（用于 ws 订阅过滤）
     pub fn subscription_id(&self) -> &str {
         match self {
-            Self::SubscriptionCreated { subscription_id, .. }
+            Self::SubscriptionCreated {
+                subscription_id, ..
+            }
             | Self::SubscriptionUpdated { subscription_id }
             | Self::SubscriptionDeleted { subscription_id }
-            | Self::StatusChanged { subscription_id, .. }
-            | Self::RunStarted { subscription_id, .. }
-            | Self::DiffDetected { subscription_id, .. }
-            | Self::ItemScheduled { subscription_id, .. }
-            | Self::ItemStatusChanged { subscription_id, .. }
-            | Self::RunCompleted { subscription_id, .. }
-            | Self::RunFailed { subscription_id, .. } => subscription_id,
+            | Self::StatusChanged {
+                subscription_id, ..
+            }
+            | Self::RunStarted {
+                subscription_id, ..
+            }
+            | Self::DiffDetected {
+                subscription_id, ..
+            }
+            | Self::ItemScheduled {
+                subscription_id, ..
+            }
+            | Self::ItemStatusChanged {
+                subscription_id, ..
+            }
+            | Self::RunCompleted {
+                subscription_id, ..
+            }
+            | Self::RunFailed {
+                subscription_id, ..
+            } => subscription_id,
         }
     }
 

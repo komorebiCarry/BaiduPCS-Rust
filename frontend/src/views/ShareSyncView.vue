@@ -250,13 +250,13 @@
             </el-select>
             <el-input
               v-if="t.kind === 'netdisk'"
-              v-model="(t as any).remote_path"
+              v-model="(t as NetdiskTarget).remote_path"
               placeholder="网盘路径，如 /我的资源/同步"
               style="margin-left: 8px; flex: 1"
             />
             <el-input
               v-else
-              v-model="(t as any).local_path"
+              v-model="(t as LocalTarget).local_path"
               placeholder="本地路径"
               style="margin-left: 8px; flex: 1"
             />
@@ -390,7 +390,8 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, type ElTree } from 'element-plus'
+import type { AxiosError } from 'axios'
 import {
   Plus, Edit, Delete, Refresh, ArrowRight, Link,
   FolderOpened, Document, VideoPause, VideoPlay,
@@ -398,11 +399,16 @@ import {
 import {
   type ShareSubscription,
   type SyncTarget,
+  type NetdiskTarget,
+  type LocalTarget,
+  type CreateShareSubscriptionRequest,
+  type UpdateShareSubscriptionRequest,
   type RunRecord,
   type RunDetail,
   type ConflictStrategy,
   type PollConfig,
   type TreeNode,
+  type ShareSyncWsEvent,
   listSubscriptions, createSubscription, updateSubscription,
   deleteSubscription, setSubscriptionEnabled, triggerSubscription, listRuns, getRun,
   previewTree,
@@ -429,31 +435,45 @@ const excludeInput = ref('')
 // 目录树选择
 const treePickerVisible = ref(false)
 const treeData = ref<TreeNode[]>([])
-const treeRef = ref<any>()
-const treeProps = { children: 'children', label: 'name', isLeaf: (d: any) => !d.is_dir }
+const treeRef = ref<InstanceType<typeof ElTree>>()
+const treeProps = {
+  children: 'children',
+  label: 'name',
+  isLeaf: (d: TreeNode) => !d.is_dir,
+} as const
 const treeFilterText = ref('')
 const treeCheckStrictly = ref(false)
 const treeDepth = ref<number>(2)
 const loadingTree = ref(false)
 const treeError = ref('')
 watch(treeFilterText, (v) => {
-  treeRef.value?.filter?.(v)
+  treeRef.value?.filter(v)
 })
 
-function createDefaultTarget() {
-  return { kind: 'local', local_path: DEFAULT_LOCAL_TARGET_PATH }
+function createDefaultTarget(): SyncTarget {
+  return { kind: 'local', local_path: DEFAULT_LOCAL_TARGET_PATH, conflict_strategy: null }
 }
 
-const defaultForm = () => ({
+const defaultForm = (): {
+  name: string
+  share_url: string
+  password: string
+  include_paths: string[]
+  exclude_patterns: string[]
+  targets: SyncTarget[]
+  conflict_strategy: ConflictStrategy
+  delete_missing: boolean
+  poll_config: PollConfig
+} => ({
   name: '',
   share_url: '',
   password: '',
-  include_paths: [] as string[],
-  exclude_patterns: [] as string[],
-  targets: [createDefaultTarget()] as any[],
-  conflict_strategy: 'overwrite' as ConflictStrategy,
+  include_paths: [],
+  exclude_patterns: [],
+  targets: [createDefaultTarget()],
+  conflict_strategy: 'overwrite',
   delete_missing: false,
-  poll_config: { enabled: true, mode: 'interval', interval_secs: 1800, schedule_hour: null, schedule_minute: null } as PollConfig,
+  poll_config: { enabled: true, mode: 'interval', interval_secs: 1800, schedule_hour: null, schedule_minute: null },
 })
 
 const form = ref(defaultForm())
@@ -523,7 +543,7 @@ const formRules = {
 async function refresh() {
   try {
     subscriptions.value = await listSubscriptions()
-  } catch (e: any) {
+  } catch (e) {
     ElMessage.error(`加载订阅失败: ${getApiErrorMessage(e)}`)
     return
   }
@@ -543,7 +563,7 @@ async function loadRuns(id: string) {
     runs.value = await listRuns(id, 1, 30)
   } catch (e) {
     runs.value = []
-    const status = (e as any)?.response?.status
+    const status = (e as AxiosError)?.response?.status
     if (status !== 404) {
       console.error('load runs failed', e)
     }
@@ -565,7 +585,7 @@ function openEdit() {
     password: selected.value.password || '',
     include_paths: [...selected.value.include_paths],
     exclude_patterns: [...selected.value.exclude_patterns],
-    targets: selected.value.targets.map(t => ({ ...t })) as any,
+    targets: selected.value.targets.map(t => ({ ...t })) as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
     delete_missing: selected.value.delete_missing,
     poll_config: normalizePollConfigForUi(selected.value.poll_config),
@@ -583,12 +603,13 @@ function openEdit() {
   dialogVisible.value = true
 }
 
-function getApiErrorMessage(e: any): string {
-  return e?.response?.data?.message
-    || e?.response?.data?.error
-    || e?.response?.data?.msg
-    || e?.response?.data?.details
-    || e?.message
+function getApiErrorMessage(e: unknown): string {
+  const ax = e as AxiosError<{ message?: string; error?: string; msg?: string; details?: string }>
+  return ax?.response?.data?.message
+    || ax?.response?.data?.error
+    || ax?.response?.data?.msg
+    || ax?.response?.data?.details
+    || (e as Error)?.message
     || '未知错误'
 }
 
@@ -610,7 +631,7 @@ async function saveForm() {
   saving.value = true
   try {
     if (dialogMode.value === 'create') {
-      const req: any = {
+      const req: CreateShareSubscriptionRequest = {
         name: form.value.name,
         share_url: form.value.share_url,
         password: form.value.password || null,
@@ -624,7 +645,7 @@ async function saveForm() {
       await createSubscription(req)
       ElMessage.success('已创建订阅')
     } else if (selected.value) {
-      const req: any = {
+      const req: UpdateShareSubscriptionRequest = {
         name: form.value.name,
         share_url: form.value.share_url,
         password: form.value.password || null,
@@ -640,7 +661,7 @@ async function saveForm() {
     }
     dialogVisible.value = false
     await refresh()
-  } catch (e: any) {
+  } catch (e) {
     ElMessage.error(`保存失败: ${getApiErrorMessage(e)}`)
   } finally {
     saving.value = false
@@ -654,7 +675,7 @@ function validateForm(): boolean {
   }
 
   for (let i = 0; i < form.value.targets.length; i++) {
-    const t = form.value.targets[i] as any
+    const t = form.value.targets[i] as NetdiskTarget | LocalTarget
     if (t.kind === 'netdisk') {
       if (!t.remote_path || !String(t.remote_path).trim()) {
         ElMessage.error(`目标 #${i + 1}：网盘路径不能为空`)
@@ -747,9 +768,9 @@ function buildSanitizedPayload() {
   form.value.include_paths = Array.from(includeSet)
   form.value.exclude_patterns = Array.from(excludeSet)
 
-  const nextTargets: any[] = []
+  const nextTargets: SyncTarget[] = []
   for (const raw of form.value.targets) {
-    const t = raw as any
+    const t = raw as NetdiskTarget | LocalTarget
     if (!t.kind) {
       continue
     }
@@ -791,7 +812,7 @@ async function removeSubscription() {
     selected.value = null
     runs.value = []
     await refresh()
-  } catch (e: any) {
+  } catch (e) {
     ElMessage.error(`删除失败: ${getApiErrorMessage(e)}`)
   }
 }
@@ -802,7 +823,7 @@ async function toggleEnabled() {
     await setSubscriptionEnabled(selected.value.id, !selected.value.enabled)
     ElMessage.success('已切换启用状态')
     await refresh()
-  } catch (e: any) {
+  } catch (e) {
     ElMessage.error(`操作失败: ${getApiErrorMessage(e)}`)
   }
 }
@@ -814,7 +835,7 @@ async function triggerNow() {
     await triggerSubscription(selected.value.id)
     ElMessage.success('已触发同步，结果将稍后出现在运行历史')
     setTimeout(() => selected.value && loadRuns(selected.value.id), 1500)
-  } catch (e: any) {
+  } catch (e) {
     ElMessage.error(`触发失败: ${getApiErrorMessage(e)}`)
   } finally {
     triggering.value = false
@@ -825,21 +846,21 @@ async function openRun(runId: string) {
   try {
     currentRun.value = await getRun(runId)
     runDialogVisible.value = true
-  } catch (e: any) {
+  } catch (e) {
     ElMessage.error(`加载运行详情失败: ${getApiErrorMessage(e)}`)
   }
 }
 
-function onTargetKindChange(t: any) {
+function onTargetKindChange(t: SyncTarget) {
   if (t.kind === 'netdisk') {
     t.remote_path = normalizeRemotePath(String(t.remote_path || '/'))
     t.save_fs_id = Number.isFinite(Number(t.save_fs_id)) ? Number(t.save_fs_id) : 0
-    delete t.local_path
+    delete (t as unknown as Record<string, unknown>).local_path
   }
   if (t.kind === 'local') {
     t.local_path = normalizeLocalPath(String(t.local_path || DEFAULT_LOCAL_TARGET_PATH))
-    delete t.save_fs_id
-    delete t.remote_path
+    delete (t as unknown as Record<string, unknown>).save_fs_id
+    delete (t as unknown as Record<string, unknown>).remote_path
   }
 }
 
@@ -887,11 +908,12 @@ async function loadTree() {
     form.value.include_paths.forEach((p: string) => {
       treeRef.value?.setChecked?.(p, true, false)
     })
-  } catch (e: any) {
+  } catch (e) {
+    const ax = e as AxiosError<{ message?: string; error?: string }>
     treeError.value =
-      e?.response?.data?.message ||
-      e?.response?.data?.error ||
-      e?.message ||
+      ax?.response?.data?.message ||
+      ax?.response?.data?.error ||
+      (e as Error)?.message ||
       '加载目录树失败'
   } finally {
     loadingTree.value = false
@@ -906,7 +928,7 @@ function confirmTreePicker() {
   const nextInclude: string[] = []
   const uniq = new Set<string>()
   all
-    .map((n: any) => n.path as string)
+    .map((n) => (n as unknown as TreeNode).path)
     .map((p: string) => normalizePath(p))
     .filter((p: string) => p.length > 0)
     .forEach((p: string) => {
@@ -919,7 +941,7 @@ function confirmTreePicker() {
   treePickerVisible.value = false
 }
 
-function filterTreeNode(query: string, data: any) {
+function filterTreeNode(query: string, data: TreeNode) {
   if (!query) return true
   return (data.name as string)?.toLowerCase?.().includes(query.toLowerCase())
 }
@@ -1009,8 +1031,8 @@ onMounted(async () => {
   connectWebSocket()
   const ws = getWebSocketClient()
   ws.subscribe(['share_sync'])
-  const handler = (event: any) => {
-    const evt = event?.detail ?? event
+  const handler = (event: CustomEvent<ShareSyncWsEvent>) => {
+    const evt = event?.detail
     if (!evt || !evt.type) return
     const sid = evt.subscription_id
     if (!sid) return

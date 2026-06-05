@@ -107,7 +107,10 @@ pub struct ProxyFallbackManager {
 impl std::fmt::Debug for ProxyFallbackManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyFallbackManager")
-            .field("consecutive_failures", &self.consecutive_failures.load(Ordering::Relaxed))
+            .field(
+                "consecutive_failures",
+                &self.consecutive_failures.load(Ordering::Relaxed),
+            )
             .field("failure_threshold", &self.failure_threshold)
             .field("fallen_back", &self.fallen_back.load(Ordering::Relaxed))
             .field("flap_count", &self.flap_count.load(Ordering::Relaxed))
@@ -167,9 +170,9 @@ impl ProxyFallbackManager {
         match self.flap_count.load(Ordering::SeqCst) {
             0 | 1 => Duration::from_secs(30),
             2 => Duration::from_secs(60),
-            3 => Duration::from_secs(120),  // 2min
-            4 => Duration::from_secs(300),  // 5min
-            _ => Duration::from_secs(600),  // 10min 封顶
+            3 => Duration::from_secs(120), // 2min
+            4 => Duration::from_secs(300), // 5min
+            _ => Duration::from_secs(600), // 10min 封顶
         }
     }
 
@@ -339,7 +342,6 @@ impl ProxyFallbackManager {
     }
 }
 
-
 /// 将 reqwest 代理错误转换为用户友好的中文提示
 fn friendly_proxy_error(e: &reqwest::Error) -> String {
     let raw = e.to_string();
@@ -354,7 +356,10 @@ fn friendly_proxy_error(e: &reqwest::Error) -> String {
         if raw.contains("eof while tunneling") || raw.contains("unexpected eof") {
             return "代理隧道建立失败，可能是代理类型不匹配或需要认证".to_string();
         }
-        if raw.contains("dns") || raw.contains("resolve") || raw.contains("Name or service not known") {
+        if raw.contains("dns")
+            || raw.contains("resolve")
+            || raw.contains("Name or service not known")
+        {
             return "代理地址无法解析，请检查主机名是否正确".to_string();
         }
         if raw.contains("reset") {
@@ -441,7 +446,6 @@ pub trait ProxyHotUpdater: Send + Sync {
     async fn update_folder_download_manager(&self, proxy: Option<&ProxyConfig>);
     async fn update_autobackup_manager(&self, proxy: Option<&ProxyConfig>);
 }
-
 
 /// 启动后台代理探测任务
 ///
@@ -530,7 +534,7 @@ mod tests {
         // 默认阈值为 3
         assert!(!mgr.record_failure()); // 1
         assert!(!mgr.record_failure()); // 2
-        assert!(mgr.record_failure());  // 3 → 触发回退
+        assert!(mgr.record_failure()); // 3 → 触发回退
         assert!(mgr.is_fallen_back());
     }
 
@@ -539,7 +543,7 @@ mod tests {
         let mgr = ProxyFallbackManager::new();
         mgr.record_failure(); // 1
         mgr.record_failure(); // 2
-        assert!(mgr.record_failure());  // 3 → 第一个触发
+        assert!(mgr.record_failure()); // 3 → 第一个触发
         assert!(!mgr.record_failure()); // 4 → 已经回退，compare_exchange 失败
         assert!(!mgr.record_failure()); // 5 → 同上
     }
@@ -552,7 +556,7 @@ mod tests {
         mgr.record_success(); // 重置
         assert!(!mgr.record_failure()); // 1（重新开始）
         assert!(!mgr.record_failure()); // 2
-        assert!(mgr.record_failure());  // 3 → 触发
+        assert!(mgr.record_failure()); // 3 → 触发
     }
 
     #[tokio::test]
@@ -598,8 +602,7 @@ mod tests {
     async fn test_check_and_increment_flap_outside_window() {
         let mgr = ProxyFallbackManager::new();
         // 模拟很久以前恢复（超过稳定窗口）
-        *mgr.last_proxy_restore_time.lock().await =
-            Some(Instant::now() - Duration::from_secs(600));
+        *mgr.last_proxy_restore_time.lock().await = Some(Instant::now() - Duration::from_secs(600));
 
         mgr.flap_count.store(5, Ordering::SeqCst);
 
@@ -672,7 +675,8 @@ mod tests {
         // allow_fallback=false 时，record_failure 仍然返回 true（达到阈值时）
         // 但调用方应检查 allow_fallback 并决定是否执行回退
         let mgr = ProxyFallbackManager::new();
-        mgr.set_user_proxy_config(Some(make_proxy_config(false))).await;
+        mgr.set_user_proxy_config(Some(make_proxy_config(false)))
+            .await;
 
         mgr.record_failure();
         mgr.record_failure();
@@ -719,7 +723,8 @@ mod tests {
         assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::NoProxy);
 
         // 设置代理配置
-        mgr.set_user_proxy_config(Some(make_proxy_config(true))).await;
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::Normal);
 
         // 清除代理配置
@@ -732,7 +737,8 @@ mod tests {
         let mgr = ProxyFallbackManager::new();
 
         // 先设置代理配置
-        mgr.set_user_proxy_config(Some(make_proxy_config(true))).await;
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::Normal);
 
         // 模拟回退：标记为已回退，设置状态为 Probing
@@ -742,7 +748,8 @@ mod tests {
         assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::Probing);
 
         // 再次调用 set_user_proxy_config，不应覆盖 Probing 状态
-        mgr.set_user_proxy_config(Some(make_proxy_config(true))).await;
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::Probing);
     }
 
@@ -756,7 +763,8 @@ mod tests {
     async fn test_next_probe_in_secs_returns_remaining() {
         let mgr = ProxyFallbackManager::new();
         // 模拟刚开始 sleep
-        mgr.set_last_probe_sleep_started_at(Some(Instant::now())).await;
+        mgr.set_last_probe_sleep_started_at(Some(Instant::now()))
+            .await;
 
         let remaining = mgr.next_probe_in_secs().await;
         assert!(remaining.is_some());

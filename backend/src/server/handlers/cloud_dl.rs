@@ -73,7 +73,10 @@ pub async fn add_task(
     };
 
     // 调用 API 添加任务
-    match client.cloud_dl_add_task(&req.source_url, &req.save_path).await {
+    match client
+        .cloud_dl_add_task(&req.source_url, &req.save_path)
+        .await
+    {
         Ok(task_id) => {
             info!("添加离线下载任务成功: task_id={}", task_id);
 

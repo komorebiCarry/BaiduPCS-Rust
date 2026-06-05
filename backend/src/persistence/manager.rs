@@ -182,18 +182,16 @@ impl PersistenceManager {
         offset: usize,
         limit: usize,
     ) -> Option<(Vec<TaskMetadata>, usize)> {
-        self.history_db
-            .as_ref()
-            .and_then(|db| {
-                db.get_task_history_by_type_status_exclude_backup(
-                    task_type,
-                    status,
-                    exclude_backup,
-                    offset,
-                    limit,
-                )
-                    .ok()
-            })
+        self.history_db.as_ref().and_then(|db| {
+            db.get_task_history_by_type_status_exclude_backup(
+                task_type,
+                status,
+                exclude_backup,
+                offset,
+                limit,
+            )
+            .ok()
+        })
     }
 
     // ========================================================================
@@ -285,7 +283,10 @@ impl PersistenceManager {
         // 迁移文件夹历史 (folder_history.jsonl)
         let folder_history_jsonl_path = super::folder::get_folder_history_path(&self.wal_dir);
         if folder_history_jsonl_path.exists() {
-            info!("检测到旧文件夹历史文件，开始迁移: {:?}", folder_history_jsonl_path);
+            info!(
+                "检测到旧文件夹历史文件，开始迁移: {:?}",
+                folder_history_jsonl_path
+            );
             match super::folder::load_folder_history(&self.wal_dir) {
                 Ok(folders) => {
                     if !folders.is_empty() {
@@ -293,8 +294,11 @@ impl PersistenceManager {
                             Ok(count) => {
                                 info!("成功迁移 {} 条文件夹历史到数据库", count);
                                 // 迁移成功后重命名旧文件为 .bak
-                                let bak_path = folder_history_jsonl_path.with_extension("jsonl.bak");
-                                if let Err(e) = std::fs::rename(&folder_history_jsonl_path, &bak_path) {
+                                let bak_path =
+                                    folder_history_jsonl_path.with_extension("jsonl.bak");
+                                if let Err(e) =
+                                    std::fs::rename(&folder_history_jsonl_path, &bak_path)
+                                {
                                     warn!("重命名旧文件夹历史文件失败: {}", e);
                                 } else {
                                     info!("已将旧文件夹历史文件重命名为: {:?}", bak_path);
@@ -435,7 +439,7 @@ impl PersistenceManager {
                 retention_days,
                 shutdown_rx,
             )
-                .await;
+            .await;
         });
 
         self.archive_task = Some(handle);
@@ -637,7 +641,10 @@ impl PersistenceManager {
         let info = TaskPersistenceInfo::new_upload(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
-        debug!("已注册上传任务: {} (encrypt_enabled={:?})", task_id, encrypt_enabled);
+        debug!(
+            "已注册上传任务: {} (encrypt_enabled={:?})",
+            task_id, encrypt_enabled
+        );
 
         Ok(())
     }
@@ -690,7 +697,10 @@ impl PersistenceManager {
         let info = TaskPersistenceInfo::new_upload(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
-        debug!("已注册备份上传任务: {} (encrypt_enabled={:?})", task_id, encrypt_enabled);
+        debug!(
+            "已注册备份上传任务: {} (encrypt_enabled={:?})",
+            task_id, encrypt_enabled
+        );
 
         Ok(())
     }
@@ -746,7 +756,10 @@ impl PersistenceManager {
         let info = TaskPersistenceInfo::new_download(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
-        debug!("已注册备份下载任务: {} (is_encrypted={:?})", task_id, is_encrypted);
+        debug!(
+            "已注册备份下载任务: {} (is_encrypted={:?})",
+            task_id, is_encrypted
+        );
 
         Ok(())
     }
@@ -938,7 +951,10 @@ impl PersistenceManager {
         // 3. 从历史数据库中删除
         if let Some(db) = &self.history_db {
             if let Err(e) = db.remove_task_from_history(task_id) {
-                warn!("从历史数据库中删除任务失败: task_id={}, 错误: {}", task_id, e);
+                warn!(
+                    "从历史数据库中删除任务失败: task_id={}, 错误: {}",
+                    task_id, e
+                );
             }
         }
 
@@ -1063,7 +1079,10 @@ impl PersistenceManager {
             m.set_error_msg(warning_owned);
         })?;
 
-        debug!("已更新任务警告信息（不影响状态）: task_id={}, warning={}", task_id, warning);
+        debug!(
+            "已更新任务警告信息（不影响状态）: task_id={}, warning={}",
+            task_id, warning
+        );
 
         Ok(())
     }
@@ -1080,7 +1099,10 @@ impl PersistenceManager {
             m.mark_failed();
         })?;
 
-        debug!("已更新任务错误信息并标记为失败: task_id={}, error={}", task_id, error_msg);
+        debug!(
+            "已更新任务错误信息并标记为失败: task_id={}, error={}",
+            task_id, error_msg
+        );
 
         Ok(())
     }
@@ -1632,10 +1654,7 @@ async fn history_archive_loop(
 }
 
 /// 归档已完成任务到数据库（直接扫描 .meta 文件，不经过 JSONL）
-async fn archive_completed_to_db(
-    wal_dir: &PathBuf,
-    history_db: &Option<Arc<HistoryDbManager>>,
-) {
+async fn archive_completed_to_db(wal_dir: &PathBuf, history_db: &Option<Arc<HistoryDbManager>>) {
     use super::metadata::{delete_task_files, scan_all_metadata};
     use super::types::TaskPersistenceStatus;
 
@@ -1674,15 +1693,15 @@ async fn archive_completed_to_db(
         }
     } else {
         // 无数据库时仅记录日志
-        warn!("历史数据库不可用，跳过归档 {} 个已完成任务", completed_tasks.len());
+        warn!(
+            "历史数据库不可用，跳过归档 {} 个已完成任务",
+            completed_tasks.len()
+        );
     }
 }
 
 /// 归档已完成文件夹到数据库（直接扫描文件夹持久化文件，不经过 JSONL）
-async fn archive_folders_to_db(
-    wal_dir: &PathBuf,
-    history_db: &Option<Arc<HistoryDbManager>>,
-) {
+async fn archive_folders_to_db(wal_dir: &PathBuf, history_db: &Option<Arc<HistoryDbManager>>) {
     use super::folder::{delete_folder, load_all_folders};
     use crate::downloader::folder::FolderStatus;
 
@@ -1723,10 +1742,7 @@ async fn archive_folders_to_db(
 }
 
 /// 清理过期历史（从数据库）
-async fn cleanup_expired_from_db(
-    history_db: &Option<Arc<HistoryDbManager>>,
-    retention_days: u64,
-) {
+async fn cleanup_expired_from_db(history_db: &Option<Arc<HistoryDbManager>>, retention_days: u64) {
     // 从数据库清理
     if let Some(db) = history_db {
         // 清理过期任务历史
@@ -1814,9 +1830,9 @@ mod tests {
                 None,
                 false,
                 None,
-                None,  // is_encrypted
-                None,  // encryption_key_version
-                None,  // transfer_task_id
+                None, // is_encrypted
+                None, // encryption_key_version
+                None, // transfer_task_id
             )
             .unwrap();
 
@@ -1842,8 +1858,8 @@ mod tests {
                 2 * 1024 * 1024,
                 512 * 1024,
                 4,
-                None,  // encrypt_enabled
-                None,  // encryption_key_version
+                None, // encrypt_enabled
+                None, // encryption_key_version
             )
             .unwrap();
 
@@ -1892,9 +1908,9 @@ mod tests {
                 None,
                 false,
                 None,
-                None,  // is_encrypted
-                None,  // encryption_key_version
-                None,  // transfer_task_id
+                None, // is_encrypted
+                None, // encryption_key_version
+                None, // transfer_task_id
             )
             .unwrap();
 
@@ -1926,8 +1942,8 @@ mod tests {
                 1024,
                 256,
                 4,
-                None,  // encrypt_enabled
-                None,  // encryption_key_version
+                None, // encrypt_enabled
+                None, // encryption_key_version
             )
             .unwrap();
 
@@ -1962,9 +1978,9 @@ mod tests {
                 None,
                 false,
                 None,
-                None,  // is_encrypted
-                None,  // encryption_key_version
-                None,  // transfer_task_id
+                None, // is_encrypted
+                None, // encryption_key_version
+                None, // transfer_task_id
             )
             .unwrap();
 
@@ -2059,8 +2075,8 @@ mod tests {
                 1024,
                 256,
                 4,
-                None,  // encrypt_enabled
-                None,  // encryption_key_version
+                None, // encrypt_enabled
+                None, // encryption_key_version
             )
             .unwrap();
 
@@ -2095,9 +2111,9 @@ mod tests {
                 None,
                 false,
                 None,
-                None,  // is_encrypted
-                None,  // encryption_key_version
-                None
+                None, // is_encrypted
+                None, // encryption_key_version
+                None,
             )
             .unwrap();
 
@@ -2138,9 +2154,9 @@ mod tests {
                 None,
                 false,
                 None,
-                None,  // is_encrypted
-                None,  // encryption_key_version
-                None
+                None, // is_encrypted
+                None, // encryption_key_version
+                None,
             )
             .unwrap();
 
@@ -2192,9 +2208,9 @@ mod tests {
                 None,
                 false,
                 None,
-                None,  // is_encrypted
-                None,  // encryption_key_version
-                None
+                None, // is_encrypted
+                None, // encryption_key_version
+                None,
             )
             .unwrap();
 
@@ -2230,8 +2246,14 @@ mod tests {
                 10 * 1024 * 1024,
                 1024 * 1024,
                 10,
-                None, None, None,
-                false, None, None, None, None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
         manager.on_chunk_completed("dl_resume", 0);
@@ -2275,8 +2297,14 @@ mod tests {
                 10 * 1024 * 1024,
                 1024 * 1024,
                 10,
-                None, None, None,
-                false, None, None, None, None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -2325,8 +2353,14 @@ mod tests {
                 50 * 1024 * 1024,
                 5 * 1024 * 1024,
                 10,
-                None, None, None,
-                false, None, None, None, None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 

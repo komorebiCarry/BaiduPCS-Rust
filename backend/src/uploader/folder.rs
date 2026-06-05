@@ -7,9 +7,9 @@
 //! - 分批扫描支持（内存优化）
 
 use anyhow::{Context, Result};
-use serde::{Serialize, Deserialize};
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// 分批扫描配置常量
@@ -65,7 +65,9 @@ fn is_symlink_target_allowed(path: &Path, allowed_paths: &[PathBuf]) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    allowed_paths.iter().any(|allowed| real_path.starts_with(allowed))
+    allowed_paths
+        .iter()
+        .any(|allowed| real_path.starts_with(allowed))
 }
 
 /// 文件夹扫描器
@@ -176,7 +178,7 @@ impl FolderScanner {
             } else {
                 std::fs::symlink_metadata(&path)
             }
-                .with_context(|| format!("读取文件元数据失败: {}", path.display()))?;
+            .with_context(|| format!("读取文件元数据失败: {}", path.display()))?;
 
             if metadata.is_dir() {
                 // 递归扫描子目录
@@ -292,7 +294,11 @@ impl BatchedScanIterator {
         let mut pending_dirs = VecDeque::new();
         pending_dirs.push_back(root_path.clone());
 
-        info!("开始分批扫描文件夹: {}, batch_size={}", root_path.display(), batch_size);
+        info!(
+            "开始分批扫描文件夹: {}, batch_size={}",
+            root_path.display(),
+            batch_size
+        );
 
         Ok(Self {
             pending_dirs,
@@ -325,7 +331,10 @@ impl BatchedScanIterator {
         }
         info!(
             "从检查点恢复扫描: {}, 已扫描目录={}, 待扫描目录={}, 已扫描文件={}",
-            root_path.display(), scanned_dirs.len(), dirs.len(), scanned_files_count
+            root_path.display(),
+            scanned_dirs.len(),
+            dirs.len(),
+            scanned_files_count
         );
         Ok(Self {
             pending_dirs: dirs,
@@ -384,10 +393,7 @@ impl BatchedScanIterator {
         // 检查是否扫描完成
         if batch.is_empty() && self.pending_dirs.is_empty() && self.pending_files.is_empty() {
             self.finished = true;
-            info!(
-                "分批扫描完成: 总共扫描 {} 个文件",
-                self.total_scanned
-            );
+            info!("分批扫描完成: 总共扫描 {} 个文件", self.total_scanned);
             return Ok(None);
         }
 
@@ -750,7 +756,8 @@ mod tests {
             ..Default::default()
         };
         // 使用小批次大小测试分批逻辑
-        let mut iterator = BatchedScanIterator::with_batch_size(temp_dir.path(), options, 2).unwrap();
+        let mut iterator =
+            BatchedScanIterator::with_batch_size(temp_dir.path(), options, 2).unwrap();
 
         let mut batch_count = 0;
         let mut all_files = Vec::new();
@@ -774,7 +781,11 @@ mod tests {
 
         // 创建 50 个文件
         for i in 0..50 {
-            fs::write(root.join(format!("file{:03}.txt", i)), format!("content{}", i)).unwrap();
+            fs::write(
+                root.join(format!("file{:03}.txt", i)),
+                format!("content{}", i),
+            )
+            .unwrap();
         }
 
         let options = ScanOptions::default();
@@ -807,7 +818,8 @@ mod tests {
     fn test_batched_scan_has_more() {
         let temp_dir = create_test_folder();
         let options = ScanOptions::default();
-        let mut iterator = BatchedScanIterator::with_batch_size(temp_dir.path(), options, 2).unwrap();
+        let mut iterator =
+            BatchedScanIterator::with_batch_size(temp_dir.path(), options, 2).unwrap();
 
         assert!(iterator.has_more(), "初始状态应该有更多批次");
 
@@ -821,7 +833,8 @@ mod tests {
     fn test_batched_scan_total_scanned() {
         let temp_dir = create_test_folder();
         let options = ScanOptions::default();
-        let mut iterator = BatchedScanIterator::with_batch_size(temp_dir.path(), options, 2).unwrap();
+        let mut iterator =
+            BatchedScanIterator::with_batch_size(temp_dir.path(), options, 2).unwrap();
 
         assert_eq!(iterator.total_scanned(), 0, "初始扫描数应为0");
 
@@ -845,7 +858,11 @@ mod tests {
             all_files.extend(batch);
         }
 
-        assert!(all_files.len() <= 3, "应该最多扫描3个文件，实际: {}", all_files.len());
+        assert!(
+            all_files.len() <= 3,
+            "应该最多扫描3个文件，实际: {}",
+            all_files.len()
+        );
     }
 
     // ==================== 符号链接白名单校验测试 ====================

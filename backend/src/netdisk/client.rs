@@ -134,9 +134,7 @@ impl NetdiskClient {
             builder = proxy.apply_to_builder(builder)?;
         }
 
-        let client = builder
-            .build()
-            .context("Failed to create HTTP client")?;
+        let client = builder.build().context("Failed to create HTTP client")?;
 
         info!(
             "初始化网盘客户端成功, UID={}, PTOKEN={}",
@@ -205,7 +203,9 @@ impl NetdiskClient {
                             // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
                             let mgr_clone = std::sync::Arc::clone(mgr);
                             tokio::spawn(async move {
-                                let allow = mgr_clone.user_proxy_config().await
+                                let allow = mgr_clone
+                                    .user_proxy_config()
+                                    .await
                                     .map(|c| c.allow_fallback)
                                     .unwrap_or(true);
                                 if allow {
@@ -482,7 +482,7 @@ impl NetdiskClient {
             "步骤 1/4 (/disk/home)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         self.debug_print_cookies("步骤 1/4 后 Cookie 状态");
 
@@ -506,7 +506,7 @@ impl NetdiskClient {
             "步骤 2/4 (/api/loginStatus)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
             if let Some(bdstoken) = json["login_info"]["bdstoken"].as_str() {
@@ -542,7 +542,7 @@ impl NetdiskClient {
             "步骤 3/4 (/api/gettemplatevariable)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         // 提取 bdstoken
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body3) {
@@ -580,7 +580,7 @@ impl NetdiskClient {
             "步骤 4/4 (/pcloud/user/getinfo)",
             &self.panpsc_cookie,
         )
-            .await?;
+        .await?;
 
         self.debug_print_cookies("步骤 4/4 后 Cookie 状态");
 
@@ -768,17 +768,17 @@ impl NetdiskClient {
             .await
             .context("fetch_bdstoken: /api/loginStatus 请求失败")?;
 
-        let body = resp
-            .text()
-            .await
-            .context("fetch_bdstoken: 读取响应失败")?;
+        let body = resp.text().await.context("fetch_bdstoken: 读取响应失败")?;
 
         info!("fetch_bdstoken: /api/loginStatus 响应 = {}", body);
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
             if let Some(token) = json["login_info"]["bdstoken"].as_str() {
                 if !token.is_empty() {
-                    info!("fetch_bdstoken: 从 loginStatus 获取到 bdstoken（长度={}）", token.len());
+                    info!(
+                        "fetch_bdstoken: 从 loginStatus 获取到 bdstoken（长度={}）",
+                        token.len()
+                    );
                     let mut cached = self.bdstoken.lock().await;
                     *cached = Some(token.to_string());
                     return Ok(Some(token.to_string()));
@@ -811,7 +811,10 @@ impl NetdiskClient {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
             if let Some(token) = json["result"]["bdstoken"].as_str() {
                 if !token.is_empty() {
-                    info!("fetch_bdstoken: 从 gettemplatevariable 获取到 bdstoken（长度={}）", token.len());
+                    info!(
+                        "fetch_bdstoken: 从 gettemplatevariable 获取到 bdstoken（长度={}）",
+                        token.len()
+                    );
                     let mut cached = self.bdstoken.lock().await;
                     *cached = Some(token.to_string());
                     return Ok(Some(token.to_string()));
@@ -1017,10 +1020,12 @@ impl NetdiskClient {
             anyhow::bail!("Search API error errno={}", search_result.errno);
         }
 
-        debug!("搜索到 {} 个结果 (list={}, contentlist={})",
+        debug!(
+            "搜索到 {} 个结果 (list={}, contentlist={})",
             search_result.list.len() + search_result.contentlist.len(),
             search_result.list.len(),
-            search_result.contentlist.len());
+            search_result.contentlist.len()
+        );
         Ok(search_result)
     }
 
@@ -1066,10 +1071,8 @@ impl NetdiskClient {
             }
         };
 
-        let file_metas: crate::netdisk::FileMetasResponse = response
-            .json()
-            .await
-            .context("解析文件元信息响应失败")?;
+        let file_metas: crate::netdisk::FileMetasResponse =
+            response.json().await.context("解析文件元信息响应失败")?;
 
         if file_metas.errno != 0 {
             anyhow::bail!(
@@ -1478,7 +1481,10 @@ impl NetdiskClient {
         block_list: &str,
         rtype: &str,
     ) -> Result<PrecreateResponse> {
-        info!("预创建文件: path={}, size={}, rtype={}", remote_path, file_size, rtype);
+        info!(
+            "预创建文件: path={}, size={}, rtype={}",
+            remote_path, file_size, rtype
+        );
 
         let url = "https://pan.baidu.com/api/precreate";
 
@@ -2267,7 +2273,10 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<crate::transfer::ShareFileListResult> {
-        info!("获取分享文件列表(根目录): short_key={}, page={}, num={}", short_key, page, num);
+        info!(
+            "获取分享文件列表(根目录): short_key={}, page={}, num={}",
+            short_key, page, num
+        );
 
         // short_key 包含 '1'（如 "1abcDEFg"），需要去掉第一个字符
         let shorturl = if short_key.starts_with('1') && short_key.len() > 1 {
@@ -2321,10 +2330,14 @@ impl NetdiskClient {
         }
 
         // 从响应中提取 uk 和 share_id（用于子目录导航拼接 dir）
-        let resp_uk = json["uk"].as_u64().map(|v| v.to_string())
+        let resp_uk = json["uk"]
+            .as_u64()
+            .map(|v| v.to_string())
             .or_else(|| json["uk"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        let resp_shareid = json["share_id"].as_u64().map(|v| v.to_string())
+        let resp_shareid = json["share_id"]
+            .as_u64()
+            .map(|v| v.to_string())
             .or_else(|| json["share_id"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
 
@@ -2405,7 +2418,10 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
-        info!("获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}", shareid, dir, page, num);
+        info!(
+            "获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}",
+            shareid, dir, page, num
+        );
 
         let encoded_dir = urlencoding::encode(dir);
 
@@ -2428,10 +2444,14 @@ impl NetdiskClient {
             .await
             .context("获取分享子目录文件列表失败")?;
 
-        let response_text = response.text().await.context("读取子目录文件列表响应失败")?;
+        let response_text = response
+            .text()
+            .await
+            .context("读取子目录文件列表响应失败")?;
         debug!("子目录文件列表响应: {}", response_text);
 
-        let json: Value = serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
+        let json: Value =
+            serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
 
         let errno = json["errno"].as_i64().unwrap_or(-1);
         if errno != 0 {
@@ -2591,7 +2611,14 @@ impl NetdiskClient {
 
                 // 调用 query_transfer_task 轮询任务状态
                 return self
-                    .query_transfer_task(&task_id_string, shareid, share_uk, bdstoken, referer, internal_task_id)
+                    .query_transfer_task(
+                        &task_id_string,
+                        shareid,
+                        share_uk,
+                        bdstoken,
+                        referer,
+                        internal_task_id,
+                    )
                     .await;
             }
 
@@ -2678,7 +2705,9 @@ impl NetdiskClient {
                     .as_array()
                     .map(|list| {
                         list.iter()
-                            .filter_map(|item| item["server_filename"].as_str().map(|s| s.to_string()))
+                            .filter_map(|item| {
+                                item["server_filename"].as_str().map(|s| s.to_string())
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -2767,9 +2796,9 @@ impl NetdiskClient {
                 0 // 第 1 次：立即
             } else {
                 let (base_ms, jitter_ms) = match attempt {
-                    2..=5 => (1000, 200),   // 第 2-5 次：1秒 ± 200ms
-                    6..=10 => (2000, 400),  // 第 6-10 次：2秒 ± 400ms
-                    _ => (5000, 1000),      // 第 11+ 次：5秒 ± 1000ms
+                    2..=5 => (1000, 200),  // 第 2-5 次：1秒 ± 200ms
+                    6..=10 => (2000, 400), // 第 6-10 次：2秒 ± 400ms
+                    _ => (5000, 1000),     // 第 11+ 次：5秒 ± 1000ms
                 };
 
                 // 生成随机抖动
@@ -2781,9 +2810,9 @@ impl NetdiskClient {
             // 等待延迟
             if delay_ms > 0 {
                 debug!(
-                        "异步转存任务查询 - 尝试 {}: 等待 {}ms 后查询",
-                        attempt, delay_ms
-                    );
+                    "异步转存任务查询 - 尝试 {}: 等待 {}ms 后查询",
+                    attempt, delay_ms
+                );
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
             } else {
                 debug!("异步转存任务查询 - 尝试 {}: 立即查询", attempt);
@@ -2820,7 +2849,8 @@ impl NetdiskClient {
             let response_text = response.text().await.context("读取任务查询响应失败")?;
             debug!("任务查询响应 (尝试 {}): {}", attempt, response_text);
 
-            let json: Value = serde_json::from_str(&response_text).context("解析任务查询响应失败")?;
+            let json: Value =
+                serde_json::from_str(&response_text).context("解析任务查询响应失败")?;
 
             let errno = json["errno"].as_i64().unwrap_or(-1);
             let task_errno = json["task_errno"].as_i64().unwrap_or(0);
@@ -2829,10 +2859,10 @@ impl NetdiskClient {
             // 检查 API 错误
             if errno != 0 {
                 return Err(anyhow::anyhow!(
-                        "任务查询 API 错误: errno={}, response={}",
-                        errno,
-                        response_text
-                    ));
+                    "任务查询 API 错误: errno={}, response={}",
+                    errno,
+                    response_text
+                ));
             }
 
             // 检查任务错误
@@ -2849,10 +2879,10 @@ impl NetdiskClient {
                         progress
                     );
                 return Err(anyhow::anyhow!(
-                        "异步转存任务失败: task_errno={}, response={}",
-                        task_errno,
-                        response_text
-                    ));
+                    "异步转存任务失败: task_errno={}, response={}",
+                    task_errno,
+                    response_text
+                ));
             }
 
             // 检查任务状态
@@ -2860,9 +2890,9 @@ impl NetdiskClient {
                 "success" => {
                     // 任务完成，提取结果
                     info!(
-                            "异步转存任务完成 (task_id={}, 尝试次数={})",
-                            task_id, attempt
-                        );
+                        "异步转存任务完成 (task_id={}, 尝试次数={})",
+                        task_id, attempt
+                    );
 
                     let list = json["list"].as_array();
                     let mut transferred_paths = Vec::new();
@@ -2882,10 +2912,7 @@ impl NetdiskClient {
                             }
                         }
 
-                        info!(
-                                "异步转存成功: {} 个文件 (使用 list.length)",
-                                list.len()
-                            );
+                        info!("异步转存成功: {} 个文件 (使用 list.length)", list.len());
                     } else {
                         warn!("任务查询响应中没有 list 字段");
                     }
@@ -2901,24 +2928,24 @@ impl NetdiskClient {
                 "failed" => {
                     // 任务失败
                     return Err(anyhow::anyhow!(
-                            "异步转存任务失败: status=failed, response={}",
-                            response_text
-                        ));
+                        "异步转存任务失败: status=failed, response={}",
+                        response_text
+                    ));
                 }
                 "running" => {
                     // 任务仍在运行，继续轮询
                     debug!(
-                            "异步转存任务仍在运行 (task_id={}, 尝试 {})",
-                            task_id, attempt
-                        );
+                        "异步转存任务仍在运行 (task_id={}, 尝试 {})",
+                        task_id, attempt
+                    );
                     continue;
                 }
                 _ => {
                     // 未知状态，记录警告并继续轮询（兼容性考虑）
                     warn!(
-                            "异步转存任务状态未知: status='{}', 继续轮询 (尝试 {})",
-                            status, attempt
-                        );
+                        "异步转存任务状态未知: status='{}', 继续轮询 (尝试 {})",
+                        status, attempt
+                    );
                     continue;
                 }
             }
@@ -3069,7 +3096,10 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取磁力链接信息响应失败")?;
 
-        info!("查询磁力链接信息响应: status={}, body={}", status, response_text);
+        info!(
+            "查询磁力链接信息响应: status={}, body={}",
+            status, response_text
+        );
 
         // 解析响应，提取文件数量
         let json: serde_json::Value =
@@ -3107,7 +3137,10 @@ impl NetdiskClient {
     /// # 返回
     /// 新创建的任务 ID
     pub async fn cloud_dl_add_task(&self, source_url: &str, save_path: &str) -> Result<i64> {
-        info!("添加离线下载任务: source_url={}, save_path={}", source_url, save_path);
+        info!(
+            "添加离线下载任务: source_url={}, save_path={}",
+            source_url, save_path
+        );
 
         // 标准化磁力链接（将 Base32 转换为十六进制，小写转大写）
         let normalized_url = Self::normalize_magnet_link(source_url);
@@ -3117,7 +3150,10 @@ impl NetdiskClient {
 
         // 对于磁力链接，需要先查询文件列表，然后选择所有文件
         let selected_idx = if is_magnet {
-            match self.cloud_dl_query_magnet_info(&normalized_url, save_path).await {
+            match self
+                .cloud_dl_query_magnet_info(&normalized_url, save_path)
+                .await
+            {
                 Ok(file_count) if file_count > 0 => {
                     // 生成所有文件的索引：1,2,3,...,n（索引从1开始）
                     let indices: Vec<String> = (1..=file_count).map(|i| i.to_string()).collect();
@@ -3164,7 +3200,10 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取添加任务响应失败")?;
 
-        info!("添加离线任务响应: status={}, body={}", status, response_text);
+        info!(
+            "添加离线任务响应: status={}, body={}",
+            status, response_text
+        );
 
         let api_response: crate::netdisk::cloud_dl::BaiduAddTaskResponse =
             serde_json::from_str(&response_text).context("解析添加任务响应失败")?;
@@ -3343,10 +3382,9 @@ impl NetdiskClient {
         let mut tasks = Vec::new();
         if let Some(task_map) = api_response.task_info.as_object() {
             for (task_id_str, task_value) in task_map {
-                if let Ok(mut baidu_task) =
-                    serde_json::from_value::<crate::netdisk::cloud_dl::BaiduTaskInfo>(
-                        task_value.clone(),
-                    )
+                if let Ok(mut baidu_task) = serde_json::from_value::<
+                    crate::netdisk::cloud_dl::BaiduTaskInfo,
+                >(task_value.clone())
                 {
                     // 如果 task_id 为空，使用 JSON key 作为 task_id
                     if baidu_task.task_id.is_empty() {
@@ -3472,7 +3510,8 @@ impl NetdiskClient {
     pub async fn cloud_dl_clear_task(&self) -> Result<i32> {
         info!("清空离线下载任务记录");
 
-        let url = "https://pan.baidu.com/rest/2.0/services/cloud_dl?method=clear_task&app_id=250528";
+        let url =
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?method=clear_task&app_id=250528";
 
         let response = self
             .client
@@ -3676,7 +3715,10 @@ impl NetdiskClient {
         let response_text = response.text().await.context("读取分享列表响应失败")?;
 
         // 临时使用 info 级别日志查看响应内容
-        info!("获取分享列表响应: status={}, body={}", status, response_text);
+        info!(
+            "获取分享列表响应: status={}, body={}",
+            status, response_text
+        );
 
         let list_response: crate::netdisk::ShareListResponse =
             serde_json::from_str(&response_text).context("解析分享列表响应失败")?;
@@ -3854,10 +3896,7 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取删除文件响应失败")?;
 
-        info!(
-            "删除文件响应: status={}, body={}",
-            status, response_text
-        );
+        info!("删除文件响应: status={}, body={}", status, response_text);
 
         // 解析响应
         let api_response: crate::netdisk::DeleteFilesApiResponse =
@@ -3951,7 +3990,11 @@ impl NetdiskClient {
             HeaderValue::from_static("https://pan.baidu.com/disk/main"),
         );
 
-        debug!("filemanager POST opera={} filelist_len={}", opera, filelist_json.len());
+        debug!(
+            "filemanager POST opera={} filelist_len={}",
+            opera,
+            filelist_json.len()
+        );
 
         let response = pan_client
             .post(&url)
@@ -3978,7 +4021,10 @@ impl NetdiskClient {
             .await
             .context(format!("读取 filemanager {} 响应失败", opera))?;
         let safe_body = redact_authwidget_in_body(&response_text);
-        info!("filemanager {} 响应: status={}, body={}", opera, status, safe_body);
+        info!(
+            "filemanager {} 响应: status={}, body={}",
+            opera, status, safe_body
+        );
 
         Ok(response_text)
     }
@@ -3990,8 +4036,12 @@ impl NetdiskClient {
     /// - `errno == 0 && taskid == 0` → 同步完成，返回 Success（罕见）
     /// - `errno == 0 && taskid != 0` → 进入 `query_filemanager_task` 轮询
     async fn handle_filemanager_result(&self, body: &str) -> Result<FileOperationOutcome> {
-        let resp: FileManagerResponse = serde_json::from_str(body)
-            .with_context(|| format!("解析 filemanager 响应失败: body={}", redact_authwidget_in_body(body)))?;
+        let resp: FileManagerResponse = serde_json::from_str(body).with_context(|| {
+            format!(
+                "解析 filemanager 响应失败: body={}",
+                redact_authwidget_in_body(body)
+            )
+        })?;
 
         if resp.errno != 0 {
             let message = if !resp.errmsg.is_empty() {
@@ -4040,7 +4090,10 @@ impl NetdiskClient {
         loop {
             attempt += 1;
             if attempt > MAX_ATTEMPTS {
-                warn!("filemanager taskquery 轮询达到上限 {} 次仍未完成: taskid={}", MAX_ATTEMPTS, taskid);
+                warn!(
+                    "filemanager taskquery 轮询达到上限 {} 次仍未完成: taskid={}",
+                    MAX_ATTEMPTS, taskid
+                );
                 return Ok(FileOperationOutcome::Failed {
                     message: "任务仍在后台处理，请稍后刷新查看".to_string(),
                     payload: FileOperationErrorPayload {
@@ -4103,11 +4156,15 @@ impl NetdiskClient {
                 .await
                 .context("读取 filemanager taskquery 响应失败")?;
             let safe_body = redact_authwidget_in_body(&body);
-            debug!("filemanager taskquery 响应 (尝试 {}): {}", attempt, safe_body);
+            debug!(
+                "filemanager taskquery 响应 (尝试 {}): {}",
+                attempt, safe_body
+            );
 
-            let parsed: FileManagerTaskQueryResponse = serde_json::from_str(&body).with_context(|| {
-                format!("解析 filemanager taskquery 响应失败: body={}", safe_body)
-            })?;
+            let parsed: FileManagerTaskQueryResponse =
+                serde_json::from_str(&body).with_context(|| {
+                    format!("解析 filemanager taskquery 响应失败: body={}", safe_body)
+                })?;
 
             // body 本身 errno != 0：透传 errno，并同步填 task_errno（与 status=failed 路径保持一致，便于 -6/111 retry 判定）
             if parsed.errno != 0 {
@@ -4133,7 +4190,10 @@ impl NetdiskClient {
 
             match parsed.status.as_str() {
                 "success" => {
-                    info!("filemanager 任务完成: taskid={} total={}", taskid, parsed.total);
+                    info!(
+                        "filemanager 任务完成: taskid={} total={}",
+                        taskid, parsed.total
+                    );
                     return Ok(FileOperationOutcome::Success(FileOperationSuccess {
                         taskid,
                         total: parsed.total,
@@ -4168,7 +4228,10 @@ impl NetdiskClient {
                 }
                 other => {
                     // 未知状态，按容错策略继续轮询
-                    warn!("filemanager taskquery 未知状态: status='{}' (尝试 {})", other, attempt);
+                    warn!(
+                        "filemanager taskquery 未知状态: status='{}' (尝试 {})",
+                        other, attempt
+                    );
                     continue;
                 }
             }
@@ -4202,7 +4265,8 @@ impl NetdiskClient {
     ///
     /// 接收 owned `RenameItem`：rename 单条 item，调用方按需 clone 以支持 warmup 重试。
     pub async fn rename_file(&self, item: RenameItem) -> Result<FileOperationOutcome> {
-        let filelist_json = serde_json::to_string(&[item]).context("序列化 rename filelist 失败")?;
+        let filelist_json =
+            serde_json::to_string(&[item]).context("序列化 rename filelist 失败")?;
         let body = self.filemanager_post("rename", &filelist_json).await?;
         self.handle_filemanager_result(&body).await
     }
@@ -4237,7 +4301,10 @@ pub fn validate_filename(name: &str) -> Result<(), String> {
         return Err(format!("名称含非法字符: {}", c));
     }
     // ASCII 控制字符
-    if name.chars().any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F) {
+    if name
+        .chars()
+        .any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F)
+    {
         return Err("名称含控制字符".to_string());
     }
     // 首尾空格
@@ -4251,9 +4318,8 @@ pub fn validate_filename(name: &str) -> Result<(), String> {
     // Windows 保留名（取 stem 部分对比，大小写不敏感）
     let stem = name.split('.').next().unwrap_or(name).to_uppercase();
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if RESERVED.contains(&stem.as_str()) {
         return Err(format!("名称不能使用系统保留词: {}", stem));
@@ -4379,7 +4445,11 @@ mod tests {
 
         assert!(!response.success);
         assert!(response.error.is_some());
-        assert!(response.error.as_ref().unwrap().contains("部分文件删除失败"));
+        assert!(response
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("部分文件删除失败"));
         assert_eq!(response.failed_paths, failed_paths);
         assert_eq!(response.deleted_count, 5);
     }
@@ -4473,7 +4543,7 @@ mod transfer_preservation_tests {
                 "list": list
             }
         })
-            .to_string()
+        .to_string()
     }
 
     /// 模拟同步转存响应（task_id 为字符串 "0"）
@@ -4496,7 +4566,7 @@ mod transfer_preservation_tests {
                 "list": list
             }
         })
-            .to_string()
+        .to_string()
     }
 
     /// 模拟 errno=4 重复文件错误响应
@@ -4518,7 +4588,7 @@ mod transfer_preservation_tests {
                 "list": dup_list
             }
         })
-            .to_string()
+        .to_string()
     }
 
     /// 模拟 errno=4 但没有 duplicated 字段（真正的超时）
@@ -4527,7 +4597,7 @@ mod transfer_preservation_tests {
             "errno": 4,
             "show_msg": "请求超时"
         })
-            .to_string()
+        .to_string()
     }
 
     /// 模拟 errno=12 部分错误（同名文件）
@@ -4541,7 +4611,7 @@ mod transfer_preservation_tests {
                 }
             ]
         })
-            .to_string()
+        .to_string()
     }
 
     /// 模拟 errno=12 转存数量超限
@@ -4551,7 +4621,7 @@ mod transfer_preservation_tests {
             "target_file_nums": current,
             "target_file_nums_limit": limit
         })
-            .to_string()
+        .to_string()
     }
 
     /// 解析转存响应（模拟 transfer_share_files 的核心逻辑）
@@ -4784,7 +4854,7 @@ mod transfer_preservation_tests {
             "errno": 4,
             "duplicated": {}
         })
-            .to_string();
+        .to_string();
         let result = parse_transfer_response(&response);
 
         assert!(!result.success);
@@ -4839,7 +4909,7 @@ mod transfer_preservation_tests {
             "errno": -1,
             "show_msg": "未知错误"
         })
-            .to_string();
+        .to_string();
         let result = parse_transfer_response(&response);
 
         assert!(!result.success);
@@ -4978,7 +5048,7 @@ mod transfer_preservation_tests {
                 "list": []
             }
         })
-            .to_string();
+        .to_string();
 
         let result = parse_transfer_response(&response);
         assert!(result.success);
@@ -5007,7 +5077,7 @@ mod transfer_preservation_tests {
                 ]
             }
         })
-            .to_string();
+        .to_string();
 
         let result = parse_transfer_response(&response);
         assert!(result.success);
@@ -5033,7 +5103,7 @@ mod transfer_preservation_tests {
                 ]
             }
         })
-            .to_string();
+        .to_string();
 
         let result = parse_transfer_response(&response);
         assert!(result.success);
@@ -5044,10 +5114,8 @@ mod transfer_preservation_tests {
     // filemanager（copy / move / rename）相关单元测试
     // =====================================================
 
-    use crate::netdisk::{
-        FileManagerResponse, FileManagerTaskQueryResponse,
-    };
     use crate::netdisk::client::{redact_authwidget_in_body, validate_filename};
+    use crate::netdisk::{FileManagerResponse, FileManagerTaskQueryResponse};
 
     #[test]
     fn test_filemanager_response_parse_taskid_number() {
@@ -5186,11 +5254,8 @@ mod transfer_preservation_tests {
     fn test_validate_filename_windows_reserved() {
         // 大小写、含扩展名、仅 stem 三种形态
         for name in [
-            "CON", "con", "Con",
-            "PRN", "prn",
-            "AUX.txt", "aux.bak",
-            "NUL.bak", "nul",
-            "COM1", "com2", "COM9", "lpt1", "LPT9",
+            "CON", "con", "Con", "PRN", "prn", "AUX.txt", "aux.bak", "NUL.bak", "nul", "COM1",
+            "com2", "COM9", "lpt1", "LPT9",
         ] {
             assert!(
                 validate_filename(name).is_err(),
@@ -5210,7 +5275,8 @@ mod transfer_preservation_tests {
 
     #[test]
     fn test_redact_authwidget_in_body_basic() {
-        let body = r#"{"errno":132,"authwidget":{"saferand":"r1","safesign":"sig123","safetpl":"tplA"}}"#;
+        let body =
+            r#"{"errno":132,"authwidget":{"saferand":"r1","safesign":"sig123","safetpl":"tplA"}}"#;
         let red = redact_authwidget_in_body(body);
         assert!(red.contains(r#""saferand":"<redacted>""#));
         assert!(red.contains(r#""safesign":"<redacted>""#));

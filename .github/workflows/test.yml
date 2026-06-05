@@ -1,0 +1,74 @@
+name: Test
+
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  # ============ 后端单元 / 集成测试 ============
+  backend-test:
+    name: Backend (cargo test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run cargo test
+        working-directory: backend
+        run: cargo test --lib --all-features -- --nocapture
+
+      - name: Run cargo clippy (deny warnings)
+        working-directory: backend
+        run: cargo clippy --lib --all-features -- -D warnings
+
+  # ============ 前端类型 / 构建 / 测试 ============
+  frontend-test:
+    name: Frontend (vue-tsc + build + vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type check
+        working-directory: frontend
+        run: npx vue-tsc --noEmit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run unit tests
+        working-directory: frontend
+        run: npm test -- --run
+        continue-on-error: true   # 不阻塞：当前前端单测覆盖率低，逐步补

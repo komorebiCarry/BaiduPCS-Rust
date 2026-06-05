@@ -5,7 +5,7 @@
 //! - Stage 2: Plan（生成同步计划）
 //! - Stage 3: Execute（执行传输 + 更新状态）
 
-pub mod types;
 pub mod intent;
-pub mod state_manager;
 pub mod plan;
+pub mod state_manager;
+pub mod types;

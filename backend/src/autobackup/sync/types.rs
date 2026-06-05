@@ -2,8 +2,8 @@
 //!
 //! 定义 Sync 三阶段所需的数据结构：快照类型、同步计划、动作、状态更新等。
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// 同步动作方向（对应 sync_state.last_sync_direction）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -20,7 +20,9 @@ pub use handlers::{
     get_config, login, logout, refresh, regenerate_recovery_codes, set_password, status,
     totp_disable, totp_setup, totp_verify, update_config,
 };
-pub use middleware::{web_auth_middleware, AuthErrorResponse, AuthenticatedUser, OptionalAuthenticatedUser};
+pub use middleware::{
+    web_auth_middleware, AuthErrorResponse, AuthenticatedUser, OptionalAuthenticatedUser,
+};
 pub use password::{PasswordManager, MIN_PASSWORD_LENGTH};
 pub use rate_limiter::{
     create_rate_limiter, RateLimiter, ATTEMPT_WINDOW, CLEANUP_INTERVAL_SECS, LOCKOUT_DURATION,
@@ -28,7 +30,9 @@ pub use rate_limiter::{
 };
 pub use recovery::{RecoveryCodeManager, RECOVERY_CODE_COUNT};
 pub use state::WebAuthState;
-pub use store::{create_auth_store, create_auth_store_with_path, AuthStore, DEFAULT_AUTH_STORE_PATH};
+pub use store::{
+    create_auth_store, create_auth_store_with_path, AuthStore, DEFAULT_AUTH_STORE_PATH,
+};
 pub use token::{
     create_token_service, TokenService, ACCESS_TOKEN_EXPIRY, MAX_TOKENS, REFRESH_TOKEN_EXPIRY,
     TOKEN_CLEANUP_INTERVAL_SECS,

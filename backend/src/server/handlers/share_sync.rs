@@ -6,15 +6,16 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::server::error::ApiError;
 use crate::server::AppState;
 use crate::share_sync::{
-    infer_share_root, normalize_pagination, normalize_share_path, CreateShareSubscriptionRequest, RunItemRecord, RunRecord,
-    ShareSubscription, ShareSyncError, ShareSyncManager, UpdateShareSubscriptionRequest,
+    infer_share_root, normalize_pagination, normalize_share_path, CreateShareSubscriptionRequest,
+    RunItemRecord, RunRecord, ShareSubscription, ShareSyncError, ShareSyncManager,
+    UpdateShareSubscriptionRequest,
 };
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -70,7 +71,12 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
         ShareSyncError::FileSystemError(m) => err_bad(&m),
         ShareSyncError::NetworkError(m) => err_bad(&format!("网络错误: {}", m)),
         ShareSyncError::PersistenceError(m) => {
-            if m.contains("读取配置") || m.contains("保存配置") || m.contains("路径") || m.contains("目录") || m.contains("权限") {
+            if m.contains("读取配置")
+                || m.contains("保存配置")
+                || m.contains("路径")
+                || m.contains("目录")
+                || m.contains("权限")
+            {
                 err_bad(&m)
             } else {
                 err_internal(&m)
@@ -83,10 +89,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
     }
 }
 
-fn ensure_subscription_exists(
-    manager: &Arc<ShareSyncManager>,
-    id: &str,
-) -> ApiResult<()> {
+fn ensure_subscription_exists(manager: &Arc<ShareSyncManager>, id: &str) -> ApiResult<()> {
     if manager.get_subscription(id).is_none() {
         return Err(err_not_found("订阅不存在"));
     }
@@ -138,7 +141,9 @@ pub async fn update_subscription(
     Json(req): Json<UpdateShareSubscriptionRequest>,
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
     let m = get_manager(&state).await?;
-    let existing = m.get_subscription(&id).ok_or_else(|| err_not_found("订阅不存在"))?;
+    let existing = m
+        .get_subscription(&id)
+        .ok_or_else(|| err_not_found("订阅不存在"))?;
     let mut new_sub = existing.clone();
     if let Some(v) = req.name {
         new_sub.name = v;
@@ -183,7 +188,9 @@ pub async fn delete_subscription(
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
     m.delete_subscription(&id).map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(serde_json::json!({"deleted": id}))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({"deleted": id}),
+    )))
 }
 
 /// POST /api/v1/share-sync/subscriptions/:id/enable
@@ -193,7 +200,9 @@ pub async fn enable_subscription(
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
     m.set_enabled(&id, true).map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(serde_json::json!({"enabled": true}))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({"enabled": true}),
+    )))
 }
 
 /// POST /api/v1/share-sync/subscriptions/:id/disable
@@ -203,7 +212,9 @@ pub async fn disable_subscription(
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
     m.set_enabled(&id, false).map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(serde_json::json!({"enabled": false}))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({"enabled": false}),
+    )))
 }
 
 /// POST /api/v1/share-sync/subscriptions/:id/trigger
@@ -213,7 +224,9 @@ pub async fn trigger_subscription(
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
     m.trigger_one(&id).map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(serde_json::json!({"subscription_id": id, "triggered": true}))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({"subscription_id": id, "triggered": true}),
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,14 +262,8 @@ pub async fn get_run(
         .get_run(&id)
         .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
-    let items = m
-        .persistence()
-        .list_run_items(&id)
-        .map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(RunDetailDto {
-        run: rec,
-        items,
-    })))
+    let items = m.persistence().list_run_items(&id).map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(RunDetailDto { run: rec, items })))
 }
 
 #[derive(Debug, Serialize)]
@@ -365,13 +372,7 @@ pub async fn preview_tree(
         if !pwd.is_empty() {
             let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
             if let Err(e) = client
-                .verify_share_password(
-                    &page.shareid,
-                    &page.share_uk,
-                    &page.bdstoken,
-                    pwd,
-                    &referer,
-                )
+                .verify_share_password(&page.shareid, &page.share_uk, &page.bdstoken, pwd, &referer)
                 .await
             {
                 return Err(err_bad(&format!("验证提取码失败: {}", e)));

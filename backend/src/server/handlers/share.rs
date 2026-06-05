@@ -235,19 +235,19 @@ pub async fn create_share(
     };
 
     // 调用分享API
-    match client
-        .share_set(&request.paths, request.period, &pwd)
-        .await
-    {
+    match client.share_set(&request.paths, request.period, &pwd).await {
         Ok(response) => {
             if response.is_success() {
                 // 使用我们传入的 pwd，而不是 response.pwd（百度API可能不返回）
                 let result = ShareResult {
                     link: response.link,
-                    pwd: pwd.clone(),  // 使用我们生成/传入的提取码
+                    pwd: pwd.clone(), // 使用我们生成/传入的提取码
                     shareid: response.shareid,
                 };
-                info!("分享创建成功: shareid={}, pwd={}", result.shareid, result.pwd);
+                info!(
+                    "分享创建成功: shareid={}, pwd={}",
+                    result.shareid, result.pwd
+                );
                 Ok(Json(ApiResponse::success(result)))
             } else {
                 // 检查是否需要预热重试 (errno=-6)
@@ -262,15 +262,12 @@ pub async fn create_share(
                             // 重新获取客户端
                             let client = state.netdisk_client.read().await;
                             if let Some(ref c) = *client {
-                                match c
-                                    .share_set(&request.paths, request.period, &pwd)
-                                    .await
-                                {
+                                match c.share_set(&request.paths, request.period, &pwd).await {
                                     Ok(retry_response) => {
                                         if retry_response.is_success() {
                                             let result = ShareResult {
                                                 link: retry_response.link,
-                                                pwd: pwd.clone(),  // 使用我们生成/传入的提取码
+                                                pwd: pwd.clone(), // 使用我们生成/传入的提取码
                                                 shareid: retry_response.shareid,
                                             };
                                             info!(

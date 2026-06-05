@@ -3,9 +3,7 @@
 //! 使用 notify crate 实现跨平台文件监听
 
 use anyhow::{anyhow, Result};
-use notify::{
-    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -60,7 +58,10 @@ impl FileWatcher {
     }
 
     /// 创建新的文件监听器（自定义最大失败次数）
-    pub fn with_max_failures(event_tx: mpsc::UnboundedSender<FileChangeEvent>, max_failures: u32) -> Result<Self> {
+    pub fn with_max_failures(
+        event_tx: mpsc::UnboundedSender<FileChangeEvent>,
+        max_failures: u32,
+    ) -> Result<Self> {
         let watched_paths = Arc::new(RwLock::new(std::collections::HashMap::new()));
         let watched_paths_clone = watched_paths.clone();
         let event_tx_clone = event_tx.clone();
@@ -82,7 +83,8 @@ impl FileWatcher {
                 }
                 Err(e) => {
                     // 增加失败计数
-                    let count = failure_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let count =
+                        failure_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tracing::error!("File watcher error (count: {}): {}", count + 1, e);
                 }
             }
@@ -184,7 +186,11 @@ impl FileWatcher {
             self.watched_paths
                 .write()
                 .insert(path.to_path_buf(), config_id.to_string());
-            tracing::info!("Started watching path: {:?} for config: {}", path, config_id);
+            tracing::info!(
+                "Started watching path: {:?} for config: {}",
+                path,
+                config_id
+            );
             Ok(())
         } else {
             Err(anyhow!("Watcher not initialized"))
@@ -242,7 +248,8 @@ impl FileWatcher {
 
     /// 停止监听
     pub fn stop(&mut self) {
-        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.watcher.take();
         self.watched_paths.write().clear();
         tracing::info!("File watcher stopped");
@@ -266,7 +273,8 @@ impl FileWatcher {
 
     /// 重置失败计数器
     pub fn reset_failure_count(&self) {
-        self.failure_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.failure_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 获取监听状态信息
@@ -323,8 +331,14 @@ impl FilterService {
         min_file_size: u64,
     ) -> Self {
         Self {
-            include_extensions: include_extensions.into_iter().map(|s| s.to_lowercase()).collect(),
-            exclude_extensions: exclude_extensions.into_iter().map(|s| s.to_lowercase()).collect(),
+            include_extensions: include_extensions
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            exclude_extensions: exclude_extensions
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
             exclude_directories: exclude_directories.into_iter().collect(),
             max_file_size,
             min_file_size,
@@ -354,7 +368,8 @@ impl FilterService {
             let ext_lower = ext.to_lowercase();
 
             // 如果有包含列表，检查是否在列表中
-            if !self.include_extensions.is_empty() && !self.include_extensions.contains(&ext_lower) {
+            if !self.include_extensions.is_empty() && !self.include_extensions.contains(&ext_lower)
+            {
                 return Ok(false);
             }
 
@@ -469,17 +484,17 @@ mod tests {
         let md_file = dir.path().join("test.md");
         let exe_file = dir.path().join("test.exe");
 
-        File::create(&txt_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&txt_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         File::create(&md_file).unwrap().write_all(b"hello").unwrap();
-        File::create(&exe_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&exe_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
 
-        let filter = FilterService::new(
-            vec!["txt".to_string()],
-            vec![],
-            vec![],
-            0,
-            0,
-        );
+        let filter = FilterService::new(vec!["txt".to_string()], vec![], vec![], 0, 0);
 
         assert!(filter.should_process(&txt_file).unwrap());
         assert!(!filter.should_process(&md_file).unwrap());
@@ -492,16 +507,16 @@ mod tests {
         let txt_file = dir.path().join("test.txt");
         let exe_file = dir.path().join("test.exe");
 
-        File::create(&txt_file).unwrap().write_all(b"hello").unwrap();
-        File::create(&exe_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&txt_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
+        File::create(&exe_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
 
-        let filter = FilterService::new(
-            vec![],
-            vec!["exe".to_string()],
-            vec![],
-            0,
-            0,
-        );
+        let filter = FilterService::new(vec![], vec!["exe".to_string()], vec![], 0, 0);
 
         assert!(filter.should_process(&txt_file).unwrap());
         assert!(!filter.should_process(&exe_file).unwrap());
@@ -514,7 +529,10 @@ mod tests {
         let large_file = dir.path().join("large.txt");
 
         File::create(&small_file).unwrap().write_all(b"hi").unwrap(); // 2 bytes
-        File::create(&large_file).unwrap().write_all(&vec![0u8; 1000]).unwrap(); // 1000 bytes
+        File::create(&large_file)
+            .unwrap()
+            .write_all(&vec![0u8; 1000])
+            .unwrap(); // 1000 bytes
 
         // Test max_file_size
         let filter = FilterService::new(vec![], vec![], vec![], 500, 0);
@@ -535,16 +553,16 @@ mod tests {
         let file_in_node_modules = node_modules.join("test.txt");
         let normal_file = dir.path().join("test.txt");
 
-        File::create(&file_in_node_modules).unwrap().write_all(b"hello").unwrap();
-        File::create(&normal_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&file_in_node_modules)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
+        File::create(&normal_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
 
-        let filter = FilterService::new(
-            vec![],
-            vec![],
-            vec!["node_modules".to_string()],
-            0,
-            0,
-        );
+        let filter = FilterService::new(vec![], vec![], vec!["node_modules".to_string()], 0, 0);
 
         assert!(filter.should_process(&normal_file).unwrap());
         assert!(!filter.should_process(&file_in_node_modules).unwrap());
@@ -557,9 +575,15 @@ mod tests {
         let md_file = dir.path().join("test.md");
         let exe_file = dir.path().join("test.exe");
 
-        File::create(&txt_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&txt_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         File::create(&md_file).unwrap().write_all(b"hello").unwrap();
-        File::create(&exe_file).unwrap().write_all(b"hello").unwrap();
+        File::create(&exe_file)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
 
         let filter = FilterService::new(
             vec!["txt".to_string(), "md".to_string()],

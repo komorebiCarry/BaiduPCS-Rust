@@ -632,7 +632,10 @@ mod tests {
     fn test_status_from_i32() {
         assert_eq!(CloudDlTaskStatus::from_i32(0), CloudDlTaskStatus::Success);
         assert_eq!(CloudDlTaskStatus::from_i32(1), CloudDlTaskStatus::Running);
-        assert_eq!(CloudDlTaskStatus::from_i32(2), CloudDlTaskStatus::SystemError);
+        assert_eq!(
+            CloudDlTaskStatus::from_i32(2),
+            CloudDlTaskStatus::SystemError
+        );
         assert_eq!(
             CloudDlTaskStatus::from_i32(3),
             CloudDlTaskStatus::ResourceNotFound
@@ -648,7 +651,10 @@ mod tests {
         );
         assert_eq!(CloudDlTaskStatus::from_i32(7), CloudDlTaskStatus::Cancelled);
         // 未知状态码应返回 SystemError
-        assert_eq!(CloudDlTaskStatus::from_i32(8), CloudDlTaskStatus::SystemError);
+        assert_eq!(
+            CloudDlTaskStatus::from_i32(8),
+            CloudDlTaskStatus::SystemError
+        );
         assert_eq!(
             CloudDlTaskStatus::from_i32(-1),
             CloudDlTaskStatus::SystemError
@@ -663,7 +669,10 @@ mod tests {
         assert_eq!(CloudDlTaskStatus::ResourceNotFound.to_text(), "资源不存在");
         assert_eq!(CloudDlTaskStatus::Timeout.to_text(), "下载超时");
         assert_eq!(CloudDlTaskStatus::DownloadFailed.to_text(), "下载失败");
-        assert_eq!(CloudDlTaskStatus::InsufficientSpace.to_text(), "存储空间不足");
+        assert_eq!(
+            CloudDlTaskStatus::InsufficientSpace.to_text(),
+            "存储空间不足"
+        );
         assert_eq!(CloudDlTaskStatus::Cancelled.to_text(), "已取消");
     }
 

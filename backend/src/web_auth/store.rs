@@ -107,7 +107,10 @@ impl AuthStore {
     /// 更新凭证
     ///
     /// 更新内存中的凭证并自动保存到文件。
-    pub async fn update_credentials(&self, credentials: AuthCredentials) -> Result<(), WebAuthError> {
+    pub async fn update_credentials(
+        &self,
+        credentials: AuthCredentials,
+    ) -> Result<(), WebAuthError> {
         {
             let mut guard = self.credentials.write().await;
             *guard = credentials;
@@ -152,7 +155,10 @@ impl AuthStore {
     }
 
     /// 设置恢复码
-    pub async fn set_recovery_codes(&self, codes: Vec<crate::web_auth::RecoveryCode>) -> Result<(), WebAuthError> {
+    pub async fn set_recovery_codes(
+        &self,
+        codes: Vec<crate::web_auth::RecoveryCode>,
+    ) -> Result<(), WebAuthError> {
         {
             let mut guard = self.credentials.write().await;
             guard.set_recovery_codes(codes);
@@ -193,7 +199,10 @@ impl AuthStore {
 
     /// 获取可用恢复码数量
     pub async fn available_recovery_codes_count(&self) -> usize {
-        self.credentials.read().await.available_recovery_codes_count()
+        self.credentials
+            .read()
+            .await
+            .available_recovery_codes_count()
     }
 
     /// 获取存储文件路径
@@ -259,8 +268,14 @@ mod tests {
         let (store, _temp) = create_test_store().await;
 
         // 设置一些凭证
-        store.set_password_hash("test_hash".to_string()).await.unwrap();
-        store.set_totp_secret("test_secret".to_string()).await.unwrap();
+        store
+            .set_password_hash("test_hash".to_string())
+            .await
+            .unwrap();
+        store
+            .set_totp_secret("test_secret".to_string())
+            .await
+            .unwrap();
 
         // 创建新的 store 实例并加载
         let store2 = AuthStore::new(store.path());
@@ -283,7 +298,10 @@ mod tests {
     async fn test_set_and_clear_password() {
         let (store, _temp) = create_test_store().await;
 
-        store.set_password_hash("hash123".to_string()).await.unwrap();
+        store
+            .set_password_hash("hash123".to_string())
+            .await
+            .unwrap();
         assert!(store.has_password().await);
 
         store.clear_password().await.unwrap();
@@ -294,7 +312,10 @@ mod tests {
     async fn test_set_and_clear_totp() {
         let (store, _temp) = create_test_store().await;
 
-        store.set_totp_secret("secret123".to_string()).await.unwrap();
+        store
+            .set_totp_secret("secret123".to_string())
+            .await
+            .unwrap();
         assert!(store.has_totp().await);
 
         store.clear_totp().await.unwrap();

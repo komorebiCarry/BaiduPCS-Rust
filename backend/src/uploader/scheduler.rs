@@ -10,13 +10,15 @@
 // - 检测任务数变化，重置服务器速度窗口
 // - 🔥 任务槽位机制由 UploadManager 的 TaskSlotPool 管理
 
-use crate::autobackup::events::{BackupTransferNotification, TransferTaskType, UploadCompletionMeta};
+use crate::autobackup::events::{
+    BackupTransferNotification, TransferTaskType, UploadCompletionMeta,
+};
 use crate::encryption::SnapshotManager;
 use crate::netdisk::{NetdiskClient, UploadErrorKind};
 use crate::persistence::PersistenceManager;
-use crate::task_slot_pool::TaskSlotPool;
 use crate::server::events::{ProgressThrottler, TaskEvent, UploadEvent};
 use crate::server::websocket::WebSocketManager;
+use crate::task_slot_pool::TaskSlotPool;
 use crate::uploader::{PcsServerHealthManager, UploadChunk, UploadChunkManager, UploadTask};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -217,7 +219,9 @@ async fn update_encryption_mapping(
     // 注意：snapshot 在 create_task 时已创建（状态为 pending），这里只更新 nonce、algorithm 并标记为 completed
     // 每个文件有独立的 nonce，需要在单个文件上传完成时立即更新
     if let Some((remote_path, encrypted_name, nonce, algorithm, version)) = encryption_info {
-        if let (Some(_enc_name), Some(enc_nonce), Some(enc_algo)) = (encrypted_name, nonce, algorithm) {
+        if let (Some(_enc_name), Some(enc_nonce), Some(enc_algo)) =
+            (encrypted_name, nonce, algorithm)
+        {
             if let Some(ref snapshot_manager) = task_info.snapshot_manager {
                 // 从 remote_path 提取实际的加密文件名（网盘上的真实文件名）
                 // remote_path 格式如: /13/上传/BPR_BKUP_xxx.bkup
@@ -236,13 +240,22 @@ async fn update_encryption_mapping(
                     version as i32,
                 ) {
                     Ok(true) => {
-                        info!("上传任务 {} 加密映射已更新: {} (is_backup={})", task_id, actual_encrypted_name, is_backup);
+                        info!(
+                            "上传任务 {} 加密映射已更新: {} (is_backup={})",
+                            task_id, actual_encrypted_name, is_backup
+                        );
                     }
                     Ok(false) => {
-                        warn!("上传任务 {} 未找到对应的加密映射记录: {} (is_backup={})", task_id, actual_encrypted_name, is_backup);
+                        warn!(
+                            "上传任务 {} 未找到对应的加密映射记录: {} (is_backup={})",
+                            task_id, actual_encrypted_name, is_backup
+                        );
                     }
                     Err(e) => {
-                        error!("更新加密映射失败: task_id={}, is_backup={}, error={}", task_id, is_backup, e);
+                        error!(
+                            "更新加密映射失败: task_id={}, is_backup={}, error={}",
+                            task_id, is_backup, e
+                        );
                     }
                 }
             } else {
@@ -339,7 +352,10 @@ impl UploadChunkScheduler {
     ///
     /// AutoBackupManager 调用此方法设置 channel sender，
     /// 所有备份相关事件（进度、状态、完成、失败等）都通过此 channel 发送
-    pub async fn set_backup_notification_sender(&self, tx: mpsc::UnboundedSender<BackupTransferNotification>) {
+    pub async fn set_backup_notification_sender(
+        &self,
+        tx: mpsc::UnboundedSender<BackupTransferNotification>,
+    ) {
         let mut sender = self.backup_notification_tx.write().await;
         *sender = Some(tx);
         info!("备份上传任务统一通知 channel 已设置");
@@ -605,7 +621,9 @@ impl UploadChunkScheduler {
                                     let client_snapshot = task_info.client.read().unwrap().clone();
                                     let rtype = {
                                         let task = task_info.task.lock().await;
-                                        crate::uploader::conflict::conflict_strategy_to_rtype(task.conflict_strategy)
+                                        crate::uploader::conflict::conflict_strategy_to_rtype(
+                                            task.conflict_strategy,
+                                        )
                                     };
                                     let create_result = client_snapshot
                                         .create_file(
@@ -650,7 +668,9 @@ impl UploadChunkScheduler {
                                                 }
 
                                                 // 🔥 从 UploadManager.tasks 中移除任务（立即清理，避免内存泄漏）
-                                                if let Some(ref manager_tasks) = task_info.manager_tasks {
+                                                if let Some(ref manager_tasks) =
+                                                    task_info.manager_tasks
+                                                {
                                                     manager_tasks.remove(task_id);
                                                     debug!("上传任务 {} 已从 UploadManager.tasks 中移除", task_id);
                                                 }
@@ -659,16 +679,25 @@ impl UploadChunkScheduler {
                                                 let (group_id, encrypted_temp_path, is_backup) = {
                                                     let mut t = task_info.task.lock().await;
                                                     t.mark_completed();
-                                                    (t.group_id.clone(), t.encrypted_temp_path.clone(), t.is_backup)
+                                                    (
+                                                        t.group_id.clone(),
+                                                        t.encrypted_temp_path.clone(),
+                                                        t.is_backup,
+                                                    )
                                                 };
 
                                                 // 🔥 更新加密映射（调度循环触发）
-                                                update_encryption_mapping(task_id, &task_info, is_backup).await;
+                                                update_encryption_mapping(
+                                                    task_id, &task_info, is_backup,
+                                                )
+                                                .await;
 
                                                 // 🔥 清理临时加密文件（如果存在）
                                                 if let Some(temp_path) = encrypted_temp_path {
                                                     if temp_path.exists() {
-                                                        match tokio::fs::remove_file(&temp_path).await {
+                                                        match tokio::fs::remove_file(&temp_path)
+                                                            .await
+                                                        {
                                                             Ok(_) => {
                                                                 info!("上传任务 {} 临时加密文件已清理: {:?}", task_id, temp_path);
                                                             }
@@ -696,19 +725,26 @@ impl UploadChunkScheduler {
 
                                                 // 🔥 如果是备份任务，通知 AutoBackupManager
                                                 if is_backup {
-                                                    let tx_guard = backup_notification_tx.read().await;
+                                                    let tx_guard =
+                                                        backup_notification_tx.read().await;
                                                     if let Some(tx) = tx_guard.as_ref() {
-                                                        let notification = BackupTransferNotification::Completed {
-                                                            task_id: task_id.to_string(),
-                                                            task_type: TransferTaskType::Upload,
-                                                            upload_meta: Some(UploadCompletionMeta {
-                                                                fs_id: response.fs_id,
-                                                                mtime: response.mtime,
-                                                                size: response.size,
-                                                            }),
-                                                        };
+                                                        let notification =
+                                                            BackupTransferNotification::Completed {
+                                                                task_id: task_id.to_string(),
+                                                                task_type: TransferTaskType::Upload,
+                                                                upload_meta: Some(
+                                                                    UploadCompletionMeta {
+                                                                        fs_id: response.fs_id,
+                                                                        mtime: response.mtime,
+                                                                        size: response.size,
+                                                                    },
+                                                                ),
+                                                            };
                                                         if let Err(e) = tx.send(notification) {
-                                                            error!("发送备份上传任务完成通知失败: {}", e);
+                                                            error!(
+                                                                "发送备份上传任务完成通知失败: {}",
+                                                                e
+                                                            );
                                                         } else {
                                                             debug!("已发送备份上传任务完成通知: task_id={}", task_id);
                                                         }
@@ -728,20 +764,27 @@ impl UploadChunkScheduler {
                                                     t.is_backup
                                                 };
                                                 if is_backup {
-                                                    let tx_guard = backup_notification_tx.read().await;
+                                                    let tx_guard =
+                                                        backup_notification_tx.read().await;
                                                     if let Some(tx) = tx_guard.as_ref() {
-                                                        let notification = BackupTransferNotification::Failed {
-                                                            task_id: task_id.to_string(),
-                                                            task_type: TransferTaskType::Upload,
-                                                            error_message: err_msg.clone(),
-                                                        };
+                                                        let notification =
+                                                            BackupTransferNotification::Failed {
+                                                                task_id: task_id.to_string(),
+                                                                task_type: TransferTaskType::Upload,
+                                                                error_message: err_msg.clone(),
+                                                            };
                                                         let _ = tx.send(notification);
                                                     }
                                                 }
 
                                                 // 🔥 更新持久化错误信息
-                                                if let Some(ref pm) = task_info.persistence_manager {
-                                                    if let Err(e) = pm.lock().await.update_task_error(task_id, err_msg) {
+                                                if let Some(ref pm) = task_info.persistence_manager
+                                                {
+                                                    if let Err(e) = pm
+                                                        .lock()
+                                                        .await
+                                                        .update_task_error(task_id, err_msg)
+                                                    {
                                                         warn!("更新上传任务错误信息失败: {}", e);
                                                     }
                                                 }
@@ -760,18 +803,23 @@ impl UploadChunkScheduler {
                                             if is_backup {
                                                 let tx_guard = backup_notification_tx.read().await;
                                                 if let Some(tx) = tx_guard.as_ref() {
-                                                    let notification = BackupTransferNotification::Failed {
-                                                        task_id: task_id.to_string(),
-                                                        task_type: TransferTaskType::Upload,
-                                                        error_message: err_msg.clone(),
-                                                    };
+                                                    let notification =
+                                                        BackupTransferNotification::Failed {
+                                                            task_id: task_id.to_string(),
+                                                            task_type: TransferTaskType::Upload,
+                                                            error_message: err_msg.clone(),
+                                                        };
                                                     let _ = tx.send(notification);
                                                 }
                                             }
 
                                             // 🔥 更新持久化错误信息
                                             if let Some(ref pm) = task_info.persistence_manager {
-                                                if let Err(e) = pm.lock().await.update_task_error(task_id, err_msg) {
+                                                if let Err(e) = pm
+                                                    .lock()
+                                                    .await
+                                                    .update_task_error(task_id, err_msg)
+                                                {
                                                     warn!("更新上传任务错误信息失败: {}", e);
                                                 }
                                             }
@@ -805,7 +853,9 @@ impl UploadChunkScheduler {
         slot_pool: Arc<ChunkSlotPool>,
         global_active_count: Arc<AtomicUsize>,
         task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
-        backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
+        backup_notification_tx: Arc<
+            RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>,
+        >,
         max_retries: Arc<AtomicUsize>,
     ) {
         tokio::spawn(async move {
@@ -827,7 +877,7 @@ impl UploadChunkScheduler {
                 slot_id,
                 max_retries.load(Ordering::SeqCst) as u32,
             )
-                .await;
+            .await;
 
             // 释放全局活跃计数
             global_active_count.fetch_sub(1, Ordering::SeqCst);
@@ -916,7 +966,10 @@ impl UploadChunkScheduler {
                             info!("上传任务 {} 分片上传失败，释放槽位", task_id);
                         }
 
-                        error!("上传任务 {} 因分片 #{} 重试耗尽已从调度器移除", task_id, chunk_index);
+                        error!(
+                            "上传任务 {} 因分片 #{} 重试耗尽已从调度器移除",
+                            task_id, chunk_index
+                        );
                     }
                 }
             } else {
@@ -942,7 +995,9 @@ impl UploadChunkScheduler {
                         let client_snapshot = task_info.client.read().unwrap().clone();
                         let rtype = {
                             let task = task_info.task.lock().await;
-                            crate::uploader::conflict::conflict_strategy_to_rtype(task.conflict_strategy)
+                            crate::uploader::conflict::conflict_strategy_to_rtype(
+                                task.conflict_strategy,
+                            )
                         };
                         let create_result = client_snapshot
                             .create_file(
@@ -982,25 +1037,36 @@ impl UploadChunkScheduler {
                                     // 🔥 从 UploadManager.tasks 中移除任务（立即清理，避免内存泄漏）
                                     if let Some(ref manager_tasks) = task_info.manager_tasks {
                                         manager_tasks.remove(&task_id);
-                                        debug!("上传任务 {} 已从 UploadManager.tasks 中移除", task_id);
+                                        debug!(
+                                            "上传任务 {} 已从 UploadManager.tasks 中移除",
+                                            task_id
+                                        );
                                     }
 
                                     // 标记完成并获取信息
                                     let (group_id, is_backup, encrypted_temp_path) = {
                                         let mut t = task_info.task.lock().await;
                                         t.mark_completed();
-                                        (t.group_id.clone(), t.is_backup, t.encrypted_temp_path.clone())
+                                        (
+                                            t.group_id.clone(),
+                                            t.is_backup,
+                                            t.encrypted_temp_path.clone(),
+                                        )
                                     };
 
                                     // 🔥 更新加密映射（回调触发）
-                                    update_encryption_mapping(&task_id, &task_info, is_backup).await;
+                                    update_encryption_mapping(&task_id, &task_info, is_backup)
+                                        .await;
 
                                     // 🔥 清理临时加密文件（如果存在）
                                     if let Some(temp_path) = encrypted_temp_path {
                                         if temp_path.exists() {
                                             match tokio::fs::remove_file(&temp_path).await {
                                                 Ok(_) => {
-                                                    info!("上传任务 {} 临时加密文件已清理: {:?}", task_id, temp_path);
+                                                    info!(
+                                                        "上传任务 {} 临时加密文件已清理: {:?}",
+                                                        task_id, temp_path
+                                                    );
                                                 }
                                                 Err(e) => {
                                                     warn!("上传任务 {} 清理临时加密文件失败: {:?}, 错误: {}", task_id, temp_path, e);
@@ -1015,7 +1081,8 @@ impl UploadChunkScheduler {
                                             ws_manager.send_if_subscribed(
                                                 TaskEvent::Upload(UploadEvent::Completed {
                                                     task_id: task_id.clone(),
-                                                    completed_at: chrono::Utc::now().timestamp_millis(),
+                                                    completed_at: chrono::Utc::now()
+                                                        .timestamp_millis(),
                                                     is_rapid_upload: false,
                                                     is_backup,
                                                 }),
@@ -1035,15 +1102,16 @@ impl UploadChunkScheduler {
                                     if is_backup {
                                         let tx_guard = backup_notification_tx.read().await;
                                         if let Some(tx) = tx_guard.as_ref() {
-                                            let notification = BackupTransferNotification::Completed {
-                                                task_id: task_id.clone(),
-                                                task_type: TransferTaskType::Upload,
-                                                upload_meta: Some(UploadCompletionMeta {
-                                                    fs_id: response.fs_id,
-                                                    mtime: response.mtime,
-                                                    size: response.size,
-                                                }),
-                                            };
+                                            let notification =
+                                                BackupTransferNotification::Completed {
+                                                    task_id: task_id.clone(),
+                                                    task_type: TransferTaskType::Upload,
+                                                    upload_meta: Some(UploadCompletionMeta {
+                                                        fs_id: response.fs_id,
+                                                        mtime: response.mtime,
+                                                        size: response.size,
+                                                    }),
+                                                };
                                             let _ = tx.send(notification);
                                         }
                                     }
@@ -1089,7 +1157,9 @@ impl UploadChunkScheduler {
 
                                     // 🔥 更新持久化错误信息
                                     if let Some(ref pm) = task_info.persistence_manager {
-                                        if let Err(e) = pm.lock().await.update_task_error(&task_id, err_msg) {
+                                        if let Err(e) =
+                                            pm.lock().await.update_task_error(&task_id, err_msg)
+                                        {
                                             warn!("更新上传任务错误信息失败: {}", e);
                                         }
                                     }
@@ -1134,7 +1204,9 @@ impl UploadChunkScheduler {
 
                                 // 🔥 更新持久化错误信息
                                 if let Some(ref pm) = task_info.persistence_manager {
-                                    if let Err(e) = pm.lock().await.update_task_error(&task_id, err_msg) {
+                                    if let Err(e) =
+                                        pm.lock().await.update_task_error(&task_id, err_msg)
+                                    {
                                         warn!("更新上传任务错误信息失败: {}", e);
                                     }
                                 }
@@ -1277,7 +1349,7 @@ impl UploadChunkScheduler {
                             if should_emit {
                                 let total_size = task_info.total_size;
                                 let progress = if total_size > 0 {
-                                    ( t.uploaded_size  as f64 / total_size as f64) * 100.0
+                                    (t.uploaded_size as f64 / total_size as f64) * 100.0
                                 } else {
                                     0.0
                                 };
@@ -1316,7 +1388,6 @@ impl UploadChunkScheduler {
                                 }
                             }
                         }
-
                     }
 
                     info!(
@@ -1403,7 +1474,7 @@ async fn read_chunk_data(local_path: &std::path::Path, chunk: &UploadChunk) -> R
 
         Ok(buffer)
     })
-        .await?
+    .await?
 }
 
 /// 错误分类

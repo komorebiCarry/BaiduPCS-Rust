@@ -461,7 +461,9 @@ mod tests {
     #[test]
     fn test_detect_encrypted_filename() {
         // 有效的加密文件名：UUID.dat
-        assert!(DownloadTask::detect_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"));
+        assert!(DownloadTask::detect_encrypted_filename(
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"
+        ));
         // 无效的文件名
         assert!(!DownloadTask::detect_encrypted_filename("normal_file.txt"));
         assert!(!DownloadTask::detect_encrypted_filename("not-a-uuid.dat"));
@@ -517,12 +519,7 @@ mod tests {
     /// 测试 next_retry_at 的序列化/反序列化
     #[test]
     fn test_next_retry_at_roundtrip() {
-        let mut task = DownloadTask::new(
-            1,
-            "/remote".to_string(),
-            PathBuf::from("./local"),
-            1024,
-        );
+        let mut task = DownloadTask::new(1, "/remote".to_string(), PathBuf::from("./local"), 1024);
 
         // Case 1: None 时不应该序列化出来（skip_serializing_if）
         let json_none = serde_json::to_string(&task).expect("序列化失败");

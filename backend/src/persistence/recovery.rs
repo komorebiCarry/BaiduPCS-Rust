@@ -762,8 +762,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -802,8 +802,8 @@ mod tests {
             1024,
             256,
             4,
-            None,  // encrypt_enabled
-            None,  // encryption_key_version
+            None, // encrypt_enabled
+            None, // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -855,7 +855,6 @@ mod tests {
         assert_eq!(recovered.task_id(), "tr_001");
         assert_eq!(recovered.task_type(), TaskType::Transfer);
     }
-    
 
     /// 旧 WAL（缺 share_root_path 字段）反序列化兼容：恢复时退化为 None，不会引发错误。
     #[test]
@@ -894,8 +893,8 @@ mod tests {
             1024,
             256,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -931,8 +930,8 @@ mod tests {
             1024,
             256,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -964,8 +963,8 @@ mod tests {
             1024,
             256,
             4,
-            None,  // encrypt_enabled
-            None,  // encryption_key_version
+            None, // encrypt_enabled
+            None, // encryption_key_version
         );
         save_metadata(wal_dir, &metadata).unwrap();
 
@@ -987,8 +986,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
 
         let mut completed_chunks = BitSet::with_capacity(4);
