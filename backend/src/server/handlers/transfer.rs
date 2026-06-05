@@ -152,6 +152,7 @@ pub async fn create_transfer(
     let create_request = crate::transfer::manager::CreateTransferRequest {
         share_url: req.share_url,
         password: req.password,
+        randsk: None,
         save_path: req.save_path,
         save_fs_id: req.save_fs_id,
         auto_download: req.auto_download,

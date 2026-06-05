@@ -1803,6 +1803,23 @@ impl NetdiskClient {
         Ok(merged)
     }
 
+    async fn collect_all_baidu_cookies_with_randsk(&self, randsk: &str) -> Result<String> {
+        Ok(Self::override_cookie_randsk(
+            &self.collect_all_baidu_cookies().await?,
+            randsk,
+        ))
+    }
+
+    fn override_cookie_randsk(cookie_header: &str, randsk: &str) -> String {
+        let mut cookies: Vec<String> = cookie_header
+            .split("; ")
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("randsk="))
+            .map(str::to_string)
+            .collect();
+        cookies.push(format!("randsk={}", randsk));
+        cookies.join("; ")
+    }
+
     /// 创建文件夹
     ///
     /// # 参数
@@ -2273,6 +2290,18 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<crate::transfer::ShareFileListResult> {
+        self.list_share_files_with_randsk(short_key, bdstoken, page, num, None)
+            .await
+    }
+
+    pub async fn list_share_files_with_randsk(
+        &self,
+        short_key: &str,
+        bdstoken: &str,
+        page: u32,
+        num: u32,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::ShareFileListResult> {
         info!(
             "获取分享文件列表(根目录): short_key={}, page={}, num={}",
             short_key, page, num
@@ -2295,14 +2324,25 @@ impl NetdiskClient {
 
         let referer = format!("https://pan.baidu.com/s/{}", short_key);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("User-Agent", &self.web_user_agent)
-            .header("Referer", &referer)
-            .send()
-            .await
-            .context("获取分享文件列表失败")?;
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .header("Cookie", cookie_header)
+                .send()
+                .await
+        } else {
+            self.client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .send()
+                .await
+        }
+        .context("获取分享文件列表失败")?;
 
         let response_text = response.text().await.context("读取文件列表响应失败")?;
         info!("文件列表响应: {}", response_text);
@@ -2418,6 +2458,23 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        self.list_share_files_in_dir_with_randsk(
+            short_key, shareid, uk, bdstoken, dir, page, num, None,
+        )
+        .await
+    }
+
+    pub async fn list_share_files_in_dir_with_randsk(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        uk: &str,
+        bdstoken: &str,
+        dir: &str,
+        page: u32,
+        num: u32,
+        randsk: Option<&str>,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
         info!(
             "获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}",
             shareid, dir, page, num
@@ -2435,14 +2492,25 @@ impl NetdiskClient {
 
         let referer = format!("https://pan.baidu.com/s/{}", short_key);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("User-Agent", &self.web_user_agent)
-            .header("Referer", &referer)
-            .send()
-            .await
-            .context("获取分享子目录文件列表失败")?;
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .header("Cookie", cookie_header)
+                .send()
+                .await
+        } else {
+            self.client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .send()
+                .await
+        }
+        .context("获取分享子目录文件列表失败")?;
 
         let response_text = response
             .text()
@@ -2528,6 +2596,30 @@ impl NetdiskClient {
         referer: &str,
         internal_task_id: Option<&str>,
     ) -> Result<crate::transfer::TransferResult> {
+        self.transfer_share_files_with_randsk(
+            shareid,
+            share_uk,
+            bdstoken,
+            fs_ids,
+            target_path,
+            referer,
+            internal_task_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn transfer_share_files_with_randsk(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        fs_ids: &[u64],
+        target_path: &str,
+        referer: &str,
+        internal_task_id: Option<&str>,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
         // 构建转存URL
         let url = format!(
             "https://pan.baidu.com/share/transfer?\
@@ -2545,15 +2637,28 @@ impl NetdiskClient {
                 .join(",")
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .header("User-Agent", &self.web_user_agent)
-            .header("Referer", referer)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
-            .send()
-            .await;
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .post(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Cookie", cookie_header)
+                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+                .send()
+                .await
+        } else {
+            self.client
+                .post(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+                .send()
+                .await
+        };
 
         let response = match response {
             Ok(resp) => {
@@ -2611,13 +2716,14 @@ impl NetdiskClient {
 
                 // 调用 query_transfer_task 轮询任务状态
                 return self
-                    .query_transfer_task(
+                    .query_transfer_task_with_randsk(
                         &task_id_string,
                         shareid,
                         share_uk,
                         bdstoken,
                         referer,
                         internal_task_id,
+                        randsk,
                     )
                     .await;
             }
@@ -2784,6 +2890,28 @@ impl NetdiskClient {
         referer: &str,
         internal_task_id: Option<&str>,
     ) -> Result<crate::transfer::TransferResult> {
+        self.query_transfer_task_with_randsk(
+            task_id,
+            shareid,
+            share_uk,
+            bdstoken,
+            referer,
+            internal_task_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn query_transfer_task_with_randsk(
+        &self,
+        task_id: &str,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        referer: &str,
+        internal_task_id: Option<&str>,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
         use rand::Rng;
 
         let mut attempt = 0;
@@ -2826,13 +2954,24 @@ impl NetdiskClient {
             );
 
             // 发送请求
-            let response = self
-                .client
-                .get(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", referer)
-                .send()
-                .await;
+            let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+                let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+                let client = self.build_temp_client_with_proxy()?;
+                client
+                    .get(&url)
+                    .header("User-Agent", &self.web_user_agent)
+                    .header("Referer", referer)
+                    .header("Cookie", cookie_header)
+                    .send()
+                    .await
+            } else {
+                self.client
+                    .get(&url)
+                    .header("User-Agent", &self.web_user_agent)
+                    .header("Referer", referer)
+                    .send()
+                    .await
+            };
 
             let response = match response {
                 Ok(resp) => {
@@ -4368,6 +4507,15 @@ mod tests {
         let ua = NetdiskClient::default_mobile_user_agent();
         assert!(ua.contains("netdisk"));
         assert!(ua.contains("android"));
+    }
+
+    #[test]
+    fn test_override_cookie_randsk_replaces_existing_value() {
+        let cookie =
+            NetdiskClient::override_cookie_randsk("BDUSS=bd; randsk=old; PANPSC=pan", "new");
+
+        assert_eq!(cookie, "BDUSS=bd; PANPSC=pan; randsk=new");
+        assert!(!cookie.contains("randsk=old"));
     }
 
     #[test]

@@ -84,6 +84,12 @@ pub struct TransferTask {
     pub download_task_ids: Vec<String>,
     /// 分享页面信息
     pub share_info: Option<SharePageInfo>,
+    /// 当前分享提取码验证返回的 randsk。
+    ///
+    /// 百度只用一个 Cookie 名保存 randsk，并发处理多个带密码分享时会互相覆盖；
+    /// 任务执行阶段需要保存自己的值并显式带到请求里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub randsk: Option<String>,
     /// 分享文件列表
     pub file_list: Vec<SharedFileInfo>,
     /// 已转存文件数
@@ -159,6 +165,7 @@ impl TransferTask {
             error: None,
             download_task_ids: Vec::new(),
             share_info: None,
+            randsk: None,
             file_list: Vec::new(),
             transferred_count: 0,
             total_count: 0,

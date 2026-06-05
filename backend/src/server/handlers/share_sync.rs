@@ -366,23 +366,30 @@ pub async fn preview_tree(
         return Err(err_bad("分享页面返回的 shareid 为空"));
     }
 
-    // 🔥 关键：如有密码，先 verify_share_password 拿到 randsk 写入 Cookie，
-    // 否则 list_share_files 会返回 errno=-9 "提取码验证失败"。
+    // Keep this share's randsk and pass it explicitly while expanding the tree.
+    let mut randsk = None;
     if let Some(ref pwd) = effective_pwd {
         if !pwd.is_empty() {
             let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-            if let Err(e) = client
+            match client
                 .verify_share_password(&page.shareid, &page.share_uk, &page.bdstoken, pwd, &referer)
                 .await
             {
-                return Err(err_bad(&format!("验证提取码失败: {}", e)));
+                Ok(sekey) => randsk = Some(sekey),
+                Err(e) => return Err(err_bad(&format!("验证提取码失败: {}", e))),
             }
         }
     }
 
     // 列根
     let root = client
-        .list_share_files(&share_link.short_key, &page.bdstoken, 1, 100)
+        .list_share_files_with_randsk(
+            &share_link.short_key,
+            &page.bdstoken,
+            1,
+            100,
+            randsk.as_deref(),
+        )
         .await
         .map_err(|e| err_bad(&format!("列根失败: {}", e)))?;
     let root_shareid = if !root.shareid.is_empty() {
@@ -406,6 +413,7 @@ pub async fn preview_tree(
             &root_shareid,
             &root_uk,
             &page.bdstoken,
+            randsk.as_deref(),
             &share_root,
             f,
             depth - 1,
@@ -428,6 +436,7 @@ fn build_tree_node<'a>(
     shareid: &'a str,
     uk: &'a str,
     bdstoken: &'a str,
+    randsk: Option<&'a str>,
     share_root: &'a str,
     info: crate::transfer::SharedFileInfo,
     remaining_depth: u32,
@@ -443,7 +452,9 @@ fn build_tree_node<'a>(
         };
         if info.is_dir && remaining_depth > 0 {
             match client
-                .list_share_files_in_dir(short_key, shareid, uk, bdstoken, &info.path, 1, 100)
+                .list_share_files_in_dir_with_randsk(
+                    short_key, shareid, uk, bdstoken, &info.path, 1, 100, randsk,
+                )
                 .await
             {
                 Ok(files) => {
@@ -456,6 +467,7 @@ fn build_tree_node<'a>(
                                 shareid,
                                 uk,
                                 bdstoken,
+                                randsk,
                                 share_root,
                                 f,
                                 remaining_depth - 1,

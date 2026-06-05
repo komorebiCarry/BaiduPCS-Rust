@@ -52,6 +52,10 @@ pub struct TransferManager {
 pub struct CreateTransferRequest {
     pub share_url: String,
     pub password: Option<String>,
+    /// Caller-provided share randsk. Internal callers use this to keep
+    /// concurrent password-protected shares from overwriting each other in the
+    /// shared CookieJar.
+    pub randsk: Option<String>,
     pub save_path: String,
     pub save_fs_id: u64,
     pub auto_download: Option<bool>,
@@ -344,6 +348,7 @@ impl TransferManager {
             request.local_download_path.clone(),
         );
         task.download_conflict_strategy = request.download_conflict_strategy;
+        task.randsk = request.randsk.clone();
 
         // 设置分享直下相关字段
         if request.is_share_direct_download {
@@ -365,38 +370,44 @@ impl TransferManager {
 
         match share_info_result {
             Ok(info) => {
-                // 如果有密码，先验证密码
+                // 如果有密码，先验证密码。内部调用方可传入刚获取到的 randsk，
+                // 避免并发分享任务反复覆盖全局 CookieJar 的 randsk。
                 if let Some(ref pwd) = password {
-                    let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-                    match client
-                        .verify_share_password(
-                            &info.shareid,
-                            &info.share_uk,
-                            &info.bdstoken,
-                            pwd,
-                            &referer,
-                        )
-                        .await
-                    {
-                        Ok(_randsk) => {
-                            info!("提取码验证成功");
-                        }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            if err_msg.contains("提取码错误") || err_msg.contains("-9") {
+                    if task.randsk.as_deref().filter(|s| !s.is_empty()).is_some() {
+                        info!("使用调用方提供的 randsk");
+                    } else {
+                        let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+                        match client
+                            .verify_share_password(
+                                &info.shareid,
+                                &info.share_uk,
+                                &info.bdstoken,
+                                pwd,
+                                &referer,
+                            )
+                            .await
+                        {
+                            Ok(randsk) => {
+                                task.randsk = Some(randsk);
+                                info!("提取码验证成功");
+                            }
+                            Err(e) => {
+                                let err_msg = e.to_string();
+                                if err_msg.contains("提取码错误") || err_msg.contains("-9") {
+                                    return Ok(CreateTransferResponse {
+                                        task_id: None,
+                                        status: None,
+                                        need_password: false,
+                                        error: Some("提取码错误".to_string()),
+                                    });
+                                }
                                 return Ok(CreateTransferResponse {
                                     task_id: None,
                                     status: None,
                                     need_password: false,
-                                    error: Some("提取码错误".to_string()),
+                                    error: Some(err_msg),
                                 });
                             }
-                            return Ok(CreateTransferResponse {
-                                task_id: None,
-                                status: None,
-                                need_password: false,
-                                error: Some(err_msg),
-                            });
                         }
                     }
                 }
@@ -632,9 +643,12 @@ impl TransferManager {
         }
 
         // 获取分享信息
-        let share_info = {
+        let (share_info, task_randsk) = {
             let t = task.read().await;
-            t.share_info.clone().context("分享信息未设置")?
+            (
+                t.share_info.clone().context("分享信息未设置")?,
+                t.randsk.clone(),
+            )
         };
 
         // 检查取消
@@ -656,7 +670,13 @@ impl TransferManager {
             if has_selected_fs_ids {
                 // 用户已选择文件，只拉第一页用于展示文件名
                 let result = client
-                    .list_share_files(&share_link.short_key, &share_info.bdstoken, 1, 100)
+                    .list_share_files_with_randsk(
+                        &share_link.short_key,
+                        &share_info.bdstoken,
+                        1,
+                        100,
+                        task_randsk.as_deref(),
+                    )
                     .await?;
                 (result.files, result.share_root_path)
             } else {
@@ -667,11 +687,12 @@ impl TransferManager {
                 let mut page: u32 = 1;
                 loop {
                     let result = client
-                        .list_share_files(
+                        .list_share_files_with_randsk(
                             &share_link.short_key,
                             &share_info.bdstoken,
                             page,
                             page_size,
+                            task_randsk.as_deref(),
                         )
                         .await?;
                     let batch_len = result.files.len();
@@ -1047,7 +1068,7 @@ impl TransferManager {
 
                 // 转存该组
                 let result = client
-                    .transfer_share_files(
+                    .transfer_share_files_with_randsk(
                         &share_info.shareid,
                         &share_info.share_uk,
                         &share_info.bdstoken,
@@ -1055,6 +1076,7 @@ impl TransferManager {
                         &group_target_dir,
                         &referer,
                         Some(task_id),
+                        task_randsk.as_deref(),
                     )
                     .await;
 
@@ -1071,7 +1093,7 @@ impl TransferManager {
                                 warn!("重试时创建目录失败: {}", e);
                             }
                             client
-                                .transfer_share_files(
+                                .transfer_share_files_with_randsk(
                                     &share_info.shareid,
                                     &share_info.share_uk,
                                     &share_info.bdstoken,
@@ -1079,6 +1101,7 @@ impl TransferManager {
                                     &group_target_dir,
                                     &referer,
                                     Some(task_id),
+                                    task_randsk.as_deref(),
                                 )
                                 .await
                         } else {
@@ -3399,6 +3422,7 @@ impl TransferManager {
             error: metadata.error_msg.clone(),
             download_task_ids: metadata.download_task_ids.clone(),
             share_info,
+            randsk: None,
             file_list,
             transferred_count,
             total_count,

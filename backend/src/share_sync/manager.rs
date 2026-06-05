@@ -491,6 +491,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
+            randsk: captured.randsk.clone(),
             save_path: target_dir.to_string(),
             save_fs_id: 0,
             auto_download: Some(false),
@@ -627,6 +628,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(&self.captured),
             password: self.captured.password.clone(),
+            randsk: self.captured.randsk.clone(),
             save_path: String::new(),
             save_fs_id: 0,
             auto_download: Some(true),
@@ -806,6 +808,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
+            randsk: captured.randsk.clone(),
             save_path: target_dir.to_string(),
             save_fs_id: 0,
             // 网盘目标不下载本地，与单文件版本一致
@@ -879,6 +882,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(&self.captured),
             password: self.captured.password.clone(),
+            randsk: self.captured.randsk.clone(),
             // 走 is_share_direct_download=true 路径，save_path 在 transfer 里
             // 会被 temp_dir 强制覆盖——这是 transfer 的硬编码行为，不在 share-sync
             // 控制范围。最终落点是 `local_download_path`（自动下载阶段被消费）。

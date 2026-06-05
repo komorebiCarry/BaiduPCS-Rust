@@ -1454,6 +1454,7 @@ mod tests {
             uk: "456".into(),
             bdstoken: "tok".into(),
             password: None,
+            randsk: None,
         }
     }
 

@@ -133,6 +133,7 @@ pub struct CapturedShare {
     pub uk: String,
     pub bdstoken: String,
     pub password: Option<String>,
+    pub randsk: Option<String>,
 }
 
 /// 抓取器：递归 list 整个分享内容
@@ -148,6 +149,7 @@ pub struct SnapshotCollector<'a> {
     uk: String,
     bdstoken: String,
     password: Option<String>,
+    randsk: Option<String>,
     include_paths: BTreeSet<String>,
     /// 预计算的 include 路径前缀索引（dir 维度）：
     /// - `ancestors`：所有 include_path 的祖先 + include_path 自身的并集
@@ -182,12 +184,14 @@ impl<'a> SnapshotCollector<'a> {
             ));
         }
 
-        // 🔥 关键：如有密码，必须先 verify_share_password 拿到 randsk 写入 Cookie，
-        // 否则 list_share_files 会返回 errno=-9 "提取码验证失败"。
+        // If a password exists, keep the returned randsk on the collector.
+        // The global CookieJar only has one randsk slot, so concurrent shares
+        // must pass their own randsk explicitly when listing pages.
+        let mut randsk = None;
         if let Some(ref pwd) = effective_pwd {
             if !pwd.is_empty() {
                 let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-                if let Err(e) = client
+                match client
                     .verify_share_password(
                         &page.shareid,
                         &page.share_uk,
@@ -197,10 +201,13 @@ impl<'a> SnapshotCollector<'a> {
                     )
                     .await
                 {
-                    return Err(ShareSyncError::ShareLinkError(format!(
-                        "验证提取码失败: {}",
-                        e
-                    )));
+                    Ok(sekey) => randsk = Some(sekey),
+                    Err(e) => {
+                        return Err(ShareSyncError::ShareLinkError(format!(
+                            "验证提取码失败: {}",
+                            e
+                        )));
+                    }
                 }
             }
         }
@@ -218,6 +225,7 @@ impl<'a> SnapshotCollector<'a> {
             uk: page.uk,
             bdstoken: page.bdstoken,
             password: effective_pwd,
+            randsk,
             include_paths,
             include_index,
             exclude_set,
@@ -233,7 +241,13 @@ impl<'a> SnapshotCollector<'a> {
         // Step 1: root
         let root = self
             .client
-            .list_share_files(&self.short_key, &self.bdstoken, 1, page_size)
+            .list_share_files_with_randsk(
+                &self.short_key,
+                &self.bdstoken,
+                1,
+                page_size,
+                self.randsk.as_deref(),
+            )
             .await
             .map_err(|e| ShareSyncError::ShareLinkError(e.to_string()))?;
 
@@ -282,7 +296,7 @@ impl<'a> SnapshotCollector<'a> {
             loop {
                 let batch = self
                     .client
-                    .list_share_files_in_dir(
+                    .list_share_files_in_dir_with_randsk(
                         &self.short_key,
                         &root_shareid,
                         &root_uk,
@@ -290,6 +304,7 @@ impl<'a> SnapshotCollector<'a> {
                         &dir,
                         page,
                         page_size,
+                        self.randsk.as_deref(),
                     )
                     .await
                     .map_err(|e| ShareSyncError::ShareLinkError(e.to_string()))?;
@@ -346,6 +361,7 @@ impl<'a> SnapshotCollector<'a> {
             uk: root_uk,
             bdstoken: self.bdstoken.clone(),
             password: self.password.clone(),
+            randsk: self.randsk.clone(),
         };
         let snap = ShareSnapshot::with_items(
             /*subscription_id*/ "", // 由调用方在 manager 处填
