@@ -351,6 +351,11 @@ impl ShareSyncManager {
                         .error
                         .clone()
                         .unwrap_or_else(|| "unknown error".into()),
+                    // v1: 目前 outcome.error 仍以原始字符串承载，reason 由 executor
+                    // 在 quota/local_disk_full 早停时显式设置。
+                    // 此分支对应 manager 自身检查到的失败（如 start_run 失败），
+                    // 暂归类为 unknown，前端用 error 字段兜底展示。
+                    reason: None,
                 });
             }
             _ => {}
@@ -373,6 +378,7 @@ impl ShareSyncManager {
             run_id: run_id.into(),
             subscription_id: sub_id.into(),
             error: err.into(),
+            reason: None,
         });
     }
 
@@ -475,7 +481,13 @@ impl ExecutorHooks for ProductionHooks {
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
 
-        let selected_path = netdisk_transfer_selected_path(item);
+        // v1 修复：用 `item.path`（相对分享根的干净路径，如 `/data/2024/file.zip`）
+        // 而非 `netdisk_transfer_selected_path(item)` 拼出的 `/sharelink1-1/<basename>`。
+        // 这让 `TransferManager::execute_task` 内部的 `group_files_by_parent_dir`（见
+        // `backend/src/transfer/manager.rs:4349`）能按 file.path 父目录分 batch，
+        // 每个 batch 的 `group_target_dir = "{target_dir}/<relative_parent>"`，
+        // 百度服务端在 target_dir 下自动创建中间目录 → **网盘目标里的子目录结构被还原**。
+        let selected_path = item.path.clone();
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
@@ -488,7 +500,9 @@ impl ExecutorHooks for ProductionHooks {
             selected_fs_ids: Some(vec![item.fs_id]),
             selected_files: Some(vec![SharedFileInfo {
                 fs_id: item.fs_id,
-                is_dir: false,
+                // 不再强制 false：executor 不传目录项过来，但 batch 化时
+                // 若上层带 is_dir=true 的"目录根锚点"也能透传。
+                is_dir: item.is_dir,
                 path: selected_path.clone(),
                 size: item.size,
                 name: item.name.clone(),
@@ -746,6 +760,167 @@ impl ExecutorHooks for ProductionHooks {
             Err(e) => Err(ShareSyncError::FileSystemError(e.to_string())),
         }
     }
+
+    // ============================================================
+    // v1 新增：整批 submit
+    // ============================================================
+    //
+    // 把 items 整组打包成 `selected_files` + `selected_fs_ids`，
+    // 单次 `TransferManager.create_task` 调用，由 transfer 内部
+    // `group_files_by_parent_dir`（`transfer/manager.rs:4349`）按父目录
+    // 分 batch 转存到 target_dir/<parent>。
+    //
+    // 与单文件 `submit_transfer` 的关键区别：
+    // - **一次 access_share_page + 鉴权**（百度的 /share/list 鉴权每条 fs_id 都要走）
+    // - **子目录结构在 target_dir 下还原**（百度服务端在 group_target_dir 不存在时
+    //   自动创建，见 `transfer/manager.rs:1001-1043` 的 `ensure_dirs_exist` + errno=2
+    //   重试逻辑）
+    // - **任务数从 N 降到 1**：大目录（500 文件）从 500 个 transfer 任务变成 1 个
+    //
+    // 失败语义：整组任一文件失败 → 整组视为失败（v1 简化）。executor 在
+    // `apply_with_run_id_grouped` 里检测到 Quota / LocalDiskFull 早停类别时
+    // 还会再细粒度地把"未提交"项标 Skipped。
+
+    async fn submit_transfer_batch(
+        &self,
+        captured: &CapturedShare,
+        target_dir: &str,
+        items: &[ShareSnapshotItem],
+        internal_label: Option<&str>,
+    ) -> Result<String, ShareSyncError> {
+        if items.is_empty() {
+            return Err(ShareSyncError::Internal(
+                "submit_transfer_batch 被传入空 items 列表".to_string(),
+            ));
+        }
+        let tm = self.transfer_manager().await?;
+        use crate::transfer::manager::CreateTransferRequest;
+        use crate::transfer::types::SharedFileInfo;
+
+        let selected_files: Vec<SharedFileInfo> = items
+            .iter()
+            .map(|item| SharedFileInfo {
+                fs_id: item.fs_id,
+                is_dir: item.is_dir,
+                path: item.path.clone(),
+                size: item.size,
+                name: item.name.clone(),
+            })
+            .collect();
+        let selected_fs_ids: Vec<u64> = items.iter().map(|i| i.fs_id).collect();
+
+        let req = CreateTransferRequest {
+            share_url: share_url_for_captured(captured),
+            password: captured.password.clone(),
+            save_path: target_dir.to_string(),
+            save_fs_id: 0,
+            // 网盘目标不下载本地，与单文件版本一致
+            auto_download: Some(false),
+            local_download_path: None,
+            is_share_direct_download: false,
+            download_conflict_strategy: None,
+            selected_fs_ids: Some(selected_fs_ids),
+            selected_files: Some(selected_files),
+            owner_uid_override: None,
+        };
+        let resp = tm
+            .create_task(req)
+            .await
+            .map_err(|e| ShareSyncError::TransferError(e.to_string()))?;
+        if resp.need_password {
+            return Err(ShareSyncError::ShareLinkError("需要提取码".into()));
+        }
+        if let Some(err) = resp.error {
+            return Err(ShareSyncError::TransferError(err));
+        }
+        let task_id = resp
+            .task_id
+            .ok_or_else(|| ShareSyncError::TransferError("TransferManager 未返回任务 ID".into()))?;
+        info!(
+            "share-sync: batch transfer submitted label={:?} task_id={} target_dir={} items={}",
+            internal_label,
+            task_id,
+            target_dir,
+            items.len()
+        );
+        Ok(task_id)
+    }
+
+    async fn submit_download_batch(
+        &self,
+        items: &[ShareSnapshotItem],
+        local_dir: &Path,
+        strategy: ConflictStrategy,
+    ) -> Result<String, ShareSyncError> {
+        if items.is_empty() {
+            return Err(ShareSyncError::Internal(
+                "submit_download_batch 被传入空 items 列表".to_string(),
+            ));
+        }
+        let tm = self.transfer_manager().await?;
+        use crate::transfer::manager::CreateTransferRequest;
+        use crate::transfer::types::SharedFileInfo;
+
+        let selected_files: Vec<SharedFileInfo> = items
+            .iter()
+            .map(|item| {
+                // 保留子目录信息：path 用 item.path，让 transfer 内部
+                // group_files_by_parent_dir 按 item.path 的父目录分 batch，
+                // 最终落 local_dir/<item.path>
+                let raw_path = if item.raw_path.trim().is_empty() {
+                    item.path.clone()
+                } else {
+                    item.raw_path.clone()
+                };
+                SharedFileInfo {
+                    fs_id: item.fs_id,
+                    is_dir: false, // executor 不传目录项
+                    path: raw_path,
+                    size: item.size,
+                    name: item.name.clone(),
+                }
+            })
+            .collect();
+        let selected_fs_ids: Vec<u64> = items.iter().map(|i| i.fs_id).collect();
+
+        let req = CreateTransferRequest {
+            share_url: share_url_for_captured(&self.captured),
+            password: self.captured.password.clone(),
+            // 走 is_share_direct_download=true 路径，save_path 在 transfer 里
+            // 会被 temp_dir 强制覆盖——这是 transfer 的硬编码行为，不在 share-sync
+            // 控制范围。最终落点是 `local_download_path`（自动下载阶段被消费）。
+            save_path: String::new(),
+            save_fs_id: 0,
+            auto_download: Some(true),
+            local_download_path: Some(local_dir.to_string_lossy().to_string()),
+            is_share_direct_download: true,
+            download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
+            selected_fs_ids: Some(selected_fs_ids),
+            selected_files: Some(selected_files),
+            owner_uid_override: None,
+        };
+
+        let resp = tm
+            .create_task(req)
+            .await
+            .map_err(|e| ShareSyncError::DownloadError(e.to_string()))?;
+        if resp.need_password {
+            return Err(ShareSyncError::ShareLinkError("需要提取码".into()));
+        }
+        if let Some(err) = resp.error {
+            return Err(ShareSyncError::DownloadError(err));
+        }
+        let task_id = resp
+            .task_id
+            .ok_or_else(|| ShareSyncError::DownloadError("TransferManager 未返回任务 ID".into()))?;
+        info!(
+            "share-sync: batch share-direct download submitted task_id={} local_dir={:?} items={}",
+            task_id,
+            local_dir,
+            items.len()
+        );
+        Ok(task_id)
+    }
 }
 
 impl ProductionHooks {
@@ -805,19 +980,6 @@ fn safe_relative_download_path(path: &str) -> Result<String, ShareSyncError> {
     } else {
         Ok(parts.join("/"))
     }
-}
-
-fn netdisk_transfer_selected_path(item: &ShareSnapshotItem) -> String {
-    let name = if item.name.trim().is_empty() {
-        item.path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or("file")
-    } else {
-        item.name.trim()
-    };
-    format!("/sharelink1-1/{}", name.trim_start_matches('/'))
 }
 
 fn normalize_netdisk_path(path: &str) -> String {

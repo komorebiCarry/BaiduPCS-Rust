@@ -159,6 +159,15 @@ pub struct DiffSummary {
     pub modified: usize,
     pub removed: usize,
     pub failed: usize,
+    /// 因 quota / local_disk_full 等"环境资源不足"被跳过的子项数（v1 新增）
+    ///
+    /// 这些项**不是失败**——失败意味着可重试 / 需修复配置；
+    /// 跳过意味着"用户清理网盘/本地磁盘后手动重跑即可"，对应 `run_item.reason`
+    /// 字段为 `quota_full` / `local_disk_full`。
+    ///
+    /// 前端展示建议：红色 = failed（需关注），黄色 = skipped（信息性）。
+    #[serde(default)]
+    pub skipped: usize,
 }
 
 #[cfg(test)]
@@ -218,6 +227,15 @@ mod tests {
         assert_eq!(s.modified, 0);
         assert_eq!(s.removed, 0);
         assert_eq!(s.failed, 0);
+        assert_eq!(s.skipped, 0);
+    }
+
+    #[test]
+    fn test_diff_summary_serde_skipped_default() {
+        // 老数据无 skipped 字段时反序列化默认为 0（向后兼容）
+        let json = r#"{"added":1,"modified":0,"removed":0,"failed":0}"#;
+        let s: DiffSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(s.skipped, 0);
     }
 
     #[test]
