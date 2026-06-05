@@ -535,9 +535,9 @@ mod tests {
     #[test]
     fn test_normalize_local_path() {
         // Windows 路径
-        let path = Path::new("C:\\Users\\test\\Documents");
         #[cfg(windows)]
         {
+            let path = Path::new("C:\\Users\\test\\Documents");
             let normalized = normalize_local_path(path);
             assert!(
                 normalized.contains("users/test/documents")
