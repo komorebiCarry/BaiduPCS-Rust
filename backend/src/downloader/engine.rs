@@ -687,7 +687,7 @@ impl UrlHealthManager {
         speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let mid = speeds.len() / 2;
-        let median = if speeds.len() % 2 == 0 {
+        let median = if speeds.len().is_multiple_of(2) {
             (speeds[mid - 1] + speeds[mid]) / 2.0
         } else {
             speeds[mid]
@@ -726,7 +726,7 @@ impl UrlHealthManager {
         sorted_medians.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let mid = sorted_medians.len() / 2;
-        let global_median = if sorted_medians.len() % 2 == 0 {
+        let global_median = if sorted_medians.len().is_multiple_of(2) {
             (sorted_medians[mid - 1] + sorted_medians[mid]) / 2.0
         } else {
             sorted_medians[mid]
@@ -773,7 +773,7 @@ impl UrlHealthManager {
         }
 
         // 按 next_probe_time 排序,选择最早到期的那个
-        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        candidates.sort_by_key(|a| a.1);
 
         let url_to_restore = candidates[0].0.clone();
         info!(
@@ -1334,13 +1334,14 @@ impl DownloadEngine {
         Arc<Mutex<ChunkManager>>,     // 分片管理器
         Arc<Mutex<SpeedCalculator>>,  // 速度计算器
     )> {
-        let (fs_id, remote_path, local_path, total_size) = {
+        let (fs_id, remote_path, local_path, total_size, owner_uid) = {
             let t = task.lock().await;
             (
                 t.fs_id,
                 t.remote_path.clone(),
                 t.local_path.clone(),
                 t.total_size,
+                t.owner_uid,
             )
         };
 
@@ -1356,24 +1357,15 @@ impl DownloadEngine {
             self.vip_type
         );
 
-        // 2. 获取所有可用下载链接
-        let all_urls = match self
-            .get_netdisk_client()
-            .get_locate_download_url(&remote_path)
+        // 2. 获取所有可用下载链接（Locate 8002 时回退 filemetas dlink）
+        let all_urls = self
+            .acquire_download_urls(&remote_path)
             .await
-        {
-            Ok(urls) => {
-                if urls.is_empty() {
-                    error!("获取到下载链接列表为空: path={}", remote_path);
-                    anyhow::bail!("未找到可用的下载链接");
-                }
-                urls
-            }
-            Err(e) => {
+            .map_err(|e| {
                 error!("获取下载链接列表失败: path={}, 错误: {}", remote_path, e);
-                return Err(e).context("获取下载链接列表失败");
-            }
-        };
+                e
+            })
+            .context("获取下载链接列表失败")?;
 
         info!("获取到 {} 个下载链接", all_urls.len());
 
@@ -1387,6 +1379,9 @@ impl DownloadEngine {
         let mut valid_urls = Vec::new();
         let mut url_speeds = Vec::new();
         let mut referer: Option<String> = None;
+        // 🔥 从探测响应 Content-Range 解析的服务器实际文件大小
+        // 用于校正 task.total_size 与服务器不一致的场景（例如文件列表 API 返回 size 与 Locate 不一致）
+        let mut server_reported_total: Option<u64> = None;
 
         // 预先获取 bduss，避免在 async 闭包中借用 self
         let bduss = self.get_netdisk_client().bduss().to_string();
@@ -1422,7 +1417,7 @@ impl DownloadEngine {
             // 处理探测结果
             for (idx, url, result) in batch_results {
                 match result {
-                    Ok((ref_url, speed)) => {
+                    Ok((ref_url, speed, server_total)) => {
                         info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", idx, speed);
                         valid_urls.push(url);
                         url_speeds.push(speed);
@@ -1430,6 +1425,11 @@ impl DownloadEngine {
                         // 保存第一个成功链接的 Referer
                         if referer.is_none() {
                             referer = ref_url;
+                        }
+
+                        // 🔥 收集第一个解析到的服务器实际文件大小
+                        if server_reported_total.is_none() {
+                            server_reported_total = server_total;
                         }
                     }
                     Err(e) => {
@@ -1508,13 +1508,35 @@ impl DownloadEngine {
         // 5. 创建 URL 健康管理器（传递speeds）
         let url_health = Arc::new(Mutex::new(UrlHealthManager::new(valid_urls, url_speeds)));
 
+        // 🔥 校正 total_size：如果探测发现服务器实际大小与 task.total_size 不一致，
+        // 用服务器值覆盖（防止最后一个分片 Content-Range 校验失败导致整个任务连续 6 次失败）。
+        // 触发场景：文件列表 API 返回 size 与 Locate 实际 size 不一致。
+        let (total_size, chunk_size) = match server_reported_total {
+            Some(server_size) if server_size != total_size && server_size > 0 => {
+                warn!(
+                    "⚠️  文件大小校正: task.total_size={} 与服务器实际={}不一致，使用服务器值",
+                    total_size, server_size
+                );
+                {
+                    let mut t = task.lock().await;
+                    t.total_size = server_size;
+                }
+                let new_chunk_size = DownloadConfig::calculate_adaptive_chunk_size(
+                    server_size,
+                    self.vip_type,
+                );
+                (server_size, new_chunk_size)
+            }
+            _ => (total_size, chunk_size),
+        };
+
         let output_path = self
             .prepare_download_output_path(&local_path, total_size, &cancellation_token)
             .await
             .context("准备本地文件失败")?;
 
         // 7. 创建分片管理器
-        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size)));
+        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size, owner_uid)));
 
         // 8. 创建速度计算器
         let speed_calc = Arc::new(Mutex::new(SpeedCalculator::with_default_window()));
@@ -1540,6 +1562,25 @@ impl DownloadEngine {
             chunk_manager,
             speed_calc,
         ))
+    }
+
+    /// 获取下载链接（Locate）。
+    ///
+    /// Locate（pcs/file?method=locatedownload）对部分资源会偶发返回临时风控错误
+    /// （errno=8002「参数异常,请更新最新版本客户端」、errno=9019「need verify」）。
+    /// 这类错误的重试已下沉到 `NetdiskClient::get_locate_download_url` 内部
+    /// （阶梯式退避 3s→8s→20s + 抖动，最多 3 次），此处只负责非空校验。
+    ///
+    /// 返回的链接列表保证非空，否则返回 Err。
+    async fn acquire_download_urls(&self, remote_path: &str) -> Result<Vec<String>> {
+        let urls = self
+            .get_netdisk_client()
+            .get_locate_download_url(remote_path)
+            .await?;
+        if urls.is_empty() {
+            anyhow::bail!("未找到可用的下载链接");
+        }
+        Ok(urls)
     }
 
     /// 下载文件（自动计算最优分片大小）
@@ -1581,24 +1622,15 @@ impl DownloadEngine {
             self.vip_type
         );
 
-        // 2. 获取所有可用下载链接（用于失败时切换）
-        let all_urls = match self
-            .get_netdisk_client()
-            .get_locate_download_url(&remote_path)
+        // 2. 获取所有可用下载链接（用于失败时切换；Locate 8002 时回退 filemetas dlink）
+        let all_urls = self
+            .acquire_download_urls(&remote_path)
             .await
-        {
-            Ok(urls) => {
-                if urls.is_empty() {
-                    error!("获取到下载链接列表为空: path={}", remote_path);
-                    anyhow::bail!("未找到可用的下载链接");
-                }
-                urls
-            }
-            Err(e) => {
+            .map_err(|e| {
                 error!("获取下载链接列表失败: path={}, 错误: {}", remote_path, e);
-                return Err(e).context("获取下载链接列表失败");
-            }
-        };
+                e
+            })
+            .context("获取下载链接列表失败")?;
 
         info!("获取到 {} 个下载链接", all_urls.len());
 
@@ -1788,7 +1820,8 @@ impl DownloadEngine {
             .context("准备本地文件失败")?;
 
         // 6. 创建分片管理器（使用自适应计算的 chunk_size）
-        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size)));
+        let owner_uid = { task.lock().await.owner_uid };
+        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size, owner_uid)));
 
         // 7. 创建速度计算器
         let speed_calc = Arc::new(Mutex::new(SpeedCalculator::with_default_window()));
@@ -2053,12 +2086,19 @@ impl DownloadEngine {
     ///
     /// 与 probe_download_link_with_client 功能相同，但不需要 &self
     /// 用于 prepare_for_scheduling 中的并行探测
+    ///
+    /// 返回 `(referer, speed_kbps, server_total_size)`：
+    /// - `server_total_size`：从 `Content-Range: bytes a-b/TOTAL` 解析出的服务器实际文件大小。
+    ///   `None` 表示响应缺失 Content-Range 或解析失败。调用方应在收集到多个探测结果时
+    ///   选择第一个 `Some(_)` 作为权威值，与本地 `task.total_size` 比对并修正不一致。
+    ///   修正可避免「文件列表 API 返回 size 与 Locate 实际 size 不一致」导致最后一个
+    ///   分片 Content-Range 不匹配而失败的问题。
     async fn probe_download_link_parallel(
         client: &Client,
         bduss: &str,
         url: &str,
         expected_size: u64,
-    ) -> Result<(Option<String>, f64)> {
+    ) -> Result<(Option<String>, f64, Option<u64>)> {
         const PROBE_SIZE: u64 = 64 * 1024; // 64KB
 
         let probe_end = if expected_size > 0 {
@@ -2094,6 +2134,14 @@ impl DownloadEngine {
             );
         }
 
+        // 解析 Content-Range 拿服务器实际文件总大小（用于校正 task.total_size）
+        let server_total_size = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split('/').nth(1))
+            .and_then(|s| s.parse::<u64>().ok());
+
         // 获取最终的 URL（如果有重定向，这将是重定向后的 URL）
         let final_url = response.url().to_string();
 
@@ -2116,13 +2164,14 @@ impl DownloadEngine {
         };
 
         debug!(
-            "✅ 探测成功: 收到 {} bytes 数据，耗时 {:.2}s，速度 {:.2} KB/s",
+            "✅ 探测成功: 收到 {} bytes 数据，耗时 {:.2}s，速度 {:.2} KB/s, 服务器总大小: {:?}",
             probe_data.len(),
             elapsed,
-            speed_kbps
+            speed_kbps,
+            server_total_size
         );
 
-        Ok((referer, speed_kbps))
+        Ok((referer, speed_kbps, server_total_size))
     }
 
     /// 用于恢复链接的简化探测函数（静态方法）
@@ -2317,7 +2366,7 @@ impl DownloadEngine {
         let mut sorted_speeds = url_speeds.clone();
         sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mid = sorted_speeds.len() / 2;
-        let median_speed = if sorted_speeds.len() % 2 == 0 {
+        let median_speed = if sorted_speeds.len().is_multiple_of(2) {
             (sorted_speeds[mid - 1] + sorted_speeds[mid]) / 2.0
         } else {
             sorted_speeds[mid]
@@ -3056,7 +3105,7 @@ impl DownloadEngine {
                 // 🔧 Warm 模式集成：
                 // 当可用链接<5时，每10个分片给warm链接分配1个
                 // 这样warm链接可以在真实下载中自我恢复
-                let use_warm = count < 5 && chunk_index % 10 == 0;
+                let use_warm = count < 5 && chunk_index.is_multiple_of(10);
 
                 let url = if use_warm {
                     // 尝试获取 warm 链接
@@ -3072,7 +3121,7 @@ impl DownloadEngine {
                             .get_url_hybrid(chunk_index)
                             .or_else(|| {
                                 let url_index = chunk_index % count;
-                                health.get_url(url_index).map(|s| s.clone())
+                                health.get_url(url_index).cloned()
                             })
                             .ok_or_else(|| anyhow::anyhow!("无法获取 URL"))?
                     }
@@ -3086,7 +3135,7 @@ impl DownloadEngine {
                             .get_url_hybrid(chunk_index)
                             .or_else(|| {
                                 let url_index = chunk_index % count;
-                                health.get_url(url_index).map(|s| s.clone())
+                                health.get_url(url_index).cloned()
                             })
                             .ok_or_else(|| anyhow::anyhow!("无法获取 URL"))?
                     } else {
@@ -3142,7 +3191,8 @@ impl DownloadEngine {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         // 更新任务已下载大小，并获取 group_id 和 is_backup
-                        let (downloaded_size, speed, group_id, is_backup) = {
+                        // 🔥 同时取出 owner_uid
+                        let (downloaded_size, speed, group_id, is_backup, owner_uid_raw) = {
                             let mut t = task_clone.lock().await;
                             // 🔥 修复：限制 downloaded_size 不超过 total_size，防止断点续传时重复累加
                             let new_size = t.downloaded_size.saturating_add(bytes);
@@ -3154,7 +3204,7 @@ impl DownloadEngine {
                             calc.add_sample(bytes);
                             t.speed = calc.speed();
 
-                            (downloaded, t.speed, t.group_id.clone(), t.is_backup)
+                            (downloaded, t.speed, t.group_id.clone(), t.is_backup, t.owner_uid.raw())
                         };
 
                         // 🔧 克隆一个临时变量用于 send
@@ -3189,6 +3239,8 @@ impl DownloadEngine {
                                             progress,
                                             group_id: group_id.clone(),
                                             is_backup,
+
+                                            owner_uid: Some(owner_uid_raw),
                                         }),
                                         group_id_for_ws,
                                     );
@@ -3329,27 +3381,26 @@ impl DownloadEngine {
 
                     // 🔥 代理回退：下载失败时检测是否为代理/连接错误
                     if let Some(ref mgr) = fallback_mgr {
-                        if !mgr.is_fallen_back() {
-                            if crate::common::proxy_fallback::is_proxy_or_connection_error(&e) {
-                                let should_fallback = mgr.record_failure();
-                                if should_fallback {
-                                    // 检查 allow_fallback 配置
-                                    let allow = mgr.user_proxy_config().await
-                                        .map(|c| c.allow_fallback)
-                                        .unwrap_or(true);
-                                    if allow {
-                                        warn!(
+                        if !mgr.is_fallen_back()
+                            && crate::common::proxy_fallback::is_proxy_or_connection_error(&e) {
+                            let should_fallback = mgr.record_failure();
+                            if should_fallback {
+                                // 检查 allow_fallback 配置
+                                let allow = mgr.user_proxy_config().await
+                                    .map(|c| c.allow_fallback)
+                                    .unwrap_or(true);
+                                if allow {
+                                    warn!(
                                             "[分片线程{}] ⚠ 代理连续失败达到阈值，触发回退到直连",
                                             chunk_thread_id
                                         );
-                                        // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
-                                        mgr.execute_fallback().await;
-                                    } else {
-                                        info!(
+                                    // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
+                                    mgr.execute_fallback().await;
+                                } else {
+                                    info!(
                                             "[分片线程{}] 代理失败达到阈值但 allow_fallback=false，不执行回退",
                                             chunk_thread_id
                                         );
-                                    }
                                 }
                             }
                         }
@@ -3486,6 +3537,7 @@ mod tests {
             bdstoken: Some("mock_bdstoken".to_string()),
             login_time: 0,
             last_warmup_at: None,
+            custom_config: Default::default(),
         }
     }
 

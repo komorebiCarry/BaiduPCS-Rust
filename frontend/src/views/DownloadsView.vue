@@ -7,6 +7,14 @@
         <el-tag :type="activeCountType" size="large">
           {{ activeCount }} 个任务进行中
         </el-tag>
+        <!-- 多账号过滤器 -->
+        <AccountFilter
+            v-if="authStore.hasMultipleAccounts"
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            size="large"
+            class="account-filter-slot"
+        />
       </div>
       <div class="header-right">
         <el-button @click="refreshTasks" :circle="isMobile">
@@ -44,11 +52,14 @@
 
     <!-- 下载任务列表 -->
     <div class="task-container">
-      <el-empty v-if="!loading && downloadItems.length === 0" description="暂无下载任务"/>
+      <el-empty
+          v-if="!loading && displayedItems.length === 0"
+          :description="ownerFilter === null ? '暂无下载任务' : '当前过滤条件下暂无下载任务'"
+      />
 
       <div v-else class="task-list">
         <el-card
-            v-for="item in downloadItems"
+            v-for="item in displayedItems"
             :key="item.id"
             :data-task-id="item.id"
             class="task-card"
@@ -78,6 +89,8 @@
                     item.type === 'folder' ? getFolderStatusText(item.status as FolderStatus) : getStatusText(item.status as TaskStatus)
                   }}
                 </el-tag>
+                <!-- 多账号 chip：只在多账号或非活跃任务上显示 -->
+                <AccountBadge :owner-uid="item.owner_uid" size="small" class="task-account-badge" />
                 <span v-if="item.type === 'folder' && item.status === 'scanning'" class="scanning-hint">
                     (已发现 {{ item.total_files }} 个文件)
                   </span>
@@ -410,12 +423,21 @@ import {
 } from '@element-plus/icons-vue'
 import {useRouter, useRoute} from 'vue-router'
 import {useIsMobile} from '@/utils/responsive'
+import {createAdaptivePoller} from '@/utils/backendHealth'
 // 🔥 WebSocket 相关导入
 import {getWebSocketClient, connectWebSocket, type ConnectionState} from '@/utils/websocket'
+// 多账号集成
+import {useAuthStore} from '@/stores/auth'
+import AccountFilter from '@/components/AccountFilter.vue'
+import AccountBadge from '@/components/AccountBadge.vue'
 
 // 响应式检测
 const isMobile = useIsMobile()
 import type {DownloadEvent, FolderEvent} from '@/types/events'
+
+// 多账号状态
+const authStore = useAuthStore()
+const ownerFilter = ref<number | null>(null)
 
 // 路由
 const router = useRouter()
@@ -445,8 +467,8 @@ const folderDetailDialog = ref({
   searchText: '',
 })
 
-// 自动刷新定时器
-let refreshTimer: number | null = null
+// 自适应轮询器：WS 未连接时兜底刷新；后端断开后阶梯式退避重连，避免高频刷屏
+const refreshPoller = createAdaptivePoller(() => { refreshTasks() }, { baseDelayMs: 1000, maxDelayMs: 30000 })
 // 文件夹详情弹窗刷新定时器
 let folderDetailTimer: number | null = null
 // 🔥 refreshFolderDetail 请求序号 + 最后应用序号，用于丢弃乱序旧响应
@@ -474,6 +496,24 @@ const hasActiveTasks = computed(() => {
     const status = item.status
     return status === 'downloading' || status === 'scanning' || status === 'paused' || status === 'pending' || status === 'decrypting'
   })
+})
+
+// 多账号过滤后的展示列表
+const displayedItems = computed(() => {
+  if (ownerFilter.value === null) return downloadItems.value
+  return downloadItems.value.filter((item) => item.owner_uid === ownerFilter.value)
+})
+
+// 每个账号的任务数
+const ownerFilterCounts = computed(() => {
+  const map: Record<number, number> = {}
+  for (const item of downloadItems.value) {
+    const uid = typeof item.owner_uid === 'number' ? item.owner_uid : null
+    if (uid !== null) {
+      map[uid] = (map[uid] || 0) + 1
+    }
+  }
+  return map
 })
 
 // 计算属性
@@ -609,10 +649,9 @@ async function refreshTasks() {
 function updateAutoRefresh() {
   // 🔥 如果 WebSocket 已连接，不使用轮询（由 WebSocket 推送更新）
   if (wsConnected.value) {
-    if (refreshTimer) {
+    if (refreshPoller.isRunning()) {
       console.log('[DownloadsView] WebSocket 已连接，停止轮询')
-      clearInterval(refreshTimer)
-      refreshTimer = null
+      refreshPoller.stop()
     }
     return
   }
@@ -620,18 +659,15 @@ function updateAutoRefresh() {
   // 🔥 WebSocket 未连接时，回退到轮询模式
   // 有活跃任务 或 初始加载尚未成功时，启动或保持定时刷新
   if (hasActiveTasks.value || !initialLoadDone) {
-    if (!refreshTimer) {
+    if (!refreshPoller.isRunning()) {
       console.log('[DownloadsView] WebSocket 未连接，启动轮询模式，活跃任务数:', activeCount.value)
-      refreshTimer = window.setInterval(() => {
-        refreshTasks()
-      }, 1000) // 🔥 改为 1 秒间隔，减少服务器压力
+      refreshPoller.start()
     }
   } else {
     // 没有活跃任务时，停止定时刷新
-    if (refreshTimer) {
+    if (refreshPoller.isRunning()) {
       console.log('[DownloadsView] 停止轮询，当前任务数:', downloadItems.value.length)
-      clearInterval(refreshTimer)
-      refreshTimer = null
+      refreshPoller.stop()
     }
   }
 }
@@ -1035,6 +1071,10 @@ function handleDownloadEvent(event: DownloadEvent) {
           group_id: event.group_id,
           original_filename: event.original_filename, // 🔥 保存原始文件名
           is_encrypted: !!event.original_filename, // 🔥 有原始文件名说明是加密文件
+          // 🔥 透传 owner_uid
+          // 后端 Created event 现在带正确 owner_uid（handler override 后再 emit），
+          // 前端按 activeUid 过滤时若 item.owner_uid 缺失，会被错误地归到默认账号。
+          owner_uid: event.owner_uid,
         } as DownloadItemFromBackend)
         mainListWsTime.set(taskId, Date.now())
       }
@@ -1051,6 +1091,7 @@ function handleDownloadEvent(event: DownloadEvent) {
             downloaded_size: 0,
             speed: 0,
             group_id: event.group_id,
+            owner_uid: event.owner_uid,
           } as DownloadTask)
           // 🔥 记录 WS 新增时间戳，合并时保护不被旧轮询丢弃
           folderDetailTaskWsTime.set(taskId, Date.now())
@@ -1065,6 +1106,14 @@ function handleDownloadEvent(event: DownloadEvent) {
         downloadItems.value[index].downloaded_size = event.downloaded_size
         downloadItems.value[index].total_size = event.total_size
         downloadItems.value[index].speed = event.speed
+        // 🔥 owner_uid 自纠错
+        // Created event 在某些路径下可能带 startup active uid（manager.owner_uid
+        // 而非 effective_uid，因 handler override 在 emit 之后）；progress event
+        // 在 override 之后发出，此时 task.owner_uid 已正确 → 用它纠正本地副本。
+        if (typeof event.owner_uid === 'number' &&
+            downloadItems.value[index].owner_uid !== event.owner_uid) {
+          downloadItems.value[index].owner_uid = event.owner_uid
+        }
         // 🔥 不更新状态，避免暂停后收到延迟进度事件导致状态回刷
         mainListWsTime.set(taskId, Date.now())
       }
@@ -1296,6 +1345,10 @@ function handleFolderEvent(event: FolderEvent) {
           total_size: 0,
           downloaded_size: 0,
           speed: 0,
+          // 🔥 透传文件夹 owner_uid
+          // 后端 FolderEvent::Created 现在带 Some(owner_uid)，前端按 ownerFilter
+          // 过滤时若 item.owner_uid 缺失会导致新建文件夹瞬间消失。
+          owner_uid: event.owner_uid,
         } as DownloadItemFromBackend)
         mainListWsTime.set(folderId, Date.now())
       }
@@ -1480,17 +1533,24 @@ onMounted(async () => {
   // 🔥 设置 WebSocket 订阅
   setupWebSocketSubscriptions()
   // updateAutoRefresh 会在 refreshTasks 完成后根据任务状态自动启动定时器
+
+  // 多账号 active 切换 → 强制重拉一次任务列表
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
 })
+
+// 多账号切换处理器
+function handleActiveChanged() {
+  refreshTasks()
+}
 
 // 组件卸载时清除定时器
 onUnmounted(() => {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-    refreshTimer = null
-  }
+  refreshPoller.stop()
   stopFolderDetailTimer()
   // 🔥 清理 WebSocket 订阅
   cleanupWebSocketSubscriptions()
+  // 多账号事件清理
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 </script>
 

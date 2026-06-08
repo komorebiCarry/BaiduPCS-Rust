@@ -71,6 +71,10 @@ export interface TransferTask {
   local_download_path?: string
   status: TransferStatus
   error?: string
+  /** 任务归属账号 UID */
+  owner_uid?: number | null
+  /** 标准化失败原因 */
+  failure_reason?: string | null
   download_task_ids: string[]
   share_info?: SharePageInfo
   file_list: SharedFileInfo[]
@@ -103,6 +107,8 @@ export interface CreateTransferRequest {
   selected_fs_ids?: number[]
   /** 选中的文件完整信息列表（可选，用于后端获取选中文件的元信息） */
   selected_files?: SharedFileInfo[]
+  /** 任务归属账号 UID */
+  owner_uid?: number
 }
 
 /// 预览分享文件请求

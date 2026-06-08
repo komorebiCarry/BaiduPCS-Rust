@@ -6,12 +6,15 @@
 import type {
   WsClientMessage,
   WsServerMessage,
+  WsServerSnapshot,
   DownloadEvent,
   FolderEvent,
   UploadEvent,
   TransferEvent,
   BackupEvent,
   CloudDlEvent,
+  AccountEvent,
+  BudgetEvent,
   TimestampedEvent,
 } from '@/types/events'
 
@@ -25,6 +28,9 @@ type UploadEventCallback = (event: UploadEvent) => void
 type TransferEventCallback = (event: TransferEvent) => void
 type BackupEventCallback = (event: BackupEvent) => void
 type CloudDlEventCallback = (event: CloudDlEvent) => void
+type AccountEventCallback = (event: AccountEvent) => void
+type BudgetEventCallback = (event: BudgetEvent) => void
+type SnapshotCallback = (snapshot: WsServerSnapshot) => void
 type ConnectionStateCallback = (state: ConnectionState) => void
 
 // 重连配置
@@ -49,6 +55,9 @@ class WebSocketClient {
   private transferListeners: Set<TransferEventCallback> = new Set()
   private backupListeners: Set<BackupEventCallback> = new Set()
   private cloudDlListeners: Set<CloudDlEventCallback> = new Set()
+  private accountListeners: Set<AccountEventCallback> = new Set()
+  private budgetListeners: Set<BudgetEventCallback> = new Set()
+  private snapshotListeners: Set<SnapshotCallback> = new Set()
   private connectionStateListeners: Set<ConnectionStateCallback> = new Set()
 
   // 连接 ID
@@ -201,8 +210,19 @@ class WebSocketClient {
           break
 
         case 'snapshot':
-          console.log('[WS] 收到状态快照')
-          // TODO: 处理状态快照
+          console.log(
+              '[WS] 收到状态快照',
+              {
+                downloads: message.downloads?.length ?? 0,
+                uploads: message.uploads?.length ?? 0,
+                transfers: message.transfers?.length ?? 0,
+                folders: message.folders?.length ?? 0,
+                accounts: message.accounts?.length ?? 0,
+                active_uid: message.active_uid ?? null,
+                readonly_mode: message.readonly_mode ?? false,
+              },
+          )
+          this.snapshotListeners.forEach((cb) => cb(message))
           break
 
         case 'error':
@@ -257,6 +277,14 @@ class WebSocketClient {
         break
       case 'cloud_dl':
         this.cloudDlListeners.forEach((cb) => cb(event.event as CloudDlEvent))
+        break
+      case 'account':
+        this.accountListeners.forEach((cb) => cb(event.event as AccountEvent))
+        break
+      case 'budget':
+        // 多账号资源配额事件。
+        // 订阅方：仅 BudgetPanel.vue 通过 stores/budget.ts 订阅。
+        this.budgetListeners.forEach((cb) => cb(event.event as BudgetEvent))
         break
       default:
         console.warn('[WS] 未知事件类别:', category)
@@ -379,6 +407,43 @@ class WebSocketClient {
   public onCloudDlEvent(callback: CloudDlEventCallback): () => void {
     this.cloudDlListeners.add(callback)
     return () => this.cloudDlListeners.delete(callback)
+  }
+
+  /**
+   * 订阅账号事件
+   *
+   * 后端事件：
+   * - `AccountEvent::Switched` → `{ event_type: 'switched', new_active_uid }`
+   * - `AccountEvent::ListChanged` → `{ event_type: 'list_changed', accounts, active_uid }`
+   *
+   * 订阅名（服务端）应为 `account:*`；调用方需自行 `subscribe(['account:*'])`。
+   */
+  public onAccountEvent(callback: AccountEventCallback): () => void {
+    this.accountListeners.add(callback)
+    return () => this.accountListeners.delete(callback)
+  }
+
+  /**
+   * 订阅多账号配额事件。
+   *
+   * 订阅名（服务端）应为 `budget:*`；调用方需自行 `subscribe(['budget:*'])`。
+   * 订阅者：仅设置页「多账号资源配额」Tab 订阅，其他页面默认不订阅。
+   */
+  public onBudgetEvent(callback: BudgetEventCallback): () => void {
+    this.budgetListeners.add(callback)
+    return () => this.budgetListeners.delete(callback)
+  }
+
+  /**
+   * 订阅状态快照
+   *
+   * 仅在客户端主动 `requestSnapshot()` 后服务端下发；
+   * 多账号场景下 accounts/active_uid/readonly_mode 均随快照下发，
+   * 订阅者可据此一次性同步 store 状态。
+   */
+  public onSnapshot(callback: SnapshotCallback): () => void {
+    this.snapshotListeners.add(callback)
+    return () => this.snapshotListeners.delete(callback)
   }
 
   /**

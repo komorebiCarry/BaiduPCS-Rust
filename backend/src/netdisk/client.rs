@@ -363,17 +363,16 @@ impl NetdiskClient {
 
             // 检查最终 URL 是否重定向到登录页（代表 BDUSS 失效）
             // 对于 /disk/home，如果最终 URL 是登录页，说明有问题
-            if step.contains("/disk/home") {
-                if final_url.contains("passport.baidu.com")
-                    || final_url.contains("wappass.baidu.com")
-                    || final_url.contains("pan.baidu.com/login")
-                {
-                    anyhow::bail!(
+            if step.contains("/disk/home")
+                && (final_url.contains("passport.baidu.com")
+                || final_url.contains("wappass.baidu.com")
+                || final_url.contains("pan.baidu.com/login"))
+            {
+                anyhow::bail!(
                         "BDUSS 已失效或请求参数错误 ({} 最终重定向到 {})",
                         step,
                         final_url
                     );
-                }
             }
 
             // 打印 Set-Cookie 并提取 PANPSC
@@ -1024,63 +1023,76 @@ impl NetdiskClient {
         Ok(search_result)
     }
 
-    /// 获取文件元信息（包含 block_list）
+    /// 按完整路径获取文件元信息（fs_id / size / server_mtime / md5 等）。
+    ///
+    /// 说明：百度开放接口 `xpan/multimedia?method=filemetas` 只支持按 `fsids` 查询，
+    /// 其 `path` 参数仅用于共享目录/专属空间，并不能按普通文件路径查询；旧实现把路径数组
+    /// 塞进了 `dlink`（应为 0/1 开关）参数且未传 `fsids`，对普通文件实际取不到结果。
+    ///
+    /// 这里改为基于已验证可用的 `xpan/file?method=list`：列出每个路径的父目录并按完整
+    /// 路径精确匹配，取到对应文件的元信息。
+    ///
+    /// 注意：`method=list` 不返回 `block_list`（分片 MD5 列表），故结果中 `block_list`
+    /// 恒为 `None`。如需 block_list，应改用其它接口（当前仓库内并无活动调用方依赖它）。
     ///
     /// # 参数
-    /// * `paths` - 文件路径数组
+    /// * `paths` - 文件路径数组（完整路径，如 "/dir/file.mp4"）
     ///
     /// # 返回
-    /// 文件元信息响应
+    /// 文件元信息响应（仅包含成功匹配到的文件）
     pub async fn filemetas(&self, paths: &[String]) -> Result<crate::netdisk::FileMetasResponse> {
-        info!("获取文件元信息: paths={:?}", paths);
+        info!("获取文件元信息(按路径): paths={:?}", paths);
 
-        let url = "https://pan.baidu.com/rest/2.0/xpan/multimedia";
-
-        // 将路径数组转换为 JSON 字符串
-        let dlink_str = serde_json::to_string(paths)?;
-
-        let response = self
-            .client
-            .get(url)
-            .query(&[
-                ("method", "filemetas"),
-                ("dlink", &dlink_str),
-                ("thumb", "0"),
-                ("extra", "1"),
-                ("needmedia", "1"),
-            ])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
-            .header("User-Agent", &self.mobile_user_agent)
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(resp) => {
-                self.record_proxy_success();
-                resp
+        let mut list = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.find_file_item_by_path(path).await? {
+                Some(item) => list.push(crate::netdisk::FileMetaInfo {
+                    fs_id: item.fs_id,
+                    path: item.path,
+                    server_filename: item.server_filename,
+                    size: item.size,
+                    isdir: item.isdir,
+                    md5: item.md5,
+                    block_list: None,
+                    dlink: None,
+                    server_ctime: item.server_ctime,
+                    server_mtime: item.server_mtime,
+                }),
+                None => debug!("filemetas: 未在父目录中匹配到文件: {}", path),
             }
-            Err(e) => {
-                let err = anyhow::Error::from(e).context("获取文件元信息请求失败");
-                self.record_proxy_failure(&err);
-                return Err(err);
-            }
-        };
-
-        let file_metas: crate::netdisk::FileMetasResponse = response
-            .json()
-            .await
-            .context("解析文件元信息响应失败")?;
-
-        if file_metas.errno != 0 {
-            anyhow::bail!(
-                "获取文件元信息失败: errno={}, errmsg={}",
-                file_metas.errno,
-                file_metas.errmsg
-            );
         }
 
-        debug!("获取到 {} 个文件元信息", file_metas.list.len());
-        Ok(file_metas)
+        debug!("获取到 {} 个文件元信息", list.len());
+        Ok(crate::netdisk::FileMetasResponse {
+            errno: 0,
+            errmsg: String::new(),
+            list,
+        })
+    }
+
+    /// 通过完整路径在其父目录列表中精确匹配文件项（用于按路径解析 fs_id 等元信息）。
+    ///
+    /// 分页遍历父目录（每页 1000，最多 100 页 ≈ 10 万项）直至命中或翻完。
+    async fn find_file_item_by_path(&self, path: &str) -> Result<Option<crate::netdisk::FileItem>> {
+        let parent = match path.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(idx) => path[..idx].to_string(),
+        };
+
+        const PAGE_SIZE: u32 = 1000;
+        const MAX_PAGES: u32 = 100;
+        for page in 1..=MAX_PAGES {
+            let resp = self.get_file_list(&parent, page, PAGE_SIZE).await?;
+            let count = resp.list.len();
+            if let Some(item) = resp.list.into_iter().find(|it| it.path == path) {
+                return Ok(Some(item));
+            }
+            // 不足一页说明已到末页
+            if count < PAGE_SIZE as usize {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// 获取Locate下载链接（通过文件路径）
@@ -1090,7 +1102,19 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// 下载URL数组
+    ///
+    /// 🔥 对偶发的临时风控错误（errno=8002「参数异常,请更新最新版本客户端」、
+    /// errno=9019「need verify」）做阶梯式退避重试（3s→8s→20s，±20% 抖动，最多 3 次）。
+    /// 其余确定性错误立即返回。
     pub async fn get_locate_download_url(&self, path: &str) -> Result<Vec<String>> {
+        crate::common::retry::retry_pcs_riskcontrol("Locate 下载取链", || {
+            self.get_locate_download_url_once(path)
+        })
+            .await
+    }
+
+    /// 获取Locate下载链接（单次尝试，不含重试）
+    async fn get_locate_download_url_once(&self, path: &str) -> Result<Vec<String>> {
         info!("获取Locate下载链接: path={}", path);
 
         // 1. 检查 UID
@@ -1334,14 +1358,14 @@ impl NetdiskClient {
             .form(&[
                 ("path", remote_path),
                 ("size", &file_size.to_string()),
-                ("isdir", &is_dir),
-                ("uploadid", &upload_id),
+                ("isdir", is_dir),
+                ("uploadid", upload_id),
                 // rtype 文件命名策略:
                 // 1 = path冲突时重命名 (推荐,避免覆盖)
                 // 2 = path冲突且block_list不同时重命名 (智能去重)
                 // 3 = path冲突时覆盖 (危险)
                 ("rtype", rtype),
-                ("block_list", &block_list),
+                ("block_list", block_list),
             ])
             .send()
             .await;
@@ -1393,7 +1417,17 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// 上传服务器主机名列表（如 `["d.pcs.baidu.com", "c.pcs.baidu.com"]`）
+    ///
+    /// 🔥 与下载取链同口径：对临时风控错误（errno=8002/9019）做阶梯式退避重试。
     pub async fn locate_upload(&self) -> Result<Vec<String>> {
+        crate::common::retry::retry_pcs_riskcontrol("Locate 上传服务器", || {
+            self.locate_upload_once()
+        })
+            .await
+    }
+
+    /// 获取上传服务器列表（单次尝试，不含重试）
+    async fn locate_upload_once(&self) -> Result<Vec<String>> {
         info!("获取上传服务器列表");
 
         let url = format!(
@@ -2774,8 +2808,8 @@ impl NetdiskClient {
 
                 // 生成随机抖动
                 let mut rng = rand::thread_rng();
-                let jitter = rng.gen_range(-(jitter_ms as i32)..=(jitter_ms as i32));
-                (base_ms as i32 + jitter).max(0) as u64
+                let jitter = rng.gen_range(-jitter_ms..=jitter_ms);
+                (base_ms + jitter).max(0) as u64
             };
 
             // 等待延迟

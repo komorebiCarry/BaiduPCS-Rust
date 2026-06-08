@@ -53,11 +53,13 @@
 //! manager.shutdown().await;
 //! ```
 
+pub mod backup;
 pub mod folder;
 pub mod history;
 pub mod history_db;
 pub mod manager;
 pub mod metadata;
+pub mod migration;
 pub mod recovery;
 pub mod types;
 pub mod wal;
@@ -83,8 +85,9 @@ pub use manager::PersistenceManager;
 // 导出恢复模块
 pub use recovery::{
     cleanup_completed_tasks, cleanup_completed_tasks_with_db, cleanup_expired_tasks,
-    cleanup_invalid_tasks, scan_recoverable_tasks, DownloadRecoveryInfo, RecoveredTask,
-    RecoveryScanResult, TransferRecoveryInfo, UploadRecoveryInfo,
+    classify_recovery_branch, cleanup_invalid_tasks, scan_recoverable_tasks,
+    DownloadRecoveryInfo, RecoveredTask, RecoveryBranch, RecoveryScanResult,
+    TransferRecoveryInfo, UploadRecoveryInfo,
 };
 
 // 导出历史归档模块
@@ -103,3 +106,12 @@ pub use folder::{
 
 // 导出历史数据库模块
 pub use history_db::{CloudDlAutoDownloadConfig, HistoryDbManager};
+
+// 导出多账号迁移矩阵执行器
+pub use migration::{
+    backfill_meta_owner_uid, is_transient_sqlite_error, migrate_backup_configs_schema,
+    run_migration_matrix, MigrationSummary,
+};
+
+// 导出迁移前完整备份
+pub use backup::{create_pre_migration_backup, needs_pre_migration_backup, PreMigrationBackup};

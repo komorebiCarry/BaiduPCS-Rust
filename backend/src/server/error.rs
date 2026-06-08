@@ -23,6 +23,20 @@ pub enum ApiError {
     BadRequest(String),
     /// 冲突
     Conflict(String),
+    // ───────── 多账号错误码 ─────────
+    /// 账号不在（账号已删除 / 客户端不可用） — 400
+    ///
+    /// 触发场景：(1) `?uid=` 或 body `uid` 指向已删除账号；(2) `active_uid = None` 且未显式提供 uid。
+    AccountNotAvailable,
+    /// 旧历史只读 — 400
+    ///
+    /// 仅用于 CloudDl 单资源控制接口（`cancel` / `delete :task_id`）显式操作 `owner_uid = NULL` 历史行的场景。
+    /// 其他模块的 legacy 行启动时已回填 active_uid，运行态不应再返回此错误。
+    LegacyHistoryReadonly,
+    /// 全局只读模式 — 503
+    ///
+    /// 触发：迁移失败 / 关键持久化异常 →`AppState.readonly_mode = true`，写接口（POST/PUT/DELETE）全部 503。
+    ReadonlyMode,
 }
 
 impl fmt::Display for ApiError {
@@ -34,6 +48,9 @@ impl fmt::Display for ApiError {
             ApiError::NotFound(msg) => write!(f, "Not found: {}", msg),
             ApiError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
             ApiError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            ApiError::AccountNotAvailable => write!(f, "account_not_available"),
+            ApiError::LegacyHistoryReadonly => write!(f, "legacy_history_readonly"),
+            ApiError::ReadonlyMode => write!(f, "readonly_mode"),
         }
     }
 }
@@ -80,6 +97,33 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(msg) => {
                 tracing::debug!("Conflict: {}", msg);
                 (StatusCode::CONFLICT, 409, msg, None)
+            }
+            ApiError::AccountNotAvailable => {
+                tracing::debug!("account_not_available");
+                (
+                    StatusCode::BAD_REQUEST,
+                    400,
+                    "account_not_available".to_string(),
+                    None,
+                )
+            }
+            ApiError::LegacyHistoryReadonly => {
+                tracing::debug!("legacy_history_readonly");
+                (
+                    StatusCode::BAD_REQUEST,
+                    400,
+                    "legacy_history_readonly".to_string(),
+                    None,
+                )
+            }
+            ApiError::ReadonlyMode => {
+                tracing::warn!("readonly_mode: 写接口被全局只读模式拦截");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "readonly_mode".to_string(),
+                    None,
+                )
             }
         };
 

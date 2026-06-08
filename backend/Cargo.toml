@@ -1,6 +1,6 @@
 [package]
 name = "baidu-netdisk-rust"
-version = "1.14.1"
+version = "2.0.0"
 edition = "2021"
 
 [dependencies]
@@ -91,7 +91,7 @@ zip = "0.6"
 # Windows 路径规范化
 dunce = "1.0"
 
-# Unix 系统调用（获取 uid/gid）
+# Unix 系统调用（获取 uid/gid、faccessat 权限检测）
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libc = "0.2"
 

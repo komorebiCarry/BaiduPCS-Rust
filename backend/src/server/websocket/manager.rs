@@ -60,7 +60,17 @@ pub struct WebSocketManager {
     /// 所有连接
     connections: DashMap<String, WsConnection>,
 
-    /// 订阅管理：connection_id -> 订阅模式集合
+    /// 🔥 用户原始订阅（不含派生 wildcard）
+    ///
+    /// `connection_id -> 用户实际调用 subscribe(...) 传入的原始 pattern 集合`。
+    /// 每次 subscribe / unsubscribe 都先维护本字段，再根据本字段**整体重建**
+    /// `subscriptions` + `subscription_index` 中该连接的派生 wildcard 视图，
+    /// 确保对称性：`unsubscribe(p)` 释放的不只是 `p` 本身，还包含 `p` 贡献且
+    /// 没有其他原始订阅共享的派生 wildcard（多个原始订阅共享同一 wildcard 时
+    /// 仍保留，避免误删）。
+    user_subscriptions: DashMap<String, HashSet<Arc<str>>>,
+
+    /// 订阅管理：connection_id -> 派生订阅模式集合（用户原始 + wildcard 派生项）
     /// 使用 Arc<str> 减少内存分配
     subscriptions: DashMap<String, HashSet<Arc<str>>>,
 
@@ -87,6 +97,7 @@ impl WebSocketManager {
     pub fn new() -> Self {
         Self {
             connections: DashMap::new(),
+            user_subscriptions: DashMap::new(),
             subscriptions: DashMap::new(),
             subscription_index: DashMap::new(),
             pending_events: DashMap::new(),
@@ -123,65 +134,157 @@ impl WebSocketManager {
     ///
     /// # 参数
     /// - `connection_id`: 连接 ID
-    /// - `patterns`: 订阅模式列表
+    /// - `patterns`: 订阅模式列表（用户原始订阅，不含 wildcard 派生）
+    ///
+    /// **订阅对称性**：每次 subscribe / unsubscribe 都先维护
+    /// `user_subscriptions`（用户原始订阅集合），再根据它整体重建该连接在
+    /// `subscriptions` + `subscription_index` 的派生 wildcard 视图，保证
+    /// subscribe/unsubscribe 对称（不会留下无主 wildcard 幽灵订阅）。
     pub fn subscribe(&self, connection_id: &str, patterns: Vec<String>) {
-        let mut conn_subs = self.subscriptions.entry(connection_id.to_string()).or_default();
-
-        for pattern in patterns {
-            // 规范化订阅模式，生成所有通配符版本，实现 O(1) 匹配
-            let normalized_patterns = Self::normalize_subscription(&pattern);
-
-            for pattern_arc in normalized_patterns {
-                // 添加到连接的订阅集合
-                conn_subs.insert(Arc::clone(&pattern_arc));
-
-                // 更新反向索引
-                self.subscription_index
-                    .entry(pattern_arc)
-                    .or_default()
-                    .insert(connection_id.to_string());
+        // Step 1: 维护用户原始订阅
+        {
+            let mut user_subs = self
+                .user_subscriptions
+                .entry(connection_id.to_string())
+                .or_default();
+            for pattern in &patterns {
+                user_subs.insert(Arc::from(pattern.as_str()));
             }
         }
 
-        info!("连接 {} 订阅更新: {:?}", connection_id, conn_subs.value());
+        // Step 2: 根据原始订阅整体重建派生 wildcard 视图
+        self.rebuild_derived_subscriptions(connection_id);
+
+        let current_subs = self
+            .subscriptions
+            .get(connection_id)
+            .map(|s| s.value().clone())
+            .unwrap_or_default();
+        info!("连接 {} 订阅更新: {:?}", connection_id, current_subs);
     }
 
     /// 移除订阅
+    ///
+    /// **取消订阅对称语义**：先从 `user_subscriptions` 删除原始订阅，再
+    /// 整体重建派生 wildcard 视图。这样：
+    /// - 用户取消 `download:file` 时，由 `download:file` 派生但被其他原始订阅
+    ///   共享的 `download:*`（如 `download:folder`）会保留
+    /// - 没有其他原始订阅共享的派生 wildcard（如本连接只订阅了 `download:file`，
+    ///   则 `download:*` 和 `*` 也跟随释放）才会从反向索引中清除
     pub fn unsubscribe(&self, connection_id: &str, patterns: Vec<String>) {
-        if let Some(mut conn_subs) = self.subscriptions.get_mut(connection_id) {
-            for pattern in patterns {
-                let pattern_arc: Arc<str> = Arc::from(pattern.as_str());
-
-                // 从连接的订阅集合移除
-                conn_subs.remove(&pattern_arc);
-
-                // 更新反向索引
-                if let Some(mut index_entry) = self.subscription_index.get_mut(&pattern_arc) {
-                    index_entry.remove(connection_id);
-                    if index_entry.is_empty() {
-                        drop(index_entry);
-                        self.subscription_index.remove(&pattern_arc);
-                    }
+        // Step 1: 从用户原始订阅中删除
+        {
+            if let Some(mut user_subs) = self.user_subscriptions.get_mut(connection_id) {
+                for pattern in &patterns {
+                    let arc: Arc<str> = Arc::from(pattern.as_str());
+                    user_subs.remove(&arc);
                 }
             }
-            info!("连接 {} 取消订阅，剩余: {:?}", connection_id, conn_subs.value());
+        }
+
+        // Step 2: 根据剩余原始订阅整体重建派生 wildcard 视图
+        self.rebuild_derived_subscriptions(connection_id);
+
+        let current_subs = self
+            .subscriptions
+            .get(connection_id)
+            .map(|s| s.value().clone())
+            .unwrap_or_default();
+        info!(
+            "连接 {} 取消订阅，剩余: {:?}",
+            connection_id, current_subs
+        );
+    }
+
+    /// 🔥 根据 `user_subscriptions[connection_id]` 整体
+    /// 重建该连接在 `subscriptions` + `subscription_index` 中的派生 wildcard 视图。
+    ///
+    /// 算法：
+    /// 1. 计算"应有的派生集合" = ∪ normalize_subscription(p) for p in user_subs
+    /// 2. 取"当前派生集合" = subscriptions[connection_id]
+    /// 3. 差集 to_add = 应有 \ 当前；to_remove = 当前 \ 应有
+    /// 4. 对 to_add：插入 subscriptions[c] + subscription_index
+    /// 5. 对 to_remove：从 subscriptions[c] 删除 + 反向索引同步清理（empty 则 drop）
+    ///
+    /// 时间复杂度：O(P × D + ΔP)，P = 原始订阅数，D = 平均规范化派生数，
+    /// ΔP = 实际增减派生数。对单连接订阅数 << 100 的常规场景影响可忽略。
+    fn rebuild_derived_subscriptions(&self, connection_id: &str) {
+        // 1) 应有派生集合
+        let desired: HashSet<Arc<str>> = self
+            .user_subscriptions
+            .get(connection_id)
+            .map(|user_subs| {
+                user_subs
+                    .iter()
+                    .flat_map(|p| Self::normalize_subscription(p))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 2) 当前派生集合
+        let current: HashSet<Arc<str>> = self
+            .subscriptions
+            .get(connection_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+
+        // 3) 差集计算
+        let to_add: Vec<Arc<str>> = desired.difference(&current).cloned().collect();
+        let to_remove: Vec<Arc<str>> = current.difference(&desired).cloned().collect();
+
+        // 4) 应用增量到 subscriptions[c]
+        let mut conn_subs = self
+            .subscriptions
+            .entry(connection_id.to_string())
+            .or_default();
+        for pat in &to_add {
+            conn_subs.insert(Arc::clone(pat));
+        }
+        for pat in &to_remove {
+            conn_subs.remove(pat);
+        }
+        let conn_subs_empty = conn_subs.is_empty();
+        drop(conn_subs);
+
+        // 如果该连接已无任何派生订阅，从 subscriptions 表中移除条目
+        if conn_subs_empty {
+            self.subscriptions.remove(connection_id);
+        }
+
+        // 5) 应用增量到 subscription_index
+        for pat in to_add {
+            self.subscription_index
+                .entry(pat)
+                .or_default()
+                .insert(connection_id.to_string());
+        }
+        for pat in to_remove {
+            if let Some(mut idx_entry) = self.subscription_index.get_mut(&pat) {
+                idx_entry.remove(connection_id);
+                if idx_entry.is_empty() {
+                    drop(idx_entry);
+                    self.subscription_index.remove(&pat);
+                }
+            }
+        }
+
+        // 用户原始订阅清空时，同步释放 user_subscriptions 条目
+        let user_empty = self
+            .user_subscriptions
+            .get(connection_id)
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        if user_empty {
+            self.user_subscriptions.remove(connection_id);
         }
     }
 
     /// 取消连接的所有订阅
     fn unsubscribe_all(&self, connection_id: &str) {
-        if let Some((_, subs)) = self.subscriptions.remove(connection_id) {
-            for pattern in subs {
-                if let Some(mut index_entry) = self.subscription_index.get_mut(&pattern) {
-                    index_entry.remove(connection_id);
-                    if index_entry.is_empty() {
-                        drop(index_entry);
-                        self.subscription_index.remove(&pattern);
-                    }
-                }
-            }
-            debug!("连接 {} 的所有订阅已清理", connection_id);
-        }
+        // 清空用户原始订阅 + 整体重建（差集会把所有派生项标记为 to_remove）
+        self.user_subscriptions.remove(connection_id);
+        self.rebuild_derived_subscriptions(connection_id);
+        debug!("连接 {} 的所有订阅已清理", connection_id);
     }
 
     /// 检查连接是否应该接收事件
@@ -689,6 +792,49 @@ impl WebSocketManager {
             .map(|subs| subs.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default()
     }
+
+    /// 🔥 枚举订阅了某个 topic 的所有连接 ID。
+    ///
+    /// 用于 CloudDl active-only 重订阅场景：
+    /// - `set_active_uid(None → Some(uid))`（删完最后账号后重新登录 / 切回有账号状态）
+    ///   时，需要找出所有「topic 订阅是 `cloud_dl` 但 `cloud_dl_ws_subscribers`
+    ///   未记录」的连接，把它们补绑到新 active uid 的 monitor 上。
+    /// - 不依赖 `cloud_dl_ws_subscribers` 内部状态，直接读 `subscription_index`
+    ///   反向索引取所有订阅了 `cloud_dl` 的连接。
+    pub fn connections_subscribed_to(&self, topic: &str) -> Vec<String> {
+        let key: Arc<str> = Arc::from(topic);
+        self.subscription_index
+            .get(&key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 🔥 按谓词枚举订阅匹配条件的所有连接 ID。
+    ///
+    /// 比 `connections_subscribed_to(exact_topic)` 更灵活：可以同时覆盖 exact 和
+    /// wildcard 多种订阅形式。CloudDl 场景下连接可能订阅 `cloud_dl` / `cloud_dl:*`
+    /// / `cloud_dl:specific_event` 任意一种（`subscribe()` 内部还会规范化生成所有
+    /// wildcard 版本），handler 用 `s == "cloud_dl" || s.starts_with("cloud_dl:")`
+    /// 二判定来识别 CloudDl 订阅；rebind 补扫必须用同一谓词避免规则漂移。
+    ///
+    /// 实现：遍历 `subscription_index` 中所有 pattern Arc，对每个 pattern 调
+    /// `predicate(pattern)`，命中则把该 pattern 关联的所有 connection_id 加入
+    /// 结果集合（去重）。
+    pub fn connections_matching_subscription<F>(&self, predicate: F) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut result: HashSet<String> = HashSet::new();
+        for entry in self.subscription_index.iter() {
+            let pattern: &Arc<str> = entry.key();
+            if predicate(pattern.as_ref()) {
+                for conn_id in entry.value().iter() {
+                    result.insert(conn_id.clone());
+                }
+            }
+        }
+        result.into_iter().collect()
+    }
 }
 
 impl Default for WebSocketManager {
@@ -742,6 +888,8 @@ mod tests {
             completed_at: 0,
             group_id: None,
             is_backup: false,
+
+            owner_uid: None,
         });
 
         manager.send_if_subscribed(event, None);
@@ -770,6 +918,8 @@ mod tests {
             progress: 10.0,
             group_id: None,
             is_backup: false,
+
+            owner_uid: None,
         });
 
         manager.send_if_subscribed(event, None);
@@ -777,5 +927,212 @@ mod tests {
         // 使用 try_recv 验证没有消息
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// CloudDl rebind 补扫规则的最小回归用例（exact）。
+    ///
+    /// 场景：连接订阅 exact `cloud_dl` topic。`connections_matching_subscription`
+    /// 用 handler 同款判定 `s == "cloud_dl" || s.starts_with("cloud_dl:")` 必须命中。
+    #[tokio::test]
+    async fn test_connections_matching_cloud_dl_exact() {
+        let manager = WebSocketManager::new();
+        let _r1 = manager.register("conn-1".to_string());
+        let _r2 = manager.register("conn-2".to_string());
+
+        manager.subscribe("conn-1", vec!["cloud_dl".to_string()]);
+        manager.subscribe("conn-2", vec!["download".to_string()]);
+
+        let conns = manager
+            .connections_matching_subscription(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0], "conn-1");
+    }
+
+    /// CloudDl rebind 补扫规则的最小回归用例（wildcard）。
+    ///
+    /// 场景：连接订阅 `cloud_dl:progress_update`，`subscribe()` 内部规范化生成
+    /// `cloud_dl:*` + `cloud_dl:progress_update`。补扫谓词必须能识别这两种 wildcard
+    /// 形式（旧版 exact 查询会漏掉，导致 rebind 找不到此连接 → 新 monitor 无订阅者
+    /// → 实时事件断流）。
+    #[tokio::test]
+    async fn test_connections_matching_cloud_dl_wildcard() {
+        let manager = WebSocketManager::new();
+        let _r = manager.register("conn-w".to_string());
+
+        // 客户端订阅分层 topic（subscribe 会规范化产生 wildcard 版本）
+        manager.subscribe("conn-w", vec!["cloud_dl:progress_update".to_string()]);
+
+        let conns = manager
+            .connections_matching_subscription(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+        assert!(
+            conns.contains(&"conn-w".to_string()),
+            "wildcard `cloud_dl:*` 订阅必须被 starts_with 谓词识别，避免 rebind 漏绑"
+        );
+    }
+
+    /// 补扫去重 — 同一连接订阅多种 cloud_dl 形式只返回一次。
+    #[tokio::test]
+    async fn test_connections_matching_cloud_dl_dedup() {
+        let manager = WebSocketManager::new();
+        let _r = manager.register("conn-d".to_string());
+
+        // 同一连接同时订阅 exact + 分层 topic（产生 cloud_dl + cloud_dl:* 多个 pattern）
+        manager.subscribe(
+            "conn-d",
+            vec![
+                "cloud_dl".to_string(),
+                "cloud_dl:status_changed".to_string(),
+            ],
+        );
+
+        let conns = manager
+            .connections_matching_subscription(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+        // 多个 pattern 命中同一 conn → 集合去重 → 仅一条
+        let occurrences = conns.iter().filter(|c| *c == "conn-d").count();
+        assert_eq!(
+            occurrences, 1,
+            "同一连接订阅多种 cloud_dl 形式时补扫结果必须去重，否则 rebind 会重复 add_subscriber 导致计数失衡"
+        );
+    }
+
+    /// subscribe / unsubscribe 对称性回归。
+    ///
+    /// 场景：连接订阅 `download:file` → subscribe 派生出 `download:*`；
+    /// 之后 unsubscribe `download:file` → 必须**同时**释放派生的 `download:*`，
+    /// 否则该连接仍会命中 `should_send_event` 中的 `download:*` 路径，收到本不该
+    /// 收到的事件（"幽灵订阅"）。
+    #[tokio::test]
+    async fn test_unsubscribe_releases_derived_wildcards() {
+        let manager = WebSocketManager::new();
+        let _r = manager.register("conn-x".to_string());
+
+        manager.subscribe("conn-x", vec!["download:file".to_string()]);
+        // 订阅后 derived 视图含 download:file + download:*
+        let derived_after_sub = manager.get_subscriptions("conn-x");
+        assert!(derived_after_sub.iter().any(|s| s == "download:file"));
+        assert!(derived_after_sub.iter().any(|s| s == "download:*"));
+
+        manager.unsubscribe("conn-x", vec!["download:file".to_string()]);
+        // 退订后 derived 视图必须**全部清空**（无其他原始订阅共享 download:*）
+        let derived_after_unsub = manager.get_subscriptions("conn-x");
+        assert!(
+            derived_after_unsub.is_empty(),
+            "退订 download:file 必须同时释放派生的 download:*；当前剩余: {:?}",
+            derived_after_unsub
+        );
+
+        // 反向索引也必须不再含 download:* / download:file
+        let conns_dl_star = manager.connections_subscribed_to("download:*");
+        let conns_dl_file = manager.connections_subscribed_to("download:file");
+        assert!(
+            !conns_dl_star.contains(&"conn-x".to_string()),
+            "subscription_index 必须同步清理 download:*"
+        );
+        assert!(
+            !conns_dl_file.contains(&"conn-x".to_string()),
+            "subscription_index 必须同步清理 download:file"
+        );
+    }
+
+    /// 多原始订阅共享 wildcard 时不误删。
+    ///
+    /// 场景：连接同时订阅 `download:file` 和 `download:folder`，两者派生同一
+    /// `download:*`。退订 `download:file` 时 `download:*` 必须**保留**（仍由
+    /// `download:folder` 贡献），否则 `download:folder` 的事件无法命中通配符路径。
+    #[tokio::test]
+    async fn test_unsubscribe_preserves_shared_wildcard() {
+        let manager = WebSocketManager::new();
+        let _r = manager.register("conn-s".to_string());
+
+        manager.subscribe(
+            "conn-s",
+            vec!["download:file".to_string(), "download:folder".to_string()],
+        );
+
+        // 两个原始订阅共享 download:*；derived 视图含 4 条
+        let before = manager.get_subscriptions("conn-s");
+        assert!(before.iter().any(|s| s == "download:file"));
+        assert!(before.iter().any(|s| s == "download:folder"));
+        assert!(before.iter().any(|s| s == "download:*"));
+
+        manager.unsubscribe("conn-s", vec!["download:file".to_string()]);
+
+        let after = manager.get_subscriptions("conn-s");
+        assert!(
+            !after.iter().any(|s| s == "download:file"),
+            "download:file 已退订必须移除"
+        );
+        assert!(
+            after.iter().any(|s| s == "download:folder"),
+            "download:folder 未退订必须保留"
+        );
+        assert!(
+            after.iter().any(|s| s == "download:*"),
+            "download:* 仍由 download:folder 贡献，必须保留（不能误删共享 wildcard）"
+        );
+    }
+
+    /// CloudDl 多子 topic 退订一个不应导致 monitor 计数错释。
+    ///
+    /// 场景：连接订阅 `cloud_dl:progress_update` + `cloud_dl:status_changed`，
+    /// 退订 `cloud_dl:progress_update`，必须仍能通过 handler 的判定式
+    /// (`s == "cloud_dl" || s.starts_with("cloud_dl:")`) 检测到剩余 cloud_dl 派生项；
+    /// 否则 handler 会错误地 `remove_subscriber()` 让 monitor 计数清零、停止轮询。
+    ///
+    /// 本测试是 `handler.rs::Unsubscribe` 分支「退订后再查 `get_subscriptions` 确认
+    /// 是否还有 cloud_dl 派生项」的核心契约保证。
+    #[tokio::test]
+    async fn test_partial_cloud_dl_unsubscribe_keeps_derived() {
+        let manager = WebSocketManager::new();
+        let _r = manager.register("conn-cd".to_string());
+
+        // 订阅两个 cloud_dl 子 topic
+        manager.subscribe(
+            "conn-cd",
+            vec![
+                "cloud_dl:progress_update".to_string(),
+                "cloud_dl:status_changed".to_string(),
+            ],
+        );
+
+        // derived 视图必须含两个原始 + 共享 wildcard cloud_dl:*
+        let before = manager.get_subscriptions("conn-cd");
+        assert!(before.iter().any(|s| s == "cloud_dl:progress_update"));
+        assert!(before.iter().any(|s| s == "cloud_dl:status_changed"));
+        assert!(before.iter().any(|s| s == "cloud_dl:*"));
+
+        // 只退一个子 topic
+        manager.unsubscribe("conn-cd", vec!["cloud_dl:progress_update".to_string()]);
+
+        let after = manager.get_subscriptions("conn-cd");
+        // handler 判定式必须仍能命中（`cloud_dl:status_changed` + `cloud_dl:*`）
+        let still_has_cloud_dl = after
+            .iter()
+            .any(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+        assert!(
+            still_has_cloud_dl,
+            "退订单个 cloud_dl 子 topic 后必须仍能检测到剩余派生项；当前: {:?}",
+            after
+        );
+        assert!(
+            after.iter().any(|s| s == "cloud_dl:status_changed"),
+            "未退订的子 topic 必须保留"
+        );
+        assert!(
+            after.iter().any(|s| s == "cloud_dl:*"),
+            "仍由 cloud_dl:status_changed 贡献的 wildcard 必须保留"
+        );
+
+        // 再退订最后一个子 topic 后才完全无 cloud_dl 派生
+        manager.unsubscribe("conn-cd", vec!["cloud_dl:status_changed".to_string()]);
+        let final_subs = manager.get_subscriptions("conn-cd");
+        let still = final_subs
+            .iter()
+            .any(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+        assert!(
+            !still,
+            "全部 cloud_dl 子 topic 退订后必须不再有任何 cloud_dl 派生项；当前: {:?}",
+            final_subs
+        );
     }
 }

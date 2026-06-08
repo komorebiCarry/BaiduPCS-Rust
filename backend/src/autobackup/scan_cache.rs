@@ -130,10 +130,8 @@ impl ScanCacheManager {
                 ))
             })?;
 
-            for row in rows {
-                if let Ok((path, mtime, size)) = row {
-                    cached.insert(path, (mtime, size));
-                }
+            for (path, mtime, size) in rows.flatten() {
+                cached.insert(path, (mtime, size));
             }
 
             // 比对：不在缓存中或 mtime/size 变化的文件

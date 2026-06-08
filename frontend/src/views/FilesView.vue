@@ -1355,15 +1355,29 @@ async function exitSearch(options: { keepExpanded?: boolean } = {}) {
   }
 }
 
+// 多账号切换处理器：重置到根目录并重拉文件列表
+// （新账号的目录树通常与旧账号不同，沿用旧 currentDir 会 404 或显示空）
+function handleActiveChanged() {
+  if (isSearchMode.value) {
+    resetSearchState()
+  }
+  selectedFiles.value = []
+  loadFiles('/')
+  loadDownloadConfig()
+}
+
 // 组件挂载时加载根目录和配置
 onMounted(() => {
   document.addEventListener('mousedown', handleSearchOutsidePointerDown)
   loadFiles('/')
   loadDownloadConfig()
+  // 多账号 active 切换 → 重置到根目录并重拉（与 DownloadsView 等 5 视图一致）
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
 })
 
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', handleSearchOutsidePointerDown)
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 
 // ============================================

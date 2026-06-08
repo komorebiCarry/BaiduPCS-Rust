@@ -209,11 +209,9 @@ pub fn load_history_task_ids(wal_dir: &Path) -> std::io::Result<HashSet<String>>
     let file = std::fs::File::open(&history_path)?;
     let reader = BufReader::new(file);
 
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Ok(metadata) = serde_json::from_str::<TaskMetadata>(&line) {
-                ids.insert(metadata.task_id);
-            }
+    for line in reader.lines().flatten() {
+        if let Ok(metadata) = serde_json::from_str::<TaskMetadata>(&line) {
+            ids.insert(metadata.task_id);
         }
     }
 

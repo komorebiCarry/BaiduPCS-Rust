@@ -7,6 +7,20 @@ pub struct BatchOperationRequest {
     pub all: Option<bool>,
     #[serde(default)]
     pub delete_files: Option<bool>,
+    /// 批量操作的归属 UID（强制过滤）。
+    ///
+    /// - `Some(uid)` → 操作仅作用于该账号的任务
+    /// - `None`     → 回退到 `state.active_uid()`，无活跃账号时拒绝
+    ///
+    /// 共享 manager 下所有路径都强制校验：
+    /// - `all=true` → 仅取该账号的可操作任务（`*_for_uid` 助手）
+    /// - 显式 `task_ids` → handler 调用 `validate_task_ids_for_uid` 逐条校验，
+    ///   `task.owner_uid != uid` 的 id 直接以 `success: false` 返回，不再下发到
+    ///   底层 manager（防止 A 账号上下文操作 B 账号任务）
+    ///
+    /// 前端 alias `owner_uid` 兼容（与 cloud_dl/uploads 一致）。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

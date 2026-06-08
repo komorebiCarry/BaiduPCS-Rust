@@ -16,9 +16,9 @@
             刷新
           </el-button>
           <el-button
-            v-if="selectedIds.length > 0"
-            type="danger"
-            @click="handleBatchCancel"
+              v-if="selectedIds.length > 0"
+              type="danger"
+              @click="handleBatchCancel"
           >
             <el-icon><Delete /></el-icon>
             批量取消 ({{ selectedIds.length }})
@@ -30,10 +30,10 @@
             <el-icon><Refresh /></el-icon>
           </el-button>
           <el-button
-            v-if="selectedIds.length > 0"
-            circle
-            type="danger"
-            @click="handleBatchCancel"
+              v-if="selectedIds.length > 0"
+              circle
+              type="danger"
+              @click="handleBatchCancel"
           >
             <el-icon><Delete /></el-icon>
           </el-button>
@@ -43,11 +43,11 @@
 
     <!-- PC端表格视图 -->
     <el-table
-      v-if="!isMobile"
-      :data="shareList"
-      v-loading="loading"
-      @selection-change="handleSelectionChange"
-      class="share-table"
+        v-if="!isMobile"
+        :data="shareList"
+        v-loading="loading"
+        @selection-change="handleSelectionChange"
+        class="share-table"
     >
       <el-table-column type="selection" width="50" />
       <el-table-column label="文件" prop="typicalPath" min-width="200">
@@ -93,16 +93,16 @@
     <!-- 移动端卡片列表 -->
     <div v-else class="share-card-list">
       <div
-        v-for="item in shareList"
-        :key="item.shareId"
-        class="share-card"
-        :class="{ selected: selectedIds.includes(item.shareId) }"
+          v-for="item in shareList"
+          :key="item.shareId"
+          class="share-card"
+          :class="{ selected: selectedIds.includes(item.shareId) }"
       >
         <div class="card-header" @click="toggleSelect(item.shareId)">
           <el-checkbox
-            :model-value="selectedIds.includes(item.shareId)"
-            @click.stop
-            @change="() => toggleSelect(item.shareId)"
+              :model-value="selectedIds.includes(item.shareId)"
+              @click.stop
+              @change="() => toggleSelect(item.shareId)"
           />
           <span class="file-name">{{ getFileName(item.typicalPath) }}</span>
           <el-tag size="small" :type="getStatusType(item.status)">
@@ -139,22 +139,22 @@
     <!-- 分页 -->
     <div class="pagination-wrapper" v-if="total > 0">
       <el-pagination
-        v-model:current-page="currentPage"
-        :page-size="pageSize"
-        :total="total"
-        :layout="isMobile ? 'prev, pager, next' : 'total, prev, pager, next'"
-        @current-change="handlePageChange"
+          v-model:current-page="currentPage"
+          :page-size="pageSize"
+          :total="total"
+          :layout="isMobile ? 'prev, pager, next' : 'total, prev, pager, next'"
+          @current-change="handlePageChange"
       />
     </div>
 
     <!-- 分享详情弹窗 - 移动端底部抽屉 -->
     <el-drawer
-      v-if="isMobile"
-      v-model="detailVisible"
-      title="分享详情"
-      direction="btt"
-      size="auto"
-      class="share-detail-drawer"
+        v-if="isMobile"
+        v-model="detailVisible"
+        title="分享详情"
+        direction="btt"
+        size="auto"
+        class="share-detail-drawer"
     >
       <div class="share-detail-mobile">
         <div class="detail-item">
@@ -193,7 +193,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Refresh,
@@ -218,6 +218,15 @@ const isMobile = useIsMobile()
 const loading = ref(false)
 const shareList = ref<ShareRecord[]>([])
 const total = ref(0)
+
+// 请求版本号 — 切账号 / 切页 时丢弃旧请求回包
+//
+// 防御场景：A 账号 getShareList 在路上 → 用户切到 B 账号 → B 的 list 先回 →
+// A 的 list 后回会覆盖 B 视图。后续操作按 B active 路由，可能 404 / 误操作 B 资源。
+let shareListRequestVersion = 0
+
+// 详情请求独立版本号 — 同上语义，挡 getShareDetail 旧回包
+let shareDetailRequestVersion = 0
 const currentPage = ref(1)
 const pageSize = 20
 const selectedIds = ref<number[]>([])
@@ -271,13 +280,13 @@ function formatExpireTime(timestamp: number): string {
   if (!timestamp || timestamp === 0) {
     return '永久有效'
   }
-  
+
   // 判断时间戳是秒还是毫秒
   // 如果时间戳大于 10000000000（约 2286 年的秒级时间戳），则认为是毫秒
   const isMilliseconds = timestamp > 10000000000
   const date = new Date(isMilliseconds ? timestamp : timestamp * 1000)
   const now = new Date()
-  
+
   if (date < now) {
     return '已过期'
   }
@@ -292,16 +301,25 @@ function formatExpireTime(timestamp: number): string {
 
 // 刷新列表
 async function refreshList() {
+  // 请求版本号防御
+  const version = ++shareListRequestVersion
   loading.value = true
   try {
     const data = await getShareList(currentPage.value)
+    if (version !== shareListRequestVersion) {
+      // 已被新请求覆盖（切账号 / 切页等）→ 丢弃本次回包
+      return
+    }
     shareList.value = data.list
     total.value = data.total
   } catch (error: any) {
+    if (version !== shareListRequestVersion) return
     console.error('获取分享列表失败:', error)
     ElMessage.error(error.message || '获取分享列表失败')
   } finally {
-    loading.value = false
+    if (version === shareListRequestVersion) {
+      loading.value = false
+    }
   }
 }
 
@@ -328,12 +346,16 @@ function toggleSelect(shareId: number) {
 
 // 获取分享详情
 async function handleGetDetail(record: ShareRecord) {
+  // 详情请求版本号防御
+  const version = ++shareDetailRequestVersion
   try {
     currentShareRecord.value = record
     const detail = await getShareDetail(record.shareId)
+    if (version !== shareDetailRequestVersion) return
     currentDetail.value = detail
     detailVisible.value = true
   } catch (error: any) {
+    if (version !== shareDetailRequestVersion) return
     console.error('获取分享详情失败:', error)
     ElMessage.error(error.message || '获取分享详情失败')
   }
@@ -367,9 +389,9 @@ async function copyDetailAll() {
   // 使用列表中的完整链接，提取码从详情接口获取
   const link = currentShareRecord.value.shortlink
   const linkWithPwd = pwd ? `${link}?pwd=${pwd}` : link
-  const text = pwd 
-    ? `链接: ${linkWithPwd}\n提取码: ${pwd}`
-    : `链接: ${linkWithPwd}`
+  const text = pwd
+      ? `链接: ${linkWithPwd}\n提取码: ${pwd}`
+      : `链接: ${linkWithPwd}`
   try {
     await navigator.clipboard.writeText(text)
     ElMessage.success('链接和提取码已复制到剪贴板')
@@ -382,13 +404,13 @@ async function copyDetailAll() {
 async function handleCancel(record: ShareRecord) {
   try {
     await ElMessageBox.confirm(
-      `确定要取消分享 "${getFileName(record.typicalPath)}" 吗？`,
-      '取消分享',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要取消分享 "${getFileName(record.typicalPath)}" 吗？`,
+        '取消分享',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
     await cancelShare([record.shareId])
     ElMessage.success('分享已取消')
@@ -404,16 +426,16 @@ async function handleCancel(record: ShareRecord) {
 // 批量取消分享
 async function handleBatchCancel() {
   if (selectedIds.value.length === 0) return
-  
+
   try {
     await ElMessageBox.confirm(
-      `确定要取消选中的 ${selectedIds.value.length} 个分享吗？`,
-      '批量取消分享',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning',
-      }
+        `确定要取消选中的 ${selectedIds.value.length} 个分享吗？`,
+        '批量取消分享',
+        {
+          confirmButtonText: '确定',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
     )
     await cancelShare(selectedIds.value)
     ElMessage.success(`已取消 ${selectedIds.value.length} 个分享`)
@@ -427,9 +449,36 @@ async function handleBatchCancel() {
   }
 }
 
+// 多账号切换处理器——与 DownloadsView/UploadsView/FilesView/...
+// 5 个视图一致：收到 active 变更时重拉当前账号的分享列表。
+//
+// 同时关闭详情弹窗 + 清空 currentShareRecord/currentDetail，
+// 否则切到新账号后弹窗仍可能展示上一账号的链接/提取码（信息混淆 — 本身不会
+// 造成跨账号删除，因为 handleGetDetail 已按当前 active 账号路由）。
+//
+// 递增 shareListRequestVersion 并清空 shareList，
+// 让旧账号 in-flight `getShareList` 回包被 refreshList 内部 version check 丢弃，
+// 避免覆盖新账号视图。
+function handleActiveChanged() {
+  shareListRequestVersion++
+  shareDetailRequestVersion++ // 丢弃旧账号详情请求回包
+  shareList.value = []
+  total.value = 0
+  detailVisible.value = false
+  currentShareRecord.value = null
+  currentDetail.value = null
+  selectedIds.value = []
+  refreshList()
+}
+
 // 组件挂载时加载数据
 onMounted(() => {
   refreshList()
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 </script>
 
@@ -443,7 +492,7 @@ onMounted(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  
+
   &.is-mobile {
     padding: 12px;
   }
@@ -465,7 +514,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  
+
   h2 {
     margin: 0;
     font-size: 18px;
@@ -483,7 +532,7 @@ onMounted(() => {
    ===================== */
 .share-table {
   flex: 1;
-  
+
   .file-name {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -506,7 +555,7 @@ onMounted(() => {
   margin-bottom: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
   transition: all 0.2s;
-  
+
   &.selected {
     border: 2px solid var(--el-color-primary);
   }
@@ -517,7 +566,7 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
-  
+
   .file-name {
     flex: 1;
     font-weight: 500;
@@ -533,20 +582,20 @@ onMounted(() => {
     font-size: 13px;
     margin-bottom: 4px;
   }
-  
+
   .label {
     color: var(--el-text-color-secondary);
     width: 50px;
     flex-shrink: 0;
   }
-  
+
   .value {
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  
+
   .link-text {
     color: var(--el-color-primary);
   }
@@ -558,7 +607,7 @@ onMounted(() => {
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--el-border-color-lighter);
-  
+
   .el-button {
     flex: 1;
     min-height: 44px; /* 触摸友好的最小高度 */
@@ -623,22 +672,22 @@ onMounted(() => {
     margin-bottom: 16px;
     display: flex;
     align-items: flex-start;
-    
+
     &:last-child {
       margin-bottom: 0;
     }
   }
-  
+
   .label {
     color: var(--el-text-color-secondary);
     width: 70px;
     flex-shrink: 0;
   }
-  
+
   .value {
     word-break: break-all;
   }
-  
+
   .pwd-highlight {
     color: var(--el-color-primary);
     font-weight: bold;
@@ -654,11 +703,11 @@ onMounted(() => {
     flex-direction: column;
     align-items: stretch;
   }
-  
+
   .header-left {
     justify-content: space-between;
   }
-  
+
   .header-right {
     justify-content: flex-end;
   }
@@ -673,7 +722,7 @@ onMounted(() => {
     padding: 16px;
     border-bottom: 1px solid var(--el-border-color-lighter);
   }
-  
+
   .el-drawer__body {
     padding: 0;
   }

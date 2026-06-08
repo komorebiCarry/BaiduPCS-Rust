@@ -167,7 +167,7 @@ impl FilesystemService {
             None
         } else {
             path.parent()
-                .map(|p| {
+                .and_then(|p| {
                     #[cfg(target_os = "windows")]
                     {
                         if p.as_os_str().is_empty() {
@@ -180,7 +180,6 @@ impl FilesystemService {
                         Some(p.to_string_lossy().to_string())
                     }
                 })
-                .flatten()
         };
 
         #[cfg(not(target_os = "windows"))]

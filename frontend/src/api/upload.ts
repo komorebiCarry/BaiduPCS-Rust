@@ -20,6 +20,10 @@ export interface UploadTask {
   started_at?: number
   completed_at?: number
   error?: string
+  /** 任务归属账号 UID */
+  owner_uid?: number | null
+  /** 标准化失败原因 */
+  failure_reason?: string | null
   is_rapid_upload?: boolean // 是否秒传
   // 分片信息
   total_chunks?: number
@@ -36,6 +40,8 @@ export interface CreateUploadRequest {
   remote_path: string
   encrypt?: boolean
   conflict_strategy?: UploadConflictStrategy
+  /** 任务归属账号 UID（不传默认为当前活跃账号） */
+  owner_uid?: number
 }
 
 /// 文件夹扫描选项
@@ -53,6 +59,8 @@ export interface CreateFolderUploadRequest {
   scan_options?: FolderScanOptions
   encrypt?: boolean
   conflict_strategy?: UploadConflictStrategy
+  /** 任务归属账号 UID */
+  owner_uid?: number
 }
 
 /// 批量创建上传任务请求
@@ -60,6 +68,8 @@ export interface CreateBatchUploadRequest {
   files: [string, string][] // [(本地路径, 远程路径)]
   encrypt?: boolean
   conflict_strategy?: UploadConflictStrategy
+  /** 任务归属账号 UID */
+  owner_uid?: number
 }
 
 /**
@@ -181,7 +191,12 @@ export const extractFilename = sharedExtractFilename
  * 计算剩余时间（秒）
  */
 export function calculateETA(task: UploadTask): number | null {
-  if (task.speed === 0 || task.uploaded_size >= task.total_size) {
+  // 已传输完成：remaining=0 → 返回 0（"即将完成"）
+  if (task.uploaded_size >= task.total_size) {
+    return 0
+  }
+  // 速度未知（0 B/s）：无法估算 → 返回 null（"计算中"）
+  if (task.speed === 0) {
     return null
   }
   const remaining = task.total_size - task.uploaded_size

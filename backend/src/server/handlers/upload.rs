@@ -1,9 +1,10 @@
 use crate::filesystem::{FilesystemConfig, PathGuard};
 use crate::server::error::{ApiError, ApiResult};
+use crate::server::extractors::{resolve_uid_from_query, UidQuery};
 use crate::server::AppState;
 use crate::uploader::{ScanOptions, ScanTaskStatus, UploadConflictStrategy, UploadTask};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -26,6 +27,12 @@ pub struct CreateUploadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<UploadConflictStrategy>,
+    /// 显式指定 owner_uid
+    ///
+    /// **字段名兼容**：
+    /// 同时接受 `uid` 和 `owner_uid` 两个字段名。前端 `upload.ts` 传 `owner_uid`。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 创建文件夹上传任务请求
@@ -44,6 +51,12 @@ pub struct CreateFolderUploadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<UploadConflictStrategy>,
+    /// 显式指定 owner_uid
+    ///
+    /// **字段名兼容**：
+    /// 同时接受 `uid` 和 `owner_uid` 两个字段名。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 文件夹扫描选项（序列化友好版本）
@@ -122,6 +135,12 @@ pub struct CreateBatchUploadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<UploadConflictStrategy>,
+    /// 显式指定 owner_uid
+    ///
+    /// **字段名兼容**：
+    /// 同时接受 `uid` 和 `owner_uid` 两个字段名。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 扫描启动响应
@@ -139,21 +158,32 @@ pub struct ScanStatusResponse {
     pub created_tasks: usize,
     pub skipped_duplicates: usize,
     pub total_size: u64,
+    /// 扫描归属账号
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
 }
 
 /// POST /api/v1/uploads
 /// 创建单文件上传任务
+///
+/// 多账号路由：
+/// - `req.uid`（或 `owner_uid` 别名）= Some(uid) → 路由到对应账号 manager，
+///   纠正 task.owner_uid 为 uid；无此账号返回 400。
+/// - `req.uid = None` → 回退到当前活跃账号。
 pub async fn create_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateUploadRequest>,
 ) -> ApiResult<Json<ApiResponse<String>>> {
-    // 获取上传管理器
+    // 🔥 effective_uid = req.uid OR active
+    let explicit_uid = req.uid.map(crate::auth::Uid::new);
+    let effective_uid = match explicit_uid {
+        Some(uid) => uid,
+        None => (*app_state.active_uid.read().await)
+            .ok_or_else(|| ApiError::Unauthorized("无活跃账号".to_string()))?,
+    };
     let upload_manager = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("上传管理器未初始化")))?;
+        .upload_manager_for(effective_uid)
+        .ok_or_else(|| ApiError::BadRequest(format!("账号 uid={} 不存在", effective_uid.raw())))?;
 
     let config = app_state.config.read().await;
     let guard = create_path_guard(&config.filesystem);
@@ -167,18 +197,26 @@ pub async fn create_upload(
     drop(config);
 
     // 🔥 传递 encrypt 参数，普通文件上传 is_folder_upload = false
+    // 用 create_task_with_owner 在创建瞬间
+    // 写入 effective_uid，task / .meta / Created event 三处一致，不再依赖事后 override。
     match upload_manager
-        .create_task(
+        .create_task_with_owner(
             local_path,
             req.remote_path,
             req.encrypt,
             false,
             conflict_strategy,
+            effective_uid,
         )
         .await
     {
         Ok(task_id) => {
-            info!("创建上传任务成功: {} (encrypt={})", task_id, req.encrypt);
+            info!(
+                "创建上传任务成功: {} (encrypt={}, effective_uid={})",
+                task_id,
+                req.encrypt,
+                effective_uid.raw()
+            );
 
             // 自动开始上传
             if let Err(e) = upload_manager.start_task(&task_id).await {
@@ -196,10 +234,42 @@ pub async fn create_upload(
 
 /// POST /api/v1/uploads/folder
 /// 创建文件夹上传任务（异步扫描模式）
+///
+/// **多账号语义**：`ScanManager` 实例本身是共享单例，
+/// 但每次扫描的归属（事件 owner_uid、上传子任务 owner_uid、checkpoint owner_uid）
+/// 都按 `effective_uid = req.uid.or(active_uid)` 解析并显式传给
+/// `start_scan_with_owner`。这样：
+/// - 切换到 B 账号后发起扫描，所有衍生资源都正确落到 B 账号
+/// - 显式 `req.uid` 不必再等于 active（之前因 ScanManager 单例 owner 限制只能 active）
+/// - `req.uid = None` 时回退到 active；无 active 返回 401
+/// - `req.uid = Some(uid)` 但该账号不存在 → 由 `effective_uid` 解析时拒绝
 pub async fn create_folder_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateFolderUploadRequest>,
 ) -> ApiResult<Json<ApiResponse<ScanStartResponse>>> {
+    // 解析 effective_uid（不再要求 == active）
+    let explicit_uid = req.uid.map(crate::auth::Uid::new);
+    let effective_uid = match explicit_uid {
+        Some(uid) => {
+            // 校验显式 uid 是已知账号
+            let mgr = app_state.account_manager.lock().await;
+            if mgr.get_user(uid).is_none() {
+                return Err(ApiError::BadRequest(format!(
+                    "账号 uid={} 不存在或已被删除",
+                    uid.raw()
+                )));
+            }
+            drop(mgr);
+            uid
+        }
+        None => match *app_state.active_uid.read().await {
+            Some(uid) => uid,
+            None => return Err(ApiError::BadRequest(
+                "无活跃账号，无法启动文件夹扫描".to_string(),
+            )),
+        },
+    };
+
     // 获取扫描管理器
     let scan_manager = app_state
         .scan_manager
@@ -246,20 +316,25 @@ pub async fn create_folder_upload(
         })
     };
 
+    // 用 _with_owner 入口显式传入 effective_uid，
+    // 使扫描事件 / 上传子任务 / checkpoint 全部绑定到目标账号
     match scan_manager
-        .start_scan(
+        .start_scan_with_owner(
             local_folder,
             req.remote_folder,
             scan_options,
             req.encrypt,
             conflict_strategy,
+            effective_uid,
         )
         .await
     {
         Ok(scan_task_id) => {
             info!(
-                "文件夹扫描任务已启动: {} (encrypt={})",
-                scan_task_id, req.encrypt
+                "文件夹扫描任务已启动: {} (encrypt={}, owner_uid={})",
+                scan_task_id,
+                req.encrypt,
+                effective_uid.raw()
             );
             Ok(Json(ApiResponse::success(ScanStartResponse {
                 scan_task_id,
@@ -274,17 +349,22 @@ pub async fn create_folder_upload(
 
 /// POST /api/v1/uploads/batch
 /// 批量创建上传任务
+///
+/// 多账号路由：与 create_upload 同语义。
 pub async fn create_batch_upload(
     State(app_state): State<AppState>,
     Json(req): Json<CreateBatchUploadRequest>,
 ) -> ApiResult<Json<ApiResponse<Vec<String>>>> {
-    // 获取上传管理器
+    // 🔥 effective_uid = req.uid OR active
+    let explicit_uid = req.uid.map(crate::auth::Uid::new);
+    let effective_uid = match explicit_uid {
+        Some(uid) => uid,
+        None => (*app_state.active_uid.read().await)
+            .ok_or_else(|| ApiError::Unauthorized("无活跃账号".to_string()))?,
+    };
     let upload_manager = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("上传管理器未初始化")))?;
+        .upload_manager_for(effective_uid)
+        .ok_or_else(|| ApiError::BadRequest(format!("账号 uid={} 不存在", effective_uid.raw())))?;
 
     let config = app_state.config.read().await;
     let guard = create_path_guard(&config.filesystem);
@@ -303,15 +383,18 @@ pub async fn create_batch_upload(
     drop(config);
 
     // 🔥 传递 encrypt 参数
+    // 用 create_batch_tasks_with_owner 在创建瞬间
+    // 写入 effective_uid，避免事后纠错路径下 Created event 短暂带启动账号。
     match upload_manager
-        .create_batch_tasks(files, req.encrypt, conflict_strategy)
+        .create_batch_tasks_with_owner(files, req.encrypt, conflict_strategy, effective_uid)
         .await
     {
         Ok(task_ids) => {
             info!(
-                "批量创建上传任务成功: {} 个 (encrypt={})",
+                "批量创建上传任务成功: {} 个 (encrypt={}, effective_uid={})",
                 task_ids.len(),
-                req.encrypt
+                req.encrypt,
+                effective_uid.raw()
             );
 
             // 自动开始所有任务
@@ -330,34 +413,55 @@ pub async fn create_batch_upload(
     }
 }
 
-/// GET /api/v1/uploads
+/// GET /api/v1/uploads?uid=
 /// 获取所有上传任务
+///
+/// - `?uid=` 缺省 → 跨账号聚合
+/// - `?uid=X` → 仅该账号
 pub async fn get_all_uploads(
     State(app_state): State<AppState>,
+    Query(q): Query<UidQuery>,
 ) -> Result<Json<ApiResponse<Vec<UploadTask>>>, StatusCode> {
-    let upload_manager = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let tasks = upload_manager.get_all_tasks().await;
+    let filter_uid = resolve_uid_from_query(&q);
+    let tasks = match filter_uid {
+        // 🔥 共享 manager 必须按 owner_uid 过滤
+        Some(uid) => match app_state.upload_manager_for(uid) {
+            Some(um) => um
+                .get_all_tasks()
+                .await
+                .into_iter()
+                .filter(|t| t.owner_uid == uid)
+                .collect(),
+            None => Vec::new(),
+        },
+        None => {
+            // 全局共享历史库会被每个账号的 get_all_tasks 各捞一遍，跨账号聚合时
+            // 按 id 去重，避免同一历史任务因账号数 N 而重复出现 N 次。
+            let mut all = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for (_uid, um) in app_state.list_upload_managers() {
+                for t in um.get_all_tasks().await {
+                    if seen.insert(t.id.clone()) {
+                        all.push(t);
+                    }
+                }
+            }
+            all
+        }
+    };
     Ok(Json(ApiResponse::success(tasks)))
 }
 
 /// GET /api/v1/uploads/:id
-/// 获取指定上传任务
+/// 获取指定上传任务（多账号路由）
 pub async fn get_upload(
     State(app_state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<UploadTask>>, StatusCode> {
-    let upload_manager = app_state
-        .upload_manager
-        .read()
+    let (_owner_uid, upload_manager) = app_state
+        .find_upload_manager_for_task(&task_id)
         .await
-        .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     match upload_manager.get_task(&task_id).await {
         Some(task) => Ok(Json(ApiResponse::success(task))),
@@ -366,17 +470,21 @@ pub async fn get_upload(
 }
 
 /// POST /api/v1/uploads/:id/pause
-/// 暂停上传任务
+/// 暂停上传任务（多账号路由）
 pub async fn pause_upload(
     State(app_state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    let upload_manager = app_state
-        .upload_manager
-        .read()
+    let (_owner_uid, upload_manager) = app_state
+        .find_upload_manager_for_task(&task_id)
         .await
-        .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // 历史/终态任务（仅存于全局历史库、不在内存）不支持暂停：路由命中但内存无此
+    // 任务 → 返回 409，而非把 `pause_task` 的"任务不存在"误报成 500。
+    if !upload_manager.has_task_in_memory(&task_id) {
+        return Err(StatusCode::CONFLICT);
+    }
 
     // skip_try_start_waiting = false，正常暂停行为（暂停后尝试启动等待队列中的任务）
     match upload_manager.pause_task(&task_id, false).await {
@@ -384,53 +492,57 @@ pub async fn pause_upload(
             info!("暂停上传任务成功: {}", task_id);
             Ok(Json(ApiResponse::success("已暂停".to_string())))
         }
+        // `pause_task` 仅在两种情况返回 Err：①任务不存在(race，已被上面的内存守卫挡)
+        // ②任务状态不支持暂停(终态/已完成等仍在内存、未 clear)。两者都是状态冲突而非
+        // 内部错误，统一返回 409，避免「终态但仍在内存」任务被误报成 500。
         Err(e) => {
-            error!("暂停上传任务失败: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            error!("暂停上传任务失败(状态冲突): {:?}", e);
+            Err(StatusCode::CONFLICT)
         }
     }
 }
 
 /// POST /api/v1/uploads/:id/resume
-/// 恢复上传任务
+/// 恢复上传任务（多账号路由）
 pub async fn resume_upload(
     State(app_state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    let upload_manager = app_state
-        .upload_manager
-        .read()
+    let (_owner_uid, upload_manager) = app_state
+        .find_upload_manager_for_task(&task_id)
         .await
-        .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // 历史/终态任务（仅存于全局历史库、不在内存）不支持恢复 → 返回 409。
+    if !upload_manager.has_task_in_memory(&task_id) {
+        return Err(StatusCode::CONFLICT);
+    }
 
     match upload_manager.resume_task(&task_id).await {
         Ok(()) => {
             info!("恢复上传任务成功: {}", task_id);
             Ok(Json(ApiResponse::success("已恢复".to_string())))
         }
+        // `resume_task` 仅在两种情况返回 Err：①任务不存在(race，已被上面的内存守卫挡)
+        // ②任务非 Paused/Failed(终态/已完成等仍在内存、未 clear)。两者都是状态冲突而非
+        // 内部错误，统一返回 409，避免「终态但仍在内存」任务被误报成 200+error。
         Err(e) => {
-            error!("恢复上传任务失败: {:?}", e);
-            Ok(Json(ApiResponse::error(
-                -1,
-                format!("恢复上传任务失败: {}", e),
-            )))
+            error!("恢复上传任务失败(状态冲突): {:?}", e);
+            Err(StatusCode::CONFLICT)
         }
     }
 }
 
 /// DELETE /api/v1/uploads/:id
-/// 删除上传任务
+/// 删除上传任务（多账号路由）
 pub async fn delete_upload(
     State(app_state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    let upload_manager = app_state
-        .upload_manager
-        .read()
+    let (_owner_uid, upload_manager) = app_state
+        .find_upload_manager_for_task(&task_id)
         .await
-        .clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     match upload_manager.delete_task(&task_id).await {
         Ok(()) => {
@@ -448,16 +560,19 @@ pub async fn delete_upload(
 /// 清除已完成的上传任务
 pub async fn clear_completed_uploads(
     State(app_state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<UploadClearScopeQuery>,
 ) -> Result<Json<ApiResponse<usize>>, StatusCode> {
+    // 按 effective_uid 过滤
+    let uid = match crate::server::helpers::resolve_batch_owner_uid(&app_state, query.uid).await {
+        Some(u) => u,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
     let upload_manager = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
+        .upload_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let count = upload_manager.clear_completed().await;
-    info!("清除了 {} 个已完成的上传任务", count);
+    let count = upload_manager.clear_completed_for_uid(uid).await;
+    info!("清除了 {} 个已完成的上传任务（owner_uid={}）", count, uid.raw());
     Ok(Json(ApiResponse::success(count)))
 }
 
@@ -465,17 +580,27 @@ pub async fn clear_completed_uploads(
 /// 清除失败的上传任务
 pub async fn clear_failed_uploads(
     State(app_state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<UploadClearScopeQuery>,
 ) -> Result<Json<ApiResponse<usize>>, StatusCode> {
+    let uid = match crate::server::helpers::resolve_batch_owner_uid(&app_state, query.uid).await {
+        Some(u) => u,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
     let upload_manager = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
+        .upload_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let count = upload_manager.clear_failed().await;
-    info!("清除了 {} 个失败的上传任务", count);
+    let count = upload_manager.clear_failed_for_uid(uid).await;
+    info!("清除了 {} 个失败的上传任务（owner_uid={}）", count, uid.raw());
     Ok(Json(ApiResponse::success(count)))
+}
+
+/// upload clear 路由的 owner_uid 过滤参数
+#[derive(Debug, serde::Deserialize)]
+pub struct UploadClearScopeQuery {
+    /// 显式指定 owner_uid；缺省时使用当前 active_uid
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// GET /api/v1/uploads/scan/:id
@@ -506,6 +631,7 @@ pub async fn get_scan_status(
                 created_tasks: info.created_tasks,
                 skipped_duplicates: info.skipped_duplicates,
                 total_size: info.total_size,
+                owner_uid: info.owner_uid.map(|u| u.raw()),
             })))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -542,21 +668,24 @@ pub async fn batch_pause_uploads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    // 所有路径都强制 owner_uid 过滤
+    let uid = match crate::server::helpers::resolve_batch_owner_uid(&app_state, req.uid).await {
+        Some(u) => u,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
     let mgr = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
+        .upload_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let ids = if req.all == Some(true) {
-        mgr.get_pausable_task_ids().await
+    let (allowed_ids, denied_pairs) = if req.all == Some(true) {
+        (mgr.get_pausable_task_ids_for_uid(uid).await, Vec::new())
     } else {
-        req.task_ids.unwrap_or_default()
+        let raw_ids = req.task_ids.unwrap_or_default();
+        mgr.validate_task_ids_for_uid(uid, &raw_ids).await
     };
 
-    let raw = mgr.batch_pause(&ids).await;
-    let results: Vec<BatchOperationItem> = raw
+    let raw = mgr.batch_pause(&allowed_ids).await;
+    let mut results: Vec<BatchOperationItem> = raw
         .into_iter()
         .map(|(id, ok, err)| BatchOperationItem {
             task_id: id,
@@ -564,6 +693,11 @@ pub async fn batch_pause_uploads(
             error: err,
         })
         .collect();
+    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
+        task_id: id,
+        success: false,
+        error: Some(reason),
+    }));
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
@@ -574,21 +708,23 @@ pub async fn batch_resume_uploads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let uid = match crate::server::helpers::resolve_batch_owner_uid(&app_state, req.uid).await {
+        Some(u) => u,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
     let mgr = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
+        .upload_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let ids = if req.all == Some(true) {
-        mgr.get_resumable_task_ids().await
+    let (allowed_ids, denied_pairs) = if req.all == Some(true) {
+        (mgr.get_resumable_task_ids_for_uid(uid).await, Vec::new())
     } else {
-        req.task_ids.unwrap_or_default()
+        let raw_ids = req.task_ids.unwrap_or_default();
+        mgr.validate_task_ids_for_uid(uid, &raw_ids).await
     };
 
-    let raw = mgr.batch_resume(&ids).await;
-    let results: Vec<BatchOperationItem> = raw
+    let raw = mgr.batch_resume(&allowed_ids).await;
+    let mut results: Vec<BatchOperationItem> = raw
         .into_iter()
         .map(|(id, ok, err)| BatchOperationItem {
             task_id: id,
@@ -596,6 +732,11 @@ pub async fn batch_resume_uploads(
             error: err,
         })
         .collect();
+    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
+        task_id: id,
+        success: false,
+        error: Some(reason),
+    }));
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
@@ -606,21 +747,23 @@ pub async fn batch_delete_uploads(
     State(app_state): State<AppState>,
     Json(req): Json<BatchOperationRequest>,
 ) -> Result<Json<ApiResponse<BatchOperationResponse>>, StatusCode> {
+    let uid = match crate::server::helpers::resolve_batch_owner_uid(&app_state, req.uid).await {
+        Some(u) => u,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
     let mgr = app_state
-        .upload_manager
-        .read()
-        .await
-        .clone()
+        .upload_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let ids = if req.all == Some(true) {
-        mgr.get_all_task_ids()
+    let (allowed_ids, denied_pairs) = if req.all == Some(true) {
+        (mgr.get_all_task_ids_for_uid(uid).await, Vec::new())
     } else {
-        req.task_ids.unwrap_or_default()
+        let raw_ids = req.task_ids.unwrap_or_default();
+        mgr.validate_task_ids_for_uid(uid, &raw_ids).await
     };
 
-    let raw = mgr.batch_delete(&ids).await;
-    let results: Vec<BatchOperationItem> = raw
+    let raw = mgr.batch_delete(&allowed_ids).await;
+    let mut results: Vec<BatchOperationItem> = raw
         .into_iter()
         .map(|(id, ok, err)| BatchOperationItem {
             task_id: id,
@@ -628,6 +771,11 @@ pub async fn batch_delete_uploads(
             error: err,
         })
         .collect();
+    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
+        task_id: id,
+        success: false,
+        error: Some(reason),
+    }));
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))

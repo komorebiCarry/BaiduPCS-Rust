@@ -13,7 +13,7 @@ use std::time::Instant;
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -51,6 +51,8 @@ pub struct ScanTaskInfo {
     pub total_size: u64,
     pub scan_options: ScanOptions,
     pub cancel_token: CancellationToken,
+    /// 扫描归属账号
+    pub owner_uid: Option<crate::auth::Uid>,
 }
 
 /// 扫描检查点（持久化到 JSON 文件）
@@ -67,6 +69,9 @@ pub struct ScanCheckpoint {
     pub created_tasks_count: usize,
     pub skipped_duplicates_count: usize,
     pub scan_options: ScanOptions,
+    /// 扫描归属账号
+    #[serde(default)]
+    pub owner_uid: Option<u64>,
 }
 
 // ============================================================================
@@ -75,11 +80,20 @@ pub struct ScanCheckpoint {
 
 pub struct ScanManager {
     active_scans: Arc<DashMap<String, ScanTaskInfo>>,
+    /// Legacy 单账号 upload manager（fallback）
     upload_manager: Arc<UploadManager>,
+    /// 🔥 多账号 per-uid upload manager 池
+    ///
+    /// 注入后扫描子任务按 `owner_uid` 路由到对应账号的 `UploadManager`，
+    /// 避免共享单例导致 owner=B 的扫描任务被加进 A 的 manager。
+    upload_manager_pool:
+        Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
     ws_manager: Arc<WebSocketManager>,
     memory_monitor: Arc<MemoryMonitor>,
     wal_dir: PathBuf,
     max_pending_tasks: usize,
+    /// 扫描归属账号
+    owner_uid: Option<crate::auth::Uid>,
 }
 
 impl ScanManager {
@@ -90,17 +104,71 @@ impl ScanManager {
         wal_dir: PathBuf,
         max_pending_tasks: usize,
     ) -> Self {
+        Self::new_with_owner(upload_manager, ws_manager, memory_monitor, wal_dir, max_pending_tasks, None)
+    }
+
+    /// 多账号版本构造器
+    pub fn new_with_owner(
+        upload_manager: Arc<UploadManager>,
+        ws_manager: Arc<WebSocketManager>,
+        memory_monitor: Arc<MemoryMonitor>,
+        wal_dir: PathBuf,
+        max_pending_tasks: usize,
+        owner_uid: Option<crate::auth::Uid>,
+    ) -> Self {
         Self {
             active_scans: Arc::new(DashMap::new()),
             upload_manager,
+            upload_manager_pool: Arc::new(RwLock::new(None)),
             ws_manager,
             memory_monitor,
             wal_dir,
             max_pending_tasks,
+            owner_uid,
         }
     }
 
-    /// 启动文件夹扫描（Task 6.3）
+    /// 🔥 注入多账号 per-uid `UploadManager` 池
+    ///
+    /// 注入后 `upload_manager_for(uid)` 严格按 uid 路由（pool 已注入但 miss → 返回 None）；
+    /// 未注入时回退 `upload_manager` 单例（legacy / 单账号兼容）。
+    pub async fn set_upload_manager_pool(
+        &self,
+        pool: Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>,
+    ) {
+        let mut guard = self.upload_manager_pool.write().await;
+        *guard = Some(pool);
+        info!("ScanManager 已注入 UploadManager 池");
+    }
+
+    /// 🔥 按 uid 解析 `UploadManager`
+    ///
+    /// 优先级（与 `FolderDownloadManager::download_manager_for` 同款语义）：
+    /// 1. **`upload_manager_pool` 已注入**（多账号路径）：
+    ///    - 命中 uid → 该账号独立 manager
+    ///    - **miss → `None`**（不再 fallback 到 active 单例，避免悄悄归并到错账号）
+    /// 2. **未注入**（legacy 单账号兼容）：返回全局 `upload_manager`
+    pub async fn upload_manager_for(
+        &self,
+        uid: crate::auth::Uid,
+    ) -> Option<Arc<UploadManager>> {
+        if let Some(pool_arc) = self.upload_manager_pool.read().await.as_ref() {
+            return pool_arc.get(&uid).map(|e| Arc::clone(e.value()));
+        }
+        // pool 未注入 → legacy fallback
+        Some(Arc::clone(&self.upload_manager))
+    }
+
+    /// 获取当前扫描归属账号
+    pub fn owner_uid(&self) -> Option<crate::auth::Uid> {
+        self.owner_uid
+    }
+
+    /// 启动文件夹扫描
+    ///
+    /// 用 `self.owner_uid`（启动期 active）作为扫描归属。
+    /// 当前调用路径**应优先使用 `start_scan_with_owner`** 来显式
+    /// 传 effective_uid，避免账号切换后归属到旧账号。
     pub async fn start_scan(
         &self,
         local_folder: PathBuf,
@@ -108,6 +176,52 @@ impl ScanManager {
         scan_options: Option<ScanOptions>,
         encrypt: bool,
         conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
+    ) -> Result<String> {
+        let owner = self.owner_uid;
+        self.start_scan_internal(
+            local_folder,
+            remote_folder,
+            scan_options,
+            encrypt,
+            conflict_strategy,
+            owner,
+        )
+            .await
+    }
+
+    /// 启动文件夹扫描（显式指定 owner_uid）
+    ///
+    /// 共享 `ScanManager` 是 startup-bound 单例，`self.owner_uid` 不可靠。
+    /// `/uploads/folder` handler 应解析 `effective_uid = req.uid.or(active)` 后
+    /// 调用此入口，使扫描事件、上传子任务、checkpoint 都绑定到正确账号。
+    pub async fn start_scan_with_owner(
+        &self,
+        local_folder: PathBuf,
+        remote_folder: String,
+        scan_options: Option<ScanOptions>,
+        encrypt: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
+    ) -> Result<String> {
+        self.start_scan_internal(
+            local_folder,
+            remote_folder,
+            scan_options,
+            encrypt,
+            conflict_strategy,
+            Some(owner_uid),
+        )
+            .await
+    }
+
+    async fn start_scan_internal(
+        &self,
+        local_folder: PathBuf,
+        remote_folder: String,
+        scan_options: Option<ScanOptions>,
+        encrypt: bool,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
+        owner_uid: Option<crate::auth::Uid>,
     ) -> Result<String> {
         // 验证路径
         if !local_folder.exists() || !local_folder.is_dir() {
@@ -131,15 +245,21 @@ impl ScanManager {
             total_size: 0,
             scan_options: options.clone(),
             cancel_token: cancel_token.clone(),
+            // 用调用方传入的 owner_uid，不再用 self.owner_uid（startup active）
+            owner_uid,
         };
         self.active_scans.insert(scan_task_id.clone(), task_info);
 
         // 推送 Started 事件
+        // 用 task.owner_uid 而非 self.owner_uid
+        let owner_uid_raw_for_events: Option<u64> = owner_uid.map(|u| u.raw());
         self.ws_manager.send_if_subscribed(
             TaskEvent::Scan(ScanEvent::Started {
                 scan_task_id: scan_task_id.clone(),
                 local_folder: local_folder.to_string_lossy().to_string(),
                 remote_folder: remote_folder.clone(),
+
+                owner_uid: owner_uid_raw_for_events,
             }),
             None,
         );
@@ -157,8 +277,23 @@ impl ScanManager {
         });
 
         // tokio::spawn: 消费端（异步任务创建）
+        //
+        // 🔥 按 owner_uid 解析 UploadManager
+        // 之前固定 captured `self.upload_manager` 单例 → owner=B 的扫描任务被
+        // 加进 A 的 manager。这里改为在启动 spawn 前按 effective owner_uid
+        // 解析对应账号 manager；解析失败硬错误（不再悄悄落到 active）。
+        let resolved_upload_manager = match owner_uid {
+            Some(uid) => self.upload_manager_for(uid).await.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScanManager: owner_uid={} 没有对应的 UploadManager（pool 未命中且不允许 fallback）",
+                    uid.raw()
+                )
+            })?,
+            None => Arc::clone(&self.upload_manager),
+        };
+
         let active_scans = Arc::clone(&self.active_scans);
-        let upload_manager = Arc::clone(&self.upload_manager);
+        let upload_manager = resolved_upload_manager;
         let ws_manager = Arc::clone(&self.ws_manager);
         let memory_monitor = Arc::clone(&self.memory_monitor);
         let wal_dir = self.wal_dir.clone();
@@ -179,6 +314,7 @@ impl ScanManager {
                 memory_monitor,
                 wal_dir,
                 max_pending,
+                owner_uid,
             )
                 .await;
         });
@@ -225,6 +361,7 @@ impl ScanManager {
     }
 
     /// 异步消费端：接收批次并创建上传任务（Task 6.4）
+    #[allow(clippy::too_many_arguments)]
     async fn scan_loop(
         scan_task_id: String,
         mut batch_rx: mpsc::Receiver<Vec<ScannedFile>>,
@@ -238,6 +375,7 @@ impl ScanManager {
         _memory_monitor: Arc<MemoryMonitor>,
         wal_dir: PathBuf,
         max_pending_tasks: usize,
+        owner_uid: Option<crate::auth::Uid>,
     ) {
         let mut total_scanned: usize = 0;
         let mut total_created: usize = 0;
@@ -271,10 +409,23 @@ impl ScanManager {
                 .collect();
 
             // 创建任务（带去重）
-            match upload_manager
-                .create_batch_tasks_dedup(files, encrypt, true, conflict_strategy)
-                .await
-            {
+            // 显式传 owner_uid，使每个上传子任务都用 effective_uid 而非共享 manager 的 startup owner。
+            let result = match owner_uid {
+                Some(uid) => upload_manager
+                    .create_batch_tasks_dedup_with_owner(
+                        files,
+                        encrypt,
+                        true,
+                        conflict_strategy,
+                        uid,
+                    )
+                    .await,
+                None => upload_manager
+                    .create_batch_tasks_dedup(files, encrypt, true, conflict_strategy)
+                    .await,
+            };
+
+            match result {
                 Ok((new_ids, existing_ids)) => {
                     total_created += new_ids.len();
                     total_skipped += existing_ids.len();
@@ -293,6 +444,8 @@ impl ScanManager {
             }
 
             // 推送进度事件
+            // 用闭包内 owner_uid（task 实际归属）
+            let owner_uid_raw_opt: Option<u64> = owner_uid.map(|u| u.raw());
             ws_manager.send_if_subscribed(
                 TaskEvent::Scan(ScanEvent::Progress {
                     scan_task_id: scan_task_id.clone(),
@@ -302,6 +455,8 @@ impl ScanManager {
                     created_tasks: total_created,
                     skipped_duplicates: total_skipped,
                     total_size,
+
+                    owner_uid: owner_uid_raw_opt,
                 }),
                 None,
             );
@@ -326,6 +481,8 @@ impl ScanManager {
                         .get(&scan_task_id)
                         .map(|i| i.scan_options.clone())
                         .unwrap_or_default(),
+                    // 用本次扫描的 owner（不要再走 active_scans 二次查询，避免与传参不一致）
+                    owner_uid: owner_uid.map(|u| u.raw()),
                 };
                 save_checkpoint(&wal_dir, &checkpoint);
                 last_checkpoint_time = Instant::now();
@@ -358,6 +515,8 @@ impl ScanManager {
         }
 
         // 推送完成/失败事件
+        // 用闭包内 owner_uid
+        let owner_uid_raw_final: Option<u64> = owner_uid.map(|u| u.raw());
         match final_status {
             ScanTaskStatus::Completed => {
                 ws_manager.send_if_subscribed(
@@ -367,6 +526,8 @@ impl ScanManager {
                         total_size,
                         created_tasks: total_created,
                         skipped_duplicates: total_skipped,
+
+                        owner_uid: owner_uid_raw_final,
                     }),
                     None,
                 );
@@ -376,6 +537,8 @@ impl ScanManager {
                     TaskEvent::Scan(ScanEvent::Failed {
                         scan_task_id: scan_task_id.clone(),
                         error: "用户取消扫描".to_string(),
+
+                        owner_uid: owner_uid_raw_final,
                     }),
                     None,
                 );
@@ -408,7 +571,12 @@ impl ScanManager {
         self.active_scans.get(scan_task_id).map(|v| v.clone())
     }
 
-    /// 恢复中断的扫描任务（Task 8.3）
+    /// 恢复中断的扫描任务
+    ///
+    /// 恢复时从 checkpoint 读取 `owner_uid`，走 `start_scan_with_owner` 路径，
+    /// 使扫描事件、上传子任务、新 checkpoint 都绑定到原始扫描的归属账号；
+    /// 如果 checkpoint 缺失 owner_uid（升级老数据），
+    /// 回退到 `self.owner_uid`（startup active），与原行为兼容。
     pub async fn resume_interrupted_scans(&self) -> Result<usize> {
         let mut resumed = 0;
         let parent = self.wal_dir.clone();
@@ -427,14 +595,39 @@ impl ScanManager {
 
             match load_checkpoint(&path) {
                 Some(cp) => {
-                    info!("恢复中断的扫描: {}", cp.scan_task_id);
-                    if let Err(e) = self.start_scan(
-                        cp.local_folder,
-                        cp.remote_folder,
-                        Some(cp.scan_options),
-                        cp.encrypt,
-                        None, // conflict_strategy - use default for resumed scans
-                    ).await {
+                    info!(
+                        "恢复中断的扫描: {} (checkpoint owner_uid={:?})",
+                        cp.scan_task_id, cp.owner_uid
+                    );
+                    // 优先用 checkpoint 里的 owner_uid
+                    let resume_owner: Option<crate::auth::Uid> = cp
+                        .owner_uid
+                        .map(crate::auth::Uid::new)
+                        .or(self.owner_uid);
+
+                    let result = match resume_owner {
+                        Some(uid) => self
+                            .start_scan_with_owner(
+                                cp.local_folder,
+                                cp.remote_folder,
+                                Some(cp.scan_options),
+                                cp.encrypt,
+                                None, // conflict_strategy - use default for resumed scans
+                                uid,
+                            )
+                            .await,
+                        None => self
+                            .start_scan(
+                                cp.local_folder,
+                                cp.remote_folder,
+                                Some(cp.scan_options),
+                                cp.encrypt,
+                                None,
+                            )
+                            .await,
+                    };
+
+                    if let Err(e) = result {
                         warn!("恢复扫描失败 ({}): {}", name, e);
                     } else {
                         resumed += 1;

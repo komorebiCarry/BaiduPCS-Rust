@@ -1,8 +1,9 @@
 //! 文件夹下载管理器
 
 use crate::autobackup::record::BackupRecordManager;
+use crate::auth::types::Uid;
 use crate::downloader::{DownloadManager, DownloadTask, TaskStatus};
-use crate::netdisk::NetdiskClient;
+use crate::netdisk::{ClientPool, NetdiskClient};
 use crate::server::events::{FolderEvent, TaskEvent};
 use crate::server::websocket::WebSocketManager;
 use anyhow::{anyhow, Context, Result};
@@ -39,10 +40,31 @@ pub struct FolderDownloadManager {
     ws_manager: Arc<RwLock<Option<Arc<WebSocketManager>>>>,
     /// 🔥 文件夹进度通知发送器（由子任务触发，发送 group_id）
     folder_progress_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    /// 🔥 任务完成通知发送器
+    ///
+    /// 每个 per-uid `DownloadManager` 都通过 `set_task_completed_sender(tx)` 共享
+    /// 同一个 sender，子任务完成时统一推到 listener，由 listener 按 `folder.owner_uid`
+    /// 路由到对应账号 manager 做槽位释放 / 补任务。保留为字段以便登录路径
+    /// （新增账号 manager 时）能取到现有 sender 注入。
+    task_completed_tx:
+        Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
     /// 持久化管理器（用于访问历史数据库）
     persistence_manager: Arc<RwLock<Option<Arc<tokio::sync::Mutex<PersistenceManager>>>>>,
     /// 🔥 备份记录管理器（用于文件夹名还原）
     backup_record_manager: Arc<RwLock<Option<Arc<BackupRecordManager>>>>,
+    /// 🔥 多账号网盘客户端池
+    ///
+    /// 当注入后，扫描/列表 API 优先按 `FolderDownload.owner_uid` 从池中取该账号
+    /// 的 `NetdiskClient`；未注入时回退到全局 `netdisk_client` 字段（兼容旧路径）。
+    client_pool: Arc<RwLock<Option<Arc<RwLock<ClientPool>>>>>,
+    /// 🔥 多账号 per-uid 下载管理器池
+    ///
+    /// 当注入后，子任务创建/补任务/槽位分配按 `FolderDownload.owner_uid` 路由到
+    /// 对应账号的 `DownloadManager`；未注入时回退到 `download_manager` 单例字段
+    /// （legacy 路径）。这避免"folder.owner_uid=B 但任务被加入 A 的 manager"
+    /// 错位。
+    download_manager_pool:
+        Arc<RwLock<Option<Arc<dashmap::DashMap<crate::auth::Uid, Arc<DownloadManager>>>>>>,
 }
 
 impl FolderDownloadManager {
@@ -57,9 +79,81 @@ impl FolderDownloadManager {
             wal_dir: Arc::new(RwLock::new(None)),
             ws_manager: Arc::new(RwLock::new(None)),
             folder_progress_tx: Arc::new(RwLock::new(None)),
+            task_completed_tx: Arc::new(RwLock::new(None)),
             persistence_manager: Arc::new(RwLock::new(None)),
             backup_record_manager: Arc::new(RwLock::new(None)),
+            client_pool: Arc::new(RwLock::new(None)),
+            download_manager_pool: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 🔥 注入多账号网盘客户端池
+    ///
+    /// 注入后 `client_for(uid)` 会优先按 uid 查池；未注入时维持原有全局
+    /// `netdisk_client` 路径。`AppState` 在创建池且活跃账号客户端已注入后
+    /// 调用一次即可。
+    pub async fn set_client_pool(&self, pool: Arc<RwLock<ClientPool>>) {
+        let mut guard = self.client_pool.write().await;
+        *guard = Some(pool);
+        info!("FolderDownloadManager 已注入 ClientPool");
+    }
+
+    /// 🔥 注入多账号 per-uid `DownloadManager` 池
+    ///
+    /// 注入后 `download_manager_for(uid)` 会优先按 uid 查池；未注入时维持原有
+    /// 全局 `download_manager` 路径。`AppState::load_initial_session` 在所有
+    /// 持久化账号 manager 注册到池后调用一次即可。
+    pub async fn set_download_manager_pool(
+        &self,
+        pool: Arc<dashmap::DashMap<Uid, Arc<DownloadManager>>>,
+    ) {
+        let mut guard = self.download_manager_pool.write().await;
+        *guard = Some(pool);
+        info!("FolderDownloadManager 已注入 DownloadManager 池");
+    }
+
+    /// 🔥 按 uid 解析 `DownloadManager`
+    ///
+    /// pool 已注入但 uid miss 时**不再** fallback 到
+    /// legacy 单例 — 这种情况意味着 owner_uid 已被删除 / manager 构造失败 / pool
+    /// 漏注入，悄悄退到 active 单例会让任务被错误归并。现严格返回 `None`。
+    ///
+    /// 优先级：
+    /// 1. **`download_manager_pool` 已注入**（多账号路径）：
+    ///    - 命中 uid → 返回该账号独立 manager
+    ///    - **miss uid → 返回 `None`**（让调用方失败，不再 fallback）
+    /// 2. **`download_manager_pool` 未注入**（legacy / 单账号兼容路径）：
+    ///    - 返回全局 `download_manager` 字段
+    ///
+    /// 调用方应把 `None` 视作硬错误（任务不能被处理），而非"用 active 兜底"。
+    pub async fn download_manager_for(&self, uid: Uid) -> Option<Arc<DownloadManager>> {
+        // 路径 1：pool 已注入 → 严格按 uid 命中或返回 None
+        if let Some(pool_arc) = self.download_manager_pool.read().await.as_ref() {
+            return pool_arc
+                .get(&uid)
+                .map(|entry| Arc::clone(entry.value()));
+        }
+        // 路径 2：pool 未注入 → legacy 全局 download_manager（单账号兼容）
+        self.download_manager.read().await.clone()
+    }
+
+    /// 🔥 按 uid 解析 `NetdiskClient`
+    ///
+    /// 优先级：
+    /// 1. `client_pool.get_client(uid)`（多账号路径）
+    /// 2. 全局 `netdisk_client` 字段（legacy 单用户路径）
+    ///
+    /// 返回 `None` 表示两条路径都不可用 → 调用方应放弃扫描并标记任务失败。
+    pub async fn client_for(&self, uid: Uid) -> Option<Arc<NetdiskClient>> {
+        // 路径 1：池
+        if let Some(pool_arc) = self.client_pool.read().await.as_ref() {
+            let pool = pool_arc.read().await;
+            if let Some(client) = pool.get_client(uid) {
+                return Some(client);
+            }
+        }
+        // 路径 2：legacy 全局客户端
+        self.netdisk_client.read().await.clone()
     }
 
     /// 设置持久化管理器
@@ -267,6 +361,16 @@ impl FolderDownloadManager {
 
         info!("发现 {} 个持久化的文件夹任务", persisted_folders.len());
 
+        // 🔥 folder owner_uid 兜底用的 active_uid（与 download/upload 保持一致）
+        // 若全局无 active_uid（理论不可能，因 restore_folders 只会在登录后调用），保持原值不变。
+        let active_uid_fallback: Option<crate::auth::Uid> = self
+            .download_manager
+            .read()
+            .await
+            .as_ref()
+            .map(|dm| dm.owner_uid())
+            .filter(|u| u.raw() != 0);
+
         let mut restored = 0;
         let mut skipped = 0;
 
@@ -289,6 +393,19 @@ impl FolderDownloadManager {
 
             // 转换为 FolderDownload
             let mut folder = persisted.to_folder();
+
+            // 🔥 folder.owner_uid==Uid(0) 视作 None，
+            // 用 active_uid 兜底填充（与 classify_recovery_branch 的 LegacyFillActive 等价）
+            if folder.owner_uid.raw() == 0 {
+                if let Some(uid) = active_uid_fallback {
+                    debug!(
+                        "folder T2-10 兜底: folder_id={} owner_uid 0 → {}",
+                        folder.id,
+                        uid.raw()
+                    );
+                    folder.owner_uid = uid;
+                }
+            }
 
             // 将状态设置为 Paused，等待用户手动恢复
             folder.status = FolderStatus::Paused;
@@ -334,27 +451,25 @@ impl FolderDownloadManager {
     /// 在恢复子任务后调用，将子任务的进度同步到对应的文件夹
     /// 同时维护 borrowed_subtask_map，确保借调位回收时能正确找到对应的子任务
     /// 🔥 修复：为已恢复但没有槽位的子任务分配借调位
+    /// 🔥 改为按 folder.owner_uid 路由 download_manager
     pub async fn sync_restored_tasks_progress(&self) {
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone()
-        };
-
-        let download_manager = match download_manager {
-            Some(dm) => dm,
-            None => {
-                warn!("下载管理器未初始化，跳过同步子任务进度");
-                return;
-            }
-        };
-
-        // 获取所有文件夹 ID
-        let folder_ids: Vec<String> = {
+        // 获取所有文件夹 (id, owner_uid)
+        let folders_meta: Vec<(String, crate::auth::Uid)> = {
             let folders = self.folders.read().await;
-            folders.keys().cloned().collect()
+            folders.iter().map(|(k, f)| (k.clone(), f.owner_uid)).collect()
         };
 
-        for folder_id in folder_ids {
+        for (folder_id, folder_owner_uid) in folders_meta {
+            let download_manager = match self.download_manager_for(folder_owner_uid).await {
+                Some(dm) => dm,
+                None => {
+                    warn!(
+                        "sync_restored_tasks_progress: 无法解析 folder.owner_uid={} 的下载管理器，跳过",
+                        folder_owner_uid.raw()
+                    );
+                    continue;
+                }
+            };
             // 获取该文件夹的所有子任务
             let tasks = download_manager.get_tasks_by_group(&folder_id).await;
 
@@ -487,22 +602,10 @@ impl FolderDownloadManager {
     ///
     /// # Returns
     /// 创建的暂停任务数
+    /// 🔥 每个文件夹按 `folder.owner_uid` 路由 download_manager
     pub async fn prefill_paused_tasks(&self, target_count: usize) -> usize {
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone()
-        };
-
-        let download_manager = match download_manager {
-            Some(dm) => dm,
-            None => {
-                warn!("下载管理器未初始化，跳过恢复模式补任务");
-                return 0;
-            }
-        };
-
-        // 获取所有需要补任务的文件夹 ID
-        let folder_ids: Vec<String> = {
+        // 获取所有需要补任务的文件夹 ID + owner_uid
+        let folder_ids: Vec<(String, crate::auth::Uid)> = {
             let folders = self.folders.read().await;
             folders
                 .iter()
@@ -512,7 +615,7 @@ impl FolderDownloadManager {
                         && f.scan_completed
                         && !f.pending_files.is_empty()
                 })
-                .map(|(id, _)| id.clone())
+                .map(|(id, f)| (id.clone(), f.owner_uid))
                 .collect()
         };
 
@@ -522,7 +625,17 @@ impl FolderDownloadManager {
 
         let mut total_created = 0usize;
 
-        for folder_id in folder_ids {
+        for (folder_id, folder_owner_uid) in folder_ids {
+            let download_manager = match self.download_manager_for(folder_owner_uid).await {
+                Some(dm) => dm,
+                None => {
+                    warn!(
+                        "prefill_paused_tasks: 无法解析 folder.owner_uid={} 的下载管理器，跳过",
+                        folder_owner_uid.raw()
+                    );
+                    continue;
+                }
+            };
             // 获取该文件夹已有的子任务数
             let existing_tasks = download_manager.get_tasks_by_group(&folder_id).await;
             let existing_count = existing_tasks.len();
@@ -534,7 +647,7 @@ impl FolderDownloadManager {
             let needed = target_count - existing_count;
 
             // 从 pending_files 取出需要的文件
-            let (files_to_create, local_root, group_root, folder_created_at) = {
+            let (files_to_create, local_root, group_root, folder_created_at, folder_owner_uid) = {
                 let mut folders = self.folders.write().await;
                 let folder = match folders.get_mut(&folder_id) {
                     Some(f) => f,
@@ -557,6 +670,7 @@ impl FolderDownloadManager {
                     folder.local_root.clone(),
                     folder.remote_root.clone(),
                     folder.created_at,
+                    folder.owner_uid,
                 )
             };
 
@@ -592,6 +706,7 @@ impl FolderDownloadManager {
                     folder_id.clone(),
                     group_root.clone(),
                     pending_file.relative_path,
+                    folder_owner_uid,
                 );
 
                 // 恢复模式下，保持任务创建时间不晚于原文件夹创建时间，
@@ -629,11 +744,45 @@ impl FolderDownloadManager {
 
     /// 设置下载管理器
     pub async fn set_download_manager(&self, manager: Arc<DownloadManager>) {
+        // 🔥 把"创建 channel + 启动监听器"做成幂等
+        // 一次创建后，channel 句柄保留在 task_completed_tx / folder_progress_tx；
+        // 后续 set_download_manager 调用（账号切换/新登录）只把新 manager 的 sender
+        // 指到同一个 channel，避免：
+        //   (a) 重新创建 channel 后旧 manager 的 sender 持有 dropped tx → 旧账号
+        //       任务完成事件被静默丢弃；
+        //   (b) 多次启动 spawn listener → 重复处理同一事件
+        let already_initialized = {
+            let task_tx_guard = self.task_completed_tx.read().await;
+            let folder_tx_guard = self.folder_progress_tx.read().await;
+            task_tx_guard.is_some() && folder_tx_guard.is_some()
+        };
+
+        if already_initialized {
+            // 复用已有 channel，把新 manager 的 sender 指到同一 channel
+            self.share_senders_with(&manager).await;
+            // 更新 download_manager 单例引用（active manager 切换的 legacy 字段维护）
+            {
+                let mut dm = self.download_manager.write().await;
+                *dm = Some(manager);
+            }
+            info!(
+                "FolderDownloadManager: 复用现有 channel + 监听器，已把新 manager 的 sender 接入"
+            );
+            return;
+        }
+
+        // 首次进入：创建 channel + 启动监听器
         // 创建任务完成通知 channel（发送 group_id 和 task_id）
         let (tx, rx) = mpsc::unbounded_channel::<(String, String, u64, bool)>();
 
         // 设置 sender 到 download_manager
-        manager.set_task_completed_sender(tx).await;
+        manager.set_task_completed_sender(tx.clone()).await;
+
+        // 保存 sender 句柄
+        {
+            let mut tx_guard = self.task_completed_tx.write().await;
+            *tx_guard = Some(tx);
+        }
 
         // 🔥 创建文件夹进度通知通道（由子任务进度变化触发）
         let (folder_progress_tx, folder_progress_rx) = mpsc::unbounded_channel::<String>();
@@ -659,26 +808,83 @@ impl FolderDownloadManager {
         // 启动文件夹进度监听器
         self.start_folder_progress_listener(folder_progress_rx);
 
-        info!("文件夹下载管理器已设置下载管理器，任务完成监听和进度监听器已启动");
+        info!("文件夹下载管理器已设置下载管理器，任务完成监听和进度监听器已启动（首次初始化）");
+    }
+
+    /// 🔥 把已存在的 task_completed / folder_progress sender 注入到新 manager
+    ///
+    /// 用于：登录新增账号 / 启动期非 active 持久化账号 等场景下，per-uid manager
+    /// 必须共享同一对 sender → 子任务完成才会触发监听器分发；不调用 listener
+    /// 拿不到事件，文件夹补任务永远卡死。
+    ///
+    /// 调用方应在 active manager 已通过 `set_download_manager()` 创建 channel
+    /// 之后调用本方法。如果 senders 还没初始化（极端情况：还没设置过 active
+    /// manager），方法是 no-op + warn。
+    pub async fn share_senders_with(&self, manager: &Arc<DownloadManager>) {
+        let task_tx = self.task_completed_tx.read().await.clone();
+        let folder_tx = self.folder_progress_tx.read().await.clone();
+        match (task_tx, folder_tx) {
+            (Some(t), Some(f)) => {
+                manager.set_task_completed_sender(t).await;
+                manager.set_folder_progress_sender(f).await;
+                info!(
+                    "FolderDownloadManager: 已共享 task_completed / folder_progress sender 给 per-uid manager"
+                );
+            }
+            _ => {
+                warn!(
+                    "share_senders_with: senders 尚未初始化（active manager 还没通过 set_download_manager 设置过），跳过"
+                );
+            }
+        }
     }
 
     /// 🔥 启动文件夹进度监听器
     ///
     /// 监听子任务进度变化通知，收到 group_id 后聚合子任务进度并发布 FolderEvent::Progress 事件
     /// 由子任务的节流器控制频率，无需额外节流
+    /// 🔥 监听器内部按 `folder.owner_uid` 通过
+    /// `self.download_manager_pool` 解析 manager，不再读单例
+    /// `self.download_manager`（避免账号切换后用错 manager 查 group / 释放槽 / 补任务）
     fn start_folder_progress_listener(&self, mut rx: mpsc::UnboundedReceiver<String>) {
         let folders = self.folders.clone();
-        let download_manager = self.download_manager.clone();
+        let download_manager_pool = self.download_manager_pool.clone();
+        let download_manager_legacy = self.download_manager.clone();
         let ws_manager = self.ws_manager.clone();
 
         tokio::spawn(async move {
             while let Some(folder_id) = rx.recv().await {
-                // 获取下载管理器
-                let dm = {
-                    let guard = download_manager.read().await;
-                    guard.clone()
+                // 🔥 先读 folder.owner_uid，再按 uid 解析 manager
+                let folder_meta = {
+                    let folders_guard = folders.read().await;
+                    folders_guard.get(&folder_id).map(|f| {
+                        (
+                            f.total_files,
+                            f.total_size,
+                            f.status.clone(),
+                            f.completed_count,
+                            f.owner_uid.raw(),
+                            f.owner_uid,
+                        )
+                    })
                 };
+                let (total_files, total_size, status, completed_files, owner_uid_raw, owner_uid) =
+                    match folder_meta {
+                        Some(info) => info,
+                        None => continue,
+                    };
 
+                // 路由 manager（pool 注入则严格按 owner_uid；未注入退回 legacy 单例）
+                let dm = {
+                    let pool_guard = download_manager_pool.read().await;
+                    if let Some(pool_arc) = pool_guard.as_ref() {
+                        pool_arc.get(&owner_uid).map(|e| Arc::clone(e.value()))
+                    } else {
+                        // pool 未注入 → legacy 路径：读单例
+                        drop(pool_guard);
+                        download_manager_legacy.read().await.clone()
+                    }
+                };
                 let dm = match dm {
                     Some(dm) => dm,
                     None => continue,
@@ -692,19 +898,6 @@ impl FolderDownloadManager {
 
                 let ws = match ws {
                     Some(ws) => ws,
-                    None => continue,
-                };
-
-                // 获取文件夹信息
-                let folder_info = {
-                    let folders_guard = folders.read().await;
-                    folders_guard.get(&folder_id).map(|f| {
-                        (f.total_files, f.total_size, f.status.clone(), f.completed_count)
-                    })
-                };
-
-                let (total_files, total_size, status, completed_files) = match folder_info {
-                    Some(info) => info,
                     None => continue,
                 };
 
@@ -740,6 +933,8 @@ impl FolderDownloadManager {
                         total_files,
                         speed,
                         status: format!("{:?}", status).to_lowercase(),
+
+                        owner_uid: Some(owner_uid_raw),
                     }),
                     None,
                 );
@@ -751,19 +946,39 @@ impl FolderDownloadManager {
     ///
     /// 当收到子任务完成通知时，立即从 pending_files 补充新任务
     /// 根据文件夹可用槽位数量（借调位+固定位）动态补充，充分利用槽位资源
+    /// 🔥 监听器内部按 `folder.owner_uid` 通过
+    /// `self.download_manager_pool` 解析 manager，不再读单例
+    /// `self.download_manager`（避免账号切换后用错 manager 释放槽 / 补任务 /
+    /// 把 owner=A 的新子任务塞进 B manager）
     fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<(String, String, u64, bool)>) {
         let folders = self.folders.clone();
-        let download_manager = self.download_manager.clone();
+        let download_manager_pool = self.download_manager_pool.clone();
+        let download_manager_legacy = self.download_manager.clone();
         let wal_dir = self.wal_dir.clone();
         let ws_manager = self.ws_manager.clone();
         let cancellation_tokens = self.cancellation_tokens.clone();
 
         tokio::spawn(async move {
             while let Some((group_id, task_id, file_size, is_success)) = rx.recv().await {
-                // 获取下载管理器
-                let dm = {
-                    let guard = download_manager.read().await;
-                    guard.clone()
+                // 🔥 先读 folder.owner_uid，再按 uid 解析 manager
+                let folder_owner_uid_for_routing = {
+                    let folders_guard = folders.read().await;
+                    folders_guard.get(&group_id).map(|f| f.owner_uid)
+                };
+                let dm = match folder_owner_uid_for_routing {
+                    Some(uid) => {
+                        let pool_guard = download_manager_pool.read().await;
+                        if let Some(pool_arc) = pool_guard.as_ref() {
+                            pool_arc.get(&uid).map(|e| Arc::clone(e.value()))
+                        } else {
+                            drop(pool_guard);
+                            download_manager_legacy.read().await.clone()
+                        }
+                    }
+                    None => {
+                        // 文件夹已不在内存（被删/恢复失败）→ 跳过这条通知
+                        continue;
+                    }
                 };
 
                 let dm = match dm {
@@ -914,6 +1129,9 @@ impl FolderDownloadManager {
                         None => continue,
                     };
 
+                    // 🔥 终态事件 owner_uid
+                    let owner_uid_raw_for_folder: u64 = folder.owner_uid.raw();
+
                     // 检查状态：已终止的文件夹不需要继续处理
                     if folder.status == FolderStatus::Paused
                         || folder.status == FolderStatus::Cancelled
@@ -974,6 +1192,8 @@ impl FolderDownloadManager {
                                     folder_id: group_id.clone(),
                                     old_status,
                                     new_status: "completed".to_string(),
+
+                                    owner_uid: Some(owner_uid_raw_for_folder),
                                 }),
                                 None,
                             );
@@ -983,6 +1203,8 @@ impl FolderDownloadManager {
                                 TaskEvent::Folder(FolderEvent::Completed {
                                     folder_id: group_id.clone(),
                                     completed_at: chrono::Utc::now().timestamp_millis(),
+
+                                    owner_uid: Some(owner_uid_raw_for_folder),
                                 }),
                                 None,
                             );
@@ -1040,6 +1262,8 @@ impl FolderDownloadManager {
                                     folder_id: group_id.clone(),
                                     old_status,
                                     new_status: "failed".to_string(),
+
+                                    owner_uid: Some(owner_uid_raw_for_folder),
                                 }),
                                 None,
                             );
@@ -1047,6 +1271,8 @@ impl FolderDownloadManager {
                                 TaskEvent::Folder(FolderEvent::Failed {
                                     folder_id: group_id.clone(),
                                     error: error_msg,
+
+                                    owner_uid: Some(owner_uid_raw_for_folder),
                                 }),
                                 None,
                             );
@@ -1087,10 +1313,10 @@ impl FolderDownloadManager {
                     // 根据可用槽位数量（借调位+固定位）取出相应数量的文件
                     let count = folder.pending_files.len().min(available);
                     let files: Vec<_> = folder.pending_files.drain(..count).collect();
-                    (files, folder.local_root.clone(), folder.remote_root.clone())
+                    (files, folder.local_root.clone(), folder.remote_root.clone(), folder.owner_uid)
                 };
 
-                let (files, local_root, group_root) = files_to_create;
+                let (files, local_root, group_root, folder_owner_uid) = files_to_create;
                 let total_files = files.len();
                 let mut created_count = 0u64;
 
@@ -1137,6 +1363,7 @@ impl FolderDownloadManager {
                         group_id.clone(),
                         group_root.clone(),
                         file_to_create.relative_path,
+                        folder_owner_uid,
                     );
 
                     // 🔥 尝试为子任务分配借调位
@@ -1273,8 +1500,15 @@ impl FolderDownloadManager {
     }
 
     /// 创建文件夹下载任务
-    pub async fn create_folder_download(&self, remote_path: String) -> Result<String> {
-        self.create_folder_download_with_name(remote_path, None, None).await
+    ///
+    /// 多账号：owner_uid 参数由调用方（一般是 handler 从 active_uid
+    /// 读取）传入，然后在 internal 里写入 folder.owner_uid。
+    pub async fn create_folder_download(
+        &self,
+        remote_path: String,
+        owner_uid: crate::auth::Uid,
+    ) -> Result<String> {
+        self.create_folder_download_with_name(remote_path, None, None, owner_uid).await
     }
 
     /// 创建文件夹下载任务（支持指定原始文件夹名）
@@ -1286,12 +1520,13 @@ impl FolderDownloadManager {
         remote_path: String,
         original_name: Option<String>,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
     ) -> Result<String> {
         // 获取远程路径中的文件夹名
         let encrypted_folder_name = remote_path
             .trim_end_matches('/')
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("download")
             .to_string();
 
@@ -1320,7 +1555,7 @@ impl FolderDownloadManager {
         let local_root = download_dir.join(&folder_name);
         drop(download_dir);
 
-        self.create_folder_download_internal(remote_path, local_root, conflict_strategy)
+        self.create_folder_download_internal(remote_path, local_root, conflict_strategy, owner_uid)
             .await
     }
 
@@ -1338,12 +1573,13 @@ impl FolderDownloadManager {
         target_dir: &std::path::Path,
         original_name: Option<String>,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
     ) -> Result<String> {
         // 获取远程路径中的文件夹名
         let encrypted_folder_name = remote_path
             .trim_end_matches('/')
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("download")
             .to_string();
 
@@ -1370,7 +1606,7 @@ impl FolderDownloadManager {
 
         let local_root = target_dir.join(&folder_name);
 
-        self.create_folder_download_internal(remote_path, local_root, conflict_strategy)
+        self.create_folder_download_internal(remote_path, local_root, conflict_strategy, owner_uid)
             .await
     }
 
@@ -1384,17 +1620,23 @@ impl FolderDownloadManager {
         remote_path: String,
         local_root: PathBuf,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
     ) -> Result<String> {
         let mut folder = FolderDownload::new(remote_path.clone(), local_root);
         let folder_id = folder.id.clone();
 
+        // 🔥 多账号：设置 folder 归属 UID（与 ClientPool/per-uid downloader 路由对齐）
+        folder.owner_uid = owner_uid;
+
         // 🔥 设置冲突策略
         folder.conflict_strategy = conflict_strategy;
 
+        // 🔥 按 folder.owner_uid 解析 download_manager（per-uid）
+        let dm_for_owner: Option<Arc<DownloadManager>> = self.download_manager_for(owner_uid).await;
+
         // 🔥 尝试为文件夹分配固定任务位（使用优先级分配，可抢占备份任务）
         let (mut fixed_slot_id, mut preempted_task_id) = {
-            let dm = self.download_manager.read().await;
-            if let Some(ref dm) = *dm {
+            if let Some(ref dm) = dm_for_owner {
                 let slot_pool = dm.task_slot_pool();
                 // 文件夹主任务使用 Normal 优先级，可以抢占备份任务
                 if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
@@ -1412,8 +1654,7 @@ impl FolderDownloadManager {
         // 🔥 处理被抢占的备份任务
         if let Some(preempted_id) = preempted_task_id.take() {
             info!("文件夹 {} 抢占了备份任务 {} 的槽位", folder_id, preempted_id);
-            let dm = self.download_manager.read().await;
-            if let Some(ref dm) = *dm {
+            if let Some(ref dm) = dm_for_owner {
                 // 暂停被抢占的备份任务并加入等待队列
                 if let Err(e) = dm.pause_task(&preempted_id, true).await {
                     warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
@@ -1423,14 +1664,17 @@ impl FolderDownloadManager {
             }
         }
 
-        // 🔥 如果没有空闲槽位，尝试从其他文件夹回收借调位
+        // 🔥 如果没有空闲槽位，尝试从同一账号的其他文件夹回收借调位
         // 这确保了多个文件夹任务之间的公平性：每个文件夹至少能获得一个固定位
+        // reclaim 必须按 owner_uid 过滤，避免跨账号误回收
         if fixed_slot_id.is_none() {
-            info!("文件夹 {} 无空闲槽位，尝试回收其他文件夹的借调位", folder_id);
-            if let Some(reclaimed_slot_id) = self.reclaim_borrowed_slot().await {
+            info!("文件夹 {} 无空闲槽位，尝试回收同账号其他文件夹的借调位", folder_id);
+            if let Some(reclaimed_slot_id) = self
+                .reclaim_borrowed_slot_for_owner(owner_uid)
+                .await
+            {
                 // 回收成功，重新分配固定位
-                let dm = self.download_manager.read().await;
-                if let Some(ref dm) = *dm {
+                if let Some(ref dm) = dm_for_owner {
                     let slot_pool = dm.task_slot_pool();
                     if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
                         &folder_id, true, crate::task_slot_pool::TaskPriority::Normal
@@ -1463,8 +1707,7 @@ impl FolderDownloadManager {
         // 🔥 尝试借调槽位（最多借调4个，总共5个并行子任务）
         // 支持抢占备份任务：如果空闲槽位不足，会抢占备份任务的槽位
         let (borrowed_slot_ids, preempted_backup_tasks) = {
-            let dm = self.download_manager.read().await;
-            if let Some(ref dm) = *dm {
+            if let Some(ref dm) = dm_for_owner {
                 let slot_pool = dm.task_slot_pool();
                 let available = slot_pool.available_borrow_slots().await;
                 let to_borrow = available.min(4); // 最多借调4个
@@ -1486,8 +1729,7 @@ impl FolderDownloadManager {
                 preempted_backup_tasks.len(),
                 preempted_backup_tasks
             );
-            let dm = self.download_manager.read().await;
-            if let Some(ref dm) = *dm {
+            if let Some(ref dm) = dm_for_owner {
                 for preempted_id in &preempted_backup_tasks {
                     // 暂停被抢占的备份任务
                     if let Err(e) = dm.pause_task(preempted_id, true).await {
@@ -1524,11 +1766,19 @@ impl FolderDownloadManager {
         {
             let folders = self.folders.read().await;
             if let Some(folder) = folders.get(&folder_id) {
+                // 🔥 文件夹 Created event 携带 owner_uid
+                //
+                // 之前固定 None 与文档"任务事件都带 owner_uid"不一致，多账号过滤 /
+                // AccountBadge 在 WS 实时路径上不可靠（前端只能等 GET /downloads/all
+                // 全量拉刷新才能看到归属）。文件夹本身已有 owner_uid 字段（来自
+                // create_folder_download_with_dir 接收的 owner_uid 参数），直接透传。
                 self.publish_event(FolderEvent::Created {
                     folder_id: folder_id.clone(),
                     name: folder.name.clone(),
                     remote_root: folder.remote_root.clone(),
                     local_root: folder.local_root.to_string_lossy().to_string(),
+
+                    owner_uid: Some(folder.owner_uid.raw()),
                 })
                     .await;
             }
@@ -1544,8 +1794,11 @@ impl FolderDownloadManager {
             wal_dir: self.wal_dir.clone(),
             ws_manager: self.ws_manager.clone(),
             folder_progress_tx: self.folder_progress_tx.clone(),
+            task_completed_tx: self.task_completed_tx.clone(),
             persistence_manager: self.persistence_manager.clone(),
             backup_record_manager: self.backup_record_manager.clone(),
+            client_pool: self.client_pool.clone(),
+            download_manager_pool: self.download_manager_pool.clone(),
         };
         let folder_id_clone = folder_id.clone();
 
@@ -1556,12 +1809,16 @@ impl FolderDownloadManager {
             {
                 error!("扫描文件夹失败: {:?}", e);
                 let error_msg = e.to_string();
-                {
+                // 🔥 mark_failed 同时取出 owner_uid
+                let owner_uid_raw_opt: Option<u64> = {
                     let mut folders = self_clone.folders.write().await;
                     if let Some(folder) = folders.get_mut(&folder_id_clone) {
                         folder.mark_failed(error_msg.clone());
+                        Some(folder.owner_uid.raw())
+                    } else {
+                        None
                     }
-                }
+                };
                 // 清理取消令牌
                 self_clone
                     .cancellation_tokens
@@ -1574,6 +1831,8 @@ impl FolderDownloadManager {
                     .publish_event(FolderEvent::Failed {
                         folder_id: folder_id_clone,
                         error: error_msg,
+
+                        owner_uid: owner_uid_raw_opt,
                     })
                     .await;
             }
@@ -1661,12 +1920,20 @@ impl FolderDownloadManager {
         // 确保前端收到消息时，状态已经保存到磁盘
         self.persist_folder(folder_id).await;
 
+        // 🔥 取出 owner_uid 用于事件
+        let owner_uid_raw_opt: Option<u64> = {
+            let folders = self.folders.read().await;
+            folders.get(folder_id).map(|f| f.owner_uid.raw())
+        };
+
         // 🔥 发送状态变更事件（在持久化之后）
         if should_publish_status_changed {
             self.publish_event(FolderEvent::StatusChanged {
                 folder_id: folder_id.to_string(),
                 old_status: "scanning".to_string(),
                 new_status: "downloading".to_string(),
+
+                owner_uid: owner_uid_raw_opt,
             })
                 .await;
         }
@@ -1674,15 +1941,13 @@ impl FolderDownloadManager {
         // 🔥 发布扫描完成事件（在锁外发布）
         let scan_event = {
             let folders = self.folders.read().await;
-            if let Some(folder) = folders.get(folder_id) {
-                Some(FolderEvent::ScanCompleted {
-                    folder_id: folder_id.to_string(),
-                    total_files: folder.total_files,
-                    total_size: folder.total_size,
-                })
-            } else {
-                None
-            }
+            folders.get(folder_id).map(|folder| FolderEvent::ScanCompleted {
+                folder_id: folder_id.to_string(),
+                total_files: folder.total_files,
+                total_size: folder.total_size,
+
+                owner_uid: Some(folder.owner_uid.raw()),
+            })
         };
         if let Some(event) = scan_event {
             self.publish_event(event).await;
@@ -1893,6 +2158,116 @@ impl FolderDownloadManager {
         removed
     }
 
+    /// 清除内存中属于指定账号的已完成文件夹
+    ///
+    /// 共享 `FolderDownloadManager` 设计下，按 `owner_uid` 严格过滤，避免
+    /// 跨账号清理。
+    pub async fn clear_completed_folders_for_owner(&self, uid: crate::auth::Uid) -> usize {
+        let mut folders = self.folders.write().await;
+        let before_count = folders.len();
+
+        folders.retain(|_, folder| {
+            !(folder.owner_uid == uid && folder.status == FolderStatus::Completed)
+        });
+
+        let removed = before_count - folders.len();
+        if removed > 0 {
+            info!(
+                "从内存中清除了 {} 个已完成的文件夹（owner_uid={}）",
+                removed,
+                uid.raw()
+            );
+        }
+        removed
+    }
+
+    /// 删除指定账号下所有文件夹下载
+    ///
+    /// 用于 `force_delete_account` 链路。`clear_completed_folders_for_owner`
+    /// 只清已完成文件夹，而真正会取消扫描令牌、清 pending_files、释放
+    /// fixed/borrowed 槽位的是 `cancel_folder` / `delete_folder`。账号被删时
+    /// 如果文件夹下载还在扫描或 pending，它会在子任务被删后继续补新子任务，
+    /// 且聚合接口仍能看到 orphan folder。
+    ///
+    /// 行为（每个文件夹）：
+    /// - 终态文件夹（Completed/Failed/Cancelled）：直接 `delete_folder` 移除内存
+    ///   + 删除持久化 + 删除历史
+    /// - 进行中文件夹：`cancel_folder` 取消扫描令牌、清 pending、释放槽位、删
+    ///   子任务（共享 manager 内的子任务已被 `delete_tasks_for_owner` 删过，
+    ///   但本路径再次调用是幂等的）；`delete_files=false` 默认，账号删除不附
+    ///   带本地文件删除
+    ///
+    /// 返回成功处理的文件夹数。
+    pub async fn delete_folders_for_owner(
+        &self,
+        uid: crate::auth::Uid,
+        delete_files: bool,
+    ) -> usize {
+        // 1) 收集归属该 uid 的所有文件夹 ID 与状态（先放锁再做异步操作，避免持锁过久）
+        let target_folders: Vec<(String, FolderStatus)> = {
+            let folders = self.folders.read().await;
+            folders
+                .iter()
+                .filter(|(_, f)| f.owner_uid == uid)
+                .map(|(id, f)| (id.clone(), f.status.clone()))
+                .collect()
+        };
+
+        if target_folders.is_empty() {
+            info!(
+                "delete_folders_for_owner: uid={} 内存中无归属文件夹",
+                uid.raw()
+            );
+            return 0;
+        }
+
+        let total = target_folders.len();
+        info!(
+            "delete_folders_for_owner: uid={} 内存中找到 {} 个文件夹下载",
+            uid.raw(),
+            total
+        );
+
+        // 2) 按状态分别处理
+        let mut processed = 0;
+        for (folder_id, status) in target_folders {
+            let result = if matches!(
+                status,
+                FolderStatus::Completed | FolderStatus::Failed | FolderStatus::Cancelled
+            ) {
+                // 终态：仅删除记录
+                self.delete_folder(&folder_id).await
+            } else {
+                // 进行中：取消扫描令牌 + 清 pending + 释放槽位 + 删除内存项
+                self.cancel_folder(&folder_id, delete_files).await
+            };
+
+            match result {
+                Ok(()) => {
+                    processed += 1;
+                    info!(
+                        "delete_folders_for_owner: 已处理 folder={}（status={:?}, delete_files={}）",
+                        folder_id, status, delete_files
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "delete_folders_for_owner: 处理 folder={} 失败（status={:?}）: {}",
+                        folder_id, status, e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "delete_folders_for_owner: uid={} 完成，处理 {}/{} 个文件夹",
+            uid.raw(),
+            processed,
+            total
+        );
+        processed
+    }
+
     /// 从历史记录加载已完成的文件夹（优先从数据库加载）
     ///
     /// 返回已完成文件夹的列表（用于前端显示历史记录）
@@ -2040,15 +2415,17 @@ impl FolderDownloadManager {
 
         // 🔥 关键：先更新文件夹状态为 Paused，阻止 task_completed_listener 创建新任务
         // 这必须在暂停任务之前执行，避免竞态条件
-        let old_status = {
+        // 🔥 同时取出 folder.owner_uid 用于路由 download_manager
+        let (old_status, folder_owner_uid_for_routing) = {
             let mut folders = self.folders.write().await;
             if let Some(folder) = folders.get_mut(folder_id) {
                 let old_status = format!("{:?}", folder.status).to_lowercase();
+                let owner_uid = folder.owner_uid;
                 folder.mark_paused();
                 info!("文件夹 {} 状态已标记为暂停", folder.name);
-                old_status
+                (old_status, Some(owner_uid))
             } else {
-                String::new()
+                (String::new(), None)
             }
         };
 
@@ -2060,10 +2437,13 @@ impl FolderDownloadManager {
             }
         }
 
-        // 获取下载管理器
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone().ok_or_else(|| anyhow!("下载管理器未初始化"))?
+        // 🔥 按 folder.owner_uid 路由 download_manager
+        let download_manager = match folder_owner_uid_for_routing {
+            Some(uid) => self
+                .download_manager_for(uid)
+                .await
+                .ok_or_else(|| anyhow!("下载管理器未初始化（owner_uid={}）", uid.raw()))?,
+            None => return Err(anyhow!("文件夹不存在")),
         };
 
         // 🔥 关键改进：使用 cancel_tasks_by_group 取消所有子任务
@@ -2095,12 +2475,20 @@ impl FolderDownloadManager {
         // 确保前端收到消息时，状态已经保存到磁盘
         self.persist_folder(folder_id).await;
 
+        // 🔥 取出 owner_uid
+        let owner_uid_raw_opt: Option<u64> = {
+            let folders = self.folders.read().await;
+            folders.get(folder_id).map(|f| f.owner_uid.raw())
+        };
+
         // 🔥 发送状态变更事件（在持久化之后）
         if !old_status.is_empty() {
             self.publish_event(FolderEvent::StatusChanged {
                 folder_id: folder_id.to_string(),
                 old_status,
                 new_status: "paused".to_string(),
+
+                owner_uid: owner_uid_raw_opt,
             })
                 .await;
         }
@@ -2108,6 +2496,8 @@ impl FolderDownloadManager {
         // 🔥 发布暂停事件
         self.publish_event(FolderEvent::Paused {
             folder_id: folder_id.to_string(),
+
+            owner_uid: owner_uid_raw_opt,
         })
             .await;
 
@@ -2119,7 +2509,8 @@ impl FolderDownloadManager {
     pub async fn resume_folder(&self, folder_id: &str) -> Result<()> {
         info!("恢复文件夹下载: {}", folder_id);
 
-        let (folder_info, old_status, new_status) = {
+        // 🔥 同时取出 folder.owner_uid 用于路由 download_manager
+        let (folder_info, old_status, new_status, folder_owner_uid_for_routing) = {
             let mut folders = self.folders.write().await;
             let folder = folders
                 .get_mut(folder_id)
@@ -2146,6 +2537,7 @@ impl FolderDownloadManager {
             }
 
             let new_status = format!("{:?}", folder.status).to_lowercase();
+            let owner_uid = folder.owner_uid;
 
             (
                 (
@@ -2155,14 +2547,20 @@ impl FolderDownloadManager {
                 ),
                 old_status,
                 new_status,
+                owner_uid,
             )
         };
 
-        // 获取下载管理器
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone().ok_or_else(|| anyhow!("下载管理器未初始化"))?
-        };
+        // 🔥 按 folder.owner_uid 路由 download_manager
+        let download_manager = self
+            .download_manager_for(folder_owner_uid_for_routing)
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "下载管理器未初始化（owner_uid={}）",
+                    folder_owner_uid_for_routing.raw()
+                )
+            })?;
 
         // 🔥 关键修复：恢复文件夹时，先为文件夹分配槽位（固定位 + 借调位）
         // 这样子任务才能使用借调位，而不是占用固定位
@@ -2190,11 +2588,15 @@ impl FolderDownloadManager {
             download_manager.add_preempted_backup_to_queue(&preempted_id).await;
         }
 
-        // 🔥 如果没有空闲槽位，尝试从其他文件夹回收借调位
+        // 🔥 如果没有空闲槽位，尝试从同一账号的其他文件夹回收借调位
         // 这确保了多个文件夹任务之间的公平性：每个文件夹至少能获得一个固定位
+        // reclaim 必须按 owner_uid 过滤，避免跨账号误回收
         if fixed_slot_id.is_none() {
-            info!("恢复文件夹 {} 无空闲槽位，尝试回收其他文件夹的借调位", folder_id);
-            if let Some(reclaimed_slot_id) = self.reclaim_borrowed_slot().await {
+            info!("恢复文件夹 {} 无空闲槽位，尝试回收同账号其他文件夹的借调位", folder_id);
+            if let Some(reclaimed_slot_id) = self
+                .reclaim_borrowed_slot_for_owner(folder_owner_uid_for_routing)
+                .await
+            {
                 // 回收成功，重新分配固定位（使用优先级分配）
                 if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
                     folder_id, true, crate::task_slot_pool::TaskPriority::Normal
@@ -2369,17 +2771,27 @@ impl FolderDownloadManager {
         // 确保前端收到消息时，状态已经保存到磁盘
         self.persist_folder(folder_id).await;
 
+        // 🔥 取出 owner_uid
+        let owner_uid_raw_opt: Option<u64> = {
+            let folders = self.folders.read().await;
+            folders.get(folder_id).map(|f| f.owner_uid.raw())
+        };
+
         // 🔥 发送状态变更事件（在持久化之后）
         self.publish_event(FolderEvent::StatusChanged {
             folder_id: folder_id.to_string(),
             old_status,
             new_status,
+
+            owner_uid: owner_uid_raw_opt,
         })
             .await;
 
         // 🔥 发布恢复事件
         self.publish_event(FolderEvent::Resumed {
             folder_id: folder_id.to_string(),
+
+            owner_uid: owner_uid_raw_opt,
         })
             .await;
 
@@ -2394,8 +2806,11 @@ impl FolderDownloadManager {
                 wal_dir: self.wal_dir.clone(),
                 ws_manager: self.ws_manager.clone(),
                 folder_progress_tx: self.folder_progress_tx.clone(),
+                task_completed_tx: self.task_completed_tx.clone(),
                 persistence_manager: self.persistence_manager.clone(),
                 backup_record_manager: self.backup_record_manager.clone(),
+                client_pool: self.client_pool.clone(),
+                download_manager_pool: self.download_manager_pool.clone(),
             };
             let folder_id = folder_id.to_string();
 
@@ -2428,7 +2843,8 @@ impl FolderDownloadManager {
 
         // 🔥 关键：先更新文件夹状态并清空 pending_files，阻止 task_completed_listener 补充新任务
         // 这必须在删除任务之前执行，避免竞态条件
-        let local_root = {
+        // 🔥 同时取出 folder.owner_uid 用于路由 download_manager
+        let (local_root, folder_owner_uid_for_routing) = {
             let mut folders = self.folders.write().await;
             if let Some(folder) = folders.get_mut(folder_id) {
                 folder.mark_cancelled();
@@ -2438,16 +2854,19 @@ impl FolderDownloadManager {
                     folder.name,
                     folder.pending_files.len()
                 );
-                Some(folder.local_root.clone())
+                (Some(folder.local_root.clone()), Some(folder.owner_uid))
             } else {
-                None
+                (None, None)
             }
         };
 
-        // 获取下载管理器
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone().ok_or_else(|| anyhow!("下载管理器未初始化"))?
+        // 🔥 按 folder.owner_uid 路由 download_manager
+        let download_manager = match folder_owner_uid_for_routing {
+            Some(uid) => self
+                .download_manager_for(uid)
+                .await
+                .ok_or_else(|| anyhow!("下载管理器未初始化（owner_uid={}）", uid.raw()))?,
+            None => return Err(anyhow!("文件夹不存在")),
         };
 
         // 🔥 新策略：直接删除所有任务记录，让分片自然结束
@@ -2505,15 +2924,19 @@ impl FolderDownloadManager {
 
         // 🔥 从 folders HashMap 中移除已取消的文件夹
         // 避免已取消的文件夹仍然出现在 get_all_folders 列表中
-        {
+        // 🔥 remove 时取出 owner_uid 用于事件
+        let owner_uid_raw_opt: Option<u64> = {
             let mut folders = self.folders.write().await;
-            folders.remove(folder_id);
+            let removed = folders.remove(folder_id);
             info!("已从 folders HashMap 中移除已取消的文件夹: {}", folder_id);
-        }
+            removed.map(|f| f.owner_uid.raw())
+        };
 
         // 🔥 发布删除事件（取消视为删除）
         self.publish_event(FolderEvent::Deleted {
             folder_id: folder_id.to_string(),
+
+            owner_uid: owner_uid_raw_opt,
         })
             .await;
 
@@ -2523,7 +2946,8 @@ impl FolderDownloadManager {
     /// 删除文件夹下载记录
     pub async fn delete_folder(&self, folder_id: &str) -> Result<()> {
         let mut folders = self.folders.write().await;
-        folders.remove(folder_id);
+        // 🔥 remove 时取出 owner_uid 用于事件
+        let owner_uid_raw_opt: Option<u64> = folders.remove(folder_id).map(|f| f.owner_uid.raw());
         drop(folders);
 
         // 删除持久化文件
@@ -2535,6 +2959,8 @@ impl FolderDownloadManager {
         // 🔥 发布删除事件
         self.publish_event(FolderEvent::Deleted {
             folder_id: folder_id.to_string(),
+
+            owner_uid: owner_uid_raw_opt,
         })
             .await;
 
@@ -2580,11 +3006,23 @@ impl FolderDownloadManager {
     /// 这是核心方法：检查活跃任务数，如果不足就从 pending_files 补充
     /// 🔥 修复：在分配借调位前，收集所有子任务已占用的槽位，避免重复分配
     async fn refill_tasks(&self, folder_id: &str, target_count: usize) -> Result<()> {
-        // 获取下载管理器
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone().ok_or_else(|| anyhow!("下载管理器未初始化"))?
+        // 🔥 先取 folder.owner_uid，按 uid 路由 download_manager
+        let folder_owner_uid_for_routing = {
+            let folders = self.folders.read().await;
+            folders
+                .get(folder_id)
+                .map(|f| f.owner_uid)
+                .ok_or_else(|| anyhow!("文件夹不存在"))?
         };
+        let download_manager = self
+            .download_manager_for(folder_owner_uid_for_routing)
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "下载管理器未初始化（folder.owner_uid={}）",
+                    folder_owner_uid_for_routing.raw()
+                )
+            })?;
 
         // 检查当前活跃任务数
         let tasks = download_manager.get_tasks_by_group(folder_id).await;
@@ -2609,7 +3047,7 @@ impl FolderDownloadManager {
         let needed = target_count - active_count;
 
         // 从 pending_files 取出需要的文件
-        let (files_to_create, local_root, group_root) = {
+        let (files_to_create, local_root, group_root, folder_owner_uid) = {
             let mut folders = self.folders.write().await;
             let folder = folders
                 .get_mut(folder_id)
@@ -2629,7 +3067,7 @@ impl FolderDownloadManager {
             }
 
             let files = folder.pending_files.drain(..to_create).collect::<Vec<_>>();
-            (files, folder.local_root.clone(), folder.remote_root.clone())
+            (files, folder.local_root.clone(), folder.remote_root.clone(), folder.owner_uid)
         };
 
         if files_to_create.is_empty() {
@@ -2711,6 +3149,7 @@ impl FolderDownloadManager {
                 folder_id.to_string(),
                 group_root.clone(),
                 pending_file.relative_path,
+                folder_owner_uid,
             );
 
             // 🔥 尝试为子任务分配借调位
@@ -2834,11 +3273,24 @@ impl FolderDownloadManager {
     /// 1. 更新已完成数和已下载大小
     /// 2. 检查是否全部完成
     /// 3. 补充任务，保持10个活跃任务
+    /// 🔥 按 folder.owner_uid 路由 download_manager
     pub async fn update_folder_progress(&self, folder_id: &str) -> Result<()> {
-        let download_manager = {
-            let dm = self.download_manager.read().await;
-            dm.clone().ok_or_else(|| anyhow!("下载管理器未初始化"))?
+        let folder_owner_uid_for_routing = {
+            let folders = self.folders.read().await;
+            folders
+                .get(folder_id)
+                .map(|f| f.owner_uid)
+                .ok_or_else(|| anyhow!("文件夹不存在"))?
         };
+        let download_manager = self
+            .download_manager_for(folder_owner_uid_for_routing)
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "下载管理器未初始化（owner_uid={}）",
+                    folder_owner_uid_for_routing.raw()
+                )
+            })?;
 
         let tasks = download_manager.get_tasks_by_group(folder_id).await;
 
@@ -2888,11 +3340,16 @@ impl FolderDownloadManager {
             self.cancellation_tokens.write().await.remove(folder_id);
 
             // 🔥 读取实际的新状态
-            let new_status = {
+            // 🔥 同时取出 owner_uid 用于事件
+            let (new_status, owner_uid_raw_opt) = {
                 let folders = self.folders.read().await;
-                folders.get(folder_id)
-                    .map(|f| format!("{:?}", f.status).to_lowercase())
-                    .unwrap_or_default()
+                match folders.get(folder_id) {
+                    Some(f) => (
+                        format!("{:?}", f.status).to_lowercase(),
+                        Some(f.owner_uid.raw()),
+                    ),
+                    None => (String::new(), None),
+                }
             };
 
             // 🔥 发布状态变更事件
@@ -2901,6 +3358,8 @@ impl FolderDownloadManager {
                     folder_id: folder_id.to_string(),
                     old_status,
                     new_status: new_status.clone(),
+
+                    owner_uid: owner_uid_raw_opt,
                 })
                     .await;
             }
@@ -2910,6 +3369,8 @@ impl FolderDownloadManager {
                 self.publish_event(FolderEvent::Completed {
                     folder_id: folder_id.to_string(),
                     completed_at: chrono::Utc::now().timestamp_millis(),
+
+                    owner_uid: owner_uid_raw_opt,
                 })
                     .await;
             } else if new_status == "failed" {
@@ -2922,6 +3383,8 @@ impl FolderDownloadManager {
                 self.publish_event(FolderEvent::Failed {
                     folder_id: folder_id.to_string(),
                     error: error_msg,
+
+                    owner_uid: owner_uid_raw_opt,
                 })
                     .await;
             }
@@ -2935,35 +3398,49 @@ impl FolderDownloadManager {
         Ok(())
     }
 
-    /// 🔥 触发借调位回收
+    /// 🔥 触发借调位回收（按 owner_uid 严格过滤候选）
     ///
-    /// 当新任务需要槽位但没有空闲时调用此方法，从文件夹回收一个借调位
+    /// 之前的版本不带 `owner_uid` 参数，遍历**所有**
+    /// folder 找借调位 — 在多账号 per-uid `task_slot_pool` 设计下，调用方实际想
+    /// 释放的是自己 `owner_uid` 那个池里的借调位；选中其它账号的 folder 来暂停/释放
+    /// 不会让调用方的池得到空闲槽位（slot_pool 不共享），同时还误暂停了别账号的
+    /// 子任务。本方法现在：候选 folder 必须 `f.owner_uid == owner_uid`，没有匹配
+    /// folder 直接返回 `None`（让调用方走等待队列）。
+    ///
+    /// 当新任务需要槽位但没有空闲时调用此方法，从 **同一账号** 的文件夹回收一个借调位
     /// 流程：
-    /// 1. 查找有借调位的文件夹
+    /// 1. 查找该账号下有借调位的文件夹
     /// 2. 选择一个使用借调位的子任务
     /// 3. 暂停该子任务并等待分片完成
     /// 4. 释放借调位
     /// 5. 返回释放的槽位ID
-    pub async fn reclaim_borrowed_slot(&self) -> Option<usize> {
-        // 获取下载管理器
-        let dm = {
-            let guard = self.download_manager.read().await;
-            guard.clone()
+    pub async fn reclaim_borrowed_slot_for_owner(
+        &self,
+        owner_uid: crate::auth::Uid,
+    ) -> Option<usize> {
+        // 🔥 candidate 必须 owner_uid 匹配
+        let candidate_folders: Vec<(String, crate::auth::Uid)> = {
+            let folders_guard = self.folders.read().await;
+            folders_guard
+                .iter()
+                .filter(|(_, f)| !f.borrowed_slot_ids.is_empty() && f.owner_uid == owner_uid)
+                .map(|(id, f)| (id.clone(), f.owner_uid))
+                .collect()
         };
 
-        let dm = match dm {
-            Some(dm) => dm,
-            None => {
-                warn!("借调位回收失败：下载管理器未初始化");
-                return None;
-            }
-        };
-
+        // 选第一个有借调位的 folder（保留原始"取一个"语义）
+        let (folder_id, folder_owner_uid) = candidate_folders.first()?.clone();
+        debug_assert_eq!(
+            folder_owner_uid, owner_uid,
+            "reclaim_borrowed_slot_for_owner: 候选 folder owner 与请求 owner 不一致"
+        );
+        let dm = self.download_manager_for(folder_owner_uid).await?;
         let slot_pool = dm.task_slot_pool();
-
-        // 查找有借调位的文件夹
-        let folder_id = slot_pool.find_folder_with_borrowed_slots().await?;
-        info!("触发借调位回收：文件夹 {}", folder_id);
+        info!(
+            "触发借调位回收：owner_uid={}, folder={}",
+            owner_uid.raw(),
+            folder_id
+        );
 
         // 获取该文件夹的借调位子任务映射
         let subtask_to_pause = {
@@ -3278,9 +3755,14 @@ impl FolderDownloadManager {
     /// 单独依赖第 1 层也不够：第 1 层只清 task 自己持有的那一份，
     /// 借调位的 owner=folder_id 槽位本身、folder 端总映射仍要由第 2 层兜底。
     pub async fn release_folder_slots(&self, folder_id: &str) {
-        let dm = {
-            let guard = self.download_manager.read().await;
-            guard.clone()
+        // 🔥 按 folder.owner_uid 路由 download_manager
+        let folder_owner_uid_for_routing = {
+            let folders = self.folders.read().await;
+            folders.get(folder_id).map(|f| f.owner_uid)
+        };
+        let dm = match folder_owner_uid_for_routing {
+            Some(uid) => self.download_manager_for(uid).await,
+            None => self.download_manager.read().await.clone(),
         };
 
         let dm = match dm {

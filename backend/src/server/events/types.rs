@@ -33,12 +33,16 @@ pub enum DownloadEvent {
         /// 原始文件名（加密文件解密后的文件名）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         original_filename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务跳过（文件已存在）
     Skipped {
         task_id: String,
         filename: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 进度更新
     Progress {
@@ -51,6 +55,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 状态变更
     StatusChanged {
@@ -67,6 +73,8 @@ pub enum DownloadEvent {
         /// 前端用 `event.error !== undefined` 判断时会把 null 当作有值。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务完成
     Completed {
@@ -76,6 +84,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务失败
     Failed {
@@ -85,6 +95,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务暂停
     Paused {
@@ -93,6 +105,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务恢复
     Resumed {
@@ -101,6 +115,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务删除
     Deleted {
@@ -109,6 +125,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 解密进度
     DecryptProgress {
@@ -123,6 +141,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 解密完成
     DecryptCompleted {
@@ -135,6 +155,8 @@ pub enum DownloadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
 }
 
@@ -235,6 +257,8 @@ pub enum FolderEvent {
         name: String,
         remote_root: String,
         local_root: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 进度更新
     Progress {
@@ -245,32 +269,52 @@ pub enum FolderEvent {
         total_files: u64,
         speed: u64,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 状态变更
     StatusChanged {
         folder_id: String,
         old_status: String,
         new_status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 扫描完成
     ScanCompleted {
         folder_id: String,
         total_files: u64,
         total_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件夹完成
     Completed {
         folder_id: String,
         completed_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件夹失败
-    Failed { folder_id: String, error: String },
+    Failed { folder_id: String, error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
     /// 文件夹暂停
-    Paused { folder_id: String },
+    Paused { folder_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
     /// 文件夹恢复
-    Resumed { folder_id: String },
+    Resumed { folder_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
     /// 文件夹删除
-    Deleted { folder_id: String },
+    Deleted { folder_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
 }
 
 impl FolderEvent {
@@ -283,9 +327,9 @@ impl FolderEvent {
             FolderEvent::ScanCompleted { folder_id, .. } => folder_id,
             FolderEvent::Completed { folder_id, .. } => folder_id,
             FolderEvent::Failed { folder_id, .. } => folder_id,
-            FolderEvent::Paused { folder_id } => folder_id,
-            FolderEvent::Resumed { folder_id } => folder_id,
-            FolderEvent::Deleted { folder_id } => folder_id,
+            FolderEvent::Paused { folder_id, .. } => folder_id,
+            FolderEvent::Resumed { folder_id, .. } => folder_id,
+            FolderEvent::Deleted { folder_id, .. } => folder_id,
         }
     }
 
@@ -333,6 +377,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 进度更新
     Progress {
@@ -346,6 +392,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 状态变更
     StatusChanged {
@@ -355,6 +403,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务完成
     Completed {
@@ -364,6 +414,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务失败
     Failed {
@@ -372,6 +424,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务暂停
     Paused {
@@ -379,6 +433,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务恢复
     Resumed {
@@ -386,6 +442,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务删除
     Deleted {
@@ -393,6 +451,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 加密进度
     EncryptProgress {
@@ -406,6 +466,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 加密完成
     EncryptCompleted {
@@ -417,6 +479,8 @@ pub enum UploadEvent {
         /// 是否为自动备份任务
         #[serde(default)]
         is_backup: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务跳过（冲突策略）
     Skipped {
@@ -424,6 +488,8 @@ pub enum UploadEvent {
         local_path: String,
         remote_path: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
 }
 
@@ -507,6 +573,8 @@ pub enum TransferEvent {
         share_url: String,
         save_path: String,
         auto_download: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 进度更新
     Progress {
@@ -515,23 +583,35 @@ pub enum TransferEvent {
         transferred_count: usize,
         total_count: usize,
         progress: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 状态变更
     StatusChanged {
         task_id: String,
         old_status: String,
         new_status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务完成
-    Completed { task_id: String, completed_at: i64 },
+    Completed { task_id: String, completed_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
     /// 任务失败
     Failed {
         task_id: String,
         error: String,
         error_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务删除
-    Deleted { task_id: String },
+    Deleted { task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
 }
 
 impl TransferEvent {
@@ -543,7 +623,7 @@ impl TransferEvent {
             TransferEvent::StatusChanged { task_id, .. } => task_id,
             TransferEvent::Completed { task_id, .. } => task_id,
             TransferEvent::Failed { task_id, .. } => task_id,
-            TransferEvent::Deleted { task_id } => task_id,
+            TransferEvent::Deleted { task_id, .. } => task_id,
         }
     }
 
@@ -583,18 +663,24 @@ pub enum BackupEvent {
         config_name: String,
         direction: String,
         trigger_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 扫描进度
     ScanProgress {
         task_id: String,
         scanned_files: usize,
         scanned_dirs: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 扫描完成
     ScanCompleted {
         task_id: String,
         total_files: usize,
         total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件进度
     FileProgress {
@@ -604,6 +690,8 @@ pub enum BackupEvent {
         transferred_bytes: u64,
         total_bytes: u64,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件状态变更
     FileStatusChanged {
@@ -612,6 +700,8 @@ pub enum BackupEvent {
         file_name: String,
         old_status: String,
         new_status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务进度
     Progress {
@@ -622,12 +712,16 @@ pub enum BackupEvent {
         total_count: usize,
         transferred_bytes: u64,
         total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 状态变更
     StatusChanged {
         task_id: String,
         old_status: String,
         new_status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务完成
     Completed {
@@ -636,29 +730,41 @@ pub enum BackupEvent {
         success_count: usize,
         failed_count: usize,
         skipped_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务失败
     Failed {
         task_id: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务暂停
     Paused {
         task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务恢复
     Resumed {
         task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务取消
     Cancelled {
         task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件加密开始
     FileEncrypting {
         task_id: String,
         file_task_id: String,
         file_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件加密完成
     FileEncrypted {
@@ -667,12 +773,16 @@ pub enum BackupEvent {
         file_name: String,
         encrypted_name: String,
         encrypted_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件解密开始
     FileDecrypting {
         task_id: String,
         file_task_id: String,
         file_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件解密完成
     FileDecrypted {
@@ -681,6 +791,8 @@ pub enum BackupEvent {
         file_name: String,
         original_name: String,
         original_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件加密进度
     FileEncryptProgress {
@@ -693,6 +805,8 @@ pub enum BackupEvent {
         processed_bytes: u64,
         /// 总字节数
         total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 文件解密进度
     FileDecryptProgress {
@@ -705,6 +819,8 @@ pub enum BackupEvent {
         processed_bytes: u64,
         /// 总字节数
         total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
 }
 
@@ -721,9 +837,9 @@ impl BackupEvent {
             BackupEvent::StatusChanged { task_id, .. } => task_id,
             BackupEvent::Completed { task_id, .. } => task_id,
             BackupEvent::Failed { task_id, .. } => task_id,
-            BackupEvent::Paused { task_id } => task_id,
-            BackupEvent::Resumed { task_id } => task_id,
-            BackupEvent::Cancelled { task_id } => task_id,
+            BackupEvent::Paused { task_id, .. } => task_id,
+            BackupEvent::Resumed { task_id, .. } => task_id,
+            BackupEvent::Cancelled { task_id, .. } => task_id,
             BackupEvent::FileEncrypting { task_id, .. } => task_id,
             BackupEvent::FileEncrypted { task_id, .. } => task_id,
             BackupEvent::FileDecrypting { task_id, .. } => task_id,
@@ -792,12 +908,16 @@ pub enum CloudDlEvent {
         old_status: Option<i32>,
         new_status: i32,
         task: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务完成（可触发自动下载）
     TaskCompleted {
         task_id: i64,
         task: serde_json::Value,
         auto_download_config: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 进度更新
     ProgressUpdate {
@@ -805,10 +925,14 @@ pub enum CloudDlEvent {
         finished_size: i64,
         file_size: i64,
         progress_percent: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务列表刷新（初始加载或手动刷新）
     TaskListRefreshed {
         tasks: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
 }
 
@@ -852,6 +976,8 @@ pub enum ScanEvent {
         scan_task_id: String,
         local_folder: String,
         remote_folder: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     Progress {
         scan_task_id: String,
@@ -861,6 +987,8 @@ pub enum ScanEvent {
         created_tasks: usize,
         skipped_duplicates: usize,
         total_size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     Completed {
         scan_task_id: String,
@@ -868,10 +996,14 @@ pub enum ScanEvent {
         total_size: u64,
         created_tasks: usize,
         skipped_duplicates: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     Failed {
         scan_task_id: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
 }
 
@@ -927,6 +1059,9 @@ pub enum TaskEvent {
     /// 扫描事件
     #[serde(rename = "scan")]
     Scan(ScanEvent),
+    /// 账号管理事件
+    #[serde(rename = "account")]
+    Account(AccountEvent),
 }
 
 impl TaskEvent {
@@ -944,6 +1079,7 @@ impl TaskEvent {
                 "cloud_dl"
             }
             TaskEvent::Scan(e) => e.task_id(),
+            TaskEvent::Account(_) => "account",
         }
     }
 
@@ -965,6 +1101,7 @@ impl TaskEvent {
             TaskEvent::Backup(e) => e.priority(),
             TaskEvent::CloudDl(e) => e.priority(),
             TaskEvent::Scan(e) => e.priority(),
+            TaskEvent::Account(_) => EventPriority::High,
         }
     }
 
@@ -978,6 +1115,7 @@ impl TaskEvent {
             TaskEvent::Backup(_) => "backup",
             TaskEvent::CloudDl(_) => "cloud_dl",
             TaskEvent::Scan(_) => "scan",
+            TaskEvent::Account(_) => "account",
         }
     }
 
@@ -991,6 +1129,7 @@ impl TaskEvent {
             TaskEvent::Backup(e) => e.event_type_name(),
             TaskEvent::CloudDl(e) => e.event_type_name(),
             TaskEvent::Scan(e) => e.event_type_name(),
+            TaskEvent::Account(e) => e.event_type_name(),
         }
     }
 
@@ -1046,6 +1185,7 @@ impl TaskEvent {
             TaskEvent::Transfer(_) => false,
             TaskEvent::CloudDl(_) => false,
             TaskEvent::Scan(_) => false,
+            TaskEvent::Account(_) => false,
         }
     }
 }
@@ -1073,6 +1213,88 @@ impl TimestampedEvent {
     }
 }
 
+// ============================================================================
+// 多账号管理事件
+// ============================================================================
+
+/// 账号管理事件（活跃账号切换、账号列表变更）。
+///
+/// 由 `helpers::set_active_uid()`（活跃账号切换）和 `accounts.rs` handler（增删账号）
+/// 主动发射；前端订阅后驱动账号切换器、跨账号侧栏更新。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum AccountEvent {
+    /// 活跃账号已切换。
+    ///
+    /// `new_active_uid = None` 表示删除最后一个账号、进入未登录状态。
+    Switched {
+        new_active_uid: Option<u64>,
+    },
+    /// 账号列表已变更（新增 / 删除 / 元数据更新）。
+    ListChanged {
+        accounts: Vec<crate::auth::AccountSummary>,
+        active_uid: Option<u64>,
+    },
+}
+
+impl AccountEvent {
+    pub fn event_type_name(&self) -> &'static str {
+        match self {
+            AccountEvent::Switched { .. } => "switched",
+            AccountEvent::ListChanged { .. } => "list_changed",
+        }
+    }
+}
+
+// ============================================================================
+// 配额事件
+// ============================================================================
+
+/// 单账号配额条目（用于 WebSocket 镜像传输）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsAccountBudget {
+    pub uid: u64,
+    pub vip_cap_download: usize,
+    pub base_download: usize,
+    pub used_download: usize,
+    pub vip_cap_upload: usize,
+    pub base_upload: usize,
+    pub used_upload: usize,
+}
+
+/// 用量快照单条（轻量版，仅 used_download/used_upload）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSnapshotEntry {
+    pub uid: u64,
+    pub used_download: usize,
+    pub used_upload: usize,
+}
+
+/// 配额相关 WebSocket 事件（独立于 `TaskEvent`，走 `WsServerMessage::Budget`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum BudgetEvent {
+    /// 全量配额重算结果（在账号增删 / 配置更新后推送）。
+    BudgetRecomputed {
+        machine_budget_download: usize,
+        machine_budget_upload: usize,
+        per_account: Vec<WsAccountBudget>,
+    },
+    /// 周期性用量快照（轻量，仅 used_*）。
+    UsageSnapshot {
+        per_account: Vec<UsageSnapshotEntry>,
+    },
+}
+
+impl BudgetEvent {
+    pub fn event_type_name(&self) -> &'static str {
+        match self {
+            BudgetEvent::BudgetRecomputed { .. } => "budget_recomputed",
+            BudgetEvent::UsageSnapshot { .. } => "usage_snapshot",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,6 +1309,7 @@ mod tests {
             progress: 50.0,
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1105,6 +1328,7 @@ mod tests {
             group_id: None,
             is_backup: false,
             original_filename: None,
+            owner_uid: None,
         });
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1122,6 +1346,7 @@ mod tests {
             progress: 0.0,
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         };
         assert_eq!(progress.priority(), EventPriority::Low);
 
@@ -1130,6 +1355,7 @@ mod tests {
             completed_at: 0,
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         };
         assert_eq!(completed.priority(), EventPriority::High);
     }
@@ -1142,6 +1368,7 @@ mod tests {
             processed_bytes: 512000,
             total_bytes: 1024000,
             is_backup: false,
+            owner_uid: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1162,6 +1389,7 @@ mod tests {
             encrypted_size: 1100,
             original_size: 1024,
             is_backup: true,
+            owner_uid: None,
         };
 
         assert_eq!(event.priority(), EventPriority::High);
@@ -1183,6 +1411,7 @@ mod tests {
             total_bytes: 1024000,
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -1204,6 +1433,7 @@ mod tests {
             decrypted_path: "/downloads/original.txt".to_string(),
             group_id: Some("folder-123".to_string()),
             is_backup: false,
+            owner_uid: None,
         };
 
         assert_eq!(event.priority(), EventPriority::High);
@@ -1224,6 +1454,7 @@ mod tests {
             processed_bytes: 0,
             total_bytes: 0,
             is_backup: false,
+            owner_uid: None,
         };
         assert_eq!(encrypt_progress.priority(), EventPriority::Low);
 
@@ -1233,6 +1464,7 @@ mod tests {
             encrypted_size: 0,
             original_size: 0,
             is_backup: false,
+            owner_uid: None,
         };
         assert_eq!(encrypt_completed.priority(), EventPriority::High);
 
@@ -1244,6 +1476,7 @@ mod tests {
             total_bytes: 0,
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         };
         assert_eq!(decrypt_progress.priority(), EventPriority::Low);
 
@@ -1254,6 +1487,7 @@ mod tests {
             decrypted_path: "".to_string(),
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         };
         assert_eq!(decrypt_completed.priority(), EventPriority::High);
     }
@@ -1267,6 +1501,7 @@ mod tests {
             processed_bytes: 0,
             total_bytes: 0,
             is_backup: false,
+            owner_uid: None,
         });
         assert!(encrypt_progress.is_active());
 
@@ -1278,6 +1513,7 @@ mod tests {
             total_bytes: 0,
             group_id: None,
             is_backup: false,
+            owner_uid: None,
         });
         assert!(decrypt_progress.is_active());
 
@@ -1287,6 +1523,7 @@ mod tests {
             old_status: "pending".to_string(),
             new_status: "encrypting".to_string(),
             is_backup: false,
+            owner_uid: None,
         });
         assert!(encrypting_status.is_active());
 
@@ -1298,6 +1535,7 @@ mod tests {
             group_id: None,
             is_backup: false,
             error: None,
+            owner_uid: None,
         });
         assert!(decrypting_status.is_active());
     }
@@ -1311,6 +1549,7 @@ mod tests {
             progress: 50.0,
             processed_bytes: 512000,
             total_bytes: 1024000,
+            owner_uid: None,
         };
 
         // 测试 task_id
@@ -1345,6 +1584,7 @@ mod tests {
             progress: 75.0,
             processed_bytes: 768000,
             total_bytes: 1024000,
+            owner_uid: None,
         };
 
         // 测试 task_id
@@ -1380,6 +1620,7 @@ mod tests {
             progress: 50.0,
             processed_bytes: 0,
             total_bytes: 0,
+            owner_uid: None,
         });
         assert!(encrypt_progress.is_active());
 
@@ -1391,6 +1632,7 @@ mod tests {
             progress: 75.0,
             processed_bytes: 0,
             total_bytes: 0,
+            owner_uid: None,
         });
         assert!(decrypt_progress.is_active());
     }

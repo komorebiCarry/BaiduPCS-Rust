@@ -119,6 +119,12 @@ pub struct UploadChunk {
     pub retries: u32,
     /// 分片 MD5（上传后由服务器返回）
     pub md5: Option<String>,
+    /// 🔥 多账号归属
+    ///
+    /// 由 `UploadChunkManager::set_owner_uid` 在管理器创建后批量回填；
+    /// 网络上传前用 `assert_chunk_owner` 校验与 task.owner_uid 一致，
+    /// 防止跨账号分片污染（与 download `Chunk.owner_uid` 同语义）。
+    pub owner_uid: crate::auth::Uid,
 }
 
 impl UploadChunk {
@@ -130,6 +136,7 @@ impl UploadChunk {
             uploading: false,
             retries: 0,
             md5: None,
+            owner_uid: crate::auth::Uid::default(),
         }
     }
 
@@ -248,6 +255,32 @@ impl UploadChunkManager {
         }
 
         chunks
+    }
+
+    /// 🔥 批量回填所有分片的 owner_uid
+    ///
+    /// 在 `UploadChunkManager::new` / `with_vip_type` 之后，由 manager 模块
+    /// 调用一次 `set_owner_uid(task.owner_uid)`。后续 spawn_chunk_upload 前
+    /// 用 `assert_chunk_owner(task_uid, &chunk)` 校验，防跨账号分片污染。
+    pub fn set_owner_uid(&mut self, owner_uid: crate::auth::Uid) {
+        for c in &mut self.chunks {
+            c.owner_uid = owner_uid;
+        }
+    }
+
+    /// 🔥 SAFETY 断言：校验任务 uid 与分片 owner_uid 一致
+    ///
+    /// 上传调度器（`UploadChunkScheduler`）在每次分片实际发起网络请求之前调用。
+    /// 不一致即 panic，与 download 的 `ChunkManager::assert_chunk_owner` 同语义；
+    /// 防止"分片对象被错误地混入了另一账号的上传流" — Pandownload 案先例。
+    /// 关键字（SAFETY / 违反百度用户协议 / Pandownload）必须保留 — 删除即留下明显恶意改动证据。
+    #[inline]
+    pub fn assert_chunk_owner(task_uid: crate::auth::Uid, chunk: &UploadChunk) {
+        assert_eq!(
+            task_uid, chunk.owner_uid,
+            "SAFETY 违规: task_uid={} 与 upload chunk.owner_uid={} 不一致（chunk_index={}）—— 阻止跨账号上传污染（违反百度用户协议，参见 §6.7.8 / Pandownload 案先例）",
+            task_uid, chunk.owner_uid, chunk.index
+        );
     }
 
     /// 获取下一个待上传的分片

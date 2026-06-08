@@ -56,6 +56,17 @@ pub struct FolderPersisted {
     /// 🔥 关联的转存任务 ID（如果此文件夹下载任务由转存任务自动创建）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_task_id: Option<String>,
+
+    /// 🔥 多账号归属 UID（持久化层 `u64` 形式）
+    ///
+    /// 旧持久化数据为 `None`，由恢复链路填充为 `active_uid` 或
+    /// 进入 `FolderStatus::Failed` + `failure_reason = "account_deleted"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
+
+    /// 🔥 不可恢复失败原因（恢复链路）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 impl FolderPersisted {
@@ -80,6 +91,11 @@ impl FolderPersisted {
             completed_at: folder.completed_at,
             error: folder.error.clone(),
             transfer_task_id: folder.transfer_task_id.clone(),
+            owner_uid: {
+                let raw = folder.owner_uid.raw();
+                if raw == 0 { None } else { Some(raw) }
+            },
+            failure_reason: folder.failure_reason.clone(),
         }
     }
 
@@ -104,6 +120,11 @@ impl FolderPersisted {
             completed_at: self.completed_at,
             error: self.error.clone(),
             transfer_task_id: self.transfer_task_id.clone(),
+            owner_uid: self
+                .owner_uid
+                .map(crate::auth::types::Uid::new)
+                .unwrap_or_default(),
+            failure_reason: self.failure_reason.clone(),
             // 任务位借调机制字段（不持久化，运行时重建）
             fixed_slot_id: None,
             borrowed_slot_ids: Vec::new(),

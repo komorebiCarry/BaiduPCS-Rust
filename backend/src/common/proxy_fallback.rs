@@ -115,6 +115,12 @@ impl std::fmt::Debug for ProxyFallbackManager {
     }
 }
 
+impl Default for ProxyFallbackManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyFallbackManager {
     pub fn new() -> Self {
         Self {

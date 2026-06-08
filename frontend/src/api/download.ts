@@ -24,6 +24,10 @@ export interface DownloadTask {
   started_at?: number
   completed_at?: number
   error?: string
+  /** 任务归属账号 UID（null 允许老路径返回空值） */
+  owner_uid?: number | null
+  /** 标准化失败原因字段（与旧 `error` 共存，优先用此） */
+  failure_reason?: string | null
   // 文件夹下载相关字段
   group_id?: string
   group_root?: string
@@ -44,6 +48,13 @@ export interface CreateDownloadRequest {
   filename: string
   total_size: number
   conflict_strategy?: DownloadConflictStrategy
+  /**
+   * 任务归属账号 UID。
+   *
+   * - 不传：后端默认使用当前活跃账号创建任务（向后兼容）
+   * - 明确传入：强制使用该 UID（需后端提供跨账号能力）
+   */
+  owner_uid?: number
 }
 
 /**
@@ -174,7 +185,12 @@ export function calculateProgress(task: DownloadTask): number {
  * 计算剩余时间（秒）
  */
 export function calculateETA(task: DownloadTask): number | null {
-  if (task.speed === 0 || task.downloaded_size >= task.total_size) {
+  // 已传输完成：remaining=0 → 返回 0（"即将完成"）
+  if (task.downloaded_size >= task.total_size) {
+    return 0
+  }
+  // 速度未知（0 B/s）：无法估算 → 返回 null（"计算中"）
+  if (task.speed === 0) {
     return null
   }
   const remaining = task.total_size - task.downloaded_size
@@ -237,6 +253,10 @@ export interface FolderDownload {
   started_at?: number
   completed_at?: number
   error?: string
+  /** 任务归属账号 UID */
+  owner_uid?: number | null
+  /** 标准化失败原因 */
+  failure_reason?: string | null
 }
 
 /// 树形节点（用于展示）
@@ -565,6 +585,10 @@ export interface DownloadItemFromBackend {
   decrypted_path?: string
   /** 原始文件名（解密后恢复的文件名） */
   original_filename?: string
+  /** 任务归属账号 UID */
+  owner_uid?: number | null
+  /** 标准化失败原因 */
+  failure_reason?: string | null
 }
 
 /**

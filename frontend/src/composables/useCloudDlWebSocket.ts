@@ -20,9 +20,17 @@ import type { CloudDlEvent as WsCloudDlEvent } from '@/types/events'
 
 /**
  * 离线下载事件基础接口
+ *
+ * 所有事件都带 `owner_uid`（后端 cloud_dl_monitor 在
+ * `convert_to_ws_event` 阶段统一 stamp 该字段）。前端订阅 `cloud_dl` 通用主题
+ * 后会收到所有账号的事件，所以处理回调里**必须**先用 `owner_uid` 过滤当前
+ * 活跃账号，避免账号 A 切到 B 后还有 A 的 in-flight 事件覆盖 B 的视图 /
+ * 触发自动下载等误操作。
  */
 interface CloudDlEventBase {
   event_type: string
+  /** 事件归属账号 UID（后端 stamp） */
+  owner_uid?: number | null
 }
 
 /**
@@ -69,10 +77,10 @@ export interface CloudDlTaskListRefreshedEvent extends CloudDlEventBase {
  * 离线下载事件联合类型
  */
 export type CloudDlEvent =
-  | CloudDlStatusChangedEvent
-  | CloudDlTaskCompletedEvent
-  | CloudDlProgressUpdateEvent
-  | CloudDlTaskListRefreshedEvent
+    | CloudDlStatusChangedEvent
+    | CloudDlTaskCompletedEvent
+    | CloudDlProgressUpdateEvent
+    | CloudDlTaskListRefreshedEvent
 
 // =====================================================
 // 事件回调类型
@@ -175,10 +183,10 @@ function handleCloudDlEvent(rawEvent: any, options: UseCloudDlWebSocketOptions):
 
   // 记录事件
   console.log(
-    `📡 [CloudDl WS] 事件类型=${event.event_type} | 任务ID=${
-      'task_id' in event ? event.task_id : 'N/A'
-    }`,
-    event
+      `📡 [CloudDl WS] 事件类型=${event.event_type} | 任务ID=${
+          'task_id' in event ? event.task_id : 'N/A'
+      }`,
+      event
   )
 
   // 调用通用事件回调
@@ -257,7 +265,7 @@ function handleCloudDlEvent(rawEvent: any, options: UseCloudDlWebSocketOptions):
  * ```
  */
 export function useCloudDlWebSocket(
-  options: UseCloudDlWebSocketOptions = {}
+    options: UseCloudDlWebSocketOptions = {}
 ): UseCloudDlWebSocketReturn {
   const { autoSubscribe = true } = options
 

@@ -155,6 +155,17 @@ pub struct UploadTask {
     /// 冲突处理策略（用于转换为百度 API 的 rtype 参数）
     #[serde(default)]
     pub conflict_strategy: crate::uploader::UploadConflictStrategy,
+
+    // === 🔥 多账号字段 ===
+    /// 任务所属 UID（运态 `Uid`；持久化层用 `#[serde(default)]` 接受旧 JSON 缺省 → `Uid(0)`）
+    ///
+    /// 旧持久化数据反序列化时为 `Uid(0)`，恢复链路按分支 C/D 填充 `active_uid`。
+    #[serde(default)]
+    pub owner_uid: crate::auth::types::Uid,
+
+    /// 不可恢复失败原因（恢复链路使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 fn default_key_version() -> u32 {
@@ -206,7 +217,19 @@ impl UploadTask {
             encryption_key_version: 1,
             // 冲突策略初始化
             conflict_strategy: crate::uploader::UploadConflictStrategy::default(),
+            // 多账号字段初始化（new 默认 Uid(0)，调用方应通过 with_owner_uid 注入正确归属）
+            owner_uid: crate::auth::types::Uid::default(),
+            failure_reason: None,
         }
+    }
+
+    /// 设置任务所属账号 UID
+    ///
+    /// 上传任务调用方应在 `new`/`new_with_group`/`new_backup` 后立即链调
+    /// `.with_owner_uid(uid)` 设置归属，与运态 `UploadManager.uid` 保持一致。
+    pub fn with_owner_uid(mut self, owner_uid: crate::auth::types::Uid) -> Self {
+        self.owner_uid = owner_uid;
+        self
     }
 
     /// 创建带文件夹组信息的任务

@@ -35,8 +35,10 @@ pub enum TaskSlotType {
 
 /// 任务优先级（与 autobackup/priority/policy.rs 中的 Priority 对应）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default)]
 pub enum TaskPriority {
     /// 普通任务（优先级最高，值=10）
+    #[default]
     Normal = 10,
     /// 子任务（中等优先级，值=20）
     SubTask = 20,
@@ -51,11 +53,6 @@ impl TaskPriority {
     }
 }
 
-impl Default for TaskPriority {
-    fn default() -> Self {
-        TaskPriority::Normal
-    }
-}
 
 /// 任务位
 #[derive(Debug, Clone)]
@@ -188,11 +185,15 @@ impl TaskSlotPool {
     /// * `new_max` - 新的最大槽位数
     ///
     /// # 扩容策略
-    /// - 直接追加新的空闲槽位到池中
+    /// - 仅追加缺失的槽位 ID（之前 `for i in old_max..new_max`
+    ///   会在 "shrink-then-grow" 序列里追加重复 ID — 例如 5 缩到 3（max_slots 改为
+    ///   3，但占用槽 3/4 物理保留）→ 再扩到 5 时又 push id=3, id=4，导致同 ID 多份
+    ///   slot，破坏互斥语义）。新实现按现存 ID 集合去重，只补缺失。
     ///
     /// # 缩容策略
-    /// - 不会中断已占用的槽位，超出新上限的任务继续运行到完成
-    /// - 只移除空闲槽位
+    /// - 不会中断已占用的槽位，超出新上限的占用槽继续运行到完成
+    /// - **同时**清理空闲且超限的槽（之前空闲超限槽
+    ///   在 occupied_beyond_limit > 0 分支被保留，扩容时撞 ID）
     /// - 新的分配只会在新上限范围内进行
     /// - 如果有超出新上限的占用槽位，会记录警告
     pub async fn resize(&self, new_max: usize) {
@@ -206,25 +207,42 @@ impl TaskSlotPool {
         let mut slots = self.slots.write().await;
 
         if new_max > old_max {
-            let additional = new_max - old_max;
+            // 扩容：只追加缺失 ID（去重防止 shrink-then-grow 重复）
+            let existing_ids: std::collections::HashSet<usize> =
+                slots.iter().map(|s| s.id).collect();
+            let mut added = 0usize;
             for i in old_max..new_max {
-                slots.push(TaskSlot::new(i));
+                if !existing_ids.contains(&i) {
+                    slots.push(TaskSlot::new(i));
+                    added += 1;
+                }
             }
-            info!("✅ 任务位池扩容: {} -> {} (+{}个槽位)", old_max, new_max, additional);
+            // 排序保证后续 allocate 路径按 id 顺序遍历（非必要但便于调试 / 测试可读性）
+            slots.sort_by_key(|s| s.id);
+            info!(
+                "✅ 任务位池扩容: {} -> {} (+{}个新槽位，{}个 ID 已存在跳过)",
+                old_max,
+                new_max,
+                added,
+                (new_max - old_max) - added
+            );
         } else {
-            let occupied_beyond_limit = slots
-                .iter()
-                .filter(|s| s.id >= new_max && !s.is_free())
-                .count();
-
+            // 缩容：清理空闲超限槽（占用槽保留至 release）
+            let before = slots.len();
+            slots.retain(|s| s.id < new_max || !s.is_free());
+            let removed = before - slots.len();
+            let occupied_beyond_limit =
+                slots.iter().filter(|s| s.id >= new_max && !s.is_free()).count();
             if occupied_beyond_limit > 0 {
                 warn!(
-                    "⚠️ 任务位池缩容: {} -> {} (有 {} 个超出新上限的槽位仍被占用，将继续运行)",
-                    old_max, new_max, occupied_beyond_limit
+                    "⚠️ 任务位池缩容: {} -> {} (清理 {} 个空闲超限槽；{} 个占用超限槽继续运行直至 release)",
+                    old_max, new_max, removed, occupied_beyond_limit
                 );
             } else {
-                slots.retain(|s| s.id < new_max);
-                info!("✅ 任务位池缩容: {} -> {} (已清理空闲槽位)", old_max, new_max);
+                info!(
+                    "✅ 任务位池缩容: {} -> {} (已清理 {} 个空闲超限槽)",
+                    old_max, new_max, removed
+                );
             }
         }
 
@@ -929,11 +947,10 @@ impl SlotTouchThrottler {
             last.elapsed() >= self.throttle_interval
         };
 
-        if should_touch {
-            if self.task_slot_pool.touch_slot(&self.task_id).await {
-                let mut last = self.last_touch_time.lock().unwrap();
-                *last = Instant::now();
-            }
+        if should_touch
+            && self.task_slot_pool.touch_slot(&self.task_id).await {
+            let mut last = self.last_touch_time.lock().unwrap();
+            *last = Instant::now();
         }
     }
 
@@ -1305,6 +1322,80 @@ mod tests {
 
         let slot_new = pool.allocate_fixed_slot("task_new", false).await;
         assert!(slot_new.is_some());
+    }
+
+    /// 缩容保留占用槽 → 再扩容时不得追加重复 ID
+    /// 复现：5 → 缩到 3（占用槽 3/4 保留物理位置） → 扩回 5 → 必须无重复 slot.id
+    #[tokio::test]
+    async fn test_resize_shrink_then_grow_no_duplicate_ids() {
+        let pool = TaskSlotPool::new(5);
+
+        // 占满 5 个槽（slot id 0..=4）
+        pool.allocate_fixed_slot("task0", false).await;
+        pool.allocate_fixed_slot("task1", false).await;
+        pool.allocate_fixed_slot("task2", false).await;
+        pool.allocate_fixed_slot("task3", false).await;
+        pool.allocate_fixed_slot("task4", false).await;
+        assert_eq!(pool.used_slots().await, 5);
+
+        // 缩到 3：占用的高位槽 3/4 在物理上仍保留（继续运行直到 release），
+        // 但 used_slots 只统计 id < max_slots 的占用，会显示 3
+        pool.resize(3).await;
+        assert_eq!(pool.max_slots(), 3);
+        assert_eq!(pool.used_slots().await, 3);
+
+        // 物理槽位数（含超限保留的）应仍为 5
+        let snapshot_after_shrink = pool.get_all_slots_status().await;
+        assert_eq!(
+            snapshot_after_shrink.len(),
+            5,
+            "缩容时占用的 id=3, id=4 应物理保留"
+        );
+
+        // 扩回 5：旧实现会在 old_max=3..new_max=5 push id=3, id=4，
+        // 但物理上 id=3, id=4 已经在 slots 里 — 修复后应去重，不重复 push
+        pool.resize(5).await;
+        assert_eq!(pool.max_slots(), 5);
+
+        // 验证：slots vec 中各 id 唯一
+        let snapshot = pool.get_all_slots_status().await;
+        let mut ids: Vec<usize> = snapshot.iter().map(|(id, _, _)| *id).collect();
+        ids.sort();
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(
+            ids, deduped,
+            "resize shrink-then-grow 后出现重复 slot id: {:?}",
+            ids
+        );
+
+        // 释放 task3（id=3 占用） — 必须有且仅有一个 id=3 槽变为空闲
+        pool.release_fixed_slot("task3").await;
+        let snapshot_after_release = pool.get_all_slots_status().await;
+        let id3_count = snapshot_after_release
+            .iter()
+            .filter(|(id, _, _)| *id == 3)
+            .count();
+        assert_eq!(id3_count, 1, "释放后 id=3 应有且仅有一份");
+
+        // 再次分配 → 必须能拿到一个 slot，且分配后所有占用槽 id 仍然唯一
+        let new_slot = pool.allocate_fixed_slot("task3_new", false).await;
+        assert!(new_slot.is_some());
+        let snapshot_final = pool.get_all_slots_status().await;
+        let occupied_ids: Vec<usize> = snapshot_final
+            .iter()
+            .filter(|(_, owner, _)| owner.is_some())
+            .map(|(id, _, _)| *id)
+            .collect();
+        let mut deduped_occupied = occupied_ids.clone();
+        deduped_occupied.sort();
+        deduped_occupied.dedup();
+        assert_eq!(
+            occupied_ids.len(),
+            deduped_occupied.len(),
+            "存在多个占用槽共享同一 id: {:?}",
+            occupied_ids
+        );
     }
 
     #[tokio::test]

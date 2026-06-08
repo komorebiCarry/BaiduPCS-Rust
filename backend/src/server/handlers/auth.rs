@@ -1,8 +1,8 @@
 // 认证API处理器
 
-use crate::auth::{CookieLoginAuth, CookieLoginApiRequest, QRCode, QRCodeStatus};
+use crate::auth::{CookieLoginAuth, CookieLoginApiRequest, QRCode, QRCodeStatus, Uid, UserAuth};
 use crate::common::ProxyType;
-use crate::server::AppState;
+use crate::server::{broadcast_account_list_changed, set_active_uid, AppState};
 use crate::transfer::TransferManager;
 use crate::uploader::UploadManager;
 use axum::{
@@ -91,12 +91,12 @@ pub async fn qrcode_status(
 ) -> Result<Json<ApiResponse<QRCodeStatus>>, StatusCode> {
     info!("API: 查询扫码状态: sign={}", params.sign);
 
-    // 防呆：检查是否已有有效的持久化会话
+    // 防呆：检查是否已有有效的活跃账号会话
+    // 从 active_uid → AccountManager 取，不再读 legacy session.json
     {
-        let mut session = state.session_manager.lock().await;
-        if let Ok(Some(user)) = session.get_session().await {
+        if let Some(user) = state.active_user_auth().await {
             info!(
-                "检测到已有持久化会话: UID={}, 验证 BDUSS 有效性...",
+                "检测到已有活跃账号: UID={}, 验证 BDUSS 有效性...",
                 user.uid
             );
 
@@ -104,11 +104,10 @@ pub async fn qrcode_status(
                 Ok(true) => {
                     info!("✅ BDUSS 仍然有效，直接返回登录成功状态");
 
-                    // 确保客户端已初始化
-                    let client_initialized = state.netdisk_client.read().await.is_some();
+                    // 确保活跃账号客户端已初始化
+                    let client_initialized = state.active_client().await.is_some();
                     if !client_initialized {
                         info!("🔄 客户端未初始化，开始初始化用户资源...");
-                        drop(session); // 释放锁避免死锁
                         if let Err(e) = state.load_initial_session().await {
                             error!("❌ 初始化用户资源失败: {}", e);
                         } else {
@@ -123,8 +122,10 @@ pub async fn qrcode_status(
                     })));
                 }
                 Ok(false) => {
-                    warn!("⚠️ 持久化的 BDUSS 已失效，清除会话，继续扫码流程");
-                    let _ = session.clear_session().await;
+                    warn!("⚠️ 持久化的 BDUSS 已失效，继续扫码流程");
+                    // BDUSS 失效不再触发 session.json 清除：legacy session 已被
+                    // accounts.json 取代，由 set_active_uid / force_delete 等专用路径
+                    // 处理凭据失效。
                 }
                 Err(e) => {
                     warn!("⚠️ BDUSS 验证出错: {}，继续扫码流程", e);
@@ -218,19 +219,47 @@ pub async fn qrcode_status(
                 *state.netdisk_client.write().await = Some(client.clone());
 
                 // 初始化下载管理器
+                //
+                // 用账号 `custom_config` 推算 effective 配置覆盖全局值。
                 let config = state.config.read().await;
                 let download_dir = config.download.download_dir.clone();
-                let max_global_threads = config.download.max_global_threads;
-                let max_concurrent_tasks = config.download.max_concurrent_tasks;
-                let max_retries = config.download.max_retries;
-                let upload_config = config.upload.clone();
+                let cc = &updated_user.custom_config;
+                let vip = crate::downloader::budget_scheduler::VipType::from_raw(updated_user.vip_type);
+                let recommended_threads = match vip {
+                    crate::downloader::budget_scheduler::VipType::Normal => {
+                        config.multi_account_vip_recommended.normal.threads
+                    }
+                    crate::downloader::budget_scheduler::VipType::Vip => {
+                        config.multi_account_vip_recommended.vip.threads
+                    }
+                    crate::downloader::budget_scheduler::VipType::Svip => {
+                        config.multi_account_vip_recommended.svip.threads
+                    }
+                };
+                let max_global_threads = if cc.auto_apply_recommended {
+                    recommended_threads
+                } else {
+                    cc.download.max_global_threads
+                };
+                let max_concurrent_tasks = cc.download.max_concurrent_tasks;
+                let max_retries = cc.download.max_retries;
+                let up_threads = if cc.auto_apply_recommended {
+                    recommended_threads
+                } else {
+                    cc.upload.max_global_threads
+                };
+                let mut upload_config = config.upload.clone();
+                upload_config.max_global_threads = up_threads;
+                upload_config.max_concurrent_tasks = cc.upload.max_concurrent_tasks;
+                upload_config.max_retries = cc.upload.max_retries;
                 let transfer_config = config.transfer.clone();
                 drop(config);
 
                 // 获取持久化管理器引用
                 let pm_arc = Arc::clone(&state.persistence_manager);
 
-                match crate::downloader::DownloadManager::with_config(
+                // 🔥 BudgetScheduler + decrypt_semaphore 由 `new_for_account` 构造时直接注入。
+                match crate::downloader::DownloadManager::new_for_account(
                     updated_user.clone(),
                     download_dir,
                     max_global_threads,
@@ -238,16 +267,30 @@ pub async fn qrcode_status(
                     max_retries,
                     proxy_config.as_ref(),
                     fallback_for_client,
+                    Arc::clone(&state.budget_scheduler),
+                    Arc::clone(&state.decrypt_semaphore),
                 ) {
                     Ok(mut manager) => {
                         // 设置持久化管理器
                         manager.set_persistence_manager(Arc::clone(&pm_arc));
 
+                        // owner_uid 已在 `new_for_account` 构造时由 `updated_user.uid` 直接注入
+
+                        // 🔥 多账号：将活跃账号 UID 写入持久化管理器，
+                        // 使后续所有 register_* 写入的元数据自动带上 owner_uid。
+                        pm_arc.lock().await.set_owner_uid(updated_user.uid);
+                        info!("PersistenceManager owner_uid 已设置: {}", updated_user.uid);
+
                         // 设置 WebSocket 管理器
                         manager.set_ws_manager(Arc::clone(&state.ws_manager)).await;
 
+                        // 🔥 SAFETY 断言（chunk-level）+ budget acquire 在 spawn_chunk_download 默认启用。
+
                         let manager_arc = Arc::new(manager);
-                        *state.download_manager.write().await = Some(Arc::clone(&manager_arc));
+
+                        // 🔥 启动 auto_requeue 消费循环
+                        // （否则 scheduler 失败/抢占/重排时 requeue_rx 无人消费，任务卡住）
+                        Arc::clone(&manager_arc).start_auto_requeue_consumer().await;
 
                         // 设置文件夹下载管理器的依赖
                         state
@@ -283,9 +326,15 @@ pub async fn qrcode_status(
                         info!("✅ 下载管理器初始化成功");
 
                         // 初始化上传管理器（使用配置参数）
+                        // 🔥 BudgetScheduler 由 `new_for_account` 构造时直接注入。
                         let config_dir = std::path::Path::new("config");
-                        let upload_manager =
-                            UploadManager::new_with_config(client.clone(), &updated_user, &upload_config, config_dir);
+                        let upload_manager = UploadManager::new_for_account(
+                            client.clone(),
+                            &updated_user,
+                            &upload_config,
+                            Arc::clone(&state.budget_scheduler),
+                            config_dir,
+                        );
                         let upload_manager_arc = Arc::new(upload_manager);
 
                         // 设置上传管理器的持久化管理器
@@ -298,20 +347,24 @@ pub async fn qrcode_status(
                             .set_ws_manager(Arc::clone(&state.ws_manager))
                             .await;
 
+                        // 🔥 SAFETY 断言 + budget acquire 在 spawn_chunk_upload 默认启用。
+
                         // 🔥 设置备份记录管理器（用于文件夹名加密映射）
                         upload_manager_arc
                             .set_backup_record_manager(Arc::clone(&state.backup_record_manager))
                             .await;
 
-                        *state.upload_manager.write().await = Some(Arc::clone(&upload_manager_arc));
                         info!("✅ 上传管理器初始化成功");
 
                         // 初始化转存管理器
-                        let transfer_manager = TransferManager::new(
+                        let mut transfer_manager = TransferManager::new(
                             Arc::new(std::sync::RwLock::new(client)),
                             transfer_config,
                             Arc::clone(&state.config),
                         );
+                        // 🔥 多账号：注入 owner_uid，使后续所有 TransferTask::new(...)
+                        // 链调 .with_owner_uid(self.owner_uid) 能写入正确归属（之前默认 0）
+                        transfer_manager.set_owner_uid(crate::auth::Uid::new(updated_user.uid));
                         let transfer_manager_arc = Arc::new(transfer_manager);
 
                         // 设置下载管理器（用于自动下载功能）
@@ -334,8 +387,65 @@ pub async fn qrcode_status(
                             .set_ws_manager(Arc::clone(&state.ws_manager))
                             .await;
 
-                        *state.transfer_manager.write().await = Some(Arc::clone(&transfer_manager_arc));
                         info!("✅ 转存管理器初始化成功");
+
+                        // 🔥 多账号 per-uid Manager 池注入
+                        // 登录后活跃账号的 3 个 Manager 同步插入 DashMap 池。
+                        state.register_account_managers(
+                            crate::auth::Uid::new(updated_user.uid),
+                            Arc::clone(&manager_arc),
+                            Arc::clone(&upload_manager_arc),
+                            Arc::clone(&transfer_manager_arc),
+                        );
+
+                        // 🔥 把 per-uid manager 池注入到 FolderDownloadManager
+                        // （否则 fresh login / 新账号场景 pool miss → fallback 到单例错误归并）。
+                        // 同时初始化 ScanManager 并注入 upload manager 池
+                        // （否则 fresh login 后 /uploads/folder 报"扫描管理器未初始化"）。
+                        state
+                            .folder_download_manager
+                            .set_download_manager_pool(Arc::clone(&state.download_managers))
+                            .await;
+                        info!("✅ FolderDownloadManager per-uid 下载池已注入");
+
+                        // 初始化扫描管理器（如尚未存在）+ 注入 upload manager 池
+                        {
+                            let scan_already_set =
+                                state.scan_manager.read().await.is_some();
+                            if !scan_already_set {
+                                let max_pending = state
+                                    .config
+                                    .read()
+                                    .await
+                                    .scan
+                                    .max_pending_tasks;
+                                let wal_dir =
+                                    pm_arc.lock().await.wal_dir().clone();
+                                let scan_mgr =
+                                    crate::uploader::ScanManager::new_with_owner(
+                                        Arc::clone(&upload_manager_arc),
+                                        Arc::clone(&state.ws_manager),
+                                        Arc::clone(&state.memory_monitor),
+                                        wal_dir,
+                                        max_pending,
+                                        Some(crate::auth::Uid::new(updated_user.uid)),
+                                    );
+                                scan_mgr
+                                    .set_upload_manager_pool(Arc::clone(&state.upload_managers))
+                                    .await;
+                                *state.scan_manager.write().await =
+                                    Some(Arc::new(scan_mgr));
+                                info!("✅ 扫描管理器已初始化（含 per-uid upload 池）");
+                            } else if let Some(scan_mgr) =
+                                state.scan_manager.read().await.as_ref().cloned()
+                            {
+                                // 已存在 → 重新注入最新池（幂等）
+                                scan_mgr
+                                    .set_upload_manager_pool(Arc::clone(&state.upload_managers))
+                                    .await;
+                                info!("✅ ScanManager per-uid upload 池已刷新");
+                            }
+                        }
 
                         // 启动 WebSocket 批量发送器
                         Arc::clone(&state.ws_manager).start_batch_sender();
@@ -349,9 +459,34 @@ pub async fn qrcode_status(
                         state.init_autobackup_manager().await;
                         info!("✅ 自动备份管理器初始化完成");
 
+                        // 🔥 autobackup 提供 encryption_config_store 后，
+                        // 统一为所有 per-uid manager 注入运行时依赖
+                        // （folder_manager / snapshot / encryption_config_store / sender 共享）
+                        let registered_uids: Vec<crate::auth::Uid> = state
+                            .download_managers
+                            .iter()
+                            .map(|e| *e.key())
+                            .collect();
+                        for uid in registered_uids {
+                            if let Err(e) = state.wire_manager_runtime_deps_for_uid(uid).await {
+                                warn!(
+                                    "登录后 uid={} wire_manager_runtime_deps 失败（继续）: {}",
+                                    uid.raw(),
+                                    e
+                                );
+                            }
+                        }
+
                         // 🔥 初始化离线下载监听服务
                         state.init_cloud_dl_monitor().await;
                         info!("✅ 离线下载监听服务初始化完成");
+
+                        // 🔥 登录成功后激活账号 + 广播事件
+                        if let Err(e) =
+                            add_account_and_activate(&state, updated_user.clone()).await
+                        {
+                            error!("qrcode_status add_account_and_activate 失败: {}", e);
+                        }
                     }
                     Err(e) => {
                         error!("❌ 初始化下载管理器失败: {}", e);
@@ -374,67 +509,62 @@ pub async fn qrcode_status(
 /// 获取当前用户信息
 ///
 /// GET /api/v1/auth/user
+///
+/// 从 `active_uid → AccountManager.get_user` 取，符合运行时真源原则。
+/// 多账号场景下返回的就是当前 active_uid 对应的账号。
 pub async fn get_current_user(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
     info!("🔍 API: 获取当前用户信息");
 
-    let mut session = state.session_manager.lock().await;
+    // 从 active_uid → AccountManager 取活跃账号
+    let user = match state.active_user_auth().await {
+        Some(u) => u,
+        None => {
+            warn!("❌ 未找到活跃账号，用户未登录");
+            return Ok(Json(ApiResponse::error(401, "Not logged in".to_string())));
+        }
+    };
 
-    match session.get_session().await {
-        Ok(Some(user)) => {
-            info!("✅ 找到会话: UID={}, 用户名={}", user.uid, user.username);
+    info!("✅ 找到活跃账号: UID={}, 用户名={}", user.uid, user.username);
 
-            // 验证 BDUSS 是否仍然有效
-            match state.qrcode_auth.read().await.verify_bduss(&user.bduss).await {
-                Ok(true) => {
-                    // BDUSS 有效，检查客户端是否已初始化
-                    info!("BDUSS 验证通过");
+    // 验证 BDUSS 是否仍然有效
+    match state
+        .qrcode_auth
+        .read()
+        .await
+        .verify_bduss(&user.bduss)
+        .await
+    {
+        Ok(true) => {
+            // BDUSS 有效，检查活跃账号客户端是否已初始化
+            info!("BDUSS 验证通过");
 
-                    // 检查网盘客户端是否已初始化
-                    let client_initialized = state.netdisk_client.read().await.is_some();
-                    if !client_initialized {
-                        info!("🔄 检测到客户端未初始化，开始初始化用户资源...");
-                        // 释放 session 锁，避免死锁
-                        drop(session);
-
-                        // 调用初始化逻辑
-                        if let Err(e) = state.load_initial_session().await {
-                            error!("❌ 初始化用户资源失败: {}", e);
-                            // 初始化失败不影响返回用户信息
-                        } else {
-                            info!("✅ 用户资源初始化成功");
-                        }
-                    }
-
-                    Ok(Json(ApiResponse::success(user)))
-                }
-                Ok(false) => {
-                    // BDUSS 已失效，清除会话
-                    warn!("BDUSS 已失效，清除会话");
-                    let _ = session.clear_session().await;
-                    Ok(Json(ApiResponse::error(
-                        401,
-                        "Session expired, please login again".to_string(),
-                    )))
-                }
-                Err(e) => {
-                    // 验证失败（可能是网络问题），暂时允许通过
-                    warn!("BDUSS 验证失败: {}，暂时允许通过", e);
-                    Ok(Json(ApiResponse::success(user)))
+            let client_initialized = state.active_client().await.is_some();
+            if !client_initialized {
+                info!("🔄 检测到客户端未初始化，开始初始化用户资源...");
+                if let Err(e) = state.load_initial_session().await {
+                    error!("❌ 初始化用户资源失败: {}", e);
+                    // 初始化失败不影响返回用户信息
+                } else {
+                    info!("✅ 用户资源初始化成功");
                 }
             }
+
+            Ok(Json(ApiResponse::success(user)))
         }
-        Ok(None) => {
-            warn!("❌ 未找到会话，用户未登录");
-            Ok(Json(ApiResponse::error(401, "Not logged in".to_string())))
+        Ok(false) => {
+            // BDUSS 已失效。这里只标记 401，账号删除/切换由调用方按需触发。
+            warn!("BDUSS 已失效 uid={}", user.uid);
+            Ok(Json(ApiResponse::error(
+                401,
+                "Session expired, please login again".to_string(),
+            )))
         }
         Err(e) => {
-            error!("获取会话失败: {}", e);
-            Ok(Json(ApiResponse::error(
-                500,
-                format!("Failed to get session: {}", e),
-            )))
+            // 验证失败（可能是网络问题），暂时允许通过
+            warn!("BDUSS 验证失败: {}，暂时允许通过", e);
+            Ok(Json(ApiResponse::success(user)))
         }
     }
 }
@@ -442,10 +572,13 @@ pub async fn get_current_user(
 /// 登出
 ///
 /// POST /api/v1/auth/logout
+///
+/// 通过 `delete_account_helper(force = true)` 编排关闭活跃账号的所有
+/// per-uid Manager + 移除 client_pool + 删除 AccountManager 条目 + 广播事件。
 pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     info!("API: 用户登出");
 
-    // 1. 清除持久化 session（文件 + 内存缓存）
+    // 1. 清除持久化 session（文件 + 内存缓存）— legacy 字段保留
     let clear_result = {
         let mut session = state.session_manager.lock().await;
         session.clear_session().await
@@ -457,7 +590,18 @@ pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, 
     // 3. 清除网盘客户端（含旧 Cookie Jar），下次登录时重新创建
     *state.netdisk_client.write().await = None;
 
-    info!("已清除 current_user 和 netdisk_client");
+    // 🔥 多账号删除编排（force 契约）
+    // - active_uid = Some(uid)：删除该 uid + force shutdown 所有 per-uid Manager
+    // - active_uid = None：跳过（已无活跃账号）
+    if let Some(active) = *state.active_uid.read().await {
+        if let Err(e) = delete_account_helper(&state, Some(active), true).await {
+            error!("delete_account_helper(active) 失败: {}", e);
+        }
+    } else {
+        info!("登出：当前无活跃账号，跳过 force-delete 编排");
+    }
+
+    info!("已清除 current_user / netdisk_client / per-uid Managers");
 
     match clear_result {
         Ok(_) => {
@@ -553,6 +697,11 @@ pub async fn cookie_login(
         warn!("Cookie 中缺少 PTOKEN，预热将被跳过 → panpsc/csrf_token/bdstoken 无法获取，转存等功能不可用");
     }
 
+    // 🔥 登录成功后注册到 AccountManager + 切换活跃账号 + 广播事件
+    if let Err(e) = add_account_and_activate(&state, user.clone()).await {
+        error!("add_account_and_activate 失败: {}", e);
+    }
+
     // 复用 load_initial_session 完成完整初始化：
     //   - 创建 NetdiskClient（含代理）
     //   - 执行预热（获取 PANPSC / csrfToken / bdstoken）
@@ -592,4 +741,106 @@ pub async fn cookie_login(
     }
 
     Ok(Json(ApiResponse::success_with_message(final_user, message)))
+}
+
+// ============================================================================
+// 多账号登录 / 登出 helpers
+// ============================================================================
+
+/// 登录成功后注册账号并激活。
+///
+/// 调用顺序：
+///   1. `account_manager.add_user(user)` — 持久化到 `accounts.json`
+///   2. `budget_scheduler.add_account(uid, vip, dl_req, up_req)` — 注册到全局预算调度器
+///      （未注册时分片调度会走 `acquire_chunk_permit → None`
+///      回滚 + return，导致下载/上传整个停摆。这里必须按 `seed_budget_scheduler` 同款逻辑
+///      把账号加入 `BudgetScheduler` 双轨；先于 `set_active_uid` 调用，确保切到 active
+///      之后第一笔分片就能 acquire 到 permit。）
+///   3. `set_active_uid(Some(uid))` — 写运行时真源 + 持久化镜像 + 发 `Switched`
+///   4. `broadcast_account_list_changed` — 发 `ListChanged`
+///   5. `broadcast_budget_recomputed` — 推 `BudgetEvent::BudgetRecomputed`
+///      （`add_account` 内部已 `recompute_budget`，这里只补 WS 推送）
+///
+/// **幂等性**：`add_user` + `BudgetScheduler::add_account`（内部 `upsert_account`）
+/// 都支持「更新已有账号」；多次调用同一 UID 安全。
+///
+/// 注：本 helper **不**重复执行客户端构造 / per-uid Manager 注入；这些步骤由
+/// `state.load_initial_session()` 在主登录流程中按需触发。
+pub async fn add_account_and_activate(state: &AppState, user: UserAuth) -> anyhow::Result<()> {
+    let uid = Uid::new(user.uid);
+
+    // 提前提取 budget 注册参数（与 `state.rs::seed_budget_scheduler` 同款逻辑）
+    let vip = crate::downloader::budget_scheduler::VipType::from_raw(user.vip_type);
+    let auto = user.custom_config.auto_apply_recommended;
+    let dl_threads = user.custom_config.download.max_global_threads;
+    let up_threads = user.custom_config.upload.max_global_threads;
+    let dl_req = if auto {
+        crate::downloader::budget_scheduler::RequestedSource::Auto
+    } else {
+        crate::downloader::budget_scheduler::RequestedSource::User(dl_threads)
+    };
+    let up_req = if auto {
+        crate::downloader::budget_scheduler::RequestedSource::Auto
+    } else {
+        crate::downloader::budget_scheduler::RequestedSource::User(up_threads)
+    };
+
+    // Step 1: 写入 AccountManager（持久化到 accounts.json）
+    {
+        let mut mgr = state.account_manager.lock().await;
+        mgr.add_user(user).await?;
+    }
+
+    // Step 2: 注册到 BudgetScheduler
+    state.budget_scheduler.add_account(uid, vip, dl_req, up_req).await;
+    info!(
+        "add_account_and_activate: uid={} 已注册到 BudgetScheduler (vip={:?}, auto={}, dl_req={:?}, up_req={:?})",
+        uid.raw(), vip, auto, dl_req, up_req
+    );
+
+    // Step 3: 切换活跃账号（唯一入口 → 持久化镜像 + 广播 Switched）
+    set_active_uid(state, Some(uid)).await?;
+
+    // Step 4: 广播账号列表变更
+    broadcast_account_list_changed(state).await;
+
+    // Step 5: 推送 BudgetRecomputed（让前端 BudgetPanel 立即看到新账号配额）
+    state.broadcast_budget_recomputed().await;
+
+    info!("add_account_and_activate: uid={} 已激活", uid.raw());
+    Ok(())
+}
+
+/// 登出 / 删除账号（force 契约）。
+///
+/// `force = true`：调用 `force_delete_account` 编排，关闭所有 per-uid Manager。
+/// `force = false`：当前实现也走 force 路径（保留兼容旧版二态语义）。
+///
+/// **NOTE**：当 `uid_to_delete = None` 表示「使用当前 active_uid」；
+/// 若同时 `active_uid = None`，返回错误（无账号可删）。
+pub async fn delete_account_helper(
+    state: &AppState,
+    uid_to_delete: Option<Uid>,
+    _force: bool,
+) -> anyhow::Result<Option<Uid>> {
+    let target = match uid_to_delete {
+        Some(uid) => uid,
+        None => state
+            .active_uid
+            .read()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("无活跃账号，无法登出"))?,
+    };
+
+    // 调用 AppState 编排
+    state.force_delete_account(target).await?;
+
+    // 读取新 active_uid（force_delete_account 内部已通过 set_active_uid 写入并广播 Switched）
+    let new_active = state.account_manager.lock().await.active_uid();
+
+    // 🔥 `force_delete_account` 已通过唯一入口 `set_active_uid`
+    // 广播 `Switched` + 重绑 CloudDl WS 订阅；这里只补 `ListChanged`，避免重复广播 `Switched`。
+    broadcast_account_list_changed(state).await;
+
+    Ok(new_active)
 }

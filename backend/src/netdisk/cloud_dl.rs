@@ -17,10 +17,12 @@ use serde::{Deserialize, Serialize};
 /// 状态码对应百度网盘 API 返回的 status 字段
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(i32)]
+#[derive(Default)]
 pub enum CloudDlTaskStatus {
     /// 下载成功
     Success = 0,
     /// 下载进行中
+    #[default]
     Running = 1,
     /// 系统错误
     SystemError = 2,
@@ -92,11 +94,6 @@ impl CloudDlTaskStatus {
     }
 }
 
-impl Default for CloudDlTaskStatus {
-    fn default() -> Self {
-        Self::Running
-    }
-}
 
 // =====================================================
 // 文件信息结构体
@@ -150,6 +147,17 @@ pub struct CloudDlTaskInfo {
     pub file_list: Vec<CloudDlFileInfo>,
     /// 结果码
     pub result: i32,
+    /// **归属账号 UID**
+    ///
+    /// 离线下载已收紧为「按 active 账号隔离」；
+    /// 后端 list/query/refresh handler 在返回前 stamp 当前 `active_uid.raw()`。
+    /// 百度 API 原始响应不含此字段，因此 `#[serde(default)]` 让反序列化兼容；
+    /// 序列化时如为 None（理论不发生）则省略。
+    ///
+    /// 前端 `CloudDlView.vue` `<AccountBadge :owner-uid="row.owner_uid"/>` 需要
+    /// 此字段在多账号场景渲染归属账号 chip。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
 }
 
 impl CloudDlTaskInfo {
@@ -204,6 +212,22 @@ pub struct AddTaskRequest {
     /// 完成时是否询问下载目录
     #[serde(default)]
     pub ask_download_path: bool,
+    /// **离线下载只能在当前活跃账号下创建**。
+    ///
+    /// 离线下载是百度云端任务（不是本地任务）：
+    /// - 创建后只能在创建账号下查询/取消（list/cancel/delete 走 active 路由）
+    /// - 跨账号创建会出现"账号 A 注入云端任务到账号 B"的安全问题
+    ///
+    /// 当前 handler 行为（`server::handlers::cloud_dl::add_task`）：
+    /// - `req.uid = None` → 使用 active_uid
+    /// - `req.uid = Some(uid)` 且 `uid != active_uid` → 返回 400
+    /// - `req.uid = Some(active_uid)` → 等价于 None，被允许
+    ///
+    /// 即字段保留只是为了向后兼容（前端旧版本可能仍在传），**新代码不应再发送
+    /// 该字段**。前端类型已移除（见 `frontend/src/api/cloudDl.ts`）。
+    /// 加 `alias = "owner_uid"` 兼容历史前端的 `owner_uid` 字段名。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 查询任务请求
@@ -549,6 +573,8 @@ impl BaiduTaskInfo {
                 })
                 .collect(),
             result: self.result,
+            // owner_uid 由 handler 在响应前 stamp 当前 active_uid
+            owner_uid: None,
         }
     }
 }
@@ -692,6 +718,7 @@ mod tests {
             od_type: 0,
             file_list: vec![],
             result: 0,
+            owner_uid: None,
         };
 
         assert!((task.progress_percent() - 50.0).abs() < 0.01);
@@ -714,6 +741,7 @@ mod tests {
             od_type: 0,
             file_list: vec![],
             result: 0,
+            owner_uid: None,
         };
 
         assert_eq!(task.progress_percent(), 0.0);

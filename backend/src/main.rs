@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
 };
 use baidu_netdisk_rust::{
-    config::LogConfig, logging, server::handlers, server::websocket,
+    config::LogConfig, logging, server::{self, handlers, websocket},
     web_auth::{self, WebAuthState},
     common::proxy_fallback::ProxyHotUpdater,
     AppState,
@@ -288,6 +288,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/cookie/login", post(handlers::cookie_login))
         .route("/auth/user", get(handlers::get_current_user))
         .route("/auth/logout", post(handlers::logout))
+        // 🔥 多账号管理 API
+        .route("/accounts/list", get(handlers::accounts::list_accounts))
+        .route("/accounts/switch", post(handlers::accounts::switch_account))
+        .route("/accounts/:uid", delete(handlers::accounts::delete_account))
         // 文件API
         .route("/files", get(handlers::get_file_list))
         .route("/files/search", get(handlers::search_files))
@@ -388,6 +392,20 @@ async fn main() -> anyhow::Result<()> {
         // 转存配置API
         .route("/config/transfer", get(handlers::get_transfer_config))
         .route("/config/transfer", put(handlers::update_transfer_config))
+        // 🔥 多账号资源配额 API
+        .route("/budget", get(handlers::budget::get_budget))
+        .route(
+            "/config/multi_account_budget",
+            put(handlers::budget::update_multi_account_budget),
+        )
+        .route(
+            "/config/vip_recommended",
+            put(handlers::budget::update_vip_recommended),
+        )
+        .route(
+            "/accounts/:uid/custom_config",
+            put(handlers::budget::update_account_custom_config),
+        )
         // 🔥 代理运行状态API
         .route("/proxy/status", get(handlers::get_proxy_status))
         .route("/proxy/test", post(handlers::test_proxy_connection))
@@ -444,6 +462,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/config/autobackup/trigger", put(handlers::autobackup::update_trigger_config))
         // 🔥 WebSocket 路由
         .route("/ws", get(websocket::handle_websocket))
+        // 🔥 全局只读模式中间件：放在 with_state 之前以共享 AppState
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            server::middleware::readonly_middleware,
+        ))
         .with_state(app_state.clone())
         // 🔥 应用 Web 认证中间件到所有 API 路由
         .layer(middleware::from_fn_with_state(
@@ -492,6 +515,12 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 先加载会话和初始化所有管理器，确保前端访问时一切就绪
     app_state.load_initial_session().await?;
     info!("应用状态初始化完成");
+
+    // 多账号 ClientPool 预热（非活跃账号 Semaphore=3 + 2s 错峰）
+    // 活跃账号客户端已在 load_initial_session 中注入；本步为非活跃账号补齐
+    if let Err(e) = app_state.preheat_inactive_clients().await {
+        tracing::warn!("ClientPool 预热出现非致命错误: {}", e);
+    }
 
     // 构建完整应用
     let app = Router::new()

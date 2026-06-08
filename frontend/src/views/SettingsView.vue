@@ -55,6 +55,16 @@
                   label-width="140px"
                   label-position="left"
               >
+                <!-- 账号管理 -->
+                <div id="section-accounts">
+                  <AccountManagementSection />
+                </div>
+
+                <!-- 多账号资源配额 -->
+                <div id="section-budget" class="budget-section-wrap">
+                  <BudgetPanel />
+                </div>
+
                 <!-- 服务器配置 -->
                 <el-card id="section-server" class="setting-card" shadow="hover">
                   <template #header>
@@ -188,51 +198,20 @@
                     </div>
                   </el-form-item>
 
-                  <el-form-item label="全局最大线程数" prop="download.max_global_threads">
-                    <el-slider
-                        v-model="formData.download.max_global_threads"
-                        :min="1"
-                        :max="20"
-                        :step="1"
-                        :marks="threadMarks"
-                        show-stops
-                        style="width: calc(100% - 20px); margin-right: 20px"
-                    />
-                    <div class="value-display">
-                      当前: {{ formData.download.max_global_threads }} 个
-                      <span v-if="recommended" class="recommend-hint">
-                    (推荐: {{ recommended.recommended.threads }} 个)
-                  </span>
-                    </div>
-                    <div class="form-tip">
-                      <el-icon><InfoFilled /></el-icon>
-                      所有下载任务共享的线程池大小，单文件可使用全部线程进行分片下载
-                    </div>
-                    <div class="form-tip warning-tip" v-if="formData.download.max_global_threads > 10 && recommended && recommended.vip_type === 0">
-                      ⚠️ 警告：普通用户建议保持1个线程，调大可能触发限速！
-                    </div>
-                  </el-form-item>
-
-                  <el-form-item label="最大同时下载数" prop="download.max_concurrent_tasks">
-                    <el-slider
-                        v-model="formData.download.max_concurrent_tasks"
-                        :min="1"
-                        :max="10"
-                        :step="1"
-                        :marks="taskMarks"
-                        show-stops
-                        style="width: calc(100% - 20px); margin-right: 20px"
-                    />
-                    <div class="value-display">
-                      当前: {{ formData.download.max_concurrent_tasks }} 个
-                      <span v-if="recommended" class="recommend-hint">
-                    (推荐: {{ recommended.recommended.max_tasks }} 个)
-                  </span>
-                    </div>
-                    <div class="form-tip">
-                      可以同时进行下载的文件数量上限
-                    </div>
-                  </el-form-item>
+                  <!--
+                    线程数 / 同时下载数统一由上方「资源配额」面板按账号分配，
+                    此处的全局滑块在任何模式下都不再直接生效，故隐藏，避免误导。
+                  -->
+                  <el-alert
+                      type="info"
+                      :closable="false"
+                      show-icon
+                      style="margin-bottom: 20px"
+                  >
+                    <template #title>
+                      线程数与同时下载数由上方「资源配额」面板按账号设置（每账号实际配额），此处不再单独提供全局设置。
+                    </template>
+                  </el-alert>
 
                   <!-- 分片大小说明（自适应，不可配置） -->
                   <el-alert
@@ -278,42 +257,20 @@
                     </div>
                   </template>
 
-                  <el-form-item label="全局最大线程数" prop="upload.max_global_threads">
-                    <el-slider
-                        v-model="formData.upload.max_global_threads"
-                        :min="1"
-                        :max="20"
-                        :step="1"
-                        :marks="threadMarks"
-                        show-stops
-                        style="width: calc(100% - 20px); margin-right: 20px"
-                    />
-                    <div class="value-display">
-                      当前: {{ formData.upload.max_global_threads }} 个
-                    </div>
-                    <div class="form-tip">
-                      <el-icon><InfoFilled /></el-icon>
-                      所有上传任务共享的线程池大小
-                    </div>
-                  </el-form-item>
-
-                  <el-form-item label="最大同时上传数" prop="upload.max_concurrent_tasks">
-                    <el-slider
-                        v-model="formData.upload.max_concurrent_tasks"
-                        :min="1"
-                        :max="10"
-                        :step="1"
-                        :marks="taskMarks"
-                        show-stops
-                        style="width: calc(100% - 20px); margin-right: 20px"
-                    />
-                    <div class="value-display">
-                      当前: {{ formData.upload.max_concurrent_tasks }} 个
-                    </div>
-                    <div class="form-tip">
-                      可以同时进行上传的文件数量上限
-                    </div>
-                  </el-form-item>
+                  <!--
+                    线程数 / 同时上传数统一由上方「资源配额」面板按账号分配，
+                    此处的全局滑块在任何模式下都不再直接生效，故隐藏，避免误导。
+                  -->
+                  <el-alert
+                      type="info"
+                      :closable="false"
+                      show-icon
+                      style="margin-bottom: 20px"
+                  >
+                    <template #title>
+                      线程数与同时上传数由上方「资源配额」面板按账号设置（每账号实际配额），此处不再单独提供全局设置。
+                    </template>
+                  </el-alert>
 
                   <el-form-item label="最大重试次数" prop="upload.max_retries">
                     <el-input-number
@@ -914,7 +871,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">v1.14.1</span>
+                      <span class="value">v2.0.0</span>
                     </div>
                     <div class="about-item">
                       <span class="label">后端技术:</span>
@@ -927,6 +884,17 @@
                     <div class="about-item">
                       <span class="label">许可证:</span>
                       <span class="value">MIT License</span>
+                    </div>
+                    <div class="about-item">
+                      <span class="label">项目仓库:</span>
+                      <a
+                          class="value repo-link"
+                          href="https://github.com/komorebiCarry/BaiduPCS-Rust"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                      >
+                        https://github.com/komorebiCarry/BaiduPCS-Rust
+                      </a>
                     </div>
                   </div>
                 </el-card>
@@ -979,15 +947,19 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useIsMobile } from '@/utils/responsive'
 import { useConfigStore } from '@/stores/config'
+import { useAuthStore } from '@/stores/auth'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
 import type { UploadConflictStrategy } from '@/api/upload'
 import type { DownloadConflictStrategy } from '@/api/download'
 import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
+import AccountManagementSection from '@/components/settings/AccountManagementSection.vue'
+import BudgetPanel from '@/views/settings/BudgetPanel.vue'
 import {
   Check,
   RefreshLeft,
@@ -1030,6 +1002,8 @@ import {
 } from '@/api/autobackup'
 
 const configStore = useConfigStore()
+const authStore = useAuthStore()
+const route = useRoute()
 
 // 响应式检测
 const isMobile = useIsMobile()
@@ -1050,6 +1024,8 @@ const activeSection = ref('section-server')
 let sectionObserver: IntersectionObserver | null = null
 
 const navItems = [
+  { id: 'section-accounts', label: '账号管理', color: '#409eff' },
+  { id: 'section-budget', label: '资源配额', color: '#9b59b6' },
   { id: 'section-server', label: '服务器', color: '#409eff' },
   { id: 'section-auth', label: '访问认证', color: '#e6a23c' },
   { id: 'section-download', label: '下载', color: '#67c23a' },
@@ -1112,23 +1088,6 @@ const triggerConfig = ref<GlobalTriggerConfig>({
 })
 const uploadScheduledTime = ref<Date | null>(null)
 const downloadScheduledTime = ref<Date | null>(null)
-
-// 滑块标记
-const threadMarks = reactive({
-  1: '1',
-  5: '5',
-  10: '10',
-  15: '15',
-  20: '20',
-})
-
-const taskMarks = reactive({
-  1: '1',
-  3: '3',
-  5: '5',
-  7: '7',
-  10: '10',
-})
 
 // 表单验证规则
 const rules = reactive<FormRules<AppConfig>>({
@@ -1682,6 +1641,25 @@ onMounted(() => {
   loadWatchCapability()
   loadTriggerConfig()
   // 代理状态轮询在 loadConfig 完成后根据代理类型决定是否启动
+
+  // 支持 ?tab=accounts 直接定位到账号管理 section
+  const targetTab = route.query.tab
+  if (typeof targetTab === 'string') {
+    const targetId = `section-${targetTab}`
+    const valid = navItems.some((n) => n.id === targetId)
+    if (valid) {
+      // 等待 DOM 完成首次渲染后再滚动（loadConfig 是 async，但 navItems 中 section 的 DOM
+      // 在表单 v-if=formData 完成后才挂载；用 requestAnimationFrame 链等待 1 帧通常足够，
+      // 复杂场景下用 nextTick 多次等待。账号 section 不依赖 formData，所以可立即滚动）
+      nextTick(() => {
+        const el = document.getElementById(targetId)
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          activeSection.value = targetId
+        }
+      })
+    }
+  }
 })
 
 // 组件卸载
@@ -1887,6 +1865,16 @@ onUnmounted(() => {
       font-size: 14px;
       font-weight: 500;
       color: #333;
+    }
+
+    .repo-link {
+      color: #409eff;
+      text-decoration: none;
+      word-break: break-all;
+
+      &:hover {
+        text-decoration: underline;
+      }
     }
   }
 }

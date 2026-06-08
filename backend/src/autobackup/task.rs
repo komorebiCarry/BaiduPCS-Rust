@@ -173,6 +173,13 @@ pub struct BackupTask {
     /// 传输任务ID到文件任务ID的映射（transfer_task_id -> file_task_id）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub transfer_task_map: HashMap<String, String>,
+    /// 任务归属账号 UID
+    ///
+    /// 注意：当前**未持久化**到 sqlite `backup_tasks` 表（schema 不含此列），
+    /// 仅在 handler 响应前从所属 `BackupConfig.owner_uid` 动态填充。
+    /// 后续若需要持久化，需 ALTER TABLE 加列 + 修改 save_task / load_task。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
 }
 
 /// 扫描进度（用于断点恢复）

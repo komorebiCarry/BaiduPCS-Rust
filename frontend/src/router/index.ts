@@ -139,44 +139,98 @@ router.beforeEach(async (to, _from, next) => {
     return
   }
 
-  // ========== 第二层：百度账号认证检查 ==========
-  // 如果访问百度登录页，需要先检查是否已登录（避免闪烁）
+  // ========== 第二层：百度账号认证检查（多账号版） ==========
+  //
+  // 多账号语义补丁：
+  //   1. 首次进入任意页面时优先 `fetchAccountList()` 拉取全量账号 + active_uid，
+  //      作为新的"是否已登录"判定来源；
+  //      - 成功且 active_uid != null   → 视为已登录
+  //      - 成功但 active_uid == null   → 视为未登录（账号列表可能为空）
+  //      - 网络失败                     → fallback 到旧路径 `fetchUserInfo()`
+  //   2. `/login?mode=add` 即使已登录也允许进入（添加新账号场景）；
+  //      其它情况下访问 /login 且已登录则跳 /files。
+
   if (to.meta.requiresBaiduAuth || to.path === '/login') {
-    // 如果已经检查过且已登录，直接跳转
+    // 添加账号：保留登录页可访问性
+    if (to.path === '/login' && to.query.mode === 'add') {
+      next()
+      return
+    }
+
+    // 已确认登录态 → 直接跳 /files
     if (authStore.isLoggedIn) {
       next('/files')
       return
     }
-    // 首次检查，需要等待结果
+
+    // 首次检查
     if (!baiduAuthChecked) {
       baiduAuthChecked = true
       try {
-        await authStore.fetchUserInfo()
-        // 获取成功，已登录，跳转到文件页
-        next('/files')
-        return
-      } catch {
-        // 获取失败，未登录，显示登录页
+        await authStore.fetchAccountList()
+        if (authStore.activeUid !== null) {
+          next('/files')
+          return
+        }
+        // 账号列表为空 / 无活跃账号 → 显示登录页
         next()
         return
+      } catch (err) {
+        console.warn('[router] fetchAccountList 失败，fallback 到 fetchUserInfo:', err)
+        try {
+          await authStore.fetchUserInfo()
+          next('/files')
+          return
+        } catch {
+          next()
+          return
+        }
       }
     }
-    // 已检查过且未登录，显示登录页
+    // 已检查过且未登录
     next()
     return
   }
 
-  // 检查是否需要百度账号认证（其他页面）
+  // 受保护页面
   if (to.meta.requiresAuth) {
+    // 已登录直接放行；首次进入也需要拉一次账号列表（用于 UI 渲染账号切换器/chip）
     if (authStore.isLoggedIn) {
+      if (!authStore.accountsLoaded) {
+        // 后台异步拉取，不阻塞导航；失败仅打日志
+        authStore.fetchAccountList().catch((err) => {
+          console.warn('[router] 后台拉取账号列表失败:', err)
+        })
+      }
       next()
-    } else {
-      // 跳转到登录页
-      next('/login')
+      return
     }
-  } else {
-    next()
+
+    // 未确认登录态：首次进入受保护页面时尝试 fetchAccountList
+    if (!baiduAuthChecked) {
+      baiduAuthChecked = true
+      try {
+        await authStore.fetchAccountList()
+        if (authStore.activeUid !== null) {
+          next()
+          return
+        }
+      } catch (err) {
+        console.warn('[router] fetchAccountList 失败，fallback 到 fetchUserInfo:', err)
+        try {
+          await authStore.fetchUserInfo()
+          next()
+          return
+        } catch {
+          /* fallthrough → /login */
+        }
+      }
+    }
+    next('/login')
+    return
   }
+
+  next()
 })
 
 export default router

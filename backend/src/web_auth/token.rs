@@ -56,7 +56,7 @@ impl TokenService {
     /// # Arguments
     /// * `jwt_secret` - JWT 签名密钥，如果为空则自动生成
     pub fn new(jwt_secret: Option<String>) -> Self {
-        let secret = jwt_secret.unwrap_or_else(|| Self::generate_random_secret());
+        let secret = jwt_secret.unwrap_or_else(Self::generate_random_secret);
         let encoding_key = EncodingKey::from_secret(secret.as_bytes());
         let decoding_key = DecodingKey::from_secret(secret.as_bytes());
 
@@ -82,22 +82,22 @@ impl TokenService {
     /// 仅当认证模式不为 `None` 时应调用此方法。
     pub async fn start_cleanup_task(self: &Arc<Self>) {
         let mut guard = self.cleanup_cancel_token.write().await;
-        
+
         // 如果已有清理任务在运行，先停止它
         if let Some(token) = guard.take() {
             token.cancel();
         }
-        
+
         let cancel_token = CancellationToken::new();
         *guard = Some(cancel_token.clone());
         drop(guard);
-        
+
         let service = Arc::clone(self);
-        
+
         tokio::spawn(async move {
             debug!("TokenService cleanup task started");
             let interval = Duration::from_secs(TOKEN_CLEANUP_INTERVAL_SECS);
-            
+
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -394,7 +394,7 @@ mod tests {
     fn test_is_at_capacity() {
         let service = TokenService::new(Some("test_secret".to_string()));
         assert!(!service.is_at_capacity());
-        
+
         // We can't easily test MAX_TOKENS without creating that many entries,
         // but we can verify the method works
         assert_eq!(service.active_token_count(), 0);

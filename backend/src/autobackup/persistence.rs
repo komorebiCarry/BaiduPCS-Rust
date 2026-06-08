@@ -854,25 +854,23 @@ impl BackupPersistenceManager {
         })?;
 
         let mut stats = FileTaskStats::default();
-        for row in rows {
-            if let Ok((status, count, size)) = row {
-                match status.as_str() {
-                    "pending" => {
-                        stats.pending_count = count as usize;
-                        stats.pending_bytes = size as u64;
-                    }
-                    "checking" => stats.checking_count = count as usize,
-                    "skipped" => stats.skipped_count = count as usize,
-                    "encrypting" => stats.encrypting_count = count as usize,
-                    "waitingtransfer" => stats.waiting_transfer_count = count as usize,
-                    "transferring" => stats.transferring_count = count as usize,
-                    "completed" => {
-                        stats.completed_count = count as usize;
-                        stats.completed_bytes = size as u64;
-                    }
-                    "failed" => stats.failed_count = count as usize,
-                    _ => {}
+        for (status, count, size) in rows.flatten() {
+            match status.as_str() {
+                "pending" => {
+                    stats.pending_count = count as usize;
+                    stats.pending_bytes = size as u64;
                 }
+                "checking" => stats.checking_count = count as usize,
+                "skipped" => stats.skipped_count = count as usize,
+                "encrypting" => stats.encrypting_count = count as usize,
+                "waitingtransfer" => stats.waiting_transfer_count = count as usize,
+                "transferring" => stats.transferring_count = count as usize,
+                "completed" => {
+                    stats.completed_count = count as usize;
+                    stats.completed_bytes = size as u64;
+                }
+                "failed" => stats.failed_count = count as usize,
+                _ => {}
             }
         }
 
@@ -1310,10 +1308,8 @@ impl BackupPersistenceManager {
         })?;
 
         let mut paths = std::collections::HashSet::new();
-        for row in rows {
-            if let Ok(path) = row {
-                paths.insert(path);
-            }
+        for path in rows.flatten() {
+            paths.insert(path);
         }
 
         Ok(paths)
@@ -1430,10 +1426,8 @@ impl BackupPersistenceManager {
         })?;
 
         let mut result = std::collections::HashSet::new();
-        for path in paths {
-            if let Ok(p) = path {
-                result.insert(p);
-            }
+        for p in paths.flatten() {
+            result.insert(p);
         }
 
         Ok(result)
@@ -1469,6 +1463,8 @@ impl BackupPersistenceManager {
             pending_upload_task_ids: std::collections::HashSet::new(),
             pending_download_task_ids: std::collections::HashSet::new(),
             transfer_task_map: std::collections::HashMap::new(),
+            // DB schema 不存 owner_uid，由 manager 在装载完后批量从 config 补齐
+            owner_uid: None,
         })
     }
 
@@ -1704,6 +1700,7 @@ mod tests {
         let manager = BackupPersistenceManager::new(&db_path).unwrap();
 
         let task = BackupTask {
+            owner_uid: None,
             id: "test-task-1".to_string(),
             config_id: "config-1".to_string(),
             status: BackupTaskStatus::Queued,
@@ -1773,6 +1770,7 @@ mod tests {
 
         // 先创建父任务满足外键约束
         let parent = BackupTask {
+            owner_uid: None,
             id: "task-1".to_string(),
             config_id: "cfg-1".to_string(),
             status: BackupTaskStatus::Transferring,
@@ -1816,6 +1814,7 @@ mod tests {
 
         // 需要先创建主任务记录（外键约束）
         let task = BackupTask {
+            owner_uid: None,
             id: "task-2".to_string(),
             config_id: "cfg-2".to_string(),
             status: BackupTaskStatus::Transferring,

@@ -171,6 +171,10 @@ impl HistoryDbManager {
         let _ = conn.execute("ALTER TABLE task_history ADD COLUMN temp_dir TEXT", []);
         let _ = conn.execute("ALTER TABLE task_history ADD COLUMN cleanup_status TEXT", []);
         let _ = conn.execute("ALTER TABLE task_history ADD COLUMN share_root_path TEXT", []);
+        // 🔥 多账号归属 — sqlite history 表也要支持 owner_uid，
+        // 否则 row_to_task_metadata 永远返回 None，前端 DownloadsView/UploadsView 显示 UID:0
+        let _ = conn.execute("ALTER TABLE task_history ADD COLUMN owner_uid INTEGER", []);
+        let _ = conn.execute("ALTER TABLE folder_history ADD COLUMN owner_uid INTEGER", []);
 
         info!("历史数据库表初始化完成");
         Ok(())
@@ -210,7 +214,7 @@ impl HistoryDbManager {
                 is_backup, backup_config_id,
                 transfer_task_id, download_task_ids,
                 file_list_json, is_share_direct_download,
-                temp_dir, cleanup_status, share_root_path
+                temp_dir, cleanup_status, share_root_path, owner_uid
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9,
@@ -221,7 +225,7 @@ impl HistoryDbManager {
                 ?26, ?27,
                 ?28, ?29,
                 ?30, ?31,
-                ?32, ?33, ?34
+                ?32, ?33, ?34, ?35
             )
             "#,
             params![
@@ -257,8 +261,10 @@ impl HistoryDbManager {
                 metadata.file_list_json,
                 metadata.is_share_direct_download.map(|b| if b { 1 } else { 0 }),
                 metadata.temp_dir,
-                metadata.cleanup_status.map(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from))).flatten(),
+                metadata.cleanup_status.and_then(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from))),
                 metadata.share_root_path,
+                // 🔥 多账号归属：Some(0) 也当作 None 写入（避免遗留 0 值被后续读成 Uid(0)）
+                metadata.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
             ],
         )?;
 
@@ -293,7 +299,7 @@ impl HistoryDbManager {
                     is_backup, backup_config_id,
                     transfer_task_id, download_task_ids,
                     file_list_json, is_share_direct_download,
-                    temp_dir, cleanup_status, share_root_path
+                    temp_dir, cleanup_status, share_root_path, owner_uid
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9,
@@ -304,7 +310,7 @@ impl HistoryDbManager {
                     ?26, ?27,
                     ?28, ?29,
                     ?30, ?31,
-                    ?32, ?33, ?34
+                    ?32, ?33, ?34, ?35
                 )
                 "#,
             )?;
@@ -354,8 +360,10 @@ impl HistoryDbManager {
                     metadata.file_list_json,
                     metadata.is_share_direct_download.map(|b| if b { 1 } else { 0 }),
                     metadata.temp_dir,
-                    metadata.cleanup_status.map(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from))).flatten(),
+                    metadata.cleanup_status.and_then(|s| serde_json::to_value(s).ok().and_then(|v| v.as_str().map(String::from))),
                     metadata.share_root_path,
+                    // 🔥 多账号归属：Some(0) 也当作 None 写入
+                    metadata.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
                 ])?;
                 count += 1;
             }
@@ -384,7 +392,7 @@ impl HistoryDbManager {
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
                 transfer_task_id, download_task_ids,
-                temp_dir, cleanup_status, share_root_path
+                temp_dir, cleanup_status, share_root_path, owner_uid
             FROM task_history
             ORDER BY completed_at DESC
             "#,
@@ -426,6 +434,7 @@ impl HistoryDbManager {
                 temp_dir: row.get(31)?,
                 cleanup_status: row.get(32)?,
                 share_root_path: row.get(33)?,
+                owner_uid: row.get(34)?,
             })
         })?;
 
@@ -482,7 +491,7 @@ impl HistoryDbManager {
                     group_id, group_root, relative_path,
                     is_backup, backup_config_id,
                     transfer_task_id, download_task_ids,
-                    temp_dir, cleanup_status, share_root_path
+                    temp_dir, cleanup_status, share_root_path, owner_uid
                 FROM task_history
                 WHERE task_id = ?1
                 "#,
@@ -522,7 +531,8 @@ impl HistoryDbManager {
                         download_task_ids: row.get(30)?,
                         temp_dir: row.get(31)?,
                         cleanup_status: row.get(32)?,
-                share_root_path: row.get(33)?,
+                        share_root_path: row.get(33)?,
+                        owner_uid: row.get(34)?,
                     })
                 },
             )
@@ -571,7 +581,7 @@ impl HistoryDbManager {
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
                 transfer_task_id, download_task_ids,
-                temp_dir, cleanup_status, share_root_path
+                temp_dir, cleanup_status, share_root_path, owner_uid
             FROM task_history
             ORDER BY completed_at DESC
             LIMIT ?1 OFFSET ?2
@@ -614,6 +624,7 @@ impl HistoryDbManager {
                 temp_dir: row.get(31)?,
                 cleanup_status: row.get(32)?,
                 share_root_path: row.get(33)?,
+                owner_uid: row.get(34)?,
             })
         })?;
 
@@ -631,7 +642,7 @@ impl HistoryDbManager {
         Ok((tasks, total))
     }
 
-    /// 按任务类型和状态分页获取任务历史
+    /// 按任务类型和状态获取任务历史
     ///
     /// # Arguments
     /// * `task_type` - 任务类型 (download, upload, transfer)
@@ -672,7 +683,7 @@ impl HistoryDbManager {
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
                 transfer_task_id, download_task_ids,
-                temp_dir, cleanup_status, share_root_path
+                temp_dir, cleanup_status, share_root_path, owner_uid
             FROM task_history
             WHERE task_type = ?1 AND status = ?2
             ORDER BY completed_at DESC
@@ -716,6 +727,7 @@ impl HistoryDbManager {
                 temp_dir: row.get(31)?,
                 cleanup_status: row.get(32)?,
                 share_root_path: row.get(33)?,
+                owner_uid: row.get(34)?,
             })
         })?;
 
@@ -778,7 +790,7 @@ impl HistoryDbManager {
                 group_id, group_root, relative_path,
                 is_backup, backup_config_id,
                 transfer_task_id, download_task_ids,
-                temp_dir, cleanup_status, share_root_path
+                temp_dir, cleanup_status, share_root_path, owner_uid
             FROM task_history
             WHERE task_type = ?1 AND status = ?2 {}
             ORDER BY completed_at DESC
@@ -824,6 +836,7 @@ impl HistoryDbManager {
                 temp_dir: row.get(31)?,
                 cleanup_status: row.get(32)?,
                 share_root_path: row.get(33)?,
+                owner_uid: row.get(34)?,
             })
         })?;
 
@@ -857,6 +870,102 @@ impl HistoryDbManager {
             info!(
                 "已从历史数据库中删除 {} 个 {} 类型的 {} 状态任务",
                 deleted, task_type, status
+            );
+        }
+        Ok(deleted)
+    }
+
+    /// 批量删除任务历史（按任务类型 + 状态 + 归属 UID 过滤）
+    ///
+    /// 共享 manager 设计下「清除已完成 / 清除失败」
+    /// 必须按 owner_uid 严格过滤，避免跨账号误删历史。
+    ///
+    /// - `owner_uid = Some(uid)` → 仅删该账号的记录
+    /// - `owner_uid = None`      → 行为同 `remove_tasks_by_type_and_status`（跨账号清理）
+    pub fn remove_tasks_by_type_status_owner(
+        &self,
+        task_type: &str,
+        status: &str,
+        owner_uid: Option<u64>,
+    ) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = match owner_uid {
+            Some(uid) => conn.execute(
+                "DELETE FROM task_history WHERE task_type = ?1 AND status = ?2 AND owner_uid = ?3",
+                params![task_type, status, uid as i64],
+            )?,
+            None => conn.execute(
+                "DELETE FROM task_history WHERE task_type = ?1 AND status = ?2",
+                params![task_type, status],
+            )?,
+        };
+
+        if deleted > 0 {
+            info!(
+                "已从历史数据库中删除 {} 个 {} 类型的 {} 状态任务（owner_uid={:?}）",
+                deleted, task_type, status, owner_uid
+            );
+        }
+        Ok(deleted)
+    }
+
+    /// 按 task_type + owner_uid 删除全部任务历史（无状态过滤）
+    ///
+    /// 用于 `force_delete_account` 链路彻底清理
+    /// 该账号的所有 transfer/download/upload 历史（不论状态）。
+    ///
+    /// - `owner_uid = Some(uid)` → 仅删该账号的记录
+    /// - `owner_uid = None`      → 跨账号清理（仅按 task_type 过滤）
+    pub fn remove_tasks_by_type_owner(
+        &self,
+        task_type: &str,
+        owner_uid: Option<u64>,
+    ) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = match owner_uid {
+            Some(uid) => conn.execute(
+                "DELETE FROM task_history WHERE task_type = ?1 AND owner_uid = ?2",
+                params![task_type, uid as i64],
+            )?,
+            None => conn.execute(
+                "DELETE FROM task_history WHERE task_type = ?1",
+                params![task_type],
+            )?,
+        };
+
+        if deleted > 0 {
+            info!(
+                "已从历史数据库中删除 {} 个 {} 类型任务（owner_uid={:?}, 无状态过滤）",
+                deleted, task_type, owner_uid
+            );
+        }
+        Ok(deleted)
+    }
+
+    /// 按 owner_uid 删除全部文件夹历史（用于账号级清理）
+    pub fn remove_folders_by_owner(&self, owner_uid: u64) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = conn.execute(
+            "DELETE FROM folder_history WHERE owner_uid = ?1",
+            params![owner_uid as i64],
+        )?;
+
+        if deleted > 0 {
+            info!(
+                "已从历史数据库中删除 {} 个文件夹历史（owner_uid={}）",
+                deleted, owner_uid
             );
         }
         Ok(deleted)
@@ -949,13 +1058,13 @@ impl HistoryDbManager {
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
-                transfer_task_id, pending_files_json
+                transfer_task_id, pending_files_json, owner_uid
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18
+                ?17, ?18, ?19
             )
             "#,
             params![
@@ -977,6 +1086,8 @@ impl HistoryDbManager {
                 folder.error,
                 folder.transfer_task_id,
                 pending_files_json,
+                // 🔥 多账号归属：Some(0) 也当 None 写入
+                folder.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
             ],
         )?;
 
@@ -1006,13 +1117,13 @@ impl HistoryDbManager {
                     total_files, total_size, created_count, completed_count, downloaded_size,
                     scan_completed, scan_progress,
                     created_at, started_at, completed_at, error,
-                    transfer_task_id, pending_files_json
+                    transfer_task_id, pending_files_json, owner_uid
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5,
                     ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12,
                     ?13, ?14, ?15, ?16,
-                    ?17, ?18
+                    ?17, ?18, ?19
                 )
                 "#,
             )?;
@@ -1044,6 +1155,8 @@ impl HistoryDbManager {
                     folder.error,
                     folder.transfer_task_id,
                     pending_files_json,
+                    // 🔥 多账号归属：Some(0) 也当 None 写入
+                    folder.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
                 ])?;
                 count += 1;
             }
@@ -1068,7 +1181,7 @@ impl HistoryDbManager {
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
-                transfer_task_id, pending_files_json
+                transfer_task_id, pending_files_json, owner_uid
             FROM folder_history
             ORDER BY completed_at DESC
             "#,
@@ -1094,6 +1207,7 @@ impl HistoryDbManager {
                 error: row.get(15)?,
                 transfer_task_id: row.get(16)?,
                 pending_files_json: row.get(17)?,
+                owner_uid: row.get(18)?,
             })
         })?;
 
@@ -1163,6 +1277,36 @@ impl HistoryDbManager {
 
         if deleted > 0 {
             info!("已从历史数据库中删除 {} 个已完成的文件夹", deleted);
+        }
+        Ok(deleted)
+    }
+
+    /// 删除指定 owner_uid 下已完成的文件夹历史
+    ///
+    /// - `owner_uid = Some(uid)` → 仅删该账号的记录
+    /// - `owner_uid = None`      → 行为同 `remove_completed_folders`
+    pub fn remove_completed_folders_for_owner(&self, owner_uid: Option<u64>) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = match owner_uid {
+            Some(uid) => conn.execute(
+                "DELETE FROM folder_history WHERE status = 'completed' AND owner_uid = ?1",
+                params![uid as i64],
+            )?,
+            None => conn.execute(
+                "DELETE FROM folder_history WHERE status = 'completed'",
+                [],
+            )?,
+        };
+
+        if deleted > 0 {
+            info!(
+                "已从历史数据库中删除 {} 个已完成的文件夹（owner_uid={:?}）",
+                deleted, owner_uid
+            );
         }
         Ok(deleted)
     }
@@ -1300,6 +1444,10 @@ impl HistoryDbManager {
             encrypt_enabled: false,
             is_encrypted: false,
             encryption_key_version: None,
+            // 🔥 多账号归属：从列读出；NULL 行仍返 None、
+            // 由上游恢复逻辑按迁移矩阵“分支 C”回填 active_uid。
+            owner_uid: row.owner_uid.map(|u| u as u64),
+            failure_reason: None,
         })
     }
 
@@ -1339,6 +1487,9 @@ impl HistoryDbManager {
             completed_at: row.completed_at,
             error: row.error,
             transfer_task_id: row.transfer_task_id,
+            // 🔥 多账号归属：从列读出
+            owner_uid: row.owner_uid.map(|u| u as u64),
+            failure_reason: None,
         })
     }
 }
@@ -1383,6 +1534,8 @@ struct TaskHistoryRow {
     temp_dir: Option<String>,
     cleanup_status: Option<String>,
     share_root_path: Option<String>,
+    /// 多账号归属 UID；NULL 行视作历史遗留
+    owner_uid: Option<i64>,
 }
 
 /// 文件夹历史行
@@ -1405,6 +1558,8 @@ struct FolderHistoryRow {
     error: Option<String>,
     transfer_task_id: Option<String>,
     pending_files_json: Option<String>,
+    /// 多账号归属 UID
+    owner_uid: Option<i64>,
 }
 
 // ========================================================================

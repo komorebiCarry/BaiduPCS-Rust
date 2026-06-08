@@ -50,6 +50,12 @@ pub struct BackupConfig {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// 更新时间
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// 🔥 多账号归属 UID（持久化层 `u64`）
+    ///
+    /// 旧备份配置 `None`；创建时绑定，绑定后不可变。
+    /// 触发时使用对应账号客户端；账号删除后该配置进入 readonly 分支。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
 }
 
 impl BackupConfig {
@@ -120,13 +126,13 @@ impl BackupConfig {
     /// 获取有效的同步冲突策略（考虑默认值）
     pub fn effective_sync_strategy(&self) -> SyncConflictStrategy {
         self.sync_conflict_strategy
-            .unwrap_or(SyncConflictStrategy::default())
+            .unwrap_or_default()
     }
 
     /// 获取有效的同步初始化模式（考虑默认值）
     pub fn effective_sync_init_mode(&self) -> SyncInitMode {
         self.sync_init_mode
-            .unwrap_or(SyncInitMode::default())
+            .unwrap_or_default()
     }
 }
 
@@ -152,41 +158,35 @@ pub enum BackupDirection {
 /// Sync 模式下传输层一律使用 Overwrite，冲突语义完全由此策略在 Stage 2 控制。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SyncConflictStrategy {
     /// 本地版本优先（本地覆盖远端）
     LocalWins,
     /// 远端版本优先（远端覆盖本地）
     RemoteWins,
     /// 较新的版本优先（按 mtime 比较，默认）
+    #[default]
     NewerWins,
     /// 跳过冲突文件（不处理，记录日志）
     Skip,
 }
 
-impl Default for SyncConflictStrategy {
-    fn default() -> Self {
-        Self::NewerWins
-    }
-}
 
 /// 首次初始化模式（仅 Sync 方向使用）
 ///
 /// 大目录首次启用同步时，控制 Case A3（两端都有文件、无 SyncState）的处理方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SyncInitMode {
     /// 自动检测：md5 可比则比对，否则走冲突策略（默认）
+    #[default]
     AutoDetect,
     /// 采纳当前状态为基线：两端都有的文件直接建 SyncState，不传输
     /// 适合"两端已基本一致"的场景，避免首次启用时大量伪冲突
     AdoptBothSides,
 }
 
-impl Default for SyncInitMode {
-    fn default() -> Self {
-        Self::AutoDetect
-    }
-}
 
 /// 监听配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +422,15 @@ pub struct CreateBackupConfigRequest {
     /// 首次初始化模式（仅 direction=Sync 时有效）
     #[serde(default)]
     pub sync_init_mode: Option<SyncInitMode>,
+    /// 显式 owner_uid（多账号场景）
+    /// - `Some(uid)` → 在指定账号下创建配置
+    /// - `None` → 回退到 `state.active_uid()`（由 handler 注入）
+    ///
+    /// 🔥 兼容前端两种字段名
+    /// (`uid` / `owner_uid`)，避免出现历史前端旧版本/新版本字段不一致时
+    /// 创建出 `owner_uid=None` 的孤儿配置。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 更新备份配置请求
@@ -511,17 +520,18 @@ mod tests {
                 sync_conflict_strategy: None,
                 sync_init_mode: None,
                 needs_full_sync: false,
+                owner_uid: None,
                 enabled: true,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
-            
+
             // 序列化为 JSON
             let serialized = serde_json::to_string(&config).unwrap();
-            
+
             // 反序列化
             let deserialized: BackupConfig = serde_json::from_str(&serialized).unwrap();
-            
+
             // 验证策略字段正确保存和加载
             prop_assert_eq!(config.upload_conflict_strategy, deserialized.upload_conflict_strategy);
             prop_assert_eq!(config.download_conflict_strategy, deserialized.download_conflict_strategy);
@@ -547,6 +557,7 @@ mod tests {
                 download_conflict_strategy: download_strategy,
                 sync_conflict_strategy: None,
                 sync_init_mode: None,
+                uid: None,
             };
 
             // 序列化为 JSON
@@ -554,7 +565,7 @@ mod tests {
 
             // 反序列化
             let deserialized: CreateBackupConfigRequest = serde_json::from_str(&serialized).unwrap();
-            
+
             // 验证策略字段正确保存和加载
             prop_assert_eq!(request.upload_conflict_strategy, deserialized.upload_conflict_strategy);
             prop_assert_eq!(request.download_conflict_strategy, deserialized.download_conflict_strategy);
@@ -585,7 +596,7 @@ mod tests {
 
             // 反序列化
             let deserialized: UpdateBackupConfigRequest = serde_json::from_str(&serialized).unwrap();
-            
+
             // 验证策略字段正确保存和加载
             prop_assert_eq!(request.upload_conflict_strategy, deserialized.upload_conflict_strategy);
             prop_assert_eq!(request.download_conflict_strategy, deserialized.download_conflict_strategy);
@@ -650,6 +661,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -685,6 +697,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -723,6 +736,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -757,6 +771,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -791,6 +806,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -823,6 +839,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -849,6 +866,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -878,6 +896,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -904,6 +923,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
             enabled: true,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

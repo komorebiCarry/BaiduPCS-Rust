@@ -10,17 +10,14 @@ use serde::{Deserialize, Serialize};
 /// 代理类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ProxyType {
+    #[default]
     None,
     Http,
     Socks5,
 }
 
-impl Default for ProxyType {
-    fn default() -> Self {
-        ProxyType::None
-    }
-}
 
 /// 代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

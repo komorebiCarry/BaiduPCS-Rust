@@ -29,13 +29,13 @@ where
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    
+
     // 获取原始文件名
     let filename = path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    
+
     // 解析文件名，提取基础名称和扩展名
     // 同时检查是否已经是 "name (N)" 格式
     let (base_name, extension) = parse_filename(&filename);
@@ -69,7 +69,7 @@ where
 
 /// 解析文件名，提取基础名称和扩展名
 /// 如果文件名已经是 "name (N)" 格式，则提取原始名称
-/// 
+///
 /// # 示例
 /// - "file.txt" -> ("file", Some("txt"))
 /// - "file (1).txt" -> ("file", Some("txt"))
@@ -85,13 +85,12 @@ fn parse_filename(filename: &str) -> (String, Option<String>) {
     } else {
         (filename, None)
     };
-    
+
     // 检查是否已经是 "name (N)" 格式
     // 使用正则表达式匹配 " (数字)" 结尾
     if let Some(paren_pos) = name_part.rfind(" (") {
         let after_paren = &name_part[paren_pos + 2..];
-        if after_paren.ends_with(')') {
-            let number_part = &after_paren[..after_paren.len() - 1];
+        if let Some(number_part) = after_paren.strip_suffix(')') {
             // 检查括号内是否全是数字
             if number_part.chars().all(|c| c.is_ascii_digit()) && !number_part.is_empty() {
                 // 提取原始基础名称（去掉 " (N)" 部分）
@@ -99,7 +98,7 @@ fn parse_filename(filename: &str) -> (String, Option<String>) {
             }
         }
     }
-    
+
     // 不是 "name (N)" 格式，直接返回
     (name_part.to_string(), extension)
 }
@@ -237,32 +236,32 @@ mod tests {
     }
 }
 
-    #[test]
-    fn test_incremental_rename_from_numbered() {
-        use std::collections::HashSet;
-        // 测试从已编号的文件继续递增
-        let existing = HashSet::from(["file.txt", "file (1).txt", "file (2).txt"]);
-        let result = generate_unique_path("file (1).txt", |p| existing.contains(p)).unwrap();
-        assert_eq!(result, "file (3).txt");
-    }
+#[test]
+fn test_incremental_rename_from_numbered() {
+    use std::collections::HashSet;
+    // 测试从已编号的文件继续递增
+    let existing = HashSet::from(["file.txt", "file (1).txt", "file (2).txt"]);
+    let result = generate_unique_path("file (1).txt", |p| existing.contains(p)).unwrap();
+    assert_eq!(result, "file (3).txt");
+}
 
-    #[test]
-    fn test_parse_filename_basic() {
-        assert_eq!(parse_filename("file.txt"), ("file".to_string(), Some("txt".to_string())));
-        assert_eq!(parse_filename("file"), ("file".to_string(), None));
-    }
+#[test]
+fn test_parse_filename_basic() {
+    assert_eq!(parse_filename("file.txt"), ("file".to_string(), Some("txt".to_string())));
+    assert_eq!(parse_filename("file"), ("file".to_string(), None));
+}
 
-    #[test]
-    fn test_parse_filename_numbered() {
-        assert_eq!(parse_filename("file (1).txt"), ("file".to_string(), Some("txt".to_string())));
-        assert_eq!(parse_filename("file (2).txt"), ("file".to_string(), Some("txt".to_string())));
-        assert_eq!(parse_filename("file (10).txt"), ("file".to_string(), Some("txt".to_string())));
-        assert_eq!(parse_filename("file (1)"), ("file".to_string(), None));
-    }
+#[test]
+fn test_parse_filename_numbered() {
+    assert_eq!(parse_filename("file (1).txt"), ("file".to_string(), Some("txt".to_string())));
+    assert_eq!(parse_filename("file (2).txt"), ("file".to_string(), Some("txt".to_string())));
+    assert_eq!(parse_filename("file (10).txt"), ("file".to_string(), Some("txt".to_string())));
+    assert_eq!(parse_filename("file (1)"), ("file".to_string(), None));
+}
 
-    #[test]
-    fn test_parse_filename_special_cases() {
-        // 括号内不是数字，不应该被解析为编号格式
-        assert_eq!(parse_filename("file (test).txt"), ("file (test)".to_string(), Some("txt".to_string())));
-        assert_eq!(parse_filename("file (a1).txt"), ("file (a1)".to_string(), Some("txt".to_string())));
-    }
+#[test]
+fn test_parse_filename_special_cases() {
+    // 括号内不是数字，不应该被解析为编号格式
+    assert_eq!(parse_filename("file (test).txt"), ("file (test)".to_string(), Some("txt".to_string())));
+    assert_eq!(parse_filename("file (a1).txt"), ("file (a1)".to_string(), Some("txt".to_string())));
+}

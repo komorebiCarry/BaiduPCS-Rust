@@ -13,7 +13,7 @@ use crate::autobackup::config::{SyncConflictStrategy, SyncInitMode};
 
 /// 生成同步计划
 ///
-/// 对每个 relative_path，按 §4.5.1 决策树生成动作：
+/// 对每个 relative_path，按决策树生成动作：
 /// - Case A: sync_state 不存在（首次发现的文件）
 /// - Case B: sync_state 存在，两端文件都存在
 /// - Case C: sync_state 存在，某端文件消失（tombstone）
@@ -563,7 +563,7 @@ fn resolve_conflict(
     }
 }
 
-/// NewerWins 精确语义（§4.2.1）
+/// NewerWins 精确语义
 fn resolve_newer_wins(
     path: &str,
     local: &LocalScannedFile,
@@ -676,7 +676,7 @@ fn is_local_mtime_backfill(local: &LocalScannedFile, state: &SyncStateRow) -> bo
 /// 2. remote_fs_id/remote_size 全为 None（首次上传后，远端信息完全缺失）
 ///    此时通过 local_size 与远端 size 宽松匹配判断是否为同一文件
 fn is_remote_mtime_backfill(remote: &RemoteScannedFile, state: &SyncStateRow) -> bool {
-    if !state.remote_mtime.is_none() {
+    if state.remote_mtime.is_some() {
         return false;
     }
     // 场景 1：remote_fs_id/remote_size 已有且匹配

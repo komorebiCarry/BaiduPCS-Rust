@@ -106,24 +106,42 @@ pub async fn reset_to_recommended(
     *app_state.config.write().await = config.clone();
 
     // 🔧 动态更新下载管理器配置
-    let manager_guard = app_state.download_manager.read().await;
-    if let Some(manager) = manager_guard.as_ref() {
-        manager.update_max_threads(config.download.max_global_threads);
+    //
+    // 按每账号 effective 配置（基于 custom_config + auto_apply_recommended）更新，
+    // 避免覆盖账号级配置。
+    for (uid, manager) in app_state.list_download_managers() {
+        let user_for_uid: Option<crate::auth::UserAuth> = {
+            let am = app_state.account_manager.lock().await;
+            am.get_user(uid).cloned()
+        };
+        let (eff_dl_threads, eff_dl_concurrent, _eff_dl_retries, _, _, _) =
+            if let Some(ref user) = user_for_uid {
+                crate::server::state::resolve_effective_account_config(user, &config)
+            } else {
+                (
+                    config.download.max_global_threads,
+                    config.download.max_concurrent_tasks,
+                    config.download.max_retries,
+                    config.upload.max_global_threads,
+                    config.upload.max_concurrent_tasks,
+                    config.upload.max_retries,
+                )
+            };
+        manager.update_max_threads(eff_dl_threads);
         manager
-            .update_max_concurrent_tasks(config.download.max_concurrent_tasks)
+            .update_max_concurrent_tasks(eff_dl_concurrent)
             .await;
-        // 更新下载目录
         manager
             .update_download_dir(config.download.download_dir.clone())
             .await;
         info!(
-            "✓ 下载管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 下载目录={:?}",
-            config.download.max_global_threads,
-            config.download.max_concurrent_tasks,
+            "✓ 下载管理器已更新为推荐配置 (uid={}): 线程数={}, 最大任务数={}, 下载目录={:?}",
+            uid.raw(),
+            eff_dl_threads,
+            eff_dl_concurrent,
             config.download.download_dir
         );
     }
-    drop(manager_guard);
 
     // 🔧 动态更新文件夹下载管理器的下载目录
     app_state
@@ -131,20 +149,38 @@ pub async fn reset_to_recommended(
         .update_download_dir(config.download.download_dir.clone())
         .await;
 
-    // 🔧 动态更新上传管理器配置
-    let upload_manager_guard = app_state.upload_manager.read().await;
-    if let Some(upload_manager) = upload_manager_guard.as_ref() {
-        upload_manager.update_max_threads(config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(config.upload.max_concurrent_tasks).await;
-        upload_manager.update_max_retries(config.upload.max_retries);
+    // 🔧 动态更新上传管理器配置（按每账号 effective 配置）
+    for (uid, upload_manager) in app_state.list_upload_managers() {
+        let user_for_uid: Option<crate::auth::UserAuth> = {
+            let am = app_state.account_manager.lock().await;
+            am.get_user(uid).cloned()
+        };
+        let (_, _, _, eff_up_threads, eff_up_concurrent, eff_up_retries) =
+            if let Some(ref user) = user_for_uid {
+                crate::server::state::resolve_effective_account_config(user, &config)
+            } else {
+                (
+                    config.download.max_global_threads,
+                    config.download.max_concurrent_tasks,
+                    config.download.max_retries,
+                    config.upload.max_global_threads,
+                    config.upload.max_concurrent_tasks,
+                    config.upload.max_retries,
+                )
+            };
+        upload_manager.update_max_threads(eff_up_threads);
+        upload_manager
+            .update_max_concurrent_tasks(eff_up_concurrent)
+            .await;
+        upload_manager.update_max_retries(eff_up_retries);
         info!(
-            "✓ 上传管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 最大重试={}",
-            config.upload.max_global_threads,
-            config.upload.max_concurrent_tasks,
-            config.upload.max_retries
+            "✓ 上传管理器已更新为推荐配置 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
+            uid.raw(),
+            eff_up_threads,
+            eff_up_concurrent,
+            eff_up_retries
         );
     }
-    drop(upload_manager_guard);
 
     info!("已恢复为推荐配置: VIP类型={:?}", vip_type);
     Ok(Json(ApiResponse::success("已恢复为推荐配置".to_string())))
@@ -160,15 +196,26 @@ pub async fn update_config(
 
     // 基本验证
     if new_config.download.max_global_threads == 0 {
-        return Err(ApiError::BadRequest("线程数必须大于0".to_string()));
+        return Err(ApiError::BadRequest("download.max_global_threads 必须大于 0".to_string()));
     }
 
     if new_config.download.chunk_size_mb == 0 {
-        return Err(ApiError::BadRequest("分片大小必须大于0".to_string()));
+        return Err(ApiError::BadRequest("download.chunk_size_mb 必须大于 0".to_string()));
     }
 
     if new_config.download.max_concurrent_tasks == 0 {
-        return Err(ApiError::BadRequest("最大同时下载数必须大于0".to_string()));
+        return Err(ApiError::BadRequest("download.max_concurrent_tasks 必须大于 0".to_string()));
+    }
+
+    // 补齐 upload 侧校验（避免 upload 接受 0 会导致上传分片调度阀门关闭，所有上传永久阻塞）。
+    if new_config.upload.max_global_threads == 0 {
+        return Err(ApiError::BadRequest("upload.max_global_threads 必须大于 0".to_string()));
+    }
+    if new_config.upload.chunk_size_mb == 0 {
+        return Err(ApiError::BadRequest("upload.chunk_size_mb 必须大于 0".to_string()));
+    }
+    if new_config.upload.max_concurrent_tasks == 0 {
+        return Err(ApiError::BadRequest("upload.max_concurrent_tasks 必须大于 0".to_string()));
     }
 
     // 获取当前用户的 VIP 类型并验证
@@ -204,27 +251,53 @@ pub async fn update_config(
     // 更新内存中的配置
     *app_state.config.write().await = new_config.clone();
 
-    // 🔧 动态更新下载管理器配置（无需重启，不影响正在进行的任务）
-    let manager_guard = app_state.download_manager.read().await;
-    if let Some(manager) = manager_guard.as_ref() {
-        manager.update_max_threads(new_config.download.max_global_threads);
-        manager
-            .update_max_concurrent_tasks(new_config.download.max_concurrent_tasks)
-            .await;
-        // 更新下载目录
-        manager
-            .update_download_dir(new_config.download.download_dir.clone())
-            .await;
-        info!(
-            "✓ 下载管理器配置已动态更新: 线程数={}, 最大任务数={}, 下载目录={:?}",
-            new_config.download.max_global_threads,
-            new_config.download.max_concurrent_tasks,
-            new_config.download.download_dir
-        );
-    } else {
-        info!("下载管理器未初始化，配置将在下次登录时生效");
+    // 🔧 动态更新下载/上传管理器配置
+    //
+    // 按每账号 `UserAuth.custom_config` 重新计算 effective 配置后，用每账号自己的值更新 manager。
+    //
+    // 全局变量：仅 `download_dir` 是真正"机器级"配置（用户希望全账号一致），保留
+    // 原行为对所有 manager 生效；线程数 / 最大任务数 / 重试次数三个均按账号 effective
+    // 走 — 这等价于"全局配置仅影响那些 `auto_apply_recommended=false` 且未设自定义
+    // 字段的账号"（因为它们 effective 仍走 custom_config 默认值）。
+    {
+        let dms = app_state.list_download_managers();
+        if dms.is_empty() {
+            info!("下载管理器未初始化，配置将在下次登录时生效");
+        } else {
+            for (uid, manager) in dms {
+                let user_for_uid: Option<crate::auth::UserAuth> = {
+                    let am = app_state.account_manager.lock().await;
+                    am.get_user(uid).cloned()
+                };
+                let (eff_dl_threads, eff_dl_concurrent, _eff_dl_retries, _, _, _) =
+                    if let Some(ref user) = user_for_uid {
+                        crate::server::state::resolve_effective_account_config(user, &new_config)
+                    } else {
+                        // 没拿到 UserAuth → 退回全局值（极端情况）
+                        (
+                            new_config.download.max_global_threads,
+                            new_config.download.max_concurrent_tasks,
+                            new_config.download.max_retries,
+                            new_config.upload.max_global_threads,
+                            new_config.upload.max_concurrent_tasks,
+                            new_config.upload.max_retries,
+                        )
+                    };
+                manager.update_max_threads(eff_dl_threads);
+                manager.update_max_concurrent_tasks(eff_dl_concurrent).await;
+                manager
+                    .update_download_dir(new_config.download.download_dir.clone())
+                    .await;
+                info!(
+                    "✓ 下载管理器配置已动态更新 (uid={}): 线程数={}, 最大任务数={}, 下载目录={:?}",
+                    uid.raw(),
+                    eff_dl_threads,
+                    eff_dl_concurrent,
+                    new_config.download.download_dir
+                );
+            }
+        }
     }
-    drop(manager_guard);
 
     // 🔧 动态更新文件夹下载管理器的下载目录
     app_state
@@ -236,22 +309,45 @@ pub async fn update_config(
         new_config.download.download_dir
     );
 
-    // 🔧 动态更新上传管理器配置（无需重启，不影响正在进行的任务）
-    let upload_manager_guard = app_state.upload_manager.read().await;
-    if let Some(upload_manager) = upload_manager_guard.as_ref() {
-        upload_manager.update_max_threads(new_config.upload.max_global_threads);
-        upload_manager.update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks).await;
-        upload_manager.update_max_retries(new_config.upload.max_retries);
-        info!(
-            "✓ 上传管理器配置已动态更新: 线程数={}, 最大任务数={}, 最大重试={}",
-            new_config.upload.max_global_threads,
-            new_config.upload.max_concurrent_tasks,
-            new_config.upload.max_retries
-        );
-    } else {
-        info!("上传管理器未初始化，配置将在下次登录时生效");
+    // 🔧 动态更新上传管理器配置（按账号 effective 配置）
+    {
+        let ums = app_state.list_upload_managers();
+        if ums.is_empty() {
+            info!("上传管理器未初始化，配置将在下次登录时生效");
+        } else {
+            for (uid, upload_manager) in ums {
+                let user_for_uid: Option<crate::auth::UserAuth> = {
+                    let am = app_state.account_manager.lock().await;
+                    am.get_user(uid).cloned()
+                };
+                let (_, _, _, eff_up_threads, eff_up_concurrent, eff_up_retries) =
+                    if let Some(ref user) = user_for_uid {
+                        crate::server::state::resolve_effective_account_config(user, &new_config)
+                    } else {
+                        (
+                            new_config.download.max_global_threads,
+                            new_config.download.max_concurrent_tasks,
+                            new_config.download.max_retries,
+                            new_config.upload.max_global_threads,
+                            new_config.upload.max_concurrent_tasks,
+                            new_config.upload.max_retries,
+                        )
+                    };
+                upload_manager.update_max_threads(eff_up_threads);
+                upload_manager
+                    .update_max_concurrent_tasks(eff_up_concurrent)
+                    .await;
+                upload_manager.update_max_retries(eff_up_retries);
+                info!(
+                    "✓ 上传管理器配置已动态更新 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
+                    uid.raw(),
+                    eff_up_threads,
+                    eff_up_concurrent,
+                    eff_up_retries
+                );
+            }
+        }
     }
-    drop(upload_manager_guard);
 
     // 🔧 代理配置热更新（如果代理配置发生变更）
     if proxy_changed {
@@ -288,7 +384,8 @@ pub async fn update_config(
         }
 
         // 2. 重建 NetdiskClient（如果已登录）
-        let user_auth = app_state.current_user.read().await.clone();
+        // 按 active_uid → AccountManager 取，不再读 current_user
+        let user_auth = app_state.active_user_auth().await;
         if let Some(user) = user_auth {
             match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
                 Ok(new_client) => {
@@ -300,64 +397,128 @@ pub async fn update_config(
         }
 
         // 3. 更新 DownloadEngine 代理配置和共享客户端
-        let dm_guard = app_state.download_manager.read().await;
-        if let Some(dm) = dm_guard.as_ref() {
+        //
+        // 遍历全部已登录 per-uid DownloadManager（按 `Arc::ptr_eq` 去重，per-uid
+        // 独立实例下每个 Arc 只出现一次）。代理是机器级配置，所有账号
+        // 的 DownloadEngine 都应该走同一代理。
+        for (uid, dm) in app_state.list_download_managers() {
             dm.update_proxy_config(proxy_for_client);
-            info!("✓ DownloadEngine 代理配置和共享客户端已热更新");
+            info!(
+                "✓ DownloadEngine uid={} 代理配置和共享客户端已热更新",
+                uid.raw()
+            );
         }
-        drop(dm_guard);
 
         // 4. 更新 UploadManager 共享 NetdiskClient（已调度的上传任务在下次重试时自动生效）
-        let um_guard = app_state.upload_manager.read().await;
-        if let Some(um) = um_guard.as_ref() {
-            let user_auth = app_state.current_user.read().await.clone();
-            if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
-                    Ok(new_client) => {
-                        um.update_netdisk_client(new_client);
-                        info!("✓ UploadManager NetdiskClient 已热更新");
-                    }
-                    Err(e) => warn!("UploadManager NetdiskClient 热更新失败: {}", e),
+        //
+        // 遍历所有 per-uid UploadManager，并按各自
+        // `UserAuth` 重建 client（每账号 cookies/bduss 不同，不能共用一个 user）。
+        for (uid, um) in app_state.list_upload_managers() {
+            let user_for_uid: Option<crate::auth::UserAuth> = {
+                let am = app_state.account_manager.lock().await;
+                am.get_user(uid).cloned()
+            };
+            let Some(user) = user_for_uid else {
+                warn!("UploadManager uid={} 代理热更新跳过：无法取到 UserAuth", uid.raw());
+                continue;
+            };
+            match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                Ok(new_client) => {
+                    um.update_netdisk_client(new_client);
+                    info!("✓ UploadManager uid={} NetdiskClient 已热更新", uid.raw());
                 }
+                Err(e) => warn!(
+                    "UploadManager uid={} NetdiskClient 热更新失败: {}",
+                    uid.raw(),
+                    e
+                ),
             }
         }
-        drop(um_guard);
 
         // 5. 更新 TransferManager 共享 NetdiskClient
-        let tm_guard = app_state.transfer_manager.read().await;
-        if let Some(tm) = tm_guard.as_ref() {
-            let user_auth = app_state.current_user.read().await.clone();
-            if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
-                    Ok(new_client) => {
-                        tm.update_netdisk_client(new_client);
-                        info!("✓ TransferManager NetdiskClient 已热更新");
-                    }
-                    Err(e) => warn!("TransferManager NetdiskClient 热更新失败: {}", e),
+        //
+        // 遍历所有 per-uid TransferManager，按各自 `UserAuth` 重建 client。
+        for (uid, tm) in app_state.list_transfer_managers() {
+            let user_for_uid: Option<crate::auth::UserAuth> = {
+                let am = app_state.account_manager.lock().await;
+                am.get_user(uid).cloned()
+            };
+            let Some(user) = user_for_uid else {
+                warn!("TransferManager uid={} 代理热更新跳过：无法取到 UserAuth", uid.raw());
+                continue;
+            };
+            match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                Ok(new_client) => {
+                    tm.update_netdisk_client(new_client);
+                    info!("✓ TransferManager uid={} NetdiskClient 已热更新", uid.raw());
                 }
+                Err(e) => warn!(
+                    "TransferManager uid={} NetdiskClient 热更新失败: {}",
+                    uid.raw(),
+                    e
+                ),
             }
         }
-        drop(tm_guard);
 
-        // 6. 更新 CloudDlMonitor 共享 NetdiskClient
-        let monitor_guard = app_state.cloud_dl_monitor.read().await;
-        if let Some(monitor) = monitor_guard.as_ref() {
-            let user_auth = app_state.current_user.read().await.clone();
-            if let Some(user) = user_auth {
-                match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+        // 5.5) 同步刷新 client_pool，让后续按 uid 取 client 的代码路径
+        //      （e.g. 各 manager `new_for_account` / 创建任务时按 uid 取 client）
+        //      也使用新代理后的客户端。
+        {
+            let am = app_state.account_manager.lock().await;
+            let users = am.list_users().to_vec();
+            drop(am);
+            for user in users {
+                let uid = crate::auth::Uid::new(user.uid);
+                match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user,
+                    proxy_for_client,
+                    fallback_for_client.clone(),
+                ) {
                     Ok(new_client) => {
-                        monitor.update_client(new_client);
-                        info!("✓ CloudDlMonitor NetdiskClient 已热更新");
+                        let mut pool = app_state.client_pool.write().await;
+                        pool.add_client(uid, std::sync::Arc::new(new_client));
+                        info!("✓ ClientPool uid={} NetdiskClient 已热更新", uid.raw());
                     }
-                    Err(e) => warn!("CloudDlMonitor NetdiskClient 热更新失败: {}", e),
+                    Err(e) => warn!(
+                        "ClientPool uid={} NetdiskClient 热更新失败: {}",
+                        uid.raw(),
+                        e
+                    ),
                 }
             }
         }
-        drop(monitor_guard);
+
+        // 6. 更新 CloudDlMonitor 共享 NetdiskClient（遍历所有账号）
+        // 严格按 monitor 的 uid 取该账号 UserAuth；不再 fallback
+        // 到 current_user（活跃账号），否则会把 uid=A 的 cookie 注入 uid=B 的 monitor
+        // 导致后续轮询/事件串账号。
+        for (uid, monitor) in app_state.iter_cloud_dl_monitors() {
+            let user_auth: Option<crate::auth::UserAuth> = {
+                let am = app_state.account_manager.lock().await;
+                am.get_user(uid).cloned()
+            };
+
+            let Some(user) = user_auth else {
+                warn!(
+                    "CloudDlMonitor uid={} 代理热更新跳过：AccountManager 中无该账号（已删除？）",
+                    uid.raw()
+                );
+                continue;
+            };
+
+            match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
+                Ok(new_client) => {
+                    monitor.update_client(new_client);
+                    info!("✓ CloudDlMonitor uid={} NetdiskClient 已热更新", uid.raw());
+                }
+                Err(e) => warn!("CloudDlMonitor uid={} NetdiskClient 热更新失败: {}", uid.raw(), e),
+            }
+        }
 
         // 7. 更新 FolderDownloadManager 共享 NetdiskClient
+        // 按 active_uid → AccountManager 取，不再读 current_user
         {
-            let user_auth = app_state.current_user.read().await.clone();
+            let user_auth = app_state.active_user_auth().await;
             if let Some(user) = user_auth {
                 match crate::netdisk::NetdiskClient::new_with_proxy(user, proxy_for_client, fallback_for_client.clone()) {
                     Ok(new_client) => {
@@ -503,14 +664,14 @@ pub async fn set_default_download_dir(
     *app_state.config.write().await = config.clone();
 
     // 同步更新下载管理器的下载目录
-    let manager_guard = app_state.download_manager.read().await;
-    if let Some(manager) = manager_guard.as_ref() {
+    //
+    // 遍历所有 per-uid manager。
+    for (uid, manager) in app_state.list_download_managers() {
         manager
             .update_download_dir(config.download.download_dir.clone())
             .await;
-        info!("✓ 下载管理器下载目录已更新");
+        info!("✓ 下载管理器下载目录已更新 (uid={})", uid.raw());
     }
-    drop(manager_guard);
 
     // 同步更新文件夹下载管理器的下载目录
     app_state
@@ -553,7 +714,7 @@ pub async fn get_transfer_config(
         )
     };
 
-    let path_str = recent_save_path.as_ref().map(|s| s.as_str()).unwrap_or("");
+    let path_str = recent_save_path.as_deref().unwrap_or("");
 
     if path_str.is_empty() || path_str == "/" {
         return Ok(Json(ApiResponse::success(TransferConfigResponse {
@@ -563,9 +724,8 @@ pub async fn get_transfer_config(
         })));
     }
 
-    // 使用单例网盘客户端
-    let client_lock = app_state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match app_state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -656,14 +816,14 @@ pub async fn update_transfer_config(
     *app_state.config.write().await = config.clone();
 
     // 同步更新转存管理器的配置
-    let transfer_manager_guard = app_state.transfer_manager.read().await;
-    if let Some(transfer_manager) = transfer_manager_guard.as_ref() {
+    //
+    // 遍历所有 per-uid manager。
+    for (uid, transfer_manager) in app_state.list_transfer_managers() {
         transfer_manager
             .update_config(config.transfer.clone())
             .await;
-        info!("✓ 转存管理器配置已更新");
+        info!("✓ 转存管理器配置已更新 (uid={})", uid.raw());
     }
-    drop(transfer_manager_guard);
 
     Ok(Json(ApiResponse::success("转存配置已更新".to_string())))
 }

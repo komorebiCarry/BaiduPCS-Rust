@@ -58,6 +58,141 @@ pub struct AppConfig {
     /// 冲突策略配置
     #[serde(default)]
     pub conflict_strategy: ConflictStrategyConfig,
+    /// 多账号资源配额配置
+    #[serde(default)]
+    pub multi_account_budget: MultiAccountBudgetConfig,
+    /// 多账号 VIP 推荐配置表
+    #[serde(default)]
+    pub multi_account_vip_recommended: MultiAccountVipRecommendedConfig,
+}
+
+// ============================================================================
+// 多账号资源配额配置
+// ============================================================================
+
+/// 机器总上限与 VIP 权重
+///
+/// `download_machine_budget` / `upload_machine_budget` 支持 `"auto"` 或具体数字。
+/// `auto` 时由代码按 `cpu_cores × 8` 推算（见 `MachineBudget::resolve`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiAccountBudgetConfig {
+    #[serde(default = "default_machine_budget")]
+    pub download_machine_budget: MachineBudget,
+    #[serde(default = "default_machine_budget")]
+    pub upload_machine_budget: MachineBudget,
+    #[serde(default = "default_weight_normal")]
+    pub weight_normal: usize,
+    #[serde(default = "default_weight_vip")]
+    pub weight_vip: usize,
+    #[serde(default = "default_weight_svip")]
+    pub weight_svip: usize,
+}
+
+/// 机器配额：可填 `"auto"` 或整数
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MachineBudget {
+    Auto(AutoTag),
+    Manual(usize),
+}
+
+/// `"auto"` 字符串的可序列化占位
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AutoTag {
+    #[serde(rename = "auto")]
+    Auto,
+}
+
+impl MachineBudget {
+    /// 解析为实际数值；`Auto` 用 `cpu_cores × 8`
+    pub fn resolve(&self) -> usize {
+        match self {
+            MachineBudget::Manual(n) => (*n).max(1),
+            MachineBudget::Auto(_) => {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .max(1);
+                cores * 8
+            }
+        }
+    }
+}
+
+fn default_machine_budget() -> MachineBudget {
+    MachineBudget::Auto(AutoTag::Auto)
+}
+fn default_weight_normal() -> usize {
+    1
+}
+fn default_weight_vip() -> usize {
+    3
+}
+fn default_weight_svip() -> usize {
+    5
+}
+
+impl Default for MultiAccountBudgetConfig {
+    fn default() -> Self {
+        Self {
+            download_machine_budget: default_machine_budget(),
+            upload_machine_budget: default_machine_budget(),
+            weight_normal: default_weight_normal(),
+            weight_vip: default_weight_vip(),
+            weight_svip: default_weight_svip(),
+        }
+    }
+}
+
+/// VIP 推荐配置表：普通/VIP/SVIP 三档（下载 + 上传共用同一档表）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiAccountVipRecommendedConfig {
+    #[serde(default = "default_recommended_normal")]
+    pub normal: VipRecommendedEntry,
+    #[serde(default = "default_recommended_vip")]
+    pub vip: VipRecommendedEntry,
+    #[serde(default = "default_recommended_svip")]
+    pub svip: VipRecommendedEntry,
+}
+
+/// 单档 VIP 推荐值
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VipRecommendedEntry {
+    pub threads: usize,
+    pub chunk_size_mb: u64,
+    pub max_concurrent_tasks: usize,
+}
+
+fn default_recommended_normal() -> VipRecommendedEntry {
+    VipRecommendedEntry {
+        threads: 1,
+        chunk_size_mb: 4,
+        max_concurrent_tasks: 1,
+    }
+}
+fn default_recommended_vip() -> VipRecommendedEntry {
+    VipRecommendedEntry {
+        threads: 10,
+        chunk_size_mb: 4,
+        max_concurrent_tasks: 3,
+    }
+}
+fn default_recommended_svip() -> VipRecommendedEntry {
+    VipRecommendedEntry {
+        threads: 15,
+        chunk_size_mb: 5,
+        max_concurrent_tasks: 5,
+    }
+}
+
+impl Default for MultiAccountVipRecommendedConfig {
+    fn default() -> Self {
+        Self {
+            normal: default_recommended_normal(),
+            vip: default_recommended_vip(),
+            svip: default_recommended_svip(),
+        }
+    }
 }
 
 /// 扫描配置
@@ -115,18 +250,12 @@ impl Default for ConflictStrategyConfig {
 
 /// 网络配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
 }
 
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            proxy: ProxyConfig::default(),
-        }
-    }
-}
 
 /// 自动备份配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,6 +803,7 @@ impl Default for TransferConfig {
 
 /// 文件系统配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct FilesystemConfig {
     /// 允许访问的路径白名单（空表示允许所有）
     #[serde(default)]
@@ -695,17 +825,6 @@ pub struct FilesystemConfig {
     pub enforce_allowlist_on_followed_symlinks: bool,
 }
 
-impl Default for FilesystemConfig {
-    fn default() -> Self {
-        Self {
-            allowed_paths: vec![],
-            default_path: None,
-            show_hidden: false,
-            follow_symlinks: false,
-            enforce_allowlist_on_followed_symlinks: false,
-        }
-    }
-}
 
 impl FilesystemConfig {
     /// 校验文件系统配置的结构合法性
@@ -1001,7 +1120,7 @@ impl DownloadConfig {
         } else if file_size_bytes < 10 * MB {
             512 * KB // 5-10MB → 512KB
         } else if file_size_bytes < 50 * MB {
-            1 * MB // 10-50MB → 1MB
+            MB // 10-50MB → 1MB
         } else if file_size_bytes < 100 * MB {
             2 * MB // 50-100MB → 2MB
         } else if file_size_bytes < 500 * MB {
@@ -1027,13 +1146,13 @@ impl DownloadConfig {
                 file_size_limit_gb: 4,
             },
             VipType::Vip => VipRecommendedConfig {
-                threads: 5,    // 普通会员5个线程
+                threads: 10,   // 普通会员10个线程
                 chunk_size: 4, // 4MB 分片
                 max_tasks: 3,  // 可以同时下载3个文件
                 file_size_limit_gb: 10,
             },
             VipType::Svip => VipRecommendedConfig {
-                threads: 10,   // SVIP 10个线程（可调至20）
+                threads: 15,   // SVIP 15个线程（可调至20）
                 chunk_size: 5, // 5MB 分片
                 max_tasks: 5,  // 可以同时下载5个文件
                 file_size_limit_gb: 20,
@@ -1148,6 +1267,8 @@ impl Default for AppConfig {
             network: NetworkConfig::default(),
             scan: ScanConfig::default(),
             conflict_strategy: ConflictStrategyConfig::default(),
+            multi_account_budget: MultiAccountBudgetConfig::default(),
+            multi_account_vip_recommended: MultiAccountVipRecommendedConfig::default(),
         }
     }
 }
@@ -1316,21 +1437,26 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.server.port, 18888); // 默认端口 18888
-        assert_eq!(config.download.max_global_threads, 10); // SVIP 默认
+        assert_eq!(config.download.max_global_threads, 15); // SVIP 默认
     }
 
     #[tokio::test]
     async fn test_save_and_load() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path().to_str().unwrap();
+        // 用 TempDir + join("app.toml")，避免 NamedTempFile 在不同平台上的
+        // 临时文件句柄/已存在语义带来的偶发问题（如 Windows 文件占用）。
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("app.toml");
+        let path = path.to_str().unwrap();
 
-        let config = AppConfig::default();
+        // save_to_file 会校验 download_dir 必须为已存在的绝对目录；用 TempDir 自身
+        // 作为下载目录，避免依赖默认 backend/downloads 在 CI/全新 clone 是否存在。
+        let mut config = AppConfig::default();
+        config.download.download_dir = temp_dir.path().to_path_buf();
         config.save_to_file(path).await.unwrap();
 
         let loaded = AppConfig::load_from_file(path).await.unwrap();
@@ -1351,13 +1477,13 @@ mod tests {
 
         // 测试会员推荐配置
         let vip = DownloadConfig::recommended_for_vip(VipType::Vip);
-        assert_eq!(vip.threads, 5);
+        assert_eq!(vip.threads, 10);
         assert_eq!(vip.chunk_size, 4);
         assert_eq!(vip.max_tasks, 3);
 
         // 测试 SVIP 推荐配置
         let svip = DownloadConfig::recommended_for_vip(VipType::Svip);
-        assert_eq!(svip.threads, 10);
+        assert_eq!(svip.threads, 15);
         assert_eq!(svip.chunk_size, 5);
         assert_eq!(svip.max_tasks, 5);
     }
