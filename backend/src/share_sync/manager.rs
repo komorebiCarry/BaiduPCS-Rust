@@ -491,6 +491,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
+            randsk: captured.randsk.clone(),
             save_path: target_dir.to_string(),
             save_fs_id: 0,
             auto_download: Some(false),
@@ -507,7 +508,6 @@ impl ExecutorHooks for ProductionHooks {
                 size: item.size,
                 name: item.name.clone(),
             }]),
-            owner_uid_override: None,
         };
         let resp = tm
             .create_task(req)
@@ -615,11 +615,7 @@ impl ExecutorHooks for ProductionHooks {
         local_dir: &Path,
         strategy: ConflictStrategy,
     ) -> Result<String, ShareSyncError> {
-        let relative_path = safe_relative_download_path(&item.path)?;
-        let local_parent = match Path::new(&relative_path).parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => local_dir.join(parent),
-            _ => local_dir.to_path_buf(),
-        };
+        let local_download_root = share_direct_download_root(local_dir, item)?;
         let tm = self.transfer_manager().await?;
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
@@ -632,10 +628,11 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(&self.captured),
             password: self.captured.password.clone(),
+            randsk: self.captured.randsk.clone(),
             save_path: String::new(),
             save_fs_id: 0,
             auto_download: Some(true),
-            local_download_path: Some(local_parent.to_string_lossy().to_string()),
+            local_download_path: Some(local_download_root.to_string_lossy().to_string()),
             is_share_direct_download: true,
             download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
             selected_fs_ids: Some(vec![item.fs_id]),
@@ -646,7 +643,6 @@ impl ExecutorHooks for ProductionHooks {
                 size: item.size,
                 name: item.name.clone(),
             }]),
-            owner_uid_override: None,
         };
 
         let resp = tm
@@ -663,8 +659,8 @@ impl ExecutorHooks for ProductionHooks {
             .task_id
             .ok_or_else(|| ShareSyncError::DownloadError("TransferManager 未返回任务 ID".into()))?;
         info!(
-            "share-sync: share-direct download submitted task_id={} path={} local_parent={:?}",
-            task_id, raw_path, local_parent
+            "share-sync: share-direct download submitted task_id={} path={} local_root={:?}",
+            task_id, raw_path, local_download_root
         );
         Ok(task_id)
     }
@@ -812,6 +808,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
+            randsk: captured.randsk.clone(),
             save_path: target_dir.to_string(),
             save_fs_id: 0,
             // 网盘目标不下载本地，与单文件版本一致
@@ -821,7 +818,6 @@ impl ExecutorHooks for ProductionHooks {
             download_conflict_strategy: None,
             selected_fs_ids: Some(selected_fs_ids),
             selected_files: Some(selected_files),
-            owner_uid_override: None,
         };
         let resp = tm
             .create_task(req)
@@ -886,6 +882,7 @@ impl ExecutorHooks for ProductionHooks {
         let req = CreateTransferRequest {
             share_url: share_url_for_captured(&self.captured),
             password: self.captured.password.clone(),
+            randsk: self.captured.randsk.clone(),
             // 走 is_share_direct_download=true 路径，save_path 在 transfer 里
             // 会被 temp_dir 强制覆盖——这是 transfer 的硬编码行为，不在 share-sync
             // 控制范围。最终落点是 `local_download_path`（自动下载阶段被消费）。
@@ -897,7 +894,6 @@ impl ExecutorHooks for ProductionHooks {
             download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
             selected_fs_ids: Some(selected_fs_ids),
             selected_files: Some(selected_files),
-            owner_uid_override: None,
         };
 
         let resp = tm
@@ -952,6 +948,17 @@ fn download_conflict_strategy_for_share_sync(
         }
         ConflictStrategy::Skip => crate::uploader::conflict::DownloadConflictStrategy::Skip,
     }
+}
+
+fn share_direct_download_root(
+    local_dir: &Path,
+    item: &ShareSnapshotItem,
+) -> Result<PathBuf, ShareSyncError> {
+    // Keep the path traversal guard in share-sync, but do not pre-append item.parent().
+    // TransferManager restores the relative parent under local_download_path after
+    // the temporary share-direct transfer completes.
+    let _ = safe_relative_download_path(&item.path)?;
+    Ok(local_dir.to_path_buf())
 }
 
 fn safe_relative_download_path(path: &str) -> Result<String, ShareSyncError> {
@@ -1194,6 +1201,27 @@ mod tests {
         assert_eq!(
             download_conflict_strategy_for_share_sync(ConflictStrategy::Skip),
             DownloadConflictStrategy::Skip
+        );
+    }
+
+    #[test]
+    fn test_share_direct_download_root_avoids_duplicate_parent_dir() {
+        let item =
+            ShareSnapshotItem::new("/monthly/000009.SZ.csv", "000009.SZ.csv", 9, 1024, false);
+        let target_root = PathBuf::from("/home/hyx/codespace/one-family/data");
+
+        let download_root = share_direct_download_root(&target_root, &item).unwrap();
+        assert_eq!(download_root, target_root);
+
+        let transfer_restored_path =
+            download_root.join(safe_relative_download_path(&item.path).unwrap());
+        assert_eq!(
+            transfer_restored_path,
+            PathBuf::from("/home/hyx/codespace/one-family/data/monthly/000009.SZ.csv")
+        );
+        assert_ne!(
+            transfer_restored_path,
+            PathBuf::from("/home/hyx/codespace/one-family/data/monthly/monthly/000009.SZ.csv")
         );
     }
 

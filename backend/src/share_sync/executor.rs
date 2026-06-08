@@ -39,6 +39,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const TASK_OPERATION_MAX_ATTEMPTS: usize = 3;
+const TASK_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
 
 /// 把"环境资源不足"类错误（Quota / LocalDiskFull）映射到 run_item reason
 ///
@@ -55,6 +57,14 @@ fn quota_skip_reason(err: &ShareSyncError) -> Option<&'static str> {
         ErrorCategory::LocalDiskFull => Some("local_disk_full"),
         _ => None,
     }
+}
+
+fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
+    let added = diff.added.iter().filter(|item| !item.is_dir).count();
+    let modified = diff.modified.iter().filter(|item| !item.new.is_dir).count();
+    let removed = diff.removed.iter().filter(|item| !item.is_dir).count();
+    summary.total = added + modified + removed + diff.unchanged_count;
+    summary.unchanged = diff.unchanged_count;
 }
 
 /// v1：整批 submit 触发的最小组内文件数
@@ -231,6 +241,7 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         let mut summary = DiffSummary::default();
+        seed_diff_summary(&mut summary, diff);
         let error: Option<String> = None;
         let mut any_failure = false;
         // 资源类错误（quota / local_disk_full）单独计数——
@@ -327,6 +338,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         None,
                         None,
                     );
+                    summary.skipped += 1;
                 }
                 summary.removed += 1; // 也计入 removed（虽然 skipped）
                 continue;
@@ -369,10 +381,13 @@ impl<'a> ShareSyncExecutor<'a> {
             error
         };
         let finished_at = Utc::now().timestamp();
-        if let Err(e) =
-            self.persistence
-                .finish_run(&run_id, finished_at, status, &summary, run_error.as_deref())
-        {
+        if let Err(e) = self.persistence.finish_run(
+            &run_id,
+            finished_at,
+            status,
+            &summary,
+            run_error.as_deref(),
+        ) {
             warn!("finish_run 失败: {}", e);
         }
 
@@ -428,13 +443,13 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         let mut summary = DiffSummary::default();
+        seed_diff_summary(&mut summary, diff);
         let mut any_failure = false;
         let mut run_failure_reason: Option<&'static str> = None;
 
         // 1) 把 added + modified.new 合并为"待处理候选"
-        let mut candidates: Vec<(SyncAction, ShareSnapshotItem)> = Vec::with_capacity(
-            diff.added.len() + diff.modified.len(),
-        );
+        let mut candidates: Vec<(SyncAction, ShareSnapshotItem)> =
+            Vec::with_capacity(diff.added.len() + diff.modified.len());
         for item in &diff.added {
             if item.is_dir {
                 continue;
@@ -470,10 +485,8 @@ impl<'a> ShareSyncExecutor<'a> {
                             .await
                         {
                             any_failure = true;
-                            run_failure_reason = update_run_failure_reason(
-                                run_failure_reason,
-                                e.category(),
-                            );
+                            run_failure_reason =
+                                update_run_failure_reason(run_failure_reason, e.category());
                             warn!("added/modified 处理失败: path={}, err={}", item.path, e);
                         }
                     }
@@ -639,7 +652,8 @@ impl<'a> ShareSyncExecutor<'a> {
                     Err(e) => {
                         any_failure = true;
                         let category = e.category();
-                        run_failure_reason = update_run_failure_reason(run_failure_reason, category);
+                        run_failure_reason =
+                            update_run_failure_reason(run_failure_reason, category);
                         warn!(
                             "batch submit 提交阶段失败: root={}, items={}, err={}",
                             root_path,
@@ -721,6 +735,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         None,
                         None,
                     );
+                    summary.skipped += 1;
                 }
                 summary.removed += 1;
                 continue;
@@ -765,9 +780,9 @@ impl<'a> ShareSyncExecutor<'a> {
         };
 
         let finished_at = Utc::now().timestamp();
-        if let Err(e) = self
-            .persistence
-            .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
+        if let Err(e) =
+            self.persistence
+                .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
         {
             warn!("finish_run 失败: {}", e);
         }
@@ -795,6 +810,7 @@ impl<'a> ShareSyncExecutor<'a> {
             SyncTarget::Netdisk(_) => TargetKind::Netdisk,
             SyncTarget::Local(_) => TargetKind::Local,
         };
+        let mut overwrote_existing = false;
 
         // 1) 按目标处理冲突策略。
         let mut versioned_old: Option<String> = None;
@@ -838,6 +854,7 @@ impl<'a> ShareSyncExecutor<'a> {
 
                 match (strategy, existing) {
                     (ConflictStrategy::Skip, Some(_)) => {
+                        summary.skipped += 1;
                         self.persistence.add_run_item(
                             run_id,
                             &item.path,
@@ -891,13 +908,20 @@ impl<'a> ShareSyncExecutor<'a> {
                             );
                             return Err(e);
                         }
+                        overwrote_existing = true;
                     }
                     _ => {}
+                }
+            }
+            SyncTarget::Local(t) if strategy == ConflictStrategy::Overwrite => {
+                if local_file_exists(&t.local_path, &item.path) {
+                    overwrote_existing = true;
                 }
             }
             SyncTarget::Local(_) if strategy == ConflictStrategy::Skip => {
                 if let SyncTarget::Local(t) = target {
                     if local_file_exists(&t.local_path, &item.path) {
+                        summary.skipped += 1;
                         self.persistence.add_run_item(
                             run_id,
                             &item.path,
@@ -934,123 +958,219 @@ impl<'a> ShareSyncExecutor<'a> {
             _ => {}
         }
 
-        // 2) 提交 transfer / download
-        let result: Result<(String, bool, RunItemStatus), ShareSyncError> = match target {
-            SyncTarget::Netdisk(t) => {
-                let target_dir = netdisk_target_parent_dir(t, item);
-                self.hooks
-                    .submit_transfer(
-                        captured,
-                        &target_dir,
-                        item,
-                        Some(&format!("share-sync/{}/{}", self.subscription.id, run_id)),
-                    )
-                    .await
-                    .map(|task_id| (task_id, false, RunItemStatus::Transferring))
-            }
-            SyncTarget::Local(t) => self
-                .hooks
-                .submit_download(item, &t.local_path, strategy)
-                .await
-                .map(|task_id| (task_id, true, RunItemStatus::Downloading)),
-        };
+        let mut run_item_id: Option<i64> = None;
+        let mut last_retry_error: Option<ShareSyncError> = None;
 
-        match result {
-            Ok((task_id, require_download_completion, initial_status)) => {
-                let run_item_id = self.persistence.add_run_item(
-                    run_id,
-                    &item.path,
-                    action,
-                    target_kind,
-                    Some(task_id.as_str()),
-                    None,
-                    initial_status,
-                    versioned_old.as_deref(),
-                    None,
-                )?;
-                info!(
-                    "executor: 已调度 {}/{} -> target={:?}, task_id={}",
-                    action, item.path, target_kind, task_id
-                );
-                match self
+        for attempt in 1..=TASK_OPERATION_MAX_ATTEMPTS {
+            // 2) 提交 transfer / download
+            let result: Result<(String, bool, RunItemStatus), ShareSyncError> = match target {
+                SyncTarget::Netdisk(t) => {
+                    let target_dir = netdisk_target_parent_dir(t, item);
+                    self.hooks
+                        .submit_transfer(
+                            captured,
+                            &target_dir,
+                            item,
+                            Some(&format!("share-sync/{}/{}", self.subscription.id, run_id)),
+                        )
+                        .await
+                        .map(|task_id| (task_id, false, RunItemStatus::Transferring))
+                }
+                SyncTarget::Local(t) => self
                     .hooks
-                    .wait_transfer_task(&task_id, require_download_completion, TASK_WAIT_TIMEOUT)
+                    .submit_download(item, &t.local_path, strategy)
                     .await
-                {
-                    Ok(()) => {
-                        self.persistence.update_run_item_status(
-                            run_item_id,
-                            RunItemStatus::Completed,
+                    .map(|task_id| (task_id, true, RunItemStatus::Downloading)),
+            };
+
+            match result {
+                Ok((task_id, require_download_completion, initial_status)) => {
+                    let current_run_item_id = if let Some(existing_id) = run_item_id {
+                        self.persistence.update_run_item_task_state(
+                            existing_id,
+                            Some(task_id.as_str()),
+                            None,
+                            initial_status,
                             None,
                         )?;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // 资源类错误（quota / local_disk_full）→ 标 Skipped
-                        if let Some(reason) = quota_skip_reason(&e) {
-                            summary.skipped += 1;
+                        existing_id
+                    } else {
+                        let new_id = self.persistence.add_run_item(
+                            run_id,
+                            &item.path,
+                            action,
+                            target_kind,
+                            Some(task_id.as_str()),
+                            None,
+                            initial_status,
+                            versioned_old.as_deref(),
+                            None,
+                        )?;
+                        run_item_id = Some(new_id);
+                        new_id
+                    };
+                    info!(
+                        "executor: 已调度 {}/{} -> target={:?}, task_id={} attempt={}/{}",
+                        action,
+                        item.path,
+                        target_kind,
+                        task_id,
+                        attempt,
+                        TASK_OPERATION_MAX_ATTEMPTS
+                    );
+                    match self
+                        .hooks
+                        .wait_transfer_task(
+                            &task_id,
+                            require_download_completion,
+                            TASK_WAIT_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
                             self.persistence.update_run_item_status(
-                                run_item_id,
-                                RunItemStatus::Skipped,
-                                Some(&e.to_string()),
+                                current_run_item_id,
+                                RunItemStatus::Completed,
+                                None,
                             )?;
-                            // 用 reason 列显式标记"为什么跳过"，便于前端
-                            // 区分"策略跳过"（reason=NULL）与"quota 跳过"
-                            let _ = self.persistence.set_run_item_reason(
-                                run_item_id,
-                                Some(reason),
-                            );
-                            info!(
-                                "executor: 因 {} 跳过 item path={}, task_id={}",
-                                reason, item.path, task_id
-                            );
-                            // 不算作 Err（不触发上一级 any_failure 累加），
-                            // 但仍返回 Err 让 quota 全局跟踪能感知到
-                            Err(e)
-                        } else {
-                            summary.failed += 1;
+                            if overwrote_existing {
+                                summary.overwritten += 1;
+                            }
+                            return Ok(());
+                        }
+                        Err(e) if e.should_retry() && attempt < TASK_OPERATION_MAX_ATTEMPTS => {
+                            let retry_msg = format!("第 {} 次失败，将重试: {}", attempt, e);
                             self.persistence.update_run_item_status(
-                                run_item_id,
-                                RunItemStatus::Failed,
-                                Some(&e.to_string()),
+                                current_run_item_id,
+                                initial_status,
+                                Some(&retry_msg),
                             )?;
-                            Err(e)
+                            let delay = TASK_RETRY_BASE_DELAY * attempt as u32;
+                            warn!(
+                                "executor: 临时失败，{}ms 后重试 item path={} attempt={}/{} err={}",
+                                delay.as_millis(),
+                                item.path,
+                                attempt + 1,
+                                TASK_OPERATION_MAX_ATTEMPTS,
+                                e
+                            );
+                            last_retry_error = Some(e);
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            // 资源类错误（quota / local_disk_full）→ 标 Skipped
+                            if let Some(reason) = quota_skip_reason(&e) {
+                                summary.skipped += 1;
+                                self.persistence.update_run_item_status(
+                                    current_run_item_id,
+                                    RunItemStatus::Skipped,
+                                    Some(&e.to_string()),
+                                )?;
+                                // 用 reason 列显式标记"为什么跳过"，便于前端
+                                // 区分"策略跳过"（reason=NULL）与"quota 跳过"
+                                let _ = self
+                                    .persistence
+                                    .set_run_item_reason(current_run_item_id, Some(reason));
+                                info!(
+                                    "executor: 因 {} 跳过 item path={}, task_id={}",
+                                    reason, item.path, task_id
+                                );
+                                // 不算作 Err（不触发上一级 any_failure 累加），
+                                // 但仍返回 Err 让 quota 全局跟踪能感知到
+                                return Err(e);
+                            } else {
+                                summary.failed += 1;
+                                self.persistence.update_run_item_status(
+                                    current_run_item_id,
+                                    RunItemStatus::Failed,
+                                    Some(&e.to_string()),
+                                )?;
+                                return Err(e);
+                            }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                // 资源类错误（quota / local_disk_full）→ 标 Skipped
-                if let Some(reason) = quota_skip_reason(&e) {
-                    summary.skipped += 1;
-                    self.record_skipped_run_item(
-                        run_id,
-                        item,
-                        action,
-                        target_kind,
-                        versioned_old.as_deref(),
-                        reason,
-                        &e,
+                Err(e) if e.should_retry() && attempt < TASK_OPERATION_MAX_ATTEMPTS => {
+                    let delay = TASK_RETRY_BASE_DELAY * attempt as u32;
+                    warn!(
+                        "executor: submit 临时失败，{}ms 后重试 item path={} attempt={}/{} err={}",
+                        delay.as_millis(),
+                        item.path,
+                        attempt + 1,
+                        TASK_OPERATION_MAX_ATTEMPTS,
+                        e
                     );
-                    info!(
-                        "executor: 因 {} 跳过 item path={} (submit 阶段)",
-                        reason, item.path
-                    );
-                    Err(e)
-                } else {
-                    self.record_failed_run_item(
-                        summary,
-                        run_id,
-                        item,
-                        action,
-                        target_kind,
-                        versioned_old.as_deref(),
-                        &e,
-                    );
-                    Err(e)
+                    last_retry_error = Some(e);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => {
+                    // 资源类错误（quota / local_disk_full）→ 标 Skipped
+                    if let Some(reason) = quota_skip_reason(&e) {
+                        summary.skipped += 1;
+                        if let Some(existing_id) = run_item_id {
+                            self.persistence.update_run_item_status(
+                                existing_id,
+                                RunItemStatus::Skipped,
+                                Some(&e.to_string()),
+                            )?;
+                            let _ = self
+                                .persistence
+                                .set_run_item_reason(existing_id, Some(reason));
+                        } else {
+                            self.record_skipped_run_item(
+                                run_id,
+                                item,
+                                action,
+                                target_kind,
+                                versioned_old.as_deref(),
+                                reason,
+                                &e,
+                            );
+                        }
+                        info!(
+                            "executor: 因 {} 跳过 item path={} (submit 阶段)",
+                            reason, item.path
+                        );
+                        return Err(e);
+                    } else {
+                        if let Some(existing_id) = run_item_id {
+                            summary.failed += 1;
+                            self.persistence.update_run_item_status(
+                                existing_id,
+                                RunItemStatus::Failed,
+                                Some(&e.to_string()),
+                            )?;
+                        } else {
+                            self.record_failed_run_item(
+                                summary,
+                                run_id,
+                                item,
+                                action,
+                                target_kind,
+                                versioned_old.as_deref(),
+                                &e,
+                            );
+                        }
+                        return Err(e);
+                    }
                 }
             }
         }
+
+        let e = last_retry_error
+            .unwrap_or_else(|| ShareSyncError::Internal("重试流程未返回结果".to_string()));
+        self.record_failed_run_item(
+            summary,
+            run_id,
+            item,
+            action,
+            target_kind,
+            versioned_old.as_deref(),
+            &e,
+        );
+        Err(e)
     }
 
     /// 处理 removed
@@ -1310,14 +1430,15 @@ pub(crate) fn group_by_dir_root(
 
     let mut groups: BTreeMap<String, Vec<(SyncAction, ShareSnapshotItem)>> = BTreeMap::new();
     for (action, item) in candidates {
-        let root = find_included_ancestor(&item.path, &includes)
-            .unwrap_or_else(|| String::new());
-        groups.entry(root).or_default().push((*action, item.clone()));
+        let root = find_included_ancestor(&item.path, &includes).unwrap_or_else(|| String::new());
+        groups
+            .entry(root)
+            .or_default()
+            .push((*action, item.clone()));
     }
 
     // 组内按 item.path 排序，便于调试和测试
-    let mut out: Vec<(String, Vec<(SyncAction, ShareSnapshotItem)>)> =
-        groups.into_iter().collect();
+    let mut out: Vec<(String, Vec<(SyncAction, ShareSnapshotItem)>)> = groups.into_iter().collect();
     for (_, group) in &mut out {
         group.sort_by(|a, b| a.1.path.cmp(&b.1.path));
     }
@@ -1429,6 +1550,7 @@ mod tests {
             uk: "456".into(),
             bdstoken: "tok".into(),
             password: None,
+            randsk: None,
         }
     }
 
@@ -1971,6 +2093,46 @@ mod tests {
         ShareSyncError::FileSystemError("ENOSPC: no space left on device".into())
     }
 
+    #[tokio::test]
+    async fn test_wait_transient_error_retries_download_task() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        let db_dir = p.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Local(LocalTarget {
+                local_path: p.to_path_buf(),
+                conflict_strategy: None,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(&s.id, vec![item("/retry.csv", 300, 999)]);
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        hooks.wait_errors.lock().unwrap().insert(
+            "dl-1".to_string(),
+            ShareSyncError::DownloadError("请求超时，请稍后再试".into()),
+        );
+
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = ex.apply(&captured(), &diff).await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(outcome.diff_summary.failed, 0);
+        assert_eq!(hooks.downloads.lock().unwrap().len(), 2);
+
+        let items = pm.list_run_items(&outcome.run_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "completed");
+        assert_eq!(items[0].transfer_task_id.as_deref(), Some("dl-2"));
+        assert!(items[0].error.is_none());
+    }
+
     #[test]
     fn test_submit_transfer_quota_marks_run_item_skipped() {
         let dir = tempdir().unwrap();
@@ -1987,10 +2149,7 @@ mod tests {
         pm.upsert_subscription(&s).unwrap();
         let prev = ShareSnapshot::with_items(&s.id, vec![]);
         pm.save_snapshot(&prev).unwrap();
-        let curr = ShareSnapshot::with_items(
-            &s.id,
-            vec![item("/big.zip", 100, 999_999_999)],
-        );
+        let curr = ShareSnapshot::with_items(&s.id, vec![item("/big.zip", 100, 999_999_999)]);
         let diff = diff_snapshots(Some(&prev), &curr);
         let hooks = MockHooks::default();
         // 注入 quota 错误到 fs_id=100
@@ -2143,10 +2302,8 @@ mod tests {
         let prev = ShareSnapshot::with_items(&s.id, vec![]);
         pm.save_snapshot(&prev).unwrap();
         // item 500: quota 跳过；item 600: 触发真实失败（用 -7 errmsg 不是 quota）
-        let curr = ShareSnapshot::with_items(
-            &s.id,
-            vec![item("/quota", 500, 1), item("/fail", 600, 1)],
-        );
+        let curr =
+            ShareSnapshot::with_items(&s.id, vec![item("/quota", 500, 1), item("/fail", 600, 1)]);
         let diff = diff_snapshots(Some(&prev), &curr);
         let hooks = MockHooks::default();
         hooks
@@ -2154,10 +2311,11 @@ mod tests {
             .lock()
             .unwrap()
             .insert(500, quota_err());
-        hooks.download_submit_errors.lock().unwrap().insert(
-            600,
-            ShareSyncError::TransferError("API error 31066".into()),
-        );
+        hooks
+            .download_submit_errors
+            .lock()
+            .unwrap()
+            .insert(600, ShareSyncError::TransferError("API error 31066".into()));
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
         let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
         // 存在非 quota 失败 → CompletedWithErrors
@@ -2217,9 +2375,11 @@ mod tests {
             .unwrap()
             .insert(702, quota_err());
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(
-            ex.apply_with_run_id_grouped("r1".into(), &captured(), &diff),
-        );
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_grouped(
+            "r1".into(),
+            &captured(),
+            &diff,
+        ));
         // 仅 quota 跳过 → Completed（不是 Failed / CompletedWithErrors）
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(outcome.diff_summary.skipped, 2);
@@ -2230,7 +2390,11 @@ mod tests {
             .iter()
             .filter(|i| i.status == "skipped" && i.reason.as_deref() == Some("quota_full"))
             .count();
-        assert!(skipped_count >= 2, "skipped/quota_full count = {}", skipped_count);
+        assert!(
+            skipped_count >= 2,
+            "skipped/quota_full count = {}",
+            skipped_count
+        );
     }
 
     #[test]
@@ -2275,9 +2439,11 @@ mod tests {
             .unwrap()
             .insert(802, quota_err());
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(
-            ex.apply_with_run_id_grouped("r2".into(), &captured(), &diff),
-        );
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_grouped(
+            "r2".into(),
+            &captured(),
+            &diff,
+        ));
         // 仍然 Completed（quota 类不算业务失败）
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(outcome.diff_summary.skipped, 1);
@@ -2291,6 +2457,9 @@ mod tests {
         );
         // 那条成功的 download 应该是 small.csv
         let downloads = hooks.downloads.lock().unwrap();
-        assert_eq!(downloads[0].0, 801, "successful fallback should be small.csv");
+        assert_eq!(
+            downloads[0].0, 801,
+            "successful fallback should be small.csv"
+        );
     }
 }

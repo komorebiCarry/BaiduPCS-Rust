@@ -155,10 +155,19 @@ impl std::fmt::Display for RunStatus {
 /// 差异摘要（持久化到 `share_sync_runs`）
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiffSummary {
+    /// 本次对比涉及的文件总数（新增 + 修改 + 删除 + 未变化，不含目录）
+    #[serde(default)]
+    pub total: usize,
     pub added: usize,
     pub modified: usize,
     pub removed: usize,
+    /// 和上次成功同步快照一致、无需执行动作的文件数（不含目录）
+    #[serde(default)]
+    pub unchanged: usize,
     pub failed: usize,
+    /// 覆盖已有目标文件的动作数
+    #[serde(default)]
+    pub overwritten: usize,
     /// 因 quota / local_disk_full 等"环境资源不足"被跳过的子项数（v1 新增）
     ///
     /// 这些项**不是失败**——失败意味着可重试 / 需修复配置；

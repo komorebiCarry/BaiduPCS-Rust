@@ -100,7 +100,13 @@ pub enum ErrorCategory {
 ///   `backend/src/transfer/manager.rs:2740` 的 `handle_transfer_error`）
 /// - 少数中文 errmsg 透传场景可能用 "空间不足" 短串
 /// - task_errno 数字串 "errno=-32" 兼容未走 `handle_transfer_error` 的路径
-const QUOTA_KEYWORDS: &[&str] = &["网盘空间不足", "空间不足", "errno=-32", "errno=-7", "errno=-12"];
+const QUOTA_KEYWORDS: &[&str] = &[
+    "网盘空间不足",
+    "空间不足",
+    "errno=-32",
+    "errno=-7",
+    "errno=-12",
+];
 
 /// 触发 `ErrorCategory::LocalDiskFull` 判定的关键字
 /// - `std::io::Error` 的 `StorageFull`/`Other` 都会被 `From<io::Error>` 归为
@@ -114,6 +120,23 @@ const LOCAL_DISK_FULL_KEYWORDS: &[&str] = &[
     "StorageFull",
 ];
 
+/// 触发 `ErrorCategory::Transient` 判定的关键字。
+///
+/// 这些错误通常来自百度接口的临时服务端超时，可能被包在 `TransferError` /
+/// `DownloadError` 里，而不是 `NetworkError`。
+const TRANSIENT_KEYWORDS: &[&str] = &[
+    "请求超时",
+    "超时",
+    "请稍后",
+    "稍后再试",
+    "timeout",
+    "timed out",
+    "temporarily",
+    "temporary",
+    "网络异常",
+    "connection reset",
+];
+
 fn matches_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
@@ -125,7 +148,7 @@ impl ShareSyncError {
             ShareSyncError::NetworkError(_) => ErrorCategory::Transient,
             ShareSyncError::ShareLinkError(_) => ErrorCategory::Auth,
             ShareSyncError::TransferError(msg) | ShareSyncError::DownloadError(msg) => {
-                // 顺序敏感：先查 Quota/LocalDisk（罕见但有特别语义），再查风控/不存在
+                // 顺序敏感：先查资源/鉴权/不存在，再把明确的服务端临时错误归为可重试。
                 if matches_any(msg, QUOTA_KEYWORDS) {
                     ErrorCategory::Quota
                 } else if matches_any(msg, LOCAL_DISK_FULL_KEYWORDS) {
@@ -134,6 +157,8 @@ impl ShareSyncError {
                     ErrorCategory::Auth
                 } else if msg.contains("不存在") || msg.contains("已失效") {
                     ErrorCategory::NotFound
+                } else if matches_any(msg, TRANSIENT_KEYWORDS) {
+                    ErrorCategory::Transient
                 } else {
                     ErrorCategory::Other
                 }
@@ -238,6 +263,20 @@ mod tests {
         // 其它错误不应被误判为 Quota
         let e = ShareSyncError::TransferError("网盘 API 异常".into());
         assert_eq!(e.category(), ErrorCategory::Other);
+    }
+
+    #[test]
+    fn test_error_category_transient_detected() {
+        let e = ShareSyncError::TransferError("请求超时，请稍后再试".into());
+        assert_eq!(e.category(), ErrorCategory::Transient);
+        assert!(e.should_retry());
+
+        let e = ShareSyncError::DownloadError("operation timed out".into());
+        assert_eq!(e.category(), ErrorCategory::Transient);
+
+        let e = ShareSyncError::TransferError("风控，请稍后再试".into());
+        assert_eq!(e.category(), ErrorCategory::Auth);
+        assert!(!e.should_retry());
     }
 
     #[test]
