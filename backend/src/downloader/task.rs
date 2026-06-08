@@ -1,3 +1,4 @@
+use crate::auth::Uid;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -25,6 +26,12 @@ pub enum TaskStatus {
 pub struct DownloadTask {
     /// 任务ID
     pub id: String,
+    /// 🔥 多账号归属 UID
+    ///
+    /// 所有运态下载任务必须带 owner_uid。旧持久化数据反序列化时使用默认值 `Uid(0)`，
+    /// 随后由恢复逻辑在加载时填充为 `active_uid` 或进入账号丢失分支。
+    #[serde(default)]
+    pub owner_uid: Uid,
     /// 文件服务器ID
     pub fs_id: u64,
     /// 网盘路径
@@ -183,9 +190,16 @@ pub struct DownloadTask {
 }
 
 impl DownloadTask {
-    pub fn new(fs_id: u64, remote_path: String, local_path: PathBuf, total_size: u64) -> Self {
+    pub fn new(
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        total_size: u64,
+        owner_uid: Uid,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            owner_uid,
             fs_id,
             remote_path,
             local_path,
@@ -241,8 +255,9 @@ impl DownloadTask {
         group_id: String,
         group_root: String,
         relative_path: String,
+        owner_uid: Uid,
     ) -> Self {
-        let mut task = Self::new(fs_id, remote_path, local_path, total_size);
+        let mut task = Self::new(fs_id, remote_path, local_path, total_size, owner_uid);
         task.group_id = Some(group_id);
         task.group_root = Some(group_root);
         task.relative_path = Some(relative_path);
@@ -256,8 +271,9 @@ impl DownloadTask {
         local_path: PathBuf,
         total_size: u64,
         backup_config_id: String,
+        owner_uid: Uid,
     ) -> Self {
-        let mut task = Self::new(fs_id, remote_path, local_path, total_size);
+        let mut task = Self::new(fs_id, remote_path, local_path, total_size, owner_uid);
         task.is_backup = true;
         task.backup_config_id = Some(backup_config_id);
         task
@@ -356,6 +372,7 @@ mod tests {
             "/test/file.txt".to_string(),
             PathBuf::from("./downloads/file.txt"),
             1024 * 1024, // 1MB
+            Uid::default(),
         );
 
         assert_eq!(task.fs_id, 12345);
@@ -366,7 +383,13 @@ mod tests {
 
     #[test]
     fn test_progress_calculation() {
-        let mut task = DownloadTask::new(1, "/test".to_string(), PathBuf::from("./test"), 1000);
+        let mut task = DownloadTask::new(
+            1,
+            "/test".to_string(),
+            PathBuf::from("./test"),
+            1000,
+            Uid::default(),
+        );
 
         task.downloaded_size = 250;
         assert_eq!(task.progress(), 25.0);
@@ -380,7 +403,13 @@ mod tests {
 
     #[test]
     fn test_eta_calculation() {
-        let mut task = DownloadTask::new(1, "/test".to_string(), PathBuf::from("./test"), 1000);
+        let mut task = DownloadTask::new(
+            1,
+            "/test".to_string(),
+            PathBuf::from("./test"),
+            1000,
+            Uid::default(),
+        );
 
         task.downloaded_size = 200;
         task.speed = 100; // 100 bytes/s
@@ -392,7 +421,13 @@ mod tests {
 
     #[test]
     fn test_status_transitions() {
-        let mut task = DownloadTask::new(1, "/test".to_string(), PathBuf::from("./test"), 1000);
+        let mut task = DownloadTask::new(
+            1,
+            "/test".to_string(),
+            PathBuf::from("./test"),
+            1000,
+            Uid::default(),
+        );
 
         task.mark_downloading();
         assert_eq!(task.status, TaskStatus::Downloading);
@@ -418,6 +453,7 @@ mod tests {
             "/test/BPR_BKUP_uuid.bkup".to_string(),
             PathBuf::from("./downloads/BPR_BKUP_uuid.bkup"),
             1100,
+            Uid::default(),
         );
 
         // 测试解密状态转换
@@ -447,6 +483,7 @@ mod tests {
             "/test/BPR_BKUP_uuid.bkup".to_string(),
             PathBuf::from("./downloads/BPR_BKUP_uuid.bkup"),
             1100,
+            Uid::default(),
         );
 
         task.is_encrypted = true;
@@ -522,6 +559,7 @@ mod tests {
             "/remote".to_string(),
             PathBuf::from("./local"),
             1024,
+            Uid::default(),
         );
 
         // Case 1: None 时不应该序列化出来（skip_serializing_if）
@@ -548,6 +586,7 @@ mod tests {
             "/test/BPR_BKUP_uuid.bkup".to_string(),
             PathBuf::from("./downloads/BPR_BKUP_uuid.bkup"),
             1100,
+            Uid::default(),
         );
         task.is_encrypted = true;
         task.decrypt_progress = 75.0;

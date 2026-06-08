@@ -32,9 +32,8 @@ fn bad_request_error(msg: &str) -> ApiError {
 /// 这是解决死锁问题的关键：获取 Arc 克隆后立即释放 RwLock，
 /// 避免在持有锁的情况下调用 .await
 async fn get_manager(state: &AppState) -> Result<Arc<AutoBackupManager>, ApiError> {
-    let guard = state.autobackup_manager.read().await;
-    match &*guard {
-        Some(manager) => Ok(Arc::clone(manager)),
+    match state.autobackup_manager_for_active().await {
+        Some(manager) => Ok(manager),
         None => Err(internal_error("自动备份管理器未初始化")),
     }
 }
@@ -66,9 +65,43 @@ pub async fn get_backup_config(
 /// 创建备份配置
 pub async fn create_backup_config(
     State(state): State<AppState>,
-    Json(request): Json<CreateBackupConfigRequest>,
+    Json(mut request): Json<CreateBackupConfigRequest>,
 ) -> ApiResult<Json<ApiResponse<BackupConfig>>> {
     let manager = get_manager(&state).await?;
+    // 🔥 完整的 owner_uid 校验
+    //
+    // 此前实现只在 `request.uid is None` 时回填 active_uid，导致两种隐患：
+    //   1. 显式传入不存在/已删除的 uid → 创建出 owner_uid 指向死账号的孤儿 config
+    //   2. None 且无 active 账号 → 创建 owner_uid=None 的"无主"配置
+    //
+    // 新规则：
+    //   - effective_uid = req.uid.or(active_uid)
+    //   - 解析失败（None 且无 active）→ 401 拒绝
+    //   - 解析后必须存在于 account_manager → 否则 400 拒绝
+    let effective_uid_raw: u64 = match request.uid {
+        Some(raw) => raw,
+        None => match *state.active_uid.read().await {
+            Some(active) => active.raw(),
+            None => {
+                return Err(bad_request_error(
+                    "无活跃账号且未显式传入 uid，无法创建备份配置（请先登录）",
+                ));
+            }
+        },
+    };
+
+    // 校验账号存在
+    {
+        let mgr = state.account_manager.lock().await;
+        if mgr.get_user(crate::auth::Uid::new(effective_uid_raw)).is_none() {
+            return Err(bad_request_error(&format!(
+                "账号 uid={} 不存在或已被删除，无法创建备份配置",
+                effective_uid_raw
+            )));
+        }
+    }
+
+    request.uid = Some(effective_uid_raw);
     // 收集 Sync 配置的 warnings
     let warnings = collect_sync_warnings(
         request.direction,
@@ -760,9 +793,7 @@ pub async fn get_watch_capability() -> ApiResult<Json<ApiResponse<WatchCapabilit
                             "inotify watch limit 较低 (当前: {})，可能无法监听大量文件",
                             limit
                         ));
-                        suggestion = Some(format!(
-                            "建议执行: sudo sysctl fs.inotify.max_user_watches=524288"
-                        ));
+                        suggestion = Some("建议执行: sudo sysctl fs.inotify.max_user_watches=524288".to_string());
                     }
                 }
             }
@@ -1109,7 +1140,7 @@ fn collect_sync_warnings(
     let mut warnings = Vec::new();
 
     if direction == BackupDirection::Sync && watch_enabled {
-        let strategy = sync_strategy.unwrap_or(SyncConflictStrategy::default());
+        let strategy = sync_strategy.unwrap_or_default();
         if strategy != SyncConflictStrategy::LocalWins {
             let strategy_name = match strategy {
                 SyncConflictStrategy::RemoteWins => "RemoteWins",

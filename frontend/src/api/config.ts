@@ -1,5 +1,9 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import type {
+  MultiAccountBudgetConfig,
+  VipRecommendedConfig as MultiAccountVipRecommendedConfig,
+} from './budget'
 
 // 本地存储键名（与 webAuth store 保持一致）
 const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
@@ -202,6 +206,8 @@ export interface AppConfig {
   share_direct_download?: ShareDirectDownloadConfig
   network?: NetworkConfig
   conflict_strategy?: ConflictStrategyConfig
+  multi_account_budget?: MultiAccountBudgetConfig
+  multi_account_vip_recommended?: MultiAccountVipRecommendedConfig
 }
 
 /// VIP 推荐配置

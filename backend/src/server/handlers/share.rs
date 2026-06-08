@@ -222,9 +222,8 @@ pub async fn create_share(
         }
     };
 
-    // 获取网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -253,15 +252,13 @@ pub async fn create_share(
                 // 检查是否需要预热重试 (errno=-6)
                 if response.errno == -6 {
                     warn!("分享创建遇到 errno=-6，触发预热重试...");
-                    drop(client_lock); // 释放读锁
 
                     // 触发预热
                     match state.trigger_warmup().await {
                         Ok(true) => {
                             info!("预热成功，重试创建分享...");
-                            // 重新获取客户端
-                            let client = state.netdisk_client.read().await;
-                            if let Some(ref c) = *client {
+                            // 重新获取活跃账号客户端（cookies 已刷新）
+                            if let Some(c) = state.active_client().await {
                                 match c
                                     .share_set(&request.paths, request.period, &pwd)
                                     .await
@@ -348,9 +345,8 @@ pub async fn cancel_share(
         )));
     }
 
-    // 获取网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -398,9 +394,8 @@ pub async fn get_share_list(
 ) -> Result<Json<ApiResponse<ShareListData>>, StatusCode> {
     info!("API: 获取分享列表 page={}", params.page);
 
-    // 获取网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -470,9 +465,8 @@ pub async fn get_share_detail(
 ) -> Result<Json<ApiResponse<ShareDetailData>>, StatusCode> {
     info!("API: 获取分享详情 share_id={}", share_id);
 
-    // 获取网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(

@@ -64,8 +64,15 @@ pub struct DownloadManager {
     download_dir: Arc<RwLock<PathBuf>>,
     /// 全局分片调度器
     chunk_scheduler: ChunkScheduler,
-    /// 最大同时下载任务数
-    max_concurrent_tasks: usize,
+    /// 最大同时下载任务数（动态可调整）
+    ///
+    /// 用 `Arc<AtomicUsize>` 而不是 `usize`：
+    /// 旧版本是 `usize`，`update_max_concurrent_tasks` 内部
+    /// 用 `let old_max = self.max_concurrent_tasks.load(Ordering::SeqCst)` 读后又因为 `&self` 不能写回，
+    /// 注释自承"这个字段只在创建时使用"。多次调用时（5→3→4）旧值始终是 5，
+    /// 误判为"调小"，不会走 `try_start_waiting_tasks()`。改成 `Arc<AtomicUsize>` +
+    /// `swap` 后，old_max 与上一次写入值严格一致。
+    max_concurrent_tasks: Arc<AtomicUsize>,
     /// 🔥 持久化管理器引用（可选）
     persistence_manager: Option<Arc<Mutex<PersistenceManager>>>,
     /// 🔥 WebSocket 管理器
@@ -90,16 +97,74 @@ pub struct DownloadManager {
     requeue_tx: mpsc::UnboundedSender<AutoRequeueRequest>,
     /// 🔥 auto_requeue 请求接收端（start_auto_requeue_consumer 消费用）
     requeue_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<AutoRequeueRequest>>>>,
+    /// 🔥 多账号：该管理器所属的账号 UID（`Uid(0)` 表示遗留单账号场景）
+    owner_uid: crate::auth::Uid,
 }
 
 impl DownloadManager {
     /// 创建新的下载管理器
-    pub fn new(user_auth: UserAuth, download_dir: PathBuf) -> Result<Self> {
-        Self::with_config(user_auth, download_dir, 10, 5, 3, None, None)
+    ///
+    /// 测试便捷构造函数 — 内部新建一个临时
+    /// `BudgetScheduler` + `Semaphore` 用于单元测试场景。生产路径请用
+    /// `new_for_account`。
+    ///
+    /// 构造时按 `user_auth.uid` 注册账号到 `BudgetScheduler`（双轨预算池），
+    /// 否则任何调用 `acquire_chunk_permit` 的真实分片下载会因 unknown account
+    /// 永远拿不到 permit 而卡死。这里在构造时按 `user_auth.uid` 调用
+    /// `add_account` 把测试账号 seed 进去；调用方需在 tokio 运行时下使用
+    /// （`#[tokio::test]`）。
+    #[cfg(test)]
+    pub async fn new(user_auth: UserAuth, download_dir: PathBuf) -> Result<Self> {
+        use crate::auth::Uid;
+        use crate::downloader::budget_scheduler::{
+            BudgetScheduler, BudgetSchedulerConfig, RequestedSource, VipType,
+        };
+
+        let budget_scheduler = BudgetScheduler::new(BudgetSchedulerConfig::default());
+        // seed 当前测试账号到双轨预算池
+        let uid = Uid::new(user_auth.uid);
+        let vip = VipType::from_raw(user_auth.vip_type);
+        budget_scheduler
+            .add_account(
+                uid,
+                vip,
+                RequestedSource::Auto,
+                RequestedSource::Auto,
+            )
+            .await;
+
+        let decrypt_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            ChunkScheduler::calculate_decrypt_concurrency(),
+        ));
+        Self::new_for_account(
+            user_auth,
+            download_dir,
+            10,
+            5,
+            3,
+            None,
+            None,
+            budget_scheduler,
+            decrypt_semaphore,
+        )
     }
 
-    /// 使用指定配置创建下载管理器（不再需要 chunk_size 参数，引擎会自动计算）
-    pub fn with_config(
+    /// 🔥 多账号唯一构造入口
+    ///
+    /// 旧的两阶段 `DownloadManager::with_config(...) → wire_global_resources(...)`
+    /// 已删除：多账号下载**唯一**走 `BudgetScheduler::acquire_chunk_permit(uid, BudgetKind::Download)`
+    /// 一条路径，构造时直接注入避免漏调 wire 的破口（与上传侧对称）。
+    ///
+    /// # 参数
+    /// * `user_auth` - 用户认证信息（提供 uid、bduss）
+    /// * `download_dir` - 默认下载目录（必须存在或可创建）
+    /// * `max_global_threads` - 全局分片线程数
+    /// * `max_concurrent_tasks` - 最大同时下载任务数
+    /// * `max_retries` - 单分片最大重试次数
+    /// * `proxy_config` / `fallback_mgr` - 代理配置（可选）
+    /// * `budget_scheduler` - 多账号配额调度器（必填，每分片 acquire 唯一来源）
+    /// * `decrypt_semaphore` - 全局解密 CPU 闸门（机器级单例）
+    pub fn new_for_account(
         user_auth: UserAuth,
         download_dir: PathBuf,
         max_global_threads: usize,
@@ -107,6 +172,8 @@ impl DownloadManager {
         max_retries: u32,
         proxy_config: Option<&ProxyConfig>,
         fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
+        budget_scheduler: std::sync::Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+        decrypt_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<Self> {
         // 确保下载目录存在（路径验证已在配置保存时完成）
         if !download_dir.exists() {
@@ -114,15 +181,30 @@ impl DownloadManager {
             info!("✓ 下载目录已创建: {:?}", download_dir);
         }
 
-        // 创建全局分片调度器（不再使用 Semaphore）
-        let chunk_scheduler = ChunkScheduler::new(max_global_threads, max_concurrent_tasks);
-
-        info!(
-            "创建下载管理器: 下载目录={:?}, 全局线程数={}, 最大同时下载数={} (分片大小自适应)",
-            download_dir, max_global_threads, max_concurrent_tasks
+        // 创建全局分片调度器（构造时直接注入 budget + decrypt + uid）
+        //
+        // 🔥 调度器 owner_uid 设计：当前架构是 per-uid 独立
+        // `DownloadManager` 实例，每个 manager 内部都有自己的 `ChunkScheduler`。
+        // scheduler 内部的 owner_uid 仍用 `Uid::default()` 占位禁用 scheduler-level
+        // assert（保留：单 manager 内同时调度多任务时 task.owner_uid 仍可能不同；
+        // 历史共享 Arc 路径与测试路径仍可能让多账号 task 流入同一调度器）；
+        // budget acquire 在 spawn_chunk_download 内按 `task.owner_uid` 路由，
+        // 确保跨账号场景 budget 从正确账号桶借调。chunk-level 防御走
+        // `ChunkManager::assert_chunk_owner(task_uid, &chunk)`。
+        let chunk_scheduler = ChunkScheduler::new(
+            max_global_threads,
+            max_concurrent_tasks,
+            budget_scheduler,
+            decrypt_semaphore,
+            crate::auth::Uid::default(),
         );
 
-        let engine = Arc::new(DownloadEngine::new_with_proxy(user_auth, proxy_config, fallback_mgr));
+        info!(
+            "创建下载管理器（per-uid uid={}）: 下载目录={:?}, 全局线程数={}, 最大同时下载数={} (分片大小自适应)",
+            user_auth.uid, download_dir, max_global_threads, max_concurrent_tasks
+        );
+
+        let engine = Arc::new(DownloadEngine::new_with_proxy(user_auth.clone(), proxy_config, fallback_mgr));
 
         // 🔥 auto_requeue channel
         let (requeue_tx, requeue_rx) = mpsc::unbounded_channel();
@@ -134,7 +216,7 @@ impl DownloadManager {
             engine,
             download_dir: Arc::new(RwLock::new(download_dir)),
             chunk_scheduler,
-            max_concurrent_tasks,
+            max_concurrent_tasks: Arc::new(AtomicUsize::new(max_concurrent_tasks)),
             persistence_manager: None,
             ws_manager: Arc::new(RwLock::new(None)),
             folder_progress_tx: Arc::new(RwLock::new(None)),
@@ -157,6 +239,8 @@ impl DownloadManager {
             active_count: Arc::new(AtomicUsize::new(0)),
             requeue_tx,
             requeue_rx: Arc::new(Mutex::new(Some(requeue_rx))),
+            // 🔥 多账号归属（从 user_auth.uid 提取）
+            owner_uid: crate::auth::Uid::new(user_auth.uid),
         };
 
         // 🔥 设置槽位超时释放处理器
@@ -190,6 +274,64 @@ impl DownloadManager {
         }
 
         Ok(manager)
+    }
+
+    /// 🔥 多账号：设置该管理器所属的账号 UID
+    pub fn set_owner_uid(&mut self, uid: crate::auth::Uid) {
+        self.owner_uid = uid;
+    }
+
+    /// 🔥 多账号：获取该管理器所属的账号 UID
+    pub fn owner_uid(&self) -> crate::auth::Uid {
+        self.owner_uid
+    }
+
+    // 🔥 旧的两阶段预算注入入口已删除。
+    // BudgetScheduler / decrypt_semaphore / owner_uid 由 `new_for_account` 构造时
+    // 一次性注入；分片调度路径不再有 None fallback。结构性消除"漏调 wire 时
+    // 分片调度静默 fallback 绕过 budget"的破口（与上传侧对称）。
+
+    /// 🔥 覆盖单个任务的归属 UID
+    ///
+    /// 用于 handler 接收到 `req.uid` 显式归属时，纠正 `create_task` 默认使用的
+    /// `self.owner_uid`（active 账号）。同时同步更新 `.meta` 持久化数据，使重启
+    /// 恢复后任务依然归属到正确账号。
+    ///
+    /// 语义：
+    /// - 任务必须存在于 `self.tasks`，否则返回 `Ok(())` 静默忽略（已迁出/被删除）
+    /// - 仅修改运行态 `DownloadTask.owner_uid` + 持久化 `.meta`，不调度任何重算
+    /// - 必须在 `start_task` 之前调用，否则 BudgetScheduler 已按旧 owner_uid 借调 permit
+    pub async fn override_task_owner_uid(
+        &self,
+        task_id: &str,
+        new_owner_uid: crate::auth::Uid,
+    ) -> anyhow::Result<()> {
+        // 1) 修改运行态 task
+        let task_arc_opt = {
+            let tasks = self.tasks.read().await;
+            tasks.get(task_id).cloned()
+        };
+        if let Some(task_arc) = task_arc_opt {
+            let mut t = task_arc.lock().await;
+            if t.owner_uid == new_owner_uid {
+                return Ok(());
+            }
+            t.owner_uid = new_owner_uid;
+        } else {
+            tracing::warn!(
+                "override_task_owner_uid: 任务不存在于运行态 tasks: {}（可能已迁出）",
+                task_id
+            );
+        }
+
+        // 2) 同步持久化 .meta
+        if let Some(ref pm) = self.persistence_manager {
+            pm.lock()
+                .await
+                .update_download_owner_uid(task_id, new_owner_uid.raw())
+                .map_err(|e| anyhow::anyhow!("更新 .meta owner_uid 失败: {e}"))?;
+        }
+        Ok(())
     }
 
     /// 🔥 设置持久化管理器
@@ -293,7 +435,35 @@ impl DownloadManager {
         let local_path = download_dir.join(&filename);
         drop(download_dir);
 
-        self.create_task_internal(fs_id, remote_path, local_path, total_size, conflict_strategy)
+        self.create_task_internal(fs_id, remote_path, local_path, total_size, conflict_strategy, None)
+            .await
+    }
+
+    /// 🔥 创建下载任务（显式 owner_uid）
+    ///
+    /// 让 task / 持久化 / Created event / 后续所有事件都使用 `owner_uid`，
+    /// 避免事后 override 与 Created event / async execution 竞态。
+    pub async fn create_task_with_owner(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        filename: String,
+        total_size: u64,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
+    ) -> Result<String> {
+        let download_dir = self.download_dir.read().await;
+        let local_path = download_dir.join(&filename);
+        drop(download_dir);
+
+        self.create_task_internal(
+            fs_id,
+            remote_path,
+            local_path,
+            total_size,
+            conflict_strategy,
+            Some(owner_uid),
+        )
             .await
     }
 
@@ -310,11 +480,38 @@ impl DownloadManager {
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<String> {
         let local_path = target_dir.join(&filename);
-        self.create_task_internal(fs_id, remote_path, local_path, total_size, conflict_strategy)
+        self.create_task_internal(fs_id, remote_path, local_path, total_size, conflict_strategy, None)
+            .await
+    }
+
+    /// 🔥 创建下载任务（指定下载目录 + 显式 owner_uid）
+    pub async fn create_task_with_dir_and_owner(
+        &self,
+        fs_id: u64,
+        remote_path: String,
+        filename: String,
+        total_size: u64,
+        target_dir: &std::path::Path,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
+    ) -> Result<String> {
+        let local_path = target_dir.join(&filename);
+        self.create_task_internal(
+            fs_id,
+            remote_path,
+            local_path,
+            total_size,
+            conflict_strategy,
+            Some(owner_uid),
+        )
             .await
     }
 
     /// 内部方法：创建下载任务
+    ///
+    /// `owner_uid_override`：`Some(uid)` 用 uid，
+    /// `None` 沿用 `self.owner_uid`（per-uid manager 架构下即该 manager 自己的 uid；
+    /// 历史共享 Arc / 测试路径下可能为 startup active）。
     async fn create_task_internal(
         &self,
         fs_id: u64,
@@ -322,7 +519,11 @@ impl DownloadManager {
         local_path: PathBuf,
         total_size: u64,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid_override: Option<crate::auth::Uid>,
     ) -> Result<String> {
+        // effective_uid 在 task 创建前就确定：
+        // task / 持久化 / Created event 全部用 effective_uid，根除事后 override 竞态。
+        let effective_uid = owner_uid_override.unwrap_or(self.owner_uid);
         // 获取默认策略（如果未指定）
         let strategy = conflict_strategy.unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
 
@@ -342,10 +543,13 @@ impl DownloadManager {
 
                 info!("跳过下载（文件已存在）: {:?}", local_path);
 
+                // 用 effective_uid 而非 self.owner_uid
                 self.publish_event(DownloadEvent::Skipped {
                     task_id: format!("skipped-{}", uuid::Uuid::new_v4()),
                     filename,
                     reason: "文件已存在".to_string(),
+
+                    owner_uid: Some(effective_uid.raw()),
                 })
                     .await;
 
@@ -372,7 +576,7 @@ impl DownloadManager {
         // 🔥 查询映射表获取原始文件名（用于加密文件显示）
         let original_filename = self.query_original_filename(&filename).await;
 
-        let mut task = DownloadTask::new(fs_id, remote_path.clone(), final_local_path.clone(), total_size);
+        let mut task = DownloadTask::new(fs_id, remote_path.clone(), final_local_path.clone(), total_size, effective_uid);
 
         // 🔥 设置原始文件名和加密标记
         if let Some(ref orig_name) = original_filename {
@@ -391,7 +595,33 @@ impl DownloadManager {
         // 🔥 活跃计数 +1（新建任务为 Pending）
         self.inc_active();
 
+        // 🔥 创建即落盘占位元数据：让任务在 register（准备阶段）之前失败时也有持久化记录，
+        // 重启后可恢复为终态「失败」，而不是凭空消失（与上传任务创建即落盘对齐）。
+        if let Some(ref pm) = self.persistence_manager {
+            if let Err(e) = pm.lock().await.persist_download_task_on_create(
+                task_id.clone(),
+                fs_id,
+                remote_path.clone(),
+                final_local_path.clone(),
+                total_size,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                Some(effective_uid.raw()),
+            ) {
+                warn!("写入下载任务创建占位元数据失败: {}", e);
+            }
+        }
+
         // 🔥 发送任务创建事件
+        //
+        // 携带 `effective_uid`（请求传入 → 使用之，否则沿用 self.owner_uid）。
+        // 这彻底解决了"Created 事件 owner 错位"问题：handler 不再
+        // 需要事后 `override_task_owner_uid`，task / 持久化 / Created event 三者
+        // 在创建瞬间就一致。
         self.publish_event(DownloadEvent::Created {
             task_id: task_id.clone(),
             fs_id,
@@ -401,6 +631,8 @@ impl DownloadManager {
             group_id,
             is_backup: false,
             original_filename,
+
+            owner_uid: Some(effective_uid.raw()),
         })
             .await;
 
@@ -538,7 +770,7 @@ impl DownloadManager {
                         "备份任务 {} 无可用任务位，加入等待队列末尾 (已用槽位: {}/{})",
                         task_id,
                         self.task_slot_pool.used_slots().await,
-                        self.max_concurrent_tasks
+                        self.max_concurrent_tasks.load(Ordering::SeqCst)
                     );
                     return Ok(());
                 }
@@ -585,8 +817,8 @@ impl DownloadManager {
                             if self.task_slot_pool.find_folder_with_borrowed_slots().await.is_some() {
                                 info!("普通任务 {} 无可用槽位，尝试回收文件夹借调槽位", task_id);
 
-                                // 尝试回收一个借调槽位
-                                if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot().await {
+                                // 尝试回收一个借调槽位（按当前 manager 的 owner_uid 过滤）
+                                if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot_for_owner(self.owner_uid()).await {
                                     // 回收成功，分配槽位给新任务
                                     if let Some((slot_id, preempted_task_id)) = self.task_slot_pool.allocate_fixed_slot_with_priority(
                                         task_id, false, TaskPriority::Normal
@@ -620,7 +852,7 @@ impl DownloadManager {
                                         "普通任务 {} 无可用任务位，加入等待队列 (已用槽位: {}/{})",
                                         task_id,
                                         self.task_slot_pool.used_slots().await,
-                                        self.max_concurrent_tasks
+                                        self.max_concurrent_tasks.load(Ordering::SeqCst)
                                     );
                                     return Ok(());
                                 }
@@ -631,7 +863,7 @@ impl DownloadManager {
                                     "普通任务 {} 无可用任务位且无借调槽位可回收，加入等待队列 (已用槽位: {}/{})",
                                     task_id,
                                     self.task_slot_pool.used_slots().await,
-                                    self.max_concurrent_tasks
+                                    self.max_concurrent_tasks.load(Ordering::SeqCst)
                                 );
                                 return Ok(());
                             }
@@ -642,7 +874,7 @@ impl DownloadManager {
                                 "普通任务 {} 无可用任务位，加入等待队列 (已用槽位: {}/{})",
                                 task_id,
                                 self.task_slot_pool.used_slots().await,
-                                self.max_concurrent_tasks
+                                self.max_concurrent_tasks.load(Ordering::SeqCst)
                             );
                             return Ok(());
                         }
@@ -798,13 +1030,16 @@ impl DownloadManager {
             );
         }
 
-        {
+        // 取出 task.owner_uid 用于 Failed 事件。
+        // handle_task_failure 是无 self 的 standalone async fn，无法访问 manager.owner_uid。
+        let owner_uid_raw_for_failed: Option<u64> = {
             let mut t = task.lock().await;
             t.mark_failed(error_msg.clone());
             t.slot_id = None;
             t.is_borrowed_slot = false;
             t.uses_folder_fixed_slot = false;
-        }
+            Some(t.owner_uid.raw())
+        };
 
         // 发布任务失败事件：备份任务走 BackupTransferNotification::Failed
         // （publish_event / send_if_subscribed 路径对备份任务统一交给 AutoBackupManager 消费），
@@ -833,6 +1068,8 @@ impl DownloadManager {
                     error: error_msg.clone(),
                     group_id: group_id.clone(),
                     is_backup,
+
+                    owner_uid: owner_uid_raw_for_failed,
                 }),
                 group_id.clone(),
             );
@@ -946,7 +1183,8 @@ impl DownloadManager {
             }
         };
 
-        let (old_status, group_id, is_backup, slot_id, is_borrowed_slot, uses_folder_fixed_slot) = {
+        // 同时取出真实 owner_uid
+        let (old_status, group_id, is_backup, slot_id, is_borrowed_slot, uses_folder_fixed_slot, task_owner_uid_raw) = {
             let t = task.lock().await;
             (
                 match t.status {
@@ -965,6 +1203,7 @@ impl DownloadManager {
                 t.slot_id,
                 t.is_borrowed_slot,
                 t.uses_folder_fixed_slot,
+                t.owner_uid.raw(),
             )
         };
 
@@ -1069,6 +1308,8 @@ impl DownloadManager {
                 group_id: group_id.clone(),
                 is_backup,
                 error: Some(reason),
+
+                owner_uid: Some(task_owner_uid_raw),
             })
                 .await;
         }
@@ -1212,6 +1453,9 @@ impl DownloadManager {
         let requeue_tx_clone = self.requeue_tx.clone();
         // 🔥 文件夹管理器引用（scheduler 中分片下载需要）
         let folder_manager_arc_clone = self.folder_manager.clone();
+        // 不再 capture self.owner_uid。
+        // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
+        // 事件归属一律读 `task.owner_uid`（已在下方 prepare 后从 task 读出 task_owner_uid）。
 
         tokio::spawn(async move {
             // 获取 WebSocket 管理器和文件夹进度发送器
@@ -1259,6 +1503,7 @@ impl DownloadManager {
                         transfer_task_id,
                         is_borrowed_slot,
                         uses_folder_fixed_slot,
+                        task_owner_uid,
                     ) = {
                         let t = task_clone.lock().await;
                         (
@@ -1274,6 +1519,8 @@ impl DownloadManager {
                             t.transfer_task_id.clone(),
                             t.is_borrowed_slot,
                             t.uses_folder_fixed_slot,
+                            // 让 .meta 持久化跟随 task.owner_uid
+                            t.owner_uid,
                         )
                     };
 
@@ -1322,6 +1569,8 @@ impl DownloadManager {
                                 group_id: group_id.clone(),
                                 is_backup,
                                 error: None,
+
+                                owner_uid: Some(task_owner_uid.raw()),
                             }),
                             group_id.clone(),
                         );
@@ -1368,6 +1617,9 @@ impl DownloadManager {
                     };
 
                     // 🔥 注册任务到持久化管理器
+                    // 显式传 task.owner_uid，避免 PersistenceManager
+                    // 启动账号与 task 实际归属不一致（per-uid manager 架构下 PersistenceManager
+                    // 是 manager 自己 uid 的 sqlite，但跨 manager 历史路径仍可能出现错配）。
                     if let Some(ref pm) = persistence_manager {
                         if let Err(e) = pm.lock().await.register_download_task(
                             task_id_clone.clone(),
@@ -1385,12 +1637,13 @@ impl DownloadManager {
                             is_encrypted,
                             encryption_key_version,
                             transfer_task_id.clone(),
+                            Some(task_owner_uid.raw()),
                         ) {
                             warn!("注册任务到持久化管理器失败: {}", e);
                         } else {
                             info!(
-                                "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={}, transfer_task_id={:?})",
-                                task_id_clone, total_chunks, is_backup, transfer_task_id
+                                "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={}, transfer_task_id={:?}, owner_uid={})",
+                                task_id_clone, total_chunks, is_backup, transfer_task_id, task_owner_uid.raw()
                             );
                         }
 
@@ -1862,6 +2115,9 @@ impl DownloadManager {
         // 🔥 auto_requeue 发送端和文件夹管理器引用
         let requeue_tx_for_monitor = self.requeue_tx.clone();
         let folder_manager_arc_for_monitor = self.folder_manager.clone();
+        // 不再 capture self.owner_uid。
+        // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
+        // 事件归属一律读 `task.owner_uid`（已在内层 spawn 后从 task 读出 task_owner_uid）。
 
         tokio::spawn(async move {
             // 🔥 优化：缩短检查间隔从3秒到1秒，减少等待时间
@@ -2105,6 +2361,7 @@ impl DownloadManager {
                                                 transfer_task_id,
                                                 is_borrowed_slot,
                                                 uses_folder_fixed_slot,
+                                                task_owner_uid,
                                             ) = {
                                                 let t = task_clone.lock().await;
                                                 (
@@ -2120,6 +2377,8 @@ impl DownloadManager {
                                                     t.transfer_task_id.clone(),
                                                     t.is_borrowed_slot,
                                                     t.uses_folder_fixed_slot,
+                                                    //
+                                                    t.owner_uid,
                                                 )
                                             };
 
@@ -2169,6 +2428,8 @@ impl DownloadManager {
                                                         group_id: group_id.clone(),
                                                         is_backup,
                                                         error: None,
+
+                                                        owner_uid: Some(task_owner_uid.raw()),
                                                     }),
                                                     group_id.clone(),
                                                 );
@@ -2215,6 +2476,7 @@ impl DownloadManager {
                                             };
 
                                             // 🔥 注册任务到持久化管理器
+                                            // 显式传 task.owner_uid
                                             if let Some(ref pm) = persistence_manager_clone {
                                                 if let Err(e) = pm.lock().await.register_download_task(
                                                     id_clone.clone(),
@@ -2232,6 +2494,7 @@ impl DownloadManager {
                                                     is_encrypted,
                                                     encryption_key_version,
                                                     transfer_task_id.clone(),
+                                                    Some(task_owner_uid.raw()),
                                                 ) {
                                                     warn!(
                                                         "后台监控：注册任务到持久化管理器失败: {}",
@@ -2500,6 +2763,11 @@ impl DownloadManager {
         // 🔥 备份任务终态失败需要走 BackupTransferNotification::Failed，
         //    与 publish_event() 的"备份任务跳过普通下载事件"约定保持一致。
         let backup_notification_tx_arc = self.backup_notification_tx.clone();
+        // 🔥 槽位超时终态失败也要写持久化，否则重启后这条失败任务会凭空消失。
+        let persistence_manager = self.persistence_manager.clone();
+        // 不再 capture self.owner_uid。
+        // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
+        // 事件归属一律读 `task.owner_uid`（在锁内一并取出）。
         tokio::spawn(async move {
             while let Some(task_id) = rx.recv().await {
                 info!("收到槽位超时释放通知，将任务设置为失败: {}", task_id);
@@ -2511,13 +2779,13 @@ impl DownloadManager {
                 let tasks_guard = tasks.read().await;
                 if let Some(task) = tasks_guard.get(&task_id) {
                     // 🔥 先在锁内读出后续要用到的字段，再尽快释放锁，避免发送通知时持锁过久
-                    let (group_id, total_size, is_backup) = {
+                    let (group_id, total_size, is_backup, task_owner_uid_raw) = {
                         let mut t = task.lock().await;
                         t.status = crate::downloader::TaskStatus::Failed;
                         t.error = Some(STALE_ERROR_MSG.to_string());
                         // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
                         t.slot_id = None;
-                        (t.group_id.clone(), t.total_size, t.is_backup)
+                        (t.group_id.clone(), t.total_size, t.is_backup, t.owner_uid.raw())
                     };
 
                     // 发送终态失败通知：备份任务走 BackupTransferNotification::Failed，
@@ -2553,9 +2821,22 @@ impl DownloadManager {
                                     error: STALE_ERROR_MSG.to_string(),
                                     group_id: group_id.clone(),
                                     is_backup,
+
+                                    owner_uid: Some(task_owner_uid_raw),
                                 }),
                                 group_id.clone(),
                             );
+                        }
+                    }
+
+                    // 🔥 写持久化错误并标记为失败，确保重启后该失败任务仍保留（终态可见、可重试/删除）
+                    if let Some(ref pm) = persistence_manager {
+                        if let Err(e) = pm
+                            .lock()
+                            .await
+                            .update_task_error(&task_id, STALE_ERROR_MSG.to_string())
+                        {
+                            warn!("槽位超时：更新下载任务错误信息失败 (task_id={}): {}", task_id, e);
                         }
                     }
 
@@ -2602,6 +2883,9 @@ impl DownloadManager {
         // 🔥 auto_requeue 发送端和文件夹管理器引用
         let requeue_tx_for_trigger = self.requeue_tx.clone();
         let folder_manager_arc_for_trigger = self.folder_manager.clone();
+        // 不再 capture self.owner_uid。
+        // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
+        // 事件归属一律读 `task.owner_uid`（已在内层 spawn 后从 task 读出 task_owner_uid）。
 
         tokio::spawn(async move {
             while let Some(()) = rx.recv().await {
@@ -2842,6 +3126,7 @@ impl DownloadManager {
                                                 transfer_task_id,
                                                 is_borrowed_slot,
                                                 uses_folder_fixed_slot,
+                                                task_owner_uid,
                                             ) = {
                                                 let t = task_clone.lock().await;
                                                 (
@@ -2857,6 +3142,8 @@ impl DownloadManager {
                                                     t.transfer_task_id.clone(),
                                                     t.is_borrowed_slot,
                                                     t.uses_folder_fixed_slot,
+                                                    //
+                                                    t.owner_uid,
                                                 )
                                             };
 
@@ -2906,6 +3193,8 @@ impl DownloadManager {
                                                         group_id: group_id.clone(),
                                                         is_backup,
                                                         error: None,
+
+                                                        owner_uid: Some(task_owner_uid.raw()),
                                                     }),
                                                     group_id.clone(),
                                                 );
@@ -2952,6 +3241,7 @@ impl DownloadManager {
                                             };
 
                                             // 🔥 注册任务到持久化管理器
+                                            // 显式传 task.owner_uid.raw()
                                             if let Some(ref pm) = persistence_manager_clone {
                                                 if let Err(e) = pm.lock().await.register_download_task(
                                                     id_clone.clone(),
@@ -2969,6 +3259,7 @@ impl DownloadManager {
                                                     is_encrypted,
                                                     encryption_key_version,
                                                     transfer_task_id.clone(),
+                                                    Some(task_owner_uid.raw()),
                                                 ) {
                                                     warn!(
                                                         "0延迟启动：注册任务到持久化管理器失败: {}",
@@ -3347,6 +3638,8 @@ impl DownloadManager {
         let mut t = task.lock().await;
         let group_id = t.group_id.clone();
         let is_backup = t.is_backup;
+        // 从 task 取真实 owner_uid（共享 manager 下 self.owner_uid 不可靠）
+        let task_owner_uid_raw = t.owner_uid.raw();
 
         if t.status != TaskStatus::Downloading {
             anyhow::bail!("任务未在下载中");
@@ -3399,7 +3692,7 @@ impl DownloadManager {
         if let Some(ref pm) = self.persistence_manager {
             use crate::persistence::types::TaskPersistenceStatus;
             if let Err(e) = crate::persistence::metadata::update_metadata(
-                &pm.lock().await.wal_dir(),
+                pm.lock().await.wal_dir(),
                 task_id,
                 |m| {
                     m.set_status(TaskPersistenceStatus::Paused);
@@ -3419,6 +3712,8 @@ impl DownloadManager {
             group_id: group_id.clone(),
             is_backup,
             error: None,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -3427,6 +3722,8 @@ impl DownloadManager {
             task_id: task_id.to_string(),
             group_id,
             is_backup,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -3488,7 +3785,8 @@ impl DownloadManager {
     /// 5. 将任务加入等待队列
     pub async fn add_preempted_backup_to_queue(&self, task_id: &str) {
         // 🔥 问题2/3修复：更新状态从 Paused 到 Pending，并发送通知
-        let (group_id, is_backup) = {
+        // 同时取出真实 owner_uid
+        let (group_id, is_backup, task_owner_uid_raw) = {
             let task = match self.tasks.read().await.get(task_id).cloned() {
                 Some(t) => t,
                 None => {
@@ -3502,14 +3800,14 @@ impl DownloadManager {
                 t.status = TaskStatus::Pending;
                 info!("被抢占的备份任务 {} 状态已从 Paused 改为 Pending", task_id);
             }
-            (t.group_id.clone(), t.is_backup)
+            (t.group_id.clone(), t.is_backup, t.owner_uid.raw())
         };
 
         // 🔥 持久化状态
         if let Some(ref pm) = self.persistence_manager {
             use crate::persistence::types::TaskPersistenceStatus;
             if let Err(e) = crate::persistence::metadata::update_metadata(
-                &pm.lock().await.wal_dir(),
+                pm.lock().await.wal_dir(),
                 task_id,
                 |m| {
                     m.set_status(TaskPersistenceStatus::Pending);
@@ -3527,6 +3825,8 @@ impl DownloadManager {
             group_id: group_id.clone(),
             is_backup,
             error: None,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -3783,6 +4083,8 @@ impl DownloadManager {
                     let old_status = format!("{:?}", task.status).to_lowercase();
                     let group_id = task.group_id.clone();
                     let is_backup = task.is_backup;
+                    // 取真实 owner_uid
+                    let task_owner_uid_raw = task.owner_uid.raw();
                     task.mark_paused();
                     paused_count += 1;
 
@@ -3801,6 +4103,8 @@ impl DownloadManager {
                         group_id: group_id.clone(),
                         is_backup,
                         error: None,
+
+                        owner_uid: Some(task_owner_uid_raw),
                     })
                         .await;
 
@@ -3809,6 +4113,8 @@ impl DownloadManager {
                         task_id: task_id.to_string(),
                         group_id,
                         is_backup,
+
+                        owner_uid: Some(task_owner_uid_raw),
                     })
                         .await;
 
@@ -3903,7 +4209,8 @@ impl DownloadManager {
         };
 
         // 更新任务状态并获取必要信息
-        let (group_id, is_backup) = {
+        // 取真实 owner_uid
+        let (group_id, is_backup, task_owner_uid_raw) = {
             let mut t = task.lock().await;
             if t.status != TaskStatus::Downloading {
                 warn!("暂停被抢占任务失败：任务 {} 不在下载中，当前状态: {:?}", task_id, t.status);
@@ -3911,11 +4218,12 @@ impl DownloadManager {
             }
             let group_id = t.group_id.clone();
             let is_backup = t.is_backup;
+            let task_owner_uid_raw = t.owner_uid.raw();
             t.mark_paused();
             // 清除槽位信息（槽位已被抢占）
             t.slot_id = None;
             t.is_borrowed_slot = false;
-            (group_id, is_backup)
+            (group_id, is_backup, task_owner_uid_raw)
         };
 
         // 从调度器取消任务
@@ -3928,7 +4236,7 @@ impl DownloadManager {
         if let Some(ref pm) = self.persistence_manager {
             use crate::persistence::types::TaskPersistenceStatus;
             if let Err(e) = crate::persistence::metadata::update_metadata(
-                &pm.lock().await.wal_dir(),
+                pm.lock().await.wal_dir(),
                 task_id,
                 |m| {
                     m.set_status(TaskPersistenceStatus::Paused);
@@ -3946,6 +4254,8 @@ impl DownloadManager {
             group_id: group_id.clone(),
             is_backup,
             error: None,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -3954,6 +4264,8 @@ impl DownloadManager {
             task_id: task_id.to_string(),
             group_id,
             is_backup,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -4002,6 +4314,8 @@ impl DownloadManager {
         let group_id;
         let old_status;
         let is_backup;
+        // 取真实 owner_uid
+        let task_owner_uid_raw;
 
         // 检查任务状态并将 Paused/Failed 改回 Pending
 
@@ -4025,6 +4339,7 @@ impl DownloadManager {
             t.status = TaskStatus::Pending;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
+            task_owner_uid_raw = t.owner_uid.raw();
         }
 
         info!("用户请求恢复下载任务: {}", task_id);
@@ -4040,6 +4355,8 @@ impl DownloadManager {
             group_id: group_id.clone(),
             is_backup,
             error: None,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -4048,6 +4365,8 @@ impl DownloadManager {
             task_id: task_id.to_string(),
             group_id,
             is_backup,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -4162,8 +4481,8 @@ impl DownloadManager {
                             if self.task_slot_pool.find_folder_with_borrowed_slots().await.is_some() {
                                 info!("恢复{} {} 无可用槽位，尝试回收文件夹借调槽位", task_type_str, task_id);
 
-                                // 尝试回收一个借调槽位
-                                if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot().await {
+                                // 尝试回收一个借调槽位（按当前 manager 的 owner_uid 过滤）
+                                if let Some(reclaimed_slot_id) = fm.reclaim_borrowed_slot_for_owner(self.owner_uid()).await {
                                     // 回收成功，分配槽位给恢复的任务（使用正确的优先级）
                                     if let Some((slot_id, preempted_task_id)) = self.task_slot_pool.allocate_fixed_slot_with_priority(
                                         task_id, false, priority
@@ -4243,6 +4562,8 @@ impl DownloadManager {
         let group_id;
         let old_status;
         let is_backup;
+        // 取真实 owner_uid
+        let task_owner_uid_raw;
 
         // 检查任务状态并将 Paused 改回 Pending
         {
@@ -4258,6 +4579,7 @@ impl DownloadManager {
             t.status = TaskStatus::Pending;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
+            task_owner_uid_raw = t.owner_uid.raw();
 
             // 🔥 关键修复：清除槽位信息
             // 当任务被暂停并重新入队时，原来的槽位已经被释放（如借调位回收）
@@ -4286,6 +4608,8 @@ impl DownloadManager {
             group_id: group_id.clone(),
             is_backup,
             error: None,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -4339,7 +4663,8 @@ impl DownloadManager {
 
     pub async fn delete_task(&self, task_id: &str, delete_file: bool) -> Result<()> {
         // 🔥 在删除前获取 group_id、is_backup 和活跃状态（用于事件通知和计数）
-        let (group_id, is_backup, was_active) = {
+        // 同时取真实 owner_uid（共享 manager 下 self.owner_uid 不可靠）
+        let (group_id, is_backup, was_active, task_owner_uid_raw) = {
             let tasks = self.tasks.read().await;
             if let Some(task_arc) = tasks.get(task_id) {
                 let t = task_arc.lock().await;
@@ -4347,18 +4672,23 @@ impl DownloadManager {
                     t.status,
                     TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
                 );
-                (t.group_id.clone(), t.is_backup, active)
+                (t.group_id.clone(), t.is_backup, active, t.owner_uid.raw())
             } else {
                 // 任务不在内存，尝试从持久化管理器读取
                 if let Some(ref pm) = self.persistence_manager {
                     let pm_guard = pm.lock().await;
                     if let Some(metadata) = pm_guard.get_history_task(task_id) {
-                        (metadata.group_id.clone(), metadata.is_backup, false)
+                        // 历史/元数据中的 owner_uid 也优先使用，缺失时退到 self.owner_uid（兼容旧数据）
+                        // 注：metadata.owner_uid 是 Option<u64>（持久化层），无需 .raw()
+                        let owner_raw = metadata
+                            .owner_uid
+                            .unwrap_or_else(|| self.owner_uid.raw());
+                        (metadata.group_id.clone(), metadata.is_backup, false, owner_raw)
                     } else {
-                        (None, false, false)
+                        (None, false, false, self.owner_uid.raw())
                     }
                 } else {
-                    (None, false, false)
+                    (None, false, false, self.owner_uid.raw())
                 }
             }
         };
@@ -4503,6 +4833,8 @@ impl DownloadManager {
             task_id: task_id.to_string(),
             group_id,
             is_backup,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -4599,7 +4931,8 @@ impl DownloadManager {
     /// 删除单个下载任务的内部实现（不触发 waiting_queue 清理、sleep 和 try_start_waiting_tasks）
     async fn delete_task_internal(&self, task_id: &str, delete_file: bool) -> Result<()> {
         // 获取任务信息
-        let (group_id, is_backup, was_active) = {
+        // 取真实 owner_uid
+        let (group_id, is_backup, was_active, task_owner_uid_raw) = {
             let tasks = self.tasks.read().await;
             if let Some(task_arc) = tasks.get(task_id) {
                 let t = task_arc.lock().await;
@@ -4607,9 +4940,9 @@ impl DownloadManager {
                     t.status,
                     TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
                 );
-                (t.group_id.clone(), t.is_backup, active)
+                (t.group_id.clone(), t.is_backup, active, t.owner_uid.raw())
             } else {
-                (None, false, false)
+                (None, false, false, self.owner_uid.raw())
             }
         };
 
@@ -4688,6 +5021,8 @@ impl DownloadManager {
             task_id: task_id.to_string(),
             group_id,
             is_backup,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -4726,6 +5061,31 @@ impl DownloadManager {
         } else {
             None
         }
+    }
+
+    /// 检查任务是否存在于内存或持久化存储中
+    pub async fn has_task_anywhere(&self, task_id: &str) -> bool {
+        let tasks = self.tasks.read().await;
+        if tasks.contains_key(task_id) {
+            return true;
+        }
+        if let Some(ref pm) = self.persistence_manager {
+            let pm_guard = pm.lock().await;
+            if pm_guard.get_history_task(task_id).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 任务是否存在于**内存**中（不查历史库）。
+    ///
+    /// 用于跨账号路由的"内存优先"判定：内存命中即可确定归属为本 manager 的
+    /// `owner_uid`（per-uid 独立 manager）。历史库为全局共享，无法据此判定归属，
+    /// 故路由的历史回退路径改用 `metadata.owner_uid`（见
+    /// `AppState::find_download_manager_for_task`）。
+    pub async fn has_task_in_memory(&self, task_id: &str) -> bool {
+        self.tasks.read().await.contains_key(task_id)
     }
 
     /// 🔥 更新任务的槽位信息
@@ -4834,13 +5194,15 @@ impl DownloadManager {
         // 这里就会让子任务带着已经失效的旧槽位标记重新进入调度，跳过真正的重新分配。
         // cancel_tasks_by_group 本身已经在源头清过；这里属于 defensive cleanup，
         // 保证从 set_task_pending_and_queue 出去的任务一定是"Pending + 三字段全空"。
-        let (old_status, group_id, is_backup) = {
+        // 取真实 owner_uid
+        let (old_status, group_id, is_backup, task_owner_uid_raw) = {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(task_id) {
                 let mut t = task.lock().await;
                 let old = format!("{:?}", t.status).to_lowercase();
                 let gid = t.group_id.clone();
                 let backup = t.is_backup;
+                let owner_raw = t.owner_uid.raw();
                 if t.status == TaskStatus::Paused {
                     t.status = TaskStatus::Pending;
                     info!("任务 {} 状态从 Paused 改为 Pending（等待槽位）", task_id);
@@ -4849,7 +5211,7 @@ impl DownloadManager {
                 t.slot_id = None;
                 t.is_borrowed_slot = false;
                 t.uses_folder_fixed_slot = false;
-                (old, gid, backup)
+                (old, gid, backup, owner_raw)
             } else {
                 anyhow::bail!("任务不存在: {}", task_id);
             }
@@ -4873,6 +5235,8 @@ impl DownloadManager {
             group_id,
             is_backup,
             error: None,
+
+            owner_uid: Some(task_owner_uid_raw),
         })
             .await;
 
@@ -5065,9 +5429,19 @@ impl DownloadManager {
     /// * `local_path` - 本地保存路径
     /// * `total_size` - 文件大小
     /// * `backup_config_id` - 备份配置ID
+    /// * `owner_uid` - 任务归属账号 UID（）
     ///
     /// # 返回
     /// 任务ID
+    ///
+    /// # 多账号说明
+    /// 共享 `DownloadManager` 设计下 `self.owner_uid` 不可靠（同一个 Arc 服务多账号）。
+    /// AutoBackup 创建子下载任务时必须把 `BackupConfig.owner_uid` / `BackupTask.owner_uid`
+    /// 显式传进来，否则衍生任务会落到启动账号或随机 manager owner，影响：
+    /// - 列表/过滤（按 owner_uid 过滤会漏掉这些任务）
+    /// - 预算（BudgetScheduler 借调 permit 走错账号）
+    /// - 事件归属（owner_uid 字段错误）
+    /// - 删除账号扫描（被错误账号"持有"的任务被孤立）
     pub async fn create_backup_task(
         &self,
         fs_id: u64,
@@ -5076,6 +5450,7 @@ impl DownloadManager {
         total_size: u64,
         backup_config_id: String,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
     ) -> Result<String> {
         use crate::uploader::conflict_resolver::ConflictResolver;
         use crate::uploader::conflict::{ConflictResolution, DownloadConflictStrategy};
@@ -5102,6 +5477,10 @@ impl DownloadManager {
                     task_id: format!("backup-skipped-{}", uuid::Uuid::new_v4()),
                     filename,
                     reason: "文件已存在".to_string(),
+
+                    // 用调用方传入的 owner_uid，
+                    // 不再用共享 manager 的 self.owner_uid（共享 manager 下不可靠）
+                    owner_uid: Some(owner_uid.raw()),
                 })
                     .await;
 
@@ -5119,18 +5498,20 @@ impl DownloadManager {
         }
 
         // 创建备份任务
+        // task.owner_uid = 调用方传入的 owner_uid
         let task = DownloadTask::new_backup(
             fs_id,
             remote_path.clone(),
             final_local_path.clone(),
             total_size,
             backup_config_id.clone(),
+            owner_uid,
         );
         let task_id = task.id.clone();
 
         info!(
-            "创建备份下载任务: id={}, remote={}, local={:?}, size={}, backup_config={}, strategy={:?}",
-            task_id, remote_path, final_local_path, total_size, backup_config_id, strategy
+            "创建备份下载任务: id={}, remote={}, local={:?}, size={}, backup_config={}, strategy={:?}, owner_uid={}",
+            task_id, remote_path, final_local_path, total_size, backup_config_id, strategy, owner_uid.raw()
         );
 
         let task_arc = Arc::new(Mutex::new(task));
@@ -5139,7 +5520,29 @@ impl DownloadManager {
         // 🔥 活跃计数 +1（新建备份任务为 Pending）
         self.inc_active();
 
+        // 🔥 创建即落盘占位元数据（与非备份 create_task_internal 同款）：
+        // 备份下载任务若在 register 之前失败，重启后也能恢复为终态「失败」。
+        if let Some(ref pm) = self.persistence_manager {
+            if let Err(e) = pm.lock().await.persist_download_task_on_create(
+                task_id.clone(),
+                fs_id,
+                remote_path.clone(),
+                final_local_path.clone(),
+                total_size,
+                None,
+                None,
+                None,
+                true,
+                Some(backup_config_id.clone()),
+                None,
+                Some(owner_uid.raw()),
+            ) {
+                warn!("写入备份下载任务创建占位元数据失败: {}", e);
+            }
+        }
+
         // 🔥 发送任务创建事件（备份任务，is_backup=true）
+        // 见非备份 create_task_internal 同款注释。
         self.publish_event(DownloadEvent::Created {
             task_id: task_id.clone(),
             fs_id,
@@ -5149,6 +5552,9 @@ impl DownloadManager {
             group_id: None,
             is_backup: true,
             original_filename: None, // 备份下载任务不需要原始文件名
+
+            //
+            owner_uid: Some(owner_uid.raw()),
         })
             .await;
 
@@ -5165,6 +5571,8 @@ impl DownloadManager {
 
         Some(DownloadTask {
             id: metadata.task_id.clone(),
+            // 多账号归属：从 metadata 恢复，缺失时为默认 Uid(0)
+            owner_uid: metadata.owner_uid.map(crate::auth::Uid::new).unwrap_or_default(),
             fs_id,
             remote_path,
             local_path,
@@ -5331,6 +5739,8 @@ impl DownloadManager {
                 if t.status == TaskStatus::Pending && !t.is_backup {
                     let group_id = t.group_id.clone();
                     let is_backup = t.is_backup;
+                    // 取真实 owner_uid
+                    let task_owner_uid_raw = t.owner_uid.raw();
                     t.mark_paused();
                     drop(t);
 
@@ -5343,7 +5753,7 @@ impl DownloadManager {
                     if let Some(ref pm) = self.persistence_manager {
                         use crate::persistence::types::TaskPersistenceStatus;
                         if let Err(e) = crate::persistence::metadata::update_metadata(
-                            &pm.lock().await.wal_dir(),
+                            pm.lock().await.wal_dir(),
                             id,
                             |m| {
                                 m.set_status(TaskPersistenceStatus::Paused);
@@ -5360,6 +5770,8 @@ impl DownloadManager {
                         group_id: group_id.clone(),
                         is_backup,
                         error: None,
+
+                        owner_uid: Some(task_owner_uid_raw),
                     })
                         .await;
 
@@ -5367,6 +5779,8 @@ impl DownloadManager {
                         task_id: id.to_string(),
                         group_id,
                         is_backup,
+
+                        owner_uid: Some(task_owner_uid_raw),
                     })
                         .await;
 
@@ -5518,6 +5932,299 @@ impl DownloadManager {
         self.tasks.read().await.keys().cloned().collect()
     }
 
+    // ============================================================
+    // 多账号：按 owner_uid 过滤的批量操作助手
+    //
+    // 共享 Manager 设计下，所有持久化账号共用同一个 `DownloadManager` 实例
+    // （见 `state.rs::register_account_managers`）。前端在 active 账号下点
+    // 「全部暂停 / 全部恢复 / 全部删除 / 清除已完成 / 清除失败」时，必须
+    // 按 `task.owner_uid == uid` 过滤，否则会误操作其他账号的任务。
+    //
+    // 调用约定：handler 解析 `effective_uid = req.uid.or(active_uid)`，
+    // 再传入 `_for_uid` 方法。备份任务（is_backup=true）始终被排除。
+    // ============================================================
+
+    /// 获取属于指定账号的可暂停任务ID列表
+    pub async fn get_pausable_task_ids_for_uid(&self, uid: crate::auth::Uid) -> Vec<String> {
+        let tasks = self.tasks.read().await;
+        let mut ids = Vec::new();
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            if t.owner_uid == uid
+                && !t.is_backup
+                && matches!(t.status, TaskStatus::Downloading | TaskStatus::Pending)
+            {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// 获取属于指定账号的可恢复任务ID列表
+    pub async fn get_resumable_task_ids_for_uid(&self, uid: crate::auth::Uid) -> Vec<String> {
+        let tasks = self.tasks.read().await;
+        let mut ids = Vec::new();
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            if t.owner_uid == uid
+                && !t.is_backup
+                && matches!(t.status, TaskStatus::Paused | TaskStatus::Failed)
+            {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// 获取属于指定账号的所有任务ID列表（含 active/Paused/Failed/Completed，
+    /// 用于"全部删除"批量操作）。备份任务排除。
+    pub async fn get_all_task_ids_for_uid(&self, uid: crate::auth::Uid) -> Vec<String> {
+        let tasks = self.tasks.read().await;
+        let mut ids = Vec::new();
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            if t.owner_uid == uid && !t.is_backup {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// 校验显式提交的 task_ids 是否都属于指定账号
+    ///
+    /// 共享 manager 设计下，handler 只用 `effective_uid` 路由是不够的——前端
+    /// 直接传 `task_ids` 时也必须每条校验 `task.owner_uid == uid`，否则 A 账号
+    /// 上下文可以操作 B 账号任务。
+    ///
+    /// 返回 `(allowed, denied)`：
+    /// - `allowed`：所有 `task.owner_uid == uid` 且任务存在的 id（直接传给 batch_*）
+    /// - `denied`：`(id, reason)` —— 任务不存在 / 归属不同账号 / is_backup
+    ///
+    /// 调用方按 `denied` 生成 `BatchOperationItem { success: false, error: Some(reason) }`，
+    /// 与 `batch_pause` 的返回结构合并即可。
+    pub async fn validate_task_ids_for_uid(
+        &self,
+        uid: crate::auth::Uid,
+        task_ids: &[String],
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let tasks = self.tasks.read().await;
+        let mut allowed = Vec::new();
+        let mut denied = Vec::new();
+        for id in task_ids {
+            match tasks.get(id) {
+                Some(task_arc) => {
+                    let t = task_arc.lock().await;
+                    if t.owner_uid != uid {
+                        denied.push((
+                            id.clone(),
+                            format!(
+                                "任务不属于当前账号（task.owner_uid={}, 请求 uid={}）",
+                                t.owner_uid.raw(),
+                                uid.raw()
+                            ),
+                        ));
+                    } else if t.is_backup {
+                        denied.push((
+                            id.clone(),
+                            "备份任务不允许通过下载管理批量接口操作".to_string(),
+                        ));
+                    } else {
+                        allowed.push(id.clone());
+                    }
+                }
+                None => {
+                    denied.push((id.clone(), "任务不存在".to_string()));
+                }
+            }
+        }
+        (allowed, denied)
+    }
+
+    /// 清除指定账号下已完成的任务（仅内存 + 内存对应历史）
+    ///
+    /// 共享 manager 设计下 `clear_completed()` 会清掉所有账号的已完成任务，
+    /// 这里按 owner_uid 严格过滤。
+    pub async fn clear_completed_for_uid(&self, uid: crate::auth::Uid) -> usize {
+        let mut tasks = self.tasks.write().await;
+        let mut to_remove = Vec::new();
+
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            if t.owner_uid == uid
+                && t.status == TaskStatus::Completed
+                && !t.is_share_direct_download
+            {
+                to_remove.push(id.clone());
+            }
+        }
+
+        let memory_count = to_remove.len();
+        for id in &to_remove {
+            tasks.remove(id);
+        }
+        drop(tasks);
+
+        // 历史数据库：仅删该 owner_uid 的已完成下载任务
+        let mut history_count = 0;
+        if let Some(ref pm) = self.persistence_manager {
+            let pm_guard = pm.lock().await;
+            let history_db = pm_guard.history_db().cloned();
+            drop(pm_guard);
+
+            if let Some(db) = history_db {
+                match db.remove_tasks_by_type_status_owner(
+                    "download",
+                    "completed",
+                    Some(uid.raw()),
+                ) {
+                    Ok(count) => history_count = count,
+                    Err(e) => warn!("从历史数据库删除已完成下载任务（按 owner_uid={}）失败: {}", uid.raw(), e),
+                }
+                match db.remove_completed_folders_for_owner(Some(uid.raw())) {
+                    Ok(count) => {
+                        history_count += count;
+                        info!(
+                            "从历史数据库删除了 {} 个已完成的文件夹任务（owner_uid={}）",
+                            count,
+                            uid.raw()
+                        );
+                    }
+                    Err(e) => warn!("从历史数据库删除已完成文件夹任务（按 owner_uid={}）失败: {}", uid.raw(), e),
+                }
+            }
+        }
+
+        // FolderDownloadManager 内存：按 owner_uid 过滤已完成
+        let folder_memory_count = {
+            let fm = self.folder_manager.read().await;
+            if let Some(ref folder_manager) = *fm {
+                folder_manager.clear_completed_folders_for_owner(uid).await
+            } else {
+                0
+            }
+        };
+
+        let total_count = memory_count + history_count + folder_memory_count;
+        info!(
+            "清除了 {} 个已完成的任务（owner_uid={}, 文件内存: {}, 文件夹内存: {}, 历史: {}）",
+            total_count,
+            uid.raw(),
+            memory_count,
+            folder_memory_count,
+            history_count
+        );
+        total_count
+    }
+
+    /// 清除指定账号下失败的任务
+    pub async fn clear_failed_for_uid(&self, uid: crate::auth::Uid) -> usize {
+        let mut tasks = self.tasks.write().await;
+        let mut to_remove = Vec::new();
+
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            if t.owner_uid == uid && t.status == TaskStatus::Failed {
+                to_remove.push((id.clone(), t.local_path.clone()));
+            }
+        }
+
+        let count = to_remove.len();
+        for (id, local_path) in to_remove {
+            tasks.remove(&id);
+
+            if local_path.exists() {
+                if let Err(e) = std::fs::remove_file(&local_path) {
+                    warn!("删除失败任务的临时文件失败: {:?}, 错误: {}", local_path, e);
+                } else {
+                    info!("已删除失败任务的临时文件: {:?}", local_path);
+                }
+            }
+        }
+
+        info!("清除了 {} 个失败的任务（owner_uid={}）", count, uid.raw());
+        count
+    }
+
+    /// 删除指定账号下所有下载任务
+    ///
+    /// 用于 `force_delete_account` 链路：共享 `DownloadManager` 设计下，
+    /// 删除账号时必须取消并删除该 uid 归属的所有任务（运行中的取消、内存中的
+    /// 移除、`.meta` 持久化清理、历史记录清理），否则任务在共享 manager 内
+    /// 继续跑，账号已从 accounts.json 删除但下载任务还在消耗带宽 + 占槽位。
+    ///
+    /// 返回 `(memory_deleted, history_deleted)`。
+    pub async fn delete_tasks_for_owner(
+        &self,
+        uid: crate::auth::Uid,
+        delete_files: bool,
+    ) -> (usize, usize) {
+        // 1) 收集内存中归属该 uid 的任务 ID（含备份任务，账号删除时一起清理）
+        let target_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            let mut ids = Vec::new();
+            for (id, task) in tasks.iter() {
+                let t = task.lock().await;
+                if t.owner_uid == uid {
+                    ids.push(id.clone());
+                }
+            }
+            ids
+        };
+
+        let memory_count = target_ids.len();
+        info!(
+            "delete_tasks_for_owner: uid={} 内存中找到 {} 个下载任务",
+            uid.raw(),
+            memory_count
+        );
+
+        // 2) batch_delete_tasks 复用：取消、移除内存、清理 .meta、释放槽位
+        if !target_ids.is_empty() {
+            let (success, failed) = self.batch_delete_tasks(&target_ids, delete_files).await;
+            info!(
+                "delete_tasks_for_owner: uid={} batch_delete 完成: 成功={}, 失败={}",
+                uid.raw(),
+                success,
+                failed
+            );
+        }
+
+        // 3) 历史数据库：按 owner_uid 删除该账号所有 download 历史 + 文件夹历史
+        let mut history_count = 0;
+        if let Some(ref pm) = self.persistence_manager {
+            let pm_guard = pm.lock().await;
+            let history_db = pm_guard.history_db().cloned();
+            drop(pm_guard);
+
+            if let Some(db) = history_db {
+                match db.remove_tasks_by_type_owner("download", Some(uid.raw())) {
+                    Ok(count) => history_count += count,
+                    Err(e) => warn!(
+                        "delete_tasks_for_owner: 删除历史下载任务（owner_uid={}）失败: {}",
+                        uid.raw(),
+                        e
+                    ),
+                }
+                match db.remove_folders_by_owner(uid.raw()) {
+                    Ok(count) => history_count += count,
+                    Err(e) => warn!(
+                        "delete_tasks_for_owner: 删除历史文件夹任务（owner_uid={}）失败: {}",
+                        uid.raw(),
+                        e
+                    ),
+                }
+            }
+        }
+
+        info!(
+            "delete_tasks_for_owner: uid={} 完成（内存={}, 历史={}）",
+            uid.raw(),
+            memory_count,
+            history_count
+        );
+        (memory_count, history_count)
+    }
+
     /// 获取下载目录
     pub async fn download_dir(&self) -> PathBuf {
         self.download_dir.read().await.clone()
@@ -5559,17 +6266,14 @@ impl DownloadManager {
     ///   当前运行的任务完成后，会根据新的限制从等待队列启动任务
     ///   任务位池容量同步缩减（超出上限的占用槽位继续运行到完成）
     pub async fn update_max_concurrent_tasks(&self, new_max: usize) {
-        let old_max = self.max_concurrent_tasks;
+        // 用 swap 原子读写，正确返回上一次写入值，避免 5→3→4 序列时误判为"调小"。
+        let old_max = self.max_concurrent_tasks.swap(new_max, Ordering::SeqCst);
 
         // 更新调度器的限制
         self.chunk_scheduler.update_max_concurrent_tasks(new_max);
 
         // 🔥 动态调整任务位池容量
         self.task_slot_pool.resize(new_max).await;
-
-        // 更新 manager 自己的记录（因为 max_concurrent_tasks 不是 Arc 包装的）
-        // 注意：这里有个限制，因为 self 是 &self，我们不能修改 max_concurrent_tasks
-        // 但调度器和任务位池已经更新了，这个字段只在创建时使用，之后都用调度器的值
 
         if new_max > old_max {
             // 调大：立即尝试启动等待队列中的任务
@@ -5937,6 +6641,19 @@ impl DownloadManager {
             }
         }
 
+        // 多账号 owner_uid 优先级 = recovery_info.owner_uid > self.owner_uid
+        //
+        // recovery_info.owner_uid 已经过 state.rs::filter_by_branch 的兜底填充：
+        //   - Some(uid) 且 uid ∈ accounts → Normal { uid }
+        //   - Some(0)/None + active_uid    → LegacyFillActive { active_uid }
+        //   - Some(uid) 且 uid ∉ accounts → 已被丢弃（不会进 restore_task）
+        //
+        // 仅当 recovery_info.owner_uid 缺失时（极端边界）才退回 self.owner_uid 作兜底。
+        let resolved_owner_uid = recovery_info
+            .owner_uid
+            .map(crate::auth::Uid::new)
+            .unwrap_or(self.owner_uid);
+
         // 创建恢复任务（使用 Paused 状态）
         // 🔥 根据是否为备份任务选择不同的构造方式
         let mut task = if recovery_info.is_backup {
@@ -5946,6 +6663,7 @@ impl DownloadManager {
                 recovery_info.local_path.clone(),
                 recovery_info.file_size,
                 recovery_info.backup_config_id.clone().unwrap_or_default(),
+                resolved_owner_uid,
             )
         } else {
             DownloadTask::new(
@@ -5953,14 +6671,21 @@ impl DownloadManager {
                 recovery_info.remote_path.clone(),
                 recovery_info.local_path.clone(),
                 recovery_info.file_size,
+                resolved_owner_uid,
             )
         };
 
         // 恢复任务 ID（保持原有 ID）
         task.id = task_id.clone();
 
-        // 设置为暂停状态（等待用户手动恢复）
-        task.status = TaskStatus::Paused;
+        // 🔥 终态失败任务恢复为 Failed（保留错误信息，等待用户手动重试/删除）；
+        // 其余任务恢复为 Paused（等待用户手动恢复续传）。
+        if recovery_info.is_failed {
+            task.status = TaskStatus::Failed;
+            task.error = recovery_info.error.clone();
+        } else {
+            task.status = TaskStatus::Paused;
+        }
 
         // 🔥 精确计算已下载大小：逐片累计（处理稀疏分布）
         let last_chunk_index = recovery_info.total_chunks.saturating_sub(1);
@@ -6015,10 +6740,11 @@ impl DownloadManager {
         let task_arc = Arc::new(Mutex::new(task));
         self.tasks.write().await.insert(task_id.clone(), task_arc.clone());
 
-        // 🔥 暂停状态的任务不分配槽位，等待用户手动恢复时再分配
+        // 🔥 暂停/失败态的任务都不分配槽位，等待用户手动恢复/重试时再分配
         // 这样可以让正在下载的任务借用更多槽位
         if is_single_file {
-            info!("单文件任务 {} 恢复完成 (暂停状态，不占用槽位)", task_id);
+            let restored_state = if recovery_info.is_failed { "失败状态" } else { "暂停状态" };
+            info!("单文件任务 {} 恢复完成 ({}，不占用槽位)", task_id, restored_state);
         } else {
             info!("文件夹子任务 {} 恢复完成，槽位由 FolderManager 管理", task_id);
         }
@@ -6104,6 +6830,7 @@ mod tests {
             bdstoken: Some("mock_bdstoken".to_string()),
             login_time: 0,
             last_warmup_at: None,
+            custom_config: Default::default(),
         }
     }
 
@@ -6111,7 +6838,7 @@ mod tests {
     async fn test_manager_creation() {
         let temp_dir = TempDir::new().unwrap();
         let user_auth = create_mock_user_auth();
-        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
+        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).await.unwrap();
 
         assert_eq!(manager.download_dir().await, temp_dir.path());
         assert_eq!(manager.get_all_tasks().await.len(), 0);
@@ -6121,7 +6848,7 @@ mod tests {
     async fn test_create_task() {
         let temp_dir = TempDir::new().unwrap();
         let user_auth = create_mock_user_auth();
-        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
+        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).await.unwrap();
 
         let task_id = manager
             .create_task(
@@ -6146,7 +6873,7 @@ mod tests {
     async fn test_delete_task() {
         let temp_dir = TempDir::new().unwrap();
         let user_auth = create_mock_user_auth();
-        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
+        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).await.unwrap();
 
         let task_id = manager
             .create_task(
@@ -6169,7 +6896,7 @@ mod tests {
     async fn test_clear_completed() {
         let temp_dir = TempDir::new().unwrap();
         let user_auth = create_mock_user_auth();
-        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
+        let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).await.unwrap();
 
         // 创建3个任务
         let task_id1 = manager
@@ -6246,6 +6973,7 @@ mod tests {
                     total_chunks,
                     None, None, None,
                     false, None, None, None, None,
+                    None, // owner_uid_override
                 )
                 .unwrap();
             pm_prev.on_chunk_completed("dl_cold", 0);
@@ -6265,7 +6993,7 @@ mod tests {
 
         let user_auth = create_mock_user_auth();
         let mut manager =
-            DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
+            DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).await.unwrap();
         manager.persistence_manager = Some(pm_arc.clone());
 
         // 构建 DownloadRecoveryInfo
@@ -6279,6 +7007,7 @@ mod tests {
 
         let recovery_info = DownloadRecoveryInfo {
             task_id: "dl_cold".to_string(),
+            owner_uid: None,
             fs_id: 777,
             remote_path: "/remote/cold.bin".to_string(),
             local_path: temp_dir.path().join("cold.bin"),
@@ -6296,6 +7025,8 @@ mod tests {
             is_encrypted: false,
             encryption_key_version: None,
             partial_progress,
+            is_failed: false,
+            error: None,
         };
 
         // 执行冷恢复
@@ -6343,6 +7074,7 @@ mod tests {
                     total_chunks,
                     None, None, None,
                     false, None, None, None, None,
+                    None, // owner_uid_override
                 )
                 .unwrap();
 

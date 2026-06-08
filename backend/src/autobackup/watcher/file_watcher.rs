@@ -301,6 +301,7 @@ impl Drop for FileWatcher {
 
 /// 过滤服务
 #[derive(Clone)]
+#[derive(Default)]
 pub struct FilterService {
     /// 包含的扩展名
     pub include_extensions: HashSet<String>,
@@ -401,17 +402,6 @@ impl FilterService {
     }
 }
 
-impl Default for FilterService {
-    fn default() -> Self {
-        Self {
-            include_extensions: HashSet::new(),
-            exclude_extensions: HashSet::new(),
-            exclude_directories: HashSet::new(),
-            max_file_size: 0,
-            min_file_size: 0,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

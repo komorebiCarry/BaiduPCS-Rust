@@ -11,6 +11,11 @@ import type { BackupTask, BackupFileTask, BackupFileStatus, BackupSubPhase, Skip
 import { listFileTasks, retryFileTask } from '@/api/autobackup'
 import { getWebSocketClient } from '@/utils/websocket'
 import type { BackupEvent, BackupEventFileProgress, BackupEventProgress } from '@/types/events'
+// 多账号集成：在任务详情中显示账号标签
+import AccountBadge from '@/components/AccountBadge.vue'
+import { useAuthStore } from '@/stores/auth'
+
+const authStore = useAuthStore()
 
 const props = defineProps<{
   modelValue: boolean
@@ -465,6 +470,13 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
             <el-tag v-if="task.sub_phase" size="small" type="info" style="margin-left: 8px">
               {{ getSubPhaseText(task.sub_phase) }}
             </el-tag>
+            <!-- 多账号标签 -->
+            <AccountBadge
+                v-if="authStore.hasMultipleAccounts && task.owner_uid != null"
+                :owner-uid="task.owner_uid"
+                size="small"
+                style="margin-left: 8px"
+            />
           </div>
           <div class="config-name" v-if="configName">{{ configName }}</div>
         </div>

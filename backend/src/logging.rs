@@ -149,7 +149,7 @@ impl LogFileManagerInner {
             self.current_size += written as u64;
             Ok(written)
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "日志文件未打开"))
+            Err(io::Error::other("日志文件未打开"))
         }
     }
 

@@ -64,38 +64,73 @@ fn calculate_backoff_delay(retry_count: u32, error_kind: &UploadErrorKind) -> u6
 ///
 /// 为每个正在上传的分片分配一个唯一的槽位ID（1, 2, 3...max_slots）
 /// 分片完成后归还槽位，确保同一时刻每个槽位只有一个分片在使用
+///
+/// 支持热扩缩容（`update_max_threads` 调用 `resize`）。
+///
+/// `available_slots` + `max_slots` 合并到单个 `Mutex<ChunkSlotState>`，
+/// 避免 acquire / release / resize 三路获取两把锁顺序不一致导致的死锁
+/// （与下载侧对称）。
+#[derive(Debug)]
+struct ChunkSlotState {
+    /// 可用槽位栈（pop 取最小 ID）
+    available: Vec<usize>,
+    /// 当前最大槽位数
+    max_slots: usize,
+}
+
 #[derive(Debug)]
 struct ChunkSlotPool {
-    /// 可用槽位栈（使用 Mutex 保护）
-    available_slots: std::sync::Mutex<Vec<usize>>,
-    /// 最大槽位数
-    max_slots: usize,
+    state: std::sync::Mutex<ChunkSlotState>,
 }
 
 impl ChunkSlotPool {
     fn new(max_slots: usize) -> Self {
         // 初始化所有槽位为可用（从大到小，pop时得到小的）
-        let slots: Vec<usize> = (1..=max_slots).rev().collect();
+        let available: Vec<usize> = (1..=max_slots).rev().collect();
         Self {
-            available_slots: std::sync::Mutex::new(slots),
-            max_slots,
+            state: std::sync::Mutex::new(ChunkSlotState {
+                available,
+                max_slots,
+            }),
         }
     }
 
     /// 获取一个空闲槽位，如果没有则返回备用ID
     fn acquire(&self) -> usize {
-        let mut slots = self.available_slots.lock().unwrap();
-        slots.pop().unwrap_or(self.max_slots + 1)
+        let mut state = self.state.lock().unwrap();
+        let max = state.max_slots;
+        state.available.pop().unwrap_or(max + 1)
     }
 
     /// 归还槽位
     fn release(&self, slot_id: usize) {
-        if slot_id <= self.max_slots {
-            let mut slots = self.available_slots.lock().unwrap();
-            if !slots.contains(&slot_id) {
-                slots.push(slot_id);
-            }
+        let mut state = self.state.lock().unwrap();
+        if slot_id <= state.max_slots && !state.available.contains(&slot_id) {
+            state.available.push(slot_id);
         }
+        // slot_id > max（缩容前借出 / acquire 备用 ID）：直接丢弃
+    }
+
+    /// 🔥 热调整最大槽位数
+    ///
+    /// - 扩容（new_max > old_max）：把新增的 ID 加入可用栈
+    /// - 缩容（new_max < old_max）：从可用栈中移除 > new_max 的 ID；正在使用的
+    ///   高 ID 槽位会在 `release` 时被忽略（不重新入栈），自然消亡
+    /// - 不变：直接返回
+    fn resize(&self, new_max: usize) {
+        let mut state = self.state.lock().unwrap();
+        let old_max = state.max_slots;
+        if new_max == old_max {
+            return;
+        }
+        if new_max > old_max {
+            for id in ((old_max + 1)..=new_max).rev() {
+                state.available.push(id);
+            }
+        } else {
+            state.available.retain(|&id| id <= new_max);
+        }
+        state.max_slots = new_max;
     }
 }
 
@@ -286,27 +321,58 @@ pub struct UploadChunkScheduler {
     backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
     /// 上一轮的任务数（用于检测任务数变化）
     last_task_count: Arc<AtomicUsize>,
+    /// 🔥 多账号配额调度器
+    ///
+    /// **必须**在构造时注入（非 `Option`）：多账号上传**唯一**走
+    /// `BudgetScheduler::acquire_chunk_permit(uid, BudgetKind::Upload)` 一条路径，
+    /// 任何"未注入 → fallback 到本地 slot"的分支都会绕过多账号配额。本字段升级为
+    /// 必填字段后，`spawn_chunk_upload` 路径不再有 `None` fallback，编译期保证不会
+    /// 出现"忘记 wire 就启动上传"的结构性缺口。
+    budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+    /// 🔥 调度器所属账号 UID
+    ///
+    /// 当前架构是 per-uid 独立 `UploadManager`，每个 manager 内部各自构造
+    /// `UploadChunkScheduler`。该字段保留为 `Uid::default()` 占位以禁用
+    /// scheduler-level `task.owner_uid == scheduler.owner_uid` 断言 — 单 manager
+    /// 内同时调度的多个 task 可能 owner 不同（历史共享 Arc / 测试路径下尤其如此）。
+    /// 分片调度按 `task.owner_uid` 路由才是 effective owner；本字段仍保留为
+    /// `Arc<StdRwLock<...>>` 维持原可写语义。
+    owner_uid: Arc<StdRwLock<crate::auth::Uid>>,
 }
 
 impl UploadChunkScheduler {
     /// 创建新的调度器（使用默认重试次数）
-    pub fn new(max_global_threads: usize, max_concurrent_tasks: usize) -> Self {
+    ///
+    /// 必须传入 `budget_scheduler` + `owner_uid`，
+    /// 不再有"未注入 → fallback 到本地 slot"的语义破口。
+    pub fn new(
+        max_global_threads: usize,
+        max_concurrent_tasks: usize,
+        budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+        owner_uid: crate::auth::Uid,
+    ) -> Self {
         Self::new_with_config(
             max_global_threads,
             max_concurrent_tasks,
             DEFAULT_MAX_RETRIES,
+            budget_scheduler,
+            owner_uid,
         )
     }
 
     /// 创建新的调度器（完整配置）
+    ///
+    /// `budget_scheduler` + `owner_uid` 必填。
     pub fn new_with_config(
         max_global_threads: usize,
         max_concurrent_tasks: usize,
         max_retries: u32,
+        budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+        owner_uid: crate::auth::Uid,
     ) -> Self {
         info!(
-            "创建全局上传分片调度器: 全局线程数={}, 最大并发任务数={}, 最大重试次数={}",
-            max_global_threads, max_concurrent_tasks, max_retries
+            "创建全局上传分片调度器: 全局线程数={}, 最大并发任务数={}, 最大重试次数={}, owner_uid={}",
+            max_global_threads, max_concurrent_tasks, max_retries, owner_uid.raw()
         );
 
         let scheduler = Self {
@@ -320,6 +386,9 @@ impl UploadChunkScheduler {
             task_completed_tx: Arc::new(RwLock::new(None)),
             backup_notification_tx: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
+            // 🔥 构造时注入，不再有 None fallback
+            budget_scheduler,
+            owner_uid: Arc::new(StdRwLock::new(owner_uid)),
         };
 
         // 启动全局调度循环
@@ -327,6 +396,9 @@ impl UploadChunkScheduler {
 
         scheduler
     }
+
+    // 多账号上传配额唯一构造入口 = `new` / `new_with_config` 必填 `budget_scheduler` +
+    // `owner_uid`，结构性消除"忘记 wire 就启动上传"的缺口。
 
     /// 设置任务完成通知发送器
     pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<String>) {
@@ -346,9 +418,15 @@ impl UploadChunkScheduler {
     }
 
     /// 动态更新最大全局线程数
+    ///
+    /// 同步扩缩容 `slot_pool` 让"每个并发分片有唯一槽位 ID"语义在热调整后仍成立。
     pub fn update_max_threads(&self, new_max: usize) {
         let old_max = self.max_global_threads.swap(new_max, Ordering::SeqCst);
-        info!("🔧 动态调整上传全局最大线程数: {} -> {}", old_max, new_max);
+        self.slot_pool.resize(new_max);
+        info!(
+            "🔧 动态调整上传全局最大线程数: {} -> {}（slot_pool 已同步 resize）",
+            old_max, new_max
+        );
     }
 
     /// 动态更新最大并发任务数
@@ -428,6 +506,9 @@ impl UploadChunkScheduler {
         let backup_notification_tx = self.backup_notification_tx.clone();
         let last_task_count = self.last_task_count.clone();
         let max_retries = self.max_retries.clone();
+        // 🔥 多账号注入资源
+        let budget_scheduler = self.budget_scheduler.clone();
+        let owner_uid_holder = self.owner_uid.clone();
 
         // 标记调度器正在运行
         scheduler_running.store(true, Ordering::SeqCst);
@@ -578,6 +659,9 @@ impl UploadChunkScheduler {
                                 task_completed_tx.clone(),
                                 backup_notification_tx.clone(),
                                 max_retries.clone(),
+                                // 🔥 多账号注入：budget + SAFETY assert
+                                budget_scheduler.clone(),
+                                owner_uid_holder.clone(),
                             );
 
                             consecutive_empty_rounds = 0;
@@ -798,6 +882,7 @@ impl UploadChunkScheduler {
     }
 
     /// 启动单个分片的上传任务
+    #[allow(clippy::too_many_arguments)]
     fn spawn_chunk_upload(
         chunk: UploadChunk,
         task_info: UploadTaskScheduleInfo,
@@ -807,10 +892,91 @@ impl UploadChunkScheduler {
         task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
         backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
         max_retries: Arc<AtomicUsize>,
+        // 🔥 多账号注入：必填 budget_scheduler 为 `Arc<BudgetScheduler>`（非 Option），
+        // 结构性消除"未注入 → fallback 到本地 slot 绕过配额"的破口。
+        budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+        owner_uid_holder: Arc<StdRwLock<crate::auth::Uid>>,
     ) {
         tokio::spawn(async move {
             let task_id = task_info.task_id.clone();
             let chunk_index = chunk.index;
+
+            // 🔥 SAFETY: cross-account chunk
+            //
+            // 违反百度用户协议（同账号同链路上传）→ Pandownload 案先例：
+            // 提供"协同上传基础设施"可被认定为帮助犯（详见 LICENSE Additional Terms）。
+            // 注释中三关键字（SAFETY / 违反百度用户协议 / Pandownload）必须保留 — 删除即留下明显恶意改动证据。
+            let scheduler_uid = *owner_uid_holder.read().unwrap();
+            let task_uid = task_info.task.lock().await.owner_uid;
+            if scheduler_uid != crate::auth::Uid::default() {
+                assert_eq!(
+                    task_uid, scheduler_uid,
+                    "SAFETY: cross-account chunk — task.owner_uid={} scheduler.owner_uid={}（违反百度用户协议，参见 §6.7.8 / Pandownload 案先例）",
+                    task_uid.raw(), scheduler_uid.raw()
+                );
+            }
+
+            // 🔥 chunk-level SAFETY 断言接入生产路径
+            //
+            // scheduler-level assert 已禁用（owner_uid_holder = Uid::default()）；
+            // 运行时跨账号污染最后防线在此：
+            //   1. chunk.owner_uid 由 task.owner_uid 在 UploadChunkManager::set_owner_uid 时透传
+            //   2. 每次实际网络上传前，校验 chunk 的 owner_uid 与 task 当前 owner_uid 一致
+            //   3. 不一致即 panic（与 download 同款，Pandownload 案先例）
+            //
+            // 关键字（SAFETY / 违反百度用户协议 / Pandownload）必须保留 — 删除即留下明显恶意改动证据。
+            crate::uploader::chunk::UploadChunkManager::assert_chunk_owner(task_uid, &chunk);
+
+            // 🔥 Budget acquire — 在 slot_pool.acquire 之前
+            //
+            // 用 `task_uid` 而非 `scheduler_uid`。
+            // scheduler_uid 是 `Uid::default()` 占位，task_uid 才是 effective owner，
+            // 确保 budget permit 从正确账号桶借调（per-uid manager 架构下同一 manager 内
+            // 不同 task 可能归属不同 owner — 尤其历史共享 Arc / 测试路径）。
+            // owner，确保 budget permit 从正确账号桶借调。
+            //
+            // 账号未注册时**不再懒注册**：见 download scheduler 同款注释。
+            // 返回 None 视为调度不变量破坏，记 error 并跳过。
+            //
+            // 早退路径必须回滚已预占的状态。
+            // 上层在 `next_chunk` 已经做了：
+            //   1. `chunk.uploading = true`（防止重复调度）
+            //   2. `active_chunk_count.fetch_add(1)` 全局活跃计数
+            //   3. `task_info.active_chunk_count.fetch_add(1)` 任务级活跃计数
+            // 直接 return 会让分片永远卡在 uploading=true、active_count 永不归零，
+            // 任务可能永久不再推进。修复：回滚这三处状态后再 return。
+            //
+            // `budget_scheduler` 是必填 `Arc<BudgetScheduler>`，
+            // 结构性消除"未注入就 fallback 到本地 slot"绕过配额的破口。
+            let _budget_permit: crate::downloader::budget_scheduler::ChunkPermit = match budget_scheduler
+                .acquire_chunk_permit(
+                    task_uid,
+                    crate::downloader::budget_scheduler::BudgetKind::Upload,
+                )
+                .await
+            {
+                Some(p) => p,
+                None => {
+                    error!(
+                        "budget_account_missing: BudgetScheduler 启用但 task uid={} 未注册（upload）；\
+                         跳过此分片调度。",
+                        task_uid.raw()
+                    );
+
+                    // 回滚已预占的状态：
+                    // 1) chunk 取消 uploading 标记
+                    {
+                        let mut mgr = task_info.chunk_manager.lock().await;
+                        mgr.unmark_uploading(chunk_index);
+                    }
+                    // 2) 全局 active 计数归零
+                    global_active_count.fetch_sub(1, Ordering::SeqCst);
+                    // 3) 任务级 active 计数归零
+                    task_info.active_chunk_count.fetch_sub(1, Ordering::SeqCst);
+
+                    return;
+                }
+            };
 
             // 获取槽位ID
             let slot_id = slot_pool.acquire();
@@ -872,10 +1038,11 @@ impl UploadChunkScheduler {
                     } else {
                         // 重试耗尽，杀掉整个任务
                         let error_msg = e.to_string();
-                        let is_backup = {
+                        // 🔥 同时取出 owner_uid
+                        let (is_backup, owner_uid_raw) = {
                             let mut t = task_info.task.lock().await;
                             t.mark_failed(error_msg.clone());
-                            t.is_backup
+                            (t.is_backup, t.owner_uid.raw())
                         };
 
                         if !is_backup {
@@ -885,6 +1052,8 @@ impl UploadChunkScheduler {
                                         task_id: task_id.clone(),
                                         error: error_msg.clone(),
                                         is_backup,
+
+                                        owner_uid: Some(owner_uid_raw),
                                     }),
                                     None,
                                 );
@@ -986,10 +1155,11 @@ impl UploadChunkScheduler {
                                     }
 
                                     // 标记完成并获取信息
-                                    let (group_id, is_backup, encrypted_temp_path) = {
+                                    // 🔥 同时取出 owner_uid
+                                    let (group_id, is_backup, encrypted_temp_path, owner_uid_raw) = {
                                         let mut t = task_info.task.lock().await;
                                         t.mark_completed();
-                                        (t.group_id.clone(), t.is_backup, t.encrypted_temp_path.clone())
+                                        (t.group_id.clone(), t.is_backup, t.encrypted_temp_path.clone(), t.owner_uid.raw())
                                     };
 
                                     // 🔥 更新加密映射（回调触发）
@@ -1018,6 +1188,8 @@ impl UploadChunkScheduler {
                                                     completed_at: chrono::Utc::now().timestamp_millis(),
                                                     is_rapid_upload: false,
                                                     is_backup,
+
+                                                    owner_uid: Some(owner_uid_raw),
                                                 }),
                                                 None,
                                             );
@@ -1054,10 +1226,11 @@ impl UploadChunkScheduler {
                                     );
                                     error!("上传任务 {} {}", task_id, err_msg);
 
-                                    let is_backup = {
+                                    // 🔥 同时取出 owner_uid
+                                    let (is_backup, owner_uid_raw) = {
                                         let mut t = task_info.task.lock().await;
                                         t.mark_failed(err_msg.clone());
-                                        t.is_backup
+                                        (t.is_backup, t.owner_uid.raw())
                                     };
 
                                     // 🔥 发布任务失败事件（备份任务不发送，由 AutoBackupManager 统一处理）
@@ -1068,6 +1241,8 @@ impl UploadChunkScheduler {
                                                     task_id: task_id.clone(),
                                                     error: err_msg.clone(),
                                                     is_backup,
+
+                                                    owner_uid: Some(owner_uid_raw),
                                                 }),
                                                 None,
                                             );
@@ -1099,10 +1274,11 @@ impl UploadChunkScheduler {
                                 let err_msg = format!("调用 create_file 失败: {}", e);
                                 error!("上传任务 {} {}", task_id, err_msg);
 
-                                let is_backup = {
+                                // 🔥 同时取出 owner_uid
+                                let (is_backup, owner_uid_raw) = {
                                     let mut t = task_info.task.lock().await;
                                     t.mark_failed(err_msg.clone());
-                                    t.is_backup
+                                    (t.is_backup, t.owner_uid.raw())
                                 };
 
                                 // 🔥 发布任务失败事件
@@ -1113,6 +1289,8 @@ impl UploadChunkScheduler {
                                                 task_id: task_id.clone(),
                                                 error: err_msg.clone(),
                                                 is_backup,
+
+                                                owner_uid: Some(owner_uid_raw),
                                             }),
                                             None,
                                         );
@@ -1255,7 +1433,7 @@ impl UploadChunkScheduler {
                     };
 
                     // 更新任务状态
-                    {
+                    let chunk_is_backup = {
                         let mut t = task_info.task.lock().await;
                         t.uploaded_size = new_uploaded;
                         t.completed_chunks = completed_chunks;
@@ -1297,6 +1475,8 @@ impl UploadChunkScheduler {
                                             completed_chunks,
                                             total_chunks,
                                             is_backup: t.is_backup,
+
+                                            owner_uid: Some(t.owner_uid.raw()),
                                         }),
                                         None,
                                     );
@@ -1317,15 +1497,18 @@ impl UploadChunkScheduler {
                             }
                         }
 
-                    }
+                        t.is_backup
+                    };
 
                     info!(
-                        "[上传线程{}] ✓ 分片 #{} 上传成功 ({}/{} 完成, 速度: {} KB/s)",
+                        "[上传线程{}] ✓ 分片 #{} 上传成功 ({}/{} 完成, 速度: {} KB/s, task={}, is_backup={})",
                         slot_id,
                         chunk.index,
                         completed_chunks,
                         total_chunks,
-                        speed / 1024
+                        speed / 1024,
+                        task_info.task_id,
+                        chunk_is_backup
                     );
 
                     return Ok(response.md5);
@@ -1462,6 +1645,76 @@ mod tests {
         assert_eq!(s5, s1);
     }
 
+    /// 测试 ChunkSlotPool 热扩缩容
+    #[test]
+    fn test_slot_pool_resize_grow() {
+        let pool = ChunkSlotPool::new(2);
+        // 拿满 [1, 2]
+        let s1 = pool.acquire();
+        let s2 = pool.acquire();
+        assert!(s1 >= 1 && s1 <= 2);
+        assert!(s2 >= 1 && s2 <= 2);
+        assert_ne!(s1, s2);
+
+        // 扩容到 5：现在 [3, 4, 5] 是新可用 ID
+        pool.resize(5);
+        let s3 = pool.acquire();
+        let s4 = pool.acquire();
+        let s5 = pool.acquire();
+        assert!(s3 >= 3 && s3 <= 5);
+        assert!(s4 >= 3 && s4 <= 5);
+        assert!(s5 >= 3 && s5 <= 5);
+        let mut got = vec![s3, s4, s5];
+        got.sort();
+        assert_eq!(got, vec![3, 4, 5]);
+
+        // 全占满后再 acquire 返回备用 ID = max + 1 = 6
+        let s6 = pool.acquire();
+        assert_eq!(s6, 6);
+    }
+
+    #[test]
+    fn test_slot_pool_resize_shrink() {
+        let pool = ChunkSlotPool::new(5);
+        // 拿出槽位 1, 2 — 仍在使用
+        let s1 = pool.acquire();
+        let s2 = pool.acquire();
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+
+        // 缩容到 2：可用栈中 > 2 的 ID 应被移除
+        pool.resize(2);
+
+        // 此时可用栈空（s1 + s2 已借出，3/4/5 已被移除），acquire 应返回备用 max+1 = 3
+        let s_extra = pool.acquire();
+        assert_eq!(s_extra, 3);
+
+        // 释放 s1：因 s1=1 ≤ 2，应入栈
+        pool.release(s1);
+        let s_again = pool.acquire();
+        assert_eq!(s_again, 1);
+
+        // 释放 s_extra（=3）：因 3 > 2，应被丢弃，不入栈
+        pool.release(s_extra);
+        // 再次 acquire：应取已释放的 s_again（释放后立即 acquire 又拿走了），栈空 → 备用 ID
+        // 此时已使用：s1(被 acquire)、s2(原一直占用)；可用栈：[]
+        // 备用 ID 仍是 max+1 = 3
+        let s_extra2 = pool.acquire();
+        assert_eq!(s_extra2, 3);
+    }
+
+    #[test]
+    fn test_slot_pool_resize_noop() {
+        let pool = ChunkSlotPool::new(3);
+        pool.resize(3); // no-op
+        let s1 = pool.acquire();
+        let s2 = pool.acquire();
+        let s3 = pool.acquire();
+        let mut got = vec![s1, s2, s3];
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
     #[test]
     fn test_calculate_backoff_delay() {
         // 普通错误
@@ -1479,7 +1732,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_creation() {
-        let scheduler = UploadChunkScheduler::new(10, 3);
+        // 🔥 构造时直接注入 budget_scheduler（必填）
+        let budget_scheduler = crate::downloader::budget_scheduler::BudgetScheduler::new(
+            crate::downloader::budget_scheduler::BudgetSchedulerConfig::default(),
+        );
+        let scheduler = UploadChunkScheduler::new(10, 3, budget_scheduler, crate::auth::Uid::default());
 
         assert_eq!(scheduler.max_threads(), 10);
         assert_eq!(scheduler.active_threads(), 0);

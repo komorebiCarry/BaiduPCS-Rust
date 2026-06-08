@@ -253,18 +253,10 @@ impl QRCodeAuth {
                 } else {
                     None
                 };
-                user.passid = if let Some(passid_cookie) =
-                    cookie_pairs.iter().find(|c| c.starts_with("PASSID="))
-                {
-                    Some(
-                        passid_cookie
-                            .strip_prefix("PASSID=")
-                            .unwrap_or("")
-                            .to_string(),
-                    )
-                } else {
-                    None
-                };
+                user.passid = cookie_pairs.iter().find(|c| c.starts_with("PASSID=")).map(|passid_cookie| passid_cookie
+                    .strip_prefix("PASSID=")
+                    .unwrap_or("")
+                    .to_string());
                 user.cookies = if !cookie_pairs.is_empty() {
                     Some(cookie_pairs.join("; ")) // 用 "; " 连接 name=value 对
                 } else {
@@ -291,18 +283,10 @@ impl QRCodeAuth {
                 } else {
                     None
                 };
-                user.passid = if let Some(passid_cookie) =
-                    cookie_pairs.iter().find(|c| c.starts_with("PASSID="))
-                {
-                    Some(
-                        passid_cookie
-                            .strip_prefix("PASSID=")
-                            .unwrap_or("")
-                            .to_string(),
-                    )
-                } else {
-                    None
-                };
+                user.passid = cookie_pairs.iter().find(|c| c.starts_with("PASSID=")).map(|passid_cookie| passid_cookie
+                    .strip_prefix("PASSID=")
+                    .unwrap_or("")
+                    .to_string());
                 user.cookies = if !cookie_pairs.is_empty() {
                     Some(cookie_pairs.join("; "))
                 } else {

@@ -485,7 +485,7 @@ impl UploadErrorKind {
     pub fn from_errno(errno: i32) -> Self {
         match errno {
             0 => UploadErrorKind::Unknown, // 成功不是错误
-            -6 | -7 | -8 | -9 => UploadErrorKind::Network,
+            -9..=-6 => UploadErrorKind::Network,
             -10 | -21 => UploadErrorKind::Timeout,
             -1 | -3 | -11 | 2 => UploadErrorKind::ServerError,
             31023 | 31024 => UploadErrorKind::RateLimited,
@@ -853,6 +853,10 @@ pub struct FileMetaInfo {
     /// block_list（分片MD5列表，JSON字符串格式）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_list: Option<String>,
+
+    /// 下载地址（仅当 filemetas 请求 dlink=1 时返回；有效期约 8 小时）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlink: Option<String>,
 
     /// 服务器创建时间
     pub server_ctime: i64,

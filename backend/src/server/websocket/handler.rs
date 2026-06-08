@@ -111,9 +111,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     if was_subscribed_cloud_dl {
-        if let Some(ref monitor) = *state.cloud_dl_monitor.read().await {
-            monitor.remove_subscriber();
-            debug!("连接关闭，cloud_dl 订阅者减少: {}", connection_id);
+        // 🔥 按订阅时记录的 uid 减计数
+        // （而不是 active_uid——切换账号后两者不一致会导致计数泄漏）
+        if let Some((_, recorded_uid)) = state.cloud_dl_ws_subscribers.remove(&connection_id) {
+            if let Some(monitor) = state.cloud_dl_monitor_for(recorded_uid) {
+                monitor.remove_subscriber();
+                debug!(
+                    "连接关闭，cloud_dl 订阅者减少: connection={}, uid={}",
+                    connection_id, recorded_uid.raw()
+                );
+            }
         }
     }
 
@@ -155,9 +162,37 @@ async fn handle_client_message(state: &AppState, connection_id: &str, text: &str
 
                 // 只有之前没订阅过 cloud_dl，现在新订阅了，才增加订阅者计数
                 if subscribing_cloud_dl && !was_subscribed_cloud_dl {
-                    if let Some(ref monitor) = *state.cloud_dl_monitor.read().await {
-                        monitor.add_subscriber();
-                        debug!("cloud_dl 订阅者增加: {}", connection_id);
+                    // 🔥 记录订阅时的 uid，
+                    // 让后续切账号 / 取消订阅都能找到正确的 monitor，而不是
+                    // 依赖订阅时刻 vs 取消订阅时刻 active_uid 一致这种脆弱假设
+                    if let Some(active_uid) = *state.active_uid.read().await {
+                        // 🔥 lazy init monitor。
+                        // 切到「启动时未初始化 monitor 的账号」后首次订阅时，
+                        // 必须按需创建 monitor，否则 add_subscriber 静默 skip 实时事件断流。
+                        // lazy init 前先 ensure_client_for_uid，
+                        // 避免 monitor 用 legacy client（已移除 fallback）造成的「构造失败」。
+                        if !state.cloud_dl_monitors.contains_key(&active_uid) {
+                            if let Err(e) = state.ensure_client_for_uid(active_uid).await {
+                                warn!(
+                                    "cloud_dl 订阅前 ensure_client_for_uid 失败: uid={}, err={:?}",
+                                    active_uid.raw(),
+                                    e
+                                );
+                            } else {
+                                state.init_cloud_dl_monitor_for(active_uid).await;
+                            }
+                        }
+                        if let Some(monitor) = state.cloud_dl_monitor_for(active_uid) {
+                            monitor.add_subscriber();
+                            state
+                                .cloud_dl_ws_subscribers
+                                .insert(connection_id.to_string(), active_uid);
+                            debug!(
+                                "cloud_dl 订阅者增加: connection={}, uid={}",
+                                connection_id,
+                                active_uid.raw()
+                            );
+                        }
                     }
                 }
 
@@ -179,11 +214,44 @@ async fn handle_client_message(state: &AppState, connection_id: &str, text: &str
                 // 移除订阅
                 state.ws_manager.unsubscribe(connection_id, subscriptions);
 
-                // 如果取消订阅了 cloud_dl，通知监听服务减少订阅者
+                // 如果取消订阅了 cloud_dl，**仅当退订后该连接已不再订阅任何 cloud_dl
+                // 派生项时**才减 monitor 计数 + 移除映射。
+                //
+                // 原版本一旦本次 unsubscribe 涉及任意 cloud_dl topic 就立即减计数，
+                // 但同一连接可能还订阅着其他 cloud_dl 子 topic（如 `cloud_dl:status_changed`
+                // 仍在），结果连接仍命中 cloud_dl 通配路径但 monitor 认为没有订阅者
+                // 不再轮询、实时事件断流。本版退订后用 `get_subscriptions` 反查派生
+                // 视图，与 handler subscribe 路径用的「`s == "cloud_dl"
+                // \|\| s.starts_with("cloud_dl:")`」同款判定，确保只有"完全没有
+                // cloud_dl 订阅"时才释放计数。
                 if unsubscribing_cloud_dl {
-                    if let Some(ref monitor) = *state.cloud_dl_monitor.read().await {
-                        monitor.remove_subscriber();
-                        debug!("cloud_dl 订阅者减少: {}", connection_id);
+                    let remaining = state.ws_manager.get_subscriptions(connection_id);
+                    let still_has_cloud_dl = remaining
+                        .iter()
+                        .any(|s| s == "cloud_dl" || s.starts_with("cloud_dl:"));
+                    if !still_has_cloud_dl {
+                        // 🔥 按订阅时记录的 uid 减计数
+                        if let Some((_, recorded_uid)) =
+                            state.cloud_dl_ws_subscribers.remove(connection_id)
+                        {
+                            if let Some(monitor) = state.cloud_dl_monitor_for(recorded_uid) {
+                                monitor.remove_subscriber();
+                                debug!(
+                                    "cloud_dl 订阅者减少（最后一条 cloud_dl 派生项已退订）: connection={}, uid={}",
+                                    connection_id,
+                                    recorded_uid.raw()
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "cloud_dl 订阅未完全退订，保留 monitor 计数: connection={}, 剩余 cloud_dl 派生项={}",
+                            connection_id,
+                            remaining
+                                .iter()
+                                .filter(|s| *s == "cloud_dl" || s.starts_with("cloud_dl:"))
+                                .count()
+                        );
                     }
                 }
 
@@ -206,17 +274,14 @@ async fn handle_client_message(state: &AppState, connection_id: &str, text: &str
 /// 获取当前任务状态快照
 async fn get_snapshot(state: &AppState) -> WsServerMessage {
     // 获取下载任务
-    let downloads: Vec<serde_json::Value> = {
-        let dm_lock = state.download_manager.read().await;
-        if let Some(ref dm) = *dm_lock {
-            dm.get_all_tasks()
-                .await
-                .into_iter()
-                .filter_map(|t| serde_json::to_value(&t).ok())
-                .collect()
-        } else {
-            vec![]
-        }
+    let downloads: Vec<serde_json::Value> = match state.download_manager_for_active().await {
+        Some(dm) => dm
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter_map(|t| serde_json::to_value(&t).ok())
+            .collect(),
+        None => vec![],
     };
 
     // 获取文件夹下载任务
@@ -231,37 +296,43 @@ async fn get_snapshot(state: &AppState) -> WsServerMessage {
     };
 
     // 获取上传任务
-    let uploads: Vec<serde_json::Value> = {
-        let um_lock = state.upload_manager.read().await;
-        if let Some(ref um) = *um_lock {
-            um.get_all_tasks()
-                .await
-                .into_iter()
-                .filter_map(|t| serde_json::to_value(&t).ok())
-                .collect()
-        } else {
-            vec![]
-        }
+    let uploads: Vec<serde_json::Value> = match state.upload_manager_for_active().await {
+        Some(um) => um
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter_map(|t| serde_json::to_value(&t).ok())
+            .collect(),
+        None => vec![],
     };
 
     // 获取转存任务
-    let transfers: Vec<serde_json::Value> = {
-        let tm_lock = state.transfer_manager.read().await;
-        if let Some(ref tm) = *tm_lock {
-            tm.get_all_tasks()
-                .await
-                .into_iter()
-                .filter_map(|t| serde_json::to_value(&t).ok())
-                .collect()
-        } else {
-            vec![]
-        }
+    let transfers: Vec<serde_json::Value> = match state.transfer_manager_for_active().await {
+        Some(tm) => tm
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter_map(|t| serde_json::to_value(&t).ok())
+            .collect(),
+        None => vec![],
     };
+
+    // 多账号上下文
+    let (active_uid, accounts) = {
+        let mgr = state.account_manager.lock().await;
+        (mgr.active_uid().map(|u| u.raw()), mgr.list_accounts())
+    };
+    let readonly_mode = state
+        .readonly_mode
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     WsServerMessage::Snapshot {
         downloads,
         uploads,
         transfers,
         folders,
+        active_uid,
+        accounts,
+        readonly_mode,
     }
 }

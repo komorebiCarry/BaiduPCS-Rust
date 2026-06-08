@@ -6,6 +6,7 @@ mod memory_monitor;
 pub mod proxy;
 pub mod proxy_fallback;
 pub mod path_utils;
+pub mod retry;
 mod refresh_coordinator;
 mod speed_anomaly_detector;
 mod thread_stagnation_detector;

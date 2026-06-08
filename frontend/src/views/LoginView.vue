@@ -51,9 +51,29 @@
             <FolderOpened />
           </el-icon>
         </div>
-        <h1>百度网盘 Rust 客户端</h1>
-        <p class="subtitle">Baidu Netdisk Rust Client</p>
+        <h1>{{ isAddAccountMode ? '添加百度账号' : '百度网盘 Rust 客户端' }}</h1>
+        <p class="subtitle">
+          {{ isAddAccountMode ? '当前账号将保持登录，登录新账号后自动切换' : 'Baidu Netdisk Rust Client' }}
+        </p>
       </div>
+
+      <!-- 多账号 add 模式横幅 -->
+      <el-alert
+          v-if="isAddAccountMode"
+          type="info"
+          show-icon
+          :closable="false"
+          class="add-account-banner"
+      >
+        <template #default>
+          <div class="add-account-banner__content">
+            <span>正在添加新账号；当前已有 <strong>{{ authStore.accounts.length }}</strong> 个账号。</span>
+            <el-button text type="primary" size="small" @click="router.push({ path: '/settings', query: { tab: 'accounts' } })">
+              返回账号管理
+            </el-button>
+          </div>
+        </template>
+      </el-alert>
 
       <!-- 登录方式切换 Tab -->
       <div class="login-tabs">
@@ -220,7 +240,7 @@
       <!-- 底部信息 -->
       <div class="footer">
         <p>基于 Rust + Axum + Vue 3 构建</p>
-        <p class="version">v1.14.1</p>
+        <p class="version">v2.0.0</p>
       </div>
     </div>
   </div>
@@ -228,7 +248,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/utils/responsive'
@@ -247,10 +267,17 @@ import {
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 // 响应式检测
 const isMobile = useIsMobile()
+
+// 多账号"添加账号"模式
+//   URL: /login?mode=add
+//   - 已登录用户也可进入此页登录新账号
+//   - 登录成功后刷新 accounts 列表，并跳回 /settings?tab=accounts
+const isAddAccountMode = computed(() => route.query.mode === 'add')
 
 // 登录方式
 const activeTab = ref<'qrcode' | 'cookie'>('qrcode')
@@ -319,10 +346,22 @@ async function generateQRCode() {
     // 开始轮询
     authStore.startPolling(
         // 成功回调
-        () => {
-          ElMessage.success('登录成功')
+        async () => {
           stopCountdown()
-          router.push('/files')
+          // 多账号：登录成功后刷新账号列表（无论是否 add 模式），
+          // 让 store 拿到新增账号 + 服务端切换后的 active_uid
+          try {
+            await authStore.fetchAccountList()
+          } catch (e) {
+            console.warn('[LoginView] 登录成功但刷新账号列表失败:', e)
+          }
+          if (isAddAccountMode.value) {
+            ElMessage.success('账号添加成功')
+            router.push({ path: '/settings', query: { tab: 'accounts' } })
+          } else {
+            ElMessage.success('登录成功')
+            router.push('/files')
+          }
         },
         // 错误回调
         (err: any) => {
@@ -382,9 +421,19 @@ async function loginWithCookie() {
         showClose: true,
       })
     } else {
-      ElMessage.success('Cookie 登录成功，预热完成')
+      ElMessage.success(isAddAccountMode.value ? '账号添加成功' : 'Cookie 登录成功，预热完成')
     }
-    router.push('/files')
+    // 多账号：刷新账号列表
+    try {
+      await authStore.fetchAccountList()
+    } catch (e) {
+      console.warn('[LoginView] Cookie 登录成功但刷新账号列表失败:', e)
+    }
+    if (isAddAccountMode.value) {
+      router.push({ path: '/settings', query: { tab: 'accounts' } })
+    } else {
+      router.push('/files')
+    }
   } catch (err: any) {
     cookieError.value = err.message || 'Cookie 登录失败，请检查 Cookie 是否完整有效'
   } finally {
@@ -394,8 +443,8 @@ async function loginWithCookie() {
 
 // 组件挂载
 onMounted(async () => {
-  // 检查是否已登录
-  if (authStore.isLoggedIn) {
+  // 多账号添加账号模式：即使已登录也保留在登录页
+  if (!isAddAccountMode.value && authStore.isLoggedIn) {
     router.push('/files')
     return
   }

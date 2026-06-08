@@ -385,7 +385,7 @@ impl PcsServerHealthManager {
         speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let mid = speeds.len() / 2;
-        let median = if speeds.len() % 2 == 0 {
+        let median = if speeds.len().is_multiple_of(2) {
             (speeds[mid - 1] + speeds[mid]) / 2.0
         } else {
             speeds[mid]
@@ -427,7 +427,7 @@ impl PcsServerHealthManager {
             return None;
         }
 
-        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        candidates.sort_by_key(|a| a.1);
 
         let server_to_restore = candidates[0].0.clone();
         info!(

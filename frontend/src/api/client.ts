@@ -1,5 +1,40 @@
 import axios, { type AxiosInstance, type AxiosResponse, type AxiosError, type InternalAxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
+import { backendHealth, isBackendDownError } from '../utils/backendHealth'
+
+// 后端断开 / 恢复时的统一提示文案（避免轮询失败刷屏）
+const BACKEND_DOWN_MESSAGE = '无法连接后端服务，正在尝试重连…'
+const BACKEND_RECOVERED_MESSAGE = '后端服务已恢复连接'
+
+/** 成功请求：刷新后端健康态；若刚从断开态恢复且允许提示，提示一次 */
+function reportRequestSuccess(notify: boolean): void {
+    const recovered = backendHealth.recordSuccess()
+    if (recovered && notify) {
+        ElMessage.success(BACKEND_RECOVERED_MESSAGE)
+    }
+}
+
+/**
+ * 失败请求：若为断连类错误（网络不可达 / 5xx），更新健康态并接管提示。
+ * - 阈值内的偶发失败：返回 false，交由调用方照常提示一次
+ * - 刚跨入断开态：用统一文案提示一次（notify 时），返回 true 抑制调用方
+ * - 已处于断开态：返回 true 抑制重复刷屏
+ * 非断连类（业务 4xx）错误返回 false，不影响健康态。
+ */
+function reportRequestFailureSuppressed(error: AxiosError, notify: boolean): boolean {
+    if (!isBackendDownError(error)) {
+        return false
+    }
+    const wasDown = backendHealth.getStatus() === 'down'
+    const justWentDown = backendHealth.recordFailure()
+    if (justWentDown) {
+        if (notify) {
+            ElMessage.error(BACKEND_DOWN_MESSAGE)
+        }
+        return true
+    }
+    return wasDown
+}
 
 // ============ Web 认证令牌管理 ============
 
@@ -181,6 +216,7 @@ export function createApiClient(options: { timeout?: number; showErrorMessage?: 
     // 响应拦截器
     client.interceptors.response.use(
         (response: AxiosResponse) => {
+            reportRequestSuccess(showErrorMessage)
             const { code, message } = response.data
             if (code !== 0) {
                 if (showErrorMessage) {
@@ -200,13 +236,16 @@ export function createApiClient(options: { timeout?: number; showErrorMessage?: 
                 return Promise.reject(new Error('Web 认证令牌已过期'))
             }
 
+            // 后端断连类错误：集中节流提示，避免轮询失败刷屏
+            const suppressed = reportRequestFailureSuppressed(error, showErrorMessage)
+
             // 优先使用后端返回的 message，避免显示原始 HTTP 错误信息
             const errorData = error.response?.data as { message?: string; error?: string } | undefined
             const errorMessage = errorData?.message
                 || errorData?.error
                 || (error.response?.status ? `请求失败 (${error.response.status})` : '网络错误')
 
-            if (showErrorMessage) {
+            if (showErrorMessage && !suppressed) {
                 ElMessage.error(errorMessage)
             }
             return Promise.reject(new Error(errorMessage))
@@ -233,6 +272,7 @@ export function createApiClientWithErrorCode(options: { timeout?: number } = {})
     // 响应拦截器 - 返回完整错误信息让调用方处理
     client.interceptors.response.use(
         (response: AxiosResponse) => {
+            reportRequestSuccess(true)
             const { code, message, data } = response.data
             if (code !== 0) {
                 return Promise.reject({ code, message, data })
@@ -246,13 +286,18 @@ export function createApiClientWithErrorCode(options: { timeout?: number } = {})
                 return Promise.reject(new Error('Web 认证令牌已过期'))
             }
 
+            // 后端断连类错误：集中节流提示，避免轮询失败刷屏
+            const suppressed = reportRequestFailureSuppressed(error, true)
+
             // 优先使用后端返回的 message，避免显示原始 HTTP 错误信息
             const errorData = error.response?.data as { message?: string; error?: string } | undefined
             const errorMessage = errorData?.message
                 || errorData?.error
                 || (error.response?.status ? `请求失败 (${error.response.status})` : '网络错误')
 
-            ElMessage.error(errorMessage)
+            if (!suppressed) {
+                ElMessage.error(errorMessage)
+            }
             return Promise.reject(new Error(errorMessage))
         }
     )
@@ -284,12 +329,19 @@ export function createRawApiClient(options: { timeout?: number } = {}): AxiosIns
     // 只处理网络错误，不处理业务响应格式
     // 从 response.data 中提取错误信息，让调用方决定如何处理
     client.interceptors.response.use(
-        (response: AxiosResponse) => response,
+        (response: AxiosResponse) => {
+            // 原始客户端不弹提示，仅维护健康态供轮询退避使用
+            reportRequestSuccess(false)
+            return response
+        },
         (error: AxiosError) => {
             // 419 已在 addWebAuthInterceptor 中处理跳转
             if (error.response?.status === WEB_AUTH_EXPIRED_STATUS) {
                 return Promise.reject(new Error('Web 认证令牌已过期'))
             }
+
+            // 维护后端健康态（不弹提示，由调用方决定如何显示）
+            reportRequestFailureSuppressed(error, false)
 
             // 从 response.data 中提取错误信息（支持 message 或 error 字段）
             const errorData = error.response?.data as { message?: string; error?: string } | undefined

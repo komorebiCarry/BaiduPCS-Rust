@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 /// 上传冲突策略（直接映射百度网盘 API 的 rtype 参数）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum UploadConflictStrategy {
     /// 智能去重：比较 block_list，相同则秒传，不同则重命名（rtype=2）
+    #[default]
     SmartDedup,
     /// 自动重命名：路径冲突时自动生成唯一名称（rtype=1）
     AutoRename,
@@ -12,17 +14,14 @@ pub enum UploadConflictStrategy {
     Overwrite,
 }
 
-impl Default for UploadConflictStrategy {
-    fn default() -> Self {
-        Self::SmartDedup
-    }
-}
 
 /// 下载冲突策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DownloadConflictStrategy {
     /// 覆盖：目标文件存在时覆盖
+    #[default]
     Overwrite,
     /// 跳过：目标文件存在时跳过
     Skip,
@@ -30,11 +29,6 @@ pub enum DownloadConflictStrategy {
     AutoRename,
 }
 
-impl Default for DownloadConflictStrategy {
-    fn default() -> Self {
-        Self::Overwrite
-    }
-}
 
 /// 冲突解决方案
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,15 +42,15 @@ pub enum ConflictResolution {
 }
 
 /// 将冲突策略转换为百度网盘 API 的 rtype 参数
-/// 
+///
 /// # 参数
 /// - strategy: 上传冲突策略
-/// 
+///
 /// # 返回
 /// - "1": 路径冲突时自动重命名（AutoRename）
 /// - "2": block_list 不同时自动重命名（SmartDedup）
 /// - "3": 直接覆盖已存在文件（Overwrite，危险）
-/// 
+///
 /// # 说明
 /// 百度网盘 API 的 rtype 参数说明：
 /// - rtype=1: 当上传路径已存在文件时，自动重命名为 "文件名(1).ext"

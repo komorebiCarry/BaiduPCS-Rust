@@ -25,7 +25,13 @@ import NetdiskPathSelector from '@/components/NetdiskPathSelector.vue'
 import BackupTaskDetail from '@/components/BackupTaskDetail.vue'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { useIsMobile } from '@/utils/responsive'
+import { createAdaptivePoller } from '@/utils/backendHealth'
 import type { BackupEvent } from '@/types/events'
+// 多账号集成
+import { useAuthStore } from '@/stores/auth'
+import AccountFilter from '@/components/AccountFilter.vue'
+import AccountBadge from '@/components/AccountBadge.vue'
+import AccountSelect from '@/components/AccountSelect.vue'
 
 // 响应式检测
 const isMobile = useIsMobile()
@@ -33,6 +39,25 @@ const isMobile = useIsMobile()
 // ==================== 状态 ====================
 
 const configs = ref<BackupConfig[]>([])
+
+// 多账号状态
+const authStore = useAuthStore()
+const ownerFilter = ref<number | null>(null)
+const newConfigOwnerUid = ref<number | null>(null)
+
+const displayedConfigs = computed(() => {
+  if (ownerFilter.value === null) return configs.value
+  return configs.value.filter((c) => c.owner_uid === ownerFilter.value)
+})
+
+const ownerFilterCounts = computed(() => {
+  const map: Record<number, number> = {}
+  for (const c of configs.value) {
+    const uid = typeof c.owner_uid === 'number' ? c.owner_uid : null
+    if (uid !== null) map[uid] = (map[uid] || 0) + 1
+  }
+  return map
+})
 // 每个配置的活跃任务（正在进行的备份任务）
 const activeTaskByConfig = ref<Map<string, BackupTask | null>>(new Map())
 // 每个配置的活跃文件任务（前5个正在传输的文件）
@@ -148,10 +173,16 @@ async function loadFileTasksForActiveTask(taskId: string, configId: string) {
 
 async function handleCreateConfig() {
   try {
-    const config = await createBackupConfig(newConfig.value)
+    // 附带 owner_uid（若用户在对话框中选择）
+    const payload: CreateBackupConfigRequest = {
+      ...newConfig.value,
+      ...(newConfigOwnerUid.value !== null ? { owner_uid: newConfigOwnerUid.value } : {}),
+    }
+    const config = await createBackupConfig(payload)
     configs.value.push(config)
     showCreateDialog.value = false
     resetNewConfig()
+    newConfigOwnerUid.value = null
     ElMessage.success('配置创建成功')
   } catch (e: any) {
     // 使用 ElMessage.error 显示错误信息，保持对话框打开让用户可以修改后重试
@@ -192,6 +223,8 @@ async function resetNewConfig() {
 
 async function handleOpenCreateDialog() {
   await resetNewConfig()
+  // 打开对话框时默认归属为当前活跃账号；用户可改
+  newConfigOwnerUid.value = authStore.activeUid
   showCreateDialog.value = true
 }
 
@@ -435,7 +468,6 @@ function formatFileTransferred(fileTask: BackupFileTask): string {
 
 let unsubscribeBackup: (() => void) | null = null
 let unsubscribeConnectionState: (() => void) | null = null
-let refreshTimer: number | null = null
 const wsConnected = ref(false)
 
 // 选项1：仅当存在活跃任务且 WebSocket 未连接时启用轮询兜底
@@ -446,24 +478,22 @@ const hasActiveTask = computed(() => {
   return false
 })
 
-function stopPolling() {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-    refreshTimer = null
+// 自适应轮询器：WS 未连接且有活跃任务时兜底刷新；后端断开后阶梯式退避重连
+const refreshPoller = createAdaptivePoller(() => {
+  // 仅在“仍然未连接且仍存在活跃任务”时轮询
+  if (wsConnected.value || !hasActiveTask.value) {
+    stopPolling()
+    return
   }
+  loadActiveTasksForAllConfigs()
+}, { baseDelayMs: 2000, maxDelayMs: 30000 })
+
+function stopPolling() {
+  refreshPoller.stop()
 }
 
 function startPolling() {
-  if (refreshTimer) return
-  const interval = 2000
-  refreshTimer = window.setInterval(() => {
-    // 仅在“仍然未连接且仍存在活跃任务”时轮询
-    if (wsConnected.value || !hasActiveTask.value) {
-      stopPolling()
-      return
-    }
-    loadActiveTasksForAllConfigs()
-  }, interval)
+  refreshPoller.start()
 }
 
 function updateAutoRefresh() {
@@ -840,13 +870,19 @@ function cleanupWebSocket() {
 
 // ==================== 生命周期 ====================
 
+function handleActiveChanged() {
+  loadData()
+}
+
 onMounted(() => {
   loadData()
   setupWebSocket()
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
 })
 
 onUnmounted(() => {
   cleanupWebSocket()
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 
 // 活跃任务变化时同步检查轮询策略（例如：刚创建任务但 WS 未连接）
@@ -864,6 +900,14 @@ watch(hasActiveTask, () => {
         <el-tag v-if="managerStatus" :type="managerStatus.active_task_count > 0 ? 'success' : 'info'" size="large">
           {{ managerStatus.active_task_count }} 个任务进行中
         </el-tag>
+        <!-- 多账号过滤器 -->
+        <AccountFilter
+            v-if="authStore.hasMultipleAccounts"
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            size="large"
+            class="account-filter-slot"
+        />
       </div>
       <div class="header-right">
         <template v-if="!isMobile">
@@ -921,11 +965,14 @@ watch(hasActiveTask, () => {
 
     <!-- 配置列表 -->
     <div v-else class="config-container">
-      <el-empty v-if="configs.length === 0" description="暂无备份配置，点击「新建配置」创建第一个备份任务" />
+      <el-empty
+          v-if="displayedConfigs.length === 0"
+          :description="ownerFilter === null ? '暂无备份配置，点击「新建配置」创建第一个备份任务' : '当前过滤条件下暂无备份配置'"
+      />
 
       <div class="config-list">
         <el-card
-            v-for="config in configs"
+            v-for="config in displayedConfigs"
             :key="config.id"
             class="config-card"
             :class="{ 'is-upload': config.direction === 'upload', 'is-sync': config.direction === 'sync' }"
@@ -947,6 +994,8 @@ watch(hasActiveTask, () => {
                 <el-tag v-if="config.encrypt_enabled" type="warning" size="small">
                   <el-icon :size="12"><Key /></el-icon> 加密
                 </el-tag>
+                <!-- 多账号 chip -->
+                <AccountBadge :owner-uid="config.owner_uid" size="small" class="task-account-badge" />
               </div>
               <div class="config-path">
                 <template v-if="config.direction === 'upload'">
@@ -989,6 +1038,13 @@ watch(hasActiveTask, () => {
                     <component :is="getStatusIcon(activeTaskByConfig.get(config.id)!.status)" :class="{ 'is-loading': activeTaskByConfig.get(config.id)!.status === 'transferring' }" />
                   </el-icon>
                   <span class="task-status-text">{{ getStatusText(activeTaskByConfig.get(config.id)!.status) }}</span>
+                  <!-- 多账号 chip：活跃任务从所属 config 继承 owner_uid -->
+                  <AccountBadge
+                      v-if="authStore.hasMultipleAccounts"
+                      :owner-uid="config.owner_uid"
+                      size="small"
+                      class="task-account-badge"
+                  />
                 </div>
                 <div class="task-progress-stats">
                   <span class="task-files">{{ activeTaskByConfig.get(config.id)!.completed_count }}/{{ activeTaskByConfig.get(config.id)!.total_count }} 文件</span>
@@ -1084,6 +1140,13 @@ watch(hasActiveTask, () => {
     <!-- 创建配置对话框 -->
     <el-dialog v-model="showCreateDialog" title="新建备份配置" width="500px" :close-on-click-modal="false">
       <el-form label-position="top">
+        <!-- 多账号归属选择 -->
+        <el-form-item v-if="authStore.hasMultipleAccounts" label="归属账号">
+          <AccountSelect v-model="newConfigOwnerUid" placeholder="使用当前活跃账号" style="width: 100%" />
+          <div class="form-tip">
+            选择该备份配置归属的百度账号。未选择时使用当前活跃账号。
+          </div>
+        </el-form-item>
         <el-form-item label="配置名称">
           <el-input v-model="newConfig.name" placeholder="例如：文档备份" />
         </el-form-item>

@@ -147,7 +147,7 @@ impl EncryptionService {
     pub fn encrypt_file_chunked(&self, input_path: &Path, output_path: &Path) -> Result<EncryptionMetadata> {
         let input_file = std::fs::File::open(input_path)?;
         let file_size = input_file.metadata()?.len();
-        let total_chunks = ((file_size as usize + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE) as u32;
+        let total_chunks = (file_size as usize).div_ceil(DEFAULT_CHUNK_SIZE) as u32;
 
         let mut output_file = BufWriter::new(std::fs::File::create(output_path)?);
 
@@ -228,7 +228,7 @@ impl EncryptionService {
     {
         let input_file = std::fs::File::open(input_path)?;
         let file_size = input_file.metadata()?.len();
-        let total_chunks = ((file_size as usize + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE) as u32;
+        let total_chunks = (file_size as usize).div_ceil(DEFAULT_CHUNK_SIZE) as u32;
 
         let mut output_file = BufWriter::new(std::fs::File::create(output_path)?);
 
@@ -293,7 +293,7 @@ impl EncryptionService {
     }
 
     /// 解密文件（带进度回调）
-    /// 
+    ///
     /// # 参数
     /// * `input_path` - 输入文件路径
     /// * `output_path` - 输出文件路径
@@ -673,7 +673,7 @@ impl StreamingEncryptionService {
 
         let input_file = File::open(input_path).await?;
         let file_size = input_file.metadata().await?.len();
-        let total_chunks = ((file_size as usize + self.chunk_size - 1) / self.chunk_size) as u32;
+        let total_chunks = (file_size as usize).div_ceil(self.chunk_size) as u32;
 
         let output_file = File::create(output_path).await?;
         let mut writer = BufWriter::new(output_file);
@@ -844,7 +844,7 @@ impl StreamingEncryptionService {
 
         let input_file = File::open(input_path).await?;
         let file_size = input_file.metadata().await?.len();
-        let total_chunks = ((file_size as usize + self.chunk_size - 1) / self.chunk_size) as u32;
+        let total_chunks = (file_size as usize).div_ceil(self.chunk_size) as u32;
 
         let output_file = File::create(output_path).await?;
         let mut writer = BufWriter::new(output_file);

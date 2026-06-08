@@ -58,6 +58,11 @@ pub struct PersistenceManager {
 
     /// shutdown 信号发送端
     shutdown_tx: broadcast::Sender<()>,
+
+    /// 🔥 多账号归属 UID
+    /// 初始为 None，由上层 `DownloadManager` 初始化后通过 `set_owner_uid` 填充。
+    /// 所有 `register_*` 方法在保存前自动将此值写入 `metadata.owner_uid`。
+    owner_uid: Option<u64>,
 }
 
 impl std::fmt::Debug for PersistenceManager {
@@ -120,12 +125,18 @@ impl PersistenceManager {
             cleanup_task: None,
             archive_task: None,
             shutdown_tx,
+            owner_uid: None,
         }
     }
 
     /// 获取 WAL 目录路径
     pub fn wal_dir(&self) -> &PathBuf {
         &self.wal_dir
+    }
+
+    /// 🔥 设置多账号归属 UID
+    pub fn set_owner_uid(&mut self, uid: u64) {
+        self.owner_uid = Some(uid);
     }
 
     /// 获取配置
@@ -526,6 +537,16 @@ impl PersistenceManager {
     /// * `is_encrypted` - 是否为加密文件（可选）
     /// * `encryption_key_version` - 加密密钥版本（可选）
     /// * `transfer_task_id` - 关联的转存任务 ID（可选，由转存任务自动创建的下载任务需要设置）
+    /// * `owner_uid_override` - 🔥 显式归属 UID 覆盖：
+    ///   `Some(uid)` → 强制把 `.meta.owner_uid` 写为该值（per-uid manager 架构下
+    ///   `PersistenceManager.owner_uid` 是 manager 自己 uid，但实际任务可能由
+    ///   handler 显式传入归属 B）；
+    ///   `None` → 沿用旧行为（`self.owner_uid`）。所有 download manager 调用点
+    ///   都应该显式传 `Some(task.owner_uid.raw())`，避免重启后归属错乱。
+    ///
+    /// 类型说明：使用 `u64` 而非 `Uid` 是为了与现有 `PersistenceManager.owner_uid:
+    /// Option<u64>` 内部字段保持一致；调用方需 `Uid::raw()` 转换。
+    #[allow(clippy::too_many_arguments)]
     pub fn register_download_task(
         &self,
         task_id: String,
@@ -543,6 +564,7 @@ impl PersistenceManager {
         is_encrypted: Option<bool>,
         encryption_key_version: Option<u32>,
         transfer_task_id: Option<String>,
+        owner_uid_override: Option<u64>,
     ) -> std::io::Result<()> {
         // 🔥 已恢复的任务：跳过元数据重写和内存状态覆盖，保留原始 created_at 和 .meta 文件
         if self.tasks.contains_key(&task_id) {
@@ -578,6 +600,13 @@ impl PersistenceManager {
             metadata.set_transfer_task_id(tid.clone());
         }
 
+        // 🔥 自动注入多账号归属 UID
+        // 优先使用显式 owner_uid_override，避免 per-uid manager
+        // 架构下 self.owner_uid（manager 自己 uid）与 handler 显式覆盖归属不一致。
+        if let Some(uid) = owner_uid_override.or(self.owner_uid) {
+            metadata.owner_uid = Some(uid);
+        }
+
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
 
@@ -587,6 +616,74 @@ impl PersistenceManager {
         debug!(
             "已注册下载任务: {} (is_backup={}, is_encrypted={:?}, transfer_task_id={:?})",
             task_id, is_backup, is_encrypted, transfer_task_id
+        );
+
+        Ok(())
+    }
+
+    /// 在任务创建阶段写入下载任务的占位元数据
+    ///
+    /// 与 `register_download_task` 的区别：
+    /// - 仅写 `.meta` 文件（`status = Pending`，`chunk_size`/`total_chunks` 占位为 0），
+    ///   **不**插入内存 `tasks` 映射；
+    /// - 因此后续真正的 `register_download_task`（准备阶段拿到自适应分片布局后调用）
+    ///   仍会正常执行并用真实布局覆盖该 `.meta`、再登记内存状态。
+    ///
+    /// 目的：下载任务在 `register_download_task` 之前（如准备阶段拿下载链接失败）就失败时，
+    /// 磁盘上仍存在该任务记录，重启后可被恢复为终态「失败」（可手动重试/删除），
+    /// 而不是凭空消失。这与上传任务在创建时即 `register_upload_task` 落盘的行为对齐。
+    ///
+    /// 若 `.meta` 已存在（已 register 或已恢复）则不覆盖，保持幂等。
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_download_task_on_create(
+        &self,
+        task_id: String,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        file_size: u64,
+        group_id: Option<String>,
+        group_root: Option<String>,
+        relative_path: Option<String>,
+        is_backup: bool,
+        backup_config_id: Option<String>,
+        transfer_task_id: Option<String>,
+        owner_uid_override: Option<u64>,
+    ) -> std::io::Result<()> {
+        // 已存在则不覆盖（已 register / 已恢复 / 重复创建）
+        if super::metadata::load_metadata(&self.wal_dir, &task_id).is_some() {
+            return Ok(());
+        }
+
+        // chunk_size/total_chunks 占位为 0：真实布局在准备阶段由 register_download_task 写入。
+        // 若任务在 register 前就失败，该占位记录会被标记为 Failed 并在恢复时按终态失败处理。
+        let mut metadata = TaskMetadata::new_download(
+            task_id.clone(),
+            fs_id,
+            remote_path,
+            local_path,
+            file_size,
+            0,
+            0,
+            None,
+            None,
+        );
+
+        metadata.set_group_info(group_id, group_root, relative_path);
+        metadata.is_backup = is_backup;
+        metadata.backup_config_id = backup_config_id;
+        if let Some(ref tid) = transfer_task_id {
+            metadata.set_transfer_task_id(tid.clone());
+        }
+        if let Some(uid) = owner_uid_override.or(self.owner_uid) {
+            metadata.owner_uid = Some(uid);
+        }
+
+        // 仅落盘，不插入 self.tasks：让真正的 register_download_task 之后用真实布局覆盖
+        save_metadata(&self.wal_dir, &metadata)?;
+        debug!(
+            "已写入下载任务创建占位元数据: {} (is_backup={})",
+            task_id, is_backup
         );
 
         Ok(())
@@ -603,6 +700,11 @@ impl PersistenceManager {
     /// * `total_chunks` - 总分片数
     /// * `encrypt_enabled` - 是否启用加密（可选）
     /// * `encryption_key_version` - 加密密钥版本（可选）
+    /// * `owner_uid_override` - 🔥 显式归属 UID 覆盖：
+    ///   `Some(uid)` → 强制写入 `.meta.owner_uid`；`None` → 沿用 `self.owner_uid`。
+    ///   Upload 创建路径已支持 `create_task_with_owner` 在 task 创建瞬间确定
+    ///   effective_uid，此处务必透传 `task.owner_uid.raw()`。
+    #[allow(clippy::too_many_arguments)]
     pub fn register_upload_task(
         &self,
         task_id: String,
@@ -613,6 +715,7 @@ impl PersistenceManager {
         total_chunks: usize,
         encrypt_enabled: Option<bool>,
         encryption_key_version: Option<u32>,
+        owner_uid_override: Option<u64>,
     ) -> std::io::Result<()> {
         if self.tasks.contains_key(&task_id) {
             debug!("已注册上传任务（保留已恢复状态）: {}", task_id);
@@ -620,7 +723,7 @@ impl PersistenceManager {
         }
 
         // 创建元数据
-        let metadata = TaskMetadata::new_upload(
+        let mut metadata = TaskMetadata::new_upload(
             task_id.clone(),
             source_path,
             target_path,
@@ -630,6 +733,11 @@ impl PersistenceManager {
             encrypt_enabled,
             encryption_key_version,
         );
+
+        // 🔥 自动注入多账号归属 UID（优先 override）
+        if let Some(uid) = owner_uid_override.or(self.owner_uid) {
+            metadata.owner_uid = Some(uid);
+        }
 
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
@@ -672,7 +780,7 @@ impl PersistenceManager {
         }
 
         // 创建备份任务元数据
-        let metadata = TaskMetadata::new_upload_backup(
+        let mut metadata = TaskMetadata::new_upload_backup(
             task_id.clone(),
             source_path,
             target_path,
@@ -683,6 +791,11 @@ impl PersistenceManager {
             encrypt_enabled,
             encryption_key_version,
         );
+
+        // 🔥 自动注入多账号归属 UID
+        if let Some(uid) = self.owner_uid {
+            metadata.owner_uid = Some(uid);
+        }
 
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
@@ -727,7 +840,7 @@ impl PersistenceManager {
         }
 
         // 创建备份任务元数据
-        let metadata = TaskMetadata::new_download_backup(
+        let mut metadata = TaskMetadata::new_download_backup(
             task_id.clone(),
             fs_id,
             remote_path,
@@ -739,6 +852,11 @@ impl PersistenceManager {
             is_encrypted,
             encryption_key_version,
         );
+
+        // 🔥 自动注入多账号归属 UID
+        if let Some(uid) = self.owner_uid {
+            metadata.owner_uid = Some(uid);
+        }
 
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
@@ -760,6 +878,10 @@ impl PersistenceManager {
     /// * `target_path` - 转存目标路径
     /// * `auto_download` - 是否开启自动下载
     /// * `file_name` - 文件名称（用于展示）
+    /// * `owner_uid_override` - 🔥 显式归属 UID 覆盖：
+    ///   `Some(uid)` → 强制写入 `.meta.owner_uid`；`None` → 沿用 `self.owner_uid`。
+    ///   `TransferManager.create_task` 已在 task 创建前确定 effective_uid（见
+    ///   `transfer/manager.rs::create_task`），此处务必透传 `task.owner_uid.raw()`。
     pub fn register_transfer_task(
         &self,
         task_id: String,
@@ -768,6 +890,7 @@ impl PersistenceManager {
         target_path: String,
         auto_download: bool,
         file_name: Option<String>,
+        owner_uid_override: Option<u64>,
     ) -> std::io::Result<()> {
         if self.tasks.contains_key(&task_id) {
             debug!("已注册转存任务（保留已恢复状态）: {}", task_id);
@@ -775,7 +898,7 @@ impl PersistenceManager {
         }
 
         // 创建元数据
-        let metadata = TaskMetadata::new_transfer(
+        let mut metadata = TaskMetadata::new_transfer(
             task_id.clone(),
             share_link,
             share_pwd,
@@ -783,6 +906,11 @@ impl PersistenceManager {
             auto_download,
             file_name,
         );
+
+        // 🔥 自动注入多账号归属 UID（优先 override）
+        if let Some(uid) = owner_uid_override.or(self.owner_uid) {
+            metadata.owner_uid = Some(uid);
+        }
 
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
@@ -1207,6 +1335,40 @@ impl PersistenceManager {
             task_id, cleanup_status
         );
 
+        Ok(())
+    }
+
+    /// 🔥 覆盖任务的多账号归属 UID
+    ///
+    /// 用于 `POST /downloads` / `POST /downloads/batch` 等接收 `req.uid` 显式归属
+    /// 的场景：在 `register_download_task` 已经把 PM 当前 `owner_uid`（来自 active）
+    /// 写入 metadata 之后，handler 拿到 task_id 调本方法纠正为 req.uid 指定的 UID。
+    /// 仅更新 `.meta` 文件；调用方应同时调 `DownloadManager::override_task_owner_uid`
+    /// 来同步运行态 `DownloadTask.owner_uid`，保证持久化与运行态一致。
+    pub fn update_download_owner_uid(&self, task_id: &str, owner_uid: u64) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.owner_uid = Some(owner_uid);
+        })?;
+        debug!(
+            "已覆盖下载任务 owner_uid: task_id={}, owner_uid={}",
+            task_id, owner_uid
+        );
+        Ok(())
+    }
+
+    /// 🔥 覆盖上传任务的多账号归属 UID
+    ///
+    /// 语义同 `update_download_owner_uid`，用于 `POST /uploads` / `POST /uploads/folder`
+    /// / `POST /uploads/batch` 接收 `req.uid` 显式归属时，纠正持久化 metadata。
+    /// 共享底层 `.meta` 存储结构（`TaskMetadata.owner_uid`）。
+    pub fn update_upload_owner_uid(&self, task_id: &str, owner_uid: u64) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.owner_uid = Some(owner_uid);
+        })?;
+        debug!(
+            "已覆盖上传任务 owner_uid: task_id={}, owner_uid={}",
+            task_id, owner_uid
+        );
         Ok(())
     }
 
@@ -1817,6 +1979,7 @@ mod tests {
                 None,  // is_encrypted
                 None,  // encryption_key_version
                 None,  // transfer_task_id
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -1844,6 +2007,7 @@ mod tests {
                 4,
                 None,  // encrypt_enabled
                 None,  // encryption_key_version
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -1865,6 +2029,7 @@ mod tests {
                 "/save/path".to_string(),
                 true,
                 Some("test.zip".to_string()),
+                None, // owner_uid_override
             )
             .unwrap();
 
@@ -1895,6 +2060,7 @@ mod tests {
                 None,  // is_encrypted
                 None,  // encryption_key_version
                 None,  // transfer_task_id
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -1928,6 +2094,7 @@ mod tests {
                 4,
                 None,  // encrypt_enabled
                 None,  // encryption_key_version
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -1965,6 +2132,7 @@ mod tests {
                 None,  // is_encrypted
                 None,  // encryption_key_version
                 None,  // transfer_task_id
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -2005,6 +2173,7 @@ mod tests {
                 "/target".to_string(),
                 false,
                 None,
+                None, // owner_uid_override
             )
             .unwrap();
 
@@ -2032,6 +2201,7 @@ mod tests {
                 "/target".to_string(),
                 true,
                 Some("file.zip".to_string()),
+                None, // owner_uid_override
             )
             .unwrap();
 
@@ -2061,6 +2231,7 @@ mod tests {
                 4,
                 None,  // encrypt_enabled
                 None,  // encryption_key_version
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -2097,7 +2268,8 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
-                None
+                None,
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -2140,7 +2312,8 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
-                None
+                None,
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -2194,7 +2367,8 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
-                None
+                None,
+                None,  // owner_uid_override
             )
             .unwrap();
 
@@ -2232,6 +2406,7 @@ mod tests {
                 10,
                 None, None, None,
                 false, None, None, None, None,
+                None, // owner_uid_override
             )
             .unwrap();
         manager.on_chunk_completed("dl_resume", 0);
@@ -2277,6 +2452,7 @@ mod tests {
                 10,
                 None, None, None,
                 false, None, None, None, None,
+                None, // owner_uid_override
             )
             .unwrap();
 
@@ -2327,6 +2503,7 @@ mod tests {
                 10,
                 None, None, None,
                 false, None, None, None, None,
+                None, // owner_uid_override
             )
             .unwrap();
 
@@ -2388,5 +2565,95 @@ mod tests {
             Some(&(1 * 1024 * 1024)),
             "冷恢复后，分片 #5 的 partial_progress 应被恢复"
         );
+    }
+
+    /// 验证 set_owner_uid 后注册的任务 .meta 中包含 owner_uid
+    #[test]
+    fn test_owner_uid_persisted_in_metadata() {
+        let temp_dir = setup_temp_dir();
+        let config = create_test_config();
+        let mut manager = PersistenceManager::new(config, temp_dir.path());
+
+        // 设置 owner_uid
+        manager.set_owner_uid(123456789);
+
+        // 注册下载任务
+        manager
+            .register_download_task(
+                "dl_uid_test".to_string(),
+                99999,
+                "/remote/uid_test.bin".to_string(),
+                PathBuf::from("/local/uid_test.bin"),
+                1024 * 1024,
+                256 * 1024,
+                4,
+                None, None, None,
+                false, None, None, None, None,
+                None, // owner_uid_override
+            )
+            .unwrap();
+
+        // 从磁盘加载元数据，验证 owner_uid 已持久化
+        let meta = metadata::load_metadata(&manager.wal_dir, "dl_uid_test").unwrap();
+        assert_eq!(meta.owner_uid, Some(123456789), "owner_uid 应被写入 .meta 文件");
+
+        // 注册上传任务
+        manager
+            .register_upload_task(
+                "up_uid_test".to_string(),
+                PathBuf::from("/local/upload.txt"),
+                "/remote/upload.txt".to_string(),
+                2048,
+                512,
+                4,
+                None, None,
+                None, // owner_uid_override
+            )
+            .unwrap();
+
+        let meta_up = metadata::load_metadata(&manager.wal_dir, "up_uid_test").unwrap();
+        assert_eq!(meta_up.owner_uid, Some(123456789));
+
+        // 注册转存任务
+        manager
+            .register_transfer_task(
+                "tr_uid_test".to_string(),
+                "https://pan.baidu.com/s/abc".to_string(),
+                None,
+                "/target".to_string(),
+                false,
+                None,
+                None, // owner_uid_override
+            )
+            .unwrap();
+
+        let meta_tr = metadata::load_metadata(&manager.wal_dir, "tr_uid_test").unwrap();
+        assert_eq!(meta_tr.owner_uid, Some(123456789));
+    }
+
+    /// 未设置 owner_uid 时注册的任务 .meta 中 owner_uid 应为 None
+    #[test]
+    fn test_no_owner_uid_when_unset() {
+        let temp_dir = setup_temp_dir();
+        let config = create_test_config();
+        let manager = PersistenceManager::new(config, temp_dir.path());
+
+        manager
+            .register_download_task(
+                "dl_no_uid".to_string(),
+                11111,
+                "/remote/no_uid.bin".to_string(),
+                PathBuf::from("/local/no_uid.bin"),
+                1024,
+                256,
+                4,
+                None, None, None,
+                false, None, None, None, None,
+                None, // owner_uid_override
+            )
+            .unwrap();
+
+        let meta = metadata::load_metadata(&manager.wal_dir, "dl_no_uid").unwrap();
+        assert_eq!(meta.owner_uid, None, "未设置 owner_uid 时应为 None");
     }
 }

@@ -81,9 +81,8 @@ pub async fn get_file_list(
 ) -> Result<Json<ApiResponse<FileListData>>, StatusCode> {
     info!("API: 获取文件列表 dir={}, page={}", params.dir, params.page);
 
-    // 使用单例网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端（运行时单一真源）
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -307,8 +306,8 @@ pub async fn search_files(
         return Ok(Json(ApiResponse::error(400, "搜索关键词过长".to_string())));
     }
 
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(401, "未登录或客户端未初始化".to_string())));
@@ -400,9 +399,8 @@ pub async fn get_download_url(
         params.fs_id, params.path
     );
 
-    // 使用单例网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -466,8 +464,8 @@ pub async fn delete_files(
         )));
     }
 
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -498,8 +496,7 @@ pub async fn delete_files(
                 warn!("删除文件遇到 errno=-6，触发预热重试...");
                 match state.trigger_warmup().await {
                     Ok(true) => {
-                        let client = state.netdisk_client.read().await;
-                        if let Some(ref c) = *client {
+                        if let Some(c) = state.active_client().await {
                             match c.delete_files(&request.paths).await {
                                 Ok(response) if response.success => {
                                     // 百度异步删除，等待1秒让服务端完成处理
@@ -569,9 +566,8 @@ pub async fn create_folder(
         )));
     }
 
-    // 使用单例网盘客户端
-    let client_lock = state.netdisk_client.read().await;
-    let client = match client_lock.as_ref() {
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
         Some(c) => c,
         None => {
             return Ok(Json(ApiResponse::error(
@@ -603,9 +599,8 @@ pub async fn create_folder(
                 match state.trigger_warmup().await {
                     Ok(true) => {
                         info!("预热成功，重试创建文件夹...");
-                        // 重新获取客户端（预热后可能更新了）
-                        let client = state.netdisk_client.read().await;
-                        if let Some(ref c) = *client {
+                        // 重新获取活跃账号客户端（预热后 cookies 已刷新）
+                        if let Some(c) = state.active_client().await {
                             match c.create_folder(&request.path).await {
                                 Ok(response) => {
                                     let data = CreateFolderData {
@@ -910,17 +905,14 @@ pub async fn copy_files(
         }
     }
 
-    // 取客户端
-    let client = {
-        let lock = state.netdisk_client.read().await;
-        match lock.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                return Ok(Json(ApiResponse::error(
-                    401,
-                    "未登录或客户端未初始化".to_string(),
-                )));
-            }
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 
@@ -941,8 +933,7 @@ pub async fn copy_files(
             );
             match state.trigger_warmup().await {
                 Ok(true) => {
-                    let lock = state.netdisk_client.read().await;
-                    match lock.as_ref() {
+                    match state.active_client().await {
                         Some(c2) => match c2.copy_files(&normalized).await {
                             Ok(o2) => o2,
                             Err(retry_err) => {
@@ -1005,16 +996,14 @@ pub async fn move_files(
         }
     }
 
-    let client = {
-        let lock = state.netdisk_client.read().await;
-        match lock.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                return Ok(Json(ApiResponse::error(
-                    401,
-                    "未登录或客户端未初始化".to_string(),
-                )));
-            }
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 
@@ -1034,8 +1023,7 @@ pub async fn move_files(
             );
             match state.trigger_warmup().await {
                 Ok(true) => {
-                    let lock = state.netdisk_client.read().await;
-                    match lock.as_ref() {
+                    match state.active_client().await {
                         Some(c2) => match c2.move_files(&normalized).await {
                             Ok(o2) => o2,
                             Err(retry_err) => {
@@ -1110,16 +1098,14 @@ pub async fn rename_file(
         id: request.item.id,
     };
 
-    let client = {
-        let lock = state.netdisk_client.read().await;
-        match lock.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                return Ok(Json(ApiResponse::error(
-                    401,
-                    "未登录或客户端未初始化".to_string(),
-                )));
-            }
+    // 多账号路由：按 active_uid 取客户端
+    let client = match state.active_client().await {
+        Some(c) => c,
+        None => {
+            return Ok(Json(ApiResponse::error(
+                401,
+                "未登录或客户端未初始化".to_string(),
+            )));
         }
     };
 
@@ -1140,8 +1126,7 @@ pub async fn rename_file(
             );
             match state.trigger_warmup().await {
                 Ok(true) => {
-                    let lock = state.netdisk_client.read().await;
-                    match lock.as_ref() {
+                    match state.active_client().await {
                         // 重试用 owned item（首次传的是克隆，item 仍在作用域内）
                         Some(c2) => match c2.rename_file(item).await {
                             Ok(o2) => o2,

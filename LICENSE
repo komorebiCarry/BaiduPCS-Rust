@@ -199,3 +199,61 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+
+===============================================================================
+
+                    ADDITIONAL TERMS (multi-account, v3.24+)
+
+===============================================================================
+
+These additional terms apply to the BaiduPCS-Rust software in addition to the
+Apache License 2.0 above. They are intended to clarify the intended use of the
+multi-account functionality added in version 3.24 and later.
+
+1. INTENDED USE
+
+   The multi-account feature in this software is designed and shipped strictly
+   for "isolated parallel task management" across multiple distinct Baidu Netdisk
+   accounts owned by the end user (e.g. personal + family accounts). Each
+   account operates with its own client instance, task queue, resource quota,
+   and persistent state.
+
+2. PROHIBITED USE
+
+   Modifying this software to perform cross-account chunked parallel
+   downloads of a single file (i.e. using multiple accounts to fetch different
+   byte ranges of the same target in parallel in order to bypass per-account
+   VIP rate limits) is explicitly prohibited.
+
+   This prohibition includes, but is not limited to:
+
+   - Removing or weakening the runtime SAFETY assertion that
+     `task.owner_uid == chunk.owner_uid` in chunk schedulers
+     (`backend/src/downloader/chunk.rs`, `backend/src/uploader/chunk.rs`).
+   - Casting raw `u64` values into the `Uid` newtype
+     (`backend/src/auth/types.rs`) in order to swap chunk ownership between
+     accounts.
+   - Introducing `iter_all_clients` / `get_any` style APIs in
+     `backend/src/netdisk/` that intentionally erase the owner-uid binding
+     of HTTP requests.
+   - Any equivalent technique that distributes byte ranges of a single
+     download (or upload) target across more than one account.
+
+3. RATIONALE
+
+   The architecture-level defenses (`Uid` newtype, SAFETY assertions,
+   grep CI gates) and these license-level additional terms together form
+   defense-in-depth against unintentional or malicious modifications that
+   would put end users' Baidu accounts at risk of rate-limiting, suspension,
+   or violation of Baidu Netdisk's terms of service.
+
+4. NO WAIVER
+
+   These additional terms are not a grant of additional rights under the
+   Apache License 2.0. They are documentation of the upstream maintainers'
+   non-consent to the prohibited uses above. Modified or forked copies that
+   remove or weaken these terms remain bound by the original Apache License
+   2.0 and any applicable third-party terms of service of Baidu Netdisk.
+
+===============================================================================

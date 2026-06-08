@@ -182,31 +182,18 @@
         </div>
 
         <div class="header-right">
-          <el-dropdown @command="handleCommand">
-            <div class="user-info">
-              <el-avatar :size="32" :src="userAvatar">
-                <el-icon><User /></el-icon>
-              </el-avatar>
-              <span v-if="!isMobile" class="username">{{ username }}</span>
-              <el-icon><CaretBottom /></el-icon>
-            </div>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="profile">
-                  <el-icon><User /></el-icon>
-                  个人信息
-                </el-dropdown-item>
-                <el-dropdown-item command="logout" divided>
-                  <el-icon><SwitchButton /></el-icon>
-                  退出百度账号
-                </el-dropdown-item>
-                <el-dropdown-item v-if="webAuthStore.isAuthEnabled" command="webLogout">
-                  <el-icon><Lock /></el-icon>
-                  退出 Web 认证
-                </el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+          <!--
+            多账号切换器。
+            单一 dropdown 同时承担：账号切换 / 添加账号 / 账号管理 + 个人信息 / 退出百度账号 / 退出 Web 认证。
+            避免两个相同头像+名称的 dropdown 并列起来在视觉上重复。
+          -->
+          <AccountSwitcher
+              class="account-switcher-slot"
+              :show-web-logout="webAuthStore.isAuthEnabled"
+              @profile="profileDialogVisible = true"
+              @logout="handleLogout"
+              @web-logout="handleWebLogout"
+          />
         </div>
       </el-header>
 
@@ -249,6 +236,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useWebAuthStore } from '@/stores/webAuth'
 import { useIsMobile } from '@/utils/responsive'
 import UserProfileDialog from '@/components/UserProfileDialog.vue'
+import AccountSwitcher from '@/components/AccountSwitcher.vue'
 import {
   FolderOpened,
   Folder,
@@ -257,7 +245,6 @@ import {
   Upload,
   Setting,
   User,
-  CaretBottom,
   SwitchButton,
   Expand,
   Fold,
@@ -345,34 +332,19 @@ async function handleDrawerWebLogout() {
 // 抽屉退出登录
 async function handleLogout() {
   try {
-    await ElMessageBox.confirm('确定要退出登录吗？', '退出确认', {
+    await ElMessageBox.confirm('确定要退出当前账号吗？', '退出确认', {
       confirmButtonText: '确定',
       cancelButtonText: '取消',
       type: 'warning',
     })
     drawerVisible.value = false
     await authStore.logout()
-    ElMessage.success('已退出登录')
+    ElMessage.success('已退出当前账号')
     router.push('/login')
   } catch (error) {
     if (error !== 'cancel') {
       console.error('退出登录失败:', error)
     }
-  }
-}
-
-// 下拉菜单命令处理
-async function handleCommand(command: string) {
-  switch (command) {
-    case 'profile':
-      profileDialogVisible.value = true
-      break
-    case 'logout':
-      await handleLogout()
-      break
-    case 'webLogout':
-      await handleWebLogout()
-      break
   }
 }
 
@@ -503,24 +475,15 @@ watch(
   }
 
   .header-right {
-    .user-info {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      cursor: pointer;
-      padding: 8px 12px;
-      border-radius: 8px;
-      transition: background-color 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 12px;
 
-      &:hover {
-        background-color: #f5f5f5;
-      }
-
-      .username {
-        font-size: 14px;
-        color: #333;
-      }
+    .account-switcher-slot {
+      // AccountSwitcher 自管理触发器样式；这里仅控制布局间距
+      flex: 0 0 auto;
     }
+
   }
 }
 

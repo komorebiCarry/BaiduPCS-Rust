@@ -1,6 +1,7 @@
 //! 文件夹下载 API 处理器
 
 use crate::downloader::{DownloadConflictStrategy, DownloadTask, FolderDownload, TaskStatus};
+use crate::server::extractors::{resolve_uid_from_query, UidQuery};
 use crate::server::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -22,6 +23,12 @@ pub struct CreateFolderDownloadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<DownloadConflictStrategy>,
+    /// 显式指定 owner_uid
+    ///
+    /// **字段名兼容**：加 `alias = "owner_uid"`
+    /// 兼容前端发送的 `owner_uid` 字段名。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 删除文件夹下载请求参数
@@ -64,7 +71,10 @@ pub async fn create_folder_download(
     State(app_state): State<AppState>,
     Json(req): Json<CreateFolderDownloadRequest>,
 ) -> Result<Json<ApiResponse<String>>, StatusCode> {
-    info!("创建文件夹下载: {}, original_name: {:?}", req.path, req.original_name);
+    info!(
+        "创建文件夹下载: {}, original_name: {:?}, uid: {:?}",
+        req.path, req.original_name, req.uid
+    );
 
     // 如果未指定策略，从 AppConfig 读取默认值
     let conflict_strategy = req.conflict_strategy.or_else(|| {
@@ -72,9 +82,35 @@ pub async fn create_folder_download(
         Some(config.conflict_strategy.default_download_strategy)
     });
 
+    // 🔥 解析 effective_uid
+    // 优先使用前端显式 `req.uid`（owner_uid alias），否则回退到 active_uid。
+    // 切账号后未传 uid 时，task 应归属当前活跃账号（不是 startup 账号）。
+    let effective_uid = match req.uid {
+        Some(uid_raw) => crate::auth::Uid::new(uid_raw),
+        None => match *app_state.active_uid.read().await {
+            Some(uid) => uid,
+            None => {
+                error!("create_folder_download: 未登录且无 explicit uid");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        },
+    };
+
+    // 校验目标账号存在
+    {
+        let mgr = app_state.account_manager.lock().await;
+        if mgr.get_user(effective_uid).is_none() {
+            error!(
+                "create_folder_download: 目标账号不存在: uid={}",
+                effective_uid.raw()
+            );
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
+
     match app_state
         .folder_download_manager
-        .create_folder_download_with_name(req.path, req.original_name, conflict_strategy)
+        .create_folder_download_with_name(req.path, req.original_name, conflict_strategy, effective_uid)
         .await
     {
         Ok(folder_id) => Ok(Json(ApiResponse::success(folder_id))),
@@ -112,22 +148,54 @@ pub async fn get_folder_download(
 
 /// GET /api/v1/downloads/all
 /// 获取所有下载（文件+文件夹混合，按创建时间排序）
+///
+/// 多账号语义：
+/// - `?uid=` 缺省 → 跨账号聚合（迭代 `list_download_managers`）
+/// - `?uid=X` → 仅该账号
 pub async fn get_all_downloads_mixed(
     State(app_state): State<AppState>,
+    Query(q): Query<UidQuery>,
 ) -> Result<Json<ApiResponse<Vec<DownloadItem>>>, StatusCode> {
-    // 获取所有文件任务
-    let all_tasks = {
-        let download_manager = app_state
-            .download_manager
-            .read()
-            .await
-            .clone()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        download_manager.get_all_tasks().await
+    let filter_uid = resolve_uid_from_query(&q);
+    // 获取所有文件任务（跨账号聚合或单账号）
+    // 🔥 共享 manager 必须按 owner_uid 过滤
+    let all_tasks: Vec<DownloadTask> = match filter_uid {
+        Some(uid) => match app_state.download_manager_for(uid) {
+            Some(dm) => dm
+                .get_all_tasks()
+                .await
+                .into_iter()
+                .filter(|t| t.owner_uid == uid)
+                .collect(),
+            None => Vec::new(),
+        },
+        None => {
+            // 全局共享历史库会被每个账号的 get_all_tasks 各捞一遍，跨账号聚合时
+            // 按 id 去重，避免同一历史任务因账号数 N 而重复出现 N 次。
+            let mut all = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for (_uid, dm) in app_state.list_download_managers() {
+                for t in dm.get_all_tasks().await {
+                    if seen.insert(t.id.clone()) {
+                        all.push(t);
+                    }
+                }
+            }
+            all
+        }
     };
 
-    // 获取所有文件夹任务（内存 + 历史数据库）
-    let folders = app_state.folder_download_manager.get_all_folders_with_history().await;
+    // 获取所有文件夹任务（内存 + 历史数据库；按 uid 过滤）
+    let folders: Vec<FolderDownload> = app_state
+        .folder_download_manager
+        .get_all_folders_with_history()
+        .await
+        .into_iter()
+        .filter(|f| match filter_uid {
+            Some(uid) => f.owner_uid == uid,
+            None => true,
+        })
+        .collect();
 
     let mut items: Vec<DownloadItem> = Vec::new();
 

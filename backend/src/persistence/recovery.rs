@@ -21,7 +21,7 @@ use chrono::{Duration, Utc};
 use tracing::{debug, error, info, warn};
 
 use super::metadata::{delete_task_files, scan_all_metadata};
-use super::types::{TaskMetadata, TaskType};
+use super::types::{TaskMetadata, TaskPersistenceStatus, TaskType};
 use super::wal::read_records;
 
 /// 恢复的任务信息
@@ -89,6 +89,9 @@ pub struct RecoveryScanResult {
 
     /// 可恢复的转存任务
     pub transfer_tasks: Vec<RecoveredTask>,
+
+    /// 🔥 终态失败的下载任务（重启后保留为「失败」态，可手动重试/删除，不清理）
+    pub failed_download_tasks: Vec<RecoveredTask>,
 
     /// 已完成的任务（需要清理）
     pub completed_tasks: Vec<String>,
@@ -196,6 +199,18 @@ pub fn scan_recoverable_tasks(wal_dir: &Path) -> std::io::Result<RecoveryScanRes
             continue;
         }
 
+        // 🔥 终态「失败」的下载任务：保留为失败态，重启后仍可见、可手动重试/删除。
+        // 不走续传校验（validate_download_task 要求 total_chunks 非零，而在 register 之前
+        // 就失败的任务分片布局尚未确定，total_chunks 为 0），也不当作无效任务清理。
+        // 仅下载任务做此特殊处理；上传/转存维持原有恢复逻辑。
+        if metadata.task_type == TaskType::Download
+            && metadata.status == Some(TaskPersistenceStatus::Failed)
+        {
+            debug!("下载任务 {} 为终态失败，保留为失败态恢复", task_id);
+            result.failed_download_tasks.push(recovered);
+            continue;
+        }
+
         // 验证任务有效性
         match metadata.task_type {
             TaskType::Download => {
@@ -231,17 +246,126 @@ pub fn scan_recoverable_tasks(wal_dir: &Path) -> std::io::Result<RecoveryScanRes
     result
         .transfer_tasks
         .sort_by(|a, b| b.metadata.created_at.cmp(&a.metadata.created_at));
+    result
+        .failed_download_tasks
+        .sort_by(|a, b| b.metadata.created_at.cmp(&a.metadata.created_at));
 
     info!(
-        "扫描完成: {} 个下载任务, {} 个上传任务, {} 个转存任务, {} 个已完成, {} 个无效",
+        "扫描完成: {} 个下载任务, {} 个上传任务, {} 个转存任务, {} 个终态失败下载任务, {} 个已完成, {} 个无效",
         result.download_tasks.len(),
         result.upload_tasks.len(),
         result.transfer_tasks.len(),
+        result.failed_download_tasks.len(),
         result.completed_tasks.len(),
         result.invalid_tasks.len()
     );
 
     Ok(result)
+}
+
+/// 多账号恢复分类
+///
+/// 描述一个 `RecoveredTask` 在多账号场景下应该走的恢复分支。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryBranch {
+    /// 分支 A：`owner_uid=Some(uid)` 且 `uid ∈ accounts` → 正常恢复
+    Normal {
+        /// 解析后的归属账号
+        owner_uid: u64,
+    },
+    /// 分支 B：`owner_uid=Some(uid)` 但 `uid ∉ accounts` → 账号已删除
+    ///
+    /// 调用方应将任务标记为 `Failed` + `failure_reason="account_deleted"`，
+    /// 不启动恢复。
+    AccountDeleted {
+        /// 任务持久化的 owner_uid（账号已不存在）
+        missing_uid: u64,
+    },
+    /// 分支 C：`owner_uid=None` 且 `active_uid=Some` → 用 active_uid 兜底
+    ///
+    /// 调用方应：
+    /// 1. 把 `active_uid` 写回任务的运行态结构（DownloadTask/UploadTask/FolderDownload）
+    /// 2. 同步把 `metadata.owner_uid = Some(active_uid)` 写回 `.meta`
+    /// 3. 走分支 A 的正常恢复流程
+    LegacyFillActive {
+        /// 兜底的 active_uid
+        active_uid: u64,
+    },
+    /// 分支 D：`owner_uid=None` 且 `active_uid=None` → 无法恢复
+    ///
+    /// 调用方应将任务标记为：
+    /// - Downloads: `TaskStatus::Failed` + `failure_reason="unrecoverable_no_active_account"`
+    /// - Uploads: `UploadTaskStatus::Failed` + 同上
+    /// - FolderDownload: `FolderStatus::Failed` + 同上
+    UnrecoverableNoActive,
+}
+
+impl RecoveryBranch {
+    /// 取本分支应填充的 `failure_reason`，正常分支返回 `None`。
+    pub fn failure_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Normal { .. } | Self::LegacyFillActive { .. } => None,
+            Self::AccountDeleted { .. } => Some("account_deleted"),
+            Self::UnrecoverableNoActive => Some("unrecoverable_no_active_account"),
+        }
+    }
+
+    /// 取解析后的 owner_uid（仅 Normal / LegacyFillActive 分支返回 Some）。
+    pub fn resolved_owner_uid(&self) -> Option<u64> {
+        match self {
+            Self::Normal { owner_uid } => Some(*owner_uid),
+            Self::LegacyFillActive { active_uid } => Some(*active_uid),
+            Self::AccountDeleted { .. } | Self::UnrecoverableNoActive => None,
+        }
+    }
+}
+
+/// 多账号恢复分支分类器
+///
+/// 给定任务持久化的 `owner_uid`、当前活跃账号 `active_uid`、已加载账号 uid 集合，
+/// 返回任务应走的恢复分支。
+///
+/// # Arguments
+/// - `persisted_owner_uid`: 任务 `.meta` 持久化的 `owner_uid`（旧版数据为 `None`）
+/// - `active_uid`: `AccountManager.active_uid()`（无任何账号时为 `None`）
+/// - `known_uids`: 当前 `accounts.json` 中所有账号 uid 集合
+///
+/// # 返回值
+/// [`RecoveryBranch`]，调用方根据分支决定是否启动恢复 / 标记 Failed。
+///
+/// # 真值表
+///
+/// | persisted_owner_uid | uid ∈ accounts | active_uid | branch |
+/// |---------------------|----------------|------------|--------|
+/// | Some(uid), uid != 0 | Yes            | -          | A `Normal { uid }` |
+/// | Some(uid), uid != 0 | No             | -          | B `AccountDeleted { uid }` |
+/// | `Some(0)` 或 `None` | -              | Some(a)    | C `LegacyFillActive { a }` |
+/// | `Some(0)` 或 `None` | -              | None       | D `UnrecoverableNoActive` |
+///
+/// **`Some(0)` 等同 `None` 的原因**：v3.x 早期登录路径漏调 `set_owner_uid()`，
+/// 导致部分任务持久化为 `owner_uid=0`。这些任务在 UI 上会显示成 `UID:0`（因为
+/// `accounts` 不包含 uid=0）。把 `Some(0)` 与 `None` 都视为「未知归属」走
+/// `LegacyFillActive` 分支，自动回填为当前 `active_uid` 并写回 `.meta`，
+/// 重启后任务即归属到实际账号。
+pub fn classify_recovery_branch(
+    persisted_owner_uid: Option<u64>,
+    active_uid: Option<u64>,
+    known_uids: &std::collections::HashSet<u64>,
+) -> RecoveryBranch {
+    match persisted_owner_uid {
+        // Some(0) 是早期 bug 的占位值，等同未知归属
+        Some(0) | None => match active_uid {
+            Some(a) => RecoveryBranch::LegacyFillActive { active_uid: a },
+            None => RecoveryBranch::UnrecoverableNoActive,
+        },
+        Some(uid) => {
+            if known_uids.contains(&uid) {
+                RecoveryBranch::Normal { owner_uid: uid }
+            } else {
+                RecoveryBranch::AccountDeleted { missing_uid: uid }
+            }
+        }
+    }
 }
 
 /// 验证下载任务
@@ -483,6 +607,9 @@ pub fn cleanup_expired_tasks(wal_dir: &Path, retention_days: u64) -> std::io::Re
 pub struct TransferRecoveryInfo {
     /// 任务 ID
     pub task_id: String,
+    /// 🔥 多账号归属 UID：来自 metadata，
+    /// 在 `state.rs::filter_by_branch` 已做过 Some(0)/None → active_uid 填充
+    pub owner_uid: Option<u64>,
     /// 分享链接
     pub share_link: String,
     /// 提取码（可选）
@@ -515,6 +642,8 @@ impl TransferRecoveryInfo {
 
         Some(Self {
             task_id: metadata.task_id.clone(),
+            // 🔥 透传 owner_uid
+            owner_uid: metadata.owner_uid,
             share_link: metadata.share_link.clone()?,
             share_pwd: metadata.share_pwd.clone(),
             target_path: metadata.transfer_target_path.clone()?,
@@ -536,6 +665,13 @@ impl TransferRecoveryInfo {
 pub struct DownloadRecoveryInfo {
     /// 任务 ID
     pub task_id: String,
+    /// 🔥 多账号归属 UID
+    ///
+    /// 来源于 `TaskMetadata.owner_uid`，经 `classify_recovery_branch` 在
+    /// `state.rs::filter_by_branch` 中做过兜底填充（`Some(0)`/`None`
+    /// → `active_uid`）。`restore_task` 创建 `DownloadTask` 时优先使用本字段，
+    /// 缺失时才退回 `DownloadManager.owner_uid`。
+    pub owner_uid: Option<u64>,
     /// 百度网盘文件 fs_id
     pub fs_id: u64,
     /// 远程文件路径
@@ -575,6 +711,11 @@ pub struct DownloadRecoveryInfo {
     // === 分片内断点续传 ===
     /// 分片内部分下载进度（chunk_index → bytes_downloaded）
     pub partial_progress: HashMap<usize, u64>,
+    // === 终态失败恢复 ===
+    /// 🔥 是否为终态失败任务（恢复后置为 Failed 而非 Paused，不分配槽位、不重注册持久化）
+    pub is_failed: bool,
+    /// 失败任务的错误信息（仅 is_failed 时有意义）
+    pub error: Option<String>,
 }
 
 impl DownloadRecoveryInfo {
@@ -584,6 +725,9 @@ impl DownloadRecoveryInfo {
 
         Some(Self {
             task_id: metadata.task_id.clone(),
+            // 🔥 透传 owner_uid，
+            // 调用方在 state.rs::filter_by_branch 中已做过 Some(0)/None → active_uid 填充
+            owner_uid: metadata.owner_uid,
             fs_id: metadata.fs_id?,
             remote_path: metadata.remote_path.clone()?,
             local_path: metadata.local_path.clone()?,
@@ -606,6 +750,9 @@ impl DownloadRecoveryInfo {
             encryption_key_version: metadata.encryption_key_version,
             // 恢复分片内部分进度
             partial_progress: recovered.partial_progress.clone(),
+            // 🔥 终态失败标记 + 错误信息
+            is_failed: metadata.status == Some(TaskPersistenceStatus::Failed),
+            error: metadata.error_msg.clone(),
         })
     }
 
@@ -624,6 +771,9 @@ impl DownloadRecoveryInfo {
 pub struct UploadRecoveryInfo {
     /// 任务 ID
     pub task_id: String,
+    /// 🔥 多账号归属 UID：来自 metadata，
+    /// 在 `state.rs::filter_by_branch` 已做过 Some(0)/None → active_uid 填充
+    pub owner_uid: Option<u64>,
     /// 本地源文件路径
     pub source_path: PathBuf,
     /// 远程目标路径
@@ -663,6 +813,8 @@ impl UploadRecoveryInfo {
 
         Some(Self {
             task_id: metadata.task_id.clone(),
+            // 🔥 透传 owner_uid
+            owner_uid: metadata.owner_uid,
             source_path: metadata.source_path.clone()?,
             target_path: metadata.target_path.clone()?,
             file_size: metadata.file_size?,
@@ -786,6 +938,43 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_failed_download_task_preserved() {
+        let temp_dir = setup_temp_dir();
+        let wal_dir = temp_dir.path();
+
+        // 模拟"创建即落盘但 register 之前就失败"的占位元数据：
+        // total_chunks=0，status=Failed，带错误信息，无 WAL 记录。
+        let mut metadata = TaskMetadata::new_download(
+            "dl_failed".to_string(),
+            999,
+            "/remote/开始使用1.md".to_string(),
+            PathBuf::from("/local/开始使用1.md"),
+            2048,
+            0, // chunk_size 占位
+            0, // total_chunks 占位
+            None,
+            None,
+        );
+        metadata.set_error_msg("errno=8002".to_string());
+        metadata.mark_failed();
+        save_metadata(wal_dir, &metadata).unwrap();
+
+        let result = scan_recoverable_tasks(wal_dir).unwrap();
+
+        // 终态失败任务既不进续传列表，也不被当作无效任务清理，而是进入 failed_download_tasks
+        assert_eq!(result.download_tasks.len(), 0);
+        assert_eq!(result.invalid_tasks.len(), 0);
+        assert_eq!(result.failed_download_tasks.len(), 1);
+
+        // from_recovered 应携带 is_failed/error，供 restore_task 恢复为 Failed 态
+        let info = DownloadRecoveryInfo::from_recovered(&result.failed_download_tasks[0])
+            .expect("failed download task should be recoverable");
+        assert!(info.is_failed);
+        assert_eq!(info.error.as_deref(), Some("errno=8002"));
+        assert_eq!(info.task_id, "dl_failed");
+    }
+
+    #[test]
     fn test_scan_upload_task_with_md5() {
         let temp_dir = setup_temp_dir();
         let wal_dir = temp_dir.path();
@@ -855,7 +1044,7 @@ mod tests {
         assert_eq!(recovered.task_id(), "tr_001");
         assert_eq!(recovered.task_type(), TaskType::Transfer);
     }
-    
+
 
     /// 旧 WAL（缺 share_root_path 字段）反序列化兼容：恢复时退化为 None，不会引发错误。
     #[test]
@@ -1008,5 +1197,94 @@ mod tests {
         assert_eq!(info.fs_id, 12345);
         assert_eq!(info.total_chunks, 4);
         assert_eq!(info.pending_chunks(), vec![1, 3]);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // classify_recovery_branch 真值表验证
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn known_uids(uids: &[u64]) -> std::collections::HashSet<u64> {
+        uids.iter().copied().collect()
+    }
+
+    #[test]
+    fn t2_10_branch_a_normal_owner_in_accounts() {
+        let known = known_uids(&[100, 200]);
+        let branch = classify_recovery_branch(Some(100), Some(100), &known);
+        assert_eq!(branch, RecoveryBranch::Normal { owner_uid: 100 });
+        assert_eq!(branch.failure_reason(), None);
+        assert_eq!(branch.resolved_owner_uid(), Some(100));
+    }
+
+    #[test]
+    fn t2_10_branch_b_account_deleted() {
+        let known = known_uids(&[200]); // 100 已被删除
+        let branch = classify_recovery_branch(Some(100), Some(200), &known);
+        assert_eq!(branch, RecoveryBranch::AccountDeleted { missing_uid: 100 });
+        assert_eq!(branch.failure_reason(), Some("account_deleted"));
+        assert_eq!(branch.resolved_owner_uid(), None);
+    }
+
+    #[test]
+    fn t2_10_branch_c_legacy_fill_active() {
+        let known = known_uids(&[300, 400]);
+        let branch = classify_recovery_branch(None, Some(300), &known);
+        assert_eq!(branch, RecoveryBranch::LegacyFillActive { active_uid: 300 });
+        assert_eq!(branch.failure_reason(), None);
+        assert_eq!(branch.resolved_owner_uid(), Some(300));
+    }
+
+    #[test]
+    fn t2_10_branch_d_unrecoverable_no_active() {
+        let known = std::collections::HashSet::new();
+        let branch = classify_recovery_branch(None, None, &known);
+        assert_eq!(branch, RecoveryBranch::UnrecoverableNoActive);
+        assert_eq!(
+            branch.failure_reason(),
+            Some("unrecoverable_no_active_account")
+        );
+        assert_eq!(branch.resolved_owner_uid(), None);
+    }
+
+    #[test]
+    fn t2_10_branch_b_persisted_owner_no_active_still_account_deleted() {
+        // 持久化 owner_uid=100 但 accounts 为空 → 仍归 AccountDeleted（不再走 D）
+        let known = std::collections::HashSet::new();
+        let branch = classify_recovery_branch(Some(100), None, &known);
+        assert_eq!(branch, RecoveryBranch::AccountDeleted { missing_uid: 100 });
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // `Some(0)` 早期 bug 占位值兼容测试（auth.rs 漏调 set_owner_uid 的回归保护）
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn t2_10_some_zero_falls_back_to_legacy_fill_active() {
+        // owner_uid=Some(0) 是 v3.x 早期 auth.rs 漏调 set_owner_uid 留下的占位值，
+        // 应等同 None 走 LegacyFillActive 分支自动回填 active_uid
+        let known = known_uids(&[100, 200]);
+        let branch = classify_recovery_branch(Some(0), Some(100), &known);
+        assert_eq!(branch, RecoveryBranch::LegacyFillActive { active_uid: 100 });
+        assert_eq!(branch.resolved_owner_uid(), Some(100));
+    }
+
+    #[test]
+    fn t2_10_some_zero_no_active_unrecoverable() {
+        // owner_uid=Some(0) + 无活跃账号 → UnrecoverableNoActive（与 None 一致）
+        let known = std::collections::HashSet::new();
+        let branch = classify_recovery_branch(Some(0), None, &known);
+        assert_eq!(branch, RecoveryBranch::UnrecoverableNoActive);
+    }
+
+    #[test]
+    fn t2_10_some_zero_not_treated_as_account_deleted() {
+        // 即使 known_uids 不包含 0（永远不可能包含），Some(0) 也 **不** 走 AccountDeleted
+        // 而是走 LegacyFillActive，避免历史数据被误删
+        let known = known_uids(&[100]);
+        let branch = classify_recovery_branch(Some(0), Some(100), &known);
+        assert!(
+            !matches!(branch, RecoveryBranch::AccountDeleted { .. }),
+            "Some(0) 不能被分类为 AccountDeleted（防止误删旧任务）"
+        );
     }
 }

@@ -46,39 +46,78 @@ pub fn calculate_task_max_chunks(file_size: u64) -> usize {
 ///
 /// 为每个正在下载的分片分配一个唯一的槽位ID（1, 2, 3...max_slots）
 /// 分片完成后归还槽位，确保同一时刻每个槽位只有一个分片在使用
+///
+/// 支持热扩缩容（`update_max_threads` 调用 `resize`）
+/// 保持"每个并发分片有唯一槽位 ID"语义；缩容时已分配但仍在使用的高 ID 槽位
+/// 会在释放时被忽略（不入栈），自然在下次 acquire 时不会被复用。
+///
+/// `available_slots` + `max_slots` 合并到单个
+/// `Mutex<ChunkSlotState>`，避免 acquire / release / resize 三路获取两把锁
+/// 顺序不一致导致的死锁（旧实现 acquire 先锁 available 再读 max；release / resize
+/// 先锁 max 再锁 available — A 锁等 B、B 锁等 A）。
+#[derive(Debug)]
+struct ChunkSlotState {
+    /// 可用槽位栈（pop 取最小 ID）
+    available: Vec<usize>,
+    /// 当前最大槽位数（支持热扩缩容）
+    max_slots: usize,
+}
+
 #[derive(Debug)]
 struct ChunkSlotPool {
-    /// 可用槽位栈（使用 Mutex 保护）
-    available_slots: std::sync::Mutex<Vec<usize>>,
-    /// 最大槽位数
-    max_slots: usize,
+    state: std::sync::Mutex<ChunkSlotState>,
 }
 
 impl ChunkSlotPool {
     fn new(max_slots: usize) -> Self {
         // 初始化所有槽位为可用（从大到小，pop时得到小的）
-        let slots: Vec<usize> = (1..=max_slots).rev().collect();
+        let available: Vec<usize> = (1..=max_slots).rev().collect();
         Self {
-            available_slots: std::sync::Mutex::new(slots),
-            max_slots,
+            state: std::sync::Mutex::new(ChunkSlotState {
+                available,
+                max_slots,
+            }),
         }
     }
 
     /// 获取一个空闲槽位，如果没有则返回备用ID
     fn acquire(&self) -> usize {
-        let mut slots = self.available_slots.lock().unwrap();
-        slots.pop().unwrap_or(self.max_slots + 1) // 如果没有空闲槽位，返回超出范围的ID
+        let mut state = self.state.lock().unwrap();
+        let max = state.max_slots;
+        state.available.pop().unwrap_or(max + 1) // 没空闲槽位 → 备用 ID
     }
 
     /// 归还槽位
     fn release(&self, slot_id: usize) {
-        if slot_id <= self.max_slots {
-            let mut slots = self.available_slots.lock().unwrap();
-            // 避免重复归还
-            if !slots.contains(&slot_id) {
-                slots.push(slot_id);
-            }
+        let mut state = self.state.lock().unwrap();
+        if slot_id <= state.max_slots && !state.available.contains(&slot_id) {
+            state.available.push(slot_id);
         }
+        // slot_id > max（缩容前借出的槽位 / acquire 返回的备用 ID）：直接丢弃
+    }
+
+    /// 🔥 热调整最大槽位数
+    ///
+    /// - 扩容（new_max > old_max）：把新增的 ID 加入可用栈
+    /// - 缩容（new_max < old_max）：从可用栈中移除 > new_max 的 ID；正在使用的
+    ///   高 ID 槽位会在 `release` 时被忽略（不重新入栈），自然消亡
+    /// - 不变：直接返回
+    fn resize(&self, new_max: usize) {
+        let mut state = self.state.lock().unwrap();
+        let old_max = state.max_slots;
+        if new_max == old_max {
+            return;
+        }
+        if new_max > old_max {
+            // 扩容：新增 (old_max+1 ..= new_max)，从大到小压栈（与 new() 顺序一致）
+            for id in ((old_max + 1)..=new_max).rev() {
+                state.available.push(id);
+            }
+        } else {
+            // 缩容：移除可用栈中所有 > new_max 的 ID
+            state.available.retain(|&id| id <= new_max);
+        }
+        state.max_slots = new_max;
     }
 }
 
@@ -264,8 +303,30 @@ pub struct ChunkScheduler {
     waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     /// 上一轮的任务数（用于检测任务数变化）
     last_task_count: Arc<AtomicUsize>,
-    /// 🔥 解密并发控制信号量（限制同时解密的文件数，避免内存和CPU过载）
-    decrypt_semaphore: Arc<Semaphore>,
+    /// 🔥 解密并发控制信号量
+    ///
+    /// `Arc<RwLock<Arc<Semaphore>>>` 以支持启动后从 `AppState.decrypt_semaphore`
+    /// 注入机器级单例（多账号共享同一闸门）。构造时由调用方传入全局共享
+    /// `Arc<Semaphore>`（机器级单例）。
+    decrypt_semaphore: Arc<RwLock<Arc<Semaphore>>>,
+    /// 🔥 多账号配额调度器
+    ///
+    /// 来源：`AppState.budget_scheduler`，由 `DownloadManager::new_for_account`
+    /// 构造时直接注入。
+    ///
+    /// 字段类型为 `Arc<BudgetScheduler>`（必填，非 `Option`），与上传侧对称。
+    /// `spawn_chunk_download` 路径无 `None` fallback，结构性消除"漏调 wire 时
+    /// 分片调度静默 fallback 绕过 budget"的破口。
+    budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+    /// 🔥 调度器所属账号 UID
+    ///
+    /// 当前架构是 per-uid 独立 `DownloadManager`，每个 manager 内部各自构造
+    /// `ChunkScheduler`。该字段保留为 `Uid::default()` 占位以禁用 scheduler-level
+    /// `task.owner_uid == scheduler.owner_uid` 断言 — 单 manager 内同时调度的多个
+    /// task 可能 owner 不同（历史共享 Arc / 测试路径下尤其如此）。分片调度按
+    /// `task.owner_uid` 路由才是 effective owner；本字段仍保留为
+    /// `Arc<StdRwLock<...>>` 维持原可写语义。
+    owner_uid: Arc<StdRwLock<crate::auth::Uid>>,
 }
 
 impl ChunkScheduler {
@@ -278,7 +339,7 @@ impl ChunkScheduler {
     ///
     /// 注意：使用 std::thread::available_parallelism() 而不是 num_cpus
     /// 因为它会考虑 Docker/cgroups 的 CPU 限制
-    fn calculate_decrypt_concurrency() -> usize {
+    pub fn calculate_decrypt_concurrency() -> usize {
         let available_cpus = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4); // 获取失败时默认 4 核
@@ -287,11 +348,20 @@ impl ChunkScheduler {
         concurrency
     }
 
-    /// 创建新的调度器
-    pub fn new(max_global_threads: usize, max_concurrent_tasks: usize) -> Self {
+    /// 创建新的调度器（必填 `budget_scheduler` + `decrypt_semaphore` + `owner_uid`）
+    ///
+    /// 多账号下载**唯一**走 `BudgetScheduler::acquire_chunk_permit(uid, BudgetKind::Download)`
+    /// 一条路径，构造时直接注入避免漏调 wire 的破口（与上传侧对称）。
+    pub fn new(
+        max_global_threads: usize,
+        max_concurrent_tasks: usize,
+        budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+        decrypt_semaphore: Arc<Semaphore>,
+        owner_uid: crate::auth::Uid,
+    ) -> Self {
         info!(
-            "创建全局分片调度器: 全局线程数={}, 最大并发任务数={}",
-            max_global_threads, max_concurrent_tasks
+            "创建全局分片调度器: 全局线程数={}, 最大并发任务数={}, owner_uid={}",
+            max_global_threads, max_concurrent_tasks, owner_uid.raw()
         );
 
         let scheduler = Self {
@@ -305,10 +375,11 @@ impl ChunkScheduler {
             backup_notification_tx: Arc::new(RwLock::new(None)),
             waiting_queue_trigger: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
-            // 🔥 解密并发限制：根据 CPU 核心数动态计算
-            // 解密是 CPU 密集型 + 磁盘 IO 操作
-            // 使用 CPU 核心数的一半（至少 2，最多 8）作为并发数
-            decrypt_semaphore: Arc::new(Semaphore::new(Self::calculate_decrypt_concurrency())),
+            // 🔥 解密并发限制：构造时由调用方传入全局共享 Arc<Semaphore>（机器级单例）
+            decrypt_semaphore: Arc::new(RwLock::new(decrypt_semaphore)),
+            // 🔥 构造时注入，不再有 None fallback
+            budget_scheduler,
+            owner_uid: Arc::new(StdRwLock::new(owner_uid)),
         };
 
         // 启动全局调度循环
@@ -316,6 +387,9 @@ impl ChunkScheduler {
 
         scheduler
     }
+
+    // 多账号下载配额唯一构造入口 = `new` 必填 `budget_scheduler` + `decrypt_semaphore` +
+    // `owner_uid`，结构性消除"忘记 wire 就启动下载"的缺口。
 
     /// 设置任务完成通知发送器
     ///
@@ -362,9 +436,16 @@ impl ChunkScheduler {
     /// 动态更新最大全局线程数
     ///
     /// 该方法可以在运行时调整线程池大小，无需重启下载管理器
+    ///
+    /// 同步扩缩容 `slot_pool` 让"每个并发分片有唯一槽位 ID"语义在热调整后仍成立
+    /// （避免日志里多个分片用同一个备用 ID）。
     pub fn update_max_threads(&self, new_max: usize) {
         let old_max = self.max_global_threads.swap(new_max, Ordering::SeqCst);
-        info!("🔧 动态调整全局最大线程数: {} -> {}", old_max, new_max);
+        self.slot_pool.resize(new_max);
+        info!(
+            "🔧 动态调整全局最大线程数: {} -> {}（slot_pool 已同步 resize）",
+            old_max, new_max
+        );
     }
 
     /// 动态更新最大并发任务数
@@ -452,6 +533,9 @@ impl ChunkScheduler {
         let waiting_queue_trigger = self.waiting_queue_trigger.clone();
         let last_task_count = self.last_task_count.clone();
         let decrypt_semaphore = self.decrypt_semaphore.clone();
+        // 🔥 多账号注入资源
+        let budget_scheduler = self.budget_scheduler.clone();
+        let owner_uid_holder = self.owner_uid.clone();
 
         // 标记调度器正在运行
         scheduler_running.store(true, Ordering::SeqCst);
@@ -635,6 +719,9 @@ impl ChunkScheduler {
                                 backup_notification_tx.clone(),
                                 task_completed_tx.clone(),
                                 waiting_queue_trigger.clone(),
+                                // 🔥 多账号注入：budget + SAFETY assert
+                                budget_scheduler.clone(),
+                                owner_uid_holder.clone(),
                             );
 
                             scheduled_count += 1;
@@ -747,8 +834,9 @@ impl ChunkScheduler {
                                 let decrypt_semaphore_clone = decrypt_semaphore.clone();
 
                                 tokio::spawn(async move {
-                                    // 🔥 获取解密信号量，限制并发解密数量
-                                    let _permit = decrypt_semaphore_clone.acquire().await.unwrap();
+                                    // 🔥 获取解密信号量（注入后的机器级单例）
+                                    let sem_arc = decrypt_semaphore_clone.read().await.clone();
+                                    let _permit = sem_arc.acquire_owned().await.unwrap();
                                     debug!("任务 {} 获取解密信号量，开始解密流程", task_id_clone);
 
                                     // 🔥 R20: 快照本次解密协程的 epoch，用于在
@@ -831,9 +919,103 @@ impl ChunkScheduler {
         _backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
         _task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
         _waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
+        // 🔥 多账号注入：必填 budget_scheduler 为 `Arc<BudgetScheduler>`（非 Option），
+        // 结构性消除"未注入 → fallback 到本地 slot 绕过配额"的破口。
+        budget_scheduler: Arc<crate::downloader::budget_scheduler::BudgetScheduler>,
+        owner_uid_holder: Arc<StdRwLock<crate::auth::Uid>>,
     ) {
         tokio::spawn(async move {
             let task_id = task_info.task_id.clone();
+
+            // 🔥 SAFETY: cross-account chunk
+            //
+            // 违反百度用户协议（同账号同链路下载）→ Pandownload 案先例：
+            // 提供"协同下载基础设施"可被认定为帮助犯（详见 LICENSE Additional Terms）。
+            // 本断言阻止任务被错误路由到非自己 owner_uid 的 DownloadManager 的 scheduler。
+            // 注释中三关键字（SAFETY / 违反百度用户协议 / Pandownload）必须保留 — 删除即留下明显恶意改动证据。
+            //
+            // 当前架构是 per-uid 独立 `DownloadManager`，每个 manager 有自己的 scheduler；
+            //   但单 manager 内同时调度的 task 可能 owner_uid 不同（历史共享 Arc / 测试路径
+            //   下尤其如此），因此 `scheduler_uid` 与 `task_uid` 不必相等。
+            // - 改用 `chunk.owner_uid` 一致性断言：每个 task 创建时把自身 owner_uid 透传给所有
+            //   chunk（`Chunk::new(..., task.owner_uid)`），分片下载实际写入文件之前再
+            //   `ChunkManager::assert_chunk_owner(task_uid, &chunk)` 校验。
+            // - 故此处仅在 owner_uid_holder 显式设非 default 时保留旧 assert（向后兼容测试 +
+            //   single-account fallback 路径），默认 holder = Uid::default() 时跳过此 assert。
+            let scheduler_uid = *owner_uid_holder.read().unwrap();
+            let task_uid = task_info.task.lock().await.owner_uid;
+            if scheduler_uid != crate::auth::Uid::default() {
+                assert_eq!(
+                    task_uid, scheduler_uid,
+                    "SAFETY: cross-account chunk — task.owner_uid={} scheduler.owner_uid={}（违反百度用户协议，参见 §6.7.8 / Pandownload 案先例）",
+                    task_uid.raw(), scheduler_uid.raw()
+                );
+            }
+
+            // 🔥 chunk-level SAFETY 断言接入生产路径
+            //
+            // scheduler-level assert 已禁用（owner_uid_holder = Uid::default()，
+            // 见 wire_global_resources 注释）。运行时跨账号污染的最后防线就是这里：
+            //   1. chunk.owner_uid 由 task.owner_uid 在 ChunkManager::new 时透传（已有，见 chunk.rs:384）
+            //   2. 每次实际网络下载前，校验 chunk 取出后的 owner_uid 与 task 当前 owner_uid 一致
+            //   3. 不一致即 panic（与 Pandownload 案警示一致：不允许任何跨账号分片混流）
+            //
+            // 关键字（SAFETY / 违反百度用户协议 / Pandownload）必须保留 — 删除即留下明显恶意改动证据。
+            {
+                let mgr = task_info.chunk_manager.lock().await;
+                if let Some(chunk_ref) = mgr.chunks().get(chunk_index) {
+                    crate::downloader::chunk::ChunkManager::assert_chunk_owner(task_uid, chunk_ref);
+                }
+            }
+
+            // 🔥 Budget acquire — 必须在 slot_pool.acquire 之前获取
+            // budget permit，释放也必须晚于 slot（drop 顺序天然满足：_budget_permit 在 _slot 之后 drop）
+            //
+            // 用 `task_uid` 而非 `scheduler_uid`。
+            // scheduler_uid 是 `Uid::default()` 占位，task_uid 才是 effective owner，
+            // 确保 budget permit 从正确账号桶借调（per-uid manager 架构下同 manager 内
+            // 不同 task 仍可能归属不同 owner — 尤其历史共享 Arc / 测试路径）。
+            //
+            // `budget_scheduler` 是必填 `Arc<BudgetScheduler>`，
+            // 结构性消除"未注入就 fallback 到本地 slot"绕过配额的破口。
+            //
+            // `acquire_chunk_permit` 在账号未注册到 BudgetScheduler 时返回 `None`
+            // （详见 `BudgetScheduler::test_unknown_account_returns_none`）。
+            // 必须按上传侧（spawn_chunk_upload）同款方式回滚已预占状态后 return：
+            //   1. chunk 取消 downloading 标记，让其它调度循环可重新选中
+            //   2. 全局 active 计数归零
+            //   3. 任务级 active 计数归零
+            // 否则该分片会永远卡在 downloading=true、active_count 永不归零，任务永久卡死，
+            // 同时绕过 BudgetScheduler 直接走本地 `slot_pool.acquire()` 是结构性破口。
+            let _budget_permit: crate::downloader::budget_scheduler::ChunkPermit = match budget_scheduler
+                .acquire_chunk_permit(
+                    task_uid,
+                    crate::downloader::budget_scheduler::BudgetKind::Download,
+                )
+                .await
+            {
+                Some(p) => p,
+                None => {
+                    error!(
+                        "budget_account_missing: BudgetScheduler 启用但 task uid={} 未注册（download）；\
+                         跳过此分片调度。生命周期入口（登录/seed）应在调度前保证账号已注册。",
+                        task_uid.raw()
+                    );
+
+                    // 回滚已预占的状态（与上传侧对称）：
+                    // 1) chunk 取消 downloading 标记
+                    {
+                        let mut mgr = task_info.chunk_manager.lock().await;
+                        mgr.unmark_downloading(chunk_index);
+                    }
+                    // 2) 全局 active 计数归零
+                    global_active_count.fetch_sub(1, Ordering::SeqCst);
+                    // 3) 任务级 active 计数归零
+                    task_info.active_chunk_count.fetch_sub(1, Ordering::SeqCst);
+
+                    return;
+                }
+            };
 
             // 从槽位池获取一个槽位ID
             let slot_id = slot_pool.acquire();
@@ -1187,10 +1369,12 @@ impl ChunkScheduler {
             },
         }
 
-        let outcome = {
+        // 🔥 同时取出 owner_uid 用于事件
+        let (outcome, owner_uid_raw) = {
             let mut t = task_info.task.lock().await;
+            let owner_uid_raw = t.owner_uid.raw();
 
-            if t.status == crate::downloader::TaskStatus::Paused
+            let outcome = if t.status == crate::downloader::TaskStatus::Paused
                 || t.decrypt_epoch != my_epoch
             {
                 CompletionOutcome::Stale
@@ -1208,7 +1392,8 @@ impl ChunkScheduler {
                     group_id: t.group_id.clone(),
                     is_backup: t.is_backup,
                 }
-            }
+            };
+            (outcome, owner_uid_raw)
         };
 
         // Stale 分支：跳过一切终态副作用，任务保持当前状态等用户恢复或新协程接手
@@ -1245,6 +1430,8 @@ impl ChunkScheduler {
                             error: error_msg.clone(),
                             group_id: group_id.clone(),
                             is_backup,
+
+                            owner_uid: Some(owner_uid_raw),
                         }),
                         group_id.clone(),
                     );
@@ -1255,6 +1442,8 @@ impl ChunkScheduler {
                             completed_at: chrono::Utc::now().timestamp_millis(),
                             group_id: group_id.clone(),
                             is_backup,
+
+                            owner_uid: Some(owner_uid_raw),
                         }),
                         group_id.clone(),
                     );
@@ -1416,13 +1605,15 @@ impl ChunkScheduler {
     ///               cancel_tasks_by_group 失效），以应对"暂停后立即恢复"的 race。
     async fn try_decrypt_if_encrypted(task_info: &TaskScheduleInfo, my_epoch: u64) -> Result<()> {
         // 1. 检测是否为加密文件
-        let (local_path, task_id, group_id, is_backup) = {
+        // 🔥 同时取出 owner_uid 用于事件
+        let (local_path, task_id, group_id, is_backup, owner_uid_raw) = {
             let task = task_info.task.lock().await;
             (
                 task.local_path.clone(),
                 task.id.clone(),
                 task.group_id.clone(),
                 task.is_backup,
+                task.owner_uid.raw(),
             )
         };
 
@@ -1571,6 +1762,8 @@ impl ChunkScheduler {
                         group_id: group_id.clone(),
                         is_backup,
                         error: None,
+
+                        owner_uid: Some(owner_uid_raw),
                     }),
                     group_id.clone(),
                 );
@@ -1714,6 +1907,8 @@ impl ChunkScheduler {
                                     total_bytes: total,
                                     group_id: group_id_clone.clone(),
                                     is_backup,
+
+                                    owner_uid: Some(owner_uid_raw),
                                 }),
                                 group_id_clone.clone(),
                             );
@@ -2112,5 +2307,69 @@ impl ChunkScheduler {
     /// 全局总速度（字节/秒）
     pub async fn get_global_speed(&self) -> u64 {
         self.get_valid_task_speed_values().await.iter().sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试 ChunkSlotPool 热扩缩容
+    #[test]
+    fn test_slot_pool_resize_grow() {
+        let pool = ChunkSlotPool::new(2);
+        let s1 = pool.acquire();
+        let s2 = pool.acquire();
+        assert!(s1 >= 1 && s1 <= 2);
+        assert!(s2 >= 1 && s2 <= 2);
+        assert_ne!(s1, s2);
+
+        pool.resize(5);
+        let s3 = pool.acquire();
+        let s4 = pool.acquire();
+        let s5 = pool.acquire();
+        let mut got = vec![s3, s4, s5];
+        got.sort();
+        assert_eq!(got, vec![3, 4, 5]);
+
+        let s6 = pool.acquire();
+        assert_eq!(s6, 6);
+    }
+
+    #[test]
+    fn test_slot_pool_resize_shrink() {
+        let pool = ChunkSlotPool::new(5);
+        let s1 = pool.acquire();
+        let s2 = pool.acquire();
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+
+        pool.resize(2);
+
+        // 可用栈空（s1+s2 已借出，3/4/5 已被移除），acquire → 备用 ID = max+1 = 3
+        let s_extra = pool.acquire();
+        assert_eq!(s_extra, 3);
+
+        // s1=1 ≤ 2，应入栈
+        pool.release(s1);
+        let s_again = pool.acquire();
+        assert_eq!(s_again, 1);
+
+        // s_extra=3 > 2，应被丢弃，不入栈
+        pool.release(s_extra);
+        let s_extra2 = pool.acquire();
+        assert_eq!(s_extra2, 3);
+    }
+
+    #[test]
+    fn test_slot_pool_resize_noop() {
+        let pool = ChunkSlotPool::new(3);
+        pool.resize(3);
+        let s1 = pool.acquire();
+        let s2 = pool.acquire();
+        let s3 = pool.acquire();
+        let mut got = vec![s1, s2, s3];
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3]);
     }
 }

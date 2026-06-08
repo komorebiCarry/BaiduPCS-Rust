@@ -83,6 +83,22 @@ export interface CloudDlTaskInfo {
   file_list: CloudDlFileInfo[]
   /** 结果码 */
   result: number
+  /**
+   * 多账号：任务归属账号 UID
+   *
+   * 🔥 设计约束：
+   * 离线下载已收紧为 active-only（与 SharesView 同语义），创建时强制使用当前
+   * 活跃账号，后端在 add 时拒绝跨账号创建；后端 list/query/refresh handler
+   * 在响应前 stamp `Some(active_uid.raw())`，CloudDl WS 事件由 `CloudDlMonitor`
+   * 自动 stamp。
+   *
+   * **本字段仅用于内部事件路由 / 跨账号防御 / 兼容字段**，UI 不展示账号维度
+   * （CloudDlView 不渲染 `AccountBadge` / 账号列 / 移动端 chip）。后续实现者
+   * **不**应基于此字段恢复 AccountBadge 渲染——active-only 语义不需要它。
+   */
+  owner_uid?: number | null
+  /** 标准化失败原因（与后端 status_text 互补） */
+  failure_reason?: string | null
 }
 
 /**
@@ -99,6 +115,9 @@ export interface AddTaskRequest {
   local_download_path?: string
   /** 完成时是否询问下载目录 */
   ask_download_path?: boolean
+  // 🔥
+  // 离线下载只能在当前 active 账号下创建（云端任务，跨账号无法查询/取消）。
+  // 不再支持 owner_uid 字段；后端会按 active_uid 强制路由。
 }
 
 /**
@@ -307,12 +326,12 @@ export function isTaskSuccess(status: number): boolean {
  */
 export function isTaskFailed(status: number): boolean {
   return (
-    status === CloudDlTaskStatus.SystemError ||
-    status === CloudDlTaskStatus.ResourceNotFound ||
-    status === CloudDlTaskStatus.Timeout ||
-    status === CloudDlTaskStatus.DownloadFailed ||
-    status === CloudDlTaskStatus.InsufficientSpace ||
-    status === CloudDlTaskStatus.Cancelled
+      status === CloudDlTaskStatus.SystemError ||
+      status === CloudDlTaskStatus.ResourceNotFound ||
+      status === CloudDlTaskStatus.Timeout ||
+      status === CloudDlTaskStatus.DownloadFailed ||
+      status === CloudDlTaskStatus.InsufficientSpace ||
+      status === CloudDlTaskStatus.Cancelled
   )
 }
 

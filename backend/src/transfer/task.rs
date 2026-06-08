@@ -123,6 +123,12 @@ pub struct TransferTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_files: Option<Vec<SharedFileInfo>>,
 
+    // === 🔥 多账号字段 ===
+    /// 转存任务所属 UID。旧持久化数据反序列化时为 `Uid(0)`，
+    /// 应由恢复逻辑填充 `active_uid` 或进入账号丢失分支。
+    #[serde(default)]
+    pub owner_uid: crate::auth::types::Uid,
+
     /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
     ///
     /// 用于在转存/自动下载阶段稳定推导 share_root（剥掉分享者私有上层目录），
@@ -133,6 +139,15 @@ pub struct TransferTask {
 }
 
 impl TransferTask {
+    /// 设置任务所属账号 UID（多账号 builder、同 UploadTask::with_owner_uid）
+    ///
+    /// 调用方应在 `new(...)` 后立即链调 `.with_owner_uid(uid)` 设置归属，
+    /// 与运态 `TransferManager.owner_uid` 保持一致。
+    pub fn with_owner_uid(mut self, owner_uid: crate::auth::types::Uid) -> Self {
+        self.owner_uid = owner_uid;
+        self
+    }
+
     /// 创建新的转存任务
     pub fn new(
         share_url: String,
@@ -151,6 +166,8 @@ impl TransferTask {
             save_fs_id,
             auto_download,
             local_download_path,
+            // 多账号：default，调用方链调 .with_owner_uid(uid) 填充
+            owner_uid: crate::auth::types::Uid::default(),
             status: TransferStatus::Queued,
             error: None,
             download_task_ids: Vec::new(),

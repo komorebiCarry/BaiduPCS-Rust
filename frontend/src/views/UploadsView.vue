@@ -7,6 +7,14 @@
         <el-tag :type="activeCountType" size="large">
           {{ activeCount }} 个任务进行中
         </el-tag>
+        <!-- 多账号过滤器 -->
+        <AccountFilter
+            v-if="authStore.hasMultipleAccounts"
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            size="large"
+            class="account-filter-slot"
+        />
       </div>
       <div class="header-right">
         <el-button @click="refreshTasks" :circle="isMobile">
@@ -44,7 +52,7 @@
 
     <!-- 上传任务列表 -->
     <div class="task-container">
-      <el-empty v-if="!loading && uploadItems.length === 0" description="暂无上传任务">
+      <el-empty v-if="!loading && displayedItems.length === 0" :description="ownerFilter === null ? '暂无上传任务' : '当前过滤条件下暂无上传任务'">
         <template #image>
           <el-icon :size="80" color="#909399"><Upload /></el-icon>
         </template>
@@ -58,7 +66,7 @@
 
       <div v-else class="task-list">
         <el-card
-            v-for="item in uploadItems"
+            v-for="item in displayedItems"
             :key="item.id"
             class="task-card"
             :class="{ 'task-active': item.status === 'uploading' || item.status === 'encrypting' }"
@@ -75,6 +83,8 @@
                 <el-tag :type="getStatusType(item.status)" size="small">
                   {{ getStatusText(item.status) }}
                 </el-tag>
+                <!-- 多账号 chip -->
+                <AccountBadge :owner-uid="item.owner_uid" size="small" class="task-account-badge" />
                 <!-- 秒传标识 -->
                 <el-tag v-if="item.is_rapid_upload && item.status === 'completed'" type="success" size="small">
                   <el-icon><CircleCheck /></el-icon>
@@ -224,9 +234,14 @@ import {
   ArrowDown,
 } from '@element-plus/icons-vue'
 import {useIsMobile} from '@/utils/responsive'
+import {createAdaptivePoller} from '@/utils/backendHealth'
 // 🔥 WebSocket 相关导入
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import type { UploadEvent } from '@/types/events'
+// 多账号集成
+import { useAuthStore } from '@/stores/auth'
+import AccountFilter from '@/components/AccountFilter.vue'
+import AccountBadge from '@/components/AccountBadge.vue'
 
 // 响应式检测
 const isMobile = useIsMobile()
@@ -235,13 +250,33 @@ const isMobile = useIsMobile()
 const loading = ref(false)
 const uploadItems = ref<UploadTask[]>([])
 
-// 自动刷新定时器
-let refreshTimer: number | null = null
+// 多账号状态
+const authStore = useAuthStore()
+const ownerFilter = ref<number | null>(null)
+
+const displayedItems = computed(() => {
+  if (ownerFilter.value === null) return uploadItems.value
+  return uploadItems.value.filter((item) => item.owner_uid === ownerFilter.value)
+})
+
+const ownerFilterCounts = computed(() => {
+  const map: Record<number, number> = {}
+  for (const item of uploadItems.value) {
+    const uid = typeof item.owner_uid === 'number' ? item.owner_uid : null
+    if (uid !== null) map[uid] = (map[uid] || 0) + 1
+  }
+  return map
+})
+
+// 自适应轮询器：WS 未连接时兜底刷新；后端断开后阶梯式退避重连，避免高频刷屏
+const refreshPoller = createAdaptivePoller(() => { refreshTasks() }, { baseDelayMs: 1000, maxDelayMs: 30000 })
 // 🔥 WebSocket 事件订阅清理函数
 let unsubscribeUpload: (() => void) | null = null
 let unsubscribeConnectionState: (() => void) | null = null
 // 🔥 WebSocket 连接状态
 const wsConnected = ref(false)
+// 🔥 是否已成功加载过一次任务列表，用于初始加载失败时保持重试
+let initialLoadDone = false
 
 // 是否有活跃任务（需要实时刷新）
 const hasActiveTasks = computed(() => {
@@ -297,10 +332,10 @@ async function refreshTasks() {
   loading.value = true
   try {
     uploadItems.value = await getAllUploads()
+    initialLoadDone = true
   } catch (error: any) {
     console.error('刷新任务列表失败:', error)
-    // 请求失败时，清空任务列表，避免显示过时数据
-    uploadItems.value = []
+    // 🔥 不清空列表：保留现有数据，避免临时失败导致页面变空 + 轮询停止的死锁
   } finally {
     loading.value = false
     // 无论成功还是失败，都要检查并更新自动刷新状态
@@ -312,27 +347,24 @@ async function refreshTasks() {
 function updateAutoRefresh() {
   // 🔥 如果 WebSocket 已连接，不使用轮询（由 WebSocket 推送更新）
   if (wsConnected.value) {
-    if (refreshTimer) {
+    if (refreshPoller.isRunning()) {
       console.log('[UploadsView] WebSocket 已连接，停止轮询')
-      clearInterval(refreshTimer)
-      refreshTimer = null
+      refreshPoller.stop()
     }
     return
   }
 
   // 🔥 WebSocket 未连接时，回退到轮询模式
-  if (hasActiveTasks.value) {
-    if (!refreshTimer) {
+  // 有活跃任务 或 初始加载尚未成功时，启动或保持定时刷新
+  if (hasActiveTasks.value || !initialLoadDone) {
+    if (!refreshPoller.isRunning()) {
       console.log('[UploadsView] WebSocket 未连接，启动轮询模式，活跃任务数:', activeCount.value)
-      refreshTimer = window.setInterval(() => {
-        refreshTasks()
-      }, 1000)
+      refreshPoller.start()
     }
   } else {
-    if (refreshTimer) {
+    if (refreshPoller.isRunning()) {
       console.log('[UploadsView] 停止轮询，当前任务数:', uploadItems.value.length)
-      clearInterval(refreshTimer)
-      refreshTimer = null
+      refreshPoller.stop()
     }
   }
 }
@@ -585,19 +617,23 @@ function cleanupWebSocketSubscriptions() {
   console.log('[UploadsView] WebSocket 订阅已清理')
 }
 
+// 多账号切换处理器
+function handleActiveChanged() {
+  refreshTasks()
+}
+
 // 组件挂载时加载任务列表
 onMounted(() => {
   refreshTasks()
   setupWebSocketSubscriptions()
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
 })
 
 // 组件卸载时清除定时器
 onUnmounted(() => {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-    refreshTimer = null
-  }
+  refreshPoller.stop()
   cleanupWebSocketSubscriptions()
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 </script>
 

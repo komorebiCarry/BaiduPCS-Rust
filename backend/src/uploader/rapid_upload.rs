@@ -236,7 +236,7 @@ impl RapidUploadChecker {
         }
 
         // 文件大于分片大小: 按分片大小切分计算每个分片的 MD5
-        let block_count = (file_size + chunk_size - 1) / chunk_size;
+        let block_count = file_size.div_ceil(chunk_size);
         let mut block_md5s = Vec::with_capacity(block_count as usize);
 
         let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);

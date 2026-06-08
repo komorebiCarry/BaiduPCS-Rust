@@ -93,6 +93,14 @@ pub struct CreateTransferRequest {
     /// 解决子目录选择场景下后端无法从根目录文件列表中匹配到子文件信息的问题
     #[serde(default)]
     pub selected_files: Option<Vec<crate::transfer::SharedFileInfo>>,
+    /// 显式 owner_uid（多账号场景）
+    /// - `Some(uid)` → 在指定账号下创建任务
+    /// - `None` → 回退到 `state.active_uid()`
+    ///
+    /// **字段名兼容**：加 `alias = "owner_uid"`
+    /// 兼容前端发送的 `owner_uid` 字段名（前端 transfer.ts 已用此命名）。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 /// 创建转存任务响应
@@ -111,6 +119,10 @@ pub struct CreateTransferResponse {
 pub struct TransferListQuery {
     /// 过滤：是否为分享直下任务（可选）
     pub is_share_direct_download: Option<bool>,
+    /// 多账号筛选 `?uid=`
+    /// - `None` → 跨账号聚合
+    /// - `Some(uid)` → 仅该账号
+    pub uid: Option<u64>,
 }
 
 /// 转存任务列表响应
@@ -130,22 +142,50 @@ pub async fn create_transfer(
     State(app_state): State<AppState>,
     Json(req): Json<CreateTransferRequest>,
 ) -> Json<TransferApiResponse<CreateTransferResponse>> {
-    // 获取转存管理器
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
-            Some(tm) => tm,
+    // 🔥 解析 effective_uid
+    // 优先使用前端显式 `req.uid`（owner_uid alias），否则回退到当前 active_uid。
+    let effective_uid = match req.uid {
+        Some(uid_raw) => crate::auth::Uid::new(uid_raw),
+        None => match *app_state.active_uid.read().await {
+            Some(uid) => uid,
             None => {
-                error!("转存管理器未初始化");
+                error!("create_transfer: 未登录且无 explicit uid");
                 return Json(TransferApiResponse::error(
                     error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化，请先登录",
+                    "未登录，无法创建转存任务",
                 ));
             }
+        },
+    };
+
+    // 校验目标账号存在
+    {
+        let mgr = app_state.account_manager.lock().await;
+        if mgr.get_user(effective_uid).is_none() {
+            error!("create_transfer: 目标账号不存在: uid={}", effective_uid.raw());
+            return Json(TransferApiResponse::error(
+                error_codes::MANAGER_NOT_READY,
+                format!("账号 uid={} 不存在", effective_uid.raw()),
+            ));
+        }
+    }
+
+    // 获取目标账号的转存管理器（按 effective_uid 路由 per-uid 池；历史共享 Arc 路径也兼容）
+    let transfer_manager = match app_state.transfer_manager_for(effective_uid) {
+        Some(tm) => tm,
+        None => {
+            error!("转存管理器未初始化（uid={}）", effective_uid.raw());
+            return Json(TransferApiResponse::error(
+                error_codes::MANAGER_NOT_READY,
+                "转存管理器未初始化，请先登录",
+            ));
         }
     };
 
     // 创建转存请求
+    // 🔥 用 owner_uid_override 让 manager
+    // 在 task 创建之前就用 effective_uid（持久化、Created 事件、衍生下载都用它）。
+    // 不再依赖事后 override（会与持久化 + async execute_task 竞态）。
     let create_request = crate::transfer::manager::CreateTransferRequest {
         share_url: req.share_url,
         password: req.password,
@@ -156,6 +196,7 @@ pub async fn create_transfer(
         is_share_direct_download: req.is_share_direct_download,
         selected_fs_ids: req.selected_fs_ids,
         selected_files: req.selected_files,
+        owner_uid_override: Some(effective_uid),
     };
 
     // 创建任务
@@ -224,12 +265,32 @@ pub async fn get_all_transfers(
     State(app_state): State<AppState>,
     Query(query): Query<TransferListQuery>,
 ) -> Result<Json<TransferApiResponse<TransferListResponse>>, StatusCode> {
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        guard.clone().ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+    let mut tasks: Vec<TransferTask> = match query.uid.map(crate::auth::Uid::new) {
+        // 🔥 共享 manager 必须按 owner_uid 过滤
+        Some(uid) => match app_state.transfer_manager_for(uid) {
+            Some(tm) => tm
+                .get_all_tasks()
+                .await
+                .into_iter()
+                .filter(|t| t.owner_uid == uid)
+                .collect(),
+            None => Vec::new(),
+        },
+        None => {
+            // 全局共享历史库会被每个账号的 get_all_tasks 各捞一遍，跨账号聚合时
+            // 按 id 去重，避免同一历史任务因账号数 N 而重复出现 N 次。
+            let mut all = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for (_uid, tm) in app_state.list_transfer_managers() {
+                for t in tm.get_all_tasks().await {
+                    if seen.insert(t.id.clone()) {
+                        all.push(t);
+                    }
+                }
+            }
+            all
+        }
     };
-
-    let mut tasks = transfer_manager.get_all_tasks().await;
 
     // 按 is_share_direct_download 过滤（如果指定）
     if let Some(is_share_direct) = query.is_share_direct_download {
@@ -248,22 +309,22 @@ pub async fn get_all_transfers(
 }
 
 /// GET /api/v1/transfers/:id
-/// 获取单个转存任务
 pub async fn get_transfer(
     State(app_state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Json<TransferApiResponse<TransferTask>> {
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
+    // 按 task_id 反查归属 manager，跨账号安全
+    let transfer_manager = match app_state.find_transfer_manager_for_task(&task_id).await {
+        Some((_uid, tm)) => tm,
+        None => match app_state.transfer_manager_for_active().await {
             Some(tm) => tm,
             None => {
                 return Json(TransferApiResponse::error(
                     error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化",
+                    "转存管理器未初始化".to_string(),
                 ));
             }
-        }
+        },
     };
 
     match transfer_manager.get_task(&task_id).await {
@@ -283,17 +344,18 @@ pub async fn delete_transfer(
 ) -> Json<TransferApiResponse<String>> {
     info!("删除转存任务: {}", task_id);
 
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
+    // 按 task_id 反查归属 manager
+    let transfer_manager = match app_state.find_transfer_manager_for_task(&task_id).await {
+        Some((_uid, tm)) => tm,
+        None => match app_state.transfer_manager_for_active().await {
             Some(tm) => tm,
             None => {
                 return Json(TransferApiResponse::error(
                     error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化",
+                    "转存管理器未初始化".to_string(),
                 ));
             }
-        }
+        },
     };
 
     match transfer_manager.remove_task(&task_id).await {
@@ -316,17 +378,18 @@ pub async fn cancel_transfer(
 ) -> Json<TransferApiResponse<String>> {
     info!("取消转存任务: {}", task_id);
 
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
+    // 按 task_id 反查归属 manager
+    let transfer_manager = match app_state.find_transfer_manager_for_task(&task_id).await {
+        Some((_uid, tm)) => tm,
+        None => match app_state.transfer_manager_for_active().await {
             Some(tm) => tm,
             None => {
                 return Json(TransferApiResponse::error(
                     error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化",
+                    "转存管理器未初始化".to_string(),
                 ));
             }
-        }
+        },
     };
 
     match transfer_manager.cancel_task(&task_id).await {
@@ -386,17 +449,14 @@ pub async fn preview_share_files(
     Json(req): Json<PreviewShareRequest>,
 ) -> Json<TransferApiResponse<PreviewShareResponse>> {
     // 获取转存管理器
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
-            Some(tm) => tm,
-            None => {
-                error!("转存管理器未初始化");
-                return Json(TransferApiResponse::error(
-                    error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化，请先登录",
-                ));
-            }
+    let transfer_manager = match app_state.transfer_manager_for_active().await {
+        Some(tm) => tm,
+        None => {
+            error!("转存管理器未初始化");
+            return Json(TransferApiResponse::error(
+                error_codes::MANAGER_NOT_READY,
+                "转存管理器未初始化，请先登录",
+            ));
         }
     };
 
@@ -467,17 +527,14 @@ pub async fn preview_share_dir(
     Json(req): Json<PreviewShareDirRequest>,
 ) -> Json<TransferApiResponse<PreviewShareResponse>> {
     // 获取转存管理器
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
-            Some(tm) => tm,
-            None => {
-                error!("转存管理器未初始化");
-                return Json(TransferApiResponse::error(
-                    error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化，请先登录",
-                ));
-            }
+    let transfer_manager = match app_state.transfer_manager_for_active().await {
+        Some(tm) => tm,
+        None => {
+            error!("转存管理器未初始化");
+            return Json(TransferApiResponse::error(
+                error_codes::MANAGER_NOT_READY,
+                "转存管理器未初始化，请先登录",
+            ));
         }
     };
 
@@ -510,16 +567,13 @@ pub async fn cleanup_orphaned_temp_dirs(
 ) -> Json<TransferApiResponse<CleanupOrphanedResponse>> {
     info!("手动清理孤立临时目录");
 
-    let transfer_manager = {
-        let guard = app_state.transfer_manager.read().await;
-        match guard.clone() {
-            Some(tm) => tm,
-            None => {
-                return Json(TransferApiResponse::error(
-                    error_codes::MANAGER_NOT_READY,
-                    "转存管理器未初始化，请先登录",
-                ));
-            }
+    let transfer_manager = match app_state.transfer_manager_for_active().await {
+        Some(tm) => tm,
+        None => {
+            return Json(TransferApiResponse::error(
+                error_codes::MANAGER_NOT_READY,
+                "转存管理器未初始化，请先登录",
+            ));
         }
     };
 

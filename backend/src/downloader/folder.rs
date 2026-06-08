@@ -78,6 +78,21 @@ pub struct FolderDownload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_task_id: Option<String>,
 
+    /// 🔥 多账号归属 UID
+    ///
+    /// 旧持久化数据反序列化时为默认值 `Uid(0)`，恢复链路按
+    /// 分支 C/D 填充为 `active_uid` 或进入失败终态。
+    #[serde(default)]
+    pub owner_uid: crate::auth::types::Uid,
+
+    /// 🔥 不可恢复失败原因（恢复链路）
+    ///
+    /// 当文件夹任务进入 `FolderStatus::Failed` 时承载结构性原因：
+    /// - `"account_deleted"`：账号已删除
+    /// - `"unrecoverable_no_active_account"`：无 active_uid 兜底
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+
     // === 🔥 新增：任务位借调机制相关字段 ===
     /// 固定任务位ID（文件夹主任务位）
     #[serde(skip)]
@@ -161,6 +176,8 @@ impl FolderDownload {
             completed_at: None,
             error: None,
             transfer_task_id: None,
+            owner_uid: crate::auth::types::Uid::default(),
+            failure_reason: None,
             // 任务位借调机制字段初始化
             fixed_slot_id: None,
             borrowed_slot_ids: Vec::new(),

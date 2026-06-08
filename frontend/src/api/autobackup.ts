@@ -66,6 +66,8 @@ export interface BackupConfig {
   download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
   sync_conflict_strategy?: SyncConflictStrategy
   sync_init_mode?: SyncInitMode
+  /** 配置归属账号 UID（跨账号调度需要） */
+  owner_uid?: number | null
 }
 
 /** 创建备份配置请求 */
@@ -82,6 +84,12 @@ export interface CreateBackupConfigRequest {
   download_conflict_strategy?: 'overwrite' | 'skip' | 'auto_rename'
   sync_conflict_strategy?: SyncConflictStrategy
   sync_init_mode?: SyncInitMode
+  /**
+   * 配置归属账号 UID。
+   *
+   * 推荐在创建时显式传入（例如通过 AccountSelect 选择），以避免后续账号切换后不明确备份归属。
+   */
+  owner_uid?: number
 }
 
 /** 更新备份配置请求 */
@@ -122,6 +130,10 @@ export interface BackupTask {
   started_at?: string
   completed_at?: string
   error_message?: string
+  /** 任务归属账号 UID */
+  owner_uid?: number | null
+  /** 标准化失败原因（与旧 `error_message` 共存） */
+  failure_reason?: string | null
 }
 
 /** 文件备份状态 */
@@ -167,6 +179,10 @@ export interface BackupFileTask {
   encrypt_progress?: number
   /** 解密进度 (0.0 - 100.0) */
   decrypt_progress?: number
+  /** 文件备份任务归属账号 UID */
+  owner_uid?: number | null
+  /** 标准化失败原因 */
+  failure_reason?: string | null
 }
 
 /** 文件任务列表响应 */

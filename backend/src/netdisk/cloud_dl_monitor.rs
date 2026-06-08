@@ -42,12 +42,16 @@ pub enum CloudDlEvent {
         old_status: Option<i32>,
         new_status: i32,
         task: CloudDlTaskInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务完成（可触发自动下载）
     TaskCompleted {
         task_id: i64,
         task: CloudDlTaskInfo,
         auto_download_config: Option<AutoDownloadConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 进度更新
     ProgressUpdate {
@@ -55,9 +59,15 @@ pub enum CloudDlEvent {
         finished_size: i64,
         file_size: i64,
         progress_percent: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
     },
     /// 任务列表刷新（初始加载或手动刷新）
-    TaskListRefreshed { tasks: Vec<CloudDlTaskInfo> },
+    TaskListRefreshed {
+        tasks: Vec<CloudDlTaskInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
 }
 
 impl CloudDlEvent {
@@ -244,6 +254,12 @@ pub type EventCallback = Arc<dyn Fn(CloudDlEvent) + Send + Sync>;
 ///
 /// 负责后台轮询离线下载任务状态，并通过回调推送事件
 pub struct CloudDlMonitor {
+    /// **归属账号 UID**
+    ///
+    /// 每个 monitor 在 `AppState::init_cloud_dl_monitor_for(uid)` 创建时绑定一个
+    /// 固定 UID。所有从此 monitor 推送的 WS 事件都会 stamp 此 UID 到 `owner_uid`
+    /// 字段，确保前端能正确识别事件所属账号。
+    owner_uid: crate::auth::Uid,
     /// 网盘客户端（支持代理热更新）
     client: Arc<StdRwLock<NetdiskClient>>,
     /// 轮询配置
@@ -272,10 +288,14 @@ pub struct CloudDlMonitor {
 
 impl CloudDlMonitor {
     /// 创建新的监听服务
-    pub fn new(client: Arc<NetdiskClient>) -> Self {
+    ///
+    /// `owner_uid`：监听服务绑定的账号 UID。
+    /// 该 UID 将被 stamp 到所有从本 monitor 推送的 WS 事件 `owner_uid` 字段。
+    pub fn new(owner_uid: crate::auth::Uid, client: Arc<NetdiskClient>) -> Self {
         let client_inner = Arc::try_unwrap(client)
             .unwrap_or_else(|arc| (*arc).clone());
         Self {
+            owner_uid,
             client: Arc::new(StdRwLock::new(client_inner)),
             config: PollingConfig::default(),
             auto_download_configs: Arc::new(RwLock::new(HashMap::new())),
@@ -292,10 +312,15 @@ impl CloudDlMonitor {
     }
 
     /// 使用自定义配置创建监听服务
-    pub fn with_config(client: Arc<NetdiskClient>, config: PollingConfig) -> Self {
+    pub fn with_config(
+        owner_uid: crate::auth::Uid,
+        client: Arc<NetdiskClient>,
+        config: PollingConfig,
+    ) -> Self {
         let client_inner = Arc::try_unwrap(client)
             .unwrap_or_else(|arc| (*arc).clone());
         Self {
+            owner_uid,
             client: Arc::new(StdRwLock::new(client_inner)),
             config,
             auto_download_configs: Arc::new(RwLock::new(HashMap::new())),
@@ -309,6 +334,11 @@ impl CloudDlMonitor {
             download_manager: Arc::new(RwLock::new(None)),
             folder_download_manager: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// 获取本 monitor 绑定的账号 UID
+    pub fn owner_uid(&self) -> crate::auth::Uid {
+        self.owner_uid
     }
 
     /// 热更新网盘客户端（代理变更时调用）
@@ -490,36 +520,54 @@ impl CloudDlMonitor {
 
     /// 将 CloudDlEvent 转换为 WebSocket TaskEvent
     fn convert_to_ws_event(&self, event: &CloudDlEvent) -> TaskEvent {
+        // 🔥 所有从本 monitor 推送的 WS 事件
+        // stamp `owner_uid = Some(self.owner_uid.raw())`，让前端能正确识别事件归属。
+        //
+        // 同时对嵌入的 task / tasks 字段也回填 owner_uid（这些 `CloudDlTaskInfo`
+        // 来自百度 API 反序列化路径，本身 owner_uid 默认 None；前端
+        // `tasks.value[index] = event.task` 替换时会丢失 owner_uid 导致
+        // `AccountBadge` 显示「未知账号」），因此在序列化前 clone + stamp。
+        let owner_raw = self.owner_uid.raw();
+        let owner = Some(owner_raw);
+        let stamp_task = |t: &CloudDlTaskInfo| -> CloudDlTaskInfo {
+            let mut cloned = t.clone();
+            cloned.owner_uid = Some(owner_raw);
+            cloned
+        };
         match event {
-            CloudDlEvent::StatusChanged { task_id, old_status, new_status, task } => {
+            CloudDlEvent::StatusChanged { task_id, old_status, new_status, task, .. } => {
                 TaskEvent::CloudDl(WsCloudDlEvent::StatusChanged {
                     task_id: *task_id,
                     old_status: *old_status,
                     new_status: *new_status,
-                    task: serde_json::to_value(task).unwrap_or_default(),
+                    task: serde_json::to_value(stamp_task(task)).unwrap_or_default(),
+                    owner_uid: owner,
                 })
             }
-            CloudDlEvent::TaskCompleted { task_id, task, auto_download_config } => {
+            CloudDlEvent::TaskCompleted { task_id, task, auto_download_config, .. } => {
                 TaskEvent::CloudDl(WsCloudDlEvent::TaskCompleted {
                     task_id: *task_id,
-                    task: serde_json::to_value(task).unwrap_or_default(),
+                    task: serde_json::to_value(stamp_task(task)).unwrap_or_default(),
                     auto_download_config: auto_download_config.as_ref()
                         .and_then(|c| serde_json::to_value(c).ok()),
+                    owner_uid: owner,
                 })
             }
-            CloudDlEvent::ProgressUpdate { task_id, finished_size, file_size, progress_percent } => {
+            CloudDlEvent::ProgressUpdate { task_id, finished_size, file_size, progress_percent, .. } => {
                 TaskEvent::CloudDl(WsCloudDlEvent::ProgressUpdate {
                     task_id: *task_id,
                     finished_size: *finished_size,
                     file_size: *file_size,
                     progress_percent: *progress_percent,
+                    owner_uid: owner,
                 })
             }
-            CloudDlEvent::TaskListRefreshed { tasks } => {
+            CloudDlEvent::TaskListRefreshed { tasks, .. } => {
                 TaskEvent::CloudDl(WsCloudDlEvent::TaskListRefreshed {
                     tasks: tasks.iter()
-                        .filter_map(|t| serde_json::to_value(t).ok())
+                        .map(|t| serde_json::to_value(stamp_task(t)).unwrap_or_default())
                         .collect(),
+                    owner_uid: owner,
                 })
             }
         }
@@ -687,6 +735,8 @@ impl CloudDlMonitor {
                                         old_status: Some(*last_status),
                                         new_status: task.status,
                                         task: task.clone(),
+
+                                        owner_uid: None,
                                     };
                                     self.publish_event(event).await;
                                 }
@@ -705,6 +755,8 @@ impl CloudDlMonitor {
                                     old_status: None,
                                     new_status: task.status,
                                     task: task.clone(),
+
+                                    owner_uid: None,
                                 };
                                 self.publish_event(event).await;
                             }
@@ -730,6 +782,8 @@ impl CloudDlMonitor {
                                         finished_size: task.finished_size,
                                         file_size: task.file_size,
                                         progress_percent: progress,
+
+                                        owner_uid: None,
                                     };
                                     self.publish_event(event).await;
                                 }
@@ -923,6 +977,8 @@ impl CloudDlMonitor {
             task_id: task.task_id,
             task: task.clone(),
             auto_download_config: auto_config,
+
+            owner_uid: None,
         };
         self.publish_event(event).await;
 
@@ -1014,11 +1070,14 @@ impl CloudDlMonitor {
                     if file.isdir == 1 {
                         // 文件夹下载
                         if let Some(ref fdm) = *folder_download_manager {
+                            // 多账号：folder 归属当前 DownloadManager 所属账号
+                            let owner_uid = dm.owner_uid();
                             match fdm.create_folder_download_with_dir(
                                 file.path.clone(),
                                 target_dir,
                                 None,
                                 None,
+                                owner_uid,
                             ).await {
                                 Ok(folder_id) => {
                                     info!(
@@ -1188,6 +1247,8 @@ impl CloudDlMonitor {
 
         let event = CloudDlEvent::TaskListRefreshed {
             tasks: tasks.clone(),
+
+            owner_uid: None,
         };
         self.publish_event(event).await;
 
@@ -1281,6 +1342,8 @@ mod tests {
             old_status: Some(1),
             new_status: 0,
             task: create_test_task_info(1),
+
+            owner_uid: None,
         };
         assert_eq!(event.event_type_name(), "status_changed");
 
@@ -1288,6 +1351,8 @@ mod tests {
             task_id: 1,
             task: create_test_task_info(1),
             auto_download_config: None,
+
+            owner_uid: None,
         };
         assert_eq!(event.event_type_name(), "task_completed");
 
@@ -1296,10 +1361,14 @@ mod tests {
             finished_size: 500,
             file_size: 1000,
             progress_percent: 50.0,
+
+            owner_uid: None,
         };
         assert_eq!(event.event_type_name(), "progress_update");
 
-        let event = CloudDlEvent::TaskListRefreshed { tasks: vec![] };
+        let event = CloudDlEvent::TaskListRefreshed { tasks: vec![],
+            owner_uid: None,
+        };
         assert_eq!(event.event_type_name(), "task_list_refreshed");
     }
 
@@ -1310,10 +1379,14 @@ mod tests {
             old_status: None,
             new_status: 1,
             task: create_test_task_info(123),
+
+            owner_uid: None,
         };
         assert_eq!(event.task_id(), Some(123));
 
-        let event = CloudDlEvent::TaskListRefreshed { tasks: vec![] };
+        let event = CloudDlEvent::TaskListRefreshed { tasks: vec![],
+            owner_uid: None,
+        };
         assert_eq!(event.task_id(), None);
     }
 
@@ -1334,6 +1407,7 @@ mod tests {
             od_type: 0,
             file_list: vec![],
             result: 0,
+            owner_uid: None,
         }
     }
 }

@@ -72,7 +72,7 @@ pub struct KeyInfo {
 }
 
 /// POST /api/v1/encryption/export-bundle
-/// 
+///
 /// 导出完整的解密数据包（ZIP 格式）
 /// 包含 encryption.json 和 mapping.json
 pub async fn export_bundle(
@@ -80,7 +80,7 @@ pub async fn export_bundle(
 ) -> Result<Response, ApiError> {
     // 获取加密配置存储
     let config_store = get_encryption_config_store(&state).await?;
-    
+
     // 创建导出器
     let exporter = DecryptBundleExporter::new(
         config_store,
@@ -111,7 +111,7 @@ pub async fn export_bundle(
 }
 
 /// GET /api/v1/encryption/export-mapping
-/// 
+///
 /// 导出映射数据（JSON 格式）
 pub async fn export_mapping(
     State(state): State<AppState>,
@@ -127,7 +127,7 @@ pub async fn export_mapping(
 }
 
 /// GET /api/v1/encryption/export-keys
-/// 
+///
 /// 导出密钥配置（JSON 格式）
 pub async fn export_keys(
     State(state): State<AppState>,
@@ -164,11 +164,10 @@ pub async fn export_keys(
 }
 
 /// 获取加密配置存储
-/// 
+///
 /// 从 AutoBackupManager 获取 EncryptionConfigStore
 async fn get_encryption_config_store(state: &AppState) -> Result<Arc<EncryptionConfigStore>, ApiError> {
-    let manager_guard = state.autobackup_manager.read().await;
-    match &*manager_guard {
+    match state.autobackup_manager_for_active().await {
         Some(manager) => Ok(manager.get_encryption_config_store()),
         None => Err(ApiError::Internal(anyhow::anyhow!("自动备份管理器未初始化"))),
     }

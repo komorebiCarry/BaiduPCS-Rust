@@ -1,6 +1,11 @@
 /**
  * WebSocket 事件类型定义
  * 与后端 Rust 事件类型保持一致
+ *
+ * 多账号：所有任务事件变体均可携带
+ * `owner_uid?: number` 标识任务归属账号。后端使用 `Option<Uid>` +
+ * `#[serde(skip_serializing_if = "Option::is_none")]`，缺失时字段完全不传；
+ * 前端以可选字段（`?:`）表达 「可能缺失」 语义，**不**用 `number | null`。
  */
 
 // ============ 下载事件 ============
@@ -15,6 +20,7 @@ export interface DownloadEventCreated {
   group_id?: string
   is_backup?: boolean
   original_filename?: string
+  owner_uid?: number
 }
 
 export interface DownloadEventProgress {
@@ -24,6 +30,8 @@ export interface DownloadEventProgress {
   total_size: number
   speed: number
   progress: number
+  /** progress 类载荷高频事件，后端可选不携带；前端需通过 task_id 反查 owner_uid */
+  owner_uid?: number
 }
 
 export interface DownloadEventStatusChanged {
@@ -38,6 +46,7 @@ export interface DownloadEventStatusChanged {
    * 后端 #[serde(skip_serializing_if = "Option::is_none")]，None 时整个字段不发送
    */
   error?: string
+  owner_uid?: number
 }
 
 export interface DownloadEventCompleted {
@@ -45,28 +54,33 @@ export interface DownloadEventCompleted {
   task_id: string
   completed_at: number
   group_id?: string
+  owner_uid?: number
 }
 
 export interface DownloadEventFailed {
   event_type: 'failed'
   task_id: string
   error: string
+  owner_uid?: number
 }
 
 export interface DownloadEventPaused {
   event_type: 'paused'
   task_id: string
+  owner_uid?: number
 }
 
 export interface DownloadEventResumed {
   event_type: 'resumed'
   task_id: string
+  owner_uid?: number
 }
 
 export interface DownloadEventDeleted {
   event_type: 'deleted'
   task_id: string
   group_id?: string
+  owner_uid?: number
 }
 
 export interface DownloadEventDecryptProgress {
@@ -77,8 +91,13 @@ export interface DownloadEventDecryptProgress {
   total_bytes: number
   group_id?: string
   is_backup?: boolean
+  owner_uid?: number
 }
 
+/**
+ * `DecryptCompleted` 优先级 High、**不** 属于 progress 类，
+ * 后端必须携带 `owner_uid`。
+ */
 export interface DownloadEventDecryptCompleted {
   event_type: 'decrypt_completed'
   task_id: string
@@ -86,6 +105,7 @@ export interface DownloadEventDecryptCompleted {
   decrypted_path: string
   group_id?: string
   is_backup?: boolean
+  owner_uid?: number
 }
 
 export type DownloadEvent =
@@ -108,6 +128,7 @@ export interface FolderEventCreated {
   name: string
   remote_root: string
   local_root: string
+  owner_uid?: number
 }
 
 export interface FolderEventProgress {
@@ -119,6 +140,7 @@ export interface FolderEventProgress {
   total_files: number
   speed: number
   status: string
+  owner_uid?: number
 }
 
 export interface FolderEventStatusChanged {
@@ -126,6 +148,7 @@ export interface FolderEventStatusChanged {
   folder_id: string
   old_status: string
   new_status: string
+  owner_uid?: number
 }
 
 export interface FolderEventScanCompleted {
@@ -133,33 +156,39 @@ export interface FolderEventScanCompleted {
   folder_id: string
   total_files: number
   total_size: number
+  owner_uid?: number
 }
 
 export interface FolderEventCompleted {
   event_type: 'completed'
   folder_id: string
   completed_at: number
+  owner_uid?: number
 }
 
 export interface FolderEventFailed {
   event_type: 'failed'
   folder_id: string
   error: string
+  owner_uid?: number
 }
 
 export interface FolderEventPaused {
   event_type: 'paused'
   folder_id: string
+  owner_uid?: number
 }
 
 export interface FolderEventResumed {
   event_type: 'resumed'
   folder_id: string
+  owner_uid?: number
 }
 
 export interface FolderEventDeleted {
   event_type: 'deleted'
   folder_id: string
+  owner_uid?: number
 }
 
 export type FolderEvent =
@@ -181,6 +210,7 @@ export interface UploadEventCreated {
   local_path: string
   remote_path: string
   total_size: number
+  owner_uid?: number
 }
 
 export interface UploadEventProgress {
@@ -192,6 +222,7 @@ export interface UploadEventProgress {
   progress: number
   completed_chunks: number
   total_chunks: number
+  owner_uid?: number
 }
 
 export interface UploadEventStatusChanged {
@@ -199,6 +230,7 @@ export interface UploadEventStatusChanged {
   task_id: string
   old_status: string
   new_status: string
+  owner_uid?: number
 }
 
 export interface UploadEventCompleted {
@@ -206,27 +238,32 @@ export interface UploadEventCompleted {
   task_id: string
   completed_at: number
   is_rapid_upload: boolean
+  owner_uid?: number
 }
 
 export interface UploadEventFailed {
   event_type: 'failed'
   task_id: string
   error: string
+  owner_uid?: number
 }
 
 export interface UploadEventPaused {
   event_type: 'paused'
   task_id: string
+  owner_uid?: number
 }
 
 export interface UploadEventResumed {
   event_type: 'resumed'
   task_id: string
+  owner_uid?: number
 }
 
 export interface UploadEventDeleted {
   event_type: 'deleted'
   task_id: string
+  owner_uid?: number
 }
 
 export interface UploadEventEncryptProgress {
@@ -236,6 +273,7 @@ export interface UploadEventEncryptProgress {
   processed_bytes: number
   total_bytes: number
   is_backup?: boolean
+  owner_uid?: number
 }
 
 export interface UploadEventEncryptCompleted {
@@ -244,6 +282,7 @@ export interface UploadEventEncryptCompleted {
   encrypted_size: number
   original_size: number
   is_backup?: boolean
+  owner_uid?: number
 }
 
 export type UploadEvent =
@@ -268,6 +307,7 @@ export interface BackupEventCreated {
   config_name: string
   direction: string
   trigger_type: string
+  owner_uid?: number
 }
 
 export interface BackupEventScanProgress {
@@ -275,6 +315,7 @@ export interface BackupEventScanProgress {
   task_id: string
   scanned_files: number
   scanned_dirs: number
+  owner_uid?: number
 }
 
 export interface BackupEventScanCompleted {
@@ -282,6 +323,7 @@ export interface BackupEventScanCompleted {
   task_id: string
   total_files: number
   total_bytes: number
+  owner_uid?: number
 }
 
 export interface BackupEventFileProgress {
@@ -292,6 +334,7 @@ export interface BackupEventFileProgress {
   transferred_bytes: number
   total_bytes: number
   status: string
+  owner_uid?: number
 }
 
 export interface BackupEventFileStatusChanged {
@@ -301,6 +344,7 @@ export interface BackupEventFileStatusChanged {
   file_name: string
   old_status: string
   new_status: string
+  owner_uid?: number
 }
 
 export interface BackupEventProgress {
@@ -312,6 +356,7 @@ export interface BackupEventProgress {
   total_count: number
   transferred_bytes: number
   total_bytes: number
+  owner_uid?: number
 }
 
 export interface BackupEventStatusChanged {
@@ -319,6 +364,7 @@ export interface BackupEventStatusChanged {
   task_id: string
   old_status: string
   new_status: string
+  owner_uid?: number
 }
 
 export interface BackupEventCompleted {
@@ -328,27 +374,32 @@ export interface BackupEventCompleted {
   success_count: number
   failed_count: number
   skipped_count: number
+  owner_uid?: number
 }
 
 export interface BackupEventFailed {
   event_type: 'failed'
   task_id: string
   error: string
+  owner_uid?: number
 }
 
 export interface BackupEventPaused {
   event_type: 'paused'
   task_id: string
+  owner_uid?: number
 }
 
 export interface BackupEventResumed {
   event_type: 'resumed'
   task_id: string
+  owner_uid?: number
 }
 
 export interface BackupEventCancelled {
   event_type: 'cancelled'
   task_id: string
+  owner_uid?: number
 }
 
 export interface BackupEventFileEncrypting {
@@ -356,6 +407,7 @@ export interface BackupEventFileEncrypting {
   task_id: string
   file_task_id: string
   file_name: string
+  owner_uid?: number
 }
 
 export interface BackupEventFileEncrypted {
@@ -365,6 +417,7 @@ export interface BackupEventFileEncrypted {
   file_name: string
   encrypted_name: string
   encrypted_size: number
+  owner_uid?: number
 }
 
 export interface BackupEventFileDecrypting {
@@ -372,6 +425,7 @@ export interface BackupEventFileDecrypting {
   task_id: string
   file_task_id: string
   file_name: string
+  owner_uid?: number
 }
 
 export interface BackupEventFileDecrypted {
@@ -381,6 +435,7 @@ export interface BackupEventFileDecrypted {
   file_name: string
   original_name: string
   original_size: number
+  owner_uid?: number
 }
 
 export interface BackupEventFileEncryptProgress {
@@ -391,6 +446,7 @@ export interface BackupEventFileEncryptProgress {
   progress: number
   processed_bytes: number
   total_bytes: number
+  owner_uid?: number
 }
 
 export interface BackupEventFileDecryptProgress {
@@ -401,6 +457,7 @@ export interface BackupEventFileDecryptProgress {
   progress: number
   processed_bytes: number
   total_bytes: number
+  owner_uid?: number
 }
 
 export type BackupEvent =
@@ -431,6 +488,7 @@ export interface TransferEventCreated {
   share_url: string
   save_path: string
   auto_download: boolean
+  owner_uid?: number
 }
 
 export interface TransferEventProgress {
@@ -440,6 +498,7 @@ export interface TransferEventProgress {
   transferred_count: number
   total_count: number
   progress: number
+  owner_uid?: number
 }
 
 export interface TransferEventStatusChanged {
@@ -447,12 +506,14 @@ export interface TransferEventStatusChanged {
   task_id: string
   old_status: string
   new_status: string
+  owner_uid?: number
 }
 
 export interface TransferEventCompleted {
   event_type: 'completed'
   task_id: string
   completed_at: number
+  owner_uid?: number
 }
 
 export interface TransferEventFailed {
@@ -460,11 +521,13 @@ export interface TransferEventFailed {
   task_id: string
   error: string
   error_type: string
+  owner_uid?: number
 }
 
 export interface TransferEventDeleted {
   event_type: 'deleted'
   task_id: string
+  owner_uid?: number
 }
 
 export type TransferEvent =
@@ -483,6 +546,7 @@ export interface CloudDlEventStatusChanged {
   old_status: number | null
   new_status: number
   task: any
+  owner_uid?: number
 }
 
 export interface CloudDlEventTaskCompleted {
@@ -490,6 +554,7 @@ export interface CloudDlEventTaskCompleted {
   task_id: number
   task: any
   auto_download_config: any | null
+  owner_uid?: number
 }
 
 export interface CloudDlEventProgressUpdate {
@@ -498,11 +563,13 @@ export interface CloudDlEventProgressUpdate {
   finished_size: number
   file_size: number
   progress_percent: number
+  owner_uid?: number
 }
 
 export interface CloudDlEventTaskListRefreshed {
   event_type: 'task_list_refreshed'
   tasks: any[]
+  owner_uid?: number
 }
 
 export type CloudDlEvent =
@@ -510,6 +577,67 @@ export type CloudDlEvent =
     | CloudDlEventTaskCompleted
     | CloudDlEventProgressUpdate
     | CloudDlEventTaskListRefreshed
+
+// ============ 账号事件 ============
+
+import type { AccountSummary } from '@/api/accounts'
+
+/**
+ * 活跃账号已切换。
+ * `new_active_uid = null` 代表删除了最后一个账号 / 未登录状态。
+ */
+export interface AccountEventSwitched {
+  event_type: 'switched'
+  new_active_uid: number | null
+}
+
+/**
+ * 账号列表变更（新增 / 删除 / 元数据更新）。
+ */
+export interface AccountEventListChanged {
+  event_type: 'list_changed'
+  accounts: AccountSummary[]
+  active_uid: number | null
+}
+
+export type AccountEvent = AccountEventSwitched | AccountEventListChanged
+
+// ============ 多账号资源配额事件 (BudgetEvent) ============
+
+/**
+ * 压缩算法重算结果（账号登录/删除/配置变更触发）。
+ *
+ * 全量替换 store 的 machineBudget + perAccountBudget。
+ */
+export interface BudgetEventRecomputed {
+  type: 'budget_recomputed'
+  machine_budget_download: number
+  machine_budget_upload: number
+  per_account: Array<{
+    uid: number
+    vip_cap_download: number
+    base_download: number
+    vip_cap_upload: number
+    base_upload: number
+  }>
+}
+
+/**
+ * 实时使用量快照（独立定时器每 1s 推送一次）。
+ *
+ * 仅在「>1 账号且存在活跃任务」时推送，单账号或全空闲时跳过。
+ * 仅更新 perAccountUsage，不触发 base/vip_cap 重渲染。
+ */
+export interface BudgetEventUsageSnapshot {
+  type: 'usage_snapshot'
+  per_account: Array<{
+    uid: number
+    used_download: number
+    used_upload: number
+  }>
+}
+
+export type BudgetEvent = BudgetEventRecomputed | BudgetEventUsageSnapshot
 
 // ============ 统一任务事件 ============
 
@@ -543,6 +671,16 @@ export interface TaskEventCloudDl {
   event: CloudDlEvent
 }
 
+export interface TaskEventAccount {
+  category: 'account'
+  event: AccountEvent
+}
+
+export interface TaskEventBudget {
+  category: 'budget'
+  event: BudgetEvent
+}
+
 export type TaskEvent =
     | TaskEventDownload
     | TaskEventFolder
@@ -550,6 +688,8 @@ export type TaskEvent =
     | TaskEventTransfer
     | TaskEventBackup
     | TaskEventCloudDl
+    | TaskEventAccount
+    | TaskEventBudget
 
 // ============ 带时间戳的事件 ============
 
@@ -557,7 +697,15 @@ export interface TimestampedEvent {
   event_id: number
   timestamp: number
   category: string
-  event: DownloadEvent | FolderEvent | UploadEvent | TransferEvent | BackupEvent | CloudDlEvent
+  event:
+      | DownloadEvent
+      | FolderEvent
+      | UploadEvent
+      | TransferEvent
+      | BackupEvent
+      | CloudDlEvent
+      | AccountEvent
+      | BudgetEvent
 }
 
 // ============ WebSocket 消息类型 ============
@@ -608,6 +756,13 @@ export interface WsServerSnapshot {
   uploads: any[]
   transfers: any[]
   folders: any[]
+  // ───── 多账号字段 ─────
+  /** 当前活跃账号 UID，后端 `Option<u64>` + skip_serializing_if，无活跃账号时字段缺失 */
+  active_uid?: number
+  /** 所有账号脱敏摘要列表（后端字段 #[serde(default)]，可能为空数组） */
+  accounts?: AccountSummary[]
+  /** 全局只读模式标志（后端字段 #[serde(default)]，初始=false） */
+  readonly_mode?: boolean
 }
 
 export interface WsServerConnected {

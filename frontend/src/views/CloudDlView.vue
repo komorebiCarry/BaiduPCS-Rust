@@ -7,6 +7,7 @@
         <el-tag :type="activeCountType" size="large">
           {{ activeCount }} 个任务进行中
         </el-tag>
+        <!-- 离线下载是百度云端实时数据，仅显示活跃账号；切换账号通过右上角 AccountSwitcher 触发刷新 -->
       </div>
       <div class="header-right">
         <!-- PC端按钮 -->
@@ -34,14 +35,23 @@
 
     <!-- PC端任务列表表格 -->
     <div v-if="!isMobile" class="task-container">
-      <el-empty v-if="!loading && tasks.length === 0" description="暂无离线下载任务" />
-      <el-table v-else :data="tasks" v-loading="loading" style="width: 100%">
+      <el-empty
+          v-if="!loading && displayedTasks.length === 0"
+          description="暂无离线下载任务"
+      />
+      <el-table v-else :data="displayedTasks" v-loading="loading" style="width: 100%">
         <el-table-column prop="task_name" label="任务名称" min-width="200" show-overflow-tooltip />
         <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <el-tag :type="getStatusType(row.status)">{{ row.status_text || getStatusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
+        <!--
+          🔥
+          离线下载已收紧为「按 active 账号隔离」（与 SharesView 同语义），
+          不再显示账号列；切换账号通过右上角 AccountSwitcher 触发自动重拉。
+          `owner_uid` 仍保留为内部事件路由 / 兼容字段，但 UI 不再展示。
+        -->
         <el-table-column prop="save_path" label="保存路径" min-width="150" show-overflow-tooltip />
         <el-table-column label="创建时间" width="180">
           <template #default="{ row }">{{ formatTimestamp(row.create_time) }}</template>
@@ -58,9 +68,12 @@
 
     <!-- 移动端任务卡片列表 -->
     <div v-else class="task-cards">
-      <el-empty v-if="!loading && tasks.length === 0" description="暂无离线下载任务" />
+      <el-empty
+          v-if="!loading && displayedTasks.length === 0"
+          description="暂无离线下载任务"
+      />
       <div
-          v-for="task in tasks"
+          v-for="task in displayedTasks"
           :key="task.task_id"
           class="task-card"
           :class="getTaskCardClass(task.status)"
@@ -71,6 +84,10 @@
           <el-tag :type="getStatusType(task.status)" size="small">
             {{ task.status_text || getStatusText(task.status) }}
           </el-tag>
+          <!--
+            🔥
+            CloudDl 收紧为 active-only 后移除任务卡 chip（与 SharesView 同语义）。
+          -->
         </div>
         <div class="task-info">
           <div class="info-row">
@@ -196,6 +213,14 @@
         @close="resetAddForm"
     >
       <el-form :model="addForm" label-width="100px" :label-position="isMobile ? 'top' : 'right'">
+        <!--
+          🔥
+          CloudDl 收紧为 active-only（与 SharesView 同语义），UI 不再展示账号维度。
+          创建强制使用当前活跃账号、列表只显示当前账号、不再渲染 AccountBadge。
+          切换账号请使用右上角 AccountSwitcher，切换后自动重拉。
+          跨账号创建后 list/cancel 走 active
+          路由会出现行为不一致与安全注入风险，因此仍保留「强制 active_uid」契约。
+        -->
         <el-form-item label="下载链接" required>
           <el-input
               v-model="addForm.source_url"
@@ -315,6 +340,17 @@ import {
 import { createBatchDownload, type BatchDownloadItem } from '@/api/download'
 import { getConfig, updateRecentDirDebounced, updateTransferConfig, type DownloadConfig, type UploadConfig, type TransferConfig } from '@/api/config'
 
+// CloudDl 是 active-only 路由，但 WS 订阅是 cloud_dl 通用主题，
+// 切账号过程中可能收到旧账号的 in-flight 事件。需要按 event.owner_uid === activeUid
+// 过滤，否则旧事件可能写回新账号视图 / 触发跨账号自动下载弹窗。
+import { useAuthStore } from '@/stores/auth'
+// 多账号集成：CloudDl 收紧为 active-only 后 UI 不再展示账号维度。
+// AccountFilter 已移除：离线下载只显示活跃账号实时数据，切换账号自动刷新
+// AccountBadge 已移除：与 SharesView 同语义
+// AccountSelect 已移除：离线下载不再支持跨账号创建
+// useAuthStore 已不再导入：UI 不再依赖账号维度状态，
+//   切账号自动重拉由 multi-account:active-changed window 事件驱动
+
 // 响应式检测
 const isMobile = useIsMobile()
 
@@ -327,7 +363,50 @@ const transferConfig = ref<TransferConfig | null>(null)
 const loading = ref(false)
 const adding = ref(false)
 const tasks = ref<CloudDlTaskInfo[]>([])
+
+// active-uid 过滤源 — 用于 WS 事件归属判断
+const authStore = useAuthStore()
+
+// 请求版本号 — 切账号时丢弃旧请求回包
+//
+// 防御场景：A 账号 listTasks/refresh 在路上 → 用户切到 B 账号 → B 的列表先回 →
+// A 的列表后回会覆盖 B 视图。后续操作按 B active 路由，可能 404 / 误操作 B 资源。
+let cloudDlListRequestVersion = 0
+
+// 详情请求独立版本号
+//
+// 切账号清空详情状态已经做了，但仍挡不住"A 详情请求在路上 → 切到 B → 用户打开
+// B 的详情 → A 旧回包覆盖 B 弹窗"序列。这里和 list 分开维护版本号，因为详情
+// 弹窗的生命周期独立于列表（用户可只刷新列表不开详情）。
+let cloudDlDetailRequestVersion = 0
+
+// WS 事件归属过滤 helper
+//
+// CloudDl 已收紧为 active-only 路由，但 WS 订阅是 `cloud_dl` 通用主题，事件流里
+// 可能短暂出现旧账号事件（切账号时 `state.rebind_cloud_dl_ws_subscribers` 完成
+// 之前已在飞行的事件 / 多账号 monitor 并行轮询窗口）。所有 WS 回调入口先过滤，
+// 不匹配 → 直接 return，避免覆盖新账号视图或触发跨账号自动下载弹窗。
+function isCurrentCloudDlEvent(
+    event: { owner_uid?: number | null },
+): boolean {
+  const ownerUid = event.owner_uid
+  // 后端总是 stamp owner_uid（cloud_dl_monitor.convert_to_ws_event）；
+  // 若缺失视为遗留事件，遵循"宁失勿误"语义直接丢弃
+  if (typeof ownerUid !== 'number') {
+    return false
+  }
+  return ownerUid === authStore.activeUid
+}
 const showAddDialog = ref(false)
+
+// 多账号状态：CloudDl 收紧为 active-only 后 UI 不再依赖账号维度状态。
+// ownerFilter / ownerFilterCounts 已移除：
+//   离线下载是百度网盘实时数据，仅显示当前活跃账号；切换账号会自动 refresh，不再需要前端做账号过滤。
+// 🔥
+//   离线下载不再支持跨账号创建，newTaskOwnerUid 已移除。
+
+const displayedTasks = computed(() => tasks.value)
+
 const showPathSelector = ref(false)
 const showLocalPathSelector = ref(false)
 const showAutoDownloadPicker = ref(false)
@@ -388,6 +467,8 @@ const { isSubscribed, isRefreshing, refresh } = useCloudDlWebSocket({
 
 // 事件处理函数
 function handleStatusChanged(event: CloudDlStatusChangedEvent) {
+  // 按 owner_uid 过滤当前活跃账号
+  if (!isCurrentCloudDlEvent(event)) return
   const index = tasks.value.findIndex(t => t.task_id === event.task_id)
   if (index !== -1) {
     tasks.value[index] = event.task
@@ -399,6 +480,11 @@ function handleStatusChanged(event: CloudDlStatusChangedEvent) {
 }
 
 function handleTaskCompleted(event: CloudDlTaskCompletedEvent) {
+  // 按 owner_uid 过滤当前活跃账号
+  // 重要：跨账号事件不应触发自动下载弹窗（pendingAutoDownloadTask 走当前
+  // active 账号的 createBatchDownload，会把 A 账号任务下载到 B 账号本地路径）
+  if (!isCurrentCloudDlEvent(event)) return
+
   const index = tasks.value.findIndex(t => t.task_id === event.task_id)
   if (index !== -1) {
     tasks.value[index] = event.task
@@ -422,6 +508,8 @@ function handleTaskCompleted(event: CloudDlTaskCompletedEvent) {
 }
 
 function handleProgressUpdate(event: CloudDlProgressUpdateEvent) {
+  // 按 owner_uid 过滤当前活跃账号
+  if (!isCurrentCloudDlEvent(event)) return
   const index = tasks.value.findIndex(t => t.task_id === event.task_id)
   if (index !== -1) {
     tasks.value[index].finished_size = event.finished_size
@@ -435,6 +523,8 @@ function handleProgressUpdate(event: CloudDlProgressUpdateEvent) {
 }
 
 function handleTaskListRefreshed(event: CloudDlTaskListRefreshedEvent) {
+  // 按 owner_uid 过滤当前活跃账号
+  if (!isCurrentCloudDlEvent(event)) return
   tasks.value = event.tasks
 }
 
@@ -463,19 +553,25 @@ function getTaskCardClass(status: number): string {
 
 // 显示任务详情
 async function handleShowDetail(task: CloudDlTaskInfo) {
+  // 递增版本号，旧账号 in-flight queryTask 回包会被下方 check 丢弃
+  const version = ++cloudDlDetailRequestVersion
   showDetailDialog.value = true
   detailLoading.value = true
   detailTask.value = null
 
   try {
     const detail = await queryTask(task.task_id)
+    if (version !== cloudDlDetailRequestVersion) return
     detailTask.value = detail
   } catch (error: any) {
+    if (version !== cloudDlDetailRequestVersion) return
     ElMessage.error('获取任务详情失败: ' + (error.message || error))
     // 如果获取详情失败，使用列表中的基本信息
     detailTask.value = task
   } finally {
-    detailLoading.value = false
+    if (version === cloudDlDetailRequestVersion) {
+      detailLoading.value = false
+    }
   }
 }
 
@@ -533,24 +629,34 @@ async function handleDeleteFromDetail() {
 
 // 刷新任务列表
 async function handleRefresh() {
+  // 请求版本号防御
+  const version = ++cloudDlListRequestVersion
   try {
     const result = await refresh()
+    if (version !== cloudDlListRequestVersion) return
     tasks.value = result
   } catch (error: any) {
+    if (version !== cloudDlListRequestVersion) return
     ElMessage.error('刷新失败: ' + (error.message || error))
   }
 }
 
 // 加载任务列表
 async function loadTasks() {
+  // 请求版本号防御
+  const version = ++cloudDlListRequestVersion
   loading.value = true
   try {
     const response = await listTasks()
+    if (version !== cloudDlListRequestVersion) return
     tasks.value = response.tasks
   } catch (error: any) {
+    if (version !== cloudDlListRequestVersion) return
     ElMessage.error('加载任务列表失败: ' + (error.message || error))
   } finally {
-    loading.value = false
+    if (version === cloudDlListRequestVersion) {
+      loading.value = false
+    }
   }
 }
 
@@ -564,6 +670,7 @@ function resetAddForm() {
     local_download_path: '',
     ask_download_path: false,
   }
+  // 🔥 不再设置归属账号（后端强制使用 active_uid）
 }
 
 // 路径选择器打开
@@ -613,6 +720,7 @@ async function handleAddTask() {
       source_url: sourceUrl,
       save_path: addForm.value.save_path || '/',
       auto_download: addForm.value.auto_download,
+      // 🔥 不再传 owner_uid，后端强制使用 active_uid
       local_download_path: addForm.value.local_download_path || undefined,
       ask_download_path: addForm.value.ask_download_path,
     })
@@ -754,6 +862,32 @@ async function triggerAutoDownload(task: CloudDlTaskInfo, localPath: string) {
   }
 }
 
+// 多账号切换处理器
+// 🔥 切账号时只需重拉列表，无需手动 unsubscribe / resubscribe。
+// 后端 `helpers::set_active_uid` 已经在 `AccountEvent::Switched` 广播之前调
+// `state.rebind_cloud_dl_ws_subscribers(new_uid)`，把当前所有订阅 `cloud_dl` 的连接
+// 计数从旧 monitor 转到新 monitor，并 stamp 新 uid 到事件 `owner_uid` 字段。
+// 前端 WS 订阅维持 `cloud_dl` 通用主题不变，事件流无缝切到新账号的 monitor。
+//
+// 递增 cloudDlListRequestVersion 并清空 tasks，让旧账号
+// in-flight `listTasks/refresh` 回包被内部 version check 丢弃，避免覆盖新账号视图。
+//
+// 同时关闭详情弹窗、清空 detailTask / autoDownloadConfigs /
+// pendingAutoDownloadTask / showAutoDownloadPicker，否则旧账号事件 → 上轮在路上的
+// 详情可能在新账号视图弹出 / 触发跨账号自动下载。
+function handleActiveChanged() {
+  cloudDlListRequestVersion++
+  cloudDlDetailRequestVersion++ // 丢弃旧账号详情请求回包
+  tasks.value = []
+  showDetailDialog.value = false
+  detailTask.value = null
+  pendingAutoDownloadTask.value = null
+  showAutoDownloadPicker.value = false
+  autoDownloadDefaultDir.value = ''
+  autoDownloadConfigs.value.clear()
+  loadTasks()
+}
+
 // 生命周期
 onMounted(async () => {
   // 加载配置
@@ -768,6 +902,13 @@ onMounted(async () => {
 
   // 加载任务列表
   loadTasks()
+
+  // 多账号切换事件订阅
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 </script>
 

@@ -44,6 +44,11 @@ pub struct TransferManager {
     persistence_manager: Arc<Mutex<Option<Arc<Mutex<PersistenceManager>>>>>,
     /// 🔥 WebSocket 管理器
     ws_manager: Arc<RwLock<Option<Arc<WebSocketManager>>>>,
+    /// 🔥 多账号归属 UID
+    ///
+    /// per-uid manager 创建后由 setter 注入或在 `new` 时传入。
+    /// 所有 TransferTask 创建点都会链调 .with_owner_uid(self.owner_uid)。
+    owner_uid: crate::auth::Uid,
 }
 
 /// 创建转存任务请求
@@ -65,6 +70,13 @@ pub struct CreateTransferRequest {
     /// 用户选择的文件完整信息列表（可选）
     /// 前端在文件选择模式下传入，包含选中文件的名称、大小、类型等信息
     pub selected_files: Option<Vec<SharedFileInfo>>,
+    /// 🔥 显式 owner_uid 覆盖
+    ///
+    /// `Some(uid)` → 在创建 task / 持久化 / Created event / 衍生下载之前
+    /// 就用此 UID（**而不是事后 override** —— 避免持久化和异步执行竞态）。
+    /// `None` → 沿用 `TransferManager.owner_uid`（per-uid manager 架构下即该
+    /// manager 自己的 uid；历史共享 Arc / 测试路径下默认是 startup active）。
+    pub owner_uid_override: Option<crate::auth::Uid>,
 }
 
 /// 创建转存任务响应
@@ -98,7 +110,8 @@ enum TransferErrorHandled {
 }
 
 impl TransferManager {
-    /// 创建新的转存管理器
+    /// 创建新的转存管理器（多账号：owner_uid 初始为 Uid::default()、
+    /// 调用方应在创建后立即调 `set_owner_uid` 或使用 `new_with_owner`）
     pub fn new(
         client: Arc<StdRwLock<NetdiskClient>>,
         config: TransferConfig,
@@ -114,7 +127,56 @@ impl TransferManager {
             app_config,
             persistence_manager: Arc::new(Mutex::new(None)),
             ws_manager: Arc::new(RwLock::new(None)),
+            // 多账号：初始为 Uid(0)、由 set_owner_uid 注入
+            owner_uid: crate::auth::Uid::default(),
         }
+    }
+
+    /// 🔥 多账号：设置该管理器所属的账号 UID（同 DownloadManager::set_owner_uid）
+    pub fn set_owner_uid(&mut self, uid: crate::auth::Uid) {
+        self.owner_uid = uid;
+    }
+
+    /// 🔥 多账号：获取该管理器所属的账号 UID
+    pub fn owner_uid(&self) -> crate::auth::Uid {
+        self.owner_uid
+    }
+
+    /// 🔥 覆盖单个任务的归属 UID
+    ///
+    /// 用于 handler 接收到 `req.uid` 显式归属时，纠正 `create_task` 默认使用的
+    /// `self.owner_uid`（active 账号）。仅修改运行态 `TransferTask.owner_uid`，
+    /// **不会回写 `.meta` 文件**。
+    ///
+    /// ⚠️ **现已弃用建议**：`CreateTransferRequest` 已支持
+    /// `owner_uid_override` 字段（参见 `transfer/manager.rs::create_task`），
+    /// task / 持久化 / Created event / 衍生下载在创建瞬间就用 effective_uid。
+    /// 新调用方应优先用 `owner_uid_override`，避免本方法的事后纠错路径。
+    /// 本方法保留仅供已存在任务的运行态纠错。
+    ///
+    /// ⚠️ **关于 .meta**：Transfer 任务有 `.meta`（由 `register_transfer_task` 写入）；
+    /// 但本方法仍只覆盖运行态字段，**不重写 .meta**，因为 `.meta` 已由
+    /// `register_transfer_task(owner_uid_override=Some(effective_uid.raw()))`
+    /// 在 task 创建时一次性写正确，无需再改。
+    ///
+    /// 语义：
+    /// - 任务存在 → 直接修改 task.owner_uid + 返回 Ok
+    /// - 任务不存在 → 警告日志 + 返回 Ok（幂等，避免 race condition 报错）
+    pub async fn override_task_owner_uid(
+        &self,
+        task_id: &str,
+        new_owner_uid: crate::auth::Uid,
+    ) -> anyhow::Result<()> {
+        if let Some(entry) = self.tasks.get(task_id) {
+            let mut t = entry.task.write().await;
+            t.owner_uid = new_owner_uid;
+        } else {
+            tracing::warn!(
+                "TransferManager::override_task_owner_uid: 任务不存在: {}（可能已迁出）",
+                task_id
+            );
+        }
+        Ok(())
     }
 
     /// 🔥 热更新网盘客户端（代理切换时由 ProxyHotUpdater 调用）
@@ -279,6 +341,17 @@ impl TransferManager {
     ) -> Result<CreateTransferResponse> {
         info!("创建转存任务: url={}, is_share_direct_download={}", request.share_url, request.is_share_direct_download);
 
+        // 🔥 effective_uid 在 task 创建前就确定
+        //
+        // 当前架构是 per-uid 独立 `TransferManager`，但 `self.owner_uid` 是 manager
+        // 构造时的 owner（启动 active 或登录账号），与 handler 显式传入的 `req.uid`
+        // 不一定一致（前端按 active 切换、显式覆盖、批量场景）。事后
+        // `override_task_owner_uid` 会与持久化、Created event、async execute_task /
+        // 衍生下载竞态。这里在 task
+        // 构造之前就确定 effective_uid，下游所有路径（task.with_owner_uid /
+        // metadata 持久化 / Created event / execute_task 衍生下载）统一使用。
+        let effective_uid = request.owner_uid_override.unwrap_or(self.owner_uid);
+
         // 1. 解析分享链接
         let share_link = self.client.read().unwrap().parse_share_link(&request.share_url)?;
 
@@ -316,7 +389,7 @@ impl TransferManager {
             (request.save_path.clone(), request.save_fs_id, auto_download, None)
         };
 
-        // 3. 创建任务
+        // 3. 创建任务（多账号：链调 with_owner_uid 用 effective_uid，避免事后 override）
         let mut task = TransferTask::new(
             request.share_url.clone(),
             password.clone(),
@@ -324,7 +397,8 @@ impl TransferManager {
             save_fs_id,
             auto_download,
             request.local_download_path.clone(),
-        );
+        )
+            .with_owner_uid(effective_uid);
 
         // 设置分享直下相关字段
         if request.is_share_direct_download {
@@ -408,6 +482,9 @@ impl TransferManager {
                     .as_ref()
                     .map(|pm| pm.clone())
                 {
+                    // 🔥 显式传 effective_uid
+                    // PersistenceManager 的 `owner_uid` 是 per-uid manager 自身的 uid
+                    // （即 startup A），切账号或 handler 显式传 B 时 .meta 必须写 B。
                     if let Err(e) = pm_arc.lock().await.register_transfer_task(
                         task_id.clone(),
                         request.share_url.clone(),
@@ -415,6 +492,7 @@ impl TransferManager {
                         save_path.clone(),
                         auto_download,
                         None, // 文件名在获取文件列表后更新
+                        Some(effective_uid.raw()),
                     ) {
                         warn!("注册转存任务到持久化管理器失败: {}", e);
                     }
@@ -431,12 +509,14 @@ impl TransferManager {
                     }
                 }
 
-                // 🔥 发送任务创建事件
+                // 🔥 发送任务创建事件（带 effective_uid）
                 self.publish_event(TransferEvent::Created {
                     task_id: task_id.clone(),
                     share_url: request.share_url.clone(),
                     save_path: save_path.clone(),
                     auto_download,
+
+                    owner_uid: Some(effective_uid.raw()),
                 })
                     .await;
 
@@ -455,17 +535,16 @@ impl TransferManager {
                 let err_msg = e.to_string();
 
                 // 检查是否需要密码
-                if err_msg.contains("需要密码") || err_msg.contains("need password") {
-                    if password.is_none() {
-                        return Ok(CreateTransferResponse {
-                            task_id: None,
-                            status: None,
-                            need_password: true,
-                            error: Some("需要提取码".to_string()),
-                        });
-                    }
-                    // 有密码但可能是错误的，继续尝试验证
+                if (err_msg.contains("需要密码") || err_msg.contains("need password"))
+                    && password.is_none() {
+                    return Ok(CreateTransferResponse {
+                        task_id: None,
+                        status: None,
+                        need_password: true,
+                        error: Some("需要提取码".to_string()),
+                    });
                 }
+                // 有密码但可能是错误的，继续尝试验证
 
                 // 检查分享是否失效
                 if err_msg.contains("已失效") || err_msg.contains("expired") {
@@ -530,10 +609,15 @@ impl TransferManager {
                 error!("转存任务执行失败: task_id={}, error={}", task_id, error_msg);
 
                 // 更新任务状态为失败
-                if let Some(task_info) = tasks.get(&task_id) {
+                // 🔥 失败事件带 task.owner_uid
+                let owner_uid_raw = if let Some(task_info) = tasks.get(&task_id) {
                     let mut task = task_info.task.write().await;
+                    let uid = task.owner_uid.raw();
                     task.mark_transfer_failed(error_msg.clone());
-                }
+                    uid
+                } else {
+                    0
+                };
 
                 // 🔥 发布失败事件
                 if let Some(ref ws) = ws_manager {
@@ -542,6 +626,8 @@ impl TransferManager {
                             task_id: task_id.clone(),
                             error: error_msg.clone(),
                             error_type: "execution_error".to_string(),
+
+                            owner_uid: Some(owner_uid_raw),
                         }),
                         None,
                     );
@@ -587,6 +673,9 @@ impl TransferManager {
         let task = task_info.task.clone();
         drop(task_info);
 
+        // 🔥 execute_task 内所有 TransferEvent 一律带 task 的 owner_uid（按"任务事件都带 owner_uid"契约）。
+        let owner_uid_raw = task.read().await.owner_uid.raw();
+
         // 更新状态为检查中
         let old_status;
         {
@@ -602,6 +691,8 @@ impl TransferManager {
                     task_id: task_id.to_string(),
                     old_status,
                     new_status: "checking_share".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }),
                 None,
             );
@@ -628,7 +719,7 @@ impl TransferManager {
         // 如果是全选模式（selected_fs_ids 为空），需要循环分页拉取全部 fs_id
         let has_selected_fs_ids = {
             let t = task.read().await;
-            t.selected_fs_ids.as_ref().map_or(false, |ids| !ids.is_empty())
+            t.selected_fs_ids.as_ref().is_some_and(|ids| !ids.is_empty())
         };
 
         let (file_list, share_root_path_from_api): (Vec<SharedFileInfo>, Option<String>) = if has_selected_fs_ids {
@@ -751,6 +842,8 @@ impl TransferManager {
                     task_id: task_id.to_string(),
                     old_status,
                     new_status: "transferring".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }),
                 None,
             );
@@ -887,7 +980,7 @@ impl TransferManager {
             // 🔥 诊断日志：真实选择集里的跨目录同名 basename 列表
             let mut basename_to_paths: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
             for f in &filtered_file_list {
-                basename_to_paths.entry(f.name.as_str()).or_insert_with(Vec::new).push(f.path.as_str());
+                basename_to_paths.entry(f.name.as_str()).or_default().push(f.path.as_str());
             }
             let cross_dir_duplicates: Vec<(&str, Vec<&str>)> = basename_to_paths
                 .into_iter()
@@ -1090,6 +1183,8 @@ impl TransferManager {
                                 task_id: task_id.to_string(),
                                 old_status,
                                 new_status: "transfer_failed".to_string(),
+
+                                owner_uid: Some(owner_uid_raw),
                             }),
                             None,
                         );
@@ -1102,6 +1197,8 @@ impl TransferManager {
                                 task_id: task_id.to_string(),
                                 error: error_msg.clone(),
                                 error_type: "transfer_failed".to_string(),
+
+                                owner_uid: Some(owner_uid_raw),
                             }),
                             None,
                         );
@@ -1234,6 +1331,8 @@ impl TransferManager {
                             TaskEvent::Transfer(TransferEvent::Completed {
                                 task_id: task_id.to_string(),
                                 completed_at: chrono::Utc::now().timestamp_millis(),
+
+                                owner_uid: Some(owner_uid_raw),
                             }),
                             None,
                         );
@@ -1254,6 +1353,8 @@ impl TransferManager {
                                 task_id: task_id.to_string(),
                                 old_status,
                                 new_status: "transferred".to_string(),
+
+                                owner_uid: Some(owner_uid_raw),
                             }),
                             None,
                         );
@@ -1282,6 +1383,8 @@ impl TransferManager {
                             TaskEvent::Transfer(TransferEvent::Completed {
                                 task_id: task_id.to_string(),
                                 completed_at: chrono::Utc::now().timestamp_millis(),
+
+                                owner_uid: Some(owner_uid_raw),
                             }),
                             None,
                         );
@@ -1392,6 +1495,8 @@ impl TransferManager {
                                     TaskEvent::Transfer(TransferEvent::Completed {
                                         task_id: task_id.to_string(),
                                         completed_at: chrono::Utc::now().timestamp_millis(),
+
+                                        owner_uid: Some(owner_uid_raw),
                                     }),
                                     None,
                                 );
@@ -1411,6 +1516,8 @@ impl TransferManager {
                                         task_id: task_id.to_string(),
                                         old_status,
                                         new_status: "transferred".to_string(),
+
+                                        owner_uid: Some(owner_uid_raw),
                                     }),
                                     None,
                                 );
@@ -1431,6 +1538,8 @@ impl TransferManager {
                                     TaskEvent::Transfer(TransferEvent::Completed {
                                         task_id: task_id.to_string(),
                                         completed_at: chrono::Utc::now().timestamp_millis(),
+
+                                        owner_uid: Some(owner_uid_raw),
                                     }),
                                     None,
                                 );
@@ -1458,6 +1567,8 @@ impl TransferManager {
                                     task_id: task_id.to_string(),
                                     old_status,
                                     new_status: "transfer_failed".to_string(),
+
+                                    owner_uid: Some(owner_uid_raw),
                                 }),
                                 None,
                             );
@@ -1470,6 +1581,8 @@ impl TransferManager {
                                     task_id: task_id.to_string(),
                                     error: err_msg.clone(),
                                     error_type: "transfer_failed".to_string(),
+
+                                    owner_uid: Some(owner_uid_raw),
                                 }),
                                 None,
                             );
@@ -1542,6 +1655,12 @@ impl TransferManager {
         let task_info = tasks.get(task_id).context("任务不存在")?;
         let task = task_info.task.clone();
         drop(task_info);
+
+        // 🔥 提前读 transfer task 的 owner_uid
+        // - 让所有衍生下载（文件 + 文件夹）共用同一 effective_uid，与 transfer task 归属一致
+        // - start_auto_download 内所有 TransferEvent 也用 owner_uid_raw（不再固定 None）
+        let transfer_owner_uid = task.read().await.owner_uid;
+        let owner_uid_raw = transfer_owner_uid.raw();
 
         // 获取本地下载路径配置 + 缓存的分享根路径（用于 share_root 推导）
         let (local_download_path, ask_each_time, default_download_dir, task_share_root_path) = {
@@ -1705,13 +1824,14 @@ impl TransferManager {
                 }
             }
             match dm
-                .create_task_with_dir(
+                .create_task_with_dir_and_owner(
                     fs_id,
                     remote_path.clone(),
                     filename.clone(),
                     size,
                     &local_dir,
                     None,
+                    transfer_owner_uid,
                 )
                 .await
             {
@@ -1746,6 +1866,9 @@ impl TransferManager {
             }
         }
 
+        // 🔥 衍生下载 owner_uid 走 transfer task
+        // （此处复用循环前已读的 `transfer_owner_uid`，避免重复加锁）
+        let owner_uid = transfer_owner_uid;
         // 释放下载管理器锁，避免后面持有两个锁
         drop(dm_lock);
 
@@ -1762,7 +1885,7 @@ impl TransferManager {
                         }
                     }
                     match fdm
-                        .create_folder_download_with_dir(folder_path.clone(), &local_dir, None, None)
+                        .create_folder_download_with_dir(folder_path.clone(), &local_dir, None, None, owner_uid)
                         .await
                     {
                         Ok(folder_id) => {
@@ -1828,6 +1951,8 @@ impl TransferManager {
                     task_id: task_id.to_string(),
                     old_status,
                     new_status: "downloading".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }),
                 None,
             );
@@ -1916,12 +2041,14 @@ impl TransferManager {
                 let task = task_info.task.clone();
                 drop(task_info);
 
-                let (status, download_task_ids, download_started_at) = {
+                // 🔥 本 loop 内所有 TransferEvent 用 task.owner_uid
+                let (status, download_task_ids, download_started_at, owner_uid_raw) = {
                     let t = task.read().await;
                     (
                         t.status.clone(),
                         t.download_task_ids.clone(),
                         t.download_started_at,
+                        t.owner_uid.raw(),
                     )
                 };
 
@@ -2027,6 +2154,8 @@ impl TransferManager {
                                                 task_id: task_id.to_string(),
                                                 old_status,
                                                 new_status: "cleaning".to_string(),
+
+                                                owner_uid: Some(owner_uid_raw),
                                             }),
                                             None,
                                         );
@@ -2074,6 +2203,8 @@ impl TransferManager {
                                                 task_id: task_id.to_string(),
                                                 old_status,
                                                 new_status: "completed".to_string(),
+
+                                                owner_uid: Some(owner_uid_raw),
                                             }),
                                             None,
                                         );
@@ -2118,6 +2249,8 @@ impl TransferManager {
                                                 task_id: task_id.to_string(),
                                                 old_status,
                                                 new_status: "completed".to_string(),
+
+                                                owner_uid: Some(owner_uid_raw),
                                             }),
                                             None,
                                         );
@@ -2151,6 +2284,8 @@ impl TransferManager {
                                             task_id: task_id.to_string(),
                                             old_status,
                                             new_status: "download_failed".to_string(),
+
+                                            owner_uid: Some(owner_uid_raw),
                                         }),
                                         None,
                                     );
@@ -2186,6 +2321,8 @@ impl TransferManager {
                                             task_id: task_id.to_string(),
                                             old_status,
                                             new_status: format!("{:?}", new_status).to_lowercase(),
+
+                                            owner_uid: Some(owner_uid_raw),
                                         }),
                                         None,
                                     );
@@ -2209,6 +2346,8 @@ impl TransferManager {
                                     task_id: task_id.to_string(),
                                     old_status,
                                     new_status: format!("{:?}", new_status).to_lowercase(),
+
+                                    owner_uid: Some(owner_uid_raw),
                                 }),
                                 None,
                             );
@@ -2534,7 +2673,7 @@ impl TransferManager {
         // 必须使用 selected_files（前端传入的完整信息，包含子目录选择场景）
         // ⚠️ 当 selected_fs_ids 非空但 selected_files 缺失时，file_list 仅包含分享第一页
         //    过滤后的结果（见 manager.rs line 613-620），恢复信息不完整，宁可不恢复
-        let has_selected_fs_ids = selected_fs_ids.as_ref().map_or(false, |ids| !ids.is_empty());
+        let has_selected_fs_ids = selected_fs_ids.as_ref().is_some_and(|ids| !ids.is_empty());
 
         let files_to_check: Vec<SharedFileInfo> = if let Some(ref files) = selected_files {
             if !files.is_empty() {
@@ -3014,14 +3153,29 @@ impl TransferManager {
     }
 
     /// 获取所有任务（包括当前任务和历史任务）
+    ///
+    /// # 锁策略
+    ///
+    /// 此前用 `try_read()` 收集内存任务：如果任务正在状态流转持有写锁，
+    /// 该任务会被静默跳过 → 调用方（如 `force=false` 删除前的运行任务扫描）
+    /// 误判为无运行任务，进入静默强删。
+    ///
+    /// 这里改为先克隆 `(id, Arc<RwLock<TransferTask>>)` 再依次 `read().await`，
+    /// 锁等待是瞬时的（写锁持续期短），但保证不漏任何任务。
     pub async fn get_all_tasks(&self) -> Vec<TransferTask> {
         let mut result = Vec::new();
 
-        // 获取当前任务
-        for entry in self.tasks.iter() {
-            if let Ok(task) = entry.value().task.try_read() {
-                result.push(task.clone());
-            }
+        // 1) 收集内存中的任务 Arc（DashMap iter 不持久持锁，仅克隆 Arc）
+        let task_arcs: Vec<Arc<RwLock<TransferTask>>> = self
+            .tasks
+            .iter()
+            .map(|e| e.value().task.clone())
+            .collect();
+
+        // 2) 跨 .await 顺序读取，确保每个任务都被收集（不跳过写锁占用的）
+        for task_arc in task_arcs {
+            let task = task_arc.read().await;
+            result.push(task.clone());
         }
 
         // 从历史数据库获取历史任务
@@ -3122,6 +3276,8 @@ impl TransferManager {
             temp_dir: metadata.temp_dir.clone(),
             selected_fs_ids: None,
             selected_files: None,
+            // 🔥 多账号：从 metadata 恢复 owner_uid，缺失为 Uid(0)（兜底）
+            owner_uid: metadata.owner_uid.map(crate::auth::Uid::new).unwrap_or_default(),
             // 恢复分享根路径（老元数据缺该字段时为 None，调用方退化到启发式）
             share_root_path: metadata.share_root_path.clone(),
         })
@@ -3134,6 +3290,41 @@ impl TransferManager {
         } else {
             None
         }
+    }
+
+    /// 任务是否存在于**内存**中（不查历史库）。
+    ///
+    /// 用于跨账号路由的"内存优先"判定：内存命中即可确定归属为本 manager 的
+    /// `owner_uid`（per-uid 独立 manager）。
+    pub fn has_task_in_memory(&self, id: &str) -> bool {
+        self.tasks.contains_key(id)
+    }
+
+    /// 任务是否存在于内存**或**持久化历史库中（与 `DownloadManager` /
+    /// `UploadManager::has_task_anywhere` 语义对齐）。
+    ///
+    /// ⚠️ 注意：历史库为**全局共享**（所有账号同一张 `task_history` 表，
+    /// 按 `task_id` 查），因此本方法对任意账号的历史任务都会返回 `true`，
+    /// **不能**用于判定任务归属哪个账号。跨账号路由请用
+    /// `AppState::find_transfer_manager_for_task`（内存优先 + 历史 `owner_uid`
+    /// 精确路由）。
+    pub async fn has_task_anywhere(&self, id: &str) -> bool {
+        if self.tasks.contains_key(id) {
+            return true;
+        }
+        if let Some(pm_arc) = self
+            .persistence_manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|pm| pm.clone())
+        {
+            let pm_guard = pm_arc.lock().await;
+            if pm_guard.get_history_task(id).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// 取消任务
@@ -3156,9 +3347,10 @@ impl TransferManager {
         drop(task_info);
 
         // 获取当前状态和分享直下相关信息
-        let (current_status, is_share_direct_download, temp_dir) = {
+        // 🔥 cancel_task 各分支 TransferEvent 用 task.owner_uid
+        let (current_status, is_share_direct_download, temp_dir, owner_uid_raw) = {
             let t = task.read().await;
-            (t.status.clone(), t.is_share_direct_download, t.temp_dir.clone())
+            (t.status.clone(), t.is_share_direct_download, t.temp_dir.clone(), t.owner_uid.raw())
         };
 
         info!(
@@ -3189,6 +3381,8 @@ impl TransferManager {
                     task_id: id.to_string(),
                     old_status: "checking_share".to_string(),
                     new_status: "transfer_failed".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }).await;
 
                 info!("取消转存任务成功（CheckingShare）: {}", id);
@@ -3209,6 +3403,8 @@ impl TransferManager {
                     task_id: id.to_string(),
                     old_status: "transferring".to_string(),
                     new_status: "transfer_failed".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }).await;
 
                 // 分享直下任务：清理临时目录
@@ -3265,6 +3461,8 @@ impl TransferManager {
                     task_id: id.to_string(),
                     old_status: "downloading".to_string(),
                     new_status: "download_failed".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }).await;
 
                 // 分享直下任务：清理临时目录
@@ -3314,6 +3512,8 @@ impl TransferManager {
                     task_id: id.to_string(),
                     old_status: format!("{:?}", current_status).to_lowercase(),
                     new_status: "transfer_failed".to_string(),
+
+                    owner_uid: Some(owner_uid_raw),
                 }).await;
 
                 info!("取消转存任务成功: task_id={}, old_status={:?}", id, current_status);
@@ -3324,14 +3524,19 @@ impl TransferManager {
 
     /// 删除任务
     pub async fn remove_task(&self, id: &str) -> Result<()> {
-        // 先尝试从内存中移除
-        if let Some((_, task_info)) = self.tasks.remove(id) {
+        // 🔥 在 remove 前取出 task.owner_uid
+        // 用于事件 owner_uid，避免事件不带归属导致前端按账号过滤失效。
+        // 内存中找不到（已归档）时回退到 self.owner_uid（per-uid manager 的归属）。
+        let owner_uid_raw: Option<u64> = if let Some((_, task_info)) = self.tasks.remove(id) {
+            let uid_raw = task_info.task.read().await.owner_uid.raw();
             task_info.cancellation_token.cancel();
             info!("删除转存任务（内存中）: {}", id);
+            Some(uid_raw)
         } else {
             // 不在内存中，仍然执行持久化清理，保证幂等
             info!("删除转存任务（历史/已归档）: {}", id);
-        }
+            Some(self.owner_uid.raw())
+        };
 
         // 🔥 清理持久化文件
         if let Some(pm_arc) = self
@@ -3348,13 +3553,107 @@ impl TransferManager {
             warn!("持久化管理器未初始化，无法清理转存任务: {}", id);
         }
 
-        // 🔥 发送删除事件
+        // 🔥 发送删除事件（带 owner_uid，与 task / .meta 一致）
         self.publish_event(TransferEvent::Deleted {
             task_id: id.to_string(),
+
+            owner_uid: owner_uid_raw,
         })
             .await;
 
         Ok(())
+    }
+
+    /// 删除指定账号下所有转存任务
+    ///
+    /// 用于 `force_delete_account` 链路：共享 `TransferManager` 设计下，
+    /// 删除账号时必须取消并删除该 uid 归属的所有任务（运行中的取消、内存中的
+    /// 移除、持久化的删除），否则任务在共享 manager 内继续跑，状态错乱。
+    ///
+    /// 行为：
+    /// - 内存任务：找出 `task.owner_uid == uid` 的全部 → 取消 cancellation_token →
+    ///   清理持久化（`.meta`）→ 从 `tasks` 移除 → 发送 `Deleted` 事件
+    /// - 历史任务：从 sqlite `task_history` 按 `owner_uid` 删除
+    ///
+    /// 返回 `(memory_deleted, history_deleted)`。
+    ///
+    /// # 锁策略
+    ///
+    /// 此前用 `try_read()` 收集 task ids：如果某个 task 此时正在状态流转持有写锁，
+    /// `try_read` 直接跳过 → 该任务被漏删 → `force_delete_account` 后续移除 uid
+    /// 映射 + client_pool，但漏掉的 transfer 还在共享 manager 内继续跑/残留 .meta。
+    /// 强删路径必须确定性收集，这里改用 `read().await`（短暂等待写锁释放）。
+    pub async fn delete_tasks_for_owner(
+        &self,
+        uid: crate::auth::Uid,
+    ) -> (usize, usize) {
+        // 1) 收集内存中归属该 uid 的 task ids（确定性 read，避免 try_read 漏删）
+        //    DashMap iter 的元素先克隆 task Arc，然后按 .await 顺序取读锁。
+        //    这避免 cross-await 持有 DashMap 锁（容易死锁）。
+        let task_arcs: Vec<(String, Arc<RwLock<TransferTask>>)> = self
+            .tasks
+            .iter()
+            .map(|e| (e.key().clone(), e.value().task.clone()))
+            .collect();
+
+        let mut target_ids: Vec<String> = Vec::new();
+        for (id, task_arc) in task_arcs {
+            let task = task_arc.read().await;
+            if task.owner_uid == uid {
+                target_ids.push(id);
+            }
+        }
+
+        let memory_count = target_ids.len();
+        info!(
+            "delete_tasks_for_owner: uid={} 内存中找到 {} 个转存任务",
+            uid.raw(),
+            memory_count
+        );
+
+        // 2) 逐个删除（复用 remove_task 的取消 + 持久化清理 + 事件流程）
+        for id in target_ids {
+            if let Err(e) = self.remove_task(&id).await {
+                warn!(
+                    "delete_tasks_for_owner: 删除任务 {} 失败: {}",
+                    id, e
+                );
+            }
+        }
+
+        // 3) 历史数据库：按 owner_uid 删除 transfer 类型的所有历史记录
+        let mut history_count = 0;
+        if let Some(pm_arc) = self
+            .persistence_manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|pm| pm.clone())
+        {
+            let pm_guard = pm_arc.lock().await;
+            let history_db = pm_guard.history_db().cloned();
+            drop(pm_guard);
+
+            if let Some(db) = history_db {
+                // 按 owner_uid 删除该账号所有 transfer 历史（无论状态）
+                match db.remove_tasks_by_type_owner("transfer", Some(uid.raw())) {
+                    Ok(count) => history_count = count,
+                    Err(e) => warn!(
+                        "delete_tasks_for_owner: 删除历史转存任务（owner_uid={}）失败: {}",
+                        uid.raw(),
+                        e
+                    ),
+                }
+            }
+        }
+
+        info!(
+            "delete_tasks_for_owner: uid={} 完成（内存={}, 历史={}）",
+            uid.raw(),
+            memory_count,
+            history_count
+        );
+        (memory_count, history_count)
     }
 
     /// 获取配置
@@ -3393,7 +3692,13 @@ impl TransferManager {
             anyhow::bail!("任务 {} 已存在，无法恢复", task_id);
         }
 
-        // 创建恢复任务
+        // 🔥 多账号 owner_uid 优先级 = recovery_info.owner_uid > self.owner_uid
+        let resolved_owner_uid = recovery_info
+            .owner_uid
+            .map(crate::auth::Uid::new)
+            .unwrap_or(self.owner_uid);
+
+        // 创建恢复任务（多账号：链调 with_owner_uid 使用 resolved_owner_uid）
         let mut task = TransferTask::new(
             recovery_info.share_link.clone(),
             recovery_info.share_pwd.clone(),
@@ -3401,7 +3706,8 @@ impl TransferManager {
             0,     // save_fs_id 未保存，设为 0
             false, // auto_download 稍后设置
             None,
-        );
+        )
+            .with_owner_uid(resolved_owner_uid);
 
         // 恢复任务 ID（保持原有 ID）
         task.id = task_id.clone();
@@ -3524,6 +3830,8 @@ impl TransferManager {
                     if let Some(task_info) = tasks.get(&task_id_clone) {
                         let mut t = task_info.task.write().await;
                         let old_status = format!("{:?}", t.status).to_lowercase();
+                        // 🔥 恢复后清理事件带 owner_uid
+                        let owner_uid_raw = t.owner_uid.raw();
                         t.mark_completed();
 
                         // 发送状态变更事件
@@ -3533,6 +3841,8 @@ impl TransferManager {
                                     task_id: task_id_clone.clone(),
                                     old_status,
                                     new_status: "completed".to_string(),
+
+                                    owner_uid: Some(owner_uid_raw),
                                 }),
                                 None,
                             );
@@ -3672,18 +3982,25 @@ impl TransferManager {
         }
 
         // 2. 获取当前所有活跃任务的 temp_dir 集合
-        let active_temp_dirs: std::collections::HashSet<String> = self
+        //
+        // 此前用 `try_read()`，活跃任务正在
+        // 状态流转持有写锁时其 temp_dir 不会进入集合 → 后续被当作孤立目录删除，
+        // 可能误删活跃任务的临时目录。改为先收集 Arc 再依次 `read().await`，
+        // 确保所有活跃任务的 temp_dir 都被纳入"白名单"。
+        let active_task_arcs: Vec<Arc<RwLock<TransferTask>>> = self
             .tasks
             .iter()
-            .filter_map(|entry| {
-                // 使用 try_read 避免阻塞
-                if let Ok(task) = entry.value().task.try_read() {
-                    task.temp_dir.clone()
-                } else {
-                    None
-                }
-            })
+            .map(|e| e.value().task.clone())
             .collect();
+
+        let mut active_temp_dirs: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(active_task_arcs.len());
+        for task_arc in active_task_arcs {
+            let task = task_arc.read().await;
+            if let Some(ref temp_dir) = task.temp_dir {
+                active_temp_dirs.insert(temp_dir.clone());
+            }
+        }
 
         // 3. 找出孤立目录（不属于任何活跃任务的目录）
         let orphaned_dirs: Vec<String> = subdirs

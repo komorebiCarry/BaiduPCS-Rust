@@ -1,6 +1,7 @@
 //! WebSocket 消息类型定义
 
-use crate::server::events::TimestampedEvent;
+use crate::auth::AccountSummary;
+use crate::server::events::{BudgetEvent, TimestampedEvent};
 use serde::{Deserialize, Serialize};
 
 /// 客户端发送给服务端的消息
@@ -68,6 +69,16 @@ pub enum WsServerMessage {
         transfers: Vec<serde_json::Value>,
         /// 文件夹下载列表
         folders: Vec<serde_json::Value>,
+        // ───────── 多账号字段 ─────────
+        /// 当前活跃账号 UID（HTTP 线缆 `u64`，`null` = 无活跃账号）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_uid: Option<u64>,
+        /// 所有账号脱敏摘要列表
+        #[serde(default)]
+        accounts: Vec<AccountSummary>,
+        /// 全局只读模式标志
+        #[serde(default)]
+        readonly_mode: bool,
     },
     /// 连接成功
     Connected {
@@ -92,6 +103,17 @@ pub enum WsServerMessage {
     UnsubscribeSuccess {
         /// 剩余订阅列表
         subscriptions: Vec<String>,
+    },
+    /// 多账号配额事件
+    ///
+    /// 不挂载到 `TaskEvent` 是因为该事件并非任务级（没有 `task_id`），
+    /// 而是机器级 / 账号级聚合视图，订阅模式为 `"budget"`。
+    Budget {
+        /// 服务端时间戳（毫秒）
+        timestamp: i64,
+        /// 事件内容
+        #[serde(flatten)]
+        event: BudgetEvent,
     },
 }
 
@@ -139,6 +161,14 @@ impl WsServerMessage {
     pub fn unsubscribe_success(subscriptions: Vec<String>) -> Self {
         Self::UnsubscribeSuccess { subscriptions }
     }
+
+    /// 创建配额事件消息
+    pub fn budget(event: BudgetEvent) -> Self {
+        Self::Budget {
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            event,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,5 +191,15 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("pong"));
         assert!(json.contains("1234567890"));
+    }
+
+    #[test]
+    fn test_budget_message_serialization() {
+        let msg = WsServerMessage::budget(BudgetEvent::UsageSnapshot { per_account: vec![] });
+        let json = serde_json::to_string(&msg).unwrap();
+        // outer tag
+        assert!(json.contains("\"type\":\"budget\""));
+        // inner BudgetEvent tag (flattened)
+        assert!(json.contains("\"event_type\":\"usage_snapshot\""));
     }
 }

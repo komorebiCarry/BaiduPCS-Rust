@@ -22,9 +22,15 @@ export function formatSpeed(bytesPerSec: number): string {
 
 /**
  * 格式化剩余时间
+ *
+ * - null：速度未知（如 0 B/s），无法估算 → "计算中"
+ * - 0：已传输完成（remaining=0）→ "即将完成"
  */
 export function formatETA(seconds: number | null): string {
-  if (seconds === null || seconds === 0) {
+  if (seconds === null) {
+    return '计算中'
+  }
+  if (seconds === 0) {
     return '即将完成'
   }
 

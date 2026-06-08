@@ -105,7 +105,7 @@ impl SnapshotManager {
     /// 根据加密文件名查找快照
     pub fn find_by_encrypted_name(&self, encrypted_name: &str) -> Result<Option<SnapshotInfo>> {
         let snapshot = self.record_manager.find_snapshot_by_encrypted_name(encrypted_name)?;
-        Ok(snapshot.map(|s| SnapshotInfo::from(s)))
+        Ok(snapshot.map(SnapshotInfo::from))
     }
 
     /// 根据原始文件路径查找快照
@@ -115,7 +115,7 @@ impl SnapshotManager {
         original_name: &str,
     ) -> Result<Option<SnapshotInfo>> {
         let snapshot = self.record_manager.find_snapshot_by_original(original_path, original_name)?;
-        Ok(snapshot.map(|s| SnapshotInfo::from(s)))
+        Ok(snapshot.map(SnapshotInfo::from))
     }
 
     /// 标记为加密中

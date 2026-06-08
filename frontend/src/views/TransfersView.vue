@@ -7,6 +7,14 @@
         <el-tag :type="activeCountType" size="large">
           {{ activeCount }} 个任务进行中
         </el-tag>
+        <!-- 多账号过滤器 -->
+        <AccountFilter
+            v-if="authStore.hasMultipleAccounts"
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            size="large"
+            class="account-filter-slot"
+        />
       </div>
       <div class="header-right">
         <template v-if="!isMobile">
@@ -48,8 +56,11 @@
 
     <!-- 转存任务列表 -->
     <div class="task-container">
-      <el-empty v-if="!loading && tasks.length === 0" description="暂无转存任务">
-        <el-button type="primary" @click="showTransferDialog = true">
+      <el-empty
+          v-if="!loading && displayedTasks.length === 0"
+          :description="ownerFilter === null ? '暂无转存任务' : '当前过滤条件下暂无转存任务'"
+      >
+        <el-button v-if="ownerFilter === null" type="primary" @click="showTransferDialog = true">
           <el-icon><Share /></el-icon>
           新建转存
         </el-button>
@@ -57,7 +68,7 @@
 
       <div v-else class="task-list">
         <el-card
-            v-for="task in tasks"
+            v-for="task in displayedTasks"
             :key="task.id"
             :data-task-id="task.id"
             class="task-card"
@@ -80,6 +91,8 @@
                 <el-tag :type="getTransferStatusType(task.status)" size="small">
                   {{ getTransferStatusText(task.status) }}
                 </el-tag>
+                <!-- 多账号 chip -->
+                <AccountBadge :owner-uid="task.owner_uid" size="small" class="task-account-badge" />
               </div>
               <div class="task-path">
                 <span class="path-label">保存到:</span>
@@ -232,6 +245,10 @@ import ShareDirectDownloadDialog from '@/components/ShareDirectDownloadDialog.vu
 // 🔥 WebSocket 相关导入
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import type { TransferEvent } from '@/types/events'
+// 多账号集成
+import { useAuthStore } from '@/stores/auth'
+import AccountFilter from '@/components/AccountFilter.vue'
+import AccountBadge from '@/components/AccountBadge.vue'
 
 // 路由
 const router = useRouter()
@@ -248,6 +265,24 @@ const loading = ref(false)
 const tasks = ref<TransferTask[]>([])
 const showTransferDialog = ref(false)
 const showShareDirectDialog = ref(false)
+
+// 多账号状态
+const authStore = useAuthStore()
+const ownerFilter = ref<number | null>(null)
+
+const displayedTasks = computed(() => {
+  if (ownerFilter.value === null) return tasks.value
+  return tasks.value.filter((t) => t.owner_uid === ownerFilter.value)
+})
+
+const ownerFilterCounts = computed(() => {
+  const map: Record<number, number> = {}
+  for (const t of tasks.value) {
+    const uid = typeof t.owner_uid === 'number' ? t.owner_uid : null
+    if (uid !== null) map[uid] = (map[uid] || 0) + 1
+  }
+  return map
+})
 
 // 自动刷新定时器
 let refreshTimer: number | null = null
@@ -605,7 +640,13 @@ onMounted(async () => {
   }
 
   setupWebSocketSubscriptions()
+  window.addEventListener('multi-account:active-changed', handleActiveChanged)
 })
+
+// 多账号切换处理器
+function handleActiveChanged() {
+  refreshTasks()
+}
 
 // 组件卸载
 onUnmounted(() => {
@@ -614,6 +655,7 @@ onUnmounted(() => {
     refreshTimer = null
   }
   cleanupWebSocketSubscriptions()
+  window.removeEventListener('multi-account:active-changed', handleActiveChanged)
 })
 </script>
 

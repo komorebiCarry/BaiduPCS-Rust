@@ -276,6 +276,23 @@ pub struct TaskMetadata {
     /// 非加密模式下为 None（target_path 即为原始路径）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_remote_path: Option<String>,
+
+    // === 🔥 多账号归属字段 ===
+    /// 任务所属 UID（运态 `Uid` 与持久化 `u64` 双向转换 — 加载/保存时各发生一次）。
+    /// 旧持久化数据为 `None`，这种情况下恢复逻辑会填充 `active_uid` 或进入账号丢失分支。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
+
+    /// 不可恢复失败原因（恢复链路）
+    ///
+    /// 恢复链路落到 `Failed` 终态时由本字段承载语义，区分多种不可恢复原因：
+    /// - `"account_deleted"` — 任务持久化 `owner_uid` 已不在 `accounts.json` 内
+    /// - `"unrecoverable_no_active_account"` — `owner_uid=None` 且无 `active_uid` 兜底
+    ///
+    /// 与 `error_msg` 区别：`error_msg` 是网络/IO 等运行期错误；`failure_reason` 是
+    /// **结构性不可恢复**信号，前端可据此显示固定文案而非透传错误。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -350,6 +367,8 @@ impl TaskMetadata {
             is_encrypted: is_encrypted.unwrap_or(false),
             encryption_key_version,
             original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
     }
 
@@ -422,6 +441,8 @@ impl TaskMetadata {
             is_encrypted: is_encrypted.unwrap_or(false),
             encryption_key_version,
             original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
     }
 
@@ -490,6 +511,8 @@ impl TaskMetadata {
             is_encrypted: false,
             encryption_key_version,
             original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
     }
 
@@ -560,6 +583,8 @@ impl TaskMetadata {
             is_encrypted: false,
             encryption_key_version,
             original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
     }
 
@@ -598,7 +623,7 @@ impl TaskMetadata {
             upload_id: None,
             upload_id_created_at: None,
             share_link: Some(share_link),
-            share_pwd: share_pwd,
+            share_pwd,
             transfer_target_path: Some(target_path),
             transfer_status: Some("checking_share".to_string()),
             download_task_ids: vec![],
@@ -624,7 +649,18 @@ impl TaskMetadata {
             is_encrypted: false,
             encryption_key_version: None,
             original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
+    }
+
+    /// 设置任务所属账号 UID。
+    ///
+    /// 生产代码应该在调用 `new_*` 后立即链调 `.with_owner_uid(task.owner_uid.0)`，
+    /// 使持久化与运态任务保持账号归属一致。
+    pub fn with_owner_uid(mut self, owner_uid: u64) -> Self {
+        self.owner_uid = Some(owner_uid);
+        self
     }
 
     /// 更新最后修改时间
@@ -1256,5 +1292,64 @@ mod tests {
 
         metadata.set_transfer_task_id("transfer_001".to_string());
         assert_eq!(metadata.transfer_task_id, Some("transfer_001".to_string()));
+    }
+
+    /// 旧 .meta（无 owner_uid 字段）必须仍能反序列化，owner_uid=None
+    ///
+    /// 这是多账号必备的向后兼容能力；新逻辑通过恢复分支处理
+    /// （C/D 把 None 填充为 active_uid）。
+    #[test]
+    fn test_owner_uid_backward_compat_deserialization() {
+        // 构造一段不含 owner_uid 的旧版本 JSON
+        // 注：TaskType / TaskPersistenceStatus 均为 snake_case 序列化
+        let legacy_json = r#"{
+            "task_id": "legacy_001",
+            "task_type": "download",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "fs_id": 12345,
+            "remote_path": "/legacy/file.txt",
+            "local_path": "/local/legacy.txt",
+            "file_size": 1024,
+            "chunk_size": 256,
+            "total_chunks": 4,
+            "status": "pending"
+        }"#;
+
+        let metadata: TaskMetadata = serde_json::from_str(legacy_json).expect("旧 .meta 必须可反序列化");
+        assert_eq!(metadata.task_id, "legacy_001");
+        assert_eq!(metadata.owner_uid, None, "旧 .meta 反序列化后 owner_uid 必须为 None");
+
+        // 序列化再反序列化（None 不应被写入 JSON）
+        let json = serde_json::to_string(&metadata).expect("序列化失败");
+        assert!(!json.contains("owner_uid"), "owner_uid=None 不应写入 JSON，实际：{}", json);
+
+        let round_trip: TaskMetadata = serde_json::from_str(&json).expect("回环失败");
+        assert_eq!(round_trip.owner_uid, None);
+    }
+
+    /// with_owner_uid builder + 写入 JSON + 重新反序列化
+    #[test]
+    fn test_owner_uid_builder_roundtrip() {
+        let metadata = TaskMetadata::new_download(
+            "with_uid_001".to_string(),
+            999,
+            "/test".to_string(),
+            PathBuf::from("/local/test.txt"),
+            100,
+            10,
+            10,
+            None,
+            None,
+        )
+            .with_owner_uid(7890123456);
+
+        assert_eq!(metadata.owner_uid, Some(7890123456));
+
+        let json = serde_json::to_string(&metadata).expect("序列化失败");
+        assert!(json.contains("\"owner_uid\":7890123456"), "owner_uid 应被写入 JSON，实际：{}", json);
+
+        let parsed: TaskMetadata = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(parsed.owner_uid, Some(7890123456));
     }
 }

@@ -86,7 +86,7 @@ impl MountDetector {
                 }
             }
 
-            return mounts_linux;
+            mounts_linux
         }
 
         #[cfg(not(target_os = "linux"))]

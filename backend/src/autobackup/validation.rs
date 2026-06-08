@@ -598,6 +598,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
         }];
 
         // 创建子配置应该冲突
@@ -635,6 +636,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
         }];
 
         // 创建反向下载配置应该冲突（闭环）
@@ -669,6 +671,7 @@ mod tests {
             sync_conflict_strategy: None,
             sync_init_mode: None,
             needs_full_sync: false,
+            owner_uid: None,
         }];
 
         // 本地路径相同但云端路径不同，不冲突

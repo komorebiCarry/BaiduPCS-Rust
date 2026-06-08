@@ -61,22 +61,22 @@ impl RateLimiter {
     /// 仅当认证模式不为 `None` 时应调用此方法。
     pub async fn start_cleanup_task(self: &Arc<Self>) {
         let mut guard = self.cleanup_cancel_token.write().await;
-        
+
         // 如果已有清理任务在运行，先停止它
         if let Some(token) = guard.take() {
             token.cancel();
         }
-        
+
         let cancel_token = CancellationToken::new();
         *guard = Some(cancel_token.clone());
         drop(guard);
-        
+
         let limiter = Arc::clone(self);
-        
+
         tokio::spawn(async move {
             debug!("RateLimiter cleanup task started");
             let interval = Duration::from_secs(CLEANUP_INTERVAL_SECS);
-            
+
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -87,7 +87,7 @@ impl RateLimiter {
                         let before_count = limiter.active_records_count();
                         limiter.cleanup_expired();
                         let after_count = limiter.active_records_count();
-                        
+
                         if before_count != after_count {
                             debug!(
                                 "RateLimiter cleanup: removed {} expired records ({} -> {})",
@@ -234,11 +234,7 @@ impl RateLimiter {
     /// 获取剩余尝试次数
     pub fn get_remaining_attempts(&self, ip: &str) -> u32 {
         let count = self.get_failure_count(ip);
-        if count >= MAX_FAILED_ATTEMPTS {
-            0
-        } else {
-            MAX_FAILED_ATTEMPTS - count
-        }
+        MAX_FAILED_ATTEMPTS.saturating_sub(count)
     }
 
     /// 获取活跃记录数量（用于监控）
@@ -368,7 +364,7 @@ mod tests {
     fn test_is_at_capacity() {
         let limiter = RateLimiter::new();
         assert!(!limiter.is_at_capacity());
-        
+
         // We can't easily test MAX_RECORDS without creating that many entries,
         // but we can verify the method works
         assert_eq!(limiter.active_records_count(), 0);

@@ -69,10 +69,33 @@ pub struct AutoBackupManager {
     ws_manager: Arc<RwLock<Option<Weak<WebSocketManager>>>>,
     /// 上传管理器引用（用于复用现有上传功能）
     /// 使用 Weak 引用避免循环引用导致的内存泄漏
+    ///
+    /// ⚠️ 此单引用为 **legacy fallback**，仅在
+    /// `upload_manager_pool` 未注入或按 owner_uid 未命中时使用。跨账号执行备份
+    /// 子任务时必须走 `resolve_upload_manager(owner_uid)`，否则 owner=A 的子任务
+    /// 会被错误插入 active=B 的 manager，导致 `GET /uploads?uid=A` 漏查。
     upload_manager: Arc<RwLock<Option<Weak<UploadManager>>>>,
     /// 下载管理器引用（用于复用现有下载功能）
     /// 使用 Weak 引用避免循环引用导致的内存泄漏
+    ///
+    /// ⚠️ 同 `upload_manager`：legacy fallback，优先走 `resolve_download_manager`。
     download_manager: Arc<RwLock<Option<Weak<DownloadManager>>>>,
+    /// 🔥 per-uid 上传管理器池
+    ///
+    /// 与 `AppState.upload_managers` 共享同一份 `Arc<DashMap>`，由
+    /// `set_upload_manager_pool` 在 `init_autobackup_manager` 时注入。
+    /// 备份子任务按 `BackupConfig.owner_uid` 从此池解析目标账号 manager。
+    upload_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
+    /// 🔥 per-uid 下载管理器池
+    download_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<DownloadManager>>>>>>,
+    /// 🔥 ClientPool 引用
+    ///
+    /// 备份模块的远端扫描 / 下载 / 同步快照路径必须按 `BackupConfig.owner_uid`
+    /// 取目标账号的 `NetdiskClient`，禁止再用 legacy `SessionManager::load_session()`
+    /// 兜底（迁移后的 `session.json.migrated` 会让旧账号场景"未登录"，新账号
+    /// 场景又会让 B 账号配置拿 A 账号 cookie 扫远端 — 串账号）。
+    /// 使用 Weak 避免循环引用；setter 由 `init_autobackup_manager` 注入。
+    client_pool: Arc<RwLock<Option<Weak<tokio::sync::RwLock<crate::netdisk::ClientPool>>>>>,
     /// 聚合事件接收器（用于启动事件消费循环）
     aggregated_rx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<ChangeEvent>>>>,
     /// 任务控制器（每个配置一个，用于防止并发执行和触发合并）
@@ -87,6 +110,13 @@ pub struct AutoBackupManager {
     fallback_mgr: Arc<RwLock<Option<Arc<ProxyFallbackManager>>>>,
     /// Sync 意图位图（每个 Sync 配置一个，用于合并 Watch/Poll 触发）
     sync_intents: Arc<DashMap<String, Arc<super::sync::intent::SyncIntent>>>,
+    /// 🔥 备份子任务通知 sender 缓存
+    ///
+    /// `start_transfer_listeners` 启动时创建 `notification_tx` + spawn 接收循环；
+    /// 同时把 sender 缓存在这里。后续 `refresh_transfer_listener_bindings()` 把
+    /// 这个 sender 重新注册到所有 per-uid manager（含新登录的账号），让新账号
+    /// 的备份子任务完成/失败事件也能回到 AutoBackupManager 推进父任务状态。
+    backup_notification_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<super::events::BackupTransferNotification>>>>,
 }
 
 impl AutoBackupManager {
@@ -203,6 +233,9 @@ impl AutoBackupManager {
             ws_manager: Arc::new(RwLock::new(None)),
             upload_manager: Arc::new(RwLock::new(None)),
             download_manager: Arc::new(RwLock::new(None)),
+            upload_manager_pool: Arc::new(RwLock::new(None)),
+            download_manager_pool: Arc::new(RwLock::new(None)),
+            client_pool: Arc::new(RwLock::new(None)),
             aggregated_rx,
             task_controllers: Arc::new(DashMap::new()),
             aggregator_handle,
@@ -210,6 +243,7 @@ impl AutoBackupManager {
             proxy_config: Arc::new(RwLock::new(None)),
             fallback_mgr: Arc::new(RwLock::new(None)),
             sync_intents: Arc::new(DashMap::new()),
+            backup_notification_tx: Arc::new(RwLock::new(None)),
         };
 
         // 加载已保存的配置
@@ -296,8 +330,8 @@ impl AutoBackupManager {
     /// 服务重启后，将未完成的任务恢复到内存中，并重置为待执行状态
     /// 正在执行中的任务（Preparing/Transferring）会被重置为 Queued，等待重新调度
     ///
-    /// 关键修复：从 SQLite 加载文件子任务回填到 task.pending_files，
-    /// 同时重建 related_task_id 映射，确保能复用 uploader 已恢复的任务
+    /// 同时从 SQLite 加载文件子任务回填到 `task.pending_files` 并重建
+    /// `related_task_id` 映射，使得能复用 uploader 已恢复的任务。
     fn restore_incomplete_tasks(&self) -> Result<()> {
         let tasks = self.persistence_manager.load_incomplete_tasks()?;
 
@@ -340,7 +374,7 @@ impl AutoBackupManager {
                 }
             }
 
-            // 【关键修复】从 SQLite 加载非终态文件任务，回填 pending_files
+            // 从 SQLite 加载非终态文件任务，回填 pending_files
             match self.persistence_manager.load_file_tasks_for_restore(&task_id) {
                 Ok(mut file_tasks) => {
                     let files_loaded = file_tasks.len();
@@ -453,9 +487,9 @@ impl AutoBackupManager {
         );
 
         for config_id in config_ids_to_resume {
-            // 检查配置是否存在且启用
-            let config = match self.get_config(&config_id) {
-                Some(c) if c.enabled => c,
+            // 检查配置是否存在且启用（仅做存在性 + enabled 校验，task_loop 内会再次按 cid 取最新配置）
+            match self.get_config(&config_id) {
+                Some(c) if c.enabled => {}
                 Some(_) => {
                     tracing::warn!("配置已禁用，跳过恢复任务: config={}", config_id);
                     continue;
@@ -464,7 +498,7 @@ impl AutoBackupManager {
                     tracing::warn!("配置不存在，跳过恢复任务: config={}", config_id);
                     continue;
                 }
-            };
+            }
 
             // 获取或创建 TaskController 并触发执行
             let controller = self.task_controllers
@@ -475,14 +509,35 @@ impl AutoBackupManager {
                     // 为新控制器启动任务执行循环
                     let ctrl_clone = ctrl.clone();
                     let manager = Arc::clone(self);
-                    let cfg = config.clone();
+                    let cid = config_id.clone();
 
                     tokio::spawn(async move {
+                        // 每次执行都按 cid 从 manager.configs
+                        // 重新读取最新配置（与 Poll / GlobalPoll 路径同款），避免
+                        // update_config 后旧 snapshot 残留。
                         task_loop(ctrl_clone, || {
                             let m = manager.clone();
-                            let c = cfg.clone();
+                            let cid_inner = cid.clone();
                             async move {
-                                m.execute_backup_for_config(&c).await
+                                match m.get_config(&cid_inner) {
+                                    Some(c) if c.enabled => {
+                                        m.execute_backup_for_config(&c).await
+                                    }
+                                    Some(_) => {
+                                        tracing::debug!(
+                                            "task_loop: 配置 {} 已禁用，跳过本次执行",
+                                            cid_inner
+                                        );
+                                        Ok(())
+                                    }
+                                    None => {
+                                        tracing::debug!(
+                                            "task_loop: 配置 {} 已删除，跳过本次执行",
+                                            cid_inner
+                                        );
+                                        Ok(())
+                                    }
+                                }
                             }
                         }).await;
                     });
@@ -563,6 +618,7 @@ impl AutoBackupManager {
             sync_conflict_strategy: request.sync_conflict_strategy,
             sync_init_mode: request.sync_init_mode,
             needs_full_sync: request.direction == BackupDirection::Sync,
+            owner_uid: request.uid,
         };
 
         // 保存配置
@@ -612,7 +668,7 @@ impl AutoBackupManager {
         // 🔥 冲突校验：防止更新后产生同方向重复任务或上传/下载闭环
         // 构建更新后的路径用于校验
         let updated_local_path = request.local_path.as_ref()
-            .map(|p| PathBuf::from(p))
+            .map(PathBuf::from)
             .unwrap_or_else(|| config.local_path.clone());
         let updated_remote_path = request.remote_path.as_ref()
             .cloned()
@@ -709,9 +765,12 @@ impl AutoBackupManager {
         // 删除所有关联的底层上传/下载任务
         tracing::info!("开始清理配置 {} 的所有关联任务", id);
 
+        // 🔥 按该 config 的 owner_uid 解析目标账号 manager，
+        // 否则跨账号场景下子任务在别的账号 manager 里，清理会漏掉。
+        let cfg_owner_uid = self.configs.get(id).and_then(|c| c.owner_uid).map(crate::auth::Uid::new);
+
         // 批量删除上传任务
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_mgr = self.get_upload_manager();
+        let upload_mgr = self.resolve_upload_manager(cfg_owner_uid);
         if let Some(ref upload_mgr) = upload_mgr {
             let upload_tasks = upload_mgr.get_tasks_by_backup_config(id).await;
             let task_ids: Vec<String> = upload_tasks.iter().map(|t| t.id.clone()).collect();
@@ -723,8 +782,7 @@ impl AutoBackupManager {
         }
 
         // 批量删除下载任务（如果是下载备份配置）
-        // 使用安全获取方法，处理 Weak 引用升级
-        let download_mgr = self.get_download_manager();
+        let download_mgr = self.resolve_download_manager(cfg_owner_uid);
         if let Some(ref download_mgr) = download_mgr {
             let download_tasks = download_mgr.get_tasks_by_backup_config(id).await;
             let task_ids: Vec<String> = download_tasks.iter().map(|t| t.id.clone()).collect();
@@ -778,6 +836,18 @@ impl AutoBackupManager {
 
         tracing::info!("Deleted backup config: {} ({})", config.1.name, id);
 
+        // 🔥 再次精确 unwatch 该 config（防御性：上面 stop_config_services
+        // 在 configs.remove 之前执行，期间如果有 race 让任务循环重新 watch 该 config 的路径，
+        // configs 已经移除该项 → cleanup_idle_services 不会再触碰它 → 多账号场景下其它
+        // config 仍存在时整个 watcher 不会被置空 → 残留路径继续 fire 事件但 config 已不存在。
+        // 这里用精确的 unwatch_config(id) 把当前 config_id 关联的所有路径再扫一次，确保彻底干净。
+        if let Err(e) = self.stop_config_services(id).await {
+            tracing::warn!(
+                "delete_config: 二次精确 unwatch config={} 失败（可忽略）: {}",
+                id, e
+            );
+        }
+
         // 如果没有配置了，停止全局监听器和调度器
         self.cleanup_idle_services().await;
 
@@ -823,6 +893,98 @@ impl AutoBackupManager {
     /// 获取所有备份配置
     pub fn get_all_configs(&self) -> Vec<BackupConfig> {
         self.configs.iter().map(|c| c.clone()).collect()
+    }
+
+    /// 🔥 统计指定 owner_uid 的"运行中"备份任务数量
+    ///
+    /// 用于 `DELETE /accounts/:uid?force=false` 的运行任务保护检查 — 在删除账号
+    /// 前确认目标账号没有进行中的扫描/排队/传输任务，避免静默丢弃用户工作。
+    ///
+    /// "运行中"定义：状态在 `Queued / Preparing / Transferring / Paused` 中任一。
+    /// 终态（`Completed / PartiallyCompleted / Cancelled / Failed`）不计入。
+    ///
+    /// 注意：此方法读 `tasks` DashMap 是 O(N)，但备份任务在终态后会被
+    /// `cleanup_completed_task_static` 清出 DashMap，所以 N 实际上只包含活跃任务。
+    pub fn count_running_tasks_for_owner(&self, owner_uid: u64) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                t.owner_uid == Some(owner_uid)
+                    && matches!(
+                        t.status,
+                        BackupTaskStatus::Queued
+                            | BackupTaskStatus::Preparing
+                            | BackupTaskStatus::Transferring
+                            | BackupTaskStatus::Paused
+                    )
+            })
+            .count()
+    }
+
+    /// 删除指定账号下的所有备份配置
+    ///
+    /// 用于 `force_delete_account` 链路：共享 `AutoBackupManager` 设计下，
+    /// 不能直接 `shutdown()` 该 manager（会停掉其它账号的 watcher / poll），
+    /// 必须只清掉被删账号归属的 config + 任务，保留 manager 自身继续运行。
+    ///
+    /// 行为（每个 config 都走 `delete_config` 全流程）：
+    /// - 取消 TaskController（停止扫描/传输）
+    /// - 批量删除关联的上传/下载子任务
+    /// - 从内存 + DB 删除备份任务记录
+    /// - 移除配置本身
+    /// - 停止 watcher / poll scheduler
+    ///
+    /// 返回删除的配置数。
+    pub async fn delete_configs_for_owner(&self, owner_uid: u64) -> usize {
+        let target_config_ids: Vec<String> = self
+            .configs
+            .iter()
+            .filter(|c| c.owner_uid == Some(owner_uid))
+            .map(|c| c.id.clone())
+            .collect();
+
+        if target_config_ids.is_empty() {
+            tracing::info!(
+                "delete_configs_for_owner: owner_uid={} 没有归属的备份配置",
+                owner_uid
+            );
+            return 0;
+        }
+
+        tracing::info!(
+            "delete_configs_for_owner: 开始删除 owner_uid={} 的 {} 个备份配置",
+            owner_uid,
+            target_config_ids.len()
+        );
+
+        let mut deleted = 0;
+        for cfg_id in &target_config_ids {
+            match self.delete_config(cfg_id).await {
+                Ok(()) => {
+                    deleted += 1;
+                    tracing::info!(
+                        "delete_configs_for_owner: 已删除 config={}（owner_uid={}）",
+                        cfg_id,
+                        owner_uid
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "delete_configs_for_owner: 删除 config={} 失败: {}",
+                        cfg_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            "delete_configs_for_owner: owner_uid={} 完成，删除 {}/{} 个配置",
+            owner_uid,
+            deleted,
+            target_config_ids.len()
+        );
+        deleted
     }
 
     /// 获取所有备份配置（别名，用于兼容）
@@ -1065,7 +1227,7 @@ impl AutoBackupManager {
         let has_active_task = self.tasks.iter().any(|t| {
             t.config_id == config.id && matches!(
                 t.status,
-                BackupTaskStatus::Queued | BackupTaskStatus::Preparing | 
+                BackupTaskStatus::Queued | BackupTaskStatus::Preparing |
                 BackupTaskStatus::Transferring | BackupTaskStatus::Paused
             )
         });
@@ -1121,6 +1283,8 @@ impl AutoBackupManager {
             pending_upload_task_ids: std::collections::HashSet::new(),
             pending_download_task_ids: std::collections::HashSet::new(),
             transfer_task_map: std::collections::HashMap::new(),
+            // 多账号：从所属 config 继承 owner_uid（不持久化到 sqlite）
+            owner_uid: config.owner_uid,
         };
 
         // 保存到内存
@@ -1146,6 +1310,9 @@ impl AutoBackupManager {
             let self_tasks = self.tasks.clone();
             let self_upload_manager = self.upload_manager.clone();
             let self_download_manager = self.download_manager.clone();
+            // 🔥 clone per-uid 池，静态方法按 config.owner_uid 解析 manager
+            let self_upload_manager_pool = self.upload_manager_pool.clone();
+            let self_download_manager_pool = self.download_manager_pool.clone();
             let self_persistence_manager = self.persistence_manager.clone();
             let self_ws_manager = self.ws_manager.clone();
             let self_record_manager = self.record_manager.clone();
@@ -1153,6 +1320,8 @@ impl AutoBackupManager {
             let self_encryption_config_store = self.encryption_config_store.clone();
             let self_proxy_config = self.proxy_config.read().clone();
             let self_fallback_mgr = self.fallback_mgr.read().clone();
+            // clone client_pool Weak 让静态方法按 owner_uid 解析 client
+            let self_client_pool = self.client_pool.clone();
 
             // 在后台任务中执行备份，根据配置方向选择上传或下载
             tokio::spawn(async move {
@@ -1163,6 +1332,7 @@ impl AutoBackupManager {
                             config_clone,
                             self_tasks,
                             self_upload_manager,
+                            self_upload_manager_pool,
                             self_persistence_manager,
                             self_ws_manager,
                             self_record_manager,
@@ -1176,11 +1346,13 @@ impl AutoBackupManager {
                             config_clone,
                             self_tasks,
                             self_download_manager,
+                            self_download_manager_pool,
                             self_persistence_manager,
                             self_ws_manager,
                             self_record_manager,
                             self_proxy_config,
                             self_fallback_mgr,
+                            self_client_pool,
                         ).await
                     }
                     BackupDirection::Sync => {
@@ -1205,6 +1377,8 @@ impl AutoBackupManager {
         config: BackupConfig,
         tasks: Arc<DashMap<String, BackupTask>>,
         upload_manager: Arc<RwLock<Option<Weak<UploadManager>>>>,
+        // 🔥 per-uid 池，按 config.owner_uid 解析目标账号 manager
+        upload_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
         persistence_manager: Arc<BackupPersistenceManager>,
         ws_manager: Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         record_manager: Arc<BackupRecordManager>,
@@ -1235,7 +1409,7 @@ impl AutoBackupManager {
         }
 
         // 发送状态变更事件
-        Self::publish_status_changed_static(&ws_manager, &task_id, "queued", "preparing");
+        Self::publish_status_changed_static(&ws_manager, &task_id, "queued", "preparing", config.owner_uid);
 
         // 🔥 优先复用已恢复的文件任务（重启续传关键：不要覆盖 related_task_id）
         // 注意：这里的 clone 是必要的，因为我们需要在循环中消费 file_tasks
@@ -1471,7 +1645,7 @@ impl AutoBackupManager {
                 task.status = BackupTaskStatus::Completed;
                 task.completed_at = Some(Utc::now());
             }
-            Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "completed");
+            Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "completed", config.owner_uid);
             // 发送任务完成事件
             if let Some(task) = tasks.get(&task_id) {
                 Self::publish_task_completed_static(&ws_manager, &task);
@@ -1480,14 +1654,17 @@ impl AutoBackupManager {
         }
 
         // 发送状态变更事件
-        Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring");
+        Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring", config.owner_uid);
 
         // 阶段 2：执行上传
-        // 使用 Weak 引用升级获取 Arc
-        let upload_mgr = {
-            let guard = upload_manager.read();
-            guard.as_ref().and_then(|weak| weak.upgrade())
-        };
+        // 🔥 按 config.owner_uid 从 per-uid 池解析目标账号 manager，
+        // 避免 owner=A 的子任务被错误插入 active=B 的 upload manager。
+        let owner_uid = config.owner_uid.map(crate::auth::Uid::new);
+        let upload_mgr = Self::resolve_upload_manager_static(
+            &upload_manager_pool,
+            &upload_manager,
+            owner_uid,
+        );
 
         let upload_mgr = match upload_mgr {
             Some(mgr) => mgr,
@@ -1562,7 +1739,7 @@ impl AutoBackupManager {
                         upload_task_id
                     );
 
-                    // 🔥 【关键修复】续传失败时，删除旧的上传任务（清 WAL，避免下次又被恢复）
+                    // 续传失败时，删除旧的上传任务（清 WAL，避免下次又被恢复）
                     if let Err(e) = upload_mgr.delete_task(upload_task_id).await {
                         tracing::warn!(
                             "删除续传失败的旧上传任务失败: upload_task={}, error={}",
@@ -1604,6 +1781,31 @@ impl AutoBackupManager {
                 .unwrap_or(crate::uploader::conflict::UploadConflictStrategy::SmartDedup);
 
             // 创建并启动上传任务
+            // 硬失败而非回退 Uid(0)
+            // 原因：QR 登录首次或多账号场景下 backfill 可能未执行，
+            //       config.owner_uid 仍为 None。回退 Uid(0) 会污染任务归属
+            //       （事件过滤、预算、删除账号扫描都会错）。
+            //       此处遇到 None 直接把该文件标记 Failed 并 continue。
+            let task_owner_uid = match config.owner_uid {
+                Some(v) => crate::auth::Uid::new(v),
+                None => {
+                    tracing::error!(
+                        "create_backup_task: config={} 缺失 owner_uid，跳过文件并标记失败: \
+                         file_task={}（请通过 UI 重新关联账号后重试）",
+                        config.id, file_task_id
+                    );
+                    if let Some(mut task) = tasks.get_mut(&task_id) {
+                        task.failed_count += 1;
+                        if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                            ft.status = BackupFileStatus::Failed;
+                            ft.error_message =
+                                Some("owner_uid 缺失，无法创建子任务".to_string());
+                            ft.updated_at = Utc::now();
+                        }
+                    }
+                    continue;
+                }
+            };
             match upload_mgr.create_backup_task(
                 local_path.clone(),
                 remote_path.clone(),
@@ -1612,6 +1814,7 @@ impl AutoBackupManager {
                 Some(task_id.clone()),
                 Some(file_task_id.clone()),
                 Some(upload_strategy), // 传递冲突策略
+                task_owner_uid,
             ).await {
                 Ok(upload_task_id) => {
                     tracing::debug!("备份上传任务已创建: upload_task={}, file={:?}", upload_task_id, local_path);
@@ -1688,7 +1891,7 @@ impl AutoBackupManager {
                 }
 
                 let final_status = format!("{:?}", task.status).to_lowercase();
-                Self::publish_status_changed_static(&ws_manager, &task_id, "transferring", &final_status);
+                Self::publish_status_changed_static(&ws_manager, &task_id, "transferring", &final_status, task.owner_uid);
 
                 // 发送任务完成/失败事件
                 match task.status {
@@ -1697,7 +1900,7 @@ impl AutoBackupManager {
                     }
                     BackupTaskStatus::Failed => {
                         let error_msg = task.error_message.clone().unwrap_or_else(|| "所有文件传输失败".to_string());
-                        Self::publish_task_failed_static(&ws_manager, &task_id, &error_msg);
+                        Self::publish_task_failed_static(&ws_manager, &task_id, &error_msg, task.owner_uid);
                     }
                     _ => {}
                 }
@@ -1723,14 +1926,16 @@ impl AutoBackupManager {
         config: BackupConfig,
         tasks: Arc<DashMap<String, BackupTask>>,
         download_manager: Arc<RwLock<Option<Weak<DownloadManager>>>>,
+        // 🔥 per-uid 池，按 config.owner_uid 解析目标账号 manager
+        download_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<DownloadManager>>>>>>,
         persistence_manager: Arc<BackupPersistenceManager>,
         ws_manager: Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         record_manager: Arc<BackupRecordManager>,
         proxy_config: Option<ProxyConfig>,
         fallback_mgr: Option<Arc<ProxyFallbackManager>>,
+        // 按 owner_uid 严格路由 client，禁止 legacy session.json fallback
+        client_pool: Arc<RwLock<Option<Weak<tokio::sync::RwLock<crate::netdisk::ClientPool>>>>>,
     ) -> Result<()> {
-        use crate::auth::SessionManager;
-
         tracing::info!("开始执行下载备份任务: task={}, config={}", task_id, config.id);
 
         // 更新任务状态为准备中
@@ -1740,14 +1945,16 @@ impl AutoBackupManager {
         }
 
         // 发送状态变更事件
-        Self::publish_status_changed_static(&ws_manager, &task_id, "queued", "preparing");
+        Self::publish_status_changed_static(&ws_manager, &task_id, "queued", "preparing", config.owner_uid);
 
         // 获取下载管理器
-        // 使用 Weak 引用升级获取 Arc
-        let download_mgr = {
-            let guard = download_manager.read();
-            guard.as_ref().and_then(|weak| weak.upgrade())
-        };
+        // 🔥 按 config.owner_uid 从 per-uid 池解析目标账号 manager
+        let owner_uid = config.owner_uid.map(crate::auth::Uid::new);
+        let download_mgr = Self::resolve_download_manager_static(
+            &download_manager_pool,
+            &download_manager,
+            owner_uid,
+        );
 
         let download_mgr = match download_mgr {
             Some(mgr) => mgr,
@@ -1793,7 +2000,7 @@ impl AutoBackupManager {
             if let Some(mut task) = tasks.get_mut(&task_id) {
                 task.status = BackupTaskStatus::Transferring;
             }
-            Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring");
+            Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring", config.owner_uid);
 
             let mut created_count = 0;
 
@@ -1882,6 +2089,27 @@ impl AutoBackupManager {
                         let download_strategy = config.download_conflict_strategy
                             .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
 
+                        // 硬失败而非回退 Uid(0)
+                        let task_owner_uid = match config.owner_uid {
+                            Some(v) => crate::auth::Uid::new(v),
+                            None => {
+                                tracing::error!(
+                                    "create_backup_task: config={} 缺失 owner_uid，\
+                                     跳过文件并标记失败: file_task={}（请通过 UI 重新关联账号）",
+                                    config.id, file_task_id
+                                );
+                                if let Some(mut task) = tasks.get_mut(&task_id) {
+                                    task.failed_count += 1;
+                                    if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                                        ft.status = BackupFileStatus::Failed;
+                                        ft.error_message =
+                                            Some("owner_uid 缺失，无法创建子任务".to_string());
+                                        ft.updated_at = Utc::now();
+                                    }
+                                }
+                                continue;
+                            }
+                        };
                         match download_mgr.create_backup_task(
                             fs_id,
                             remote_path.clone(),
@@ -1889,6 +2117,7 @@ impl AutoBackupManager {
                             file_task.file_size,
                             config.id.clone(),
                             Some(download_strategy), // 传递冲突策略
+                            task_owner_uid,
                         ).await {
                             Ok(new_download_task_id) => {
                                 // 检查是否为跳过标记
@@ -1959,6 +2188,27 @@ impl AutoBackupManager {
                     let download_strategy = config.download_conflict_strategy
                         .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
 
+                    // 硬失败而非回退 Uid(0)
+                    let task_owner_uid = match config.owner_uid {
+                        Some(v) => crate::auth::Uid::new(v),
+                        None => {
+                            tracing::error!(
+                                "create_backup_task: config={} 缺失 owner_uid，\
+                                 跳过文件并标记失败: file_task={}（请通过 UI 重新关联账号）",
+                                config.id, file_task_id
+                            );
+                            if let Some(mut task) = tasks.get_mut(&task_id) {
+                                task.failed_count += 1;
+                                if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                                    ft.status = BackupFileStatus::Failed;
+                                    ft.error_message =
+                                        Some("owner_uid 缺失，无法创建子任务".to_string());
+                                    ft.updated_at = Utc::now();
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     match download_mgr.create_backup_task(
                         fs_id,
                         remote_path.clone(),
@@ -1966,6 +2216,7 @@ impl AutoBackupManager {
                         file_task.file_size,
                         config.id.clone(),
                         Some(download_strategy), // 传递冲突策略
+                        task_owner_uid,
                     ).await {
                         Ok(new_download_task_id) => {
                             // 检查是否为跳过标记
@@ -2077,7 +2328,7 @@ impl AutoBackupManager {
                         tracing::warn!("持久化备份任务失败: {}", e);
                     }
                     let final_status = format!("{:?}", task.status).to_lowercase();
-                    Self::publish_status_changed_static(&ws_manager, &task_id, "transferring", &final_status);
+                    Self::publish_status_changed_static(&ws_manager, &task_id, "transferring", &final_status, task.owner_uid);
 
                     // 发送任务完成/失败事件
                     match task.status {
@@ -2086,7 +2337,7 @@ impl AutoBackupManager {
                         }
                         BackupTaskStatus::Failed => {
                             let error_msg = task.error_message.clone().unwrap_or_else(|| "所有文件传输失败".to_string());
-                            Self::publish_task_failed_static(&ws_manager, &task_id, &error_msg);
+                            Self::publish_task_failed_static(&ws_manager, &task_id, &error_msg, task.owner_uid);
                         }
                         _ => {}
                     }
@@ -2099,40 +2350,28 @@ impl AutoBackupManager {
             return Ok(());
         }
 
-        // 创建网盘客户端用于获取文件列表
-        let mut session_manager = SessionManager::new(None);
-        let session = match session_manager.load_session().await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                tracing::error!("未登录，无法执行下载备份: task={}", task_id);
-                if let Some(mut task) = tasks.get_mut(&task_id) {
-                    task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some("未登录".to_string());
-                    task.completed_at = Some(Utc::now());
-                }
-                return Err(anyhow!("未登录"));
-            }
-            Err(e) => {
-                tracing::error!("加载会话失败: task={}, error={}", task_id, e);
-                if let Some(mut task) = tasks.get_mut(&task_id) {
-                    task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some(format!("加载会话失败: {}", e));
-                    task.completed_at = Some(Utc::now());
-                }
-                return Err(anyhow!("加载会话失败: {}", e));
-            }
-        };
-
-        let client = match crate::netdisk::NetdiskClient::new_with_proxy(session, proxy_config.as_ref(), fallback_mgr) {
+        // 严格按 config.owner_uid 从 client_pool 取目标账号
+        // client；不再回退 legacy session.json（迁移后会读错账号或"未登录"）。
+        let client = match Self::resolve_netdisk_client_for_config_static(
+            &config,
+            proxy_config.as_ref(),
+            fallback_mgr.as_ref(),
+            &client_pool,
+        )
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("创建网盘客户端失败: task={}, error={}", task_id, e);
+                tracing::error!(
+                    "下载备份任务无法解析目标账号 client: task={}, config={}, owner_uid={:?}, error={}",
+                    task_id, config.id, config.owner_uid, e
+                );
                 if let Some(mut task) = tasks.get_mut(&task_id) {
                     task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some(format!("创建网盘客户端失败: {}", e));
+                    task.error_message = Some(format!("无法解析目标账号客户端: {}", e));
                     task.completed_at = Some(Utc::now());
                 }
-                return Err(anyhow!("创建网盘客户端失败: {}", e));
+                return Err(anyhow!("无法解析目标账号客户端: {}", e));
             }
         };
 
@@ -2356,7 +2595,7 @@ impl AutoBackupManager {
                 task.status = BackupTaskStatus::Completed;
                 task.completed_at = Some(Utc::now());
             }
-            Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "completed");
+            Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "completed", config.owner_uid);
             // 发送任务完成事件
             if let Some(task) = tasks.get(&task_id) {
                 Self::publish_task_completed_static(&ws_manager, &task);
@@ -2365,7 +2604,7 @@ impl AutoBackupManager {
         }
 
         // 发送状态变更事件
-        Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring");
+        Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring", config.owner_uid);
 
         // 阶段 2：批量创建和启动所有下载任务（立即返回，不等待）
         let mut created_count = 0;
@@ -2415,6 +2654,27 @@ impl AutoBackupManager {
                 .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
 
             // 创建并启动备份下载任务
+            // 硬失败而非回退 Uid(0)
+            let task_owner_uid = match config.owner_uid {
+                Some(v) => crate::auth::Uid::new(v),
+                None => {
+                    tracing::error!(
+                        "create_backup_task: config={} 缺失 owner_uid，\
+                         跳过文件并标记失败: file_task={}（请通过 UI 重新关联账号）",
+                        config.id, file_task_id
+                    );
+                    if let Some(mut task) = tasks.get_mut(&task_id) {
+                        task.failed_count += 1;
+                        if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
+                            ft.status = BackupFileStatus::Failed;
+                            ft.error_message =
+                                Some("owner_uid 缺失，无法创建子任务".to_string());
+                            ft.updated_at = Utc::now();
+                        }
+                    }
+                    continue;
+                }
+            };
             match download_mgr.create_backup_task(
                 fs_id,
                 remote_path.clone(),
@@ -2422,6 +2682,7 @@ impl AutoBackupManager {
                 file_size,
                 config.id.clone(),
                 Some(download_strategy), // 传递冲突策略
+                task_owner_uid,
             ).await {
                 Ok(download_task_id) => {
                     // 检查是否为跳过标记
@@ -2511,7 +2772,7 @@ impl AutoBackupManager {
                 }
 
                 let final_status = format!("{:?}", task.status).to_lowercase();
-                Self::publish_status_changed_static(&ws_manager, &task_id, "transferring", &final_status);
+                Self::publish_status_changed_static(&ws_manager, &task_id, "transferring", &final_status, task.owner_uid);
 
                 // 发送任务完成/失败事件
                 match task.status {
@@ -2520,7 +2781,7 @@ impl AutoBackupManager {
                     }
                     BackupTaskStatus::Failed => {
                         let error_msg = task.error_message.clone().unwrap_or_else(|| "所有文件传输失败".to_string());
-                        Self::publish_task_failed_static(&ws_manager, &task_id, &error_msg);
+                        Self::publish_task_failed_static(&ws_manager, &task_id, &error_msg, task.owner_uid);
                     }
                     _ => {}
                 }
@@ -2539,11 +2800,15 @@ impl AutoBackupManager {
     }
 
     /// 发送状态变更事件（静态方法）
+    ///
+    /// 必须显式传入 `owner_uid`，由调用方
+    /// 在持有 `tasks` 引用时从 `task.owner_uid` / `config.owner_uid` 取出。
     fn publish_status_changed_static(
         ws_manager: &Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         task_id: &str,
         old_status: &str,
         new_status: &str,
+        owner_uid: Option<u64>,
     ) {
         let ws = ws_manager.read();
         if let Some(ref weak) = *ws {
@@ -2553,6 +2818,8 @@ impl AutoBackupManager {
                         task_id: task_id.to_string(),
                         old_status: old_status.to_string(),
                         new_status: new_status.to_string(),
+
+                        owner_uid,
                     }),
                     None,
                 );
@@ -2577,6 +2844,10 @@ impl AutoBackupManager {
                         total_count: task.total_count,
                         transferred_bytes: task.transferred_bytes,
                         total_bytes: task.total_bytes,
+
+                        // 从 task 直接取（task.owner_uid 已由
+                        // create_task / restore 路径回填到 config.owner_uid）。
+                        owner_uid: task.owner_uid,
                     }),
                     None,
                 );
@@ -2599,6 +2870,8 @@ impl AutoBackupManager {
                         success_count: task.completed_count,
                         failed_count: task.failed_count,
                         skipped_count: task.skipped_count,
+
+                        owner_uid: task.owner_uid,
                     }),
                     None,
                 );
@@ -2607,10 +2880,13 @@ impl AutoBackupManager {
     }
 
     /// 发送任务失败事件（静态方法）
+    ///
+    /// 调用方需显式传 `owner_uid`。
     fn publish_task_failed_static(
         ws_manager: &Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         task_id: &str,
         error: &str,
+        owner_uid: Option<u64>,
     ) {
         let ws = ws_manager.read();
         if let Some(ref weak) = *ws {
@@ -2619,6 +2895,8 @@ impl AutoBackupManager {
                     TaskEvent::Backup(WsBackupEvent::Failed {
                         task_id: task_id.to_string(),
                         error: error.to_string(),
+
+                        owner_uid,
                     }),
                     None,
                 );
@@ -2633,6 +2911,7 @@ impl AutoBackupManager {
         ws_manager: &Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         task_id: &str,
         file_task: &BackupFileTask,
+        owner_uid: Option<u64>,
     ) {
         let ws = ws_manager.read();
         if let Some(ref weak) = *ws {
@@ -2661,6 +2940,8 @@ impl AutoBackupManager {
                         transferred_bytes: file_task.transferred_bytes,
                         total_bytes: file_task.file_size,
                         status: status.to_string(),
+
+                        owner_uid,
                     }),
                     None,
                 );
@@ -2678,6 +2959,7 @@ impl AutoBackupManager {
         file_name: &str,
         old_status: &str,
         new_status: &str,
+        owner_uid: Option<u64>,
     ) {
         let ws = ws_manager.read();
         if let Some(ref weak) = *ws {
@@ -2689,6 +2971,8 @@ impl AutoBackupManager {
                         file_name: file_name.to_string(),
                         old_status: old_status.to_string(),
                         new_status: new_status.to_string(),
+
+                        owner_uid,
                     }),
                     None,
                 );
@@ -2841,6 +3125,16 @@ impl AutoBackupManager {
             }
         }
 
+        // DB schema 不存 owner_uid，从所属 config 补齐
+        let config_owner_uid = self.configs.get(config_id).and_then(|c| c.owner_uid);
+        if let Some(uid) = config_owner_uid {
+            for task in &mut result {
+                if task.owner_uid.is_none() {
+                    task.owner_uid = Some(uid);
+                }
+            }
+        }
+
         (result, total)
     }
 
@@ -2876,16 +3170,27 @@ impl AutoBackupManager {
             }
         }
 
+        // DB schema 不存 owner_uid，从所属 config 补齐
+        let config_owner_uid = self.configs.get(config_id).and_then(|c| c.owner_uid);
+        if let Some(uid) = config_owner_uid {
+            for task in &mut result {
+                if task.owner_uid.is_none() {
+                    task.owner_uid = Some(uid);
+                }
+            }
+        }
+
         (result, total)
     }
     /// 轻量拷贝 BackupTask，跳过 pending_files 等大字段（用于 API 响应）
     fn lightweight_clone_task(task: &BackupTask) -> BackupTask {
         BackupTask {
+            owner_uid: task.owner_uid,
             id: task.id.clone(),
             config_id: task.config_id.clone(),
-            status: task.status.clone(),
+            status: task.status,
             sub_phase: task.sub_phase,
-            trigger_type: task.trigger_type.clone(),
+            trigger_type: task.trigger_type,
             pending_files: Vec::new(),
             completed_count: task.completed_count,
             failed_count: task.failed_count,
@@ -3141,9 +3446,11 @@ impl AutoBackupManager {
             }
         };
 
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_manager = self.get_upload_manager();
-        let download_manager = self.get_download_manager();
+        // 🔥 以持久化的 BackupConfig.owner_uid 解析目标账号 manager
+        // （task.owner_uid 未持久化，不可作为依据）。
+        let owner_uid = self.owner_uid_for_config(&config_id);
+        let upload_manager = self.resolve_upload_manager(owner_uid);
+        let download_manager = self.resolve_download_manager(owner_uid);
 
         // 批量删除所有关联的上传任务（避免逐个删除导致的 O(n²) 锁竞争）
         let mut deleted_uploads = 0;
@@ -3196,7 +3503,9 @@ impl AutoBackupManager {
         };
 
         // 更新备份任务状态
-        if let Some(mut task) = self.tasks.get_mut(task_id) {
+        // 🔥 防自死锁：在 get_mut 写 guard 内先取出 old_status/owner_uid，
+        // 释放 guard 后再 publish（publish_status_changed 会反查 self.tasks.get → 同 shard 重入死锁）
+        let status_change = if let Some(mut task) = self.tasks.get_mut(task_id) {
             let old_status = format!("{:?}", task.status);
             task.status = BackupTaskStatus::Cancelled;
             task.completed_at = Some(Utc::now());
@@ -3206,8 +3515,14 @@ impl AutoBackupManager {
                 tracing::error!("持久化取消状态失败: task={}, error={}", task_id, e);
             }
 
-            // 发送状态变更事件
-            self.publish_status_changed(task_id, &old_status, "Cancelled");
+            Some((old_status, task.owner_uid))
+        } else {
+            None
+        };
+
+        // 发送状态变更事件（已释放 get_mut guard）
+        if let Some((old_status, owner_uid)) = status_change {
+            self.publish_status_changed_with_owner(task_id, &old_status, "Cancelled", owner_uid);
         }
 
         // 🔥 内存优化：任务取消后从 DashMap 移除
@@ -3227,7 +3542,7 @@ impl AutoBackupManager {
     /// 删除时会同时删除所有关联的底层上传/下载任务
     pub async fn delete_task(&self, task_id: &str) -> Result<()> {
         // 先收集需要删除的子任务ID
-        let (pending_uploads, pending_downloads) = {
+        let (pending_uploads, pending_downloads, config_id) = {
             // 先尝试从内存获取
             if let Some(task) = self.tasks.get(task_id) {
                 // 检查是否可删除（活跃任务不可删除）
@@ -3243,6 +3558,7 @@ impl AutoBackupManager {
                 (
                     task.pending_upload_task_ids.iter().cloned().collect::<Vec<_>>(),
                     task.pending_download_task_ids.iter().cloned().collect::<Vec<_>>(),
+                    task.config_id.clone(),
                 )
             } else {
                 // 内存中没有，尝试从 DB 加载
@@ -3260,6 +3576,7 @@ impl AutoBackupManager {
                         (
                             task.pending_upload_task_ids.iter().cloned().collect::<Vec<_>>(),
                             task.pending_download_task_ids.iter().cloned().collect::<Vec<_>>(),
+                            task.config_id.clone(),
                         )
                     }
                     Ok(None) => {
@@ -3272,9 +3589,10 @@ impl AutoBackupManager {
             }
         };
 
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_manager = self.get_upload_manager();
-        let download_manager = self.get_download_manager();
+        // 🔥 以持久化的 BackupConfig.owner_uid 解析目标账号 manager
+        let owner_uid = self.owner_uid_for_config(&config_id);
+        let upload_manager = self.resolve_upload_manager(owner_uid);
+        let download_manager = self.resolve_download_manager(owner_uid);
 
         // 删除所有关联的上传任务
         let mut deleted_uploads = 0;
@@ -3327,7 +3645,7 @@ impl AutoBackupManager {
     pub async fn pause_task(&self, task_id: &str) -> Result<()> {
         // 步骤7: 操作接口限制为活跃任务
         // 先收集需要暂停的底层任务ID，避免持有 DashMap 锁时调用 async 方法
-        let (pending_uploads, pending_downloads) = {
+        let (pending_uploads, pending_downloads, config_id) = {
             let task = self.tasks.get(task_id)
                 .ok_or_else(|| anyhow!("任务已完成或不存在，无法操作: {}", task_id))?;
 
@@ -3336,6 +3654,7 @@ impl AutoBackupManager {
                     (
                         task.pending_upload_task_ids.iter().cloned().collect::<Vec<_>>(),
                         task.pending_download_task_ids.iter().cloned().collect::<Vec<_>>(),
+                        task.config_id.clone(),
                     )
                 }
                 BackupTaskStatus::Paused => {
@@ -3347,9 +3666,10 @@ impl AutoBackupManager {
             }
         };
 
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_manager = self.get_upload_manager();
-        let download_manager = self.get_download_manager();
+        // 🔥 以持久化的 BackupConfig.owner_uid 解析目标账号 manager
+        let owner_uid = self.owner_uid_for_config(&config_id);
+        let upload_manager = self.resolve_upload_manager(owner_uid);
+        let download_manager = self.resolve_download_manager(owner_uid);
 
         // 暂停所有关联的上传任务
         // skip_try_start_waiting = true，避免暂停一个任务后立即启动另一个等待任务
@@ -3402,7 +3722,8 @@ impl AutoBackupManager {
         }
 
         // 更新备份任务状态并持久化
-        if let Some(mut task) = self.tasks.get_mut(task_id) {
+        // 🔥 防自死锁：guard 内取出 old_status/owner_uid，释放后再 publish
+        let status_change = if let Some(mut task) = self.tasks.get_mut(task_id) {
             let old_status = format!("{:?}", task.status);
             task.status = BackupTaskStatus::Paused;
 
@@ -3411,8 +3732,14 @@ impl AutoBackupManager {
                 tracing::error!("持久化暂停状态失败: task={}, error={}", task_id, e);
             }
 
-            // 发送状态变更事件
-            self.publish_status_changed(task_id, &old_status, "Paused");
+            Some((old_status, task.owner_uid))
+        } else {
+            None
+        };
+
+        // 发送状态变更事件（已释放 get_mut guard）
+        if let Some((old_status, owner_uid)) = status_change {
+            self.publish_status_changed_with_owner(task_id, &old_status, "Paused", owner_uid);
         }
 
         // 发送暂停事件
@@ -3431,7 +3758,7 @@ impl AutoBackupManager {
     pub async fn resume_task(&self, task_id: &str) -> Result<()> {
         // 步骤7: 操作接口限制为活跃任务
         // 先收集需要恢复的底层任务ID，避免持有 DashMap 锁时调用 async 方法
-        let (pending_uploads, pending_downloads) = {
+        let (pending_uploads, pending_downloads, config_id) = {
             let task = self.tasks.get(task_id)
                 .ok_or_else(|| anyhow!("任务已完成或不存在，无法操作: {}", task_id))?;
 
@@ -3440,6 +3767,7 @@ impl AutoBackupManager {
                     (
                         task.pending_upload_task_ids.iter().cloned().collect::<Vec<_>>(),
                         task.pending_download_task_ids.iter().cloned().collect::<Vec<_>>(),
+                        task.config_id.clone(),
                     )
                 }
                 _ => {
@@ -3448,9 +3776,10 @@ impl AutoBackupManager {
             }
         };
 
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_manager = self.get_upload_manager();
-        let download_manager = self.get_download_manager();
+        // 🔥 以持久化的 BackupConfig.owner_uid 解析目标账号 manager
+        let owner_uid = self.owner_uid_for_config(&config_id);
+        let upload_manager = self.resolve_upload_manager(owner_uid);
+        let download_manager = self.resolve_download_manager(owner_uid);
 
         // 恢复所有关联的上传任务
         if let Some(ref upload_mgr) = upload_manager {
@@ -3487,7 +3816,8 @@ impl AutoBackupManager {
         }
 
         // 更新备份任务状态为 Transferring（如果有正在传输的任务）或 Queued，并持久化
-        if let Some(mut task) = self.tasks.get_mut(task_id) {
+        // 🔥 防自死锁：guard 内取出 old_status/new_status/owner_uid，释放后再 publish
+        let status_change = if let Some(mut task) = self.tasks.get_mut(task_id) {
             let old_status = format!("{:?}", task.status);
 
             // 如果有待处理的传输任务，设置为 Transferring，否则设置为 Queued
@@ -3504,8 +3834,14 @@ impl AutoBackupManager {
                 tracing::error!("持久化恢复状态失败: task={}, error={}", task_id, e);
             }
 
-            // 发送状态变更事件
-            self.publish_status_changed(task_id, &old_status, &new_status);
+            Some((old_status, new_status, task.owner_uid))
+        } else {
+            None
+        };
+
+        // 发送状态变更事件（已释放 get_mut guard）
+        if let Some((old_status, new_status, owner_uid)) = status_change {
+            self.publish_status_changed_with_owner(task_id, &old_status, &new_status, owner_uid);
         }
 
         // 发送恢复事件
@@ -3693,6 +4029,90 @@ impl AutoBackupManager {
     }
 
     // ==================== 配置持久化 ====================
+
+    /// 启动期回填老配置和内存任务缺失的 `owner_uid`。
+    ///
+    /// 与 `persistence::migration::backfill_history_owner_uid` 的对比说明：
+    ///
+    /// - `task_history` / `folder_history` 是 SQL 一刀切 `UPDATE`，影响**所有**
+    ///   历史记录（多账号场景下其他账号的历史会被错误归并到 active_uid），
+    ///   风险大 → 多账号严格跳过。
+    /// - `autobackup_configs.json` 是**用户可见可控**的 JSON 配置文件（每个
+    ///   用户最多几十条 config，UI 列表可直接看到），即使多账号场景下把缺
+    ///   `owner_uid` 的老 config 归到 active_uid，用户在 UI 中能立即看到并
+    ///   通过更新 API 修正 → 多账号也回填，但打印 warn 日志列出受影响 config_id。
+    ///
+    /// 两步：
+    /// - **Step 1: config 回填**（无账号数限制，多账号场景仅打 warn）
+    /// - **Step 2: 内存 task 回填**（从所属 config 同步，无归并风险）
+    ///
+    /// 幂等：所有循环都仅对 `owner_uid is None` 的条目操作。
+    pub async fn backfill_configs_owner_uid(
+        &self,
+        uid: u64,
+        account_count: usize,
+    ) -> Result<usize> {
+        // ── Step 1: 回填 config.owner_uid（落盘 autobackup_configs.json） ──
+        let mut updated_config_ids: Vec<String> = Vec::new();
+        for mut entry in self.configs.iter_mut() {
+            if entry.value().owner_uid.is_none() {
+                entry.value_mut().owner_uid = Some(uid);
+                updated_config_ids.push(entry.key().clone());
+            }
+        }
+        if !updated_config_ids.is_empty() {
+            self.save_configs().await?;
+        }
+
+        // ── Step 2: 内存 task 从所属 config 同步 owner_uid ──
+        // 关键修复：`restore_incomplete_tasks` 从 SQLite 加载 task 后 owner_uid
+        // 总是 None（`backup_tasks` 表无该列）。本循环把"config 上已经存在的
+        // owner_uid"同步到内存 task。幂等：已设值的 task 跳过。
+        let mut backfilled_task_count: usize = 0;
+        for mut task_entry in self.tasks.iter_mut() {
+            if task_entry.value().owner_uid.is_some() {
+                continue;
+            }
+            let cfg_owner_uid = self
+                .configs
+                .get(&task_entry.value().config_id)
+                .and_then(|c| c.owner_uid);
+            if let Some(cfg_uid) = cfg_owner_uid {
+                task_entry.value_mut().owner_uid = Some(cfg_uid);
+                backfilled_task_count += 1;
+            }
+        }
+
+        // ── Step 3: 日志（多账号 config 回填用 warn，其他用 info） ──
+        match (updated_config_ids.len(), backfilled_task_count) {
+            (0, 0) => {} // 全是已迁移数据，no-op
+            (0, _) => {
+                tracing::info!(
+                    "backfill_configs_owner_uid: 内存 task 同步 owner_uid {} 条（config 已有 owner_uid，无需变更）",
+                    backfilled_task_count
+                );
+            }
+            (n, _) if account_count > 1 => {
+                tracing::warn!(
+                    "backfill_configs_owner_uid: 多账号场景（{}个账号）下回填了 {} 条旧备份配置 owner_uid={}（这些 config 是单账号升级遗留数据，归属当前活跃账号是经验猜测；如归属错误请通过更新 API 修正）。同时同步内存 task {} 条。受影响配置: {:?}",
+                    account_count,
+                    n,
+                    uid,
+                    backfilled_task_count,
+                    updated_config_ids
+                );
+            }
+            (n, _) => {
+                tracing::info!(
+                    "backfill_configs_owner_uid: config 回填 {} 条 owner_uid={}（单账号场景），内存 task 同步 {} 条",
+                    n,
+                    uid,
+                    backfilled_task_count
+                );
+            }
+        }
+        Ok(updated_config_ids.len())
+    }
 
     /// 保存配置到文件
     async fn save_configs(&self) -> Result<()> {
@@ -4075,6 +4495,218 @@ impl AutoBackupManager {
         tracing::info!("自动备份管理器已设置上传管理器（Weak 引用）");
     }
 
+    /// 🔥 注入 per-uid 上传管理器池
+    ///
+    /// 与 `AppState.upload_managers` 共享同一份 `Arc<DashMap>`，使备份子任务能按
+    /// `BackupConfig.owner_uid` 解析到正确账号的 `UploadManager`，而非固定 active。
+    pub fn set_upload_manager_pool(
+        &self,
+        pool: Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>,
+    ) {
+        *self.upload_manager_pool.write() = Some(pool);
+        tracing::info!("自动备份管理器已注入 per-uid 上传管理器池");
+    }
+
+    /// 🔥 注入 per-uid 下载管理器池
+    pub fn set_download_manager_pool(
+        &self,
+        pool: Arc<DashMap<crate::auth::Uid, Arc<DownloadManager>>>,
+    ) {
+        *self.download_manager_pool.write() = Some(pool);
+        tracing::info!("自动备份管理器已注入 per-uid 下载管理器池");
+    }
+
+    /// 🔥 注入 `ClientPool` Weak 引用
+    ///
+    /// 远端扫描 / 下载 / 同步快照路径用此池按 `BackupConfig.owner_uid` 解析目标账号
+    /// `NetdiskClient`，取代 legacy `SessionManager::load_session()` fallback。
+    pub fn set_client_pool(
+        &self,
+        pool: Arc<tokio::sync::RwLock<crate::netdisk::ClientPool>>,
+    ) {
+        *self.client_pool.write() = Some(Arc::downgrade(&pool));
+        tracing::info!("自动备份管理器已注入 ClientPool（Weak 引用）");
+    }
+
+    /// 🔥 按 `BackupConfig.owner_uid` 解析对应账号的 `NetdiskClient`
+    ///
+    /// 严格按 owner_uid 路由：
+    /// - `owner_uid = Some(uid)` → 必须从 `client_pool` 命中目标账号 client；命中失败
+    ///   返回 `Err`（拒绝 fallback active client / legacy session）。
+    /// - `owner_uid = None` → 仅在单账号兼容场景出现（旧配置缺 owner_uid）；此时
+    ///   按 `active_uid` 路由（如有），未登录则 `Err`。
+    ///
+    /// **不允许**回退到 `SessionManager::new(None).load_session()` — 那条路径在多账号
+    /// 迁移后会读到错误账号或"未登录"。
+    pub(crate) async fn resolve_netdisk_client_for_config(
+        &self,
+        config: &BackupConfig,
+        proxy: Option<&ProxyConfig>,
+        fallback: Option<Arc<ProxyFallbackManager>>,
+    ) -> Result<crate::netdisk::NetdiskClient> {
+        let pool_arc_opt: Option<Arc<tokio::sync::RwLock<crate::netdisk::ClientPool>>> = {
+            let g = self.client_pool.read();
+            g.as_ref().and_then(|w| w.upgrade())
+        };
+        let pool_arc = pool_arc_opt
+            .ok_or_else(|| anyhow!("client_pool 未注入或已被 drop（自动备份初始化未完成？）"))?;
+
+        if let Some(raw_uid) = config.owner_uid {
+            let uid = crate::auth::Uid::new(raw_uid);
+            // 严格按 owner_uid 命中
+            let pool = pool_arc.read().await;
+            let client_arc = pool.get_client(uid).ok_or_else(|| {
+                anyhow!(
+                    "config={} owner_uid={} 在 client_pool 中无对应客户端（账号未登录或已删除）",
+                    config.id,
+                    uid.raw()
+                )
+            })?;
+            return Ok((*client_arc).clone());
+        }
+
+        // owner_uid = None（兼容旧配置）：按 active_uid 路由，**不**走 session.json
+        // 这条路径只在迁移期出现；正确做法是通过 backfill 把 owner_uid 补齐。
+        // 这里需要 active_uid，但 AutoBackupManager 不持有 AppState；折中方案：
+        // 直接构造 NetdiskClient 仍不可行。于是我们要求调用方在 config.owner_uid =
+        // None 时通过 backfill 流程补齐 owner_uid，runtime 此处直接返回错误以
+        // 暴露问题（避免静默串账号）。
+        let _ = (proxy, fallback);
+        Err(anyhow!(
+            "config={} 缺少 owner_uid，无法解析目标账号 client（请通过 UI 重新关联账号 / 启动期 backfill）",
+            config.id
+        ))
+    }
+
+    /// 🔥 静态版本的 `resolve_netdisk_client_for_config`
+    ///
+    /// 供 `execute_download_backup_task_internal` 等不持有 `&self` 的静态执行路径使用。
+    /// 语义与实例方法等同：严格按 `config.owner_uid` 路由 client_pool；
+    /// `owner_uid = None` 直接返回错误（不走 legacy session.json）。
+    async fn resolve_netdisk_client_for_config_static(
+        config: &BackupConfig,
+        _proxy: Option<&ProxyConfig>,
+        _fallback: Option<&Arc<ProxyFallbackManager>>,
+        client_pool: &Arc<RwLock<Option<Weak<tokio::sync::RwLock<crate::netdisk::ClientPool>>>>>,
+    ) -> Result<crate::netdisk::NetdiskClient> {
+        let pool_arc_opt: Option<Arc<tokio::sync::RwLock<crate::netdisk::ClientPool>>> = {
+            let g = client_pool.read();
+            g.as_ref().and_then(|w| w.upgrade())
+        };
+        let pool_arc = pool_arc_opt
+            .ok_or_else(|| anyhow!("client_pool 未注入或已被 drop（自动备份初始化未完成？）"))?;
+
+        let raw_uid = config.owner_uid.ok_or_else(|| {
+            anyhow!(
+                "config={} 缺少 owner_uid，无法解析目标账号 client（请通过 UI 重新关联账号 / 启动期 backfill）",
+                config.id
+            )
+        })?;
+        let uid = crate::auth::Uid::new(raw_uid);
+        let pool = pool_arc.read().await;
+        let client_arc = pool.get_client(uid).ok_or_else(|| {
+            anyhow!(
+                "config={} owner_uid={} 在 client_pool 中无对应客户端（账号未登录或已删除）",
+                config.id,
+                uid.raw()
+            )
+        })?;
+        Ok((*client_arc).clone())
+    }
+
+    /// 🔥 按 owner_uid 解析对应账号的 `UploadManager`
+    ///
+    /// 优先从 per-uid 池命中目标账号 manager；池未注入或未命中时回退到 legacy
+    /// 单 manager（兼容旧调用路径 / 单账号 / 测试）。`owner_uid = None` 时直接走
+    /// fallback。
+    pub fn resolve_upload_manager(&self, owner_uid: Option<crate::auth::Uid>) -> Option<Arc<UploadManager>> {
+        Self::resolve_upload_manager_static(
+            &self.upload_manager_pool,
+            &self.upload_manager,
+            owner_uid,
+        )
+    }
+
+    /// 🔥 按 owner_uid 解析对应账号的 `DownloadManager`
+    pub fn resolve_download_manager(&self, owner_uid: Option<crate::auth::Uid>) -> Option<Arc<DownloadManager>> {
+        Self::resolve_download_manager_static(
+            &self.download_manager_pool,
+            &self.download_manager,
+            owner_uid,
+        )
+    }
+
+    /// 🔥 按 `config_id` 解析其归属账号 `Uid`
+    ///
+    /// `BackupTask.owner_uid` **未持久化**（仅 handler 响应前动态填充），因此任务级
+    /// 操作（cancel/pause/resume/delete/restore）必须以持久化的 `BackupConfig.owner_uid`
+    /// 为准，否则跨账号场景会解析到错误账号的 manager。
+    fn owner_uid_for_config(&self, config_id: &str) -> Option<crate::auth::Uid> {
+        self.configs.get(config_id).and_then(|c| c.owner_uid).map(crate::auth::Uid::new)
+    }
+
+    /// 静态版本：供 spawn 出的 `execute_*_backup` 静态方法使用。
+    ///
+    /// 🔥 解析策略
+    /// - `owner_uid = None` → 旧数据兼容路径，回退 legacy 单 manager
+    /// - `owner_uid = Some(uid)` 且 pool **已注入**：
+    ///   * 命中 → 返回该账号 manager
+    ///   * 未命中 → **硬失败返回 None**，不回退 legacy，避免产生
+    ///     "owner_uid 指向 A，实际入 B manager" 的孤儿任务
+    /// - `owner_uid = Some(uid)` 且 pool **未注入**（测试 / 未迁移）→ 回退 legacy
+    fn resolve_upload_manager_static(
+        pool: &Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
+        fallback: &Arc<RwLock<Option<Weak<UploadManager>>>>,
+        owner_uid: Option<crate::auth::Uid>,
+    ) -> Option<Arc<UploadManager>> {
+        if let Some(uid) = owner_uid {
+            let pool_opt = pool.read().as_ref().map(Arc::clone);
+            if let Some(p) = pool_opt {
+                if let Some(mgr) = p.get(&uid).map(|e| Arc::clone(e.value())) {
+                    return Some(mgr);
+                }
+                // pool 已注入但未命中：硬失败，不回退避免错路由
+                tracing::error!(
+                    "resolve_upload_manager: owner_uid={} 在 per-uid 池中未命中，硬失败拒绝回退 legacy（避免孤儿任务）",
+                    uid.raw()
+                );
+                return None;
+            }
+            // pool 未注入：测试 / 未迁移单账号场景，允许回退 legacy
+            tracing::debug!(
+                "resolve_upload_manager: owner_uid={} 但 per-uid 池未注入，回退 legacy",
+                uid.raw()
+            );
+        }
+        fallback.read().as_ref().and_then(|weak| weak.upgrade())
+    }
+
+    /// 静态版本：见 `resolve_upload_manager_static`，策略与之对称。
+    fn resolve_download_manager_static(
+        pool: &Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<DownloadManager>>>>>>,
+        fallback: &Arc<RwLock<Option<Weak<DownloadManager>>>>,
+        owner_uid: Option<crate::auth::Uid>,
+    ) -> Option<Arc<DownloadManager>> {
+        if let Some(uid) = owner_uid {
+            let pool_opt = pool.read().as_ref().map(Arc::clone);
+            if let Some(p) = pool_opt {
+                if let Some(mgr) = p.get(&uid).map(|e| Arc::clone(e.value())) {
+                    return Some(mgr);
+                }
+                tracing::error!(
+                    "resolve_download_manager: owner_uid={} 在 per-uid 池中未命中，硬失败拒绝回退 legacy（避免孤儿任务）",
+                    uid.raw()
+                );
+                return None;
+            }
+            tracing::debug!(
+                "resolve_download_manager: owner_uid={} 但 per-uid 池未注入，回退 legacy",
+                uid.raw()
+            );
+        }
+        fallback.read().as_ref().and_then(|weak| weak.upgrade())
+    }
+
     /// 设置代理配置和回退管理器
     pub fn set_proxy_config(&self, proxy: Option<ProxyConfig>, mgr: Arc<ProxyFallbackManager>) {
         *self.proxy_config.write() = proxy;
@@ -4089,10 +4721,30 @@ impl AutoBackupManager {
     }
 
     /// 创建代理感知的 NetdiskClient（内部 helper）
+    ///
+    /// 保留 `#[allow(dead_code)]`，所有备份模块远端路径
+    /// 已切到 `resolve_netdisk_client_for_config`，此 helper 仅作历史调用入口预留。
+    #[allow(dead_code)]
     fn create_netdisk_client(&self, session: crate::auth::UserAuth) -> Result<crate::netdisk::NetdiskClient> {
         let proxy = self.proxy_config.read().clone();
         let fallback = self.fallback_mgr.read().clone();
         crate::netdisk::NetdiskClient::new_with_proxy(session, proxy.as_ref(), fallback)
+    }
+
+    /// 🔥 按 `BackupConfig.owner_uid` 解析对应账号的 NetdiskClient
+    ///
+    /// 此方法已被 `resolve_netdisk_client_for_config`
+    /// 完全替代（严格按 `client_pool` 路由 + 拒绝 legacy `session.json` fallback）。
+    /// 保留空 stub 以避免破坏可能存在的外部 import，实际不应再被调用。
+    #[allow(dead_code)]
+    pub(crate) async fn resolve_user_auth_for_config(
+        &self,
+        config: &BackupConfig,
+    ) -> Result<crate::auth::UserAuth> {
+        let _ = config;
+        Err(anyhow!(
+            "resolve_user_auth_for_config 已废弃 — 请使用 resolve_netdisk_client_for_config 按 owner_uid 路由"
+        ))
     }
 
     /// 启动事件消费循环
@@ -4169,8 +4821,9 @@ impl AutoBackupManager {
                     ChangeEvent::PollEvent { config_id } => {
                         tracing::debug!("收到定时轮询事件: config={}", config_id);
 
-                        let config = match self_clone.get_config(&config_id) {
-                            Some(c) if c.enabled => c,
+                        // 仅做存在性 + enabled 校验，task_loop 内会再次按 cid 取最新配置
+                        match self_clone.get_config(&config_id) {
+                            Some(c) if c.enabled => {}
                             Some(_) => {
                                 tracing::debug!("配置已禁用，跳过Poll事件: config={}", config_id);
                                 continue;
@@ -4179,7 +4832,7 @@ impl AutoBackupManager {
                                 tracing::warn!("配置不存在，跳过Poll事件: config={}", config_id);
                                 continue;
                             }
-                        };
+                        }
 
                         let controller = task_controllers
                             .entry(config_id.clone())
@@ -4187,14 +4840,36 @@ impl AutoBackupManager {
                                 let ctrl = Arc::new(TaskController::new(config_id.clone()));
                                 let ctrl_clone = ctrl.clone();
                                 let manager = self_clone.clone();
-                                let cfg = config.clone();
+                                let cid = config_id.clone();
 
                                 tokio::spawn(async move {
+                                    // 每次执行都按 cid 从 manager.configs
+                                    // 重新读取最新配置，而不是把首次创建时的 config snapshot 一直
+                                    // 复用 — 确保 update_config 后续 Poll 也按新配置执行
+                                    // （local_path / remote_path / filter / 冲突策略等）。
                                     task_loop(ctrl_clone, || {
                                         let m = manager.clone();
-                                        let c = cfg.clone();
+                                        let cid_inner = cid.clone();
                                         async move {
-                                            m.execute_backup_for_config(&c).await
+                                            match m.get_config(&cid_inner) {
+                                                Some(c) if c.enabled => {
+                                                    m.execute_backup_for_config(&c).await
+                                                }
+                                                Some(_) => {
+                                                    tracing::debug!(
+                                                        "task_loop: 配置 {} 已禁用，跳过本次执行",
+                                                        cid_inner
+                                                    );
+                                                    Ok(())
+                                                }
+                                                None => {
+                                                    tracing::debug!(
+                                                        "task_loop: 配置 {} 已删除，跳过本次执行",
+                                                        cid_inner
+                                                    );
+                                                    Ok(())
+                                                }
+                                            }
                                         }
                                     }).await;
                                 });
@@ -4311,14 +4986,34 @@ impl AutoBackupManager {
                                     let ctrl = Arc::new(TaskController::new(config.id.clone()));
                                     let ctrl_clone = ctrl.clone();
                                     let manager = self_clone.clone();
-                                    let cfg = config.clone();
+                                    let cid = config.id.clone();
 
                                     tokio::spawn(async move {
+                                        // 见上方 Poll 路径同款注释 —
+                                        // 按 cid 重新读取最新配置，避免 update_config 后旧 snapshot 残留
                                         task_loop(ctrl_clone, || {
                                             let m = manager.clone();
-                                            let c = cfg.clone();
+                                            let cid_inner = cid.clone();
                                             async move {
-                                                m.execute_backup_for_config(&c).await
+                                                match m.get_config(&cid_inner) {
+                                                    Some(c) if c.enabled => {
+                                                        m.execute_backup_for_config(&c).await
+                                                    }
+                                                    Some(_) => {
+                                                        tracing::debug!(
+                                                            "task_loop: 配置 {} 已禁用，跳过本次执行",
+                                                            cid_inner
+                                                        );
+                                                        Ok(())
+                                                    }
+                                                    None => {
+                                                        tracing::debug!(
+                                                            "task_loop: 配置 {} 已删除，跳过本次执行",
+                                                            cid_inner
+                                                        );
+                                                        Ok(())
+                                                    }
+                                                }
                                             }
                                         }).await;
                                     });
@@ -4506,7 +5201,8 @@ impl AutoBackupManager {
                         if let Some(task) = self.tasks.get(&task_id) {
                             let _ = self.persistence_manager.save_task(&task);
                         }
-                        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring");
+                        let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
+                        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring", owner_uid_for_event);
 
                         // 创建上传传输任务
                         if !upload_files.is_empty() {
@@ -4552,6 +5248,11 @@ impl AutoBackupManager {
 
                         tracing::info!("Sync 断点续传已排队: task={}", task_id);
                     }
+
+                    // 🔥 兜底结算：Sync 续传若所有 upload/download 子任务在创建/启动/resume
+                    // 阶段被处理掉（无 pending、无 transfer 通知），主动按计数结算父任务终态，
+                    // 避免永久卡 Transferring。
+                    self.finalize_backup_task_if_no_pending(&task_id);
                 }
             }
 
@@ -4624,7 +5325,8 @@ impl AutoBackupManager {
                             tracing::warn!("持久化失败的同步任务失败: {}", e);
                         }
                     }
-                    Self::publish_status_changed_static(&self.ws_manager, &sync_task_id, "preparing", "failed");
+                    let owner_uid_for_event = self.tasks.get(&sync_task_id).and_then(|t| t.owner_uid);
+                    Self::publish_status_changed_static(&self.ws_manager, &sync_task_id, "preparing", "failed", owner_uid_for_event);
                 }
                 return Ok(());
             }
@@ -4644,12 +5346,17 @@ impl AutoBackupManager {
             config.id, new_files.len()
         );
 
-        // 🔥 传输阶段优化：检查是否有正在传输的任务（Transferring 状态）
+        // 传输阶段优化：检查是否有正在传输的任务（Transferring 状态）
         // 如果有，进行增量合并；如果没有，创建新任务
-        if let Some(transferring_task) = self.tasks.iter()
+        //
+        // 注意：必须先把 task_id 克隆出来再结束 iter()，使 DashMap shard guard 在
+        // 语句结束时立即释放。否则 guard 会跨越下方的 merge_new_files_to_task().await
+        // 持有，而该函数内部又对同一 task 调用 self.tasks.get_mut()（同 shard 写锁），
+        // 造成永久自死锁——表现为 tasks.iter()/len() 全量遍历卡死。
+        let transferring_task_id = self.tasks.iter()
             .find(|t| t.config_id == config.id && t.status == BackupTaskStatus::Transferring)
-        {
-            let task_id = transferring_task.id.clone();
+            .map(|t| t.id.clone());
+        if let Some(task_id) = transferring_task_id {
             tracing::info!(
                 "配置 {} 已有传输任务正在进行中（task={}），增量合并 {} 个新文件到现有任务",
                 config.id, task_id, new_files.len()
@@ -4759,6 +5466,8 @@ impl AutoBackupManager {
             pending_upload_task_ids: std::collections::HashSet::new(),
             pending_download_task_ids: std::collections::HashSet::new(),
             transfer_task_map: std::collections::HashMap::new(),
+            // 多账号：从所属 config 继承 owner_uid（不持久化到 sqlite）
+            owner_uid: config.owner_uid,
         };
 
         // 保存到内存
@@ -4893,6 +5602,117 @@ impl AutoBackupManager {
         tracing::info!("自动备份管理器已设置下载管理器（Weak 引用）");
     }
 
+    /// 🔥 刷新备份子任务通知 sender 绑定到所有 per-uid manager
+    ///
+    /// 用于"新增账号 / 重建 manager 后让其也接入既有的 transfer listener 循环"
+    /// — 不重新启动 `notification_rx` 接收循环（避免 double-spawn），仅把缓存
+    /// 在 `backup_notification_tx` 字段里的 sender 重新派发给当前池里所有 manager。
+    ///
+    /// 行为：
+    /// - 若 `backup_notification_tx` 还未初始化（`start_transfer_listeners` 未调）
+    ///   → 直接 warn 跳过；调用方应先确保 `start_transfer_listeners` 至少跑过一次。
+    /// - 否则按 per-uid 池去重并 `set_backup_notification_sender(tx.clone())`。
+    pub async fn refresh_transfer_listener_bindings(self: &Arc<Self>) {
+        let tx_opt = { self.backup_notification_tx.read().clone() };
+        match tx_opt {
+            Some(tx) => self.refresh_transfer_listener_bindings_with(tx).await,
+            None => {
+                tracing::warn!(
+                    "refresh_transfer_listener_bindings: backup_notification_tx 尚未初始化（start_transfer_listeners 未调用？），跳过"
+                );
+            }
+        }
+    }
+
+    /// 内部 helper：用指定 sender 绑定到所有 manager。
+    ///
+    /// 抽出 `start_transfer_listeners` 的旧内联逻辑，让"首次启动监听循环"和
+    /// "后续刷新绑定"共用同一份代码。
+    async fn refresh_transfer_listener_bindings_with(
+        self: &Arc<Self>,
+        notification_tx: tokio::sync::mpsc::UnboundedSender<super::events::BackupTransferNotification>,
+    ) {
+        use std::collections::HashSet;
+
+        // 上传侧
+        {
+            let pool_opt = self.upload_manager_pool.read().as_ref().map(Arc::clone);
+            if let Some(pool) = pool_opt {
+                let mut seen: HashSet<usize> = HashSet::new();
+                let unique: Vec<Arc<UploadManager>> = pool
+                    .iter()
+                    .filter_map(|e| {
+                        let mgr = Arc::clone(e.value());
+                        if seen.insert(Arc::as_ptr(&mgr) as usize) {
+                            Some(mgr)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let count = unique.len();
+                for mgr in unique {
+                    mgr.set_backup_notification_sender(notification_tx.clone()).await;
+                }
+                if count > 0 {
+                    tracing::info!(
+                        "已为 {} 个上传管理器（per-uid 池去重后）绑定备份通知 sender",
+                        count
+                    );
+                } else {
+                    tracing::warn!("上传管理器 per-uid 池为空，无法绑定上传通知 sender");
+                }
+            } else if let Some(upload_manager) = self.get_upload_manager() {
+                upload_manager
+                    .set_backup_notification_sender(notification_tx.clone())
+                    .await;
+                tracing::info!("已为 legacy 单一上传管理器绑定备份通知 sender（pool 未注入）");
+            } else {
+                tracing::warn!("上传管理器未设置（pool 与 legacy 均未注入），无法绑定上传通知 sender");
+            }
+        }
+
+        // 下载侧
+        {
+            let pool_opt = self.download_manager_pool.read().as_ref().map(Arc::clone);
+            if let Some(pool) = pool_opt {
+                let mut seen: HashSet<usize> = HashSet::new();
+                let unique: Vec<Arc<DownloadManager>> = pool
+                    .iter()
+                    .filter_map(|e| {
+                        let mgr = Arc::clone(e.value());
+                        if seen.insert(Arc::as_ptr(&mgr) as usize) {
+                            Some(mgr)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let count = unique.len();
+                for mgr in unique {
+                    mgr.set_backup_notification_sender(notification_tx.clone()).await;
+                }
+                if count > 0 {
+                    tracing::info!(
+                        "已为 {} 个下载管理器（per-uid 池去重后）绑定备份通知 sender",
+                        count
+                    );
+                } else {
+                    tracing::warn!("下载管理器 per-uid 池为空，无法绑定下载通知 sender");
+                }
+            } else if let Some(download_manager) = self.get_download_manager() {
+                download_manager
+                    .set_backup_notification_sender(notification_tx.clone())
+                    .await;
+                tracing::info!("已为 legacy 单一下载管理器绑定备份通知 sender（pool 未注入）");
+            } else {
+                tracing::warn!(
+                    "下载管理器未设置（pool 与 legacy 均未注入），无法绑定下载通知 sender"
+                );
+            }
+        }
+    }
+
     /// 🔥 启动统一的传输事件监听器
     ///
     /// 使用单一 channel 监听上传和下载任务的所有事件：
@@ -4911,29 +5731,21 @@ impl AutoBackupManager {
         let (notification_tx, mut notification_rx) =
             tokio::sync::mpsc::unbounded_channel::<BackupTransferNotification>();
 
-        // 设置上传管理器的通知发送器
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_manager_opt = self.get_upload_manager();
-        if let Some(upload_manager) = upload_manager_opt {
-            upload_manager
-                .set_backup_notification_sender(notification_tx.clone())
-                .await;
-            tracing::info!("已设置上传备份任务统一通知监听器");
-        } else {
-            tracing::warn!("上传管理器未设置，无法启动上传通知监听器");
-        }
+        // 缓存 sender 到字段，后续 refresh_transfer_listener_bindings
+        // 用同一份 sender 把新登录账号的 manager 也接入此监听循环。
+        *self.backup_notification_tx.write() = Some(notification_tx.clone());
 
-        // 设置下载管理器的通知发送器（共用同一个 sender）
-        // 使用安全获取方法，处理 Weak 引用升级
-        let download_manager_opt = self.get_download_manager();
-        if let Some(download_manager) = download_manager_opt {
-            download_manager
-                .set_backup_notification_sender(notification_tx)
-                .await;
-            tracing::info!("已设置下载备份任务统一通知监听器");
-        } else {
-            tracing::warn!("下载管理器未设置，无法启动下载通知监听器");
-        }
+        // 把 sender 注册到所有 per-uid manager 抽到独立方法
+        // refresh_transfer_listener_bindings；本路径首次绑定 + 后续新增账号绑定共用
+        // 同一份逻辑。
+        self.refresh_transfer_listener_bindings_with(notification_tx.clone()).await;
+
+        // 释放本作用域持有的 sender 副本。注意：`backup_notification_tx` 字段仍然
+        // 持有一份长期 sender（用于 refresh_transfer_listener_bindings
+        // 把新登录账号的 manager 接入既有监听循环），因此 `notification_rx` 不会因
+        // 各 manager Arc 全部 drop 而退出 — 它在进程生命周期内一直运行，
+        // 由 AutoBackupManager 自身被 drop（即 `notification_tx` 字段被 drop）才退出。
+        drop(notification_tx);
 
         // 🔥 启动统一的事件监听循环（只需要一个 spawn）
         let self_clone = Arc::clone(self);
@@ -5199,6 +6011,7 @@ impl AutoBackupManager {
                         BackupFileStatus::Failed => "failed",
                     };
                     let new_status_str = if success { "completed" } else { "failed" };
+                    let owner_uid_for_event = task.owner_uid;
                     Self::publish_file_status_changed_static(
                         &self.ws_manager,
                         &task.id,
@@ -5206,6 +6019,7 @@ impl AutoBackupManager {
                         &file_name,
                         old_status_str,
                         new_status_str,
+                        owner_uid_for_event,
                     );
 
                     file_task_info = Some((
@@ -5230,7 +6044,7 @@ impl AutoBackupManager {
 
             let old_status = format!("{:?}", task.status);
             let mut new_status = old_status.clone();
-            let mut final_status = task.status.clone();
+            let mut final_status = task.status;
 
             if all_completed {
                 // 根据完成情况更新备份任务状态
@@ -5243,7 +6057,7 @@ impl AutoBackupManager {
                 }
                 task.completed_at = Some(Utc::now());
                 new_status = format!("{:?}", task.status);
-                final_status = task.status.clone();
+                final_status = task.status;
 
                 tracing::info!(
                     "备份任务 {} 所有传输已完成: completed={}, failed={}, skipped={}, status={}",
@@ -5358,7 +6172,7 @@ impl AutoBackupManager {
                         }
                     } else {
                         // 🔥 现在可以安全调用 .await（已释放 DashMap 锁）
-                        let actual_local_path = self.get_download_task_local_path(transfer_task_id).await
+                        let actual_local_path = self.get_download_task_local_path(transfer_task_id, cfg.owner_uid).await
                             .unwrap_or_else(|| update.local_path.clone());
 
                         let file_name = actual_local_path.file_name()
@@ -5369,7 +6183,7 @@ impl AutoBackupManager {
                         // 🔥 修复：优先使用 BackupFileTask 中保存的 fs_id，避免从已清理的 DownloadManager 获取
                         let fs_id = match update.fs_id {
                             Some(id) => id.to_string(),
-                            None => self.get_download_task_fs_id(transfer_task_id).await
+                            None => self.get_download_task_fs_id(transfer_task_id, cfg.owner_uid).await
                                 .unwrap_or_else(|| "unknown".to_string()),
                         };
 
@@ -5480,6 +6294,87 @@ impl AutoBackupManager {
         }
     }
 
+    /// 兜底结算：创建子任务后若父任务已无 pending 传输子任务，主动按计数结算终态
+    ///
+    /// 🔥 背景：父任务终态正常由 `handle_transfer_completed` 在最后一个子任务完成/失败时计算。
+    /// 但如果所有文件在创建/启动阶段就被处理掉（全部跳过、create 失败、start/resume 失败、
+    /// owner_uid 缺失等），可能根本没有任何 pending 子任务，也就不会再有 transfer 通知触发
+    /// 结算——父任务会永久停在 `Transferring`、file_task 永久 `WaitingTransfer`。此处在
+    /// 创建流程末尾兜底：若 pending 集合为空且父任务尚未进入终态，按 completed/failed 计数
+    /// 结算并持久化、发事件、清理内存。
+    ///
+    /// 幂等：已是终态（Completed/Failed/PartiallyCompleted/Cancelled）则跳过，避免与
+    /// `handle_transfer_completed` 重复结算。
+    ///
+    /// 防自死锁：在 `get_mut` 写 guard 内只计算与持久化，取出 publish 所需字段后释放 guard，
+    /// 再调用会反查 `self.tasks.get` 的 publish_* 方法。
+    fn finalize_backup_task_if_no_pending(&self, task_id: &str) {
+        let settle = if let Some(mut task) = self.tasks.get_mut(task_id) {
+            if matches!(
+                task.status,
+                BackupTaskStatus::Completed
+                    | BackupTaskStatus::Failed
+                    | BackupTaskStatus::PartiallyCompleted
+                    | BackupTaskStatus::Cancelled
+            ) {
+                None
+            } else if task.pending_upload_task_ids.is_empty()
+                && task.pending_download_task_ids.is_empty()
+            {
+                let old_status = format!("{:?}", task.status);
+                // 与 handle_transfer_completed 完全一致的终态判定
+                if task.failed_count == 0 {
+                    task.status = BackupTaskStatus::Completed;
+                } else if task.completed_count > 0 {
+                    task.status = BackupTaskStatus::PartiallyCompleted;
+                } else {
+                    task.status = BackupTaskStatus::Failed;
+                }
+                task.completed_at = Some(Utc::now());
+                let new_status = format!("{:?}", task.status);
+                let final_status = task.status;
+                let error_message = task.error_message.clone();
+                let owner_uid = task.owner_uid;
+
+                if let Err(e) = self.persistence_manager.save_task(&task) {
+                    tracing::warn!("兜底结算持久化备份任务失败: task={}, error={}", task_id, e);
+                }
+                tracing::info!(
+                    "兜底结算备份任务 {}: 无 pending 子任务, completed={}, failed={}, skipped={}, status={}",
+                    task_id, task.completed_count, task.failed_count, task.skipped_count, new_status
+                );
+                Some((old_status, new_status, final_status, error_message, owner_uid))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 已释放 get_mut guard，安全调用反查 DashMap 的 publish_*
+        if let Some((old_status, new_status, final_status, error_message, owner_uid)) = settle {
+            self.publish_status_changed_with_owner(task_id, &old_status, &new_status, owner_uid);
+
+            if let Some(task_entry) = self.tasks.get(task_id) {
+                let task = task_entry.value();
+                Self::publish_progress_static(&self.ws_manager, task);
+                if matches!(
+                    final_status,
+                    BackupTaskStatus::Completed | BackupTaskStatus::PartiallyCompleted
+                ) {
+                    self.publish_task_completed(task);
+                }
+            }
+            if matches!(final_status, BackupTaskStatus::Failed) {
+                let msg = error_message.unwrap_or_else(|| "所有文件传输失败".to_string());
+                self.publish_task_failed(task_id, &msg);
+            }
+
+            // 任务进入终态后从 DashMap 移除（与 handle_transfer_completed 一致）
+            self.cleanup_completed_task(task_id);
+        }
+    }
+
     /// 处理传输任务进度事件
     ///
     /// 当上传或下载任务进度更新时，更新对应的备份任务进度并发送 WebSocket 事件
@@ -5523,9 +6418,13 @@ impl AutoBackupManager {
                 None
             };
 
-            // 🔥 发送文件进度事件（在锁释放后，避免死锁）
+            // 发送文件进度事件
+            // 注意：owner_uid 直接取自当前迭代的 task，绝不能再调 self.tasks.get(&task_id)——
+            // iter_mut() 已写锁当前 shard，对同一 key 再取锁会造成同 shard 重入死锁，
+            // 表现为该 shard 永久持有、tasks.len()/iter() 全量遍历卡死。
             if let Some((task_id, ref ft)) = file_task_for_event {
-                Self::publish_file_progress_static(&self.ws_manager, &task_id, ft);
+                let owner_uid_for_event = task.owner_uid;
+                Self::publish_file_progress_static(&self.ws_manager, &task_id, ft, owner_uid_for_event);
             }
 
             // 重新计算备份任务的总已传输字节数
@@ -5574,6 +6473,8 @@ impl AutoBackupManager {
                         task_id: task.id.clone(),
                         file_task_id: file_task_id.clone(),
                         file_name: file_name.to_string(),
+
+                        owner_uid: task.owner_uid,
                     });
 
                     tracing::debug!(
@@ -5617,6 +6518,8 @@ impl AutoBackupManager {
                         progress,
                         processed_bytes,
                         total_bytes,
+
+                        owner_uid: task.owner_uid,
                     });
                 }
             }
@@ -5653,6 +6556,8 @@ impl AutoBackupManager {
                         file_name: file_name.to_string(),
                         original_name: original_name.to_string(),
                         original_size: file_task.file_size,
+
+                        owner_uid: task.owner_uid,
                     });
 
                     tracing::debug!(
@@ -5761,6 +6666,7 @@ impl AutoBackupManager {
                         }
 
                         // 🔥 发送文件状态变更事件到 WebSocket
+                        let owner_uid_for_event = task.owner_uid;
                         Self::publish_file_status_changed_static(
                             &self.ws_manager,
                             &task.id,
@@ -5768,6 +6674,7 @@ impl AutoBackupManager {
                             &file_name,
                             old_status_str,
                             new_status_str,
+                            owner_uid_for_event,
                         );
                     }
                 }
@@ -5778,9 +6685,9 @@ impl AutoBackupManager {
     }
 
     /// 从下载任务获取 fs_id
-    async fn get_download_task_fs_id(&self, download_task_id: &str) -> Option<String> {
-        // 使用安全获取方法，处理 Weak 引用升级
-        let download_mgr = self.get_download_manager();
+    async fn get_download_task_fs_id(&self, download_task_id: &str, owner_uid: Option<u64>) -> Option<String> {
+        // 🔥 按 owner_uid 解析目标账号 manager
+        let download_mgr = self.resolve_download_manager(owner_uid.map(crate::auth::Uid::new));
         if let Some(ref dm) = download_mgr {
             if let Some(task) = dm.get_task(download_task_id).await {
                 return Some(task.fs_id.to_string());
@@ -5793,9 +6700,9 @@ impl AutoBackupManager {
     ///
     /// 下载加密文件后会自动解密，解密完成后 DownloadTask.local_path 会更新为解密后的路径。
     /// 此方法用于获取最新的 local_path，确保去重记录中保存的是实际文件路径。
-    async fn get_download_task_local_path(&self, download_task_id: &str) -> Option<std::path::PathBuf> {
-        // 使用安全获取方法，处理 Weak 引用升级
-        let download_mgr = self.get_download_manager();
+    async fn get_download_task_local_path(&self, download_task_id: &str, owner_uid: Option<u64>) -> Option<std::path::PathBuf> {
+        // 🔥 按 owner_uid 解析目标账号 manager
+        let download_mgr = self.resolve_download_manager(owner_uid.map(crate::auth::Uid::new));
         if let Some(ref dm) = download_mgr {
             if let Some(task) = dm.get_task(download_task_id).await {
                 return Some(task.local_path.clone());
@@ -5822,15 +6729,18 @@ impl AutoBackupManager {
 
         tracing::info!("发现 {} 个未完成的备份任务，开始恢复", task_count);
 
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_manager = self.get_upload_manager();
-        let download_manager = self.get_download_manager();
-
         for mut task in incomplete_tasks {
             tracing::info!(
                 "恢复备份任务: id={}, config_id={}, status={:?}",
                 task.id, task.config_id, task.status
             );
+
+            // 🔥 每个备份任务可能属于不同账号，逐任务按其
+            // BackupConfig.owner_uid（持久化）解析对应账号 manager，而非固定用 active。
+            // 注意：DB 加载的 task.owner_uid 始终为 None（未持久化），故必须用 config_id。
+            let task_owner_uid = self.owner_uid_for_config(&task.config_id);
+            let upload_manager = self.resolve_upload_manager(task_owner_uid);
+            let download_manager = self.resolve_download_manager(task_owner_uid);
 
             // 加载文件任务
             let (file_tasks, _) = self.persistence_manager.load_file_tasks(&task.id, 10000, 0)?;
@@ -5989,15 +6899,38 @@ impl AutoBackupManager {
             config_name: config.name.clone(),
             direction: direction.to_string(),
             trigger_type: trigger_type.to_string(),
+
+            // 从所属 task 直接读
+            owner_uid: task.owner_uid,
         });
     }
 
     /// 发送任务状态变更事件
     pub fn publish_status_changed(&self, task_id: &str, old_status: &str, new_status: &str) {
+        // 从内存 task 查 owner_uid
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
+        self.publish_status_changed_with_owner(task_id, old_status, new_status, owner_uid);
+    }
+
+    /// 发送任务状态变更事件（显式传入 owner_uid，不反查 DashMap）
+    ///
+    /// 🔥 防自死锁：`publish_status_changed` 内部会 `self.tasks.get(task_id)` 反查 owner_uid，
+    /// 若调用方此时仍持有同一 key 的 `self.tasks.get_mut(task_id)` 写 guard（cancel/pause/resume
+    /// 路径就是如此），同 shard 重入取锁会永久死锁。此方法要求调用方在持 guard 时先取出 owner_uid，
+    /// 释放 guard 后再调用，彻底避免重入。
+    pub fn publish_status_changed_with_owner(
+        &self,
+        task_id: &str,
+        old_status: &str,
+        new_status: &str,
+        owner_uid: Option<u64>,
+    ) {
         self.publish_event(WsBackupEvent::StatusChanged {
             task_id: task_id.to_string(),
             old_status: old_status.to_string(),
             new_status: new_status.to_string(),
+
+            owner_uid,
         });
     }
 
@@ -6011,24 +6944,32 @@ impl AutoBackupManager {
             total_count: task.total_count,
             transferred_bytes: task.transferred_bytes,
             total_bytes: task.total_bytes,
+
+            owner_uid: task.owner_uid,
         });
     }
 
     /// 发送扫描进度事件
     pub fn publish_scan_progress(&self, task_id: &str, scanned_files: usize, scanned_dirs: usize) {
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         self.publish_event(WsBackupEvent::ScanProgress {
             task_id: task_id.to_string(),
             scanned_files,
             scanned_dirs,
+
+            owner_uid,
         });
     }
 
     /// 发送扫描完成事件
     pub fn publish_scan_completed(&self, task_id: &str, total_files: usize, total_bytes: u64) {
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         self.publish_event(WsBackupEvent::ScanCompleted {
             task_id: task_id.to_string(),
             total_files,
             total_bytes,
+
+            owner_uid,
         });
     }
 
@@ -6040,35 +6981,49 @@ impl AutoBackupManager {
             success_count: task.completed_count,
             failed_count: task.failed_count,
             skipped_count: task.skipped_count,
+
+            owner_uid: task.owner_uid,
         });
     }
 
     /// 发送任务失败事件
     pub fn publish_task_failed(&self, task_id: &str, error: &str) {
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         self.publish_event(WsBackupEvent::Failed {
             task_id: task_id.to_string(),
             error: error.to_string(),
+
+            owner_uid,
         });
     }
 
     /// 发送任务暂停事件
     pub fn publish_task_paused(&self, task_id: &str) {
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         self.publish_event(WsBackupEvent::Paused {
             task_id: task_id.to_string(),
+
+            owner_uid,
         });
     }
 
     /// 发送任务恢复事件
     pub fn publish_task_resumed(&self, task_id: &str) {
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         self.publish_event(WsBackupEvent::Resumed {
             task_id: task_id.to_string(),
+
+            owner_uid,
         });
     }
 
     /// 发送任务取消事件
     pub fn publish_task_cancelled(&self, task_id: &str) {
+        let owner_uid = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         self.publish_event(WsBackupEvent::Cancelled {
             task_id: task_id.to_string(),
+
+            owner_uid,
         });
     }
 
@@ -6289,6 +7244,8 @@ impl AutoBackupManager {
             task_id: task_id.to_string(),
             file_task_id: file_task_id.to_string(),
             file_name: file_name.to_string(),
+
+            owner_uid: config.owner_uid,
         });
 
         // 阶段 4：加密文件到临时目录（带进度回调）
@@ -6299,6 +7256,8 @@ impl AutoBackupManager {
         let task_id_clone = task_id.to_string();
         let file_task_id_clone = file_task_id.to_string();
         let file_name_clone = file_name.to_string();
+        // 捕获 owner_uid 给闭包内事件使用
+        let owner_uid_for_event = config.owner_uid;
 
         let metadata = encryption_service.encrypt_file_with_progress(
             &file_task.local_path,
@@ -6324,6 +7283,8 @@ impl AutoBackupManager {
                                 progress,
                                 processed_bytes,
                                 total_bytes,
+
+                                owner_uid: owner_uid_for_event,
                             }),
                             None,
                         );
@@ -6351,6 +7312,8 @@ impl AutoBackupManager {
             file_name: file_name.to_string(),
             encrypted_name: encrypted_name.clone(),
             encrypted_size: metadata.encrypted_size,
+
+            owner_uid: config.owner_uid,
         });
 
         tracing::info!(
@@ -6580,11 +7543,16 @@ impl AutoBackupManager {
             .unwrap_or("unknown")
             .to_string();
 
+        // 从内存 task 取 owner_uid 给所有事件
+        let owner_uid_for_event = self.tasks.get(task_id).and_then(|t| t.owner_uid);
+
         // 发送解密开始事件
         self.publish_event(WsBackupEvent::FileDecrypting {
             task_id: task_id.to_string(),
             file_task_id: file_task_id.to_string(),
             file_name: file_name.clone(),
+
+            owner_uid: owner_uid_for_event,
         });
 
         // 更新文件状态
@@ -6631,6 +7599,8 @@ impl AutoBackupManager {
                                 progress,
                                 processed_bytes,
                                 total_bytes,
+
+                                owner_uid: owner_uid_for_event,
                             }),
                             None,
                         );
@@ -6652,6 +7622,8 @@ impl AutoBackupManager {
                     file_name,
                     original_name: original_name.clone(),
                     original_size,
+
+                    owner_uid: owner_uid_for_event,
                 });
 
                 // 清理临时加密文件
@@ -7088,15 +8060,14 @@ impl AutoBackupManager {
     ///
     /// 应用过滤规则和去重检查，返回需要下载的文件任务列表
     async fn scan_remote_directory_for_backup(&self, config: &BackupConfig) -> Result<Vec<BackupFileTask>> {
-        use crate::auth::SessionManager;
-
         tracing::info!("扫描远程目录: config={}, path={}", config.id, config.remote_path);
 
-        // 创建网盘客户端
-        let mut session_manager = SessionManager::new(None);
-        let session = session_manager.load_session().await?
-            .ok_or_else(|| anyhow!("未登录"))?;
-        let client = self.create_netdisk_client(session)?;
+        // 严格按 config.owner_uid 取 client，不走 legacy session.json
+        let proxy = self.proxy_config.read().clone();
+        let fallback = self.fallback_mgr.read().clone();
+        let client = self
+            .resolve_netdisk_client_for_config(config, proxy.as_ref(), fallback)
+            .await?;
 
         let mut all_files = Vec::new();
         let mut dirs_to_scan = vec![config.remote_path.clone()];
@@ -7350,7 +8321,8 @@ impl AutoBackupManager {
             task.status = BackupTaskStatus::Preparing;
             task.started_at = Some(Utc::now());
         }
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "queued", "preparing");
+        let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
+        Self::publish_status_changed_static(&self.ws_manager, &task_id, "queued", "preparing", owner_uid_for_event);
 
         // 批量保存文件任务到数据库
         if !file_tasks.is_empty() {
@@ -7383,7 +8355,7 @@ impl AutoBackupManager {
                 task.status = BackupTaskStatus::Completed;
                 task.completed_at = Some(Utc::now());
             }
-            Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "completed");
+            Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "completed", config.owner_uid);
             // 发送任务完成事件
             if let Some(task) = self.tasks.get(&task_id) {
                 Self::publish_task_completed_static(&self.ws_manager, &task);
@@ -7391,7 +8363,7 @@ impl AutoBackupManager {
             return Ok(());
         }
 
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring");
+        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring", config.owner_uid);
 
         // 🔥 优化：克隆 pending_files 用于创建上传任务，保留原始数据供 API 查询
         let pending_files_clone = if let Some(task) = self.tasks.get(&task_id) {
@@ -7408,6 +8380,11 @@ impl AutoBackupManager {
             task.pending_files = processed_files;
         }
 
+        // 🔥 兜底结算：若所有文件都在创建/启动阶段被处理掉（全部跳过/创建失败/start 失败/
+        // owner_uid 缺失），父任务可能无任何 pending 子任务，不会再有 transfer 通知触发结算。
+        // 此处主动按计数结算，避免父任务永久卡 Transferring。
+        self.finalize_backup_task_if_no_pending(&task_id);
+
         Ok(())
     }
 
@@ -7421,8 +8398,9 @@ impl AutoBackupManager {
         mut file_tasks: Vec<BackupFileTask>,
         override_upload_strategy: Option<crate::uploader::conflict::UploadConflictStrategy>,
     ) -> Result<Vec<BackupFileTask>> {
-        // 使用安全获取方法，处理 Weak 引用升级
-        let upload_mgr = self.get_upload_manager();
+        // 🔥 按 config.owner_uid 解析目标账号 upload manager，
+        // 避免跨账号场景把子任务插入 active 账号的 manager。
+        let upload_mgr = self.resolve_upload_manager(config.owner_uid.map(crate::auth::Uid::new));
 
         let upload_mgr = match upload_mgr {
             Some(mgr) => mgr,
@@ -7447,39 +8425,97 @@ impl AutoBackupManager {
             let file_task_id = file_task.id.clone();
 
             // 🔥 修复：如果 related_task_id 已存在，说明是重启恢复的任务，跳过创建直接复用
-            if let Some(ref existing_upload_id) = file_task.related_task_id {
-                // 更新 task 的映射关系（重建映射）
-                if let Some(mut task) = self.tasks.get_mut(task_id) {
-                    task.pending_upload_task_ids.insert(existing_upload_id.clone());
-                    task.transfer_task_map.insert(existing_upload_id.clone(), file_task_id.clone());
-                }
-
-                // 更新文件状态为等待传输
-                file_task.status = BackupFileStatus::WaitingTransfer;
-                file_task.updated_at = Utc::now();
-
-                // 🔥 关键修复：恢复的上传任务初始状态为 Paused，必须主动启动/恢复
-                // 否则任务会一直停留在 Paused 状态，不会自动执行
-                if let Err(e) = upload_mgr.start_task(existing_upload_id).await {
+            //
+            // 孤儿引用防御：
+            // 在尝试复用前先调 upload_mgr.get_task() 检查任务是否真的存在。
+            // 否则旧 wal 已被清理 / 用户手动删过 upload 任务时，file_task
+            // 会永远卡在 WaitingTransfer：start/resume 都失败但 `continue`
+            // 又跳过了下面的新建逻辑。
+            let existing_upload_id_opt = file_task.related_task_id.clone();
+            if let Some(existing_upload_id) = existing_upload_id_opt {
+                if upload_mgr.get_task(&existing_upload_id).await.is_none() {
                     tracing::warn!(
-                        "启动已恢复的上传任务失败，尝试 resume: file_task={}, upload_task={}, error={}",
-                        file_task_id, existing_upload_id, e
+                        "检测到孤儿 related_task_id（upload_task 已不存在），清空并新建: \
+                         backup_task={}, file_task={}, dangling_upload_task={}",
+                        task_id, file_task_id, existing_upload_id
                     );
-                    // start_task 失败可能是因为状态不对（如 Paused），尝试 resume
-                    if let Err(e2) = upload_mgr.resume_task(existing_upload_id).await {
-                        tracing::error!(
-                            "恢复上传任务也失败: file_task={}, upload_task={}, error={}",
-                            file_task_id, existing_upload_id, e2
-                        );
+                    // 清掉 file_task 上的孤儿引用
+                    file_task.related_task_id = None;
+                    file_task.updated_at = Utc::now();
+                    // 同步清掉 backup_task 的 pending_upload_task_ids / transfer_task_map
+                    if let Some(mut task) = self.tasks.get_mut(task_id) {
+                        task.pending_upload_task_ids.remove(&existing_upload_id);
+                        task.transfer_task_map.remove(&existing_upload_id);
                     }
-                }
+                    // 持久化清空后的 file_task（避免下次重启再卡住）
+                    if let Err(e) = self.persistence_manager.save_file_task(file_task, &config.id) {
+                        tracing::warn!("孤儿 related_task_id 清空后持久化失败: {}", e);
+                    }
+                    // 不 continue，fallthrough 到下面的新建逻辑
+                } else {
+                    // upload_task 真实存在 → 走原本的复用路径
+                    if let Some(mut task) = self.tasks.get_mut(task_id) {
+                        task.pending_upload_task_ids.insert(existing_upload_id.clone());
+                        task.transfer_task_map.insert(existing_upload_id.clone(), file_task_id.clone());
+                    }
 
-                reused_count += 1;
-                tracing::info!(
-                    "复用并启动已恢复的上传任务: file_task={}, upload_task={}",
-                    file_task_id, existing_upload_id
-                );
-                continue;
+                    file_task.status = BackupFileStatus::WaitingTransfer;
+                    file_task.updated_at = Utc::now();
+
+                    // 🔥 关键修复：恢复的上传任务初始状态为 Paused 且 is_paused=true，
+                    // 必须走 resume_task 才能清掉 is_paused 标志（start_task 不会清）。
+                    // 否则任务虽注册进调度器，但全局调度循环因 is_paused=true 永久跳过，
+                    // 一个分片都不会上传 → 子任务永远不完成 → 父任务永久卡 Transferring、
+                    // file_task 永久 WaitingTransfer。下载侧复用路径用的就是 resume_task，
+                    // 此处与之对齐。resume 仅接受 Paused/Failed，万一状态是 Pending 再回退 start_task。
+                    let mut started = true;
+                    if let Err(e) = upload_mgr.resume_task(&existing_upload_id).await {
+                        tracing::warn!(
+                            "恢复已恢复的上传任务失败，尝试 start: file_task={}, upload_task={}, error={}",
+                            file_task_id, existing_upload_id, e
+                        );
+                        // resume 仅支持 Paused/Failed；若状态为 Pending 等则回退 start_task
+                        if let Err(e2) = upload_mgr.start_task(&existing_upload_id).await {
+                            tracing::error!(
+                                "启动上传任务也失败: file_task={}, upload_task={}, error={}",
+                                file_task_id, existing_upload_id, e2
+                            );
+                            started = false;
+                        }
+                    }
+
+                    if !started {
+                        // 🔥 start/resume 都失败：必须回滚 pending 占用并把 file_task 结算为 Failed，
+                        // 否则该 pending id 永不清除，父任务永久卡 Transferring、file_task 永久 WaitingTransfer
+                        // （后续不会再有 Completed/Failed 通知来清这个 pending id）。
+                        if let Some(mut task) = self.tasks.get_mut(task_id) {
+                            task.pending_upload_task_ids.remove(&existing_upload_id);
+                            task.transfer_task_map.remove(&existing_upload_id);
+                            task.failed_count += 1;
+                        }
+                        file_task.status = BackupFileStatus::Failed;
+                        file_task.error_message =
+                            Some("启动/恢复已存在的上传子任务失败".to_string());
+                        file_task.related_task_id = None;
+                        file_task.updated_at = Utc::now();
+                        if let Err(e) =
+                            self.persistence_manager.save_file_task(file_task, &config.id)
+                        {
+                            tracing::warn!(
+                                "复用上传任务失败后持久化 file_task 失败: file_task={}, error={}",
+                                file_task_id, e
+                            );
+                        }
+                        continue;
+                    }
+
+                    reused_count += 1;
+                    tracing::info!(
+                        "复用并启动已恢复的上传任务: file_task={}, upload_task={}",
+                        file_task_id, existing_upload_id
+                    );
+                    continue;
+                }
             }
 
             // 更新文件状态（直接在 file_task 上操作）
@@ -7491,6 +8527,25 @@ impl AutoBackupManager {
                 .or(config.upload_conflict_strategy)
                 .unwrap_or(crate::uploader::conflict::UploadConflictStrategy::SmartDedup);
 
+            // 硬失败而非回退 Uid(0)
+            let task_owner_uid = match config.owner_uid {
+                Some(v) => crate::auth::Uid::new(v),
+                None => {
+                    tracing::error!(
+                        "create_backup_task: config={} 缺失 owner_uid，\
+                         跳过文件并标记失败: file_task={}（请通过 UI 重新关联账号）",
+                        config.id, file_task_id
+                    );
+                    if let Some(mut task) = self.tasks.get_mut(task_id) {
+                        task.failed_count += 1;
+                    }
+                    file_task.status = BackupFileStatus::Failed;
+                    file_task.error_message =
+                        Some("owner_uid 缺失，无法创建子任务".to_string());
+                    file_task.updated_at = Utc::now();
+                    continue;
+                }
+            };
             match upload_mgr.create_backup_task(
                 local_path.clone(),
                 remote_path.clone(),
@@ -7499,6 +8554,7 @@ impl AutoBackupManager {
                 Some(task_id.to_string()),
                 Some(file_task_id.clone()),
                 Some(upload_strategy), // 传递冲突策略
+                task_owner_uid,
             ).await {
                 Ok(upload_task_id) => {
                     if let Err(e) = upload_mgr.start_task(&upload_task_id).await {
@@ -7567,7 +8623,8 @@ impl AutoBackupManager {
             task.status = BackupTaskStatus::Preparing;
             task.started_at = Some(Utc::now());
         }
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "queued", "preparing");
+        let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
+        Self::publish_status_changed_static(&self.ws_manager, &task_id, "queued", "preparing", owner_uid_for_event);
 
         // 批量保存文件任务
         if !file_tasks.is_empty() {
@@ -7598,7 +8655,7 @@ impl AutoBackupManager {
                 task.status = BackupTaskStatus::Completed;
                 task.completed_at = Some(Utc::now());
             }
-            Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "completed");
+            Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "completed", config.owner_uid);
             // 发送任务完成事件
             if let Some(task) = self.tasks.get(&task_id) {
                 Self::publish_task_completed_static(&self.ws_manager, &task);
@@ -7606,7 +8663,7 @@ impl AutoBackupManager {
             return Ok(());
         }
 
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring");
+        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring", config.owner_uid);
 
         // 🔥 优化：克隆 pending_files 用于创建下载任务，保留原始数据供 API 查询
         let pending_files_clone = if let Some(task) = self.tasks.get(&task_id) {
@@ -7622,6 +8679,10 @@ impl AutoBackupManager {
         if let Some(mut task) = self.tasks.get_mut(&task_id) {
             task.pending_files = processed_files;
         }
+
+        // 🔥 兜底结算：若所有文件都在创建/启动阶段被处理掉（全部跳过/创建失败/resume 失败/
+        // 目录创建失败），父任务可能无任何 pending 子任务，不会再有 transfer 通知触发结算。
+        self.finalize_backup_task_if_no_pending(&task_id);
 
         Ok(())
     }
@@ -7652,7 +8713,8 @@ impl AutoBackupManager {
             task.sub_phase = Some(BackupSubPhase::SyncScanning);
             task.started_at = Some(Utc::now());
         }
-        Self::publish_status_changed_static(&self.ws_manager, task_id, "queued", "preparing");
+        let owner_uid_for_event = self.tasks.get(task_id).and_then(|t| t.owner_uid);
+        Self::publish_status_changed_static(&self.ws_manager, task_id, "queued", "preparing", owner_uid_for_event);
 
         // ════════════════════════════════════════════════════════
         // Stage 1: Snapshot — 扫描本地和远端
@@ -7719,9 +8781,11 @@ impl AutoBackupManager {
                 tracing::warn!("删除无操作同步任务失败: {}", e);
             }
             // 从内存移除
+            // 移除前先取出 owner_uid（self.tasks.remove(task_id) 之后该任务即不可访问）
+            let owner_uid_for_event = self.tasks.get(task_id).and_then(|t| t.owner_uid);
             self.tasks.remove(task_id);
             // 通知前端移除该任务
-            Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "removed");
+            Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "removed", owner_uid_for_event);
             return Ok(());
         }
 
@@ -7763,7 +8827,7 @@ impl AutoBackupManager {
                     tracing::warn!("持久化仅状态更新的同步任务失败: {}", e);
                 }
             }
-            Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "completed");
+            Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "completed", config.owner_uid);
             if let Some(task) = self.tasks.get(task_id) {
                 Self::publish_task_completed_static(&self.ws_manager, &task);
             }
@@ -7867,7 +8931,8 @@ impl AutoBackupManager {
                 tracing::warn!("持久化同步任务失败: {}", e);
             }
         }
-        Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "transferring");
+        let owner_uid_for_event = self.tasks.get(task_id).and_then(|t| t.owner_uid);
+        Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "transferring", owner_uid_for_event);
 
         // Step 1: 创建上传传输任务（直接调用低层方法，不经过 execute_upload_backup_with_files）
         if total_upload_count > 0 {
@@ -7935,6 +9000,10 @@ impl AutoBackupManager {
             "同步备份任务已排队: config={}, task={}, uploads={}, downloads={}",
             config.id, task_id, total_upload_count, total_download_count
         );
+
+        // 🔥 兜底结算：Sync Stage 3 若所有 upload/download 子任务在创建/启动阶段被处理掉
+        // （无 pending、无 transfer 通知），主动按计数结算父任务终态，避免永久卡 Transferring。
+        self.finalize_backup_task_if_no_pending(task_id);
 
         Ok(())
     }
@@ -8163,12 +9232,12 @@ impl AutoBackupManager {
     ///
     /// 与 scan_remote_directory_for_backup 不同：不做去重检查，只收集文件元数据。
     async fn scan_remote_for_sync(&self, config: &BackupConfig) -> Result<Vec<super::sync::types::RemoteScannedFile>> {
-        use crate::auth::SessionManager;
-
-        let mut session_manager = SessionManager::new(None);
-        let session = session_manager.load_session().await?
-            .ok_or_else(|| anyhow!("未登录"))?;
-        let client = self.create_netdisk_client(session)?;
+        // 严格按 config.owner_uid 取 client，不走 legacy session.json
+        let proxy = self.proxy_config.read().clone();
+        let fallback = self.fallback_mgr.read().clone();
+        let client = self
+            .resolve_netdisk_client_for_config(config, proxy.as_ref(), fallback)
+            .await?;
 
         let mut result = Vec::new();
         let mut dirs_to_scan = vec![config.remote_path.clone()];
@@ -8267,8 +9336,9 @@ impl AutoBackupManager {
         mut file_tasks: Vec<BackupFileTask>,
         override_download_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     ) -> Result<Vec<BackupFileTask>> {
-        // 使用安全获取方法，处理 Weak 引用升级
-        let download_mgr = self.get_download_manager();
+        // 🔥 按 config.owner_uid 解析目标账号 download manager，
+        // 避免跨账号场景把子任务插入 active 账号的 manager。
+        let download_mgr = self.resolve_download_manager(config.owner_uid.map(crate::auth::Uid::new));
 
         let download_mgr = match download_mgr {
             Some(mgr) => mgr,
@@ -8295,32 +9365,72 @@ impl AutoBackupManager {
             let fs_id = file_task.fs_id.unwrap_or(0);
 
             // 🔥 修复：如果 related_task_id 已存在，说明是重启恢复的任务，跳过创建直接复用
-            if let Some(ref existing_download_id) = file_task.related_task_id {
-                // 更新 task 的映射关系（重建映射）
-                if let Some(mut task) = self.tasks.get_mut(task_id) {
-                    task.pending_download_task_ids.insert(existing_download_id.clone());
-                    task.transfer_task_map.insert(existing_download_id.clone(), file_task_id.clone());
-                }
-
-                // 更新文件状态为等待传输
-                file_task.status = BackupFileStatus::WaitingTransfer;
-                file_task.updated_at = Utc::now();
-
-                // 🔥 关键修复：恢复的下载任务需要主动启动/恢复
-                // 否则任务会一直停留在初始状态，不会自动执行
-                if let Err(e) = download_mgr.resume_task(existing_download_id).await {
+            //
+            // 孤儿引用防御：与 upload 路径同步的修复，
+            // 复用前先调 download_mgr.get_task() 检查任务存在性；不存在则清空并 fallthrough。
+            let existing_download_id_opt = file_task.related_task_id.clone();
+            if let Some(existing_download_id) = existing_download_id_opt {
+                if download_mgr.get_task(&existing_download_id).await.is_none() {
                     tracing::warn!(
-                        "恢复已恢复的下载任务失败: file_task={}, download_task={}, error={}",
-                        file_task_id, existing_download_id, e
+                        "检测到孤儿 related_task_id（download_task 已不存在），清空并新建: \
+                         backup_task={}, file_task={}, dangling_download_task={}",
+                        task_id, file_task_id, existing_download_id
                     );
-                }
+                    file_task.related_task_id = None;
+                    file_task.updated_at = Utc::now();
+                    if let Some(mut task) = self.tasks.get_mut(task_id) {
+                        task.pending_download_task_ids.remove(&existing_download_id);
+                        task.transfer_task_map.remove(&existing_download_id);
+                    }
+                    if let Err(e) = self.persistence_manager.save_file_task(file_task, &config.id) {
+                        tracing::warn!("孤儿 related_task_id 清空后持久化失败: {}", e);
+                    }
+                    // 不 continue，fallthrough 到下面的新建逻辑
+                } else {
+                    if let Some(mut task) = self.tasks.get_mut(task_id) {
+                        task.pending_download_task_ids.insert(existing_download_id.clone());
+                        task.transfer_task_map.insert(existing_download_id.clone(), file_task_id.clone());
+                    }
 
-                reused_count += 1;
-                tracing::info!(
-                    "复用并启动已恢复的下载任务: file_task={}, download_task={}",
-                    file_task_id, existing_download_id
-                );
-                continue;
+                    file_task.status = BackupFileStatus::WaitingTransfer;
+                    file_task.updated_at = Utc::now();
+
+                    // 🔥 关键修复：恢复的下载任务需要主动启动/恢复
+                    if let Err(e) = download_mgr.resume_task(&existing_download_id).await {
+                        tracing::error!(
+                            "恢复已恢复的下载任务失败: file_task={}, download_task={}, error={}",
+                            file_task_id, existing_download_id, e
+                        );
+                        // 🔥 resume 失败：必须回滚 pending 占用并把 file_task 结算为 Failed，
+                        // 否则该 pending id 永不清除，父任务永久卡 Transferring、file_task 永久 WaitingTransfer
+                        if let Some(mut task) = self.tasks.get_mut(task_id) {
+                            task.pending_download_task_ids.remove(&existing_download_id);
+                            task.transfer_task_map.remove(&existing_download_id);
+                            task.failed_count += 1;
+                        }
+                        file_task.status = BackupFileStatus::Failed;
+                        file_task.error_message =
+                            Some("恢复已存在的下载子任务失败".to_string());
+                        file_task.related_task_id = None;
+                        file_task.updated_at = Utc::now();
+                        if let Err(e) =
+                            self.persistence_manager.save_file_task(file_task, &config.id)
+                        {
+                            tracing::warn!(
+                                "复用下载任务失败后持久化 file_task 失败: file_task={}, error={}",
+                                file_task_id, e
+                            );
+                        }
+                        continue;
+                    }
+
+                    reused_count += 1;
+                    tracing::info!(
+                        "复用并启动已恢复的下载任务: file_task={}, download_task={}",
+                        file_task_id, existing_download_id
+                    );
+                    continue;
+                }
             }
 
             // 确保本地目录存在
@@ -8346,6 +9456,25 @@ impl AutoBackupManager {
                 .or(config.download_conflict_strategy)
                 .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
 
+            // 硬失败而非回退 Uid(0)
+            let task_owner_uid = match config.owner_uid {
+                Some(v) => crate::auth::Uid::new(v),
+                None => {
+                    tracing::error!(
+                        "create_backup_task: config={} 缺失 owner_uid，\
+                         跳过文件并标记失败: file_task={}（请通过 UI 重新关联账号）",
+                        config.id, file_task_id
+                    );
+                    if let Some(mut task) = self.tasks.get_mut(task_id) {
+                        task.failed_count += 1;
+                    }
+                    file_task.status = BackupFileStatus::Failed;
+                    file_task.error_message =
+                        Some("owner_uid 缺失，无法创建子任务".to_string());
+                    file_task.updated_at = Utc::now();
+                    continue;
+                }
+            };
             match download_mgr.create_backup_task(
                 fs_id,
                 remote_path.clone(),
@@ -8353,6 +9482,7 @@ impl AutoBackupManager {
                 file_size,
                 config.id.clone(),
                 Some(download_strategy), // 传递冲突策略
+                task_owner_uid,
             ).await {
                 Ok(download_task_id) => {
                     // 检查是否为跳过标记
@@ -8478,7 +9608,8 @@ impl AutoBackupManager {
                         tracing::warn!("持久化失败任务失败: {}", e);
                     }
                 }
-                Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "failed");
+                let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
+                Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "failed", owner_uid_for_event);
             }
             return Ok(());
         }

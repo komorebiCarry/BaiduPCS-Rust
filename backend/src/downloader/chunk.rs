@@ -1,3 +1,4 @@
+use crate::auth::Uid;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
@@ -44,10 +45,12 @@ pub struct Chunk {
     /// 🔥 冷却截止时间（指数退避期间调度器跳过此分片）
     /// None = 无冷却；Some(instant) = 在此时刻之前不调度
     pub cooldown_until: Option<std::time::Instant>,
+    /// 🔥 多账号归属 UID（跨账号分片防御）
+    pub owner_uid: Uid,
 }
 
 impl Chunk {
-    pub fn new(index: usize, range: Range<u64>) -> Self {
+    pub fn new(index: usize, range: Range<u64>, owner_uid: Uid) -> Self {
         Self {
             index,
             range,
@@ -57,6 +60,7 @@ impl Chunk {
             bytes_downloaded: 0,
             deferred: false,
             cooldown_until: None,
+            owner_uid,
         }
     }
 
@@ -333,11 +337,12 @@ pub struct ChunkManager {
 }
 
 impl ChunkManager {
-    /// 创建新的分片管理器
-    pub fn new(total_size: u64, chunk_size: u64) -> Self {
-        let chunks = Self::calculate_chunks(total_size, chunk_size);
+    /// 创建新的分片管理器（必须传 `owner_uid`）
+    pub fn new(total_size: u64, chunk_size: u64, owner_uid: Uid) -> Self {
+        let chunks = Self::calculate_chunks(total_size, chunk_size, owner_uid);
         info!(
-            "创建分片管理器: 文件大小={} bytes, 分片数量={}",
+            "创建分片管理器: uid={}, 文件大小={} bytes, 分片数量={}",
+            owner_uid,
             total_size,
             chunks.len()
         );
@@ -349,19 +354,34 @@ impl ChunkManager {
     }
 
     /// 使用默认分片大小创建
-    pub fn with_default_chunk_size(total_size: u64) -> Self {
-        Self::new(total_size, DEFAULT_CHUNK_SIZE)
+    pub fn with_default_chunk_size(total_size: u64, owner_uid: Uid) -> Self {
+        Self::new(total_size, DEFAULT_CHUNK_SIZE, owner_uid)
+    }
+
+    /// 🔥 SAFETY 断言：校验任务 uid 与分片 owner_uid 一致
+    ///
+    /// 在每次分片下载进入网络层之前调用。任何不一致都表示"分片对象被错误地混入了另一账号的下载流"——
+    /// 历史上 Pandownload 案因此导致跨账号数据污染、cookie 串用、风控连坐。
+    /// 此处使用 `assert_eq!`（**非** debug_assert），release 构建也保留，
+    /// 一旦命中直接 panic 防止数据污染扩散。
+    #[inline]
+    pub fn assert_chunk_owner(task_uid: Uid, chunk: &Chunk) {
+        assert_eq!(
+            task_uid, chunk.owner_uid,
+            "SAFETY 违规: task_uid={} 与 chunk.owner_uid={} 不一致（chunk_index={}）—— 阻止跨账号下载污染",
+            task_uid, chunk.owner_uid, chunk.index
+        );
     }
 
     /// 计算分片
-    fn calculate_chunks(total_size: u64, chunk_size: u64) -> Vec<Chunk> {
+    fn calculate_chunks(total_size: u64, chunk_size: u64, owner_uid: Uid) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         let mut offset = 0u64;
         let mut index = 0;
 
         while offset < total_size {
             let end = std::cmp::min(offset + chunk_size, total_size);
-            chunks.push(Chunk::new(index, offset..end));
+            chunks.push(Chunk::new(index, offset..end, owner_uid));
             offset = end;
             index += 1;
         }
@@ -581,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_chunk_creation() {
-        let chunk = Chunk::new(0, 0..1024);
+        let chunk = Chunk::new(0, 0..1024, Uid::default());
         assert_eq!(chunk.index, 0);
         assert_eq!(chunk.range.start, 0);
         assert_eq!(chunk.range.end, 1024);
@@ -591,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_chunk_manager_creation() {
-        let manager = ChunkManager::new(100 * 1024 * 1024, 10 * 1024 * 1024);
+        let manager = ChunkManager::new(100 * 1024 * 1024, 10 * 1024 * 1024, Uid::default());
         assert_eq!(manager.chunk_count(), 10);
         assert_eq!(manager.completed_count(), 0);
         assert_eq!(manager.progress(), 0.0);
@@ -600,13 +620,13 @@ mod tests {
     #[test]
     fn test_chunk_calculation() {
         // 测试完整分片
-        let manager = ChunkManager::new(100, 10);
+        let manager = ChunkManager::new(100, 10, Uid::default());
         assert_eq!(manager.chunk_count(), 10);
         assert_eq!(manager.chunks[0].range, 0..10);
         assert_eq!(manager.chunks[9].range, 90..100);
 
         // 测试不完整分片
-        let manager = ChunkManager::new(105, 10);
+        let manager = ChunkManager::new(105, 10, Uid::default());
         assert_eq!(manager.chunk_count(), 11);
         assert_eq!(manager.chunks[10].range, 100..105);
         assert_eq!(manager.chunks[10].size(), 5);
@@ -614,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_progress_calculation() {
-        let mut manager = ChunkManager::new(1000, 100);
+        let mut manager = ChunkManager::new(1000, 100, Uid::default());
         assert_eq!(manager.progress(), 0.0);
 
         // 完成前5个分片
@@ -635,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_next_pending() {
-        let mut manager = ChunkManager::new(300, 100);
+        let mut manager = ChunkManager::new(300, 100, Uid::default());
 
         let chunk1 = manager.next_pending();
         assert!(chunk1.is_some());
@@ -650,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mut manager = ChunkManager::new(300, 100);
+        let mut manager = ChunkManager::new(300, 100, Uid::default());
 
         // 完成所有分片
         for i in 0..3 {
@@ -662,5 +682,23 @@ mod tests {
         manager.reset();
         assert_eq!(manager.completed_count(), 0);
         assert!(!manager.is_completed());
+    }
+
+    /// SAFETY 断言 — uid 一致时通过
+    #[test]
+    fn test_assert_chunk_owner_ok() {
+        let uid = Uid::new(42);
+        let chunk = Chunk::new(0, 0..100, uid);
+        // 不应 panic
+        ChunkManager::assert_chunk_owner(uid, &chunk);
+    }
+
+    /// SAFETY 断言 — uid 不一致时 panic
+    #[test]
+    #[should_panic(expected = "SAFETY 违规")]
+    fn test_assert_chunk_owner_mismatch_panics() {
+        let chunk = Chunk::new(0, 0..100, Uid::new(1));
+        // 不同 uid 应触发 panic
+        ChunkManager::assert_chunk_owner(Uid::new(2), &chunk);
     }
 }
