@@ -459,6 +459,34 @@ impl ShareSyncPersistence {
         Ok(())
     }
 
+    /// 更新 run_item 绑定的任务与状态。
+    ///
+    /// 分享同步对临时失败做重新提交时，新的 transfer task_id 需要覆盖旧值，
+    /// 否则历史记录会指向第一次已经失败的任务。
+    pub fn update_run_item_task_state(
+        &self,
+        run_item_id: i64,
+        transfer_task_id: Option<&str>,
+        download_task_id: Option<&str>,
+        status: RunItemStatus,
+        error: Option<&str>,
+    ) -> Result<(), ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE share_sync_run_items
+             SET transfer_task_id = ?1, download_task_id = ?2, status = ?3, error = ?4
+             WHERE id = ?5",
+            params![
+                transfer_task_id,
+                download_task_id,
+                status.to_string(),
+                error,
+                run_item_id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 单独更新 run_item 的 reason 字段（v1 新增）
     ///
     /// 用于"submit/wait 阶段因 quota 跳过"——此时 `add_run_item` 已经把 status

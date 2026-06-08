@@ -1813,10 +1813,11 @@ impl NetdiskClient {
     fn override_cookie_randsk(cookie_header: &str, randsk: &str) -> String {
         let mut cookies: Vec<String> = cookie_header
             .split("; ")
-            .filter(|kv| !kv.is_empty() && !kv.starts_with("randsk="))
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("randsk=") && !kv.starts_with("BDCLND="))
             .map(str::to_string)
             .collect();
         cookies.push(format!("randsk={}", randsk));
+        cookies.push(format!("BDCLND={}", randsk));
         cookies.join("; ")
     }
 
@@ -4511,11 +4512,14 @@ mod tests {
 
     #[test]
     fn test_override_cookie_randsk_replaces_existing_value() {
-        let cookie =
-            NetdiskClient::override_cookie_randsk("BDUSS=bd; randsk=old; PANPSC=pan", "new");
+        let cookie = NetdiskClient::override_cookie_randsk(
+            "BDUSS=bd; randsk=old; BDCLND=old; PANPSC=pan",
+            "new",
+        );
 
-        assert_eq!(cookie, "BDUSS=bd; PANPSC=pan; randsk=new");
+        assert_eq!(cookie, "BDUSS=bd; PANPSC=pan; randsk=new; BDCLND=new");
         assert!(!cookie.contains("randsk=old"));
+        assert!(!cookie.contains("BDCLND=old"));
     }
 
     #[test]

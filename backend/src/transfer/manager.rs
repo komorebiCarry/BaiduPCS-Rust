@@ -21,6 +21,9 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+const TRANSFER_BATCH_MAX_ATTEMPTS: usize = 3;
+const TRANSFER_BATCH_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+
 /// 转存任务信息（包含任务和取消令牌）
 pub struct TransferTaskInfo {
     pub task: Arc<RwLock<TransferTask>>,
@@ -1066,50 +1069,81 @@ impl TransferManager {
                 // 提取该组的 fs_ids
                 let group_fs_ids: Vec<u64> = group_files.iter().map(|f| f.fs_id).collect();
 
-                // 转存该组
-                let result = client
-                    .transfer_share_files_with_randsk(
-                        &share_info.shareid,
-                        &share_info.share_uk,
-                        &share_info.bdstoken,
-                        &group_fs_ids,
-                        &group_target_dir,
-                        &referer,
-                        Some(task_id),
-                        task_randsk.as_deref(),
-                    )
-                    .await;
+                let mut result: Option<Result<TransferResult>> = None;
+                for attempt in 1..=TRANSFER_BATCH_MAX_ATTEMPTS {
+                    if cancellation_token.is_cancelled() {
+                        result = Some(Err(anyhow::anyhow!("分批转存被用户取消")));
+                        break;
+                    }
 
-                // errno=2 重试：逐级创建中间目录后重试一次
-                let result = match &result {
-                    Ok(r) if !r.success => {
-                        let err_msg = r.error.as_deref().unwrap_or("");
-                        if err_msg.contains("errno\":2") || err_msg.contains("路径不存在") {
-                            warn!(
-                                "批次 {} 路径不存在，逐级创建目录后重试: {}",
-                                batch_num, group_target_dir
-                            );
-                            if let Err(e) = ensure_dirs_exist(&client, &group_target_dir).await {
-                                warn!("重试时创建目录失败: {}", e);
+                    // 转存该组
+                    let attempt_result = client
+                        .transfer_share_files_with_randsk(
+                            &share_info.shareid,
+                            &share_info.share_uk,
+                            &share_info.bdstoken,
+                            &group_fs_ids,
+                            &group_target_dir,
+                            &referer,
+                            Some(task_id),
+                            task_randsk.as_deref(),
+                        )
+                        .await;
+
+                    // errno=2 重试：逐级创建中间目录后重试一次
+                    let attempt_result = match &attempt_result {
+                        Ok(r) if !r.success => {
+                            let err_msg = r.error.as_deref().unwrap_or("");
+                            if err_msg.contains("errno\":2") || err_msg.contains("路径不存在")
+                            {
+                                warn!(
+                                    "批次 {} 路径不存在，逐级创建目录后重试: {}",
+                                    batch_num, group_target_dir
+                                );
+                                if let Err(e) = ensure_dirs_exist(&client, &group_target_dir).await
+                                {
+                                    warn!("重试时创建目录失败: {}", e);
+                                }
+                                client
+                                    .transfer_share_files_with_randsk(
+                                        &share_info.shareid,
+                                        &share_info.share_uk,
+                                        &share_info.bdstoken,
+                                        &group_fs_ids,
+                                        &group_target_dir,
+                                        &referer,
+                                        Some(task_id),
+                                        task_randsk.as_deref(),
+                                    )
+                                    .await
+                            } else {
+                                attempt_result
                             }
-                            client
-                                .transfer_share_files_with_randsk(
-                                    &share_info.shareid,
-                                    &share_info.share_uk,
-                                    &share_info.bdstoken,
-                                    &group_fs_ids,
-                                    &group_target_dir,
-                                    &referer,
-                                    Some(task_id),
-                                    task_randsk.as_deref(),
-                                )
-                                .await
-                        } else {
-                            result
+                        }
+                        _ => attempt_result,
+                    };
+
+                    if let Some(err_msg) = retryable_transfer_result_error(&attempt_result) {
+                        if attempt < TRANSFER_BATCH_MAX_ATTEMPTS {
+                            let delay = TRANSFER_BATCH_RETRY_BASE_DELAY * attempt as u32;
+                            warn!(
+                                "转存批次 {}/{} 临时失败，{}ms 后重试 ({}/{}): {}",
+                                batch_num,
+                                total_groups,
+                                delay.as_millis(),
+                                attempt + 1,
+                                TRANSFER_BATCH_MAX_ATTEMPTS,
+                                err_msg
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
                         }
                     }
-                    _ => result,
-                };
+
+                    result = Some(attempt_result);
+                    break;
+                }
+                let result = result.unwrap_or_else(|| Err(anyhow::anyhow!("分批转存未执行")));
 
                 let batch_ok = match &result {
                     Ok(r) => r.success,
@@ -4396,6 +4430,49 @@ fn group_files_by_parent_dir(
     result
 }
 
+fn retryable_transfer_result_error(result: &Result<TransferResult>) -> Option<String> {
+    match result {
+        Ok(r) if !r.success => {
+            let msg = r.error.as_deref().unwrap_or("");
+            is_retryable_transfer_error_message(msg).then(|| msg.to_string())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            is_retryable_transfer_error_message(&msg).then_some(msg)
+        }
+        _ => None,
+    }
+}
+
+fn is_retryable_transfer_error_message(msg: &str) -> bool {
+    if msg.trim().is_empty() {
+        return false;
+    }
+
+    if msg.contains("空间不足")
+        || msg.contains("提取码")
+        || msg.contains("风控")
+        || msg.contains("已失效")
+        || msg.contains("不存在")
+        || msg.contains("errno=132")
+    {
+        return false;
+    }
+
+    let lower = msg.to_ascii_lowercase();
+    msg.contains("请求超时")
+        || msg.contains("请稍后")
+        || msg.contains("稍后再试")
+        || msg.contains("连接超时")
+        || msg.contains("网络异常")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("temporarily")
+        || lower.contains("temporary")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+}
+
 /// 合并分批转存结果
 ///
 /// 关键逻辑：至少一个批次成功就标记 success=true，继续自动下载流程。
@@ -4966,6 +5043,14 @@ mod tests {
     }
 
     // ========== merge_batch_results ==========
+
+    #[test]
+    fn test_retryable_transfer_error_message() {
+        assert!(is_retryable_transfer_error_message("请求超时，请稍后再试"));
+        assert!(is_retryable_transfer_error_message("operation timed out"));
+        assert!(!is_retryable_transfer_error_message("网盘空间不足"));
+        assert!(!is_retryable_transfer_error_message("风控，请稍后再试"));
+    }
 
     #[test]
     fn test_merge_all_success() {
