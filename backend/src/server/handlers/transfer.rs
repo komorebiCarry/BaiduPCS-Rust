@@ -193,6 +193,7 @@ pub async fn create_transfer(
         save_fs_id: req.save_fs_id,
         auto_download: req.auto_download,
         local_download_path: req.local_download_path,
+        download_conflict_strategy: None,
         is_share_direct_download: req.is_share_direct_download,
         selected_fs_ids: req.selected_fs_ids,
         selected_files: req.selected_files,

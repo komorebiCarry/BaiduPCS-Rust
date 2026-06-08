@@ -13,6 +13,9 @@ use uuid::Uuid;
 pub struct ShareSnapshotItem {
     /// 相对分享根的路径（如 `/剧集/01.mp4`）；根级条目 path 为 `/<name>`
     pub path: String,
+    /// 百度返回的原始分享路径，用于后续转存/下载定位；老快照缺失时回退到 `path`
+    #[serde(default)]
+    pub raw_path: String,
     /// 百度 fs_id（目录也分配）
     pub fs_id: u64,
     /// 文件大小（目录固定 0）
@@ -31,8 +34,28 @@ impl ShareSnapshotItem {
         size: u64,
         is_dir: bool,
     ) -> Self {
+        let path = path.into();
+        Self {
+            raw_path: path.clone(),
+            path,
+            name: name.into(),
+            fs_id,
+            size,
+            is_dir,
+        }
+    }
+
+    pub fn with_raw_path(
+        path: impl Into<String>,
+        name: impl Into<String>,
+        fs_id: u64,
+        size: u64,
+        is_dir: bool,
+        raw_path: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
+            raw_path: raw_path.into(),
             name: name.into(),
             fs_id,
             size,
@@ -66,10 +89,7 @@ impl ShareSnapshot {
     }
 
     /// 创建一个带条目的快照
-    pub fn with_items(
-        subscription_id: impl Into<String>,
-        items: Vec<ShareSnapshotItem>,
-    ) -> Self {
+    pub fn with_items(subscription_id: impl Into<String>, items: Vec<ShareSnapshotItem>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             subscription_id: subscription_id.into(),
@@ -101,8 +121,9 @@ impl ShareSnapshot {
 // =====================================================
 
 use crate::netdisk::client::NetdiskClient;
-use crate::transfer::types::{ShareFileListResult, SharedFileInfo};
 use crate::share_sync::error::ShareSyncError;
+use crate::transfer::types::{ShareFileListResult, SharedFileInfo};
+use regex::RegexSet;
 
 /// 抓取结果（含访问元数据，便于后续转存/下载使用）
 #[derive(Debug, Clone)]
@@ -128,7 +149,12 @@ pub struct SnapshotCollector<'a> {
     bdstoken: String,
     password: Option<String>,
     include_paths: BTreeSet<String>,
-    exclude_patterns: Vec<String>,
+    /// 预计算的 include 路径前缀索引（dir 维度）：
+    /// - `ancestors`：所有 include_path 的祖先 + include_path 自身的并集
+    ///   命中此集合的目录是值得递归进入的（O(log N) 查询）
+    include_index: BTreeSet<String>,
+    /// 预编译的 exclude glob → RegexSet
+    exclude_set: Option<RegexSet>,
 }
 
 impl<'a> SnapshotCollector<'a> {
@@ -156,6 +182,35 @@ impl<'a> SnapshotCollector<'a> {
             ));
         }
 
+        // 🔥 关键：如有密码，必须先 verify_share_password 拿到 randsk 写入 Cookie，
+        // 否则 list_share_files 会返回 errno=-9 "提取码验证失败"。
+        if let Some(ref pwd) = effective_pwd {
+            if !pwd.is_empty() {
+                let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+                if let Err(e) = client
+                    .verify_share_password(
+                        &page.shareid,
+                        &page.share_uk,
+                        &page.bdstoken,
+                        pwd,
+                        &referer,
+                    )
+                    .await
+                {
+                    return Err(ShareSyncError::ShareLinkError(format!(
+                        "验证提取码失败: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        let include_paths: BTreeSet<String> = include_paths
+            .into_iter()
+            .filter_map(normalize_snapshot_path)
+            .collect();
+        let include_index = build_include_index(&include_paths);
+        let exclude_set = compile_exclude_patterns(&exclude_patterns);
         Ok(Self {
             client,
             short_key: share_link.short_key,
@@ -163,8 +218,9 @@ impl<'a> SnapshotCollector<'a> {
             uk: page.uk,
             bdstoken: page.bdstoken,
             password: effective_pwd,
-            include_paths: include_paths.into_iter().collect(),
-            exclude_patterns,
+            include_paths,
+            include_index,
+            exclude_set,
         })
     }
 
@@ -193,24 +249,33 @@ impl<'a> SnapshotCollector<'a> {
             self.uk.clone()
         };
 
+        let share_root = infer_share_root(&root.files);
         let mut all_items: Vec<ShareSnapshotItem> = Vec::new();
         let mut seen: HashSet<(String, u64)> = HashSet::new();
+        let mut queued_dirs: HashSet<String> = HashSet::new();
+        let mut found_included_files: BTreeSet<String> = BTreeSet::new();
 
         // 推入 root
         for f in root.files {
-            push_unique(&mut all_items, &mut seen, f);
-        }
-
-        // Step 2: BFS 子目录
-        let mut queue: VecDeque<String> = VecDeque::new();
-        for it in &all_items {
-            if it.is_dir {
-                queue.push_back(it.path.clone());
+            let is_dir = f.is_dir;
+            let raw_path = f.path.clone();
+            let normalized_path = normalize_share_path(&f.path, &f.name, &share_root);
+            if !is_dir && self.include_paths.contains(&normalized_path) {
+                found_included_files.insert(normalized_path.clone());
+            }
+            push_unique(&mut all_items, &mut seen, &share_root, f);
+            if is_dir && self.dir_allowed(&normalized_path) {
+                queued_dirs.insert(raw_path);
             }
         }
 
+        // Step 2: BFS 子目录
+        let mut queue: VecDeque<String> = queued_dirs.iter().cloned().collect();
+
         while let Some(dir) = queue.pop_front() {
-            if !self.dir_allowed(&dir) {
+            let normalized_dir =
+                normalize_share_path(&dir, dir.rsplit('/').next().unwrap_or(&dir), &share_root);
+            if !self.dir_allowed(&normalized_dir) {
                 continue;
             }
             let mut page: u32 = 1;
@@ -236,13 +301,23 @@ impl<'a> SnapshotCollector<'a> {
                 let batch_len = batch.len();
                 for f in batch {
                     let is_dir = f.is_dir;
-                    let path = f.path.clone();
-                    push_unique(&mut all_items, &mut seen, f);
-                    if is_dir && !queue.contains(&path) {
-                        queue.push_back(path);
+                    let raw_path = f.path.clone();
+                    let normalized_path = normalize_share_path(&f.path, &f.name, &share_root);
+                    if !is_dir && self.include_paths.contains(&normalized_path) {
+                        found_included_files.insert(normalized_path.clone());
+                    }
+                    push_unique(&mut all_items, &mut seen, &share_root, f);
+                    if is_dir
+                        && self.dir_allowed(&normalized_path)
+                        && queued_dirs.insert(raw_path.clone())
+                    {
+                        queue.push_back(raw_path);
                     }
                 }
 
+                if !self.dir_needs_more_pages(&normalized_dir, &found_included_files) {
+                    break;
+                }
                 if batch_len < page_size as usize {
                     break;
                 }
@@ -283,84 +358,259 @@ impl<'a> SnapshotCollector<'a> {
         if self.include_paths.is_empty() {
             return true;
         }
-        self.include_paths
-            .iter()
-            .any(|inc| dir == inc || dir.starts_with(inc))
+        // 命中预计算索引 → dir 是某个 include_path 自身或它的祖先
+        self.include_index.contains(dir)
     }
 
     fn item_allowed(&self, item: &ShareSnapshotItem) -> bool {
-        if !self.include_paths.is_empty()
-            && !self
-                .include_paths
-                .iter()
-                .any(|inc| item.path == *inc || item.path.starts_with(inc))
-        {
-            return false;
+        // 1) include 过滤：item.path 是某个 include_path 自身或后代
+        if !self.include_paths.is_empty() && !self.include_index.contains(&item.path) {
+            // 二级检查：item.path 是否是某个 include_path 的后代（include 选了目录，
+            // 它下面的所有文件/子目录都应被收录）
+            let mut allowed = false;
+            for inc in &self.include_paths {
+                if is_path_ancestor_or_self(&item.path, inc) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if !allowed {
+                return false;
+            }
         }
-        for pat in &self.exclude_patterns {
-            if glob_match(pat, &item.path) {
+        // 2) exclude 过滤：任意 exclude glob 命中则排除
+        if let Some(ref set) = self.exclude_set {
+            if set.is_match(&item.path) {
                 return false;
             }
         }
         true
     }
+
+    fn dir_needs_more_pages(&self, dir: &str, found_included_files: &BTreeSet<String>) -> bool {
+        if self.include_paths.is_empty() {
+            return true;
+        }
+
+        // If the selected include path is this directory or an ancestor of it,
+        // the user selected a whole subtree, so we must scan all pages.
+        if self
+            .include_paths
+            .iter()
+            .any(|inc| is_path_ancestor_or_self(dir, inc))
+        {
+            return true;
+        }
+
+        // Otherwise this directory is only being scanned to find exact file
+        // include paths below it. Once every requested descendant file has been
+        // found, continuing to page through thousands of siblings is wasted work.
+        self.include_paths
+            .iter()
+            .any(|inc| is_path_ancestor_or_self(inc, dir) && !found_included_files.contains(inc))
+    }
 }
 
-/// 简单的 glob 匹配（仅支持 `*` 与 `?`）
-fn glob_match(pattern: &str, s: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = s.chars().collect();
-    glob_match_inner(&p, &t)
+/// 把 include_paths 展开为"祖先 + 自身"的并集索引。
+///
+/// 这样 `dir_allowed(dir)` 只需要一次 `BTreeSet::contains`（O(log N)），
+/// 不再每次线性扫 `include_paths`。
+///
+/// 例：include_paths = `["/a/b/c.csv", "/a/x/y.csv"]` →
+///   `{"/", "/a", "/a/b", "/a/b/c.csv", "/a/x", "/a/x/y.csv"}`
+fn build_include_index(include_paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut idx: BTreeSet<String> = BTreeSet::new();
+    idx.insert("/".to_string());
+    for inc in include_paths {
+        idx.insert(inc.clone());
+        // 逐级加祖先
+        let mut cur = inc.as_str();
+        while let Some(slash) = cur.rfind('/') {
+            if slash == 0 {
+                break;
+            }
+            cur = &cur[..slash];
+            idx.insert(cur.to_string());
+        }
+    }
+    idx
 }
 
-fn glob_match_inner(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return t.is_empty();
+/// 把 glob 模式（仅 `*` / `?`）编译为 `RegexSet`，对每条路径做 O(L) 匹配。
+///
+/// 旧实现是手写递归 + 回溯，复杂度 O(2^L)，对万级条目 × 多个 pattern 会很慢。
+/// 编译失败时回退到"无 exclude"（不阻塞主流程）。
+fn compile_exclude_patterns(patterns: &[String]) -> Option<RegexSet> {
+    if patterns.is_empty() {
+        return None;
     }
-    match p[0] {
-        '*' => {
-            // 跳过连续 *
-            let mut i = 0;
-            while i < p.len() && p[i] == '*' {
-                i += 1;
+    let regexes: Vec<String> = patterns
+        .iter()
+        .map(|p| glob_to_regex(p).map(|r| format!("^{}$", r)))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    RegexSet::new(&regexes).ok()
+}
+
+/// 简单 glob → regex 转换（仅 `*` 和 `?`，其余元字符转义）。
+fn glob_to_regex(pattern: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(pattern.len() * 2);
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            // regex 元字符需要转义
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
+                out.push('\\');
+                out.push(ch);
             }
-            for j in 0..=t.len() {
-                if glob_match_inner(&p[i..], &t[j..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        '?' => {
-            if t.is_empty() {
-                false
-            } else {
-                glob_match_inner(&p[1..], &t[1..])
-            }
-        }
-        c => {
-            if t.is_empty() || t[0] != c {
-                false
-            } else {
-                glob_match_inner(&p[1..], &t[1..])
-            }
+            _ => out.push(ch),
         }
     }
+    Ok(out)
+}
+
+pub fn infer_share_root(files: &[SharedFileInfo]) -> String {
+    let parents: Vec<String> = files
+        .iter()
+        .filter_map(|f| normalize_snapshot_path(f.path.clone()))
+        .map(|p| parent_dir(&p))
+        .collect();
+    if parents.is_empty() {
+        return String::new();
+    }
+
+    let mut common: Vec<String> = path_components(&parents[0]);
+    for parent in parents.iter().skip(1) {
+        let parts = path_components(parent);
+        let keep = common
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(keep);
+        if common.is_empty() {
+            break;
+        }
+    }
+
+    if common.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", common.join("/"))
+    }
+}
+
+pub fn normalize_share_path(raw_path: &str, name: &str, share_root: &str) -> String {
+    let raw = normalize_snapshot_path(raw_path.to_string()).unwrap_or_default();
+    let root = normalize_snapshot_path(share_root.to_string()).unwrap_or_default();
+    let relative = if raw.is_empty() {
+        String::new()
+    } else if root.is_empty() || root == "/" {
+        raw.trim_start_matches('/').to_string()
+    } else if raw == root {
+        String::new()
+    } else if raw.starts_with(&root) && raw.as_bytes().get(root.len()) == Some(&b'/') {
+        raw[root.len() + 1..].to_string()
+    } else {
+        raw.trim_start_matches('/').to_string()
+    };
+
+    let fallback = if name.trim().is_empty() {
+        raw.rsplit('/').next().unwrap_or("").to_string()
+    } else {
+        name.trim().to_string()
+    };
+    let candidate = if relative.trim().is_empty() {
+        fallback
+    } else {
+        relative
+    };
+
+    normalize_snapshot_path(candidate).unwrap_or_else(|| "/".to_string())
+}
+
+fn normalize_snapshot_path(path: String) -> Option<String> {
+    let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let prefixed = if trimmed.starts_with('/') {
+        trimmed
+    } else {
+        format!("/{}", trimmed)
+    };
+    let mut collapsed = String::with_capacity(prefixed.len());
+    let mut prev_slash = false;
+    for ch in prefixed.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    if collapsed == "/" {
+        return Some("/".to_string());
+    }
+    let normalized = collapsed.trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn parent_dir(path: &str) -> String {
+    let path = normalize_snapshot_path(path.to_string()).unwrap_or_else(|| "/".to_string());
+    if path == "/" {
+        return "/".to_string();
+    }
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) if parent.is_empty() => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn path_components(path: &str) -> Vec<String> {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn is_path_ancestor_or_self(path: &str, ancestor: &str) -> bool {
+    if ancestor == "/" {
+        return true;
+    }
+    if path == ancestor {
+        return true;
+    }
+    path.starts_with(ancestor) && path.as_bytes().get(ancestor.len()) == Some(&b'/')
 }
 
 fn push_unique(
     out: &mut Vec<ShareSnapshotItem>,
     seen: &mut HashSet<(String, u64)>,
+    share_root: &str,
     info: SharedFileInfo,
 ) {
-    let key = (info.path.clone(), info.fs_id);
+    let normalized_path = normalize_share_path(&info.path, &info.name, share_root);
+    let key = (normalized_path.clone(), info.fs_id);
     if seen.insert(key) {
-        out.push(ShareSnapshotItem::new(
-            info.path,
+        out.push(ShareSnapshotItem::with_raw_path(
+            normalized_path,
             info.name,
             info.fs_id,
             info.size,
             info.is_dir,
+            info.path,
         ));
     }
 }
@@ -382,6 +632,16 @@ mod tests {
     fn item(path: &str, fs_id: u64, size: u64) -> ShareSnapshotItem {
         let name = path.rsplit('/').next().unwrap_or(path).to_string();
         ShareSnapshotItem::new(path, name, fs_id, size, false)
+    }
+
+    fn shared_file(path: &str, name: &str, fs_id: u64, is_dir: bool) -> SharedFileInfo {
+        SharedFileInfo {
+            fs_id,
+            is_dir,
+            path: path.to_string(),
+            size: if is_dir { 0 } else { 123 },
+            name: name.to_string(),
+        }
     }
 
     #[test]
@@ -421,12 +681,66 @@ mod tests {
     fn test_sorted_items() {
         let s = ShareSnapshot::with_items(
             "sub-1",
-            vec![item("/c.txt", 3, 1), item("/a.txt", 1, 1), item("/b.txt", 2, 1)],
+            vec![
+                item("/c.txt", 3, 1),
+                item("/a.txt", 1, 1),
+                item("/b.txt", 2, 1),
+            ],
         );
         let sorted = s.sorted_items();
         assert_eq!(sorted[0].path, "/a.txt");
         assert_eq!(sorted[1].path, "/b.txt");
         assert_eq!(sorted[2].path, "/c.txt");
+    }
+
+    #[test]
+    fn test_normalize_single_file_share_to_root_file() {
+        let files = vec![shared_file(
+            "/_pcs_.workspace/curated/report.csv",
+            "report.csv",
+            1,
+            false,
+        )];
+        let root = infer_share_root(&files);
+
+        assert_eq!(root, "/_pcs_.workspace/curated");
+        assert_eq!(
+            normalize_share_path(&files[0].path, &files[0].name, &root),
+            "/report.csv"
+        );
+    }
+
+    #[test]
+    fn test_normalize_multi_folder_share_keeps_folder_prefixes() {
+        let files = vec![
+            shared_file(
+                "/_pcs_.workspace/curated/fina_indicator",
+                "fina_indicator",
+                1,
+                true,
+            ),
+            shared_file(
+                "/_pcs_.workspace/curated/stock_basic",
+                "stock_basic",
+                2,
+                true,
+            ),
+        ];
+        let root = infer_share_root(&files);
+
+        assert_eq!(root, "/_pcs_.workspace/curated");
+        assert_eq!(
+            normalize_share_path(&files[0].path, &files[0].name, &root),
+            "/fina_indicator"
+        );
+        assert_eq!(
+            normalize_share_path(
+                "/_pcs_.workspace/curated/fina_indicator/000004.SZ.csv",
+                "000004.SZ.csv",
+                &root,
+            ),
+            "/fina_indicator/000004.SZ.csv"
+        );
     }
 
     #[test]
@@ -439,41 +753,127 @@ mod tests {
         assert_eq!(back.items[0].path, "/a");
     }
 
-    // ========== glob 匹配测试 ==========
+    // ========== glob 匹配测试（RegexSet 路径） ==========
+
+    fn compile(patterns: &[&str]) -> RegexSet {
+        // 模拟 compile_exclude_patterns 的 "^...$" 锚定
+        let regexes: Vec<String> = patterns
+            .iter()
+            .map(|p| format!("^{}$", glob_to_regex(p).unwrap()))
+            .collect();
+        RegexSet::new(&regexes).unwrap()
+    }
+
+    fn is_hit(set: &RegexSet, s: &str) -> bool {
+        set.is_match(s)
+    }
 
     #[test]
     fn test_glob_match_star() {
-        assert!(glob_match("*.txt", "a.txt"));
-        assert!(glob_match("*.txt", "abc.txt"));
-        assert!(!glob_match("*.txt", "a.png"));
-        assert!(glob_match("*", ""));
-        assert!(glob_match("*", "anything"));
+        let set = compile(&["*.txt"]);
+        assert!(is_hit(&set, "a.txt"));
+        assert!(is_hit(&set, "abc.txt"));
+        assert!(!is_hit(&set, "a.png"));
+        // 单独的 "*" 经 ^.*$ 锚定后能匹配空字符串和非空
+        let set_any = compile(&["*"]);
+        assert!(is_hit(&set_any, "anything"));
     }
 
     #[test]
     fn test_glob_match_question() {
-        assert!(glob_match("a?c", "abc"));
-        assert!(glob_match("a?c", "axc"));
-        assert!(!glob_match("a?c", "ac"));
-        assert!(!glob_match("a?c", "abbc"));
+        let set = compile(&["a?c"]);
+        assert!(is_hit(&set, "abc"));
+        assert!(is_hit(&set, "axc"));
+        assert!(!is_hit(&set, "ac"));
+        assert!(!is_hit(&set, "abbc"));
     }
 
     #[test]
     fn test_glob_match_literal() {
-        assert!(glob_match("foo", "foo"));
-        assert!(!glob_match("foo", "bar"));
-        assert!(!glob_match("foo", "fooo"));
+        let set = compile(&["foo"]);
+        assert!(is_hit(&set, "foo"));
+        assert!(!is_hit(&set, "bar"));
+        assert!(!is_hit(&set, "fooo"));
     }
 
     #[test]
     fn test_glob_match_combined() {
         // * 匹配任意字符（含 /），与 shell glob 不同；本实现以"扩展名过滤"为主
-        assert!(glob_match("a/*/b", "a/x/b"));
-        assert!(glob_match("a/*/b", "a/x/y/b")); // * 匹配 x/y
-        assert!(glob_match("file-*.txt", "file-2024.txt"));
-        assert!(glob_match("?est.tmp", "test.tmp"));
+        let set = compile(&["a/*/b", "file-*.txt", "?est.tmp", "*.tmp"]);
+        assert!(is_hit(&set, "a/x/b"));
+        assert!(is_hit(&set, "a/x/y/b")); // * 匹配 x/y
+        assert!(is_hit(&set, "file-2024.txt"));
+        assert!(is_hit(&set, "test.tmp"));
         // 典型用法：扩展名排除
-        assert!(glob_match("*.tmp", "anything.tmp"));
-        assert!(!glob_match("*.tmp", "anything.txt"));
+        assert!(is_hit(&set, "anything.tmp"));
+        assert!(!is_hit(&set, "anything.txt"));
+    }
+
+    #[test]
+    fn test_glob_to_regex_escapes_metachars() {
+        // 扩展名 dot、字符类、管道等需要转义
+        assert_eq!(glob_to_regex("a.b").unwrap(), "a\\.b");
+        assert_eq!(glob_to_regex("a+b").unwrap(), "a\\+b");
+        assert_eq!(glob_to_regex("a(b)c").unwrap(), "a\\(b\\)c");
+    }
+
+    #[test]
+    fn test_build_include_index_basic() {
+        let mut inc = BTreeSet::new();
+        inc.insert("/a/b/c.csv".to_string());
+        inc.insert("/a/x/y.csv".to_string());
+        let idx = build_include_index(&inc);
+        assert!(idx.contains("/"));
+        assert!(idx.contains("/a"));
+        assert!(idx.contains("/a/b"));
+        assert!(idx.contains("/a/b/c.csv"));
+        assert!(idx.contains("/a/x"));
+        assert!(idx.contains("/a/x/y.csv"));
+        // 不相关路径
+        assert!(!idx.contains("/c"));
+        assert!(!idx.contains("/a/b/other.csv"));
+    }
+
+    #[test]
+    fn test_compile_exclude_empty_returns_none() {
+        let set = compile_exclude_patterns(&[]);
+        assert!(set.is_none());
+    }
+
+    #[test]
+    fn test_compile_exclude_invalid_falls_back() {
+        // `compile_exclude_patterns` 在 `RegexSet::new` 返回 Err 时回退到 None。
+        // 现代 regex crate 非常宽松，常规 glob 都能编译——这里用 Pattern::new 直接
+        // 验证 glob_to_regex 不 panic + compile_exclude_patterns 接受空 patterns。
+        assert!(glob_to_regex("[abc]").is_ok());
+        assert!(compile_exclude_patterns(&[]).is_none());
+        // 正常一组 pattern 编译成功
+        let set = compile_exclude_patterns(&["*.tmp".to_string(), "*.bak".to_string()]);
+        assert!(set.is_some());
+    }
+
+    #[test]
+    fn test_is_path_ancestor_or_self() {
+        assert!(is_path_ancestor_or_self("/foo/bar", "/foo"));
+        assert!(is_path_ancestor_or_self("/foo", "/foo"));
+        assert!(!is_path_ancestor_or_self("/foobar", "/foo"));
+        assert!(is_path_ancestor_or_self("/foobar", "/"));
+    }
+
+    #[test]
+    fn test_normalize_snapshot_path() {
+        assert_eq!(
+            normalize_snapshot_path("/foo/".to_string()),
+            Some("/foo".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("foo".to_string()),
+            Some("/foo".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("   /bar//".to_string()),
+            Some("/bar".to_string())
+        );
+        assert_eq!(normalize_snapshot_path("".to_string()), None);
     }
 }

@@ -72,9 +72,8 @@ pub struct DiffSummaryView {
 ///
 /// `prev == None` 表示首次抓取：所有条目视为 `added`
 pub fn diff_snapshots(prev: Option<&ShareSnapshot>, curr: &ShareSnapshot) -> ShareDiff {
-    let prev_map: BTreeMap<String, &ShareSnapshotItem> = prev
-        .map(|s| s.index_by_path())
-        .unwrap_or_default();
+    let prev_map: BTreeMap<String, &ShareSnapshotItem> =
+        prev.map(|s| s.index_by_path()).unwrap_or_default();
     let curr_map: BTreeMap<String, &ShareSnapshotItem> = curr.index_by_path();
 
     let mut added = Vec::new();
@@ -225,10 +224,10 @@ mod tests {
     #[test]
     fn test_complex_mix() {
         let prev = snap(vec![
-            file("/keep", 1, 100),       // unchanged
-            file("/grow", 2, 100),       // modified (size)
-            file("/vanish", 3, 100),     // removed
-            // /new is added
+            file("/keep", 1, 100), // unchanged
+            file("/grow", 2, 100), // modified (size)
+            file("/vanish", 3, 100), // removed
+                                   // /new is added
         ]);
         let curr = snap(vec![
             file("/keep", 1, 100),
@@ -266,7 +265,11 @@ mod tests {
     #[test]
     fn test_summary_view() {
         let prev = snap(vec![file("/a", 1, 100)]);
-        let curr = snap(vec![file("/a", 1, 200), file("/b", 2, 100), file("/c", 3, 50)]);
+        let curr = snap(vec![
+            file("/a", 1, 200),
+            file("/b", 2, 100),
+            file("/c", 3, 50),
+        ]);
         let diff = diff_snapshots(Some(&prev), &curr);
         let s = diff.summary();
         assert_eq!(s.added, 2);

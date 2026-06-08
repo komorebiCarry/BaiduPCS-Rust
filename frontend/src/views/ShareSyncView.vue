@@ -31,7 +31,7 @@
             >
               <div class="sub-name">
                 <el-icon><Link /></el-icon>
-                <span>{{ s.name }}</span>
+  <span>{{ s.name }}</span>
                 <el-tag v-if="!s.enabled" size="small" type="info">已停用</el-tag>
               </div>
               <div class="sub-meta">
@@ -55,7 +55,7 @@
                 <el-button
                   size="small"
                   :type="selected.enabled ? 'warning' : 'success'"
-                  :icon="selected.enabled ? 'VideoPause' : 'VideoPlay'"
+                  :icon="selected.enabled ? VideoPause : VideoPlay"
                   @click="toggleEnabled"
                 >
                   {{ selected.enabled ? '停用' : '启用' }}
@@ -90,8 +90,34 @@
                 </span>
               </div>
             </el-descriptions-item>
+            <el-descriptions-item label="同步范围">
+              <div v-if="selected.include_paths.length > 0" class="path-tags">
+                <el-tag
+                  v-for="(p, i) in selected.include_paths"
+                  :key="`inc-${i}`"
+                  size="small"
+                  type="info"
+                >
+                  {{ p }}
+                </el-tag>
+              </div>
+              <span v-else>同步整个分享</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="排除规则">
+              <div v-if="selected.exclude_patterns.length > 0" class="path-tags">
+                <el-tag
+                  v-for="(p, i) in selected.exclude_patterns"
+                  :key="`ex-${i}`"
+                  size="small"
+                  type="info"
+                >
+                  {{ p }}
+                </el-tag>
+              </div>
+              <span v-else>无</span>
+            </el-descriptions-item>
             <el-descriptions-item label="轮询">
-              <span v-if="selected.poll_config.enabled">
+              <span v-if="isPollEnabled(selected.poll_config)">
                 {{ describeInterval(selected.poll_config) }}
               </span>
               <span v-else>已禁用</span>
@@ -139,7 +165,7 @@
       width="640px"
       @close="resetForm"
     >
-      <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef">
+    <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef">
         <el-form-item label="名称" prop="name">
           <el-input v-model="form.name" placeholder="如：剧集合集同步" />
         </el-form-item>
@@ -148,6 +174,66 @@
         </el-form-item>
         <el-form-item label="提取码">
           <el-input v-model="form.password" placeholder="可选" maxlength="4" />
+        </el-form-item>
+        <el-form-item label="同步路径">
+          <div class="path-editor">
+            <div v-if="form.include_paths.length === 0" class="path-empty">
+              不填则同步整个分享；填写后只同步勾选的子路径（前缀匹配）。
+            </div>
+            <div v-else class="path-tags">
+              <el-tag
+                v-for="(p, i) in form.include_paths"
+                :key="p + i"
+                closable
+                @close="form.include_paths.splice(i, 1)"
+                style="margin: 2px 4px 2px 0"
+              >{{ p }}</el-tag>
+            </div>
+            <div class="path-actions">
+              <el-input
+                v-model="pathInput"
+                size="small"
+                placeholder="手动输入路径，如 /剧集"
+                style="width: 220px; margin-right: 8px"
+                @keyup.enter="addPath"
+              >
+                <template #append>
+                  <el-button :icon="Plus" @click="addPath" />
+                </template>
+              </el-input>
+              <el-button
+                size="small"
+                :icon="FolderOpened"
+                :loading="loadingTree"
+                :disabled="!form.share_url"
+                @click="openTreePicker"
+              >从分享浏览</el-button>
+            </div>
+          </div>
+        </el-form-item>
+        <el-form-item label="排除规则">
+          <div class="path-editor">
+            <div class="path-tags">
+              <el-tag
+                v-for="(p, i) in form.exclude_patterns"
+                :key="p + i"
+                closable
+                type="info"
+                @close="form.exclude_patterns.splice(i, 1)"
+                style="margin: 2px 4px 2px 0"
+              >{{ p }}</el-tag>
+              <span v-if="form.exclude_patterns.length === 0" class="path-empty-inline">
+                支持 glob：*.tmp、sample.*、*广告* 等
+              </span>
+            </div>
+            <el-input
+              v-model="excludeInput"
+              size="small"
+              placeholder="添加排除规则，按回车确认"
+              style="width: 280px; margin-top: 4px"
+              @keyup.enter="addExclude"
+            />
+          </div>
         </el-form-item>
         <el-form-item label="冲突策略">
           <el-radio-group v-model="form.conflict_strategy">
@@ -164,19 +250,19 @@
             </el-select>
             <el-input
               v-if="t.kind === 'netdisk'"
-              v-model="(t as any).remote_path"
+              v-model="(t as NetdiskTarget).remote_path"
               placeholder="网盘路径，如 /我的资源/同步"
               style="margin-left: 8px; flex: 1"
             />
             <el-input
               v-else
-              v-model="(t as any).local_path"
+              v-model="(t as LocalTarget).local_path"
               placeholder="本地路径"
               style="margin-left: 8px; flex: 1"
             />
             <el-button :icon="Delete" link type="danger" @click="form.targets.splice(i, 1)" style="margin-left: 4px" />
           </div>
-          <el-button :icon="Plus" link @click="form.targets.push({ kind: 'netdisk', remote_path: '/', save_fs_id: 0 } as any)">
+          <el-button :icon="Plus" link @click="form.targets.push(createDefaultTarget())">
             添加目标
           </el-button>
         </el-form-item>
@@ -210,6 +296,70 @@
       </template>
     </el-dialog>
 
+    <!-- 目录树选择对话框 -->
+    <el-dialog
+      v-model="treePickerVisible"
+      title="从分享中选择要同步的子路径"
+      width="640px"
+      :close-on-click-modal="false"
+      @open="loadTree"
+    >
+      <div class="tree-picker-toolbar">
+        <el-input
+          v-model="treeFilterText"
+          placeholder="搜索路径/文件名"
+          clearable
+          size="small"
+          style="width: 240px"
+        />
+        <el-checkbox v-model="treeCheckStrictly" style="margin-left: 12px">
+          父子独立选择
+        </el-checkbox>
+        <el-radio-group v-model="treeDepth" size="small" style="margin-left: 12px">
+          <el-radio-button :value="1">仅根</el-radio-button>
+          <el-radio-button :value="2">2 层</el-radio-button>
+          <el-radio-button :value="3">3 层</el-radio-button>
+        </el-radio-group>
+        <el-button size="small" :loading="loadingTree" :icon="Refresh" style="margin-left: 12px" @click="loadTree">刷新</el-button>
+      </div>
+      <el-alert
+        v-if="treeError"
+        :title="treeError"
+        type="error"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 8px"
+      />
+      <el-tree
+        ref="treeRef"
+        :data="treeData"
+        :props="treeProps"
+        node-key="path"
+        show-checkbox
+        :check-strictly="treeCheckStrictly"
+        :default-checked-keys="form.include_paths"
+        :filter-node-method="filterTreeNode"
+        :default-expand-all="false"
+        v-loading="loadingTree"
+        empty-text="暂无内容或分享已失效"
+        style="max-height: 420px; overflow: auto"
+      >
+        <template #default="{ node, data }">
+          <span class="tree-node">
+            <el-icon v-if="data.is_dir"><FolderOpened /></el-icon>
+            <el-icon v-else><Document /></el-icon>
+            <span style="margin-left: 4px">{{ data.name }}</span>
+            <span v-if="!data.is_dir" class="tree-size">{{ formatSize(data.size) }}</span>
+          </span>
+        </template>
+      </el-tree>
+      <template #footer>
+        <span class="tree-picker-hint">已选 {{ form.include_paths.length }} 个路径</span>
+        <el-button @click="treePickerVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmTreePicker">确定</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 运行详情对话框 -->
     <el-dialog v-model="runDialogVisible" title="运行详情" width="700px">
       <div v-if="currentRun" class="run-detail">
@@ -239,24 +389,34 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ElMessage, ElMessageBox, type ElTree } from 'element-plus'
+import type { AxiosError } from 'axios'
 import {
   Plus, Edit, Delete, Refresh, ArrowRight, Link,
+  FolderOpened, Document, VideoPause, VideoPlay,
 } from '@element-plus/icons-vue'
 import {
   type ShareSubscription,
   type SyncTarget,
+  type NetdiskTarget,
+  type LocalTarget,
+  type CreateShareSubscriptionRequest,
+  type UpdateShareSubscriptionRequest,
   type RunRecord,
   type RunDetail,
   type ConflictStrategy,
   type PollConfig,
-  listSubscriptions, getSubscription, createSubscription, updateSubscription,
+  type TreeNode,
+  type ShareSyncWsEvent,
+  listSubscriptions, createSubscription, updateSubscription,
   deleteSubscription, setSubscriptionEnabled, triggerSubscription, listRuns, getRun,
+  previewTree,
 } from '@/api/shareSync'
 import { getWebSocketClient, connectWebSocket } from '@/utils/websocket'
 
 const subscriptions = ref<ShareSubscription[]>([])
+const DEFAULT_LOCAL_TARGET_PATH = '/home/hyx/codespace/one-family/data'
 const selected = ref<ShareSubscription | null>(null)
 const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
@@ -268,19 +428,107 @@ const triggering = ref(false)
 const formRef = ref()
 const scheduledTime = ref<string>('03:00')
 
-const defaultForm = () => ({
+// 路径编辑
+const pathInput = ref('')
+const excludeInput = ref('')
+
+// 目录树选择
+const treePickerVisible = ref(false)
+const treeData = ref<TreeNode[]>([])
+const treeRef = ref<InstanceType<typeof ElTree>>()
+const treeProps = {
+  children: 'children',
+  label: 'name',
+  isLeaf: (d: TreeNode) => !d.is_dir,
+} as const
+const treeFilterText = ref('')
+const treeCheckStrictly = ref(false)
+const treeDepth = ref<number>(2)
+const loadingTree = ref(false)
+const treeError = ref('')
+watch(treeFilterText, (v) => {
+  treeRef.value?.filter(v)
+})
+
+function createDefaultTarget(): SyncTarget {
+  return { kind: 'local', local_path: DEFAULT_LOCAL_TARGET_PATH, conflict_strategy: null }
+}
+
+const defaultForm = (): {
+  name: string
+  share_url: string
+  password: string
+  include_paths: string[]
+  exclude_patterns: string[]
+  targets: SyncTarget[]
+  conflict_strategy: ConflictStrategy
+  delete_missing: boolean
+  poll_config: PollConfig
+} => ({
   name: '',
   share_url: '',
   password: '',
-  include_paths: [] as string[],
-  exclude_patterns: [] as string[],
-  targets: [{ kind: 'netdisk', remote_path: '/', save_fs_id: 0 }] as any[],
-  conflict_strategy: 'overwrite' as ConflictStrategy,
+  include_paths: [],
+  exclude_patterns: [],
+  targets: [createDefaultTarget()],
+  conflict_strategy: 'overwrite',
   delete_missing: false,
-  poll_config: { enabled: true, mode: 'interval', interval_secs: 1800, schedule_hour: null, schedule_minute: null } as PollConfig,
+  poll_config: { enabled: true, mode: 'interval', interval_secs: 1800, schedule_hour: null, schedule_minute: null },
 })
 
 const form = ref(defaultForm())
+
+function normalizePollConfigForUi(p?: PollConfig | null): PollConfig {
+  const rawMode = p?.mode || 'interval'
+  const enabled = p?.enabled !== false
+  const mode = (!enabled || rawMode === 'disabled' ? 'disabled' : rawMode) as PollConfig['mode']
+  const intervalSecs = Number.isFinite(Number(p?.interval_secs))
+    ? Math.max(600, Number(p?.interval_secs))
+    : 1800
+
+  return {
+    enabled: mode !== 'disabled',
+    mode,
+    interval_secs: intervalSecs,
+    schedule_hour: mode === 'scheduled' ? (p?.schedule_hour ?? 3) : null,
+    schedule_minute: mode === 'scheduled' ? (p?.schedule_minute ?? 0) : null,
+  }
+}
+
+function normalizePollConfigForSubmit(p: PollConfig): PollConfig {
+  const mode = (p.mode || 'interval') as PollConfig['mode']
+  const intervalSecs = Number.isFinite(Number(p.interval_secs))
+    ? Math.max(600, Number(p.interval_secs))
+    : 1800
+
+  if (mode === 'disabled') {
+    return {
+      enabled: false,
+      mode: 'disabled',
+      interval_secs: intervalSecs,
+      schedule_hour: null,
+      schedule_minute: null,
+    }
+  }
+
+  if (mode === 'interval') {
+    return {
+      enabled: true,
+      mode: 'interval',
+      interval_secs: intervalSecs,
+      schedule_hour: null,
+      schedule_minute: null,
+    }
+  }
+
+  return {
+    enabled: true,
+    mode: 'scheduled',
+    interval_secs: intervalSecs,
+    schedule_hour: p.schedule_hour ?? 3,
+    schedule_minute: p.schedule_minute ?? 0,
+  }
+}
 
 const formRules = {
   name: [{ required: true, message: '请输入名称', trigger: 'blur' }],
@@ -293,7 +541,12 @@ const formRules = {
 // ==================== 数据加载 ====================
 
 async function refresh() {
-  subscriptions.value = await listSubscriptions()
+  try {
+    subscriptions.value = await listSubscriptions()
+  } catch (e) {
+    ElMessage.error(`加载订阅失败: ${getApiErrorMessage(e)}`)
+    return
+  }
   if (selected.value) {
     const fresh = subscriptions.value.find(s => s.id === selected.value!.id)
     if (fresh) selected.value = fresh
@@ -309,12 +562,17 @@ async function loadRuns(id: string) {
   try {
     runs.value = await listRuns(id, 1, 30)
   } catch (e) {
-    console.error('load runs failed', e)
+    runs.value = []
+    const status = (e as AxiosError)?.response?.status
+    if (status !== 404) {
+      console.error('load runs failed', e)
+    }
   }
 }
 
 function openCreate() {
   form.value = defaultForm()
+  scheduledTime.value = '03:00'
   dialogMode.value = 'create'
   dialogVisible.value = true
 }
@@ -327,18 +585,32 @@ function openEdit() {
     password: selected.value.password || '',
     include_paths: [...selected.value.include_paths],
     exclude_patterns: [...selected.value.exclude_patterns],
-    targets: selected.value.targets.map(t => ({ ...t })) as any,
+    targets: selected.value.targets.map(t => ({ ...t })) as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
     delete_missing: selected.value.delete_missing,
-    poll_config: { ...selected.value.poll_config },
+    poll_config: normalizePollConfigForUi(selected.value.poll_config),
   }
-  if (selected.value.poll_config.mode === 'scheduled') {
-    const h = String(selected.value.poll_config.schedule_hour || 0).padStart(2, '0')
-    const m = String(selected.value.poll_config.schedule_minute || 0).padStart(2, '0')
+  if (form.value.poll_config.mode === 'scheduled') {
+    const h = String(form.value.poll_config.schedule_hour || 0).padStart(2, '0')
+    const m = String(form.value.poll_config.schedule_minute || 0).padStart(2, '0')
     scheduledTime.value = `${h}:${m}`
+  } else {
+    scheduledTime.value = '03:00'
+    form.value.poll_config.schedule_hour = null
+    form.value.poll_config.schedule_minute = null
   }
   dialogMode.value = 'edit'
   dialogVisible.value = true
+}
+
+function getApiErrorMessage(e: unknown): string {
+  const ax = e as AxiosError<{ message?: string; error?: string; msg?: string; details?: string }>
+  return ax?.response?.data?.message
+    || ax?.response?.data?.error
+    || ax?.response?.data?.msg
+    || ax?.response?.data?.details
+    || (e as Error)?.message
+    || '未知错误'
 }
 
 function resetForm() {
@@ -351,10 +623,15 @@ async function saveForm() {
   } catch {
     return
   }
+  syncScheduledTimeFromPicker()
+  buildSanitizedPayload()
+  if (!validateForm()) {
+    return
+  }
   saving.value = true
   try {
     if (dialogMode.value === 'create') {
-      const req: any = {
+      const req: CreateShareSubscriptionRequest = {
         name: form.value.name,
         share_url: form.value.share_url,
         password: form.value.password || null,
@@ -368,10 +645,12 @@ async function saveForm() {
       await createSubscription(req)
       ElMessage.success('已创建订阅')
     } else if (selected.value) {
-      const req: any = {
+      const req: UpdateShareSubscriptionRequest = {
         name: form.value.name,
         share_url: form.value.share_url,
         password: form.value.password || null,
+        include_paths: form.value.include_paths,
+        exclude_patterns: form.value.exclude_patterns,
         targets: form.value.targets,
         conflict_strategy: form.value.conflict_strategy,
         delete_missing: form.value.delete_missing,
@@ -382,11 +661,138 @@ async function saveForm() {
     }
     dialogVisible.value = false
     await refresh()
-  } catch (e: any) {
-    ElMessage.error(`保存失败: ${e?.response?.data?.error || e.message}`)
+  } catch (e) {
+    ElMessage.error(`保存失败: ${getApiErrorMessage(e)}`)
   } finally {
     saving.value = false
   }
+}
+
+function validateForm(): boolean {
+  if (form.value.targets.length === 0) {
+    ElMessage.error('请至少配置一个同步目标')
+    return false
+  }
+
+  for (let i = 0; i < form.value.targets.length; i++) {
+    const t = form.value.targets[i] as NetdiskTarget | LocalTarget
+    if (t.kind === 'netdisk') {
+      if (!t.remote_path || !String(t.remote_path).trim()) {
+        ElMessage.error(`目标 #${i + 1}：网盘路径不能为空`)
+        return false
+      }
+    } else if (t.kind === 'local') {
+      const lp = String(t.local_path || '').trim()
+      if (!lp) {
+        ElMessage.error(`目标 #${i + 1}：本地路径不能为空`)
+        return false
+      }
+      if (!lp.startsWith('/')) {
+        ElMessage.error(`目标 #${i + 1}：本地路径必须是绝对路径`)
+        return false
+      }
+    } else {
+      ElMessage.error(`目标 #${i + 1}：未知目标类型`)
+      return false
+    }
+  }
+
+  if (form.value.poll_config.mode === 'interval' && form.value.poll_config.interval_secs < 600) {
+    ElMessage.error('间隔模式下最少间隔为 600 秒（10 分钟）')
+    return false
+  }
+
+  return true
+}
+
+function syncScheduledTimeFromPicker() {
+  if (form.value.poll_config.mode === 'disabled') {
+    form.value.poll_config.enabled = false
+    form.value.poll_config.schedule_hour = null
+    form.value.poll_config.schedule_minute = null
+    return
+  }
+
+  form.value.poll_config.enabled = true
+  if (form.value.poll_config.mode !== 'scheduled') {
+    form.value.poll_config.schedule_hour = null
+    form.value.poll_config.schedule_minute = null
+    return
+  }
+
+  const [hourStr = '03', minuteStr = '00'] = (scheduledTime.value || '03:00').split(':')
+  const h = Number(hourStr)
+  const m = Number(minuteStr)
+  const hour = Number.isFinite(h) ? h : 3
+  const minute = Number.isFinite(m) ? m : 0
+  form.value.poll_config.schedule_hour = Math.min(23, Math.max(0, Math.round(hour)))
+  form.value.poll_config.schedule_minute = Math.min(59, Math.max(0, Math.round(minute)))
+  scheduledTime.value = `${String(form.value.poll_config.schedule_hour).padStart(2, '0')}:${String(form.value.poll_config.schedule_minute).padStart(2, '0')}`
+}
+
+function normalizePath(v: string): string {
+  const s = v.trim().replace(/\/+/g, '/')
+  if (!s) return ''
+  const prefixed = s.startsWith('/') ? s : `/${s}`
+  if (prefixed.length === 1) return '/'
+  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
+}
+
+function normalizeRemotePath(v: string): string {
+  return normalizePath(v) || '/'
+}
+
+function normalizeLocalPath(v: string): string {
+  const s = v.trim().replace(/\/+/g, '/')
+  if (!s) return ''
+  const prefixed = s.startsWith('/') ? s : `/${s}`
+  if (prefixed.length === 1) return '/'
+  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
+}
+
+function buildSanitizedPayload() {
+  const includeSet = new Set<string>()
+  for (const p of form.value.include_paths) {
+    const n = normalizePath(p)
+    if (n) {
+      includeSet.add(n)
+    }
+  }
+  const excludeSet = new Set<string>()
+  for (const p of form.value.exclude_patterns) {
+    const n = p.trim()
+    if (n) {
+      excludeSet.add(n)
+    }
+  }
+  form.value.include_paths = Array.from(includeSet)
+  form.value.exclude_patterns = Array.from(excludeSet)
+
+  const nextTargets: SyncTarget[] = []
+  for (const raw of form.value.targets) {
+    const t = raw as NetdiskTarget | LocalTarget
+    if (!t.kind) {
+      continue
+    }
+    if (t.kind === 'netdisk') {
+      const remote = normalizeRemotePath(String(t.remote_path || ''))
+      nextTargets.push({
+        kind: 'netdisk',
+        remote_path: remote,
+        save_fs_id: Number.isFinite(Number(t.save_fs_id)) ? Number(t.save_fs_id) : 0,
+        ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
+      })
+    } else if (t.kind === 'local') {
+      const local = normalizeLocalPath(String(t.local_path || ''))
+      nextTargets.push({
+        kind: 'local',
+        local_path: local,
+        ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
+      })
+    }
+  }
+  form.value.targets = nextTargets
+  form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
 }
 
 async function removeSubscription() {
@@ -400,18 +806,26 @@ async function removeSubscription() {
   } catch {
     return
   }
-  await deleteSubscription(selected.value.id)
-  ElMessage.success('已删除')
-  selected.value = null
-  runs.value = []
-  await refresh()
+  try {
+    await deleteSubscription(selected.value.id)
+    ElMessage.success('已删除')
+    selected.value = null
+    runs.value = []
+    await refresh()
+  } catch (e) {
+    ElMessage.error(`删除失败: ${getApiErrorMessage(e)}`)
+  }
 }
 
 async function toggleEnabled() {
   if (!selected.value) return
-  await setSubscriptionEnabled(selected.value.id, !selected.value.enabled)
-  ElMessage.success('已切换启用状态')
-  await refresh()
+  try {
+    await setSubscriptionEnabled(selected.value.id, !selected.value.enabled)
+    ElMessage.success('已切换启用状态')
+    await refresh()
+  } catch (e) {
+    ElMessage.error(`操作失败: ${getApiErrorMessage(e)}`)
+  }
 }
 
 async function triggerNow() {
@@ -421,8 +835,8 @@ async function triggerNow() {
     await triggerSubscription(selected.value.id)
     ElMessage.success('已触发同步，结果将稍后出现在运行历史')
     setTimeout(() => selected.value && loadRuns(selected.value.id), 1500)
-  } catch (e: any) {
-    ElMessage.error(`触发失败: ${e?.response?.data?.error || e.message}`)
+  } catch (e) {
+    ElMessage.error(`触发失败: ${getApiErrorMessage(e)}`)
   } finally {
     triggering.value = false
   }
@@ -432,34 +846,142 @@ async function openRun(runId: string) {
   try {
     currentRun.value = await getRun(runId)
     runDialogVisible.value = true
-  } catch (e: any) {
-    ElMessage.error(`加载运行详情失败: ${e?.message}`)
+  } catch (e) {
+    ElMessage.error(`加载运行详情失败: ${getApiErrorMessage(e)}`)
   }
 }
 
-function onTargetKindChange(t: any) {
-  if (t.kind === 'netdisk' && !t.remote_path) t.remote_path = '/'
-  if (t.kind === 'local' && !t.local_path) t.local_path = ''
+function onTargetKindChange(t: SyncTarget) {
+  if (t.kind === 'netdisk') {
+    t.remote_path = normalizeRemotePath(String(t.remote_path || '/'))
+    t.save_fs_id = Number.isFinite(Number(t.save_fs_id)) ? Number(t.save_fs_id) : 0
+    delete (t as unknown as Record<string, unknown>).local_path
+  }
+  if (t.kind === 'local') {
+    t.local_path = normalizeLocalPath(String(t.local_path || DEFAULT_LOCAL_TARGET_PATH))
+    delete (t as unknown as Record<string, unknown>).save_fs_id
+    delete (t as unknown as Record<string, unknown>).remote_path
+  }
+}
+
+// ==================== 路径编辑 / 树选择 ====================
+
+function addPath() {
+  const v = normalizePath(pathInput.value)
+  if (!v) return
+  if (!form.value.include_paths.includes(v)) {
+    form.value.include_paths.push(v)
+  }
+  pathInput.value = ''
+}
+
+function addExclude() {
+  const v = excludeInput.value.trim()
+  if (!v) return
+  if (!form.value.exclude_patterns.includes(v)) {
+    form.value.exclude_patterns.push(v)
+  }
+  excludeInput.value = ''
+}
+
+function openTreePicker() {
+  if (!form.value.share_url) {
+    ElMessage.warning('请先填写分享链接')
+    return
+  }
+  treeError.value = ''
+  treePickerVisible.value = true
+}
+
+async function loadTree() {
+  loadingTree.value = true
+  treeError.value = ''
+  try {
+    const resp = await previewTree(
+      form.value.share_url,
+      form.value.password || null,
+      treeDepth.value
+    )
+    treeData.value = resp.root || []
+    // 重新设置已选
+    await nextTick()
+    form.value.include_paths.forEach((p: string) => {
+      treeRef.value?.setChecked?.(p, true, false)
+    })
+  } catch (e) {
+    const ax = e as AxiosError<{ message?: string; error?: string }>
+    treeError.value =
+      ax?.response?.data?.message ||
+      ax?.response?.data?.error ||
+      (e as Error)?.message ||
+      '加载目录树失败'
+  } finally {
+    loadingTree.value = false
+  }
+}
+
+function confirmTreePicker() {
+  const checked = treeRef.value?.getCheckedNodes?.(false, false) || []
+  const halfChecked = treeRef.value?.getHalfCheckedNodes?.() || []
+  const all = [...checked, ...halfChecked]
+  // 按照树节点路径回填，先标准化再去重
+  const nextInclude: string[] = []
+  const uniq = new Set<string>()
+  all
+    .map((n) => (n as unknown as TreeNode).path)
+    .map((p: string) => normalizePath(p))
+    .filter((p: string) => p.length > 0)
+    .forEach((p: string) => {
+      if (!uniq.has(p)) {
+        uniq.add(p)
+        nextInclude.push(p)
+      }
+    })
+  form.value.include_paths = nextInclude
+  treePickerVisible.value = false
+}
+
+function filterTreeNode(query: string, data: TreeNode) {
+  if (!query) return true
+  return (data.name as string)?.toLowerCase?.().includes(query.toLowerCase())
+}
+
+function formatSize(n: number): string {
+  if (!n) return ''
+  const u = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  let v = n
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024
+    i++
+  }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + ' ' + u[i]
 }
 
 function onScheduledChange(val: string | null) {
+  if (form.value.poll_config.mode !== 'scheduled') {
+    return
+  }
   if (!val) return
-  const [h, m] = val.split(':').map(Number)
-  form.value.poll_config.schedule_hour = h
-  form.value.poll_config.schedule_minute = m
+  syncScheduledTimeFromPicker()
 }
 
 // ==================== 辅助显示 ====================
 
+function isPollEnabled(p: PollConfig): boolean {
+  return normalizePollConfigForUi(p).mode !== 'disabled'
+}
+
 function describeInterval(p: PollConfig): string {
-  if (!p.enabled) return '已禁用'
-  if (p.mode === 'interval') {
-    const m = Math.floor(p.interval_secs / 60)
+  const normalized = normalizePollConfigForUi(p)
+  if (normalized.mode === 'disabled') return '已禁用'
+  if (normalized.mode === 'interval') {
+    const m = Math.floor(normalized.interval_secs / 60)
     return `每 ${m} 分钟`
   }
-  if (p.mode === 'scheduled') {
-    const h = String(p.schedule_hour || 0).padStart(2, '0')
-    const m = String(p.schedule_minute || 0).padStart(2, '0')
+  if (normalized.mode === 'scheduled') {
+    const h = String(normalized.schedule_hour || 0).padStart(2, '0')
+    const m = String(normalized.schedule_minute || 0).padStart(2, '0')
     return `每日 ${h}:${m}`
   }
   return '已禁用'
@@ -509,8 +1031,8 @@ onMounted(async () => {
   connectWebSocket()
   const ws = getWebSocketClient()
   ws.subscribe(['share_sync'])
-  const handler = (event: any) => {
-    const evt = event?.detail ?? event
+  const handler = (event: CustomEvent<ShareSyncWsEvent>) => {
+    const evt = event?.detail
     if (!evt || !evt.type) return
     const sid = evt.subscription_id
     if (!sid) return
@@ -573,4 +1095,28 @@ onUnmounted(() => {
 .run-stats { font-size: 12px; color: #909399; margin-top: 2px; }
 
 .run-detail { h4 { margin: 16px 0 8px; } }
+
+.path-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.path-empty, .path-empty-inline {
+  color: #909399;
+  font-size: 12px;
+}
+.path-tags { display: flex; flex-wrap: wrap; align-items: center; }
+.path-actions { display: flex; align-items: center; }
+
+.tree-picker-toolbar {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.tree-picker-hint { margin-right: 12px; color: #909399; font-size: 12px; }
+.tree-node { display: inline-flex; align-items: center; gap: 4px; }
+.tree-size { margin-left: 6px; color: #909399; font-size: 11px; }
 </style>

@@ -6,7 +6,8 @@
 use crate::share_sync::types::{ConflictStrategy, PollMode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 /// 网盘目标
@@ -180,9 +181,7 @@ impl ShareSubscription {
         if self.share_url.trim().is_empty() {
             return Err("分享链接不能为空".into());
         }
-        if !self.share_url.contains("pan.baidu.com") && !self.share_url.contains("baidu.com/s/") {
-            return Err("分享链接必须是 pan.baidu.com 域名".into());
-        }
+        validate_share_url(&self.share_url)?;
         if self.targets.is_empty() {
             return Err("至少需要配置一个同步目标".into());
         }
@@ -197,6 +196,8 @@ impl ShareSubscription {
                     if t.local_path.as_os_str().is_empty() {
                         return Err(format!("目标 #{} 本地路径不能为空", idx + 1));
                     }
+                    validate_local_path(&t.local_path)
+                        .map_err(|e| format!("目标 #{} {}", idx + 1, e))?;
                 }
             }
         }
@@ -221,6 +222,88 @@ impl ShareSubscription {
         }
         Ok(())
     }
+}
+
+/// 校验分享链接：
+/// 1. 必须是 `http(s)://pan.baidu.com/s/<short_key>[?pwd=xxxx]` 格式
+/// 2. 域名后必须跟 `/s/` 路径段（防 `https://evilpan.baidu.com.attack.com/` 类同形钓鱼）
+fn validate_share_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    // 协议（仅允许 http/https）
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| "分享链接必须以 http:// 或 https:// 开头".to_string())?;
+    // 域名段必须以 pan.baidu.com 结尾
+    let domain_end = rest
+        .find('/')
+        .ok_or_else(|| "分享链接缺少路径段 /s/<short_key>".to_string())?;
+    let host = &rest[..domain_end];
+    if !host.eq_ignore_ascii_case("pan.baidu.com") {
+        return Err(format!(
+            "分享链接域名必须是 pan.baidu.com（当前: {}）",
+            host
+        ));
+    }
+    // 路径必须以 /s/ 开头（即 /s/<short_key>）
+    let path = &rest[domain_end..];
+    let after_slash_s = path
+        .strip_prefix("/s/")
+        .or_else(|| path.strip_prefix("/s"))
+        .ok_or_else(|| "分享链接必须包含 /s/<short_key> 路径段".to_string())?;
+    if after_slash_s.is_empty() {
+        return Err("分享链接缺少 short_key".to_string());
+    }
+    // short_key 至少 6 位字母数字
+    let short_key = after_slash_s
+        .split(|c: char| c == '?' || c == '#' || c == '/')
+        .next()
+        .unwrap_or("");
+    if short_key.len() < 6 {
+        return Err(format!("分享链接 short_key 过短: {}", short_key));
+    }
+    // 百度 short_key 实际由 [A-Za-z0-9_-] 组成（base64 变体）
+    if !short_key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("分享链接 short_key 含非法字符: {}", short_key));
+    }
+    Ok(())
+}
+
+fn validate_local_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "本地路径必须是绝对路径: {}",
+            path.to_string_lossy()
+        ));
+    }
+    let meta = path
+        .metadata()
+        .map_err(|e| format!("本地路径不可访问: {} ({})", path.to_string_lossy(), e))?;
+    if !meta.is_dir() {
+        return Err(format!("本地路径必须是目录: {}", path.to_string_lossy()));
+    }
+    if meta.permissions().readonly() {
+        return Err(format!("本地路径不可写: {}", path.to_string_lossy()));
+    }
+
+    if let Ok(system_time) = SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let probe = path.join(format!(
+            ".baidu-pcs-rust-share-sync-probe-{}",
+            system_time.as_nanos()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|e| format!("本地路径不可写: {} ({})", path.to_string_lossy(), e))?;
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    Ok(())
 }
 
 // =====================================================
@@ -300,7 +383,7 @@ mod tests {
     fn test_new_subscription_defaults() {
         let sub = ShareSubscription::new(
             "test".into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![SyncTarget::Netdisk(NetdiskTarget {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
@@ -317,7 +400,7 @@ mod tests {
     fn test_validate_empty_name() {
         let sub = ShareSubscription::new(
             " ".into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![SyncTarget::Netdisk(NetdiskTarget {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
@@ -342,10 +425,73 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_lookalike_url_rejected() {
+        // 同形钓鱼：pan.baidu.com.attack.com 域名结尾不是 pan.baidu.com
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com.attack.com/s/1abcdef".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("pan.baidu.com"), "实际错误: {}", err);
+    }
+
+    #[test]
+    fn test_validate_short_short_key_rejected() {
+        // short_key 太短
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/abc".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("short_key"), "实际错误: {}", err);
+    }
+
+    #[test]
+    fn test_validate_url_missing_s_path_rejected() {
+        // 域名是 pan.baidu.com 但路径不是 /s/
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/disk/home".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("/s/"), "实际错误: {}", err);
+    }
+
+    #[test]
+    fn test_validate_valid_url_with_pwd_accepted() {
+        // 合法链接 + pwd 参数
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7Clu03oLWC4_ZjCHY8Wdw?pwd=i96y".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        assert!(sub.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_no_targets() {
         let mut sub = ShareSubscription::new(
             "t".into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![],
         );
         sub.targets.clear();
@@ -354,17 +500,51 @@ mod tests {
 
     #[test]
     fn test_validate_short_interval() {
+        let tmp = std::env::temp_dir();
         let mut sub = ShareSubscription::new(
             "t".into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![SyncTarget::Local(LocalTarget {
-                local_path: PathBuf::from("/tmp/x"),
+                local_path: tmp,
                 conflict_strategy: None,
             })],
         );
         sub.poll_config.interval_secs = 60;
         let err = sub.validate().unwrap_err();
         assert!(err.contains("不能小于"));
+    }
+
+    #[test]
+    fn test_validate_local_path_must_be_absolute() {
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Local(LocalTarget {
+                local_path: PathBuf::from("relative/path"),
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("本地路径必须是绝对路径"));
+    }
+
+    #[test]
+    fn test_validate_local_path_not_directory() {
+        let tmp = std::env::temp_dir().join("baidu-pcs-rust-share-sync-test-file");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"probe").unwrap();
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Local(LocalTarget {
+                local_path: tmp,
+                conflict_strategy: None,
+            })],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("本地路径必须是目录"));
+        let _ =
+            std::fs::remove_file(std::env::temp_dir().join("baidu-pcs-rust-share-sync-test-file"));
     }
 
     #[test]
@@ -417,7 +597,7 @@ mod tests {
     fn test_subscription_serialize_roundtrip() {
         let sub = ShareSubscription::new(
             "t".into(),
-            "https://pan.baidu.com/s/1abc".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             vec![SyncTarget::Netdisk(NetdiskTarget {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
@@ -435,7 +615,7 @@ mod tests {
     fn test_create_request_into_subscription() {
         let req = CreateShareSubscriptionRequest {
             name: "t".into(),
-            share_url: "https://pan.baidu.com/s/1abc".into(),
+            share_url: "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
             password: Some("1234".into()),
             include_paths: vec!["/a".into()],
             exclude_patterns: vec![],

@@ -8,7 +8,7 @@
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// 单个订阅的调度状态
 pub struct SubscriptionScheduler {
@@ -53,7 +53,10 @@ impl SubscriptionScheduler {
         let cancel = self.cancel_token.clone();
 
         let handle = tokio::spawn(async move {
-            info!("scheduler: 订阅 {} 主循环启动, interval={}s", sub_id, interval);
+            info!(
+                "scheduler: 订阅 {} 主循环启动, interval={}s",
+                sub_id, interval
+            );
             // 首次启动后小幅抖动（避免所有订阅同时发起请求）
             let initial_delay = jitter(interval, 0.25);
             tokio::select! {

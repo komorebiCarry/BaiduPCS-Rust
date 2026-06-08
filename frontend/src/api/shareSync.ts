@@ -11,19 +11,19 @@ export type PollMode = 'disabled' | 'interval' | 'scheduled'
 export type TargetKind = 'netdisk' | 'local'
 
 export interface NetdiskTarget {
+  kind: 'netdisk'
   remote_path: string
   save_fs_id: number
   conflict_strategy?: ConflictStrategy | null
 }
 
 export interface LocalTarget {
+  kind: 'local'
   local_path: string
   conflict_strategy?: ConflictStrategy | null
 }
 
-export type SyncTarget =
-  | { kind: 'netdisk'; remote_path: string; save_fs_id: number; conflict_strategy?: ConflictStrategy | null }
-  | { kind: 'local'; local_path: string; conflict_strategy?: ConflictStrategy | null }
+export type SyncTarget = NetdiskTarget | LocalTarget
 
 export interface PollConfig {
   enabled: boolean
@@ -111,6 +111,35 @@ export interface RunDetail {
   items: RunItemRecord[]
 }
 
+export interface ShareSnapshotItem {
+  path: string
+  raw_path?: string
+  fs_id: number
+  size: number
+  name: string
+  is_dir: boolean
+}
+
+export interface ShareSnapshot {
+  id: string
+  subscription_id: string
+  captured_at: string
+  items: ShareSnapshotItem[]
+}
+
+/**
+ * 分享同步 WS 事件载荷（与后端 ShareSyncEvent 对齐）
+ */
+export type ShareSyncWsEvent =
+  | { type: 'subscription_created'; subscription_id: string; name: string }
+  | { type: 'subscription_updated'; subscription_id: string }
+  | { type: 'subscription_deleted'; subscription_id: string }
+  | { type: 'status_changed'; subscription_id: string; enabled: boolean }
+  | { type: 'diff_detected'; run_id: string; subscription_id: string; added: number; modified: number; removed: number }
+  | { type: 'run_started'; run_id: string; subscription_id: string }
+  | { type: 'run_completed'; run_id: string; subscription_id: string; added: number; modified: number; removed: number; failed: number }
+  | { type: 'run_failed'; run_id: string; subscription_id: string; error: string }
+
 // ==================== API ====================
 
 const BASE = '/share-sync'
@@ -160,7 +189,39 @@ export async function getRun(runId: string): Promise<RunDetail> {
   return r.data.data
 }
 
-export async function getLatestSnapshot(id: string): Promise<any> {
-  const r = await rawApiClient.get(`${BASE}/subscriptions/${id}/snapshots/latest`)
-  return r.data
+export async function getLatestSnapshot(id: string): Promise<ShareSnapshot> {
+  const r = await rawApiClient.get<{ success: boolean; data: ShareSnapshot }>(`${BASE}/subscriptions/${id}/snapshots/latest`)
+  return r.data.data
+}
+
+// ==================== 目录树预览 ====================
+
+export interface TreeNode {
+  path: string
+  name: string
+  is_dir: boolean
+  size: number
+  fs_id: number
+  children?: TreeNode[] | null
+}
+
+export interface PreviewTreeResponse {
+  root: TreeNode[]
+  short_key: string
+  shareid: string
+}
+
+/**
+ * 预览分享的目录树（用于前端勾选 include_paths）
+ */
+export async function previewTree(
+  share_url: string,
+  password?: string | null,
+  depth = 2
+): Promise<PreviewTreeResponse> {
+  const r = await rawApiClient.post<{ success: boolean; data: PreviewTreeResponse }>(
+    `${BASE}/preview-tree`,
+    { share_url, password: password || null, depth }
+  )
+  return r.data.data
 }
