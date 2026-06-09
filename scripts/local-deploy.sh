@@ -2,7 +2,7 @@
 
 # 本地部署脚本（不使用 Docker）
 # 直接在本机构建并启动后端（rust 二进制）+ 前端（vite）
-# 前端端口：5173
+# 前端端口：4923（vite preview，绑定 0.0.0.0）
 # 后端端口：取自 config/app.toml（默认 18888）
 #
 # 关键设计：
@@ -36,12 +36,14 @@ BACKEND_PID_FILE="$PID_DIR/backend.pid"
 FRONTEND_PID_FILE="$PID_DIR/frontend.pid"
 BACKEND_PGID_FILE="$PID_DIR/backend.pgid"
 FRONTEND_PGID_FILE="$PID_DIR/frontend.pgid"
+FRONTEND_PORT_FILE="$PID_DIR/frontend.port"
 
 BACKEND_BIN_NAME="baidu-netdisk-rust"
 BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
 
 # ----------------- 配置 -----------------
-FRONTEND_PORT=5173
+FRONTEND_PORT=4923
+FRONTEND_HOST="0.0.0.0"
 BACKEND_HOST="127.0.0.1"
 BACKEND_PORT=18888
 MODE="prod"   # prod | dev
@@ -76,7 +78,7 @@ while [ $# -gt 0 ]; do
 选项:
   --dev          以开发模式启动前端（vite dev，HMR）
   --prod         以生产模式启动前端（vite build + vite preview，默认）
-  --port <port>  指定前端端口（默认 5173）
+  --port <port>  指定前端端口（默认 4923）
 
 子命令（手动模式）:
   start              启动前后端服务（默认）
@@ -96,7 +98,7 @@ while [ $# -gt 0 ]; do
   run-frontend       前台运行前端（不要手动调用）
 
 示例:
-  $0                       # 生产模式启动，前端端口 5173
+  $0                       # 生产模式启动，前端端口 4923
   $0 --dev                 # 开发模式启动
   $0 stop                  # 停止服务
   sudo $0 install-systemd  # 安装为系统服务，开机自启
@@ -118,6 +120,33 @@ is_running() {
     local pid
     pid=$(cat "$pid_file" 2>/dev/null || echo "")
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+detect_frontend_port() {
+    local port="$FRONTEND_PORT"
+
+    if [ -f "$FRONTEND_PORT_FILE" ]; then
+        local saved
+        saved=$(cat "$FRONTEND_PORT_FILE" 2>/dev/null || echo "")
+        case "$saved" in
+            ''|*[!0-9]*) ;;
+            *) echo "$saved"; return ;;
+        esac
+    fi
+
+    if [ -f "$FRONTEND_PID_FILE" ]; then
+        local pid detected
+        pid=$(cat "$FRONTEND_PID_FILE" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+            detected=$(tr '\0' '\n' < "/proc/$pid/cmdline" | awk 'prev=="--port"{print; exit} {prev=$0}')
+            case "$detected" in
+                ''|*[!0-9]*) ;;
+                *) port="$detected" ;;
+            esac
+        fi
+    fi
+
+    echo "$port"
 }
 
 # 释放占用某端口的所有进程（兜底）
@@ -227,7 +256,7 @@ import base from './vite.config'
 
 export default mergeConfig(base, defineConfig({
   server: {
-    host: '0.0.0.0',
+    host: '${FRONTEND_HOST}',
     port: ${FRONTEND_PORT},
     strictPort: true,
     allowedHosts: true,
@@ -238,7 +267,7 @@ export default mergeConfig(base, defineConfig({
     }
   },
   preview: {
-    host: '0.0.0.0',
+    host: '${FRONTEND_HOST}',
     port: ${FRONTEND_PORT},
     strictPort: true,
     allowedHosts: true,
@@ -299,7 +328,10 @@ start_backend() {
 
 start_frontend() {
     if is_running "$FRONTEND_PID_FILE"; then
-        warn "前端已在运行 (PID $(cat "$FRONTEND_PID_FILE"))，跳过启动"
+        local running_port
+        running_port=$(detect_frontend_port)
+        echo "$running_port" > "$FRONTEND_PORT_FILE"
+        warn "前端已在运行 (PID $(cat "$FRONTEND_PID_FILE"), 端口 $running_port)，跳过启动"
         return
     fi
 
@@ -314,17 +346,18 @@ start_frontend() {
         setsid nohup "$vite_bin" --config vite.local.config.ts >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     else
         log "启动前端 (vite preview) 端口 $FRONTEND_PORT -> $FRONTEND_LOG"
-        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host 0.0.0.0 >>"$FRONTEND_LOG" 2>&1 < /dev/null &
+        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host "$FRONTEND_HOST" >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     fi
     local pid=$!
     echo "$pid" > "$FRONTEND_PID_FILE"
     local pgid
     pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || echo "$pid")
     echo "$pgid" > "$FRONTEND_PGID_FILE"
+    echo "$FRONTEND_PORT" > "$FRONTEND_PORT_FILE"
 
     sleep 2
     if is_running "$FRONTEND_PID_FILE"; then
-        ok "前端已启动 (PID $pid, PGID $pgid)，监听 0.0.0.0:${FRONTEND_PORT}"
+        ok "前端已启动 (PID $pid, PGID $pgid)，监听 ${FRONTEND_HOST}:${FRONTEND_PORT}"
     else
         err "前端启动失败，查看 $FRONTEND_LOG"
         exit 1
@@ -339,7 +372,9 @@ show_status() {
         warn "后端未运行"
     fi
     if is_running "$FRONTEND_PID_FILE"; then
-        ok "前端运行中 (PID $(cat "$FRONTEND_PID_FILE"))  http://localhost:${FRONTEND_PORT}"
+        local frontend_port
+        frontend_port=$(detect_frontend_port)
+        ok "前端运行中 (PID $(cat "$FRONTEND_PID_FILE"))  http://localhost:${frontend_port}"
     else
         warn "前端未运行"
     fi
@@ -559,7 +594,10 @@ do_start() {
 
 do_stop() {
     read_backend_port
-    stop_service "前端" "$FRONTEND_PID_FILE" "$FRONTEND_PGID_FILE" "$FRONTEND_PORT"
+    local frontend_port
+    frontend_port=$(detect_frontend_port)
+    stop_service "前端" "$FRONTEND_PID_FILE" "$FRONTEND_PGID_FILE" "$frontend_port"
+    rm -f "$FRONTEND_PORT_FILE"
     stop_service "后端" "$BACKEND_PID_FILE"  "$BACKEND_PGID_FILE"  "$BACKEND_PORT"
 }
 
