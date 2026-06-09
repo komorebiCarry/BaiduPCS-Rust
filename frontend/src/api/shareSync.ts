@@ -79,10 +79,14 @@ export interface RunRecord {
   started_at: number
   finished_at: number | null
   status: string
+  total_count: number
   added_count: number
   modified_count: number
   removed_count: number
+  unchanged_count: number
   failed_count: number
+  skipped_count: number
+  overwritten_count: number
   error: string | null
 }
 
@@ -96,6 +100,7 @@ export interface RunItemRecord {
   status: string
   versioned_old_path: string | null
   error: string | null
+  reason?: string | null
 }
 
 export interface RunDetail {
@@ -103,10 +108,14 @@ export interface RunDetail {
   started_at: number
   finished_at: number | null
   status: string
+  total_count: number
   added_count: number
   modified_count: number
   removed_count: number
+  unchanged_count: number
   failed_count: number
+  skipped_count: number
+  overwritten_count: number
   error: string | null
   items: RunItemRecord[]
 }

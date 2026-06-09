@@ -16,8 +16,8 @@
 
 use crate::downloader::DownloadManager;
 use crate::netdisk::client::NetdiskClient;
-use crate::share_sync::config::ShareSubscription;
-use crate::share_sync::diff::diff_snapshots;
+use crate::share_sync::config::{ShareSubscription, SyncTarget};
+use crate::share_sync::diff::{diff_snapshots, ShareDiff, ShareModifiedItem};
 use crate::share_sync::error::ShareSyncError;
 use crate::share_sync::events::{
     NoopShareSyncEventPublisher, ShareSyncEvent, ShareSyncEventPublisher,
@@ -27,11 +27,14 @@ use crate::share_sync::executor::{
 };
 use crate::share_sync::persistence::ShareSyncPersistence;
 use crate::share_sync::scheduler::SubscriptionScheduler;
-use crate::share_sync::snapshot::{CapturedShare, ShareSnapshotItem, SnapshotCollector};
+use crate::share_sync::snapshot::{
+    CapturedShare, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
+};
 use crate::share_sync::types::{ConflictStrategy, RunStatus};
 use crate::transfer::{TransferManager, TransferStatus};
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -298,7 +301,13 @@ impl ShareSyncManager {
         let prev = self.persistence.latest_snapshot(id).ok().flatten();
 
         // 3) diff
-        let diff = diff_snapshots(prev.as_ref(), &curr_snapshot);
+        let mut diff = diff_snapshots(prev.as_ref(), &curr_snapshot);
+        if let Err(e) =
+            augment_diff_with_local_target_state(&sub, prev.as_ref(), &curr_snapshot, &mut diff)
+        {
+            self.fail_run(&run_id, id, &format!("本地目标校验失败: {}", e));
+            return Err(e);
+        }
 
         self.publisher.publish(ShareSyncEvent::DiffDetected {
             run_id: run_id.clone(),
@@ -508,6 +517,7 @@ impl ExecutorHooks for ProductionHooks {
                 size: item.size,
                 name: item.name.clone(),
             }]),
+            owner_uid_override: None,
         };
         let resp = tm
             .create_task(req)
@@ -643,6 +653,7 @@ impl ExecutorHooks for ProductionHooks {
                 size: item.size,
                 name: item.name.clone(),
             }]),
+            owner_uid_override: None,
         };
 
         let resp = tm
@@ -818,6 +829,7 @@ impl ExecutorHooks for ProductionHooks {
             download_conflict_strategy: None,
             selected_fs_ids: Some(selected_fs_ids),
             selected_files: Some(selected_files),
+            owner_uid_override: None,
         };
         let resp = tm
             .create_task(req)
@@ -894,6 +906,7 @@ impl ExecutorHooks for ProductionHooks {
             download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
             selected_fs_ids: Some(selected_fs_ids),
             selected_files: Some(selected_files),
+            owner_uid_override: None,
         };
 
         let resp = tm
@@ -1057,10 +1070,80 @@ fn is_netdisk_not_found_error(msg: &str) -> bool {
         || msg.contains("文件不存在")
 }
 
+fn augment_diff_with_local_target_state(
+    sub: &ShareSubscription,
+    prev: Option<&ShareSnapshot>,
+    curr: &ShareSnapshot,
+    diff: &mut ShareDiff,
+) -> Result<(), ShareSyncError> {
+    let local_roots: Vec<&Path> = sub
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            SyncTarget::Local(t) => Some(t.local_path.as_path()),
+            SyncTarget::Netdisk(_) => None,
+        })
+        .collect();
+    if local_roots.is_empty() {
+        return Ok(());
+    }
+
+    let prev_map = prev.map(|snap| snap.index_by_path()).unwrap_or_default();
+    let mut action_paths: BTreeSet<String> = diff
+        .added
+        .iter()
+        .map(|item| item.path.clone())
+        .chain(diff.modified.iter().map(|item| item.new.path.clone()))
+        .chain(diff.removed.iter().map(|item| item.path.clone()))
+        .collect();
+
+    let mut repaired = 0usize;
+    for item in curr.items.iter().filter(|item| !item.is_dir) {
+        if action_paths.contains(&item.path) {
+            continue;
+        }
+
+        let relative = safe_relative_download_path(&item.path)?;
+        let needs_repair = local_roots.iter().any(|root| {
+            let local_path = root.join(&relative);
+            match std::fs::metadata(&local_path) {
+                Ok(meta) => !meta.is_file() || meta.len() != item.size,
+                Err(_) => true,
+            }
+        });
+
+        if !needs_repair {
+            continue;
+        }
+
+        let old = prev_map
+            .get(&item.path)
+            .map(|item| (**item).clone())
+            .unwrap_or_else(|| item.clone());
+        diff.modified.push(ShareModifiedItem {
+            old,
+            new: item.clone(),
+        });
+        action_paths.insert(item.path.clone());
+        diff.unchanged_count = diff.unchanged_count.saturating_sub(1);
+        repaired += 1;
+    }
+
+    if repaired > 0 {
+        diff.modified.sort_by(|a, b| a.old.path.cmp(&b.old.path));
+        info!(
+            "share-sync: 本地目标校验发现 {} 个缺失/大小不一致文件，已纳入 modified diff: subscription={}",
+            repaired, sub.id
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::share_sync::config::{LocalTarget, SyncTarget};
+    use crate::share_sync::config::{LocalTarget, NetdiskTarget, SyncTarget};
     use crate::share_sync::events::NoopShareSyncEventPublisher;
     use tempfile::tempdir;
 
@@ -1223,6 +1306,81 @@ mod tests {
             transfer_restored_path,
             PathBuf::from("/home/hyx/codespace/one-family/data/monthly/monthly/000009.SZ.csv")
         );
+    }
+
+    #[test]
+    fn test_local_missing_file_is_promoted_to_modified_diff() {
+        let dir = tempdir().unwrap();
+        let sub = ShareSubscription::new(
+            "local".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Local(LocalTarget {
+                local_path: dir.path().to_path_buf(),
+                conflict_strategy: None,
+            })],
+        );
+        let items = vec![
+            ShareSnapshotItem::new("/a.csv", "a.csv", 1, 3, false),
+            ShareSnapshotItem::new("/b.csv", "b.csv", 2, 4, false),
+        ];
+        std::fs::write(dir.path().join("a.csv"), b"abc").unwrap();
+        let prev = ShareSnapshot::with_items(&sub.id, items.clone());
+        let curr = ShareSnapshot::with_items(&sub.id, items);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+
+        augment_diff_with_local_target_state(&sub, Some(&prev), &curr, &mut diff).unwrap();
+
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].new.path, "/b.csv");
+        assert_eq!(diff.unchanged_count, 1);
+    }
+
+    #[test]
+    fn test_local_size_mismatch_is_promoted_to_modified_diff() {
+        let dir = tempdir().unwrap();
+        let sub = ShareSubscription::new(
+            "local".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Local(LocalTarget {
+                local_path: dir.path().to_path_buf(),
+                conflict_strategy: None,
+            })],
+        );
+        let item = ShareSnapshotItem::new("/nested/a.csv", "a.csv", 1, 4, false);
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/a.csv"), b"abc").unwrap();
+        let prev = ShareSnapshot::with_items(&sub.id, vec![item.clone()]);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![item]);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+
+        augment_diff_with_local_target_state(&sub, Some(&prev), &curr, &mut diff).unwrap();
+
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].new.path, "/nested/a.csv");
+        assert_eq!(diff.unchanged_count, 0);
+    }
+
+    #[test]
+    fn test_netdisk_only_target_does_not_use_local_filesystem_diff() {
+        let sub = ShareSubscription::new(
+            "netdisk".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/backup".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        let item =
+            ShareSnapshotItem::new("/missing-locally.csv", "missing-locally.csv", 1, 4, false);
+        let prev = ShareSnapshot::with_items(&sub.id, vec![item.clone()]);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![item]);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+
+        augment_diff_with_local_target_state(&sub, Some(&prev), &curr, &mut diff).unwrap();
+
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.unchanged_count, 1);
     }
 
     #[tokio::test]

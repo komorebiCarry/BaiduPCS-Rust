@@ -56,6 +56,10 @@ pub struct TransferManager {
 pub struct CreateTransferRequest {
     pub share_url: String,
     pub password: Option<String>,
+    /// Caller-provided share randsk. Internal callers use this to keep
+    /// concurrent password-protected shares from overwriting each other in the
+    /// shared CookieJar.
+    pub randsk: Option<String>,
     pub save_path: String,
     pub save_fs_id: u64,
     pub auto_download: Option<bool>,

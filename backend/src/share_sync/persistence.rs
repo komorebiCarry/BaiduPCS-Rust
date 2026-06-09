@@ -368,7 +368,7 @@ impl ShareSyncPersistence {
                 run_id,
                 subscription_id,
                 started_at,
-                RunStatus::Running.to_string()
+                RunStatus::Running.as_str()
             ],
         )?;
         Ok(())
@@ -393,10 +393,10 @@ impl ShareSyncPersistence {
                  failed_count = ?8, skipped_count = ?9,
                  overwritten_count = ?10,
                  error = ?11
-             WHERE id = ?12",
+            WHERE id = ?12",
             params![
                 finished_at,
-                status.to_string(),
+                status.as_str(),
                 diff.total as i64,
                 diff.added as i64,
                 diff.modified as i64,
@@ -436,9 +436,9 @@ impl ShareSyncPersistence {
              (run_id, path, action, target, transfer_task_id, download_task_id, status, versioned_old_path, reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                run_id, path, action.to_string(), target.to_string(),
+                run_id, path, action.as_str(), target.as_str(),
                 transfer_task_id, download_task_id,
-                status.to_string(), versioned_old_path, reason
+                status.as_str(), versioned_old_path, reason
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -454,7 +454,7 @@ impl ShareSyncPersistence {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE share_sync_run_items SET status = ?1, error = ?2 WHERE id = ?3",
-            params![status.to_string(), error, run_item_id],
+            params![status.as_str(), error, run_item_id],
         )?;
         Ok(())
     }
@@ -475,11 +475,11 @@ impl ShareSyncPersistence {
         conn.execute(
             "UPDATE share_sync_run_items
              SET transfer_task_id = ?1, download_task_id = ?2, status = ?3, error = ?4
-             WHERE id = ?5",
+            WHERE id = ?5",
             params![
                 transfer_task_id,
                 download_task_id,
-                status.to_string(),
+                status.as_str(),
                 error,
                 run_item_id
             ],

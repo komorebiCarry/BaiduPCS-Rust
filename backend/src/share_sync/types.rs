@@ -3,10 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 /// 冲突处理策略
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictStrategy {
     /// 覆盖式：用新文件覆盖目标中的同名文件
+    #[default]
     Overwrite,
     /// 新版本式：保留旧文件（重命名为带时间戳后缀），写入新文件
     Versioned,
@@ -14,19 +15,20 @@ pub enum ConflictStrategy {
     Skip,
 }
 
-impl Default for ConflictStrategy {
-    fn default() -> Self {
-        ConflictStrategy::Overwrite
+impl ConflictStrategy {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConflictStrategy::Overwrite => "overwrite",
+            ConflictStrategy::Versioned => "versioned",
+            ConflictStrategy::Skip => "skip",
+        }
     }
 }
 
 impl std::fmt::Display for ConflictStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConflictStrategy::Overwrite => write!(f, "overwrite"),
-            ConflictStrategy::Versioned => write!(f, "versioned"),
-            ConflictStrategy::Skip => write!(f, "skip"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -40,21 +42,29 @@ pub enum TargetKind {
     Local,
 }
 
-impl std::fmt::Display for TargetKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl TargetKind {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
         match self {
-            TargetKind::Netdisk => write!(f, "netdisk"),
-            TargetKind::Local => write!(f, "local"),
+            TargetKind::Netdisk => "netdisk",
+            TargetKind::Local => "local",
         }
     }
 }
 
+impl std::fmt::Display for TargetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 轮询模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PollMode {
     /// 固定间隔
     #[serde(alias = "interval")]
+    #[default]
     Interval,
     /// 指定时间（每天固定时刻）
     #[serde(alias = "scheduled")]
@@ -64,9 +74,14 @@ pub enum PollMode {
     Disabled,
 }
 
-impl Default for PollMode {
-    fn default() -> Self {
-        PollMode::Interval
+impl PollMode {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PollMode::Interval => "interval",
+            PollMode::Scheduled => "scheduled",
+            PollMode::Disabled => "disabled",
+        }
     }
 }
 
@@ -80,14 +95,21 @@ pub enum SyncAction {
     Skipped,
 }
 
+impl SyncAction {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SyncAction::Added => "added",
+            SyncAction::Modified => "modified",
+            SyncAction::Removed => "removed",
+            SyncAction::Skipped => "skipped",
+        }
+    }
+}
+
 impl std::fmt::Display for SyncAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncAction::Added => write!(f, "added"),
-            SyncAction::Modified => write!(f, "modified"),
-            SyncAction::Removed => write!(f, "removed"),
-            SyncAction::Skipped => write!(f, "skipped"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -113,7 +135,14 @@ pub enum RunItemStatus {
 
 impl std::fmt::Display for RunItemStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl RunItemStatus {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
             RunItemStatus::Pending => "pending",
             RunItemStatus::Transferring => "transferring",
             RunItemStatus::Downloading => "downloading",
@@ -121,8 +150,7 @@ impl std::fmt::Display for RunItemStatus {
             RunItemStatus::Completed => "completed",
             RunItemStatus::Failed => "failed",
             RunItemStatus::Skipped => "skipped",
-        };
-        write!(f, "{}", s)
+        }
     }
 }
 
@@ -142,13 +170,19 @@ pub enum RunStatus {
 
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl RunStatus {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
             RunStatus::Running => "running",
             RunStatus::Completed => "completed",
             RunStatus::CompletedWithErrors => "completed_with_errors",
             RunStatus::Failed => "failed",
-        };
-        write!(f, "{}", s)
+        }
     }
 }
 
@@ -252,8 +286,85 @@ mod tests {
         assert_eq!(RunItemStatus::Pending.to_string(), "pending");
         assert_eq!(RunItemStatus::Transferring.to_string(), "transferring");
         assert_eq!(RunItemStatus::Downloading.to_string(), "downloading");
+        assert_eq!(RunItemStatus::Deleting.to_string(), "deleting");
         assert_eq!(RunItemStatus::Completed.to_string(), "completed");
         assert_eq!(RunItemStatus::Failed.to_string(), "failed");
         assert_eq!(RunItemStatus::Skipped.to_string(), "skipped");
+    }
+
+    fn assert_enum_str<T>(value: T, expected: &str)
+    where
+        T: Serialize + std::fmt::Display,
+    {
+        assert_eq!(value.to_string(), expected);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            format!(r#""{}""#, expected)
+        );
+    }
+
+    #[test]
+    fn test_as_str_matches_display_and_serde_names() {
+        for (value, expected) in [
+            (ConflictStrategy::Overwrite, "overwrite"),
+            (ConflictStrategy::Versioned, "versioned"),
+            (ConflictStrategy::Skip, "skip"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+            assert_enum_str(value, expected);
+        }
+
+        for (value, expected) in [
+            (TargetKind::Netdisk, "netdisk"),
+            (TargetKind::Local, "local"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+            assert_enum_str(value, expected);
+        }
+
+        for (value, expected) in [
+            (PollMode::Interval, "interval"),
+            (PollMode::Scheduled, "scheduled"),
+            (PollMode::Disabled, "disabled"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!(r#""{}""#, expected)
+            );
+        }
+
+        for (value, expected) in [
+            (SyncAction::Added, "added"),
+            (SyncAction::Modified, "modified"),
+            (SyncAction::Removed, "removed"),
+            (SyncAction::Skipped, "skipped"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+            assert_enum_str(value, expected);
+        }
+
+        for (value, expected) in [
+            (RunItemStatus::Pending, "pending"),
+            (RunItemStatus::Transferring, "transferring"),
+            (RunItemStatus::Downloading, "downloading"),
+            (RunItemStatus::Deleting, "deleting"),
+            (RunItemStatus::Completed, "completed"),
+            (RunItemStatus::Failed, "failed"),
+            (RunItemStatus::Skipped, "skipped"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+            assert_enum_str(value, expected);
+        }
+
+        for (value, expected) in [
+            (RunStatus::Running, "running"),
+            (RunStatus::Completed, "completed"),
+            (RunStatus::CompletedWithErrors, "completed_with_errors"),
+            (RunStatus::Failed, "failed"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+            assert_enum_str(value, expected);
+        }
     }
 }
