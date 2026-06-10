@@ -365,19 +365,28 @@ impl ShareSyncManager {
             rate_limiter: Arc::clone(&self.rate_limiter),
         };
         let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
-        // v2 阶段 3:flag 开时走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
-        // 关时退回老的单文件路径。后续阶段 4-6 的二分/并行/限速都挂在 tree 入口下。
+        // v2 阶段 3:默认走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
+        // 仅当显式 BAIDUPCS_DIR_TRANSFER_ENABLED=0/false 时退回老的单文件路径。
+        // 阶段 4-6 的二分/并行/限速都挂在 tree 入口下。
         let dir_transfer_enabled = std::env::var("BAIDUPCS_DIR_TRANSFER_ENABLED")
             .ok()
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
         let outcome = if dir_transfer_enabled {
+            let (execution_diff, added_dir_ancestors) =
+                execution_diff_with_directory_ancestors(&diff, &curr_snapshot);
+            if added_dir_ancestors > 0 {
+                info!(
+                    "share_sync_tree_prepare: run_id={} subscription={} added_dir_ancestors={}",
+                    run_id, sub.id, added_dir_ancestors
+                );
+            }
             info!(
                 "share_sync_route: run_id={} subscription={} mode=tree",
                 run_id, sub.id
             );
             executor
-                .apply_with_run_id_tree(run_id.clone(), &captured, &diff)
+                .apply_with_run_id_tree(run_id.clone(), &captured, &execution_diff)
                 .await
         } else {
             executor
@@ -538,6 +547,56 @@ impl ShareSyncManager {
 
 fn should_advance_snapshot_baseline(status: RunStatus) -> bool {
     matches!(status, RunStatus::Completed)
+}
+
+/// Tree 执行专用 diff。
+///
+/// 普通 diff 只包含新增/修改的文件；如果目录本身没有变化，tree::build 只能为
+/// `/dir/file` 造一个 fs_id=0 的 placeholder 目录，最终会退回逐文件提交。这里把
+/// 当前快照中真实存在的目录祖先补进 added，让 tree 路径优先用目录 fs_id 整体转存。
+/// 目录项不计入 summary，也不会被保存为新的基线；它们只影响本次执行计划。
+fn execution_diff_with_directory_ancestors(
+    diff: &ShareDiff,
+    curr: &ShareSnapshot,
+) -> (ShareDiff, usize) {
+    let curr_index = curr.index_by_path();
+    let mut existing_paths: BTreeSet<String> = diff
+        .added
+        .iter()
+        .map(|item| item.path.clone())
+        .chain(diff.modified.iter().map(|item| item.new.path.clone()))
+        .chain(diff.removed.iter().map(|item| item.path.clone()))
+        .collect();
+
+    let mut out = diff.clone();
+    let action_paths: Vec<String> = diff
+        .added
+        .iter()
+        .chain(diff.modified.iter().map(|m| &m.new))
+        .filter(|item| !item.is_dir)
+        .map(|item| item.path.clone())
+        .collect();
+
+    let mut added = 0usize;
+    for path in action_paths {
+        let mut current = parent_netdisk_dir(&path);
+        while current != "/" {
+            if existing_paths.insert(current.clone()) {
+                if let Some(item) = curr_index.get(&current).filter(|item| item.is_dir) {
+                    out.added.push((**item).clone());
+                    added += 1;
+                }
+            }
+            let parent = parent_netdisk_dir(&current);
+            if parent == current {
+                break;
+            }
+            current = parent;
+        }
+    }
+
+    out.added.sort_by(|a, b| a.path.cmp(&b.path));
+    (out, added)
 }
 
 // =====================================================
@@ -965,7 +1024,7 @@ impl ExecutorHooks for ProductionHooks {
                 };
                 SharedFileInfo {
                     fs_id: item.fs_id,
-                    is_dir: false, // executor 不传目录项
+                    is_dir: item.is_dir,
                     path: raw_path,
                     size: item.size,
                     name: item.name.clone(),
