@@ -91,6 +91,13 @@ pub enum ErrorCategory {
     Quota,
     /// 本地磁盘空间不足 —— 不重试，需用户清理本地后手动触发
     LocalDiskFull,
+    /// v2 阶段 4 新增:目录粒度转存里"模糊失败" —— 百度对一组 fs_id 一次 transfer
+    /// 调用一刀切返回 task_errno != 0,无法区分到底哪个子文件出问题。
+    /// 触发条件:errno=-33(文件数超限)或某些不在 quota/auth/notfound 关键字
+    /// 列表但有 task_errno 的失败。
+    /// 行为:不重试同一组(否则一直撞),而是触发二分(`split_two`)把子树拆开
+    /// 再各自试一次,递归到叶子(单文件)粒度。
+    DirTransferAmbiguous,
     /// 其他
     Other,
 }
@@ -137,6 +144,14 @@ const TRANSIENT_KEYWORDS: &[&str] = &[
     "connection reset",
 ];
 
+/// 触发 `ErrorCategory::DirTransferAmbiguous` 的关键字。
+///
+/// 这些错误意味着"百度对一组 fs_id 的转存整批失败,但无法精确归因到子文件" —
+/// 重试同一组只会再撞同一面墙,正确做法是拆小再试(阶段 4 二分)。
+/// - `-33`(文件数超限) — 百度对单次转存的 fs_id 总数有上限
+/// - `task_errno=-33` — 同上,只是写法不同
+const DIR_AMBIGUOUS_KEYWORDS: &[&str] = &["errno=-33", "task_errno=-33", "文件数量超出限制"];
+
 fn matches_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
 }
@@ -148,7 +163,9 @@ impl ShareSyncError {
             ShareSyncError::NetworkError(_) => ErrorCategory::Transient,
             ShareSyncError::ShareLinkError(_) => ErrorCategory::Auth,
             ShareSyncError::TransferError(msg) | ShareSyncError::DownloadError(msg) => {
-                // 顺序敏感：先查资源/鉴权/不存在，再把明确的服务端临时错误归为可重试。
+                // 顺序敏感:先查资源/鉴权/不存在,再把明确的服务端临时错误归为可重试。
+                // DirTransferAmbiguous 放在 quota 之后, transient 之前 — 它不是
+                // 可重试也不是单纯的失败,但又必须触发二分,所以独占一档。
                 if matches_any(msg, QUOTA_KEYWORDS) {
                     ErrorCategory::Quota
                 } else if matches_any(msg, LOCAL_DISK_FULL_KEYWORDS) {
@@ -157,6 +174,8 @@ impl ShareSyncError {
                     ErrorCategory::Auth
                 } else if msg.contains("不存在") || msg.contains("已失效") {
                     ErrorCategory::NotFound
+                } else if matches_any(msg, DIR_AMBIGUOUS_KEYWORDS) {
+                    ErrorCategory::DirTransferAmbiguous
                 } else if matches_any(msg, TRANSIENT_KEYWORDS) {
                     ErrorCategory::Transient
                 } else {
@@ -181,6 +200,21 @@ impl ShareSyncError {
         matches!(self.category(), ErrorCategory::Transient)
     }
 
+    /// 是否触发"目录二分递归"(阶段 4 新增)
+    ///
+    /// 这三类失败有一个共同点:**重试同一组没用,但拆小可能成功**:
+    /// - `Quota` / `LocalDiskFull`: 整组放不下,拆开后小目录可能放得下
+    /// - `DirTransferAmbiguous`: 整组被一刀切失败但可能只是某个子文件挂了,
+    ///   拆开后好的文件能继续转
+    pub fn is_bisect_trigger(&self) -> bool {
+        matches!(
+            self.category(),
+            ErrorCategory::Quota
+                | ErrorCategory::LocalDiskFull
+                | ErrorCategory::DirTransferAmbiguous
+        )
+    }
+
     /// 面向用户的可读消息
     ///
     /// 与 `autobackup/error.rs::DiskSpaceFull::user_message` 风格对齐，但不复用
@@ -197,6 +231,9 @@ impl ShareSyncError {
             ErrorCategory::Auth => "分享链接鉴权失败或触发风控，请检查链接与提取码".to_string(),
             ErrorCategory::Config => "订阅配置存在错误，请编辑后重新触发".to_string(),
             ErrorCategory::NotFound => "分享资源不存在或已失效，请检查链接".to_string(),
+            ErrorCategory::DirTransferAmbiguous => {
+                "整目录转存被一刀切失败,将自动拆为子目录递归重试".to_string()
+            }
             ErrorCategory::Other => self.to_string(),
         }
     }
@@ -312,5 +349,35 @@ mod tests {
         assert_eq!(json, "\"quota\"");
         let json = serde_json::to_string(&ErrorCategory::LocalDiskFull).unwrap();
         assert_eq!(json, "\"local_disk_full\"");
+    }
+
+    #[test]
+    fn test_dir_transfer_ambiguous_detected_for_errno_minus_33() {
+        let e = ShareSyncError::TransferError("errno=-33 文件数量超出限制".into());
+        assert_eq!(e.category(), ErrorCategory::DirTransferAmbiguous);
+        assert!(e.is_bisect_trigger());
+        assert!(!e.should_retry());
+
+        let e = ShareSyncError::TransferError("task_errno=-33".into());
+        assert_eq!(e.category(), ErrorCategory::DirTransferAmbiguous);
+
+        let e = ShareSyncError::TransferError("文件数量超出限制".into());
+        assert_eq!(e.category(), ErrorCategory::DirTransferAmbiguous);
+    }
+
+    #[test]
+    fn test_is_bisect_trigger_covers_quota_and_disk() {
+        let e = ShareSyncError::TransferError("网盘空间不足".into());
+        assert!(e.is_bisect_trigger());
+
+        let e = ShareSyncError::FileSystemError("ENOSPC".into());
+        assert!(e.is_bisect_trigger());
+
+        // 非 bisect 类失败
+        let e = ShareSyncError::TransferError("errno=132 风控".into());
+        assert!(!e.is_bisect_trigger());
+
+        let e = ShareSyncError::TransferError("网盘 API 异常".into());
+        assert!(!e.is_bisect_trigger());
     }
 }

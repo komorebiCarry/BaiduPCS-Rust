@@ -795,6 +795,527 @@ impl<'a> ShareSyncExecutor<'a> {
         }
     }
 
+    // ============================================================
+    // v2 阶段 3:按 tree 顶层节点整体提交
+    // ============================================================
+    //
+    // 与 `apply_with_run_id_grouped` 的关键差异:
+    // - grouped 仍是"文件粒度"分组(按文件的父目录),目录 fs_id 被硬过滤掉
+    // - 这里走"按 tree 顶层节点提交"——顶层是目录就把目录 fs_id 整体发一次 transfer,
+    //   百度服务端递归把整目录搬走;顶层是散文件就单独发
+    //
+    // 阶段 3 的此入口**不带 quota 二分**(失败统一标 Failed),仅做"目录整体转存"
+    // 的能力切换;quota 二分递归留给阶段 4 在 `process_subtree` 内部加。
+    //
+    // 不动 removed 流程(沿用 `apply_with_run_id_grouped` 的 removed 段)。
+    pub async fn apply_with_run_id_tree(
+        &self,
+        run_id: String,
+        captured: &CapturedShare,
+        diff: &ShareDiff,
+    ) -> ApplyOutcome {
+        use crate::share_sync::tree;
+
+        let started_at = Utc::now().timestamp();
+        if let Err(e) = self
+            .persistence
+            .start_run(&run_id, &self.subscription.id, started_at)
+        {
+            return ApplyOutcome {
+                run_id,
+                status: RunStatus::Failed,
+                diff_summary: DiffSummary::default(),
+                error: Some(format!("启动 run 失败: {}", e)),
+            };
+        }
+
+        let mut summary = DiffSummary::default();
+        seed_diff_summary(&mut summary, diff);
+        let mut any_failure = false;
+        let mut run_failure_reason: Option<&'static str> = None;
+
+        // 1) 合并 added + modified 项(**保留 is_dir**——让 tree 重建出目录骨架,
+        //    然后我们才能用目录 fs_id 整体提交)
+        let mut items: Vec<ShareSnapshotItem> =
+            Vec::with_capacity(diff.added.len() + diff.modified.len());
+        items.extend(diff.added.iter().cloned());
+        items.extend(diff.modified.iter().map(|m| m.new.clone()));
+
+        // 2) 重建树(虚拟根的 children 就是顶层节点)
+        let t = tree::build(&items);
+
+        // 3) 对每个顶层节点 × 每个 target 调 process_subtree
+        let top_nodes: Vec<usize> = t.get(t.root).children.clone();
+        info!(
+            "share_sync_tree_apply: run_id={} top_nodes={} subscription={}",
+            run_id,
+            top_nodes.len(),
+            self.subscription.id
+        );
+
+        // v2 阶段 5:并行调度。决策矩阵:
+        // - BAIDUPCS_BISECT_PARALLEL=0 → 串行(等同阶段 4 行为)
+        // - 否则:并发上限 = subscription.max_concurrent_transfers
+        //                 ?? env BAIDUPCS_BISECT_CONCURRENCY ?? 默认 4
+        //
+        // 实现选型用 futures::stream::buffer_unordered 而不是 tokio::spawn:
+        // - 不需要把 hooks 包成 Arc<dyn ExecutorHooks>(改面太大)
+        // - 同一 task 内并发 N 个 future, IO-bound 场景与 spawn 性能相当
+        // - 借用 &self / &captured / &t 不需要 'static
+        //
+        // 每个并发任务持有独立 DiffSummary, 跑完后串行 fold 到主 summary,
+        // 避免共享可变状态。`process_subtree` 内部走 ShareSyncPersistence,
+        // 后者用 Mutex<Connection> 串行化 SQLite 写入, 多 future 并发安全。
+        let bisect_parallel_enabled = std::env::var("BAIDUPCS_BISECT_PARALLEL")
+            .ok()
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+        let concurrency: usize = self
+            .subscription
+            .max_concurrent_transfers
+            .map(|n| n as usize)
+            .or_else(|| {
+                std::env::var("BAIDUPCS_BISECT_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(4)
+            .max(1);
+        let n_targets = self.subscription.targets.len();
+        // 拼工作单元: (top_node_idx, target_idx)
+        let work: Vec<(usize, usize)> = top_nodes
+            .iter()
+            .flat_map(|&n| (0..n_targets).map(move |ti| (n, ti)))
+            .collect();
+
+        let results: Vec<(DiffSummary, Result<(), ErrorCategory>)> =
+            if bisect_parallel_enabled && concurrency > 1 && work.len() > 1 {
+                use futures::stream::{self, StreamExt};
+                info!(
+                    "share_sync_parallel: run_id={} work_units={} concurrency={}",
+                    run_id,
+                    work.len(),
+                    concurrency
+                );
+                let t_ref = &t;
+                let captured_ref = captured;
+                let run_id_ref = run_id.as_str();
+                stream::iter(work.into_iter())
+                    .map(|(node_idx, target_idx)| {
+                        let target = &self.subscription.targets[target_idx];
+                        async move {
+                            let mut local = DiffSummary::default();
+                            let res = self
+                                .process_subtree(
+                                    captured_ref,
+                                    run_id_ref,
+                                    t_ref,
+                                    node_idx,
+                                    target,
+                                    &mut local,
+                                )
+                                .await;
+                            (local, res)
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await
+            } else {
+                let mut out = Vec::with_capacity(work.len());
+                for (node_idx, target_idx) in work {
+                    let target = &self.subscription.targets[target_idx];
+                    let mut local = DiffSummary::default();
+                    let res = self
+                        .process_subtree(
+                            captured,
+                            run_id.as_str(),
+                            &t,
+                            node_idx,
+                            target,
+                            &mut local,
+                        )
+                        .await;
+                    out.push((local, res));
+                }
+                out
+            };
+
+        // 聚合: process_subtree 只会改 failed/skipped/overwritten 这几个增量字段,
+        // 其它字段(added/modified/removed/unchanged/total)由下方第 4 步从 diff 直接算。
+        for (local, res) in results {
+            summary.failed += local.failed;
+            summary.skipped += local.skipped;
+            summary.overwritten += local.overwritten;
+            if let Err(category) = res {
+                any_failure = true;
+                run_failure_reason = update_run_failure_reason(run_failure_reason, category);
+            }
+        }
+
+        // 4) added/modified 计数(沿用旧逻辑:目录条目不计入文件数,但 process_subtree
+        //    内部已经把叶子文件级 run_item 都记上了)
+        summary.added = diff.added.iter().filter(|i| !i.is_dir).count();
+        summary.modified = diff.modified.iter().filter(|i| !i.new.is_dir).count();
+
+        // 5) removed 流程(完全复用 grouped 路径行为)
+        for item in &diff.removed {
+            if item.is_dir {
+                continue;
+            }
+            if !self.subscription.delete_missing {
+                for target in &self.subscription.targets {
+                    let target_kind = match target {
+                        SyncTarget::Netdisk(_) => TargetKind::Netdisk,
+                        SyncTarget::Local(_) => TargetKind::Local,
+                    };
+                    let _ = self.persistence.add_run_item(
+                        &run_id,
+                        &item.path,
+                        SyncAction::Removed,
+                        target_kind,
+                        None,
+                        None,
+                        RunItemStatus::Skipped,
+                        None,
+                        None,
+                    );
+                    summary.skipped += 1;
+                }
+                summary.removed += 1;
+                continue;
+            }
+            for target in &self.subscription.targets {
+                if let Err(e) = self
+                    .process_removed(run_id.as_str(), item, target, &mut summary)
+                    .await
+                {
+                    any_failure = true;
+                    run_failure_reason =
+                        update_run_failure_reason(run_failure_reason, e.category());
+                    warn!("removed 处理失败: path={}, err={}", item.path, e);
+                }
+            }
+            summary.removed += 1;
+        }
+
+        // 6) run 终态(沿用 grouped 路径语义:仅 quota 不算 Failed)
+        let quota_only = matches!(
+            run_failure_reason,
+            Some("quota_full") | Some("local_disk_full")
+        );
+        let status = if any_failure && !quota_only {
+            RunStatus::CompletedWithErrors
+        } else {
+            RunStatus::Completed
+        };
+        let error = if quota_only {
+            run_failure_reason.map(|r| match r {
+                "quota_full" => "网盘空间不足,部分子项已跳过".to_string(),
+                "local_disk_full" => "本地磁盘空间不足".to_string(),
+                _ => "未知失败原因".to_string(),
+            })
+        } else {
+            None
+        };
+
+        let finished_at = Utc::now().timestamp();
+        if let Err(e) =
+            self.persistence
+                .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
+        {
+            warn!("finish_run 失败: {}", e);
+        }
+
+        ApplyOutcome {
+            run_id,
+            status,
+            diff_summary: summary,
+            error,
+        }
+    }
+
+    /// 处理一棵子树(以 `node_idx` 为根)
+    ///
+    /// 阶段 4: 失败时若错误是 `is_bisect_trigger()`(Quota / LocalDiskFull /
+    /// DirTransferAmbiguous),触发二分递归 — split_two 把 children 切两半,
+    /// 各自调用 transfer_node_set 重试;深度上限 32,触顶直接 Failed。
+    ///
+    /// 入口方法,默认 depth=0;真正的递归在 `transfer_node_set` 里。
+    async fn process_subtree(
+        &self,
+        captured: &CapturedShare,
+        run_id: &str,
+        tree: &crate::share_sync::tree::Tree,
+        node_idx: usize,
+        target: &SyncTarget,
+        summary: &mut DiffSummary,
+    ) -> Result<(), ErrorCategory> {
+        self.transfer_node_set(captured, run_id, tree, vec![node_idx], target, summary, 0)
+            .await
+    }
+
+    /// 提交一组节点(可能是 1 个目录、N 个散文件、混合)的 transfer
+    ///
+    /// 这是阶段 4 二分递归的核心。
+    /// - 把 indices 拼成 items 一次性 submit_transfer_batch / submit_download_batch
+    /// - 失败 + is_bisect_trigger + depth < `BISECT_MAX_DEPTH`:
+    ///   - len(indices) > 1: 用 `split_indices_two` 对半切, 递归两次
+    ///   - len == 1 且节点有 children: 用 `split_two` 切节点的子节点, 递归两次
+    ///   - len == 1 且节点是叶子: 标 Skipped/Failed(无法再拆)
+    /// - 失败但**非** bisect 触发: 整组按 Failed/Skipped(quota_full/local_disk_full) 标记
+    ///
+    /// 由 BAIDUPCS_BISECT_ENABLED env flag 控制(默认开)。flag 关时退化为"失败
+    /// 直接标 Failed",等价于阶段 3 行为。
+    #[async_recursion::async_recursion]
+    async fn transfer_node_set(
+        &self,
+        captured: &CapturedShare,
+        run_id: &str,
+        tree: &'async_recursion crate::share_sync::tree::Tree,
+        indices: Vec<usize>,
+        target: &SyncTarget,
+        summary: &mut DiffSummary,
+        depth: u32,
+    ) -> Result<(), ErrorCategory> {
+        use crate::share_sync::tree as tree_mod;
+
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let items_to_submit = tree_mod::nodes_to_items(tree, &indices);
+        if items_to_submit.is_empty() {
+            // 全是 placeholder — 降级按叶子提交
+            let mut worst: Option<ErrorCategory> = None;
+            for idx in &indices {
+                if let Err(c) = self
+                    .submit_subtree_as_leaves(captured, run_id, tree, *idx, target, summary)
+                    .await
+                {
+                    worst = Some(worst.map_or(c, |w| max_category(w, c)));
+                }
+            }
+            return worst.map_or(Ok(()), Err);
+        }
+        let target_kind = match target {
+            SyncTarget::Netdisk(_) => TargetKind::Netdisk,
+            SyncTarget::Local(_) => TargetKind::Local,
+        };
+        let strategy = target.effective_conflict_strategy(self.subscription.conflict_strategy);
+        let internal_label =
+            format!("share-sync/{}/tree/d{}/{}", self.subscription.id, depth, run_id);
+
+        let first_path = tree.get(indices[0]).path.clone();
+        info!(
+            "share_sync_submit_batch: run_id={} depth={} n_nodes={} first_path={} target={:?}",
+            run_id,
+            depth,
+            indices.len(),
+            first_path,
+            target_kind
+        );
+
+        let submit_result: Result<String, ShareSyncError> = match target {
+            SyncTarget::Netdisk(t) => {
+                self.hooks
+                    .submit_transfer_batch(
+                        captured,
+                        &t.remote_path,
+                        &items_to_submit,
+                        Some(&internal_label),
+                    )
+                    .await
+            }
+            SyncTarget::Local(t) => {
+                self.hooks
+                    .submit_download_batch(&items_to_submit, &t.local_path, strategy)
+                    .await
+            }
+        };
+
+        let final_err: ShareSyncError = match submit_result {
+            Ok(task_id) => {
+                let require_download_completion = matches!(target, SyncTarget::Local(_));
+                let wait_res = self
+                    .hooks
+                    .wait_transfer_task(&task_id, require_download_completion, TASK_WAIT_TIMEOUT)
+                    .await;
+                match wait_res {
+                    Ok(()) => {
+                        // 成功:把所有 indices 子树叶子标 Completed
+                        let mut all_leaves: Vec<usize> = Vec::new();
+                        for &idx in &indices {
+                            all_leaves.extend(tree.descendants_leaves(idx));
+                        }
+                        for leaf_idx in all_leaves {
+                            let leaf = tree.get(leaf_idx);
+                            let _ = self.persistence.add_run_item(
+                                run_id,
+                                &leaf.path,
+                                SyncAction::Added,
+                                target_kind,
+                                Some(task_id.as_str()),
+                                None,
+                                RunItemStatus::Completed,
+                                None,
+                                None,
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!(
+                            "share_sync_wait_failed: run_id={} depth={} first_path={} task_id={} err={}",
+                            run_id, depth, first_path, task_id, e
+                        );
+                        e
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "share_sync_submit_failed: run_id={} depth={} first_path={} err={}",
+                    run_id, depth, first_path, e
+                );
+                e
+            }
+        };
+
+        // 失败处理:判断是否触发二分
+        let category = final_err.category();
+        let bisect_enabled = std::env::var("BAIDUPCS_BISECT_ENABLED")
+            .ok()
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+        const BISECT_MAX_DEPTH: u32 = 32;
+
+        if bisect_enabled && final_err.is_bisect_trigger() && depth < BISECT_MAX_DEPTH {
+            // 决定怎么二分:
+            // 1) indices 多个 → 把 indices 自己对半切
+            // 2) indices 单个但有 children → 切节点的 children
+            // 3) indices 单个且是叶子 → 无法再分,标 Skipped
+            let bisect_groups: Vec<Vec<usize>> = if indices.len() > 1 {
+                tree_mod::split_indices_two(tree, &indices)
+            } else {
+                tree_mod::split_two(tree, indices[0])
+            };
+
+            if !bisect_groups.is_empty() && bisect_groups.iter().any(|g| !g.is_empty()) {
+                info!(
+                    "share_sync_bisect_split: run_id={} depth={} from={} into={:?} reason={:?}",
+                    run_id,
+                    depth,
+                    indices.len(),
+                    bisect_groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+                    category
+                );
+                let mut worst: Option<ErrorCategory> = None;
+                for group in bisect_groups {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    if let Err(c) = self
+                        .transfer_node_set(
+                            captured,
+                            run_id,
+                            tree,
+                            group,
+                            target,
+                            summary,
+                            depth + 1,
+                        )
+                        .await
+                    {
+                        worst = Some(worst.map_or(c, |w| max_category(w, c)));
+                    }
+                }
+                return worst.map_or(Ok(()), Err);
+            }
+            // 单叶子 + bisect_trigger → 拆不动了, 落到下方的"标记终态"分支(Skipped)
+        }
+
+        // 到这里:不二分,直接给所有叶子打终态
+        let all_leaves: Vec<usize> = indices
+            .iter()
+            .flat_map(|&i| tree.descendants_leaves(i))
+            .collect();
+        for leaf_idx in all_leaves {
+            let leaf = tree.get(leaf_idx);
+            let (status, reason) = match category {
+                ErrorCategory::Quota => {
+                    summary.skipped += 1;
+                    (RunItemStatus::Skipped, Some("quota_full"))
+                }
+                ErrorCategory::LocalDiskFull => {
+                    summary.skipped += 1;
+                    (RunItemStatus::Skipped, Some("local_disk_full"))
+                }
+                ErrorCategory::DirTransferAmbiguous => {
+                    // 已二分到叶子仍失败 → 当作 Failed(实际是该单文件出问题, 比如
+                    // 被分享者删除); 暂不区分独立 reason, 走 Failed 让用户看到
+                    summary.failed += 1;
+                    (RunItemStatus::Failed, None)
+                }
+                _ => {
+                    summary.failed += 1;
+                    (RunItemStatus::Failed, None)
+                }
+            };
+            let _ = self.persistence.add_run_item(
+                run_id,
+                &leaf.path,
+                SyncAction::Added,
+                target_kind,
+                None,
+                None,
+                status,
+                None,
+                reason,
+            );
+        }
+        Err(category)
+    }
+
+    /// 当 process_subtree 遇到 placeholder / 空 items 时,降级为按叶子(单文件)
+    /// 提交。阶段 4 的二分递归到底也会复用这条路径。
+    async fn submit_subtree_as_leaves(
+        &self,
+        captured: &CapturedShare,
+        run_id: &str,
+        tree: &crate::share_sync::tree::Tree,
+        node_idx: usize,
+        target: &SyncTarget,
+        summary: &mut DiffSummary,
+    ) -> Result<(), ErrorCategory> {
+        let leaves = tree.descendants_leaves(node_idx);
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        let mut worst: Option<ErrorCategory> = None;
+        for leaf_idx in leaves {
+            let leaf = tree.get(leaf_idx);
+            let item = ShareSnapshotItem {
+                path: leaf.path.clone(),
+                raw_path: leaf.path.clone(),
+                fs_id: leaf.fs_id,
+                size: leaf.size,
+                name: leaf.name.clone(),
+                is_dir: leaf.is_dir,
+            };
+            if let Err(e) = self
+                .process_added_or_modified(captured, run_id, &item, SyncAction::Added, target, summary)
+                .await
+            {
+                worst = Some(worst.map_or(e.category(), |w| max_category(w, e.category())));
+            }
+        }
+        match worst {
+            None => Ok(()),
+            Some(c) => Err(c),
+        }
+    }
+
+
     /// 处理 added/modified 文件
     async fn process_added_or_modified(
         &self,
@@ -1504,6 +2025,30 @@ fn update_run_failure_reason(
         (Some("local_disk_full"), _) => Some("local_disk_full"),
         (Some(c), _) => Some(c), // 保留首个非严重类别
         (None, n) => n,
+    }
+}
+
+/// 取"更严重"的 ErrorCategory:Auth > NotFound > Transient > Quota > LocalDiskFull >
+/// 其它。`submit_subtree_as_leaves` 累积多个 leaf 的失败时需要选出最值得上报
+/// 的那个,以便 run_failure_reason 在 quota_only 时仍能区分 quota / non-quota。
+fn max_category(a: ErrorCategory, b: ErrorCategory) -> ErrorCategory {
+    fn weight(c: ErrorCategory) -> u8 {
+        use crate::share_sync::error::ErrorCategory as E;
+        match c {
+            E::Auth => 6,
+            E::Config => 5,
+            E::NotFound => 4,
+            E::Transient => 3,
+            E::Quota => 2,
+            E::DirTransferAmbiguous => 2,
+            E::LocalDiskFull => 1,
+            E::Other => 0,
+        }
+    }
+    if weight(a) >= weight(b) {
+        a
+    } else {
+        b
     }
 }
 

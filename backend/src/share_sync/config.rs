@@ -141,6 +141,12 @@ pub struct ShareSubscription {
     /// 是否启用
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// v2 阶段 5:tree 入口下并行提交 transfer batch 的最大并发数。
+    /// `None` → 走全局默认(env BAIDUPCS_BISECT_CONCURRENCY 或硬编码 4)。
+    /// 单个分享文件数多、风控敏感时,可在订阅级别调低(如 2);
+    /// 反之多账号低风控时可调高(如 8)。仅在 BAIDUPCS_BISECT_PARALLEL=1 时生效。
+    #[serde(default)]
+    pub max_concurrent_transfers: Option<u32>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 更新时间
@@ -163,6 +169,7 @@ impl ShareSubscription {
             delete_missing: false,
             poll_config: PollConfig::default(),
             enabled: true,
+            max_concurrent_transfers: None,
             created_at: now,
             updated_at: now,
         }

@@ -24,6 +24,47 @@ pub fn normalize_pagination(page: Option<usize>, page_size: Option<usize>) -> (u
     (p, ps)
 }
 
+/// 给 `share_sync_run_items(run_id, path)` 建 UNIQUE 索引。
+///
+/// 老库可能积累过重复行 — quota 退化、并发批量重试都会把同一 (run_id, path)
+/// 插多次。`CREATE UNIQUE INDEX` 在已有重复时会直接报错把启动卡死,所以这里
+/// 先按 `(run_id, path)` 去重(保留最大 id, 即最近一次写入,状态最新), 再建索引。
+fn ensure_run_items_unique_index(conn: &Connection) -> Result<(), ShareSyncError> {
+    // 已有则直接返回(幂等);避免对大表反复跑 DELETE 扫描
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_share_run_items_run_path'",
+            [],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if exists {
+        return Ok(());
+    }
+    // 删除"同一 (run_id, path) 的重复行,只保留 id 最大的那条"
+    let deleted = conn.execute(
+        "DELETE FROM share_sync_run_items
+         WHERE id NOT IN (
+             SELECT MAX(id) FROM share_sync_run_items GROUP BY run_id, path
+         )",
+        [],
+    )?;
+    if deleted > 0 {
+        warn!(
+            "share_sync schema 迁移: 去除 {} 条 (run_id, path) 重复 run_item",
+            deleted
+        );
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_share_run_items_run_path
+         ON share_sync_run_items(run_id, path)",
+        [],
+    )?;
+    Ok(())
+}
+
 /// 持久化管理器
 pub struct ShareSyncPersistence {
     conn: std::sync::Mutex<Connection>,
@@ -141,8 +182,16 @@ impl ShareSyncPersistence {
             );
             CREATE INDEX IF NOT EXISTS idx_share_run_items_run
               ON share_sync_run_items(run_id);
+            -- v2: status + started_at 联合索引,给 mark_stale_runs_failed 扫表用
+            CREATE INDEX IF NOT EXISTS idx_share_runs_status_started
+              ON share_sync_runs(status, started_at);
             "#,
         )?;
+        // v2: (run_id, path) UNIQUE 索引 — 老库可能已有重复行（quota 退化路径
+        // 同一 (run_id, path) 会被插两次,见 executor.rs 的 grouped 分支），
+        // 直接 CREATE UNIQUE INDEX 会报错让服务起不来。**先去重再建索引**:
+        // 同一 (run_id, path) 保留最大 id（最近一次写入,状态最新）。
+        ensure_run_items_unique_index(&conn)?;
         // 兼容老库：老版本的 share_sync_run_items 表没有 reason 列。
         // SQLite 的 `ADD COLUMN` 在列已存在时会报 "duplicate column" 错误，
         // 这里用 `try_exec` 风格的 "忽略特定错误" 模式做幂等迁移。
@@ -412,11 +461,77 @@ impl ShareSyncPersistence {
         Ok(())
     }
 
-    /// 单个 run_item 入库
+    /// 启动期自愈:把 `status='running'` 且 `started_at < now - cutoff_minutes*60`
+    /// 的 run 修复为 `Failed`,返回被收编的 run_id 列表(供 manager 广播事件)。
+    ///
+    /// 旧版本没有 stale-run 检测,服务崩溃 / 强制重启 / 进程被 kill 都会让内存
+    /// 里的 manager task 死掉但 db 行 status 留在 `running`,前端永远看到"运行中"。
+    /// 这个函数在 ShareSyncManager::start 启动时被调一次。
+    ///
+    /// 阈值 `cutoff_minutes` 选定逻辑:任何 run 跑得比"P95 × 3"还久就大概率
+    /// 是 stale 的;d17ae3f1 那次卡 1h47min 是已知漏网,默认 120 分钟兼顾安全
+    /// 与长 run 容忍。可通过 env `BAIDUPCS_STALE_FIXUP_ENABLED=0` 在 manager
+    /// 层关闭该调用(本函数本身不读 env)。
+    pub fn mark_stale_runs_failed(
+        &self,
+        cutoff_minutes: i64,
+    ) -> Result<Vec<StaleRunRecord>, ShareSyncError> {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - cutoff_minutes * 60;
+        let conn = self.conn.lock().unwrap();
+        // 先 SELECT 拿到将被收编的 run 列表(连带 subscription_id, started_at 给事件用)
+        let mut stmt = conn.prepare(
+            "SELECT id, subscription_id, started_at
+             FROM share_sync_runs
+             WHERE status = ?1 AND started_at < ?2",
+        )?;
+        let rows = stmt.query_map(params![RunStatus::Running.as_str(), cutoff], |row| {
+            Ok(StaleRunRecord {
+                run_id: row.get(0)?,
+                subscription_id: row.get(1)?,
+                started_at: row.get(2)?,
+            })
+        })?;
+        let mut stale = Vec::new();
+        for r in rows {
+            stale.push(r?);
+        }
+        drop(stmt);
+        if stale.is_empty() {
+            return Ok(stale);
+        }
+        // 一条 SQL 批量 UPDATE,error 字段填 stale_run_killed_on_startup
+        let updated = conn.execute(
+            "UPDATE share_sync_runs
+             SET status = ?1,
+                 finished_at = ?2,
+                 error = ?3
+             WHERE status = ?4 AND started_at < ?5",
+            params![
+                RunStatus::Failed.as_str(),
+                now,
+                "stale_run_killed_on_startup",
+                RunStatus::Running.as_str(),
+                cutoff,
+            ],
+        )?;
+        info!(
+            "share_sync 启动自愈: 收编 {} 条 stale running run (cutoff={}min)",
+            updated, cutoff_minutes
+        );
+        Ok(stale)
+    }
+
     ///
     /// `reason` 是 v1 新增字段，用于说明"为什么这条 item 没被真正执行"——
     /// 当前主要给 quota / local_disk_full 早停场景用，记录"skip_due_to_quota_full"
     /// 之类的语义化原因。普通成功 / 正常失败的 item 传 `None`。
+    ///
+    /// v2: 内部走 `INSERT ... ON CONFLICT(run_id, path) DO UPDATE ... RETURNING id`,
+    /// 同一 (run_id, path) 重复调用会**覆盖**前一次的所有字段并返回原 row id。
+    /// 这是 quota 退化 / 二分递归 / 并发批量重试场景下"状态以最后一次写入为准"
+    /// 的关键 — 老实现是裸 INSERT 会塞重复行,(run_id, path) 又没有 UNIQUE 约束,
+    /// 列表 API 拉出来会有多份。
     #[allow(clippy::too_many_arguments)]
     pub fn add_run_item(
         &self,
@@ -431,17 +546,27 @@ impl ShareSyncPersistence {
         reason: Option<&str>,
     ) -> Result<i64, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let row_id: i64 = conn.query_row(
             "INSERT INTO share_sync_run_items
              (run_id, path, action, target, transfer_task_id, download_task_id, status, versioned_old_path, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(run_id, path) DO UPDATE SET
+                 action = excluded.action,
+                 target = excluded.target,
+                 transfer_task_id = COALESCE(excluded.transfer_task_id, share_sync_run_items.transfer_task_id),
+                 download_task_id = COALESCE(excluded.download_task_id, share_sync_run_items.download_task_id),
+                 status = excluded.status,
+                 versioned_old_path = COALESCE(excluded.versioned_old_path, share_sync_run_items.versioned_old_path),
+                 reason = COALESCE(excluded.reason, share_sync_run_items.reason)
+             RETURNING id",
             params![
                 run_id, path, action.as_str(), target.as_str(),
                 transfer_task_id, download_task_id,
                 status.as_str(), versioned_old_path, reason
             ],
+            |row| row.get(0),
         )?;
-        Ok(conn.last_insert_rowid())
+        Ok(row_id)
     }
 
     /// 更新 run_item 状态
@@ -635,6 +760,14 @@ pub struct RunRecord {
     pub skipped_count: usize,
     pub overwritten_count: usize,
     pub error: Option<String>,
+}
+
+/// 启动自愈被收编的 stale running run 的描述,manager 用来广播 RunFailed 事件
+#[derive(Debug, Clone)]
+pub struct StaleRunRecord {
+    pub run_id: String,
+    pub subscription_id: String,
+    pub started_at: i64,
 }
 
 /// 单条 run_item
@@ -842,5 +975,177 @@ mod tests {
         let summary = diff.summary();
         assert_eq!(summary.added, 1);
         assert_eq!(summary.modified, 0);
+    }
+
+    /// v2: add_run_item 重复 (run_id, path) 应当走 ON CONFLICT DO UPDATE,
+    /// 不抛错、保留原 row id、字段被新值覆盖
+    #[test]
+    fn test_add_run_item_unique_on_run_path_overwrites() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-x", &s.id, 1000).unwrap();
+        let id1 = mgr
+            .add_run_item(
+                "run-x",
+                "/foo.csv",
+                SyncAction::Added,
+                TargetKind::Netdisk,
+                Some("tx-1"),
+                None,
+                RunItemStatus::Transferring,
+                None,
+                None,
+            )
+            .unwrap();
+        // 同一 (run_id, path) 二次写入,期望返回相同 id 且覆盖状态
+        let id2 = mgr
+            .add_run_item(
+                "run-x",
+                "/foo.csv",
+                SyncAction::Added,
+                TargetKind::Netdisk,
+                Some("tx-2"),
+                Some("dl-2"),
+                RunItemStatus::Completed,
+                None,
+                Some("quota_full"),
+            )
+            .unwrap();
+        assert_eq!(id1, id2, "ON CONFLICT 应当复用同一 row id");
+        let items = mgr.list_run_items("run-x").unwrap();
+        assert_eq!(items.len(), 1, "(run_id, path) UNIQUE 后只能有一条");
+        assert_eq!(items[0].transfer_task_id.as_deref(), Some("tx-2"));
+        assert_eq!(items[0].download_task_id.as_deref(), Some("dl-2"));
+        assert_eq!(items[0].status, "completed");
+        assert_eq!(items[0].reason.as_deref(), Some("quota_full"));
+    }
+
+    /// v2: add_run_item 的 COALESCE 行为:第二次传 None 不应覆盖第一次已写入的字段
+    #[test]
+    fn test_add_run_item_coalesce_keeps_old_fields_on_none() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-c", &s.id, 1000).unwrap();
+        mgr.add_run_item(
+            "run-c",
+            "/foo",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            Some("tx-1"),
+            Some("dl-1"),
+            RunItemStatus::Transferring,
+            Some("/old.bak"),
+            Some("first_reason"),
+        )
+        .unwrap();
+        // 第二次传 None 给 transfer_task_id / download_task_id / versioned_old_path / reason
+        mgr.add_run_item(
+            "run-c",
+            "/foo",
+            SyncAction::Modified,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Failed,
+            None,
+            None,
+        )
+        .unwrap();
+        let items = mgr.list_run_items("run-c").unwrap();
+        assert_eq!(items.len(), 1);
+        // status / action 是 NOT NULL 用 excluded 覆盖
+        assert_eq!(items[0].status, "failed");
+        assert_eq!(items[0].action, "modified");
+        // transfer/download/versioned/reason 通过 COALESCE 保留原值
+        assert_eq!(items[0].transfer_task_id.as_deref(), Some("tx-1"));
+        assert_eq!(items[0].download_task_id.as_deref(), Some("dl-1"));
+        assert_eq!(items[0].versioned_old_path.as_deref(), Some("/old.bak"));
+        assert_eq!(items[0].reason.as_deref(), Some("first_reason"));
+    }
+
+    /// v2: mark_stale_runs_failed — 把 status='running' 且 started_at 超阈值的 run
+    /// 修复为 Failed, 返回收编列表;运行中且 started_at 在阈值内的 run 不动
+    #[test]
+    fn test_mark_stale_runs_failed_picks_only_old_running() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // 老 running: 3 小时前(超阈值 120 分钟)
+        mgr.start_run("run-old", &s.id, now - 3 * 3600).unwrap();
+        // 新 running: 30 分钟前(未超阈值)
+        mgr.start_run("run-fresh", &s.id, now - 30 * 60).unwrap();
+        // 已完成: 即便很老也不应被收编
+        mgr.start_run("run-done", &s.id, now - 5 * 3600).unwrap();
+        mgr.finish_run(
+            "run-done",
+            now - 5 * 3600 + 10,
+            RunStatus::Completed,
+            &DiffSummary::default(),
+            None,
+        )
+        .unwrap();
+
+        let stale = mgr.mark_stale_runs_failed(120).unwrap();
+        let ids: Vec<&str> = stale.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(ids, ["run-old"], "只应收编超阈值的 running run");
+
+        // 校验 db 行确实变成 failed
+        let rec = mgr.get_run("run-old").unwrap().unwrap();
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.error.as_deref(), Some("stale_run_killed_on_startup"));
+        let fresh = mgr.get_run("run-fresh").unwrap().unwrap();
+        assert_eq!(fresh.status, "running");
+    }
+
+    /// v2: 老库已有 (run_id, path) 重复行时, init_tables 走 ensure_run_items_unique_index
+    /// 应当去重并建索引,而不是把启动卡死
+    #[test]
+    fn test_init_tables_handles_duplicate_run_items_in_legacy_db() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("legacy.db");
+        // 不走 ShareSyncPersistence::new(它会建 UNIQUE), 手动建老结构 + 塞重复
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE share_subscriptions (id TEXT PRIMARY KEY, name TEXT, share_url TEXT, password TEXT, config_json TEXT, enabled INTEGER, created_at INTEGER, updated_at INTEGER);
+                 CREATE TABLE share_sync_runs (id TEXT PRIMARY KEY, subscription_id TEXT, started_at INTEGER, finished_at INTEGER, status TEXT, total_count INTEGER DEFAULT 0, added_count INTEGER DEFAULT 0, modified_count INTEGER DEFAULT 0, removed_count INTEGER DEFAULT 0, unchanged_count INTEGER DEFAULT 0, failed_count INTEGER DEFAULT 0, skipped_count INTEGER DEFAULT 0, overwritten_count INTEGER DEFAULT 0, error TEXT);
+                 CREATE TABLE share_sync_run_items (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, path TEXT, action TEXT, target TEXT, transfer_task_id TEXT, download_task_id TEXT, status TEXT, versioned_old_path TEXT, error TEXT, reason TEXT);"
+            ).unwrap();
+            conn.execute("INSERT INTO share_sync_runs (id, subscription_id, started_at, status) VALUES ('r1', 'sub1', 1, 'running')", []).unwrap();
+            // 同一 (run_id, path) 塞 3 条不同状态
+            for status in ["pending", "transferring", "failed"] {
+                conn.execute(
+                    "INSERT INTO share_sync_run_items (run_id, path, action, target, status) VALUES ('r1', '/dup', 'added', 'netdisk', ?1)",
+                    params![status],
+                ).unwrap();
+            }
+        }
+        // 走完整 init -> 应当去重并建索引
+        let mgr = ShareSyncPersistence::new(&p).unwrap();
+        let items = mgr.list_run_items("r1").unwrap();
+        assert_eq!(items.len(), 1, "重复行应当被去重");
+        assert_eq!(
+            items[0].status, "failed",
+            "保留 id 最大的那条(最近一次写入)"
+        );
+        // 再插重复应当走 ON CONFLICT 不抛错
+        mgr.add_run_item(
+            "r1",
+            "/dup",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Completed,
+            None,
+            None,
+        )
+        .unwrap();
+        let items = mgr.list_run_items("r1").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "completed");
     }
 }

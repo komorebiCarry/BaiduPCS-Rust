@@ -59,6 +59,16 @@ pub enum ShareSyncEvent {
         modified: usize,
         removed: usize,
         failed: usize,
+        /// v2 阶段 7:run 总耗时(ms),便于 A/B 对照
+        /// 老消费者反序列化时 Option 缺失字段自动 None,不影响兼容
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        /// v2 阶段 7:本次 run 触发的二分递归总次数
+        #[serde(default)]
+        n_bisects: Option<u32>,
+        /// v2 阶段 7:二分递归达到的最深 depth
+        #[serde(default)]
+        max_bisect_depth: Option<u32>,
     },
     /// 一次同步失败
     RunFailed {
@@ -170,6 +180,9 @@ mod tests {
             modified: 2,
             removed: 3,
             failed: 0,
+            duration_ms: Some(1234),
+            n_bisects: Some(0),
+            max_bisect_depth: Some(0),
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"run_completed\""));
