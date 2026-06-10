@@ -80,6 +80,13 @@ pub async fn generate_qrcode(
 #[derive(Debug, Deserialize)]
 pub struct QRCodeStatusQuery {
     pub sign: String,
+    /// 是否处于"添加账号"模式（多账号）。
+    ///
+    /// 添加账号时用户通常已经有一个活跃账号，必须跳过下面"已有活跃账号即视为
+    /// 登录成功"的防呆短路，否则会在用户尚未扫码时就用旧账号返回 Success，
+    /// 导致前端误报"账号添加成功"。
+    #[serde(default)]
+    pub add: bool,
 }
 
 /// 查询扫码状态
@@ -93,7 +100,10 @@ pub async fn qrcode_status(
 
     // 防呆：检查是否已有有效的活跃账号会话
     // 从 active_uid → AccountManager 取，不再读 legacy session.json
-    {
+    //
+    // 注意：添加账号模式（add=true）下用户本就已有活跃账号，必须跳过此短路，
+    // 否则会在尚未扫码时直接用旧账号返回 Success，误报"账号添加成功"。
+    if !params.add {
         if let Some(user) = state.active_user_auth().await {
             info!(
                 "检测到已有活跃账号: UID={}, 验证 BDUSS 有效性...",

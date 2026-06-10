@@ -82,9 +82,15 @@ export async function generateQRCode(): Promise<QRCode> {
 
 /**
  * 查询扫码状态
+ *
+ * @param sign 二维码 sign
+ * @param addMode 是否处于"添加账号"模式。为 true 时附带 `add=true`，
+ *   后端会跳过"已有活跃账号即视为登录成功"的短路，避免尚未扫码就误报成功。
  */
-export async function getQRCodeStatus(sign: string): Promise<QRCodeStatus> {
-  const response = (await apiClient.get(`/auth/qrcode/status?sign=${sign}`)) as ApiResponse<QRCodeStatus>
+export async function getQRCodeStatus(sign: string, addMode = false): Promise<QRCodeStatus> {
+  const params = new URLSearchParams({ sign })
+  if (addMode) params.set('add', 'true')
+  const response = (await apiClient.get(`/auth/qrcode/status?${params.toString()}`)) as ApiResponse<QRCodeStatus>
   if (response.code !== 0 || !response.data) {
     throw new Error(response.message || '查询状态失败')
   }
