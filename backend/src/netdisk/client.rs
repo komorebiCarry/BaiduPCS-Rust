@@ -1831,6 +1831,26 @@ impl NetdiskClient {
         Ok(merged)
     }
 
+    /// 在现有 Cookie 头基础上覆盖 randsk/BDCLND（用于密码保护的分享列表/转存）
+    async fn collect_all_baidu_cookies_with_randsk(&self, randsk: &str) -> Result<String> {
+        Ok(Self::override_cookie_randsk(
+            &self.collect_all_baidu_cookies().await?,
+            randsk,
+        ))
+    }
+
+    /// 工具函数：去掉 cookie 头里所有 randsk/BDCLND，再追加一对新的 randsk/BDCLND
+    fn override_cookie_randsk(cookie_header: &str, randsk: &str) -> String {
+        let mut cookies: Vec<String> = cookie_header
+            .split("; ")
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("randsk=") && !kv.starts_with("BDCLND="))
+            .map(str::to_string)
+            .collect();
+        cookies.push(format!("randsk={}", randsk));
+        cookies.push(format!("BDCLND={}", randsk));
+        cookies.join("; ")
+    }
+
     /// 创建文件夹
     ///
     /// # 参数
@@ -2301,6 +2321,18 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<crate::transfer::ShareFileListResult> {
+        self.list_share_files_with_randsk(short_key, bdstoken, page, num, None)
+            .await
+    }
+
+    pub async fn list_share_files_with_randsk(
+        &self,
+        short_key: &str,
+        bdstoken: &str,
+        page: u32,
+        num: u32,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::ShareFileListResult> {
         info!("获取分享文件列表(根目录): short_key={}, page={}, num={}", short_key, page, num);
 
         // short_key 包含 '1'（如 "1abcDEFg"），需要去掉第一个字符
@@ -2320,14 +2352,25 @@ impl NetdiskClient {
 
         let referer = format!("https://pan.baidu.com/s/{}", short_key);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("User-Agent", &self.web_user_agent)
-            .header("Referer", &referer)
-            .send()
-            .await
-            .context("获取分享文件列表失败")?;
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .header("Cookie", cookie_header)
+                .send()
+                .await
+        } else {
+            self.client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .send()
+                .await
+        }
+        .context("获取分享文件列表失败")?;
 
         let response_text = response.text().await.context("读取文件列表响应失败")?;
         info!("文件列表响应: {}", response_text);
@@ -2439,6 +2482,23 @@ impl NetdiskClient {
         page: u32,
         num: u32,
     ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        self.list_share_files_in_dir_with_randsk(
+            short_key, shareid, uk, bdstoken, dir, page, num, None,
+        )
+        .await
+    }
+
+    pub async fn list_share_files_in_dir_with_randsk(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        uk: &str,
+        bdstoken: &str,
+        dir: &str,
+        page: u32,
+        num: u32,
+        randsk: Option<&str>,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
         info!("获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}", shareid, dir, page, num);
 
         let encoded_dir = urlencoding::encode(dir);
@@ -2453,14 +2513,25 @@ impl NetdiskClient {
 
         let referer = format!("https://pan.baidu.com/s/{}", short_key);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("User-Agent", &self.web_user_agent)
-            .header("Referer", &referer)
-            .send()
-            .await
-            .context("获取分享子目录文件列表失败")?;
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .header("Cookie", cookie_header)
+                .send()
+                .await
+        } else {
+            self.client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .send()
+                .await
+        }
+        .context("获取分享子目录文件列表失败")?;
 
         let response_text = response.text().await.context("读取子目录文件列表响应失败")?;
         debug!("子目录文件列表响应: {}", response_text);

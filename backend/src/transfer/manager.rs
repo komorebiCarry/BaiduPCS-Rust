@@ -56,10 +56,16 @@ pub struct TransferManager {
 pub struct CreateTransferRequest {
     pub share_url: String,
     pub password: Option<String>,
+    /// Caller-provided share randsk. Internal callers use this to keep
+    /// concurrent password-protected shares from overwriting each other in the
+    /// shared CookieJar.
+    pub randsk: Option<String>,
     pub save_path: String,
     pub save_fs_id: u64,
     pub auto_download: Option<bool>,
     pub local_download_path: Option<String>,
+    /// 自动下载时使用的本地文件冲突策略；None 时使用全局下载默认策略
+    pub download_conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
     /// 是否为分享直下任务
     /// 分享直下任务会自动创建临时目录，下载完成后自动清理
     #[allow(dead_code)]

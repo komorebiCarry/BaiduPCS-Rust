@@ -49,6 +49,9 @@ pub mod task_slot_pool;
 // 🔥 Web 访问认证模块
 pub mod web_auth;
 
+// 🔥 分享同步模块（订阅第三方分享并持续同步）
+pub mod share_sync;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;
