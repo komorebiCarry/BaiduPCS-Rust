@@ -1375,7 +1375,14 @@ impl DownloadEngine {
 
         // 4. 🔥 并行探测所有下载链接，过滤出可用的链接
         // 使用分批并行，每批最多 10 个，一般情况下可以一次性并行探测所有链接
-        info!("开始并行探测 {} 个下载链接（每批10个）...", all_urls.len());
+        //
+        // 🚀 海量小文件优化：当文件较小（< 5MB）时跳过链接探测，
+        //    直接采用 acquire_download_urls 返回的所有链接。
+        //    探测本身要并行 GET 8 个 64KB Range 请求（约 0.5~1s/文件），
+        //    对于 5781 × 几百KB 的目录场景，累计开销极大；
+        //    且小文件分片下载本身只要 0.5~1s，探测+下载几乎是 2x 开销。
+        //    跳过探测后，UrlHealthManager 会基于真实下载速度自适应排序，
+        //    挂起的链接由 read_timeout 与 url health 降权机制兜底剔除。
         let mut valid_urls = Vec::new();
         let mut url_speeds = Vec::new();
         let mut referer: Option<String> = None;
@@ -1383,57 +1390,76 @@ impl DownloadEngine {
         // 用于校正 task.total_size 与服务器不一致的场景（例如文件列表 API 返回 size 与 Locate 不一致）
         let mut server_reported_total: Option<u64> = None;
 
-        // 预先获取 bduss，避免在 async 闭包中借用 self
-        let bduss = self.get_netdisk_client().bduss().to_string();
+        const SMALL_FILE_PROBE_SKIP_THRESHOLD: u64 = 5 * 1024 * 1024;
+        let skip_probe = total_size > 0 && total_size <= SMALL_FILE_PROBE_SKIP_THRESHOLD;
 
-        const BATCH_SIZE: usize = 10; // 每批并行探测的链接数
+        if skip_probe {
+            info!(
+                "🚀 小文件跳过链接探测: 文件大小 {} bytes <= {} bytes，直接采用 {} 条链接",
+                total_size,
+                SMALL_FILE_PROBE_SKIP_THRESHOLD,
+                all_urls.len()
+            );
+            for url in &all_urls {
+                valid_urls.push(url.clone());
+                // 速度未知，初始化为 0；UrlHealthManager 会用 EWMA 接管
+                url_speeds.push(0.0);
+            }
+        } else {
+            info!("开始并行探测 {} 个下载链接（每批10个）...", all_urls.len());
+            // 预先获取 bduss，避免在 async 闭包中借用 self
+            let bduss = self.get_netdisk_client().bduss().to_string();
 
-        for batch_start in (0..all_urls.len()).step_by(BATCH_SIZE) {
-            let batch_end = std::cmp::min(batch_start + BATCH_SIZE, all_urls.len());
-            let batch_urls = &all_urls[batch_start..batch_end];
+            const BATCH_SIZE: usize = 10; // 每批并行探测的链接数
 
-            // 创建并行探测任务
-            let probe_futures: Vec<_> = batch_urls
-                .iter()
-                .enumerate()
-                .map(|(batch_idx, url)| {
-                    let client = download_client_snapshot.clone();
-                    let url = url.clone();
-                    let bduss = bduss.clone();
-                    let total_size = total_size;
-                    let global_idx = batch_start + batch_idx;
-                    async move {
-                        let result =
-                            Self::probe_download_link_parallel(&client, &bduss, &url, total_size)
-                                .await;
-                        (global_idx, url, result)
-                    }
-                })
-                .collect();
+            for batch_start in (0..all_urls.len()).step_by(BATCH_SIZE) {
+                let batch_end = std::cmp::min(batch_start + BATCH_SIZE, all_urls.len());
+                let batch_urls = &all_urls[batch_start..batch_end];
 
-            // 并行执行本批次的探测
-            let batch_results = join_all(probe_futures).await;
-
-            // 处理探测结果
-            for (idx, url, result) in batch_results {
-                match result {
-                    Ok((ref_url, speed, server_total)) => {
-                        info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", idx, speed);
-                        valid_urls.push(url);
-                        url_speeds.push(speed);
-
-                        // 保存第一个成功链接的 Referer
-                        if referer.is_none() {
-                            referer = ref_url;
+                // 创建并行探测任务
+                let probe_futures: Vec<_> = batch_urls
+                    .iter()
+                    .enumerate()
+                    .map(|(batch_idx, url)| {
+                        let client = download_client_snapshot.clone();
+                        let url = url.clone();
+                        let bduss = bduss.clone();
+                        let total_size = total_size;
+                        let global_idx = batch_start + batch_idx;
+                        async move {
+                            let result = Self::probe_download_link_parallel(
+                                &client, &bduss, &url, total_size,
+                            )
+                            .await;
+                            (global_idx, url, result)
                         }
+                    })
+                    .collect();
 
-                        // 🔥 收集第一个解析到的服务器实际文件大小
-                        if server_reported_total.is_none() {
-                            server_reported_total = server_total;
+                // 并行执行本批次的探测
+                let batch_results = join_all(probe_futures).await;
+
+                // 处理探测结果
+                for (idx, url, result) in batch_results {
+                    match result {
+                        Ok((ref_url, speed, server_total)) => {
+                            info!("✓ 链接 #{} 探测成功，速度: {:.2} KB/s", idx, speed);
+                            valid_urls.push(url);
+                            url_speeds.push(speed);
+
+                            // 保存第一个成功链接的 Referer
+                            if referer.is_none() {
+                                referer = ref_url;
+                            }
+
+                            // 🔥 收集第一个解析到的服务器实际文件大小
+                            if server_reported_total.is_none() {
+                                server_reported_total = server_total;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!("✗ 链接 #{} 探测失败: {}", idx, e);
+                        Err(e) => {
+                            warn!("✗ 链接 #{} 探测失败: {}", idx, e);
+                        }
                     }
                 }
             }
@@ -1451,7 +1477,8 @@ impl DownloadEngine {
         );
 
         // 🔥 淘汰慢速链接（使用中位数替代平均值）
-        if url_speeds.len() > 1 {
+        // skip_probe 时所有 speed=0，跳过淘汰，保留全部链接由 url_health 自适应
+        if !skip_probe && url_speeds.len() > 1 {
             // 计算中位数速度
             let mut sorted_speeds = url_speeds.clone();
             sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -3275,11 +3302,23 @@ impl DownloadEngine {
             let download_start = std::time::Instant::now();
 
             // 尝试下载
-            // 读取超时：取连接超时的一半，钳位到 [30, 90] 秒
+            // 读取超时：取连接超时的一半，钳位范围按分片大小自适应
             // timeout_secs（30-180s）是整个分片的连接+传输超时，
             // 但 read_timeout 针对的是"单次 stream.next() 零字节到达"的场景，
-            // 不需要那么长，否则挂起的 CDN 连接要等 180s 才能被发现
-            let read_timeout = (timeout_secs / 2).clamp(30, 90);
+            // 不需要那么长，否则挂起的 CDN 连接要等很久才能被发现。
+            //
+            // 🔥 海量小文件场景优化：
+            //   单分片 < 1MB（典型小文件场景）使用更激进的 [5, 20]s 区间，
+            //   单分片 < 8MB（中等分片）使用 [15, 45]s，其他保持 [30, 90]s。
+            //   这样 CDN 卡死时小文件能在数秒内切换到下一条链接，
+            //   而不是占着 task slot 等 30~90s。
+            let read_timeout = if chunk_size < 1024 * 1024 {
+                (timeout_secs / 2).clamp(5, 20)
+            } else if chunk_size < 8 * 1024 * 1024 {
+                (timeout_secs / 2).clamp(15, 45)
+            } else {
+                (timeout_secs / 2).clamp(30, 90)
+            };
 
             match chunk
                 .download(
