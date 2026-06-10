@@ -1770,6 +1770,9 @@ onUnmounted(() => {
 .settings-content {
   flex: 1;
   overflow-y: auto;
+  // 仅纵向滚动：设置项应换行而非横向滚动；否则 overflow-x 会随 overflow-y 计算为 auto，
+  // 子项略超宽时出现的横向滚动条会盖住底部卡片的下边框（滑到底时尤为明显）。
+  overflow-x: hidden;
   padding: 20px;
   scroll-behavior: smooth;
 }

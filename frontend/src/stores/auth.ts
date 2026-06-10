@@ -83,7 +83,8 @@ export const useAuthStore = defineStore('auth', () => {
   function startPolling(
       onSuccess: () => void,
       onError: (error: any) => void,
-      onScanned?: () => void
+      onScanned?: () => void,
+      addMode = false
   ) {
     if (isPolling.value || !qrcode.value) return
 
@@ -96,7 +97,7 @@ export const useAuthStore = defineStore('auth', () => {
           return
         }
 
-        const status = await getQRCodeStatus(qrcode.value.sign)
+        const status = await getQRCodeStatus(qrcode.value.sign, addMode)
 
         switch (status.status) {
           case 'success':

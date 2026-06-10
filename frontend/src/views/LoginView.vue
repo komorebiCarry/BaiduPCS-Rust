@@ -371,7 +371,9 @@ async function generateQRCode() {
         // 扫码回调
         () => {
           isScanned.value = true
-        }
+        },
+        // 添加账号模式：后端跳过"已有活跃账号即成功"短路，必须真正扫码新账号
+        isAddAccountMode.value
     )
 
     // 开始倒计时

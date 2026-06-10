@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 初始化日志系统（必须保持 _log_guard 存活）
     let _log_guard = logging::init_logging(&log_config);
 
-    info!("Baidu Netdisk Rust v1.3.0 启动中...");
+    info!("Baidu Netdisk Rust v2.0.0 启动中...");
 
     // 创建应用状态
     let app_state = AppState::new().await?;
