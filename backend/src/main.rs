@@ -450,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/share-sync/subscriptions/:id/runs", get(handlers::list_runs))
         .route("/share-sync/runs/:id", get(handlers::get_run))
         .route("/share-sync/subscriptions/:id/snapshots/latest", get(handlers::latest_snapshot))
+        .route("/share-sync/preview-tree", post(handlers::preview_tree))
         // 🔥 加密数据导出 API
         .route("/encryption/export-bundle", post(handlers::export_bundle))
         .route("/encryption/export-mapping", get(handlers::export_mapping))

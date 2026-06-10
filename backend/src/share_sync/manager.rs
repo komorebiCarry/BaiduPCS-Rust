@@ -57,6 +57,11 @@ pub struct ShareSyncManager {
     netdisk_client: Arc<tokio::sync::RwLock<Option<NetdiskClient>>>,
     /// TransferManager（同上）
     transfer_manager: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
+    /// v2 阶段 6:share-sync 全局风控限速器 — 阻挡 ProductionHooks 出去的
+    /// submit_transfer/submit_download 调用,避免并行 worker 撞 errno=132 风控。
+    /// 参数从 env(BAIDUPCS_RATE_LIMIT_*) 读, 默认 4 RPS / burst=8;
+    /// BAIDUPCS_RATE_LIMIT_ENABLED=0 时退化为无限速直通(供 A/B 对照)。
+    rate_limiter: Arc<crate::share_sync::rate_limit::QuotaLimiter>,
 }
 
 impl std::fmt::Debug for ShareSyncManager {
@@ -83,6 +88,38 @@ impl ShareSyncManager {
     pub async fn new(cfg: ManagerConfig) -> Result<Arc<Self>, ShareSyncError> {
         let persistence = Arc::new(ShareSyncPersistence::new(&cfg.db_path)?);
 
+        // 启动期 stale-run 自愈:把崩溃/kill 后留下的 status='running' 但实际无
+        // manager task 在跑的孤儿 run 修复为 Failed,避免前端永远显示"运行中"。
+        // d17ae3f1 的 21384bbe 卡 1h47min 就是这个漏网。可用 env
+        // BAIDUPCS_STALE_FIXUP_ENABLED=0 关闭。阈值固定 120 分钟,兼顾安全与长 run。
+        let stale_fixup_enabled = std::env::var("BAIDUPCS_STALE_FIXUP_ENABLED")
+            .ok()
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+        if stale_fixup_enabled {
+            match persistence.mark_stale_runs_failed(120) {
+                Ok(stale) if !stale.is_empty() => {
+                    info!(
+                        "share_sync 启动自愈: 收编 {} 条 stale running run",
+                        stale.len()
+                    );
+                    // 不在这里 publish — publisher 还没传进来; 用 cfg.publisher 的 clone
+                    if let Some(ref pubr) = cfg.publisher {
+                        for rec in &stale {
+                            pubr.publish(ShareSyncEvent::RunFailed {
+                                subscription_id: rec.subscription_id.clone(),
+                                run_id: rec.run_id.clone(),
+                                error: "stale_run_killed_on_startup".to_string(),
+                                reason: Some("stale_run".to_string()),
+                            });
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("share_sync 启动自愈失败: {}", e),
+            }
+        }
+
         if let Some(parent) = cfg.config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -105,6 +142,7 @@ impl ShareSyncManager {
                 .unwrap_or_else(|| Arc::new(NoopShareSyncEventPublisher)),
             netdisk_client: cfg.netdisk_client,
             transfer_manager: cfg.transfer_manager,
+            rate_limiter: crate::share_sync::rate_limit::QuotaLimiter::from_env(),
         });
 
         for sub in subs {
@@ -253,6 +291,8 @@ impl ShareSyncManager {
 
     /// 执行一次（由 scheduler 调用或 trigger_one 同步入口）
     pub async fn execute_one(&self, id: &str) -> Result<ApplyOutcome, ShareSyncError> {
+        // v2 阶段 7:打 timing A/B metric 用
+        let run_started = std::time::Instant::now();
         let sub = self
             .get_subscription(id)
             .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
@@ -322,11 +362,28 @@ impl ShareSyncManager {
             netdisk: Arc::new(netdisk.clone()),
             transfer: self.transfer_manager.clone(),
             captured: captured.clone(),
+            rate_limiter: Arc::clone(&self.rate_limiter),
         };
         let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
-        let outcome = executor
-            .apply_with_run_id(run_id.clone(), &captured, &diff)
-            .await;
+        // v2 阶段 3:flag 开时走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
+        // 关时退回老的单文件路径。后续阶段 4-6 的二分/并行/限速都挂在 tree 入口下。
+        let dir_transfer_enabled = std::env::var("BAIDUPCS_DIR_TRANSFER_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        let outcome = if dir_transfer_enabled {
+            info!(
+                "share_sync_route: run_id={} subscription={} mode=tree",
+                run_id, sub.id
+            );
+            executor
+                .apply_with_run_id_tree(run_id.clone(), &captured, &diff)
+                .await
+        } else {
+            executor
+                .apply_with_run_id(run_id.clone(), &captured, &diff)
+                .await
+        };
 
         if should_advance_snapshot_baseline(outcome.status) {
             if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
@@ -343,6 +400,19 @@ impl ShareSyncManager {
         match outcome.status {
             crate::share_sync::types::RunStatus::Completed
             | crate::share_sync::types::RunStatus::CompletedWithErrors => {
+                let duration_ms = run_started.elapsed().as_millis() as u64;
+                info!(
+                    "share_sync_run_finished: run_id={} subscription={} status={:?} duration_ms={} added={} modified={} removed={} failed={} skipped={}",
+                    outcome.run_id,
+                    id,
+                    outcome.status,
+                    duration_ms,
+                    outcome.diff_summary.added,
+                    outcome.diff_summary.modified,
+                    outcome.diff_summary.removed,
+                    outcome.diff_summary.failed,
+                    outcome.diff_summary.skipped,
+                );
                 self.publisher.publish(ShareSyncEvent::RunCompleted {
                     run_id: outcome.run_id.clone(),
                     subscription_id: id.into(),
@@ -350,6 +420,9 @@ impl ShareSyncManager {
                     modified: outcome.diff_summary.modified,
                     removed: outcome.diff_summary.removed,
                     failed: outcome.diff_summary.failed,
+                    duration_ms: Some(duration_ms),
+                    n_bisects: None, // v2 阶段 4 的二分数未在 manager 层累积, 占 None
+                    max_bisect_depth: None,
                 });
             }
             crate::share_sync::types::RunStatus::Failed => {
@@ -475,6 +548,8 @@ struct ProductionHooks {
     netdisk: Arc<NetdiskClient>,
     transfer: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
     captured: CapturedShare,
+    /// v2 阶段 6:出站请求前 acquire().await 走全局风控限速门
+    rate_limiter: Arc<crate::share_sync::rate_limit::QuotaLimiter>,
 }
 
 #[async_trait]
@@ -486,6 +561,8 @@ impl ExecutorHooks for ProductionHooks {
         item: &ShareSnapshotItem,
         internal_label: Option<&str>,
     ) -> Result<String, ShareSyncError> {
+        // v2 阶段 6:全局风控限速器
+        self.rate_limiter.acquire().await;
         let tm = self.transfer_manager().await?;
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
@@ -625,6 +702,8 @@ impl ExecutorHooks for ProductionHooks {
         local_dir: &Path,
         strategy: ConflictStrategy,
     ) -> Result<String, ShareSyncError> {
+        // v2 阶段 6:全局风控限速器
+        self.rate_limiter.acquire().await;
         let local_download_root = share_direct_download_root(local_dir, item)?;
         let tm = self.transfer_manager().await?;
         use crate::transfer::manager::CreateTransferRequest;
@@ -800,6 +879,8 @@ impl ExecutorHooks for ProductionHooks {
                 "submit_transfer_batch 被传入空 items 列表".to_string(),
             ));
         }
+        // v2 阶段 6:全局风控限速器
+        self.rate_limiter.acquire().await;
         let tm = self.transfer_manager().await?;
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
@@ -865,6 +946,8 @@ impl ExecutorHooks for ProductionHooks {
                 "submit_download_batch 被传入空 items 列表".to_string(),
             ));
         }
+        // v2 阶段 6:全局风控限速器
+        self.rate_limiter.acquire().await;
         let tm = self.transfer_manager().await?;
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;

@@ -13,8 +13,10 @@ pub mod events;
 pub mod executor;
 pub mod manager;
 pub mod persistence;
+pub mod rate_limit;
 pub mod scheduler;
 pub mod snapshot;
+pub mod tree;
 pub mod types;
 
 pub use config::{
