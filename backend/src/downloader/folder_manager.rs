@@ -1098,7 +1098,7 @@ impl FolderDownloadManager {
                             .count();
 
                         // 固定位也可以用于一个子任务，所以总数 = 空闲借调位 + 1（如果有固定位）
-                        // 逻辑：借调位4个，固定位1个，总共5个槽位可供子任务使用
+                        // 固定槽位占 1，借调位按池子容量（-1）统计，避免总并发超出 max_slots
                         if folder.fixed_slot_id.is_some() {
                             free_borrowed_slots + 1
                         } else {
@@ -1704,13 +1704,15 @@ impl FolderDownloadManager {
             warn!("文件夹 {} 无法获得固定任务位，将在有空位时重试", folder_id);
         }
 
-        // 🔥 尝试借调槽位（最多借调4个，总共5个并行子任务）
+        // 🔥 按池子容量计算可借调槽位（固定槽位保留 1 个）
         // 支持抢占备份任务：如果空闲槽位不足，会抢占备份任务的槽位
         let (borrowed_slot_ids, preempted_backup_tasks) = {
             if let Some(ref dm) = dm_for_owner {
                 let slot_pool = dm.task_slot_pool();
                 let available = slot_pool.available_borrow_slots().await;
-                let to_borrow = available.min(4); // 最多借调4个
+                let fixed_reserved = if fixed_slot_id.is_some() { 1 } else { 0 };
+                let max_borrowable = slot_pool.max_slots().saturating_sub(fixed_reserved);
+                let to_borrow = available.min(max_borrowable);
                 if to_borrow > 0 {
                     slot_pool.allocate_borrowed_slots(&folder_id, to_borrow).await
                 } else {
@@ -2628,10 +2630,12 @@ impl FolderDownloadManager {
             warn!("恢复文件夹 {} 无法获得固定任务位，将在有空位时重试", folder_id);
         }
 
-        // 2. 尝试借调槽位（最多借调4个，总共5个并行子任务）
+        // 2. 按池子容量计算可借调槽位（固定槽位保留 1 个）
         // 支持抢占备份任务：如果空闲槽位不足，会抢占备份任务的槽位
         let available = slot_pool.available_borrow_slots().await;
-        let to_borrow = available.min(4);
+        let fixed_reserved = if fixed_slot_id.is_some() { 1 } else { 0 };
+        let max_borrowable = slot_pool.max_slots().saturating_sub(fixed_reserved);
+        let to_borrow = available.min(max_borrowable);
         let (borrowed_slot_ids, preempted_backup_tasks) = if to_borrow > 0 {
             slot_pool.allocate_borrowed_slots(folder_id, to_borrow).await
         } else {

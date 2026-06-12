@@ -67,6 +67,21 @@ fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
     summary.unchanged = diff.unchanged_count;
 }
 
+fn reconcile_summary_from_run_items(
+    persistence: &ShareSyncPersistence,
+    run_id: &str,
+    summary: &mut DiffSummary,
+) {
+    if let Ok(items) = persistence.list_run_items(run_id) {
+        summary.failed = items.iter().filter(|i| i.status == "failed").count();
+        summary.skipped = items.iter().filter(|i| i.status == "skipped").count();
+        summary.overwritten = items
+            .iter()
+            .filter(|i| i.status == "completed" && i.versioned_old_path.is_some())
+            .count();
+    }
+}
+
 /// v1：整批 submit 触发的最小组内文件数
 ///
 /// 当 `apply_with_run_id_grouped` 把 added/modified 项按"目录根"分组后，
@@ -368,7 +383,18 @@ impl<'a> ShareSyncExecutor<'a> {
         // - 仅 quota / local_disk 跳过（资源类）→ Completed（run 业务上成功；
         //   summary.skipped 体现被跳过的子项数；error 字段给前端展示原因）
         // - 全成功 → Completed
-        let status = if any_failure {
+        // v1.2: 先做"超时误判恢复" ——
+        // 把"wait 超时但文件已落盘"的 failed 项升级为 completed,再重算 summary
+        recover_local_run_items(
+            &self.persistence,
+            self.subscription,
+            &run_id,
+            &mut summary,
+        );
+        reconcile_summary_from_run_items(&self.persistence, &run_id, &mut summary);
+        // 用 summary.failed 而非 any_failure 判定 ——
+        // recovery 后 summary.failed 可能归零,此时应降级回 Completed
+        let status = if summary.failed > 0 {
             RunStatus::CompletedWithErrors
         } else {
             RunStatus::Completed
@@ -421,8 +447,9 @@ impl<'a> ShareSyncExecutor<'a> {
     /// 整批 submit 入口
     ///
     /// 调用方（`ShareSyncManager::execute_one`）可选择走此路径；
-    /// 当前实现**在 manager.rs 仍调 `apply_with_run_id` 单文件路径**，
+    /// 当前实现**在 manager.rs 仍调 `apply_with_run_id` 单文件路径**,
     /// 此方法作为"v1 已就绪、未来调度可切换"的备选入口存在。
+    #[allow(unused_assignments, unused_variables)] // any_failure 在 v1.2 之后被 summary.failed 取代终态判定
     pub async fn apply_with_run_id_grouped(
         &self,
         run_id: String,
@@ -759,11 +786,19 @@ impl<'a> ShareSyncExecutor<'a> {
         // - 仅 quota / local_disk_full 跳过 → Completed（业务上成功；被跳过的子项
         //   在 summary.skipped 体现，error 字段给前端展示原因）
         // - 全成功 → Completed
+        // v1.2: 同 apply_with_run_id,先做"超时误判恢复"再 reconcile
+        recover_local_run_items(
+            &self.persistence,
+            self.subscription,
+            &run_id,
+            &mut summary,
+        );
+        reconcile_summary_from_run_items(&self.persistence, &run_id, &mut summary);
         let quota_only = matches!(
             run_failure_reason,
             Some("quota_full") | Some("local_disk_full")
         );
-        let status = if any_failure && !quota_only {
+        let status = if summary.failed > 0 && !quota_only {
             RunStatus::CompletedWithErrors
         } else {
             RunStatus::Completed
@@ -808,6 +843,7 @@ impl<'a> ShareSyncExecutor<'a> {
     // 的能力切换;quota 二分递归留给阶段 4 在 `process_subtree` 内部加。
     //
     // 不动 removed 流程(沿用 `apply_with_run_id_grouped` 的 removed 段)。
+    #[allow(unused_assignments, unused_variables)] // any_failure 在 v1.2 之后被 summary.failed 取代终态判定
     pub async fn apply_with_run_id_tree(
         &self,
         run_id: String,
@@ -1000,11 +1036,19 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         // 6) run 终态(沿用 grouped 路径语义:仅 quota 不算 Failed)
+        // v1.2: 同上,先做"超时误判恢复"再 reconcile
+        recover_local_run_items(
+            &self.persistence,
+            self.subscription,
+            &run_id,
+            &mut summary,
+        );
+        reconcile_summary_from_run_items(&self.persistence, &run_id, &mut summary);
         let quota_only = matches!(
             run_failure_reason,
             Some("quota_full") | Some("local_disk_full")
         );
-        let status = if any_failure && !quota_only {
+        let status = if summary.failed > 0 && !quota_only {
             RunStatus::CompletedWithErrors
         } else {
             RunStatus::Completed
@@ -1239,6 +1283,10 @@ impl<'a> ShareSyncExecutor<'a> {
             .iter()
             .flat_map(|&i| tree.descendants_leaves(i))
             .collect();
+        // 把 final_err 的可读消息缓存一次,所有失败叶子共用 ——
+        // 之前 marker 分支只 `add_run_item(... error 列填 None ...)`,
+        // 导致前端详情里看不到任何错误原因,debug 不到 "wait 超时" 等关键信息。
+        let err_msg = final_err.to_string();
         for leaf_idx in all_leaves {
             let leaf = tree.get(leaf_idx);
             let (status, reason) = match category {
@@ -1261,7 +1309,7 @@ impl<'a> ShareSyncExecutor<'a> {
                     (RunItemStatus::Failed, None)
                 }
             };
-            let _ = self.persistence.add_run_item(
+            match self.persistence.add_run_item(
                 run_id,
                 &leaf.path,
                 SyncAction::Added,
@@ -1271,7 +1319,25 @@ impl<'a> ShareSyncExecutor<'a> {
                 status,
                 None,
                 reason,
-            );
+            ) {
+                Ok(row_id) => {
+                    // 失败项把 error 列也写上,前端详情能展示,
+                    // recover 阶段也能根据 message 判断是否"超时"等情况
+                    if status == RunItemStatus::Failed {
+                        if let Err(e) = self.persistence.update_run_item_status(
+                            row_id,
+                            RunItemStatus::Failed,
+                            Some(&err_msg),
+                        ) {
+                            warn!(
+                                "executor: 写入失败项 error 列失败: id={} err={}",
+                                row_id, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => warn!("记录失败 run_item 失败: {}", e),
+            }
         }
         Err(category)
     }
@@ -2049,6 +2115,99 @@ fn max_category(a: ErrorCategory, b: ErrorCategory) -> ErrorCategory {
         a
     } else {
         b
+    }
+}
+
+/// 恢复"等待超时但下载已完成"的 run_item (v1.2 新增)
+///
+/// ## 触发场景
+///
+/// `transfer_node_set` 里的 `wait_transfer_task` 触发 `TASK_WAIT_TIMEOUT` (30 分钟)
+/// 时会返回 `Err(DownloadError("等待任务完成超时"))`,category 判为 `Other`,落到
+/// marker 分支把整组叶子标 `Failed`。**但 DownloadManager 实际在后台继续把
+/// 文件落盘** —— 用户看到磁盘上文件齐全,前端却显示"部分成功" + N 个失败项。
+///
+/// 这个函数就是事后兜底:对 `target='local'` 的 `Failed` run_item,反查订阅里
+/// 的 local target 目录,只要文件确实在,就把它升级为 `Completed`,并把
+/// `summary.failed` 减 1。这样:
+/// - 详情页错误列表里不再有"假失败"项
+/// - `run` 终态从 `CompletedWithErrors` 降回 `Completed` (失败归零时)
+/// - 快照基线正常推进,下次轮询不会重下这些文件
+///
+/// ## 约束
+///
+/// - **只对 `target='local'` 生效** — netdisk 目标无法用本地文件存在判断
+/// - **不动 `Skipped` / `Transferring` / `Downloading` / `Completed`** ——
+///   只挑 `Failed` 升级
+/// - **文件路径 = `local_root/<item.path>`**,与 executor 的
+///   `local_file_exists` 拼法一致
+/// - **必须在 `reconcile_summary_from_run_items` 之前调用** ——
+///   后续 summary 重算时,DB 里 `status='completed'` 已生效
+fn recover_local_run_items(
+    persistence: &ShareSyncPersistence,
+    subscription: &ShareSubscription,
+    run_id: &str,
+    summary: &mut DiffSummary,
+) {
+    let local_roots: Vec<PathBuf> = subscription
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            SyncTarget::Local(t) => Some(t.local_path.clone()),
+            _ => None,
+        })
+        .collect();
+    if local_roots.is_empty() {
+        return;
+    }
+
+    let items = match persistence.list_run_items(run_id) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("share_sync_recover: 读 run_items 失败: {}", e);
+            return;
+        }
+    };
+
+    let mut upgraded = 0usize;
+    for item in items {
+        // 只挑"failed + 本地目标",其它状态(Skipped/Transferring/Downloading/
+        // Completed)都跳过;其中 Skipped(quota_full/disk_full)是资源类,不属
+        // "超时误判",也不该升级
+        if item.status != RunItemStatus::Failed.as_str()
+            || item.target != TargetKind::Local.as_str()
+        {
+            continue;
+        }
+        let rel = item.path.trim_start_matches('/');
+        // 多个 local target 时,任一目录下存在即认为已落盘
+        let exists = local_roots.iter().any(|root| root.join(rel).is_file());
+        if !exists {
+            continue;
+        }
+        // 升级为 completed(同时清掉 error 列,前端展示更干净)
+        if let Err(e) = persistence.update_run_item_status(
+            item.id,
+            RunItemStatus::Completed,
+            None,
+        ) {
+            warn!(
+                "share_sync_recover: 升级 run_item 失败: id={} path={} err={}",
+                item.id, item.path, e
+            );
+            continue;
+        }
+        upgraded += 1;
+        if summary.failed > 0 {
+            summary.failed -= 1;
+        }
+    }
+
+    if upgraded > 0 {
+        info!(
+            "share_sync_recover: run_id={} upgraded={} (文件已落盘但 wait 超时误判为失败)",
+            run_id, upgraded
+        );
     }
 }
 
@@ -3006,5 +3165,332 @@ mod tests {
             downloads[0].0, 801,
             "successful fallback should be small.csv"
         );
+    }
+
+    // ============================================================
+    // v1.2: recover_local_run_items 单元测试
+    // 模拟 "wait 超时 → marker 标 failed → 实际文件已落盘" 的场景,
+    // 验证 recovery 能把 failed 项升级为 completed 并减 summary.failed
+    // ============================================================
+
+    fn sub_with_local(local_root: PathBuf) -> ShareSubscription {
+        let mut s = sub();
+        s.targets = vec![SyncTarget::Local(LocalTarget {
+            local_path: local_root,
+            conflict_strategy: None,
+        })];
+        s
+    }
+
+    /// 模拟 apply_with_run_id 留下的"timeout 失败"项,文件其实已落盘
+    #[test]
+    fn test_recover_local_run_items_upgrades_existing_local_file() {
+        let dir = tempdir().unwrap();
+        let local_root = dir.path().to_path_buf();
+        // 在 local_root 下创建一个真实文件
+        let target_file = local_root.join("weekly/000001.SZ.csv");
+        std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+        std::fs::write(&target_file, b"data").unwrap();
+
+        let s = sub_with_local(local_root);
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        pm.start_run("test-run", &s.id, 1234).unwrap();
+        // 模拟 marker 分支写入的 failed 项(error=None)
+        let row_id = pm
+            .add_run_item(
+                "test-run",
+                "/weekly/000001.SZ.csv",
+                SyncAction::Added,
+                TargetKind::Local,
+                None,
+                None,
+                RunItemStatus::Failed,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut summary = DiffSummary::default();
+        summary.failed = 1;
+        recover_local_run_items(&pm, &s, "test-run", &mut summary);
+
+        // DB 状态应升级为 completed
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, row_id);
+        assert_eq!(items[0].status, "completed", "落盘文件应被升级");
+        // summary 应减 1
+        assert_eq!(summary.failed, 0, "summary.failed 应同步减 1");
+    }
+
+    /// 文件不在 → 不应升级,保持 failed 状态
+    #[test]
+    fn test_recover_local_run_items_skips_missing_local_file() {
+        let dir = tempdir().unwrap();
+        let local_root = dir.path().to_path_buf();
+        // 不创建任何文件
+
+        let s = sub_with_local(local_root);
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        pm.start_run("test-run", &s.id, 1234).unwrap();
+        pm.add_run_item(
+            "test-run",
+            "/missing/file.csv",
+            SyncAction::Added,
+            TargetKind::Local,
+            None,
+            None,
+            RunItemStatus::Failed,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut summary = DiffSummary::default();
+        summary.failed = 1;
+        recover_local_run_items(&pm, &s, "test-run", &mut summary);
+
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(items[0].status, "failed", "文件不存在应保持 failed");
+        assert_eq!(summary.failed, 1, "summary.failed 应不变");
+    }
+
+    /// netdisk 目标失败 → 不应被 recovery 升级(只能本地查)
+    #[test]
+    fn test_recover_local_run_items_ignores_netdisk_targets() {
+        let dir = tempdir().unwrap();
+        let mut s = sub();
+        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+            remote_path: "/我的资源/同步".into(),
+            save_fs_id: 0,
+            conflict_strategy: None,
+        })];
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        pm.start_run("test-run", &s.id, 1234).unwrap();
+        pm.add_run_item(
+            "test-run",
+            "/some/file.csv",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Failed,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut summary = DiffSummary::default();
+        summary.failed = 1;
+        recover_local_run_items(&pm, &s, "test-run", &mut summary);
+
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(
+            items[0].status, "failed",
+            "netdisk 目标不应被 recovery 升级"
+        );
+        assert_eq!(summary.failed, 1);
+    }
+
+    /// Skipped 状态(quota/disk) → 不应被升级(它是资源类,不是超时误判)
+    #[test]
+    fn test_recover_local_run_items_ignores_skipped_status() {
+        let dir = tempdir().unwrap();
+        let local_root = dir.path().to_path_buf();
+        // 即使文件存在,Skipped 项也不应被升级
+        let target_file = local_root.join("data.csv");
+        std::fs::write(&target_file, b"data").unwrap();
+
+        let s = sub_with_local(local_root);
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        pm.start_run("test-run", &s.id, 1234).unwrap();
+        pm.add_run_item(
+            "test-run",
+            "/data.csv",
+            SyncAction::Added,
+            TargetKind::Local,
+            None,
+            None,
+            RunItemStatus::Skipped,
+            None,
+            Some("quota_full"),
+        )
+        .unwrap();
+
+        let mut summary = DiffSummary::default();
+        summary.skipped = 1;
+        recover_local_run_items(&pm, &s, "test-run", &mut summary);
+
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(
+            items[0].status, "skipped",
+            "Skipped 状态(quota/disk)不应被 recovery 升级"
+        );
+    }
+
+    /// 多个 local target 时,任一目录存在即升级
+    #[test]
+    fn test_recover_local_run_items_multi_local_targets() {
+        let dir = tempdir().unwrap();
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        // 文件只在 root_b 下
+        std::fs::write(root_b.join("x.csv"), b"data").unwrap();
+
+        let mut s = sub();
+        s.targets = vec![
+            SyncTarget::Local(LocalTarget {
+                local_path: root_a,
+                conflict_strategy: None,
+            }),
+            SyncTarget::Local(LocalTarget {
+                local_path: root_b,
+                conflict_strategy: None,
+            }),
+        ];
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        pm.start_run("test-run", &s.id, 1234).unwrap();
+        pm.add_run_item(
+            "test-run",
+            "/x.csv",
+            SyncAction::Added,
+            TargetKind::Local,
+            None,
+            None,
+            RunItemStatus::Failed,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut summary = DiffSummary::default();
+        summary.failed = 1;
+        recover_local_run_items(&pm, &s, "test-run", &mut summary);
+
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(items[0].status, "completed");
+        assert_eq!(summary.failed, 0);
+    }
+
+    /// 没有 local target 的订阅 → recovery 是 no-op
+    #[test]
+    fn test_recover_local_run_items_no_local_targets_is_noop() {
+        let dir = tempdir().unwrap();
+        let s = sub();
+        // 强制改成 netdisk-only
+        let mut s = s;
+        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+            remote_path: "/backup".into(),
+            save_fs_id: 0,
+            conflict_strategy: None,
+        })];
+
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        pm.start_run("test-run", &s.id, 1234).unwrap();
+        pm.add_run_item(
+            "test-run",
+            "/x.csv",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Failed,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut summary = DiffSummary::default();
+        summary.failed = 1;
+        recover_local_run_items(&pm, &s, "test-run", &mut summary);
+
+        // 没有任何改动
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(items[0].status, "failed");
+        assert_eq!(summary.failed, 1);
+    }
+
+    /// 端到端: simulate "marker 失败后 file 已落盘" → 调 apply 全流程
+    /// 验证 run 终态能从 CompletedWithErrors 降级为 Completed
+    #[tokio::test]
+    async fn test_end_to_end_recovery_downgrades_run_status_to_completed() {
+        let dir = tempdir().unwrap();
+        let local_root = dir.path().to_path_buf();
+        let s = sub_with_local(local_root.clone());
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+
+        // 准备 prev=空, curr=2 个文件
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![item("/a.csv", 1, 100), item("/b.csv", 2, 200)],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+
+        // 用 mock hooks 让 submit 失败(wait 阶段模拟超时错误)
+        let hooks = MockHooks {
+            wait_errors: Mutex::new(HashMap::new()),
+            ..Default::default()
+        };
+        // 把"a.csv"和"b.csv"两个 task_id 都注入"超时"错误
+        {
+            let mut waits = hooks.wait_errors.lock().unwrap();
+            // 单文件路径会先 submit → tx-1, tx-2,再 wait 各自
+            // 实际 task_id 由 submit 顺序决定:tx-1, tx-2
+            waits.insert(
+                "tx-1".to_string(),
+                ShareSyncError::DownloadError("等待任务完成超时".to_string()),
+            );
+            waits.insert(
+                "tx-2".to_string(),
+                ShareSyncError::DownloadError("等待任务完成超时".to_string()),
+            );
+        }
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+
+        // 模拟"wait 超时后 downloader 实际把文件落盘":
+        // 在调 apply 之前先创建好文件,这样 recovery 阶段能查到
+        std::fs::write(local_root.join("a.csv"), b"data-a").unwrap();
+        std::fs::write(local_root.join("b.csv"), b"data-b").unwrap();
+
+        // 调单文件路径(不走 tree)— 用 apply_with_run_id 而不是 apply
+        // 因为我们的 mock 单文件路径会触发 process_added_or_modified 的重试,
+        // 重试用尽后才标 failed,这样就能完整测到 marker 失败 → recovery 升级
+        let run_id = "test-recover-run".to_string();
+        let _outcome = ex.apply_with_run_id(run_id.clone(), &captured(), &diff).await;
+
+        // DB 里所有项都应是 completed(recovery 升级)
+        let items = pm.list_run_items(&run_id).unwrap();
+        assert_eq!(items.len(), 2, "应记录 2 个 run_item");
+        for it in &items {
+            assert_eq!(
+                it.status, "completed",
+                "wait 超时后文件已落盘 → recovery 升级为 completed: path={}",
+                it.path
+            );
+        }
+
+        // run 终态应是 Completed(因为 summary.failed == 0)
+        // (apply_with_run_id 路径返回的 outcome.status,以及 DB 里存的 share_sync_runs.status)
+        let run = pm
+            .get_run(&run_id)
+            .expect("run 应能查到")
+            .expect("run 应存在");
+        assert_eq!(
+            run.status, "completed",
+            "所有失败项都被 recovery 升级 → run 应是 completed,实际是: {}",
+            run.status
+        );
+        assert_eq!(run.failed_count, 0, "failed_count 应为 0");
     }
 }

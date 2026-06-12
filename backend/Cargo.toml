@@ -1,6 +1,6 @@
 [package]
 name = "baidu-netdisk-rust"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 
 [dependencies]
@@ -103,3 +103,10 @@ libc = "0.2"
 # 测试工具
 tempfile = "3.8"
 proptest = "1.4"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.dev.build-override]
+debug = 0

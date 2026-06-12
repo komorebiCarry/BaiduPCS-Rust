@@ -206,12 +206,15 @@ impl ShareSyncError {
     /// - `Quota` / `LocalDiskFull`: 整组放不下,拆开后小目录可能放得下
     /// - `DirTransferAmbiguous`: 整组被一刀切失败但可能只是某个子文件挂了,
     ///   拆开后好的文件能继续转
+    /// - `NotFound`: 批量提交里常见的"某个文件已失效/被删除"会把整组一起打爆,
+    ///   继续二分能把真正失效的叶子隔离出来,避免把可用文件也标成失败
     pub fn is_bisect_trigger(&self) -> bool {
         matches!(
             self.category(),
             ErrorCategory::Quota
                 | ErrorCategory::LocalDiskFull
                 | ErrorCategory::DirTransferAmbiguous
+                | ErrorCategory::NotFound
         )
     }
 
@@ -371,6 +374,9 @@ mod tests {
         assert!(e.is_bisect_trigger());
 
         let e = ShareSyncError::FileSystemError("ENOSPC".into());
+        assert!(e.is_bisect_trigger());
+
+        let e = ShareSyncError::TransferError("文件不存在".into());
         assert!(e.is_bisect_trigger());
 
         // 非 bisect 类失败

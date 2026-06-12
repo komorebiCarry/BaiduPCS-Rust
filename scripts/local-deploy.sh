@@ -6,7 +6,7 @@
 # 后端端口：取自 config/app.toml（默认 18888）
 #
 # 关键设计：
-#   - 后端：cargo build 后直接 exec 出 target/release 二进制，PID 即为服务进程，避免 cargo wrapper 残留
+#   - 后端：cargo build 后直接 exec 出 target/<profile> 二进制，PID 即为服务进程，避免 cargo wrapper 残留
 #   - 前端：直接调用 frontend/node_modules/.bin/vite，绕过 npx wrapper，避免 node 子进程残留
 #   - 启动用 setsid 建立独立进程组，停止时 kill -- -PGID 整组
 #   - 兜底再用 fuser/lsof 清理仍占端口的进程
@@ -39,7 +39,10 @@ FRONTEND_PGID_FILE="$PID_DIR/frontend.pgid"
 FRONTEND_PORT_FILE="$PID_DIR/frontend.port"
 
 BACKEND_BIN_NAME="baidu-netdisk-rust"
-BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
+BACKEND_PROFILE="${BACKEND_PROFILE:-debug}"  # debug | release
+BACKEND_BIN="$BACKEND_DIR/target/debug/$BACKEND_BIN_NAME"
+BACKEND_CARGO_ARGS="build"
+SKIP_BACKEND_BUILD=false
 
 # ----------------- 配置 -----------------
 FRONTEND_PORT=4923
@@ -59,6 +62,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dev) MODE="dev"; shift ;;
         --prod) MODE="prod"; shift ;;
+        --fast|--debug-backend) BACKEND_PROFILE="debug"; shift ;;
+        --release-backend) BACKEND_PROFILE="release"; shift ;;
+        --skip-build|--skip-backend-build) SKIP_BACKEND_BUILD=true; shift ;;
         --port) FRONTEND_PORT="$2"; shift 2 ;;
         start)            ACTION="start"; shift ;;
         stop)             ACTION="stop"; shift ;;
@@ -78,6 +84,10 @@ while [ $# -gt 0 ]; do
 选项:
   --dev          以开发模式启动前端（vite dev，HMR）
   --prod         以生产模式启动前端（vite build + vite preview，默认）
+  --fast         后端使用 debug 构建（默认，适合本地验证，编译快）
+  --debug-backend 同 --fast
+  --release-backend 后端使用 release 构建（发布/压测时使用，编译慢）
+  --skip-build   跳过后端构建，直接使用已有 target/<profile> 二进制
   --port <port>  指定前端端口（默认 4923）
 
 子命令（手动模式）:
@@ -107,6 +117,21 @@ EOF
         *) echo -e "${RED}未知参数: $1${NC}"; exit 1 ;;
     esac
 done
+
+case "$BACKEND_PROFILE" in
+    debug)
+        BACKEND_BIN="$BACKEND_DIR/target/debug/$BACKEND_BIN_NAME"
+        BACKEND_CARGO_ARGS="build"
+        ;;
+    release)
+        BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
+        BACKEND_CARGO_ARGS="build --release"
+        ;;
+    *)
+        echo -e "${RED}未知后端构建 profile: $BACKEND_PROFILE${NC}"
+        exit 1
+        ;;
+esac
 
 # ----------------- 工具函数 -----------------
 log()   { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
@@ -282,8 +307,13 @@ EOF
 }
 
 build_backend() {
-    log "构建后端 (cargo build --release)..."
-    ( cd "$BACKEND_DIR" && cargo build --release 2>&1 | tee -a "$BACKEND_LOG" )
+    if [ "$SKIP_BACKEND_BUILD" = "true" ]; then
+        log "跳过后端构建 (profile=$BACKEND_PROFILE, bin=$BACKEND_BIN)"
+        [ -x "$BACKEND_BIN" ] || { err "未找到后端二进制 $BACKEND_BIN"; exit 1; }
+        return
+    fi
+    log "构建后端 (cargo $BACKEND_CARGO_ARGS, profile=$BACKEND_PROFILE)..."
+    ( cd "$BACKEND_DIR" && cargo $BACKEND_CARGO_ARGS 2>&1 | tee -a "$BACKEND_LOG" )
     [ -x "$BACKEND_BIN" ] || { err "未找到后端二进制 $BACKEND_BIN"; exit 1; }
 }
 
@@ -568,6 +598,7 @@ do_start() {
 
     echo -e "${BLUE}=== 本地部署（无 Docker） ===${NC}"
     echo "模式:       $MODE"
+    echo "后端构建:   $BACKEND_PROFILE"
     echo "前端端口:   $FRONTEND_PORT"
     echo "后端端口:   $BACKEND_PORT"
     echo "项目目录:   $PROJECT_ROOT"

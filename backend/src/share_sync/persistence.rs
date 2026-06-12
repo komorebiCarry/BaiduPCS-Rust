@@ -742,6 +742,17 @@ impl ShareSyncPersistence {
         }
         Ok(out)
     }
+
+    /// 统计某次 run 的 run_item 总数
+    pub fn count_run_items(&self, run_id: &str) -> Result<usize, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM share_sync_run_items WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
 }
 
 /// 一次运行的摘要

@@ -871,7 +871,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">v2.0.0</span>
+                      <span class="value">v2.0.1</span>
                     </div>
                     <div class="about-item">
                       <span class="label">后端技术:</span>
@@ -1770,6 +1770,9 @@ onUnmounted(() => {
 .settings-content {
   flex: 1;
   overflow-y: auto;
+  // 仅纵向滚动：设置项应换行而非横向滚动；否则 overflow-x 会随 overflow-y 计算为 auto，
+  // 子项略超宽时出现的横向滚动条会盖住底部卡片的下边框（滑到底时尤为明显）。
+  overflow-x: hidden;
   padding: 20px;
   scroll-behavior: smooth;
 }
