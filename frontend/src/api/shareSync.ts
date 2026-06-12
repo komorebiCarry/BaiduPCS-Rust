@@ -118,6 +118,8 @@ export interface RunDetail {
   overwritten_count: number
   error: string | null
   items: RunItemRecord[]
+  items_total?: number
+  items_truncated?: boolean
 }
 
 export interface ShareSnapshotItem {

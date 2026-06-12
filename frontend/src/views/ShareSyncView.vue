@@ -388,7 +388,17 @@
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
         </el-descriptions>
-        <h4 style="margin-top: 16px">文件动作（{{ currentRun.items.length }}）</h4>
+        <h4 style="margin-top: 16px">
+          文件动作（{{ currentRun.items.length }} / {{ currentRun.items_total ?? currentRun.items.length }}）
+        </h4>
+        <el-alert
+          v-if="currentRun.items_truncated"
+          title="仅展示前 200 条文件动作，避免详情页卡死。其余明细仍保留在后端。"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 8px"
+        />
         <el-table :data="currentRun.items" size="small" max-height="400">
           <el-table-column prop="path" label="路径" />
           <el-table-column prop="action" label="动作" width="80" />
@@ -858,7 +868,13 @@ async function triggerNow() {
 
 async function openRun(runId: string) {
   try {
-    currentRun.value = await getRun(runId)
+    const r = await getRun(runId)
+    currentRun.value = {
+      ...r,
+      items: r.items.slice(0, 200),
+      items_total: r.items_total ?? r.items.length,
+      items_truncated: (r.items_total ?? r.items.length) > 200 || !!r.items_truncated,
+    }
     runDialogVisible.value = true
   } catch (e) {
     ElMessage.error(`加载运行详情失败: ${getApiErrorMessage(e)}`)

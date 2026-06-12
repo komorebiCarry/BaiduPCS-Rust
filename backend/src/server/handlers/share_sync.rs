@@ -255,6 +255,7 @@ pub async fn list_runs(
 pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
 ) -> ApiResult<Json<ApiResponse<RunDetailDto>>> {
     let m = get_manager(&state).await?;
     let rec = m
@@ -262,8 +263,28 @@ pub async fn get_run(
         .get_run(&id)
         .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
-    let items = m.persistence().list_run_items(&id).map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(RunDetailDto { run: rec, items })))
+    let items_total = m.persistence().count_run_items(&id).map_err(map_share_err)?;
+    let limit = q.items_limit.unwrap_or(DEFAULT_RUN_ITEM_LIMIT).clamp(1, MAX_RUN_ITEM_LIMIT);
+    let mut items = m.persistence().list_run_items(&id).map_err(map_share_err)?;
+    let items_truncated = items.len() > limit;
+    if items_truncated {
+        items.truncate(limit);
+    }
+    Ok(Json(ApiResponse::success(RunDetailDto {
+        run: rec,
+        items,
+        items_total,
+        items_truncated,
+    })))
+}
+
+const DEFAULT_RUN_ITEM_LIMIT: usize = 200;
+const MAX_RUN_ITEM_LIMIT: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+pub struct RunDetailQuery {
+    #[serde(default)]
+    pub items_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +292,8 @@ pub struct RunDetailDto {
     #[serde(flatten)]
     pub run: RunRecord,
     pub items: Vec<RunItemRecord>,
+    pub items_total: usize,
+    pub items_truncated: bool,
 }
 
 /// GET /api/v1/share-sync/subscriptions/:id/snapshots/latest
