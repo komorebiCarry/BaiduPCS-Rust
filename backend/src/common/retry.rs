@@ -176,7 +176,7 @@ mod tests {
             PCS_RETRY_MAX_RETRIES,
             no_delay,
         )
-        .await;
+            .await;
         assert_eq!(r.unwrap(), 42);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
@@ -193,7 +193,7 @@ mod tests {
             PCS_RETRY_MAX_RETRIES,
             no_delay,
         )
-        .await;
+            .await;
         assert!(r.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -210,7 +210,7 @@ mod tests {
             PCS_RETRY_MAX_RETRIES,
             no_delay,
         )
-        .await;
+            .await;
         assert!(r.is_err());
         // 1 次首发 + 3 次重试 = 4 次
         assert_eq!(calls.load(Ordering::SeqCst), 1 + PCS_RETRY_MAX_RETRIES);
