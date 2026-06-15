@@ -1,1308 +1,1124 @@
-//! WebSocket 事件类型定义
+//! 持久化模块核心类型定义
 //!
-//! 定义所有任务相关的事件类型，用于 WebSocket 实时推送
+//! 定义任务持久化所需的所有数据结构
 
+use bit_set::BitSet;
+use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tracing::warn;
 
-/// 事件优先级
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EventPriority {
-    /// 低优先级：进度更新
-    Low = 0,
-    /// 中优先级：状态变更
-    Medium = 1,
-    /// 高优先级：完成、失败、删除等关键事件
-    High = 2,
+use crate::transfer::types::CleanupStatus;
+
+/// 任务持久化状态
+///
+/// 统一的任务状态枚举，用于持久化和历史归档
+/// 使用 snake_case 序列化以便 JSON 可读
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPersistenceStatus {
+    /// 等待中（任务已创建，等待开始）
+    Pending,
+    /// 下载中
+    Downloading,
+    /// 上传中
+    Uploading,
+    /// 转存中
+    Transferring,
+    /// 已暂停
+    Paused,
+    /// 已完成
+    Completed,
+    /// 失败
+    Failed,
 }
 
-/// 下载任务事件
+impl TaskPersistenceStatus {
+    /// 是否为终态（完成或失败）
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+
+    /// 是否为活跃状态（正在执行）
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Downloading | Self::Uploading | Self::Transferring
+        )
+    }
+
+    /// 从任务类型推断初始状态
+    pub fn initial_for(_task_type: TaskType) -> Self {
+        Self::Pending
+    }
+
+    /// 从任务类型推断活跃状态
+    pub fn active_for(task_type: TaskType) -> Self {
+        match task_type {
+            TaskType::Download => Self::Downloading,
+            TaskType::Upload => Self::Uploading,
+            TaskType::Transfer => Self::Transferring,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskPersistenceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Downloading => write!(f, "downloading"),
+            Self::Uploading => write!(f, "uploading"),
+            Self::Transferring => write!(f, "transferring"),
+            Self::Paused => write!(f, "paused"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// 任务类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    /// 下载任务
+    Download,
+    /// 上传任务
+    Upload,
+    /// 转存任务
+    Transfer,
+}
+
+impl TaskType {
+    /// 获取任务类型的显示名称
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskType::Download => "download",
+            TaskType::Upload => "upload",
+            TaskType::Transfer => "transfer",
+        }
+    }
+}
+
+/// 任务元数据
+///
+/// 保存任务的基本信息，用于恢复时重建任务
+/// 以 JSON 格式存储在 .meta 文件中
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum DownloadEvent {
-    /// 任务创建
-    Created {
+pub struct TaskMetadata {
+    /// 任务 ID
+    pub task_id: String,
+
+    /// 任务类型
+    pub task_type: TaskType,
+
+    /// 创建时间
+    pub created_at: DateTime<Utc>,
+
+    /// 最后更新时间
+    pub updated_at: DateTime<Utc>,
+
+    // === 下载任务字段 ===
+    /// 百度网盘文件 fs_id（下载任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fs_id: Option<u64>,
+
+    /// 关联的转存任务 ID（如果此下载任务由转存任务自动创建）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_task_id: Option<String>,
+
+    /// 远程文件路径（下载任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_path: Option<String>,
+
+    /// 本地保存路径（下载任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<PathBuf>,
+
+    /// 文件大小（字节）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+
+    /// 分片大小（字节）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<u64>,
+
+    /// 总分片数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_chunks: Option<usize>,
+
+    // === 上传任务字段 ===
+    /// 本地文件路径（上传任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
+
+    /// 远程目标路径（上传任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+
+    /// 上传 ID（百度网盘 precreate 返回）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
+
+    /// 上传 ID 创建时间（用于判断是否过期）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_id_created_at: Option<DateTime<Utc>>,
+
+    // === 转存任务字段 ===
+    /// 分享链接
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_link: Option<String>,
+
+    /// 提取码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_pwd: Option<String>,
+
+    /// 转存目标路径
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_target_path: Option<String>,
+
+    /// 转存状态（checking_share, transferring, transferred, downloading, completed）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_status: Option<String>,
+
+    /// 关联的下载任务 ID 列表（转存后下载）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub download_task_ids: Vec<String>,
+
+    /// 转存成功后的分享信息（JSON 序列化）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_info_json: Option<String>,
+
+    /// 是否开启自动下载
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_download: Option<bool>,
+
+    /// 转存文件名称（用于展示，从分享文件列表中提取主要文件名）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_file_name: Option<String>,
+
+    /// 转存文件列表（JSON 序列化的 Vec<SharedFileInfo>）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_list_json: Option<String>,
+
+    // === 分享直下相关字段 ===
+    /// 是否为分享直下任务
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_share_direct_download: Option<bool>,
+
+    /// 临时目录路径（网盘路径，分享直下专用，用于清理）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_dir: Option<String>,
+
+    /// 临时目录清理状态（分享直下任务专用，仅后端诊断使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_status: Option<CleanupStatus>,
+
+    /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
+    ///
+    /// 用于在转存恢复 / 自动下载阶段稳定推导 share_root（剥掉分享者私有上层目录），
+    /// 避免从文件路径反推时的歧义。详见 `docs/share-root-fix.md`。
+    /// 老元数据缺该字段时反序列化为 None，调用方退化到启发式推导。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_root_path: Option<String>,
+
+    // === 文件夹下载组信息 ===
+    /// 文件夹下载组ID（单文件下载时为 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+
+    /// 文件夹根路径，如 "/电影"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_root: Option<String>,
+
+    /// 相对于根文件夹的路径，如 "科幻片/星际穿越.mp4"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+
+    // === 历史归档字段 ===
+    /// 任务状态（使用枚举类型，提供类型安全）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskPersistenceStatus>,
+
+    /// 完成时间（仅已完成任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+
+    /// 错误信息（任务失败时）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_msg: Option<String>,
+
+    // === 自动备份字段 ===
+    /// 是否为备份任务
+    #[serde(default)]
+    pub is_backup: bool,
+
+    /// 关联的备份配置 ID（备份任务时使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_config_id: Option<String>,
+
+    // === 加密相关字段 ===
+    /// 是否启用加密（上传任务）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub encrypt_enabled: bool,
+
+    /// 是否为加密文件（下载任务）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_encrypted: bool,
+
+    /// 加密时使用的密钥版本（上传/下载任务）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_key_version: Option<u32>,
+
+    /// 加密前的原始远程路径（用于去重索引，与自动恢复功能无关）
+    /// 去重索引 key = (local_path, original_remote_path)，重启后从 .meta 文件重建
+    /// 非加密模式下为 None（target_path 即为原始路径）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_remote_path: Option<String>,
+
+    // === 🔥 多账号归属字段 ===
+    /// 任务所属 UID（运态 `Uid` 与持久化 `u64` 双向转换 — 加载/保存时各发生一次）。
+    /// 旧持久化数据为 `None`，这种情况下恢复逻辑会填充 `active_uid` 或进入账号丢失分支。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u64>,
+
+    /// 不可恢复失败原因（恢复链路）
+    ///
+    /// 恢复链路落到 `Failed` 终态时由本字段承载语义，区分多种不可恢复原因：
+    /// - `"account_deleted"` — 任务持久化 `owner_uid` 已不在 `accounts.json` 内
+    /// - `"unrecoverable_no_active_account"` — `owner_uid=None` 且无 `active_uid` 兜底
+    ///
+    /// 与 `error_msg` 区别：`error_msg` 是网络/IO 等运行期错误；`failure_reason` 是
+    /// **结构性不可恢复**信号，前端可据此显示固定文案而非透传错误。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl TaskMetadata {
+    /// 创建下载任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `fs_id` - 百度网盘文件 fs_id
+    /// * `remote_path` - 远程文件路径
+    /// * `local_path` - 本地保存路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `is_encrypted` - 是否为加密文件（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn new_download(
         task_id: String,
         fs_id: u64,
         remote_path: String,
-        local_path: String,
-        total_size: u64,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        /// 原始文件名（加密文件解密后的文件名）
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        original_filename: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务跳过（文件已存在）
-    Skipped {
-        task_id: String,
-        filename: String,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 进度更新
-    Progress {
-        task_id: String,
-        downloaded_size: u64,
-        total_size: u64,
-        speed: u64,
-        progress: f64,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 状态变更
-    StatusChanged {
-        task_id: String,
-        old_status: String,
-        new_status: String,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        /// 🔥 状态变更原因（auto_requeue_task 携带退回原因，其他场景为 None）
-        ///
-        /// 必须加 `skip_serializing_if`，否则 None 会序列化成 "error":null。
-        /// 前端用 `event.error !== undefined` 判断时会把 null 当作有值。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务完成
-    Completed {
-        task_id: String,
-        completed_at: i64,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务失败
-    Failed {
-        task_id: String,
-        error: String,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务暂停
-    Paused {
-        task_id: String,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务恢复
-    Resumed {
-        task_id: String,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务删除
-    Deleted {
-        task_id: String,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 解密进度
-    DecryptProgress {
-        task_id: String,
-        /// 解密进度 (0.0 - 100.0)
-        decrypt_progress: f64,
-        /// 已处理字节数
-        processed_bytes: u64,
-        /// 总字节数
-        total_bytes: u64,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 解密完成
-    DecryptCompleted {
-        task_id: String,
-        /// 解密后原始文件大小
-        original_size: u64,
-        /// 解密后文件路径
-        decrypted_path: String,
-        group_id: Option<String>,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl DownloadEvent {
-    /// 获取任务 ID
-    pub fn task_id(&self) -> &str {
-        match self {
-            DownloadEvent::Created { task_id, .. } => task_id,
-            DownloadEvent::Skipped { task_id, .. } => task_id,
-            DownloadEvent::Progress { task_id, .. } => task_id,
-            DownloadEvent::StatusChanged { task_id, .. } => task_id,
-            DownloadEvent::Completed { task_id, .. } => task_id,
-            DownloadEvent::Failed { task_id, .. } => task_id,
-            DownloadEvent::Paused { task_id, .. } => task_id,
-            DownloadEvent::Resumed { task_id, .. } => task_id,
-            DownloadEvent::Deleted { task_id, .. } => task_id,
-            DownloadEvent::DecryptProgress { task_id, .. } => task_id,
-            DownloadEvent::DecryptCompleted { task_id, .. } => task_id,
-        }
-    }
-
-    /// 获取分组id
-    pub fn group_id(&self) -> Option<&str> {
-        match self {
-            DownloadEvent::Created { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::Skipped { .. } => None,
-            DownloadEvent::Progress { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::StatusChanged { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::Completed { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::Failed { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::Paused { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::Resumed { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::Deleted { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::DecryptProgress { group_id, .. } => group_id.as_deref(),
-            DownloadEvent::DecryptCompleted { group_id, .. } => group_id.as_deref(),
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            DownloadEvent::Progress { .. } => EventPriority::Low,
-            DownloadEvent::DecryptProgress { .. } => EventPriority::Low,
-            DownloadEvent::StatusChanged { .. } => EventPriority::Medium,
-            DownloadEvent::Created { .. } => EventPriority::Medium,
-            DownloadEvent::Skipped { .. } => EventPriority::Medium,
-            DownloadEvent::Completed { .. } => EventPriority::High,
-            DownloadEvent::Failed { .. } => EventPriority::High,
-            DownloadEvent::Paused { .. } => EventPriority::Medium,
-            DownloadEvent::Resumed { .. } => EventPriority::Medium,
-            DownloadEvent::Deleted { .. } => EventPriority::High,
-            DownloadEvent::DecryptCompleted { .. } => EventPriority::High,
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            DownloadEvent::Created { .. } => "created",
-            DownloadEvent::Skipped { .. } => "skipped",
-            DownloadEvent::Progress { .. } => "progress",
-            DownloadEvent::StatusChanged { .. } => "status_changed",
-            DownloadEvent::Completed { .. } => "completed",
-            DownloadEvent::Failed { .. } => "failed",
-            DownloadEvent::Paused { .. } => "paused",
-            DownloadEvent::Resumed { .. } => "resumed",
-            DownloadEvent::Deleted { .. } => "deleted",
-            DownloadEvent::DecryptProgress { .. } => "decrypt_progress",
-            DownloadEvent::DecryptCompleted { .. } => "decrypt_completed",
-        }
-    }
-
-    /// 是否为自动备份任务
-    pub fn is_backup(&self) -> bool {
-        match self {
-            DownloadEvent::Created { is_backup, .. } => *is_backup,
-            DownloadEvent::Skipped { .. } => false,
-            DownloadEvent::Progress { is_backup, .. } => *is_backup,
-            DownloadEvent::StatusChanged { is_backup, .. } => *is_backup,
-            DownloadEvent::Completed { is_backup, .. } => *is_backup,
-            DownloadEvent::Failed { is_backup, .. } => *is_backup,
-            DownloadEvent::Paused { is_backup, .. } => *is_backup,
-            DownloadEvent::Resumed { is_backup, .. } => *is_backup,
-            DownloadEvent::Deleted { is_backup, .. } => *is_backup,
-            DownloadEvent::DecryptProgress { is_backup, .. } => *is_backup,
-            DownloadEvent::DecryptCompleted { is_backup, .. } => *is_backup,
-        }
-    }
-}
-
-/// 文件夹下载事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum FolderEvent {
-    /// 文件夹创建
-    Created {
-        folder_id: String,
-        name: String,
-        remote_root: String,
-        local_root: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 进度更新
-    Progress {
-        folder_id: String,
-        downloaded_size: u64,
-        total_size: u64,
-        completed_files: u64,
-        total_files: u64,
-        speed: u64,
-        status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 状态变更
-    StatusChanged {
-        folder_id: String,
-        old_status: String,
-        new_status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 扫描完成
-    ScanCompleted {
-        folder_id: String,
-        total_files: u64,
-        total_size: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件夹完成
-    Completed {
-        folder_id: String,
-        completed_at: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件夹失败
-    Failed { folder_id: String, error: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件夹暂停
-    Paused { folder_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件夹恢复
-    Resumed { folder_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件夹删除
-    Deleted { folder_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl FolderEvent {
-    /// 获取文件夹 ID
-    pub fn folder_id(&self) -> &str {
-        match self {
-            FolderEvent::Created { folder_id, .. } => folder_id,
-            FolderEvent::Progress { folder_id, .. } => folder_id,
-            FolderEvent::StatusChanged { folder_id, .. } => folder_id,
-            FolderEvent::ScanCompleted { folder_id, .. } => folder_id,
-            FolderEvent::Completed { folder_id, .. } => folder_id,
-            FolderEvent::Failed { folder_id, .. } => folder_id,
-            FolderEvent::Paused { folder_id, .. } => folder_id,
-            FolderEvent::Resumed { folder_id, .. } => folder_id,
-            FolderEvent::Deleted { folder_id, .. } => folder_id,
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            FolderEvent::Progress { .. } => EventPriority::Low,
-            FolderEvent::StatusChanged { .. } => EventPriority::Medium,
-            FolderEvent::Created { .. }
-            | FolderEvent::ScanCompleted { .. }
-            | FolderEvent::Completed { .. }
-            | FolderEvent::Failed { .. }
-            | FolderEvent::Paused { .. }
-            | FolderEvent::Resumed { .. }
-            | FolderEvent::Deleted { .. } => EventPriority::High,
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            FolderEvent::Created { .. } => "created",
-            FolderEvent::Progress { .. } => "progress",
-            FolderEvent::StatusChanged { .. } => "status_changed",
-            FolderEvent::ScanCompleted { .. } => "scan_completed",
-            FolderEvent::Completed { .. } => "completed",
-            FolderEvent::Failed { .. } => "failed",
-            FolderEvent::Paused { .. } => "paused",
-            FolderEvent::Resumed { .. } => "resumed",
-            FolderEvent::Deleted { .. } => "deleted",
-        }
-    }
-}
-
-/// 上传任务事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum UploadEvent {
-    /// 任务创建
-    Created {
-        task_id: String,
-        local_path: String,
-        remote_path: String,
-        total_size: u64,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 进度更新
-    Progress {
-        task_id: String,
-        uploaded_size: u64,
-        total_size: u64,
-        speed: u64,
-        progress: f64,
-        completed_chunks: usize,
+        local_path: PathBuf,
+        file_size: u64,
+        chunk_size: u64,
         total_chunks: usize,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 状态变更
-    StatusChanged {
-        task_id: String,
-        old_status: String,
-        new_status: String,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务完成
-    Completed {
-        task_id: String,
-        completed_at: i64,
-        is_rapid_upload: bool,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务失败
-    Failed {
-        task_id: String,
-        error: String,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务暂停
-    Paused {
-        task_id: String,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务恢复
-    Resumed {
-        task_id: String,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务删除
-    Deleted {
-        task_id: String,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 加密进度
-    EncryptProgress {
-        task_id: String,
-        /// 加密进度 (0.0 - 100.0)
-        encrypt_progress: f64,
-        /// 已处理字节数
-        processed_bytes: u64,
-        /// 总字节数
-        total_bytes: u64,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 加密完成
-    EncryptCompleted {
-        task_id: String,
-        /// 加密后文件大小
-        encrypted_size: u64,
-        /// 原始文件大小
-        original_size: u64,
-        /// 是否为自动备份任务
-        #[serde(default)]
-        is_backup: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务跳过（冲突策略）
-    Skipped {
-        task_id: String,
-        local_path: String,
-        remote_path: String,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl UploadEvent {
-    /// 获取任务 ID
-    pub fn task_id(&self) -> &str {
-        match self {
-            UploadEvent::Created { task_id, .. } => task_id,
-            UploadEvent::Progress { task_id, .. } => task_id,
-            UploadEvent::StatusChanged { task_id, .. } => task_id,
-            UploadEvent::Completed { task_id, .. } => task_id,
-            UploadEvent::Failed { task_id, .. } => task_id,
-            UploadEvent::Paused { task_id, .. } => task_id,
-            UploadEvent::Resumed { task_id, .. } => task_id,
-            UploadEvent::Deleted { task_id, .. } => task_id,
-            UploadEvent::EncryptProgress { task_id, .. } => task_id,
-            UploadEvent::EncryptCompleted { task_id, .. } => task_id,
-            UploadEvent::Skipped { task_id, .. } => task_id,
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            UploadEvent::Progress { .. } => EventPriority::Low,
-            UploadEvent::EncryptProgress { .. } => EventPriority::Low,
-            UploadEvent::StatusChanged { .. } => EventPriority::Medium,
-            UploadEvent::Created { .. }
-            | UploadEvent::Completed { .. }
-            | UploadEvent::Failed { .. }
-            | UploadEvent::Paused { .. }
-            | UploadEvent::Resumed { .. }
-            | UploadEvent::Deleted { .. }
-            | UploadEvent::EncryptCompleted { .. }
-            | UploadEvent::Skipped { .. } => EventPriority::High,
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            UploadEvent::Created { .. } => "created",
-            UploadEvent::Progress { .. } => "progress",
-            UploadEvent::StatusChanged { .. } => "status_changed",
-            UploadEvent::Completed { .. } => "completed",
-            UploadEvent::Failed { .. } => "failed",
-            UploadEvent::Paused { .. } => "paused",
-            UploadEvent::Resumed { .. } => "resumed",
-            UploadEvent::Deleted { .. } => "deleted",
-            UploadEvent::EncryptProgress { .. } => "encrypt_progress",
-            UploadEvent::EncryptCompleted { .. } => "encrypt_completed",
-            UploadEvent::Skipped { .. } => "skipped",
-        }
-    }
-
-    /// 是否为自动备份任务
-    pub fn is_backup(&self) -> bool {
-        match self {
-            UploadEvent::Created { is_backup, .. } => *is_backup,
-            UploadEvent::Progress { is_backup, .. } => *is_backup,
-            UploadEvent::StatusChanged { is_backup, .. } => *is_backup,
-            UploadEvent::Completed { is_backup, .. } => *is_backup,
-            UploadEvent::Failed { is_backup, .. } => *is_backup,
-            UploadEvent::Paused { is_backup, .. } => *is_backup,
-            UploadEvent::Resumed { is_backup, .. } => *is_backup,
-            UploadEvent::Deleted { is_backup, .. } => *is_backup,
-            UploadEvent::EncryptProgress { is_backup, .. } => *is_backup,
-            UploadEvent::EncryptCompleted { is_backup, .. } => *is_backup,
-            UploadEvent::Skipped { .. } => false, // Skipped events are not backup tasks
-        }
-    }
-}
-
-/// 转存任务事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum TransferEvent {
-    /// 任务创建
-    Created {
-        task_id: String,
-        share_url: String,
-        save_path: String,
-        auto_download: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 进度更新
-    Progress {
-        task_id: String,
-        status: String,
-        transferred_count: usize,
-        total_count: usize,
-        progress: f64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 状态变更
-    StatusChanged {
-        task_id: String,
-        old_status: String,
-        new_status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务完成
-    Completed { task_id: String, completed_at: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务失败
-    Failed {
-        task_id: String,
-        error: String,
-        error_type: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务删除
-    Deleted { task_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl TransferEvent {
-    /// 获取任务 ID
-    pub fn task_id(&self) -> &str {
-        match self {
-            TransferEvent::Created { task_id, .. } => task_id,
-            TransferEvent::Progress { task_id, .. } => task_id,
-            TransferEvent::StatusChanged { task_id, .. } => task_id,
-            TransferEvent::Completed { task_id, .. } => task_id,
-            TransferEvent::Failed { task_id, .. } => task_id,
-            TransferEvent::Deleted { task_id, .. } => task_id,
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            TransferEvent::Progress { .. } => EventPriority::Low,
-            TransferEvent::StatusChanged { .. } => EventPriority::Medium,
-            TransferEvent::Created { .. }
-            | TransferEvent::Completed { .. }
-            | TransferEvent::Failed { .. }
-            | TransferEvent::Deleted { .. } => EventPriority::High,
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            TransferEvent::Created { .. } => "created",
-            TransferEvent::Progress { .. } => "progress",
-            TransferEvent::StatusChanged { .. } => "status_changed",
-            TransferEvent::Completed { .. } => "completed",
-            TransferEvent::Failed { .. } => "failed",
-            TransferEvent::Deleted { .. } => "deleted",
-        }
-    }
-}
-
-/// 备份任务事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum BackupEvent {
-    /// 任务创建
-    Created {
-        task_id: String,
-        config_id: String,
-        config_name: String,
-        direction: String,
-        trigger_type: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 扫描进度
-    ScanProgress {
-        task_id: String,
-        scanned_files: usize,
-        scanned_dirs: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 扫描完成
-    ScanCompleted {
-        task_id: String,
-        total_files: usize,
-        total_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件进度
-    FileProgress {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        transferred_bytes: u64,
-        total_bytes: u64,
-        status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件状态变更
-    FileStatusChanged {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        old_status: String,
-        new_status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务进度
-    Progress {
-        task_id: String,
-        completed_count: usize,
-        failed_count: usize,
-        skipped_count: usize,
-        total_count: usize,
-        transferred_bytes: u64,
-        total_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 状态变更
-    StatusChanged {
-        task_id: String,
-        old_status: String,
-        new_status: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务完成
-    Completed {
-        task_id: String,
-        completed_at: i64,
-        success_count: usize,
-        failed_count: usize,
-        skipped_count: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务失败
-    Failed {
-        task_id: String,
-        error: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务暂停
-    Paused {
-        task_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务恢复
-    Resumed {
-        task_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务取消
-    Cancelled {
-        task_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件加密开始
-    FileEncrypting {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件加密完成
-    FileEncrypted {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        encrypted_name: String,
-        encrypted_size: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件解密开始
-    FileDecrypting {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件解密完成
-    FileDecrypted {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        original_name: String,
-        original_size: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件加密进度
-    FileEncryptProgress {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        /// 加密进度 (0.0 - 100.0)
-        progress: f64,
-        /// 已处理字节数
-        processed_bytes: u64,
-        /// 总字节数
-        total_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 文件解密进度
-    FileDecryptProgress {
-        task_id: String,
-        file_task_id: String,
-        file_name: String,
-        /// 解密进度 (0.0 - 100.0)
-        progress: f64,
-        /// 已处理字节数
-        processed_bytes: u64,
-        /// 总字节数
-        total_bytes: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl BackupEvent {
-    /// 获取任务 ID
-    pub fn task_id(&self) -> &str {
-        match self {
-            BackupEvent::Created { task_id, .. } => task_id,
-            BackupEvent::ScanProgress { task_id, .. } => task_id,
-            BackupEvent::ScanCompleted { task_id, .. } => task_id,
-            BackupEvent::FileProgress { task_id, .. } => task_id,
-            BackupEvent::FileStatusChanged { task_id, .. } => task_id,
-            BackupEvent::Progress { task_id, .. } => task_id,
-            BackupEvent::StatusChanged { task_id, .. } => task_id,
-            BackupEvent::Completed { task_id, .. } => task_id,
-            BackupEvent::Failed { task_id, .. } => task_id,
-            BackupEvent::Paused { task_id, .. } => task_id,
-            BackupEvent::Resumed { task_id, .. } => task_id,
-            BackupEvent::Cancelled { task_id, .. } => task_id,
-            BackupEvent::FileEncrypting { task_id, .. } => task_id,
-            BackupEvent::FileEncrypted { task_id, .. } => task_id,
-            BackupEvent::FileDecrypting { task_id, .. } => task_id,
-            BackupEvent::FileDecrypted { task_id, .. } => task_id,
-            BackupEvent::FileEncryptProgress { task_id, .. } => task_id,
-            BackupEvent::FileDecryptProgress { task_id, .. } => task_id,
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            BackupEvent::Progress { .. } => EventPriority::Low,
-            BackupEvent::ScanProgress { .. } => EventPriority::Low,
-            BackupEvent::FileProgress { .. } => EventPriority::Low,
-            BackupEvent::FileEncryptProgress { .. } => EventPriority::Low,
-            BackupEvent::FileDecryptProgress { .. } => EventPriority::Low,
-            BackupEvent::FileEncrypting { .. } => EventPriority::Medium,
-            BackupEvent::FileDecrypting { .. } => EventPriority::Medium,
-            BackupEvent::FileStatusChanged { .. } => EventPriority::Medium,
-            BackupEvent::StatusChanged { .. } => EventPriority::Medium,
-            BackupEvent::Created { .. }
-            | BackupEvent::ScanCompleted { .. }
-            | BackupEvent::Completed { .. }
-            | BackupEvent::Failed { .. }
-            | BackupEvent::Paused { .. }
-            | BackupEvent::Resumed { .. }
-            | BackupEvent::Cancelled { .. }
-            | BackupEvent::FileEncrypted { .. }
-            | BackupEvent::FileDecrypted { .. } => EventPriority::High,
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            BackupEvent::Created { .. } => "created",
-            BackupEvent::ScanProgress { .. } => "scan_progress",
-            BackupEvent::ScanCompleted { .. } => "scan_completed",
-            BackupEvent::FileProgress { .. } => "file_progress",
-            BackupEvent::FileStatusChanged { .. } => "file_status_changed",
-            BackupEvent::Progress { .. } => "progress",
-            BackupEvent::StatusChanged { .. } => "status_changed",
-            BackupEvent::Completed { .. } => "completed",
-            BackupEvent::Failed { .. } => "failed",
-            BackupEvent::Paused { .. } => "paused",
-            BackupEvent::Resumed { .. } => "resumed",
-            BackupEvent::Cancelled { .. } => "cancelled",
-            BackupEvent::FileEncrypting { .. } => "file_encrypting",
-            BackupEvent::FileEncrypted { .. } => "file_encrypted",
-            BackupEvent::FileDecrypting { .. } => "file_decrypting",
-            BackupEvent::FileDecrypted { .. } => "file_decrypted",
-            BackupEvent::FileEncryptProgress { .. } => "file_encrypt_progress",
-            BackupEvent::FileDecryptProgress { .. } => "file_decrypt_progress",
-        }
-    }
-}
-
-/// 离线下载事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum CloudDlEvent {
-    /// 任务状态变化
-    StatusChanged {
-        task_id: i64,
-        old_status: Option<i32>,
-        new_status: i32,
-        task: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务完成（可触发自动下载）
-    TaskCompleted {
-        task_id: i64,
-        task: serde_json::Value,
-        auto_download_config: Option<serde_json::Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 进度更新
-    ProgressUpdate {
-        task_id: i64,
-        finished_size: i64,
-        file_size: i64,
-        progress_percent: f32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    /// 任务列表刷新（初始加载或手动刷新）
-    TaskListRefreshed {
-        tasks: Vec<serde_json::Value>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl CloudDlEvent {
-    /// 获取任务 ID（如果有）
-    pub fn task_id(&self) -> Option<String> {
-        match self {
-            CloudDlEvent::StatusChanged { task_id, .. } => Some(task_id.to_string()),
-            CloudDlEvent::TaskCompleted { task_id, .. } => Some(task_id.to_string()),
-            CloudDlEvent::ProgressUpdate { task_id, .. } => Some(task_id.to_string()),
-            CloudDlEvent::TaskListRefreshed { .. } => None,
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            CloudDlEvent::ProgressUpdate { .. } => EventPriority::Low,
-            CloudDlEvent::StatusChanged { .. } => EventPriority::Medium,
-            CloudDlEvent::TaskCompleted { .. } => EventPriority::High,
-            CloudDlEvent::TaskListRefreshed { .. } => EventPriority::High,
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            CloudDlEvent::StatusChanged { .. } => "status_changed",
-            CloudDlEvent::TaskCompleted { .. } => "task_completed",
-            CloudDlEvent::ProgressUpdate { .. } => "progress_update",
-            CloudDlEvent::TaskListRefreshed { .. } => "task_list_refreshed",
-        }
-    }
-}
-
-/// 扫描事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum ScanEvent {
-    Started {
-        scan_task_id: String,
-        local_folder: String,
-        remote_folder: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    Progress {
-        scan_task_id: String,
-        scanned_files: usize,
-        scanned_dirs: usize,
-        current_path: String,
-        created_tasks: usize,
-        skipped_duplicates: usize,
-        total_size: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    Completed {
-        scan_task_id: String,
-        total_files: usize,
-        total_size: u64,
-        created_tasks: usize,
-        skipped_duplicates: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-    Failed {
-        scan_task_id: String,
-        error: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_uid: Option<u64>,
-    },
-}
-
-impl ScanEvent {
-    pub fn task_id(&self) -> &str {
-        match self {
-            ScanEvent::Started { scan_task_id, .. } => scan_task_id,
-            ScanEvent::Progress { scan_task_id, .. } => scan_task_id,
-            ScanEvent::Completed { scan_task_id, .. } => scan_task_id,
-            ScanEvent::Failed { scan_task_id, .. } => scan_task_id,
-        }
-    }
-
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            ScanEvent::Progress { .. } => EventPriority::Low,
-            _ => EventPriority::High,
-        }
-    }
-
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            ScanEvent::Started { .. } => "scan_started",
-            ScanEvent::Progress { .. } => "scan_progress",
-            ScanEvent::Completed { .. } => "scan_completed",
-            ScanEvent::Failed { .. } => "scan_failed",
-        }
-    }
-}
-
-/// 统一任务事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "category", content = "event")]
-pub enum TaskEvent {
-    /// 下载事件
-    #[serde(rename = "download")]
-    Download(DownloadEvent),
-    /// 文件夹下载事件
-    #[serde(rename = "folder")]
-    Folder(FolderEvent),
-    /// 上传事件
-    #[serde(rename = "upload")]
-    Upload(UploadEvent),
-    /// 转存事件
-    #[serde(rename = "transfer")]
-    Transfer(TransferEvent),
-    /// 备份事件
-    #[serde(rename = "backup")]
-    Backup(BackupEvent),
-    /// 离线下载事件
-    #[serde(rename = "cloud_dl")]
-    CloudDl(CloudDlEvent),
-    /// 扫描事件
-    #[serde(rename = "scan")]
-    Scan(ScanEvent),
-    /// 账号管理事件
-    #[serde(rename = "account")]
-    Account(AccountEvent),
-    /// 分享同步事件
-    #[serde(rename = "share_sync")]
-    ShareSync(crate::share_sync::events::ShareSyncEvent),
-}
-
-impl TaskEvent {
-    /// 获取任务 ID
-    pub fn task_id(&self) -> &str {
-        match self {
-            TaskEvent::Download(e) => e.task_id(),
-            TaskEvent::Folder(e) => e.folder_id(),
-            TaskEvent::Upload(e) => e.task_id(),
-            TaskEvent::Transfer(e) => e.task_id(),
-            TaskEvent::Backup(e) => e.task_id(),
-            TaskEvent::CloudDl(_e) => {
-                // CloudDl 使用 i64 task_id，这里返回静态字符串
-                // 实际 task_id 通过 task_id_string() 方法获取
-                "cloud_dl"
-            }
-            TaskEvent::Scan(e) => e.task_id(),
-            TaskEvent::Account(_) => "account",
-            TaskEvent::ShareSync(e) => e.subscription_id(),
-        }
-    }
-
-    /// 获取任务 ID 字符串（用于 CloudDl 等使用数字 ID 的事件）
-    pub fn task_id_string(&self) -> String {
-        match self {
-            TaskEvent::CloudDl(e) => e.task_id().unwrap_or_default(),
-            _ => self.task_id().to_string(),
-        }
-    }
-
-    /// 获取事件优先级
-    pub fn priority(&self) -> EventPriority {
-        match self {
-            TaskEvent::Download(e) => e.priority(),
-            TaskEvent::Folder(e) => e.priority(),
-            TaskEvent::Upload(e) => e.priority(),
-            TaskEvent::Transfer(e) => e.priority(),
-            TaskEvent::Backup(e) => e.priority(),
-            TaskEvent::CloudDl(e) => e.priority(),
-            TaskEvent::Scan(e) => e.priority(),
-            TaskEvent::Account(_) => EventPriority::High,
-            TaskEvent::ShareSync(_) => EventPriority::Medium,
-        }
-    }
-
-    /// 获取事件类别
-    pub fn category(&self) -> &'static str {
-        match self {
-            TaskEvent::Download(_) => "download",
-            TaskEvent::Folder(_) => "folder",
-            TaskEvent::Upload(_) => "upload",
-            TaskEvent::Transfer(_) => "transfer",
-            TaskEvent::Backup(_) => "backup",
-            TaskEvent::CloudDl(_) => "cloud_dl",
-            TaskEvent::Scan(_) => "scan",
-            TaskEvent::Account(_) => "account",
-            TaskEvent::ShareSync(_) => "share_sync",
-        }
-    }
-
-    /// 获取事件类型名称
-    pub fn event_type(&self) -> &'static str {
-        match self {
-            TaskEvent::Download(e) => e.event_type_name(),
-            TaskEvent::Folder(e) => e.event_type_name(),
-            TaskEvent::Upload(e) => e.event_type_name(),
-            TaskEvent::Transfer(e) => e.event_type_name(),
-            TaskEvent::Backup(e) => e.event_type_name(),
-            TaskEvent::CloudDl(e) => e.event_type_name(),
-            TaskEvent::Scan(e) => e.event_type_name(),
-            TaskEvent::Account(e) => e.event_type_name(),
-            TaskEvent::ShareSync(e) => e.event_type_name(),
-        }
-    }
-
-    /// 是否为活跃任务事件（需要高频推送）
-    pub fn is_active(&self) -> bool {
-        match self {
-            TaskEvent::Download(DownloadEvent::Progress { .. }) => true,
-            TaskEvent::Download(DownloadEvent::DecryptProgress { .. }) => true,
-            TaskEvent::Download(DownloadEvent::StatusChanged { new_status, .. }) => {
-                new_status == "downloading" || new_status == "decrypting"
-            }
-            TaskEvent::Folder(FolderEvent::Progress { .. }) => true,
-            TaskEvent::Folder(FolderEvent::StatusChanged { new_status, .. }) => {
-                new_status == "downloading" || new_status == "scanning"
-            }
-            TaskEvent::Upload(UploadEvent::Progress { .. }) => true,
-            TaskEvent::Upload(UploadEvent::EncryptProgress { .. }) => true,
-            TaskEvent::Upload(UploadEvent::StatusChanged { new_status, .. }) => {
-                new_status == "uploading" || new_status == "encrypting"
-            }
-            TaskEvent::Transfer(TransferEvent::Progress { .. }) => true,
-            TaskEvent::Transfer(TransferEvent::StatusChanged { new_status, .. }) => {
-                new_status == "transferring" || new_status == "downloading"
-            }
-            TaskEvent::Backup(BackupEvent::Progress { .. }) => true,
-            TaskEvent::Backup(BackupEvent::ScanProgress { .. }) => true,
-            TaskEvent::Backup(BackupEvent::FileProgress { .. }) => true,
-            TaskEvent::Backup(BackupEvent::FileEncryptProgress { .. }) => true,
-            TaskEvent::Backup(BackupEvent::FileDecryptProgress { .. }) => true,
-            TaskEvent::Backup(BackupEvent::StatusChanged { new_status, .. }) => {
-                new_status == "transferring" || new_status == "preparing"
-            }
-            TaskEvent::CloudDl(CloudDlEvent::ProgressUpdate { .. }) => true,
-            TaskEvent::CloudDl(CloudDlEvent::StatusChanged { new_status, .. }) => {
-                *new_status == 1 // Running status
-            }
-            TaskEvent::Scan(ScanEvent::Started { .. }) => true,
-            TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress { .. }) => true,
-            _ => false,
-        }
-    }
-
-    /// 是否为自动备份任务事件
-    ///
-    /// 用于 WebSocket 消息隔离：备份任务事件不应发送到普通下载/上传页面
-    pub fn is_backup(&self) -> bool {
-        match self {
-            TaskEvent::Download(e) => e.is_backup(),
-            TaskEvent::Upload(e) => e.is_backup(),
-            TaskEvent::Backup(_) => true,
-            // 文件夹下载、转存任务和离线下载不支持备份标记
-            TaskEvent::Folder(_) => false,
-            TaskEvent::Transfer(_) => false,
-            TaskEvent::CloudDl(_) => false,
-            TaskEvent::Scan(_) => false,
-            TaskEvent::Account(_) => false,
-            TaskEvent::ShareSync(_) => false,
-        }
-    }
-}
-
-/// 带时间戳的事件包装器
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimestampedEvent {
-    /// 事件 ID（全局唯一递增）
-    pub event_id: u64,
-    /// 时间戳（Unix 毫秒）
-    pub timestamp: i64,
-    /// 事件内容
-    #[serde(flatten)]
-    pub event: TaskEvent,
-}
-
-impl TimestampedEvent {
-    /// 创建新的带时间戳事件
-    pub fn new(event_id: u64, event: TaskEvent) -> Self {
+        is_encrypted: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> Self {
+        let now = Utc::now();
         Self {
-            event_id,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            event,
+            task_id,
+            task_type: TaskType::Download,
+            created_at: now,
+            updated_at: now,
+            fs_id: Some(fs_id),
+            transfer_task_id: None,
+            remote_path: Some(remote_path),
+            local_path: Some(local_path),
+            file_size: Some(file_size),
+            chunk_size: Some(chunk_size),
+            total_chunks: Some(total_chunks),
+            source_path: None,
+            target_path: None,
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: None,
+            share_pwd: None,
+            transfer_target_path: None,
+            transfer_status: None,
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: None,
+            transfer_file_name: None,
+            file_list_json: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
+            cleanup_status: None,
+            share_root_path: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: false,
+            backup_config_id: None,
+            // 加密字段
+            encrypt_enabled: false,
+            is_encrypted: is_encrypted.unwrap_or(false),
+            encryption_key_version,
+            original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
     }
-}
 
-// ============================================================================
-// 多账号管理事件
-// ============================================================================
-
-/// 账号管理事件（活跃账号切换、账号列表变更）。
-///
-/// 由 `helpers::set_active_uid()`（活跃账号切换）和 `accounts.rs` handler（增删账号）
-/// 主动发射；前端订阅后驱动账号切换器、跨账号侧栏更新。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum AccountEvent {
-    /// 活跃账号已切换。
+    /// 创建下载备份任务元数据
     ///
-    /// `new_active_uid = None` 表示删除最后一个账号、进入未登录状态。
-    Switched {
-        new_active_uid: Option<u64>,
-    },
-    /// 账号列表已变更（新增 / 删除 / 元数据更新）。
-    ListChanged {
-        accounts: Vec<crate::auth::AccountSummary>,
-        active_uid: Option<u64>,
-    },
-}
-
-impl AccountEvent {
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            AccountEvent::Switched { .. } => "switched",
-            AccountEvent::ListChanged { .. } => "list_changed",
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `fs_id` - 百度网盘文件 fs_id
+    /// * `remote_path` - 远程文件路径
+    /// * `local_path` - 本地保存路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `backup_config_id` - 备份配置 ID
+    /// * `is_encrypted` - 是否为加密文件（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn new_download_backup(
+        task_id: String,
+        fs_id: u64,
+        remote_path: String,
+        local_path: PathBuf,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        backup_config_id: String,
+        is_encrypted: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id,
+            task_type: TaskType::Download,
+            created_at: now,
+            updated_at: now,
+            fs_id: Some(fs_id),
+            transfer_task_id: None,
+            remote_path: Some(remote_path),
+            local_path: Some(local_path),
+            file_size: Some(file_size),
+            chunk_size: Some(chunk_size),
+            total_chunks: Some(total_chunks),
+            source_path: None,
+            target_path: None,
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: None,
+            share_pwd: None,
+            transfer_target_path: None,
+            transfer_status: None,
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: None,
+            transfer_file_name: None,
+            file_list_json: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
+            cleanup_status: None,
+            share_root_path: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: true,
+            backup_config_id: Some(backup_config_id),
+            // 加密字段
+            encrypt_enabled: false,
+            is_encrypted: is_encrypted.unwrap_or(false),
+            encryption_key_version,
+            original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
         }
+    }
+
+    /// 创建上传任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `source_path` - 本地源文件路径
+    /// * `target_path` - 远程目标路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `encrypt_enabled` - 是否启用加密（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn new_upload(
+        task_id: String,
+        source_path: PathBuf,
+        target_path: String,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        encrypt_enabled: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id,
+            task_type: TaskType::Upload,
+            created_at: now,
+            updated_at: now,
+            fs_id: None,
+            transfer_task_id: None,
+            remote_path: None,
+            local_path: None,
+            file_size: Some(file_size),
+            chunk_size: Some(chunk_size),
+            total_chunks: Some(total_chunks),
+            source_path: Some(source_path),
+            target_path: Some(target_path),
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: None,
+            share_pwd: None,
+            transfer_target_path: None,
+            transfer_status: None,
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: None,
+            transfer_file_name: None,
+            file_list_json: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
+            cleanup_status: None,
+            share_root_path: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: false,
+            backup_config_id: None,
+            // 加密字段
+            encrypt_enabled: encrypt_enabled.unwrap_or(false),
+            is_encrypted: false,
+            encryption_key_version,
+            original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
+        }
+    }
+
+    /// 创建上传备份任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `source_path` - 本地源文件路径
+    /// * `target_path` - 远程目标路径
+    /// * `file_size` - 文件大小（字节）
+    /// * `chunk_size` - 分片大小（字节）
+    /// * `total_chunks` - 总分片数
+    /// * `backup_config_id` - 备份配置 ID
+    /// * `encrypt_enabled` - 是否启用加密（可选）
+    /// * `encryption_key_version` - 加密密钥版本（可选）
+    pub fn new_upload_backup(
+        task_id: String,
+        source_path: PathBuf,
+        target_path: String,
+        file_size: u64,
+        chunk_size: u64,
+        total_chunks: usize,
+        backup_config_id: String,
+        encrypt_enabled: Option<bool>,
+        encryption_key_version: Option<u32>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id,
+            task_type: TaskType::Upload,
+            created_at: now,
+            updated_at: now,
+            fs_id: None,
+            transfer_task_id: None,
+            remote_path: None,
+            local_path: None,
+            file_size: Some(file_size),
+            chunk_size: Some(chunk_size),
+            total_chunks: Some(total_chunks),
+            source_path: Some(source_path),
+            target_path: Some(target_path),
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: None,
+            share_pwd: None,
+            transfer_target_path: None,
+            transfer_status: None,
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: None,
+            transfer_file_name: None,
+            file_list_json: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
+            cleanup_status: None,
+            share_root_path: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: true,
+            backup_config_id: Some(backup_config_id),
+            // 加密字段
+            encrypt_enabled: encrypt_enabled.unwrap_or(false),
+            is_encrypted: false,
+            encryption_key_version,
+            original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
+        }
+    }
+
+    /// 创建转存任务元数据
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `share_link` - 分享链接
+    /// * `share_pwd` - 提取码
+    /// * `target_path` - 转存目标路径
+    /// * `auto_download` - 是否开启自动下载
+    /// * `file_name` - 文件名称（用于展示）
+    pub fn new_transfer(
+        task_id: String,
+        share_link: String,
+        share_pwd: Option<String>,
+        target_path: String,
+        auto_download: bool,
+        file_name: Option<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            task_id,
+            task_type: TaskType::Transfer,
+            created_at: now,
+            updated_at: now,
+            fs_id: None,
+            transfer_task_id: None,
+            remote_path: None,
+            local_path: None,
+            file_size: None,
+            chunk_size: None,
+            total_chunks: None,
+            source_path: None,
+            target_path: None,
+            upload_id: None,
+            upload_id_created_at: None,
+            share_link: Some(share_link),
+            share_pwd,
+            transfer_target_path: Some(target_path),
+            transfer_status: Some("checking_share".to_string()),
+            download_task_ids: vec![],
+            share_info_json: None,
+            auto_download: Some(auto_download),
+            transfer_file_name: file_name,
+            file_list_json: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
+            cleanup_status: None,
+            share_root_path: None,
+            group_id: None,
+            group_root: None,
+            relative_path: None,
+            status: Some(TaskPersistenceStatus::Pending),
+            completed_at: None,
+            error_msg: None,
+            is_backup: false,
+            backup_config_id: None,
+            // 加密字段
+            encrypt_enabled: false,
+            is_encrypted: false,
+            encryption_key_version: None,
+            original_remote_path: None,
+            owner_uid: None,
+            failure_reason: None,
+        }
+    }
+
+    /// 设置任务所属账号 UID。
+    ///
+    /// 生产代码应该在调用 `new_*` 后立即链调 `.with_owner_uid(task.owner_uid.0)`，
+    /// 使持久化与运态任务保持账号归属一致。
+    pub fn with_owner_uid(mut self, owner_uid: u64) -> Self {
+        self.owner_uid = Some(owner_uid);
+        self
+    }
+
+    /// 更新最后修改时间
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
+    }
+
+    /// 设置上传 ID
+    pub fn set_upload_id(&mut self, upload_id: String) {
+        self.upload_id = Some(upload_id);
+        self.upload_id_created_at = Some(Utc::now());
+        self.touch();
+    }
+
+    /// 设置转存状态
+    pub fn set_transfer_status(&mut self, status: &str) {
+        self.transfer_status = Some(status.to_string());
+        self.touch();
+    }
+
+    /// 设置关联的下载任务 ID
+    pub fn set_download_task_ids(&mut self, ids: Vec<String>) {
+        self.download_task_ids = ids;
+        self.touch();
+    }
+
+    /// 设置关联的转存任务 ID（下载任务使用）
+    pub fn set_transfer_task_id(&mut self, transfer_task_id: String) {
+        self.transfer_task_id = Some(transfer_task_id);
+        self.touch();
+    }
+
+    /// 设置自动下载标记
+    pub fn set_auto_download(&mut self, auto_download: bool) {
+        self.auto_download = Some(auto_download);
+        self.touch();
+    }
+
+    /// 设置转存文件名称
+    pub fn set_transfer_file_name(&mut self, file_name: String) {
+        self.transfer_file_name = Some(file_name);
+        self.touch();
+    }
+
+    /// 设置转存文件列表（JSON 序列化）
+    pub fn set_file_list_json(&mut self, json: String) {
+        self.file_list_json = Some(json);
+        self.touch();
+    }
+
+    /// 设置错误信息
+    pub fn set_error_msg(&mut self, error_msg: String) {
+        self.error_msg = Some(error_msg);
+        self.touch();
+    }
+
+    /// 🔥 清空错误信息（设为 None，不是 Some("")）
+    ///
+    /// 任务被等待队列重新拉起时调用，避免持久化中残留旧的失败原因。
+    pub fn clear_error_msg(&mut self) {
+        self.error_msg = None;
+        self.touch();
+    }
+
+    /// 设置文件夹下载组信息
+    pub fn set_group_info(
+        &mut self,
+        group_id: Option<String>,
+        group_root: Option<String>,
+        relative_path: Option<String>,
+    ) {
+        self.group_id = group_id;
+        self.group_root = group_root;
+        self.relative_path = relative_path;
+        self.touch();
+    }
+
+    // === 历史归档方法 ===
+
+    /// 标记任务完成
+    pub fn mark_completed(&mut self) {
+        self.status = Some(TaskPersistenceStatus::Completed);
+        self.completed_at = Some(Utc::now());
+        self.touch();
+    }
+
+    /// 标记任务失败
+    pub fn mark_failed(&mut self) {
+        self.status = Some(TaskPersistenceStatus::Failed);
+        self.touch();
+    }
+
+    /// 更新任务状态
+    pub fn set_status(&mut self, status: TaskPersistenceStatus) {
+        self.status = Some(status);
+        self.touch();
+    }
+
+    /// 更新加密信息
+    ///
+    /// # Arguments
+    /// * `encrypt_enabled` - 是否启用加密
+    /// * `key_version` - 加密密钥版本
+    pub fn set_encryption_info(&mut self, encrypt_enabled: bool, key_version: Option<u32>) {
+        self.encrypt_enabled = encrypt_enabled;
+        self.encryption_key_version = key_version;
+        self.touch();
+    }
+
+    /// 设置本地路径（解密完成后更新为解密后的路径）
+    ///
+    /// # Arguments
+    /// * `local_path` - 新的本地路径
+    pub fn set_local_path(&mut self, local_path: PathBuf) {
+        self.local_path = Some(local_path);
+        self.touch();
+    }
+
+    /// 设置分享直下相关字段
+    ///
+    /// # Arguments
+    /// * `is_share_direct_download` - 是否为分享直下任务
+    /// * `temp_dir` - 临时目录路径（网盘路径）
+    pub fn set_share_direct_download_info(
+        &mut self,
+        is_share_direct_download: bool,
+        temp_dir: Option<String>,
+    ) {
+        self.is_share_direct_download = Some(is_share_direct_download);
+        self.temp_dir = temp_dir;
+        self.touch();
+    }
+
+    /// 设置分享根的绝对路径（用于稳定推导 share_root）
+    pub fn set_share_root_path(&mut self, share_root_path: Option<String>) {
+        self.share_root_path = share_root_path;
+        self.touch();
+    }
+
+    /// 设置临时目录清理状态
+    pub fn set_cleanup_status(&mut self, status: CleanupStatus) {
+        self.cleanup_status = Some(status);
+        self.touch();
+    }
+
+    /// 检查是否已完成
+    pub fn is_completed(&self) -> bool {
+        self.status == Some(TaskPersistenceStatus::Completed)
+    }
+
+    /// 检查是否为终态
+    pub fn is_terminal(&self) -> bool {
+        self.status.map(|s| s.is_terminal()).unwrap_or(false)
     }
 }
 
-// ============================================================================
-// 配额事件
-// ============================================================================
-
-/// 单账号配额条目（用于 WebSocket 镜像传输）。
+/// WAL 记录
+///
+/// 每条记录占一行，格式为：
+/// - 完成记录：`{chunk_index},{md5},{timestamp_ms}`
+/// - 部分进度记录：`P,{chunk_index},{bytes_downloaded},{timestamp_ms}`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsAccountBudget {
-    pub uid: u64,
-    pub vip_cap_download: usize,
-    pub base_download: usize,
-    pub used_download: usize,
-    pub vip_cap_upload: usize,
-    pub base_upload: usize,
-    pub used_upload: usize,
+pub struct WalRecord {
+    /// 分片索引（0-based）
+    pub chunk_index: usize,
+
+    /// 分片 MD5（仅上传任务需要）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+
+    /// 记录时间戳（Unix 毫秒）
+    pub timestamp_ms: i64,
+
+    /// 分片内已下载字节数（仅 partial progress 记录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_downloaded: Option<u64>,
 }
 
-/// 用量快照单条（轻量版，仅 used_download/used_upload）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageSnapshotEntry {
-    pub uid: u64,
-    pub used_download: usize,
-    pub used_upload: usize,
-}
-
-/// 配额相关 WebSocket 事件（独立于 `TaskEvent`，走 `WsServerMessage::Budget`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
-pub enum BudgetEvent {
-    /// 全量配额重算结果（在账号增删 / 配置更新后推送）。
-    BudgetRecomputed {
-        machine_budget_download: usize,
-        machine_budget_upload: usize,
-        per_account: Vec<WsAccountBudget>,
-    },
-    /// 周期性用量快照（轻量，仅 used_*）。
-    UsageSnapshot {
-        per_account: Vec<UsageSnapshotEntry>,
-    },
-}
-
-impl BudgetEvent {
-    pub fn event_type_name(&self) -> &'static str {
-        match self {
-            BudgetEvent::BudgetRecomputed { .. } => "budget_recomputed",
-            BudgetEvent::UsageSnapshot { .. } => "usage_snapshot",
+impl WalRecord {
+    /// 创建下载任务的 WAL 记录（分片完成）
+    pub fn new_download(chunk_index: usize) -> Self {
+        Self {
+            chunk_index,
+            md5: None,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            bytes_downloaded: None,
         }
+    }
+
+    /// 创建上传任务的 WAL 记录（分片完成）
+    pub fn new_upload(chunk_index: usize, md5: String) -> Self {
+        Self {
+            chunk_index,
+            md5: Some(md5),
+            timestamp_ms: Utc::now().timestamp_millis(),
+            bytes_downloaded: None,
+        }
+    }
+
+    /// 创建分片内部分进度 WAL 记录（用于分片内断点续传持久化）
+    pub fn new_partial(chunk_index: usize, bytes_downloaded: u64) -> Self {
+        Self {
+            chunk_index,
+            md5: None,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            bytes_downloaded: Some(bytes_downloaded),
+        }
+    }
+
+    /// 是否为部分进度记录
+    pub fn is_partial(&self) -> bool {
+        self.bytes_downloaded.is_some()
+    }
+
+    /// 序列化为 WAL 行格式
+    ///
+    /// 完成记录：`{chunk_index},{md5},{timestamp_ms}`
+    /// 部分进度：`P,{chunk_index},{bytes_downloaded},{timestamp_ms}`
+    pub fn to_wal_line(&self) -> String {
+        if let Some(bytes) = self.bytes_downloaded {
+            format!("P,{},{},{}", self.chunk_index, bytes, self.timestamp_ms)
+        } else {
+            format!(
+                "{},{},{}",
+                self.chunk_index,
+                self.md5.as_deref().unwrap_or(""),
+                self.timestamp_ms
+            )
+        }
+    }
+
+    /// 从 WAL 行格式解析（容错）
+    ///
+    /// 支持格式：
+    /// - `P,{chunk_index},{bytes_downloaded},{timestamp_ms}` - 部分进度记录
+    /// - `{chunk_index},{md5},{timestamp_ms}` - 完整格式（分片完成）
+    /// - `{chunk_index},{md5}` - 旧格式（无时间戳）
+    /// - `{chunk_index}` - 最简格式
+    pub fn from_wal_line(line: &str) -> Option<Self> {
+        let parts: Vec<&str> = line.trim().split(',').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        // 部分进度记录：P,{chunk_index},{bytes_downloaded},{timestamp_ms}
+        if parts[0] == "P" {
+            if parts.len() < 3 {
+                return None;
+            }
+            let chunk_index = parts[1].parse::<usize>().ok()?;
+            let bytes_downloaded = parts[2].parse::<u64>().ok()?;
+            let timestamp_ms = if parts.len() > 3 {
+                parts[3]
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| Utc::now().timestamp_millis())
+            } else {
+                Utc::now().timestamp_millis()
+            };
+            return Some(Self {
+                chunk_index,
+                md5: None,
+                timestamp_ms,
+                bytes_downloaded: Some(bytes_downloaded),
+            });
+        }
+
+        // 分片完成记录：{chunk_index},{md5},{timestamp_ms}
+        let chunk_index = parts[0].parse::<usize>().ok()?;
+
+        let md5 = if parts.len() > 1 && !parts[1].is_empty() {
+            Some(parts[1].to_string())
+        } else {
+            None
+        };
+
+        let timestamp_ms = if parts.len() > 2 {
+            parts[2]
+                .parse::<i64>()
+                .unwrap_or_else(|_| Utc::now().timestamp_millis())
+        } else {
+            Utc::now().timestamp_millis()
+        };
+
+        Some(Self {
+            chunk_index,
+            md5,
+            timestamp_ms,
+            bytes_downloaded: None,
+        })
+    }
+}
+
+/// 任务持久化信息（内存状态）
+///
+/// 每个任务在内存中维护一份持久化状态
+pub struct TaskPersistenceInfo {
+    /// 任务 ID
+    pub task_id: String,
+
+    /// 任务类型
+    pub task_type: TaskType,
+
+    /// 已完成的分片集合
+    pub completed_chunks: BitSet,
+
+    /// 分片 MD5 列表（仅上传任务）
+    pub chunk_md5s: Option<Vec<Option<String>>>,
+
+    /// WAL 缓存：待刷写的分片记录
+    /// 使用 parking_lot::Mutex 保护（快速同步操作）
+    pub wal_cache: Mutex<Vec<WalRecord>>,
+
+    /// 元数据是否已修改（需要刷写）
+    pub metadata_dirty: Mutex<bool>,
+
+    /// 分片内部分下载进度（chunk_index → bytes_downloaded）
+    /// 用于分片内断点续传的冷恢复
+    pub partial_progress: HashMap<usize, u64>,
+}
+
+impl TaskPersistenceInfo {
+    /// 创建下载任务的持久化信息
+    pub fn new_download(task_id: String, total_chunks: usize) -> Self {
+        Self {
+            task_id,
+            task_type: TaskType::Download,
+            completed_chunks: BitSet::with_capacity(total_chunks),
+            chunk_md5s: None,
+            wal_cache: Mutex::new(Vec::new()),
+            metadata_dirty: Mutex::new(false),
+            partial_progress: HashMap::new(),
+        }
+    }
+
+    /// 创建上传任务的持久化信息
+    pub fn new_upload(task_id: String, total_chunks: usize) -> Self {
+        Self {
+            task_id,
+            task_type: TaskType::Upload,
+            completed_chunks: BitSet::with_capacity(total_chunks),
+            chunk_md5s: Some(vec![None; total_chunks]),
+            wal_cache: Mutex::new(Vec::new()),
+            metadata_dirty: Mutex::new(false),
+            partial_progress: HashMap::new(),
+        }
+    }
+
+    /// 创建转存任务的持久化信息（无分片）
+    pub fn new_transfer(task_id: String) -> Self {
+        Self {
+            task_id,
+            task_type: TaskType::Transfer,
+            completed_chunks: BitSet::new(),
+            chunk_md5s: None,
+            wal_cache: Mutex::new(Vec::new()),
+            metadata_dirty: Mutex::new(false),
+            partial_progress: HashMap::new(),
+        }
+    }
+
+    /// 标记分片完成（下载任务）
+    ///
+    /// 只有当分片是新完成时才添加到 WAL 缓存，避免重复记录
+    pub fn mark_chunk_completed(&mut self, chunk_index: usize) {
+        // 检查分片是否已经完成
+        // insert() 返回 true 表示新插入，false 表示已存在
+        let is_new = self.completed_chunks.insert(chunk_index);
+        // 分片已完成，清除对应的部分进度记录
+        self.partial_progress.remove(&chunk_index);
+
+        if is_new {
+            // 只有新完成的分片才添加到 WAL 缓存
+            let record = WalRecord::new_download(chunk_index);
+            self.wal_cache.lock().push(record);
+        } else {
+            // 分片已经完成过，可能是重复调用，记录警告
+            warn!("分片 #{} 已标记为完成，跳过重复记录到 WAL", chunk_index);
+        }
+    }
+
+    /// 更新分片内部分下载进度（分片内断点续传）
+    ///
+    /// 将部分进度写入内存 + WAL 缓存，待下次刷写周期持久化到磁盘
+    pub fn update_chunk_partial_progress(&mut self, chunk_index: usize, bytes_downloaded: u64) {
+        if bytes_downloaded == 0 {
+            return;
+        }
+        // 已完成的分片不需要部分进度
+        if self.completed_chunks.contains(chunk_index) {
+            return;
+        }
+        self.partial_progress.insert(chunk_index, bytes_downloaded);
+        let record = WalRecord::new_partial(chunk_index, bytes_downloaded);
+        self.wal_cache.lock().push(record);
+    }
+
+    /// 标记分片完成（上传任务，带 MD5）
+    ///
+    /// 只有当分片是新完成时才添加到 WAL 缓存，避免重复记录
+    pub fn mark_chunk_completed_with_md5(&mut self, chunk_index: usize, md5: String) {
+        // 检查分片是否已经完成
+        // insert() 返回 true 表示新插入，false 表示已存在
+        let is_new = self.completed_chunks.insert(chunk_index);
+
+        if is_new {
+            // 保存 MD5
+            if let Some(ref mut md5s) = self.chunk_md5s {
+                if chunk_index < md5s.len() {
+                    md5s[chunk_index] = Some(md5.clone());
+                }
+            }
+
+            // 只有新完成的分片才添加到 WAL 缓存
+            let record = WalRecord::new_upload(chunk_index, md5);
+            self.wal_cache.lock().push(record);
+        } else {
+            // 分片已经完成过，可能是重复调用，记录警告
+            warn!(
+                "分片 #{} 已标记为完成，跳过重复记录到 WAL (MD5: {})",
+                chunk_index, md5
+            );
+        }
+    }
+
+    /// 获取已完成的分片数
+    pub fn completed_count(&self) -> usize {
+        self.completed_chunks.len()
+    }
+
+    /// 检查分片是否已完成
+    pub fn is_chunk_completed(&self, chunk_index: usize) -> bool {
+        self.completed_chunks.contains(chunk_index)
+    }
+
+    /// 获取未完成的分片索引列表
+    pub fn get_pending_chunks(&self, total_chunks: usize) -> Vec<usize> {
+        (0..total_chunks)
+            .filter(|&i| !self.completed_chunks.contains(i))
+            .collect()
+    }
+
+    /// 获取待刷写的 WAL 记录并清空缓存
+    pub fn take_wal_cache(&self) -> Vec<WalRecord> {
+        let mut cache = self.wal_cache.lock();
+        std::mem::take(&mut *cache)
+    }
+
+    /// 标记元数据已修改
+    pub fn mark_metadata_dirty(&self) {
+        *self.metadata_dirty.lock() = true;
+    }
+
+    /// 检查并清除元数据脏标记
+    pub fn take_metadata_dirty(&self) -> bool {
+        let mut dirty = self.metadata_dirty.lock();
+        let was_dirty = *dirty;
+        *dirty = false;
+        was_dirty
     }
 }
 
@@ -1311,340 +1127,229 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_download_event_serialization() {
-        let event = DownloadEvent::Progress {
-            task_id: "test-123".to_string(),
-            downloaded_size: 1000,
-            total_size: 2000,
-            speed: 500,
-            progress: 50.0,
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("progress"));
-        assert!(json.contains("test-123"));
+    fn test_task_type_serialization() {
+        assert_eq!(TaskType::Download.as_str(), "download");
+        assert_eq!(TaskType::Upload.as_str(), "upload");
+        assert_eq!(TaskType::Transfer.as_str(), "transfer");
     }
 
     #[test]
-    fn test_task_event_serialization() {
-        let event = TaskEvent::Download(DownloadEvent::Created {
-            task_id: "test-123".to_string(),
-            fs_id: 12345,
-            remote_path: "/test.txt".to_string(),
-            local_path: "./test.txt".to_string(),
-            total_size: 1024,
-            group_id: None,
-            is_backup: false,
-            original_filename: None,
-            owner_uid: None,
-        });
+    fn test_wal_record_line_format() {
+        // 下载任务记录
+        let record = WalRecord::new_download(5);
+        let line = record.to_wal_line();
+        assert!(line.starts_with("5,,"));
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("download"));
-        assert!(json.contains("created"));
+        // 上传任务记录
+        let record = WalRecord::new_upload(3, "abc123".to_string());
+        let line = record.to_wal_line();
+        assert!(line.starts_with("3,abc123,"));
     }
 
     #[test]
-    fn test_event_priority() {
-        let progress = DownloadEvent::Progress {
-            task_id: "1".to_string(),
-            downloaded_size: 0,
-            total_size: 0,
-            speed: 0,
-            progress: 0.0,
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        };
-        assert_eq!(progress.priority(), EventPriority::Low);
+    fn test_wal_record_parsing() {
+        // 完整格式
+        let record = WalRecord::from_wal_line("5,abc123,1700000000000").unwrap();
+        assert_eq!(record.chunk_index, 5);
+        assert_eq!(record.md5, Some("abc123".to_string()));
+        assert_eq!(record.timestamp_ms, 1700000000000);
 
-        let completed = DownloadEvent::Completed {
-            task_id: "1".to_string(),
-            completed_at: 0,
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        };
-        assert_eq!(completed.priority(), EventPriority::High);
+        // 无 MD5
+        let record = WalRecord::from_wal_line("3,,1700000000000").unwrap();
+        assert_eq!(record.chunk_index, 3);
+        assert_eq!(record.md5, None);
+
+        // 最简格式
+        let record = WalRecord::from_wal_line("7").unwrap();
+        assert_eq!(record.chunk_index, 7);
+        assert_eq!(record.md5, None);
     }
 
     #[test]
-    fn test_upload_encrypt_event_serialization() {
-        let event = UploadEvent::EncryptProgress {
-            task_id: "test-123".to_string(),
-            encrypt_progress: 50.0,
-            processed_bytes: 512000,
-            total_bytes: 1024000,
-            is_backup: false,
-            owner_uid: None,
-        };
+    fn test_task_persistence_info() {
+        let mut info = TaskPersistenceInfo::new_download("task1".to_string(), 10);
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("encrypt_progress"));
-        assert!(json.contains("test-123"));
-        assert!(json.contains("512000"));
+        // 标记分片完成
+        info.mark_chunk_completed(0);
+        info.mark_chunk_completed(5);
+        info.mark_chunk_completed(9);
 
-        // 测试反序列化
-        let parsed: UploadEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.task_id(), "test-123");
-        assert_eq!(parsed.event_type_name(), "encrypt_progress");
+        assert_eq!(info.completed_count(), 3);
+        assert!(info.is_chunk_completed(0));
+        assert!(info.is_chunk_completed(5));
+        assert!(info.is_chunk_completed(9));
+        assert!(!info.is_chunk_completed(1));
+
+        // 获取未完成分片
+        let pending = info.get_pending_chunks(10);
+        assert_eq!(pending, vec![1, 2, 3, 4, 6, 7, 8]);
+
+        // WAL 缓存
+        let cache = info.take_wal_cache();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache[0].chunk_index, 0);
+        assert_eq!(cache[1].chunk_index, 5);
+        assert_eq!(cache[2].chunk_index, 9);
+
+        // 缓存已清空
+        let cache = info.take_wal_cache();
+        assert!(cache.is_empty());
     }
 
     #[test]
-    fn test_upload_encrypt_completed_event() {
-        let event = UploadEvent::EncryptCompleted {
-            task_id: "test-456".to_string(),
-            encrypted_size: 1100,
-            original_size: 1024,
-            is_backup: true,
-            owner_uid: None,
-        };
+    fn test_upload_task_with_md5() {
+        let mut info = TaskPersistenceInfo::new_upload("task2".to_string(), 5);
 
-        assert_eq!(event.priority(), EventPriority::High);
-        assert_eq!(event.event_type_name(), "encrypt_completed");
-        assert!(event.is_backup());
+        info.mark_chunk_completed_with_md5(0, "md5_0".to_string());
+        info.mark_chunk_completed_with_md5(2, "md5_2".to_string());
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("encrypt_completed"));
-        assert!(json.contains("1100"));
-        assert!(json.contains("1024"));
+        assert_eq!(info.completed_count(), 2);
+
+        // 检查 MD5 存储
+        let md5s = info.chunk_md5s.as_ref().unwrap();
+        assert_eq!(md5s[0], Some("md5_0".to_string()));
+        assert_eq!(md5s[1], None);
+        assert_eq!(md5s[2], Some("md5_2".to_string()));
+
+        // WAL 缓存带 MD5
+        let cache = info.take_wal_cache();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[0].md5, Some("md5_0".to_string()));
+        assert_eq!(cache[1].md5, Some("md5_2".to_string()));
     }
 
     #[test]
-    fn test_download_decrypt_event_serialization() {
-        let event = DownloadEvent::DecryptProgress {
-            task_id: "test-789".to_string(),
-            decrypt_progress: 75.0,
-            processed_bytes: 768000,
-            total_bytes: 1024000,
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        };
+    fn test_task_metadata_download() {
+        let metadata = TaskMetadata::new_download(
+            "task1".to_string(),
+            12345,
+            "/test/file.txt".to_string(),
+            PathBuf::from("/local/file.txt"),
+            1024 * 1024,
+            256 * 1024,
+            4,
+            None,  // is_encrypted
+            None,  // encryption_key_version
+        );
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("decrypt_progress"));
-        assert!(json.contains("test-789"));
-        assert!(json.contains("768000"));
-
-        // 测试反序列化
-        let parsed: DownloadEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.task_id(), "test-789");
-        assert_eq!(parsed.event_type_name(), "decrypt_progress");
+        assert_eq!(metadata.task_type, TaskType::Download);
+        assert_eq!(metadata.fs_id, Some(12345));
+        assert_eq!(metadata.total_chunks, Some(4));
     }
 
     #[test]
-    fn test_download_decrypt_completed_event() {
-        let event = DownloadEvent::DecryptCompleted {
-            task_id: "test-abc".to_string(),
-            original_size: 1024,
-            decrypted_path: "/downloads/original.txt".to_string(),
-            group_id: Some("folder-123".to_string()),
-            is_backup: false,
-            owner_uid: None,
-        };
+    fn test_task_metadata_upload() {
+        let mut metadata = TaskMetadata::new_upload(
+            "task2".to_string(),
+            PathBuf::from("/local/upload.txt"),
+            "/remote/upload.txt".to_string(),
+            2 * 1024 * 1024,
+            512 * 1024,
+            4,
+            None,  // encrypt_enabled
+            None,  // encryption_key_version
+        );
 
-        assert_eq!(event.priority(), EventPriority::High);
-        assert_eq!(event.event_type_name(), "decrypt_completed");
-        assert_eq!(event.group_id(), Some("folder-123"));
+        assert_eq!(metadata.task_type, TaskType::Upload);
+        assert!(metadata.upload_id.is_none());
 
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("decrypt_completed"));
-        assert!(json.contains("/downloads/original.txt"));
+        // 设置上传 ID
+        metadata.set_upload_id("upload_id_123".to_string());
+        assert_eq!(metadata.upload_id, Some("upload_id_123".to_string()));
+        assert!(metadata.upload_id_created_at.is_some());
     }
 
     #[test]
-    fn test_encrypt_decrypt_event_priority() {
-        // 加密进度事件应为低优先级
-        let encrypt_progress = UploadEvent::EncryptProgress {
-            task_id: "1".to_string(),
-            encrypt_progress: 50.0,
-            processed_bytes: 0,
-            total_bytes: 0,
-            is_backup: false,
-            owner_uid: None,
-        };
-        assert_eq!(encrypt_progress.priority(), EventPriority::Low);
+    fn test_task_metadata_transfer() {
+        let mut metadata = TaskMetadata::new_transfer(
+            "task3".to_string(),
+            "https://pan.baidu.com/s/xxx".to_string(),
+            Some("1234".to_string()),
+            "/save/path".to_string(),
+            true, // auto_download
+            Some("test_file.zip".to_string()), // file_name
+        );
 
-        // 加密完成事件应为高优先级
-        let encrypt_completed = UploadEvent::EncryptCompleted {
-            task_id: "1".to_string(),
-            encrypted_size: 0,
-            original_size: 0,
-            is_backup: false,
-            owner_uid: None,
-        };
-        assert_eq!(encrypt_completed.priority(), EventPriority::High);
+        assert_eq!(metadata.task_type, TaskType::Transfer);
+        assert_eq!(metadata.transfer_status, Some("checking_share".to_string()));
+        assert_eq!(metadata.auto_download, Some(true));
+        assert_eq!(metadata.transfer_file_name, Some("test_file.zip".to_string()));
 
-        // 解密进度事件应为低优先级
-        let decrypt_progress = DownloadEvent::DecryptProgress {
-            task_id: "1".to_string(),
-            decrypt_progress: 50.0,
-            processed_bytes: 0,
-            total_bytes: 0,
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        };
-        assert_eq!(decrypt_progress.priority(), EventPriority::Low);
+        // 设置转存状态
+        metadata.set_transfer_status("downloading");
+        assert_eq!(metadata.transfer_status, Some("downloading".to_string()));
 
-        // 解密完成事件应为高优先级
-        let decrypt_completed = DownloadEvent::DecryptCompleted {
-            task_id: "1".to_string(),
-            original_size: 0,
-            decrypted_path: "".to_string(),
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        };
-        assert_eq!(decrypt_completed.priority(), EventPriority::High);
+        // 设置关联下载任务
+        metadata.set_download_task_ids(vec!["dl1".to_string(), "dl2".to_string()]);
+        assert_eq!(metadata.download_task_ids.len(), 2);
+
+        // 测试新增的 setter 方法
+        metadata.set_auto_download(false);
+        assert_eq!(metadata.auto_download, Some(false));
+
+        metadata.set_transfer_file_name("new_file.zip".to_string());
+        assert_eq!(metadata.transfer_file_name, Some("new_file.zip".to_string()));
+
+        metadata.set_transfer_task_id("transfer_001".to_string());
+        assert_eq!(metadata.transfer_task_id, Some("transfer_001".to_string()));
     }
 
+    /// 旧 .meta（无 owner_uid 字段）必须仍能反序列化，owner_uid=None
+    ///
+    /// 这是多账号必备的向后兼容能力；新逻辑通过恢复分支处理
+    /// （C/D 把 None 填充为 active_uid）。
     #[test]
-    fn test_is_active_with_encrypt_decrypt_events() {
-        // 加密进度事件应为活跃事件
-        let encrypt_progress = TaskEvent::Upload(UploadEvent::EncryptProgress {
-            task_id: "1".to_string(),
-            encrypt_progress: 50.0,
-            processed_bytes: 0,
-            total_bytes: 0,
-            is_backup: false,
-            owner_uid: None,
-        });
-        assert!(encrypt_progress.is_active());
+    fn test_owner_uid_backward_compat_deserialization() {
+        // 构造一段不含 owner_uid 的旧版本 JSON
+        // 注：TaskType / TaskPersistenceStatus 均为 snake_case 序列化
+        let legacy_json = r#"{
+            "task_id": "legacy_001",
+            "task_type": "download",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "fs_id": 12345,
+            "remote_path": "/legacy/file.txt",
+            "local_path": "/local/legacy.txt",
+            "file_size": 1024,
+            "chunk_size": 256,
+            "total_chunks": 4,
+            "status": "pending"
+        }"#;
 
-        // 解密进度事件应为活跃事件
-        let decrypt_progress = TaskEvent::Download(DownloadEvent::DecryptProgress {
-            task_id: "1".to_string(),
-            decrypt_progress: 50.0,
-            processed_bytes: 0,
-            total_bytes: 0,
-            group_id: None,
-            is_backup: false,
-            owner_uid: None,
-        });
-        assert!(decrypt_progress.is_active());
+        let metadata: TaskMetadata = serde_json::from_str(legacy_json).expect("旧 .meta 必须可反序列化");
+        assert_eq!(metadata.task_id, "legacy_001");
+        assert_eq!(metadata.owner_uid, None, "旧 .meta 反序列化后 owner_uid 必须为 None");
 
-        // encrypting 状态变更应为活跃事件
-        let encrypting_status = TaskEvent::Upload(UploadEvent::StatusChanged {
-            task_id: "1".to_string(),
-            old_status: "pending".to_string(),
-            new_status: "encrypting".to_string(),
-            is_backup: false,
-            owner_uid: None,
-        });
-        assert!(encrypting_status.is_active());
+        // 序列化再反序列化（None 不应被写入 JSON）
+        let json = serde_json::to_string(&metadata).expect("序列化失败");
+        assert!(!json.contains("owner_uid"), "owner_uid=None 不应写入 JSON，实际：{}", json);
 
-        // decrypting 状态变更应为活跃事件
-        let decrypting_status = TaskEvent::Download(DownloadEvent::StatusChanged {
-            task_id: "1".to_string(),
-            old_status: "downloading".to_string(),
-            new_status: "decrypting".to_string(),
-            group_id: None,
-            is_backup: false,
-            error: None,
-            owner_uid: None,
-        });
-        assert!(decrypting_status.is_active());
+        let round_trip: TaskMetadata = serde_json::from_str(&json).expect("回环失败");
+        assert_eq!(round_trip.owner_uid, None);
     }
 
+    /// with_owner_uid builder + 写入 JSON + 重新反序列化
     #[test]
-    fn test_backup_file_encrypt_progress_event() {
-        let event = BackupEvent::FileEncryptProgress {
-            task_id: "backup-123".to_string(),
-            file_task_id: "file-456".to_string(),
-            file_name: "test.txt".to_string(),
-            progress: 50.0,
-            processed_bytes: 512000,
-            total_bytes: 1024000,
-            owner_uid: None,
-        };
+    fn test_owner_uid_builder_roundtrip() {
+        let metadata = TaskMetadata::new_download(
+            "with_uid_001".to_string(),
+            999,
+            "/test".to_string(),
+            PathBuf::from("/local/test.txt"),
+            100,
+            10,
+            10,
+            None,
+            None,
+        )
+            .with_owner_uid(7890123456);
 
-        // 测试 task_id
-        assert_eq!(event.task_id(), "backup-123");
+        assert_eq!(metadata.owner_uid, Some(7890123456));
 
-        // 测试优先级（进度事件应为低优先级）
-        assert_eq!(event.priority(), EventPriority::Low);
+        let json = serde_json::to_string(&metadata).expect("序列化失败");
+        assert!(json.contains("\"owner_uid\":7890123456"), "owner_uid 应被写入 JSON，实际：{}", json);
 
-        // 测试事件类型名称
-        assert_eq!(event.event_type_name(), "file_encrypt_progress");
-
-        // 测试序列化
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("file_encrypt_progress"));
-        assert!(json.contains("backup-123"));
-        assert!(json.contains("file-456"));
-        assert!(json.contains("test.txt"));
-        assert!(json.contains("512000"));
-
-        // 测试反序列化
-        let parsed: BackupEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.task_id(), "backup-123");
-        assert_eq!(parsed.event_type_name(), "file_encrypt_progress");
-    }
-
-    #[test]
-    fn test_backup_file_decrypt_progress_event() {
-        let event = BackupEvent::FileDecryptProgress {
-            task_id: "backup-789".to_string(),
-            file_task_id: "file-abc".to_string(),
-            file_name: "encrypted.bkup".to_string(),
-            progress: 75.0,
-            processed_bytes: 768000,
-            total_bytes: 1024000,
-            owner_uid: None,
-        };
-
-        // 测试 task_id
-        assert_eq!(event.task_id(), "backup-789");
-
-        // 测试优先级（进度事件应为低优先级）
-        assert_eq!(event.priority(), EventPriority::Low);
-
-        // 测试事件类型名称
-        assert_eq!(event.event_type_name(), "file_decrypt_progress");
-
-        // 测试序列化
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("file_decrypt_progress"));
-        assert!(json.contains("backup-789"));
-        assert!(json.contains("file-abc"));
-        assert!(json.contains("encrypted.bkup"));
-        assert!(json.contains("768000"));
-
-        // 测试反序列化
-        let parsed: BackupEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.task_id(), "backup-789");
-        assert_eq!(parsed.event_type_name(), "file_decrypt_progress");
-    }
-
-    #[test]
-    fn test_backup_encrypt_decrypt_progress_is_active() {
-        // 备份文件加密进度事件应为活跃事件
-        let encrypt_progress = TaskEvent::Backup(BackupEvent::FileEncryptProgress {
-            task_id: "1".to_string(),
-            file_task_id: "f1".to_string(),
-            file_name: "test.txt".to_string(),
-            progress: 50.0,
-            processed_bytes: 0,
-            total_bytes: 0,
-            owner_uid: None,
-        });
-        assert!(encrypt_progress.is_active());
-
-        // 备份文件解密进度事件应为活跃事件
-        let decrypt_progress = TaskEvent::Backup(BackupEvent::FileDecryptProgress {
-            task_id: "1".to_string(),
-            file_task_id: "f1".to_string(),
-            file_name: "test.bkup".to_string(),
-            progress: 75.0,
-            processed_bytes: 0,
-            total_bytes: 0,
-            owner_uid: None,
-        });
-        assert!(decrypt_progress.is_active());
+        let parsed: TaskMetadata = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(parsed.owner_uid, Some(7890123456));
     }
 }

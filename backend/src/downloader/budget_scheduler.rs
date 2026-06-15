@@ -1146,7 +1146,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let p1 = bs.acquire_chunk_permit(Uid::new(100), BudgetKind::Download).await;
         assert!(p1.is_some());
@@ -1200,7 +1200,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let p1 = bs.acquire_chunk_permit(Uid::new(7), BudgetKind::Download).await;
         let p2 = bs.acquire_chunk_permit(Uid::new(7), BudgetKind::Download).await;
@@ -1266,21 +1266,21 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
         bs.add_account(
             Uid::new(2),
             VipType::Normal,
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
         bs.add_account(
             Uid::new(3),
             VipType::Normal,
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let track = &bs.download;
         let slot = track.accounts.get(&Uid::new(1)).unwrap();
@@ -1364,7 +1364,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let snap1 = bs.snapshot().await;
         let acct1 = snap1
@@ -1381,7 +1381,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let snap2 = bs.snapshot().await;
         let acct2 = snap2
@@ -1401,7 +1401,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let snap3 = bs.snapshot().await;
         let acct3 = snap3
@@ -1438,7 +1438,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let snap1 = bs.snapshot().await;
         let acct1 = snap1.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
 
         let snap2 = bs.snapshot().await;
         let acct2 = snap2.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
 
         let snap4 = bs.snapshot().await;
         let acct4 = snap4.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
@@ -1527,7 +1527,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         // acquire 8 个 permit
         let mut held: Vec<ChunkPermit> = Vec::new();
@@ -1553,7 +1553,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
 
         // 此时 forget_permits 只消耗了 available 的 2 个；剩余 3 进入 shrink_debt
         assert_eq!(slot.sem.available_permits(), 0, "available 被 forget 消耗光");
@@ -1635,7 +1635,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         // acquire 8 个 permit
         let mut held: Vec<ChunkPermit> = Vec::new();
@@ -1660,7 +1660,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
         assert_eq!(slot.shrink_debt.load(Ordering::SeqCst), 3, "debt=3");
         assert_eq!(slot.sem.available_permits(), 0);
 
@@ -1673,7 +1673,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
 
         // 验收：debt 必须先被 diff(=5) 抵消 3 个 → debt=0，剩 2 真正 add_permits
         assert_eq!(
@@ -1749,7 +1749,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         let track = &bs.download;
         let slot = Arc::clone(track.accounts.get(&Uid::new(1)).unwrap().value());
@@ -1784,7 +1784,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
         assert_eq!(slot.effective_cap.load(Ordering::SeqCst), 5);
         assert_eq!(slot.sem.available_permits(), 5);
 
@@ -1841,7 +1841,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         // 32 个 task 同时启动，每个 task 跑 ROUNDS 轮
         const TASKS: usize = 32;
@@ -1921,7 +1921,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
         bs.update_recommended(
             Some(VipRecommendedTable {
                 normal_threads: 1,
@@ -1930,7 +1930,7 @@ mod tests {
             }),
             None,
         )
-        .await;
+            .await;
 
         // 验收：sem.available_permits() 必须严格等于 effective_cap
         // （旧无锁实现：会出现并发下 sem 容量被多次 add，比 effective_cap 大几倍）
@@ -1982,14 +1982,14 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
         bs.add_account(
             Uid::new(2),
             VipType::Vip,
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-        .await;
+            .await;
 
         // 并发 reader：不断快照
         let bs_r = Arc::clone(&bs);

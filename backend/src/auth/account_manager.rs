@@ -642,8 +642,8 @@ mod tests {
             &accounts_file,
             serde_json::to_string_pretty(&existing).unwrap(),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         // 迁移应跳过
         let mgr = AccountManager::migrate_from_session(&session_file, &accounts_file)

@@ -643,7 +643,7 @@ mod tests {
             Duration::from_millis(100),
             sem.acquire(Priority::P1),
         )
-        .await;
+            .await;
         assert!(new_permit.is_ok(), "acquire 在 cancel 之后应能正常成功");
     }
 
