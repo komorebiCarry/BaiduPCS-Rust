@@ -18,11 +18,11 @@
             <template v-for="(item, index) in pathStack" :key="index">
               <span class="breadcrumb-sep">/</span>
               <el-button
-                link
-                :type="index === pathStack.length - 1 ? 'default' : 'primary'"
-                size="small"
-                :disabled="index === pathStack.length - 1"
-                @click="navigateToLevel(index)"
+                  link
+                  :type="index === pathStack.length - 1 ? 'default' : 'primary'"
+                  size="small"
+                  :disabled="index === pathStack.length - 1"
+                  @click="navigateToLevel(index)"
               >
                 {{ item.name }}
               </el-button>
@@ -31,9 +31,9 @@
         </div>
         <div class="header-bottom">
           <el-checkbox
-            :model-value="isAllCurrentSelected"
-            :indeterminate="isCurrentIndeterminate"
-            @change="handleSelectAllCurrent"
+              :model-value="isAllCurrentSelected"
+              :indeterminate="isCurrentIndeterminate"
+              @change="handleSelectAllCurrent"
           >
             全选
           </el-checkbox>
@@ -50,16 +50,16 @@
       <el-scrollbar ref="scrollbarRef" :max-height="isMobile ? '250px' : '300px'">
         <div class="file-list" ref="fileListRef">
           <div
-            v-for="file in currentFiles"
-            :key="file.fs_id"
-            class="file-item"
-            @click="handleItemClick(file)"
+              v-for="file in currentFiles"
+              :key="file.fs_id"
+              class="file-item"
+              @click="handleItemClick(file)"
           >
             <el-checkbox
-              :model-value="isFolderChecked(file)"
-              :indeterminate="isFolderIndeterminate(file)"
-              @change="(val: boolean) => handleCheckChange(file.fs_id, val, file)"
-              @click.stop
+                :model-value="isFolderChecked(file)"
+                :indeterminate="isFolderIndeterminate(file)"
+                @change="(val: boolean) => handleCheckChange(file.fs_id, val, file)"
+                @click.stop
             />
             <el-icon class="file-icon" :class="{ 'folder-icon': file.is_dir }">
               <Folder v-if="file.is_dir" />
@@ -100,7 +100,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { Loading, Folder, Document, ArrowRight } from '@element-plus/icons-vue'
 import { useIsMobile } from '@/utils/responsive'
 import { formatFileSize } from '@/api/utils'
-import { previewShareDir, previewShareFiles, type SharedFileInfo, type PreviewShareInfo, type PreviewShareRequest } from '@/api/transfer'
+import { previewShareDir, previewShareFiles, type SharedFileInfo, type PreviewShareInfo } from '@/api/transfer'
 
 const isMobile = useIsMobile()
 
@@ -144,7 +144,7 @@ const fileListRef = ref<HTMLElement | null>(null)
 
 // 当前显示的文件列表（根目录用 props.files + rootExtraFiles，子目录用 dirFiles）
 const currentFiles = computed(() =>
-  pathStack.value.length > 0 ? dirFiles.value : [...props.files, ...rootExtraFiles.value]
+    pathStack.value.length > 0 ? dirFiles.value : [...props.files, ...rootExtraFiles.value]
 )
 
 // 全局选中状态（跨目录保持）
@@ -256,7 +256,7 @@ function handleSelectAllCurrent(val: boolean | string | number) {
 // 单个文件选择变化
 function handleCheckChange(fsId: number, checked: boolean | string | number, file?: SharedFileInfo) {
   const newSet = new Set(checkedFsIds.value)
-  
+
   // 如果是进入过的文件夹，勾选/取消勾选要联动子文件
   if (file?.is_dir) {
     const children = folderChildren.value.get(fsId)
@@ -286,7 +286,7 @@ function handleCheckChange(fsId: number, checked: boolean | string | number, fil
       newSet.delete(fsId)
     }
   }
-  
+
   checkedFsIds.value = newSet
   emitSelection()
 }
@@ -517,7 +517,7 @@ function emitSelection() {
   const result: number[] = []
   // 收集所有"被进入过的文件夹的子文件 id"，用于后续判断是否需要折叠
   const coveredByFolder = new Set<number>()
-  
+
   // 先处理进入过的文件夹：判断全选还是部分选中
   for (const [folderId, children] of folderChildren.value) {
     if (children.length === 0) continue
@@ -531,19 +531,19 @@ function emitSelection() {
     }
     // 部分选中 → 不发文件夹 id，子文件各自判断（下面统一处理）
   }
-  
+
   // 再处理 checkedFsIds 中剩余的项
   for (const fsId of checkedFsIds.value) {
     if (coveredByFolder.has(fsId)) continue // 已被全选文件夹覆盖
     result.push(fsId)
   }
-  
+
   emit('update:selectedFsIds', result)
 
   // 同时发送选中文件的完整信息（用于后端获取文件元信息）
   const selectedFiles: SharedFileInfo[] = result
-    .map(fsId => allKnownFiles.value.get(fsId))
-    .filter((f): f is SharedFileInfo => f !== undefined)
+      .map(fsId => allKnownFiles.value.get(fsId))
+      .filter((f): f is SharedFileInfo => f !== undefined)
   emit('update:selectedFiles', selectedFiles)
 }
 </script>

@@ -177,7 +177,7 @@ export async function createBatchDownload(req: CreateBatchDownloadRequest): Prom
  */
 export function calculateProgress(task: DownloadTask): number {
   if (task.total_size === 0) return 0
-  return (task.downloaded_size / task.total_size) * 100
+  return Math.min(100, Math.max(0, (task.downloaded_size / task.total_size) * 100))
 }
 
 

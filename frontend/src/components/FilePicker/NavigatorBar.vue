@@ -168,7 +168,7 @@ const breadcrumbs = computed(() => {
 
     const restPath = path.substring(3) // 去掉 C:\
     if (restPath) {
-      const segments = restPath.split(/[\\\/]/).filter(Boolean)
+      const segments = restPath.split(/[\\/]/).filter(Boolean)
       let currentPath = driveLetter
       for (const segment of segments) {
         currentPath += '\\' + segment

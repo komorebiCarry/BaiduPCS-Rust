@@ -209,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 初始化日志系统（必须保持 _log_guard 存活）
     let _log_guard = logging::init_logging(&log_config);
 
-    info!("Baidu Netdisk Rust v2.0.1 启动中...");
+    info!("Baidu Netdisk Rust v2.1.0 启动中...");
 
     // 创建应用状态
     let app_state = AppState::new().await?;
@@ -447,7 +447,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/share-sync/subscriptions/:id/enable", post(handlers::enable_subscription))
         .route("/share-sync/subscriptions/:id/disable", post(handlers::disable_subscription))
         .route("/share-sync/subscriptions/:id/trigger", post(handlers::trigger_subscription))
+        .route("/share-sync/subscriptions/:id/resume", post(handlers::resume_subscription))
         .route("/share-sync/subscriptions/:id/runs", get(handlers::list_runs))
+        .route("/share-sync/subscriptions/:id/subtasks", get(handlers::list_subtasks))
         .route("/share-sync/runs/:id", get(handlers::get_run))
         .route("/share-sync/subscriptions/:id/snapshots/latest", get(handlers::latest_snapshot))
         .route("/share-sync/preview-tree", post(handlers::preview_tree))

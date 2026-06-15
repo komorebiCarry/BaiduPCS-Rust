@@ -1,10 +1,10 @@
 <template>
   <el-dialog
-    v-model="visible"
-    title="个人信息"
-    width="400px"
-    :close-on-click-modal="true"
-    @close="handleClose"
+      v-model="visible"
+      title="个人信息"
+      width="400px"
+      :close-on-click-modal="true"
+      @close="handleClose"
   >
     <div class="profile-content">
       <!-- 头像和基本信息 -->
@@ -40,9 +40,9 @@
           <span class="storage-text">{{ usedSpaceFormatted }} / {{ totalSpaceFormatted }}</span>
         </div>
         <el-progress
-          :percentage="storagePercentage"
-          :color="storageColor"
-          :stroke-width="10"
+            :percentage="storagePercentage"
+            :color="storageColor"
+            :stroke-width="10"
         />
       </div>
     </div>
@@ -115,7 +115,7 @@ const totalSpaceFormatted = computed(() => {
 
 const storagePercentage = computed(() => {
   if (!props.user?.total_space) return 0
-  return Math.round((props.user.used_space || 0) / props.user.total_space * 100)
+  return Math.min(100, Math.max(0, Math.round((props.user.used_space || 0) / props.user.total_space * 100)))
 })
 
 const storageColor = computed(() => {

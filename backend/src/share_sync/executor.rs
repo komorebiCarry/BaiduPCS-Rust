@@ -40,6 +40,20 @@ use uuid::Uuid;
 
 const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const TASK_OPERATION_MAX_ATTEMPTS: usize = 3;
+/// 二分递归深度上限（既用于失败后二分,也用于 Netdisk 主动预拆批）。
+const BISECT_MAX_DEPTH: u32 = 32;
+/// 百度非超级会员单次转存 fs_id 总数上限（默认 500），可用
+/// `BAIDUPCS_TRANSFER_FILE_LIMIT` 覆盖。Netdisk 整目录一次转存超过它必撞
+/// errno=12「转存文件数超限」，故据此主动预拆批,避免提交注定失败的整目录转存。
+const TRANSFER_FILE_LIMIT_DEFAULT: usize = 500;
+
+fn transfer_file_limit() -> usize {
+    std::env::var("BAIDUPCS_TRANSFER_FILE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(TRANSFER_FILE_LIMIT_DEFAULT)
+}
 const TASK_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
 
 /// 把"环境资源不足"类错误（Quota / LocalDiskFull）映射到 run_item reason
@@ -65,21 +79,6 @@ fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
     let removed = diff.removed.iter().filter(|item| !item.is_dir).count();
     summary.total = added + modified + removed + diff.unchanged_count;
     summary.unchanged = diff.unchanged_count;
-}
-
-fn reconcile_summary_from_run_items(
-    persistence: &ShareSyncPersistence,
-    run_id: &str,
-    summary: &mut DiffSummary,
-) {
-    if let Ok(items) = persistence.list_run_items(run_id) {
-        summary.failed = items.iter().filter(|i| i.status == "failed").count();
-        summary.skipped = items.iter().filter(|i| i.status == "skipped").count();
-        summary.overwritten = items
-            .iter()
-            .filter(|i| i.status == "completed" && i.versioned_old_path.is_some())
-            .count();
-    }
 }
 
 /// v1：整批 submit 触发的最小组内文件数
@@ -135,6 +134,7 @@ pub trait ExecutorHooks: Send + Sync {
         item: &ShareSnapshotItem,
         local_dir: &Path,
         strategy: ConflictStrategy,
+        transfer_netdisk_dir: Option<&str>,
     ) -> Result<String, ShareSyncError>;
 
     /// 等待转存任务进入业务所需的终态
@@ -194,6 +194,7 @@ pub trait ExecutorHooks: Send + Sync {
         _items: &[ShareSnapshotItem],
         _local_dir: &Path,
         _strategy: ConflictStrategy,
+        _transfer_netdisk_dir: Option<&str>,
     ) -> Result<String, ShareSyncError> {
         Err(ShareSyncError::Internal(
             "submit_download_batch 未实现".to_string(),
@@ -207,6 +208,10 @@ pub struct ApplyOutcome {
     pub status: RunStatus,
     pub diff_summary: DiffSummary,
     pub error: Option<String>,
+    /// 是否有子项因资源类原因（网盘配额满 / 本地磁盘满）被跳过。
+    /// 这类项虽然不把 run 标记为业务失败，但**尚未真正落地**，
+    /// 因此调用方不应据此推进快照基线，否则被跳过的项会被误标为已同步而永不重试。
+    pub resource_skipped: bool,
 }
 
 /// 同步执行器
@@ -226,6 +231,97 @@ impl<'a> ShareSyncExecutor<'a> {
             subscription,
             persistence,
             hooks,
+        }
+    }
+
+    /// 计算「同步到本地」时转存子任务应落到的网盘目录。
+    ///
+    /// 行为按「是否存在网盘目标」自动推导（不再读 `LocalTarget::mode`）：
+    /// - 订阅**有**网盘目标 → `Some(网盘目录)`：本地腿复用网盘目标的 remote_path
+    ///   作落点（转存后保留、不清理）。这一份网盘副本同时满足「网盘目标」，
+    ///   因此 `effective_transfer_ops` 不再额外起一条独立网盘转存腿，避免重复转存。
+    /// - 订阅**无**网盘目标 → `None`：分享直下（转存到临时目录 → 下载 → 清理）。
+    ///
+    /// 落点取网盘目标的 **remote_path 根目录**（与 `transfer_netdisk_root_for_local`
+    /// 一致），由 `TransferManager` 内部按 item 路径重建子目录。
+    /// 不能用 `netdisk_target_parent_dir`（= 根目录 + item 相对父目录）：
+    /// `group_files_by_parent_dir` 还会再拼一次 item 的相对父目录，单文件会落到
+    /// `<root>/测试2-1/测试2-1/文件`（目录名翻倍），且与 `netdisk_target_file_path`
+    /// 的存在性判定路径不一致，下次同步会被判缺失而重复转存。
+    fn transfer_netdisk_dir_for_local(&self, _local: &LocalTarget) -> Option<String> {
+        self.subscription.targets.iter().find_map(|t| match t {
+            SyncTarget::Netdisk(net) => Some(net.remote_path.clone()),
+            _ => None,
+        })
+    }
+
+    /// 同上，但用于 batch 下载：返回网盘目标的 remote_path 根目录
+    /// （与 `submit_transfer_batch` 落点一致，TransferManager 内部按 item 路径重建子目录）。
+    fn transfer_netdisk_root_for_local(&self, _local: &LocalTarget) -> Option<String> {
+        self.subscription.targets.iter().find_map(|t| match t {
+            SyncTarget::Netdisk(net) => Some(net.remote_path.clone()),
+            _ => None,
+        })
+    }
+
+    /// 把订阅的目标列表推导成「有效转存操作」列表（仅用于 added/modified 转存路径）。
+    ///
+    /// 返回 `(target_index, record_kind)`：`target_index` 指向 `subscription.targets`
+    /// 中实际用于提交的目标，`record_kind` 是写入运行历史的目标种类标签。
+    ///
+    /// 推导规则（与「网盘/本地两个开关」模型一致）：
+    /// - 只有网盘目标 → 每个网盘目标各一条转存腿（`Netdisk`）。
+    /// - 只有本地目标 → 每个本地目标一条分享直下腿（`Local`）。
+    /// - 网盘 + 本地都有 → 本地腿转存到网盘目录一次并下载（`NetdiskAndLocal`），
+    ///   这一条同时覆盖第一个网盘目标，**不再**单独起网盘转存腿（消除重复转存）；
+    ///   多余的网盘目标（罕见）仍各起一条独立 `Netdisk` 腿。
+    ///
+    /// 注意：删除（removed）流程不走这里——删除需分别作用于网盘和本地，仍按原始
+    /// 目标逐个处理。
+    fn effective_transfer_ops(&self) -> Vec<(usize, TargetKind)> {
+        let mut netdisk_idxs: Vec<usize> = Vec::new();
+        let mut local_idxs: Vec<usize> = Vec::new();
+        for (i, t) in self.subscription.targets.iter().enumerate() {
+            match t {
+                SyncTarget::Netdisk(_) => netdisk_idxs.push(i),
+                SyncTarget::Local(_) => local_idxs.push(i),
+            }
+        }
+        let mut ops: Vec<(usize, TargetKind)> = Vec::new();
+        match (netdisk_idxs.is_empty(), local_idxs.is_empty()) {
+            // 无目标（理论上不会发生，创建时已校验）
+            (true, true) => {}
+            // 只有网盘
+            (false, true) => {
+                for i in netdisk_idxs {
+                    ops.push((i, TargetKind::Netdisk));
+                }
+            }
+            // 只有本地 → 分享直下
+            (true, false) => {
+                for i in local_idxs {
+                    ops.push((i, TargetKind::Local));
+                }
+            }
+            // 网盘 + 本地：本地腿转存到网盘目录一次 + 下载，覆盖 netdisk_idxs[0]
+            (false, false) => {
+                for &i in &local_idxs {
+                    ops.push((i, TargetKind::NetdiskAndLocal));
+                }
+                // 第一个网盘目标已被本地腿覆盖；其余（罕见）各起独立网盘腿
+                for &i in netdisk_idxs.iter().skip(1) {
+                    ops.push((i, TargetKind::Netdisk));
+                }
+            }
+        }
+        ops
+    }
+
+    /// 该有效操作是否会把文件转存到网盘（用于决定是否做 Netdisk 预拆批 / >500 拆批）。
+    fn op_transfers_to_netdisk(&self, target: &SyncTarget) -> bool {
+        match target {
+            SyncTarget::Netdisk(_) => true,
+            SyncTarget::Local(local) => self.transfer_netdisk_root_for_local(local).is_some(),
         }
     }
 
@@ -252,6 +348,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 status: RunStatus::Failed,
                 diff_summary: DiffSummary::default(),
                 error: Some(format!("启动 run 失败: {}", e)),
+                resource_skipped: false,
             };
         }
 
@@ -265,12 +362,16 @@ impl<'a> ShareSyncExecutor<'a> {
         let mut any_quota_skip = false;
         let mut last_quota_skip_msg: Option<String> = None;
 
+        // 有效转存操作（网盘+本地合并为一条腿，消除重复转存）
+        let ops = self.effective_transfer_ops();
+
         // 处理 added
         for item in &diff.added {
             if item.is_dir {
                 continue;
             }
-            for target in &self.subscription.targets {
+            for &(ti, record_kind) in &ops {
+                let target = &self.subscription.targets[ti];
                 let _ = self
                     .process_added_or_modified(
                         captured,
@@ -278,6 +379,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         item,
                         SyncAction::Added,
                         target,
+                        record_kind,
                         &mut summary,
                     )
                     .await
@@ -304,7 +406,8 @@ impl<'a> ShareSyncExecutor<'a> {
             if new.is_dir {
                 continue;
             }
-            for target in &self.subscription.targets {
+            for &(ti, record_kind) in &ops {
+                let target = &self.subscription.targets[ti];
                 let _ = self
                     .process_added_or_modified(
                         captured,
@@ -312,6 +415,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         new,
                         SyncAction::Modified,
                         target,
+                        record_kind,
                         &mut summary,
                     )
                     .await
@@ -383,18 +487,7 @@ impl<'a> ShareSyncExecutor<'a> {
         // - 仅 quota / local_disk 跳过（资源类）→ Completed（run 业务上成功；
         //   summary.skipped 体现被跳过的子项数；error 字段给前端展示原因）
         // - 全成功 → Completed
-        // v1.2: 先做"超时误判恢复" ——
-        // 把"wait 超时但文件已落盘"的 failed 项升级为 completed,再重算 summary
-        recover_local_run_items(
-            &self.persistence,
-            self.subscription,
-            &run_id,
-            &mut summary,
-        );
-        reconcile_summary_from_run_items(&self.persistence, &run_id, &mut summary);
-        // 用 summary.failed 而非 any_failure 判定 ——
-        // recovery 后 summary.failed 可能归零,此时应降级回 Completed
-        let status = if summary.failed > 0 {
+        let status = if any_failure {
             RunStatus::CompletedWithErrors
         } else {
             RunStatus::Completed
@@ -422,6 +515,7 @@ impl<'a> ShareSyncExecutor<'a> {
             status,
             diff_summary: summary,
             error: run_error,
+            resource_skipped: any_quota_skip,
         }
     }
 
@@ -447,9 +541,8 @@ impl<'a> ShareSyncExecutor<'a> {
     /// 整批 submit 入口
     ///
     /// 调用方（`ShareSyncManager::execute_one`）可选择走此路径；
-    /// 当前实现**在 manager.rs 仍调 `apply_with_run_id` 单文件路径**,
+    /// 当前实现**在 manager.rs 仍调 `apply_with_run_id` 单文件路径**，
     /// 此方法作为"v1 已就绪、未来调度可切换"的备选入口存在。
-    #[allow(unused_assignments, unused_variables)] // any_failure 在 v1.2 之后被 summary.failed 取代终态判定
     pub async fn apply_with_run_id_grouped(
         &self,
         run_id: String,
@@ -466,6 +559,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 status: RunStatus::Failed,
                 diff_summary: DiffSummary::default(),
                 error: Some(format!("启动 run 失败: {}", e)),
+                resource_skipped: false,
             };
         }
 
@@ -493,13 +587,17 @@ impl<'a> ShareSyncExecutor<'a> {
         // 2) 按"目录根"分组（纯函数 group_by_dir_root）
         let groups = group_by_dir_root(&candidates, &self.subscription.include_paths);
 
+        // 有效转存操作（网盘+本地合并为一条腿，消除重复转存）
+        let ops = self.effective_transfer_ops();
+
         // 3) 处理每组
         for (root_path, group) in &groups {
             // 批触发：组内文件数 >= MIN_BATCH_SIZE 才走整批 submit
             if group.len() < MIN_BATCH_SIZE {
                 // 退化：对组内每条仍走 `process_added_or_modified` 复用现有逻辑
                 for (action, item) in group {
-                    for target in &self.subscription.targets {
+                    for &(ti, record_kind) in &ops {
+                        let target = &self.subscription.targets[ti];
                         if let Err(e) = self
                             .process_added_or_modified(
                                 captured,
@@ -507,6 +605,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                 item,
                                 *action,
                                 target,
+                                record_kind,
                                 &mut summary,
                             )
                             .await
@@ -526,9 +625,9 @@ impl<'a> ShareSyncExecutor<'a> {
                 continue;
             }
 
-            // 整批 submit：对每个 target 各 submit 一次（multi-target 时仍是 N 次 submit，
-            // 但组内 N 个文件合成 1 次 TransferManager.create_task）
-            for target in &self.subscription.targets {
+            // 整批 submit：对每个有效操作各 submit 一次（网盘+本地合并为一条腿）
+            for &(ti, record_kind) in &ops {
+                let target = &self.subscription.targets[ti];
                 let items: Vec<ShareSnapshotItem> =
                     group.iter().map(|(_, item)| item.clone()).collect();
 
@@ -541,10 +640,7 @@ impl<'a> ShareSyncExecutor<'a> {
 
                 let strategy =
                     target.effective_conflict_strategy(self.subscription.conflict_strategy);
-                let target_kind = match target {
-                    SyncTarget::Netdisk(_) => TargetKind::Netdisk,
-                    SyncTarget::Local(_) => TargetKind::Local,
-                };
+                let target_kind = record_kind;
                 // 把 label String 绑到栈变量，避免 .as_str() 返回的 &str 在 await 期间悬空
                 let internal_label =
                     format!("share-sync/{}/batch/{}", self.subscription.id, run_id);
@@ -562,8 +658,14 @@ impl<'a> ShareSyncExecutor<'a> {
                             .await
                     }
                     SyncTarget::Local(t) => {
+                        let netdisk_dir = self.transfer_netdisk_root_for_local(t);
                         self.hooks
-                            .submit_download_batch(&items, &t.local_path, strategy)
+                            .submit_download_batch(
+                                &items,
+                                &t.local_path,
+                                strategy,
+                                netdisk_dir.as_deref(),
+                            )
                             .await
                     }
                 };
@@ -640,6 +742,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                             item,
                                             *item_action,
                                             target,
+                                            record_kind,
                                             &mut summary,
                                         )
                                         .await
@@ -706,6 +809,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                         item,
                                         *item_action,
                                         target,
+                                        record_kind,
                                         &mut summary,
                                     )
                                     .await
@@ -786,19 +890,11 @@ impl<'a> ShareSyncExecutor<'a> {
         // - 仅 quota / local_disk_full 跳过 → Completed（业务上成功；被跳过的子项
         //   在 summary.skipped 体现，error 字段给前端展示原因）
         // - 全成功 → Completed
-        // v1.2: 同 apply_with_run_id,先做"超时误判恢复"再 reconcile
-        recover_local_run_items(
-            &self.persistence,
-            self.subscription,
-            &run_id,
-            &mut summary,
-        );
-        reconcile_summary_from_run_items(&self.persistence, &run_id, &mut summary);
         let quota_only = matches!(
             run_failure_reason,
             Some("quota_full") | Some("local_disk_full")
         );
-        let status = if summary.failed > 0 && !quota_only {
+        let status = if any_failure && !quota_only {
             RunStatus::CompletedWithErrors
         } else {
             RunStatus::Completed
@@ -827,6 +923,7 @@ impl<'a> ShareSyncExecutor<'a> {
             status,
             diff_summary: summary,
             error,
+            resource_skipped: quota_only,
         }
     }
 
@@ -843,7 +940,6 @@ impl<'a> ShareSyncExecutor<'a> {
     // 的能力切换;quota 二分递归留给阶段 4 在 `process_subtree` 内部加。
     //
     // 不动 removed 流程(沿用 `apply_with_run_id_grouped` 的 removed 段)。
-    #[allow(unused_assignments, unused_variables)] // any_failure 在 v1.2 之后被 summary.failed 取代终态判定
     pub async fn apply_with_run_id_tree(
         &self,
         run_id: String,
@@ -862,6 +958,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 status: RunStatus::Failed,
                 diff_summary: DiffSummary::default(),
                 error: Some(format!("启动 run 失败: {}", e)),
+                resource_skipped: false,
             };
         }
 
@@ -917,11 +1014,12 @@ impl<'a> ShareSyncExecutor<'a> {
             })
             .unwrap_or(4)
             .max(1);
-        let n_targets = self.subscription.targets.len();
-        // 拼工作单元: (top_node_idx, target_idx)
-        let work: Vec<(usize, usize)> = top_nodes
+        // 有效转存操作（网盘+本地合并为一条 NetdiskAndLocal 腿，消除重复转存）
+        let ops = self.effective_transfer_ops();
+        // 拼工作单元: (top_node_idx, target_idx, record_kind)
+        let work: Vec<(usize, usize, TargetKind)> = top_nodes
             .iter()
-            .flat_map(|&n| (0..n_targets).map(move |ti| (n, ti)))
+            .flat_map(|&n| ops.iter().map(move |&(ti, rk)| (n, ti, rk)))
             .collect();
 
         let results: Vec<(DiffSummary, Result<(), ErrorCategory>)> =
@@ -937,7 +1035,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 let captured_ref = captured;
                 let run_id_ref = run_id.as_str();
                 stream::iter(work.into_iter())
-                    .map(|(node_idx, target_idx)| {
+                    .map(|(node_idx, target_idx, record_kind)| {
                         let target = &self.subscription.targets[target_idx];
                         async move {
                             let mut local = DiffSummary::default();
@@ -948,6 +1046,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                     t_ref,
                                     node_idx,
                                     target,
+                                    record_kind,
                                     &mut local,
                                 )
                                 .await;
@@ -959,7 +1058,7 @@ impl<'a> ShareSyncExecutor<'a> {
                     .await
             } else {
                 let mut out = Vec::with_capacity(work.len());
-                for (node_idx, target_idx) in work {
+                for (node_idx, target_idx, record_kind) in work {
                     let target = &self.subscription.targets[target_idx];
                     let mut local = DiffSummary::default();
                     let res = self
@@ -969,6 +1068,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             &t,
                             node_idx,
                             target,
+                            record_kind,
                             &mut local,
                         )
                         .await;
@@ -1036,19 +1136,11 @@ impl<'a> ShareSyncExecutor<'a> {
         }
 
         // 6) run 终态(沿用 grouped 路径语义:仅 quota 不算 Failed)
-        // v1.2: 同上,先做"超时误判恢复"再 reconcile
-        recover_local_run_items(
-            &self.persistence,
-            self.subscription,
-            &run_id,
-            &mut summary,
-        );
-        reconcile_summary_from_run_items(&self.persistence, &run_id, &mut summary);
         let quota_only = matches!(
             run_failure_reason,
             Some("quota_full") | Some("local_disk_full")
         );
-        let status = if summary.failed > 0 && !quota_only {
+        let status = if any_failure && !quota_only {
             RunStatus::CompletedWithErrors
         } else {
             RunStatus::Completed
@@ -1076,6 +1168,7 @@ impl<'a> ShareSyncExecutor<'a> {
             status,
             diff_summary: summary,
             error,
+            resource_skipped: quota_only,
         }
     }
 
@@ -1093,9 +1186,19 @@ impl<'a> ShareSyncExecutor<'a> {
         tree: &crate::share_sync::tree::Tree,
         node_idx: usize,
         target: &SyncTarget,
+        record_kind: TargetKind,
         summary: &mut DiffSummary,
     ) -> Result<(), ErrorCategory> {
-        self.transfer_node_set(captured, run_id, tree, vec![node_idx], target, summary, 0)
+        self.transfer_node_set(
+            captured,
+            run_id,
+            tree,
+            vec![node_idx],
+            target,
+            record_kind,
+            summary,
+            0,
+        )
             .await
     }
 
@@ -1119,6 +1222,7 @@ impl<'a> ShareSyncExecutor<'a> {
         tree: &'async_recursion crate::share_sync::tree::Tree,
         indices: Vec<usize>,
         target: &SyncTarget,
+        record_kind: TargetKind,
         summary: &mut DiffSummary,
         depth: u32,
     ) -> Result<(), ErrorCategory> {
@@ -1133,7 +1237,7 @@ impl<'a> ShareSyncExecutor<'a> {
             let mut worst: Option<ErrorCategory> = None;
             for idx in &indices {
                 if let Err(c) = self
-                    .submit_subtree_as_leaves(captured, run_id, tree, *idx, target, summary)
+                    .submit_subtree_as_leaves(captured, run_id, tree, *idx, target, record_kind, summary)
                     .await
                 {
                     worst = Some(worst.map_or(c, |w| max_category(w, c)));
@@ -1141,10 +1245,7 @@ impl<'a> ShareSyncExecutor<'a> {
             }
             return worst.map_or(Ok(()), Err);
         }
-        let target_kind = match target {
-            SyncTarget::Netdisk(_) => TargetKind::Netdisk,
-            SyncTarget::Local(_) => TargetKind::Local,
-        };
+        let target_kind = record_kind;
         let strategy = target.effective_conflict_strategy(self.subscription.conflict_strategy);
         let internal_label =
             format!("share-sync/{}/tree/d{}/{}", self.subscription.id, depth, run_id);
@@ -1159,71 +1260,249 @@ impl<'a> ShareSyncExecutor<'a> {
             target_kind
         );
 
-        let submit_result: Result<String, ShareSyncError> = match target {
-            SyncTarget::Netdisk(t) => {
-                self.hooks
-                    .submit_transfer_batch(
-                        captured,
-                        &t.remote_path,
-                        &items_to_submit,
-                        Some(&internal_label),
-                    )
-                    .await
-            }
-            SyncTarget::Local(t) => {
-                self.hooks
-                    .submit_download_batch(&items_to_submit, &t.local_path, strategy)
-                    .await
-            }
-        };
-
-        let final_err: ShareSyncError = match submit_result {
-            Ok(task_id) => {
-                let require_download_completion = matches!(target, SyncTarget::Local(_));
-                let wait_res = self
-                    .hooks
-                    .wait_transfer_task(&task_id, require_download_completion, TASK_WAIT_TIMEOUT)
-                    .await;
-                match wait_res {
-                    Ok(()) => {
-                        // 成功:把所有 indices 子树叶子标 Completed
-                        let mut all_leaves: Vec<usize> = Vec::new();
-                        for &idx in &indices {
-                            all_leaves.extend(tree.descendants_leaves(idx));
-                        }
-                        for leaf_idx in all_leaves {
-                            let leaf = tree.get(leaf_idx);
-                            let _ = self.persistence.add_run_item(
-                                run_id,
-                                &leaf.path,
-                                SyncAction::Added,
-                                target_kind,
-                                Some(task_id.as_str()),
-                                None,
-                                RunItemStatus::Completed,
-                                None,
-                                None,
-                            );
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!(
-                            "share_sync_wait_failed: run_id={} depth={} first_path={} task_id={} err={}",
-                            run_id, depth, first_path, task_id, e
+        // 主动预拆批:tree 已知整棵子树文件数,若整目录一次转存注定超过百度
+        // 单次上限(默认 500),直接拆批,而不是先提交一个注定 errno=12 的整目录转存。
+        // 那种注定失败的整目录转存,百度仍会按 ondup 把同名目标改名建出一个空目录
+        // (即用户看到的 `name_<时间戳>` 残留),预拆批可从源头避免它。
+        // 仅对「会转存到网盘」的腿预拆(纯网盘 / 转存并下载);纯分享直下下载无此上限。
+        // 受 BAIDUPCS_BISECT_ENABLED 控制(与失败后二分同一开关)。
+        {
+            let bisect_enabled = std::env::var("BAIDUPCS_BISECT_ENABLED")
+                .ok()
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true);
+            if bisect_enabled && self.op_transfers_to_netdisk(target) && depth < BISECT_MAX_DEPTH
+            {
+                let leaf_count: usize = indices
+                    .iter()
+                    .map(|&i| tree.descendants_leaves(i).len())
+                    .sum();
+                if leaf_count > transfer_file_limit() {
+                    let groups: Vec<Vec<usize>> = if indices.len() > 1 {
+                        tree_mod::split_indices_two(tree, &indices)
+                    } else {
+                        tree_mod::split_two(tree, indices[0])
+                    };
+                    if !groups.is_empty() && groups.iter().any(|g| !g.is_empty()) {
+                        info!(
+                            "share_sync_presplit: run_id={} depth={} first_path={} leaf_count={} limit={} into={:?}",
+                            run_id,
+                            depth,
+                            first_path,
+                            leaf_count,
+                            transfer_file_limit(),
+                            groups.iter().map(|g| g.len()).collect::<Vec<_>>()
                         );
-                        e
+                        let mut worst: Option<ErrorCategory> = None;
+                        for group in groups {
+                            if group.is_empty() {
+                                continue;
+                            }
+                            if let Err(c) = self
+                                .transfer_node_set(
+                                    captured,
+                                    run_id,
+                                    tree,
+                                    group,
+                                    target,
+                                    record_kind,
+                                    summary,
+                                    depth + 1,
+                                )
+                                .await
+                            {
+                                worst = Some(worst.map_or(c, |w| max_category(w, c)));
+                            }
+                        }
+                        return worst.map_or(Ok(()), Err);
                     }
                 }
             }
-            Err(e) => {
+        }
+
+        // Transient（百度临时超时 / 网络抖动，如 errno=4「请求超时，请稍后再试」）:
+        // 同一批退避重试若干次再放弃,避免一次偶发超时就把整批判失败(这跟超限二分
+        // 是两码事:超限重试同组没用要拆小,临时超时重试同组才对)。次数/基准退避可用
+        // env 调整;非 Transient 错误不在此重试,直接交给下方二分 / 终态标记。
+        let transient_max_retries: u32 = std::env::var("BAIDUPCS_SHARE_SYNC_TRANSIENT_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let transient_base_delay_ms: u64 =
+            std::env::var("BAIDUPCS_SHARE_SYNC_TRANSIENT_BACKOFF_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000);
+
+        let mut attempt: u32 = 0;
+        let mut final_err: ShareSyncError = loop {
+            let submit_result: Result<String, ShareSyncError> = match target {
+                SyncTarget::Netdisk(t) => {
+                    self.hooks
+                        .submit_transfer_batch(
+                            captured,
+                            &t.remote_path,
+                            &items_to_submit,
+                            Some(&internal_label),
+                        )
+                        .await
+                }
+                SyncTarget::Local(t) => {
+                    let netdisk_dir = self.transfer_netdisk_root_for_local(t);
+                    self.hooks
+                        .submit_download_batch(
+                            &items_to_submit,
+                            &t.local_path,
+                            strategy,
+                            netdisk_dir.as_deref(),
+                        )
+                        .await
+                }
+            };
+
+            let attempt_err: ShareSyncError = match submit_result {
+                Ok(task_id) => {
+                    let require_download_completion = matches!(target, SyncTarget::Local(_));
+                    let wait_res = self
+                        .hooks
+                        .wait_transfer_task(
+                            &task_id,
+                            require_download_completion,
+                            TASK_WAIT_TIMEOUT,
+                        )
+                        .await;
+                    match wait_res {
+                        Ok(()) => {
+                            // 成功:把所有 indices 子树叶子标 Completed
+                            let mut all_leaves: Vec<usize> = Vec::new();
+                            for &idx in &indices {
+                                all_leaves.extend(tree.descendants_leaves(idx));
+                            }
+                            for leaf_idx in all_leaves {
+                                let leaf = tree.get(leaf_idx);
+                                let _ = self.persistence.add_run_item(
+                                    run_id,
+                                    &leaf.path,
+                                    SyncAction::Added,
+                                    target_kind,
+                                    Some(task_id.as_str()),
+                                    None,
+                                    RunItemStatus::Completed,
+                                    None,
+                                    None,
+                                );
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "share_sync_wait_failed: run_id={} depth={} first_path={} task_id={} err={}",
+                                run_id, depth, first_path, task_id, e
+                            );
+                            e
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "share_sync_submit_failed: run_id={} depth={} first_path={} err={}",
+                        run_id, depth, first_path, e
+                    );
+                    e
+                }
+            };
+
+            if attempt_err.should_retry() && attempt < transient_max_retries {
+                let backoff = transient_base_delay_ms.saturating_mul(1u64 << attempt);
                 warn!(
-                    "share_sync_submit_failed: run_id={} depth={} first_path={} err={}",
-                    run_id, depth, first_path, e
+                    "share_sync_transient_retry: run_id={} depth={} first_path={} attempt={}/{} backoff_ms={} err={}",
+                    run_id, depth, first_path, attempt + 1, transient_max_retries, backoff, attempt_err
                 );
-                e
+                if backoff > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                }
+                attempt += 1;
+                continue;
             }
+            break attempt_err;
         };
+
+        // 「目标位置已存在同名」优雅继续（不判失败）:
+        // 网盘目标里已经有这份内容,所以不应整批判失败。
+        // - 网盘腿:目标已满足 → 直接把叶子标 Completed。
+        // - 本地腿:网盘副本已在(满足网盘目标),但本地副本仍缺 → 改走分享直下
+        //   (transfer_netdisk_dir=None ⇒ 临时目录→下载→清理),绕开网盘目标同名冲突,
+        //   把本地副本补齐;成功后标 Completed,失败则带新错误落到下方失败处理。
+        if final_err.is_already_exists() {
+            match target {
+                SyncTarget::Netdisk(_) => {
+                    info!(
+                        "share_sync_already_exists_netdisk: run_id={} depth={} first_path={} → 视为已转存,标记完成",
+                        run_id, depth, first_path
+                    );
+                    for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i)) {
+                        let leaf = tree.get(leaf_idx);
+                        let _ = self.persistence.add_run_item(
+                            run_id,
+                            &leaf.path,
+                            SyncAction::Added,
+                            target_kind,
+                            None,
+                            None,
+                            RunItemStatus::Completed,
+                            None,
+                            None,
+                        );
+                    }
+                    return Ok(());
+                }
+                SyncTarget::Local(t) => {
+                    info!(
+                        "share_sync_already_exists_local: run_id={} depth={} first_path={} → 网盘副本已在,改走分享直下补本地副本",
+                        run_id, depth, first_path
+                    );
+                    let direct_res = match self
+                        .hooks
+                        .submit_download_batch(&items_to_submit, &t.local_path, strategy, None)
+                        .await
+                    {
+                        Ok(task_id) => self
+                            .hooks
+                            .wait_transfer_task(&task_id, true, TASK_WAIT_TIMEOUT)
+                            .await
+                            .map(|()| task_id),
+                        Err(e) => Err(e),
+                    };
+                    match direct_res {
+                        Ok(task_id) => {
+                            for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i))
+                            {
+                                let leaf = tree.get(leaf_idx);
+                                let _ = self.persistence.add_run_item(
+                                    run_id,
+                                    &leaf.path,
+                                    SyncAction::Added,
+                                    target_kind,
+                                    Some(task_id.as_str()),
+                                    None,
+                                    RunItemStatus::Completed,
+                                    None,
+                                    None,
+                                );
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "share_sync_already_exists_local_fallback_failed: run_id={} depth={} first_path={} err={}",
+                                run_id, depth, first_path, e
+                            );
+                            final_err = e;
+                        }
+                    }
+                }
+            }
+        }
 
         // 失败处理:判断是否触发二分
         let category = final_err.category();
@@ -1231,7 +1510,6 @@ impl<'a> ShareSyncExecutor<'a> {
             .ok()
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
-        const BISECT_MAX_DEPTH: u32 = 32;
 
         if bisect_enabled && final_err.is_bisect_trigger() && depth < BISECT_MAX_DEPTH {
             // 决定怎么二分:
@@ -1265,6 +1543,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             tree,
                             group,
                             target,
+                            record_kind,
                             summary,
                             depth + 1,
                         )
@@ -1278,15 +1557,14 @@ impl<'a> ShareSyncExecutor<'a> {
             // 单叶子 + bisect_trigger → 拆不动了, 落到下方的"标记终态"分支(Skipped)
         }
 
-        // 到这里:不二分,直接给所有叶子打终态
+        // 到这里:不二分,直接给所有叶子打终态。
+        // Failed 的叶子把真实失败原因（百度错误信息）写进 run_item 的 error 字段，
+        // 让运行历史能逐文件显示「为什么失败」，而不是只剩一个笼统的「完成(部分失败)」。
+        let fail_msg = final_err.to_string();
         let all_leaves: Vec<usize> = indices
             .iter()
             .flat_map(|&i| tree.descendants_leaves(i))
             .collect();
-        // 把 final_err 的可读消息缓存一次,所有失败叶子共用 ——
-        // 之前 marker 分支只 `add_run_item(... error 列填 None ...)`,
-        // 导致前端详情里看不到任何错误原因,debug 不到 "wait 超时" 等关键信息。
-        let err_msg = final_err.to_string();
         for leaf_idx in all_leaves {
             let leaf = tree.get(leaf_idx);
             let (status, reason) = match category {
@@ -1320,23 +1598,15 @@ impl<'a> ShareSyncExecutor<'a> {
                 None,
                 reason,
             ) {
-                Ok(row_id) => {
-                    // 失败项把 error 列也写上,前端详情能展示,
-                    // recover 阶段也能根据 message 判断是否"超时"等情况
-                    if status == RunItemStatus::Failed {
-                        if let Err(e) = self.persistence.update_run_item_status(
-                            row_id,
-                            RunItemStatus::Failed,
-                            Some(&err_msg),
-                        ) {
-                            warn!(
-                                "executor: 写入失败项 error 列失败: id={} err={}",
-                                row_id, e
-                            );
-                        }
-                    }
+                Ok(row_id) if status == RunItemStatus::Failed => {
+                    let _ = self.persistence.update_run_item_status(
+                        row_id,
+                        RunItemStatus::Failed,
+                        Some(&fail_msg),
+                    );
                 }
-                Err(e) => warn!("记录失败 run_item 失败: {}", e),
+                Ok(_) => {}
+                Err(e) => warn!("记录 share-sync 叶子终态失败: {}", e),
             }
         }
         Err(category)
@@ -1351,6 +1621,7 @@ impl<'a> ShareSyncExecutor<'a> {
         tree: &crate::share_sync::tree::Tree,
         node_idx: usize,
         target: &SyncTarget,
+        record_kind: TargetKind,
         summary: &mut DiffSummary,
     ) -> Result<(), ErrorCategory> {
         let leaves = tree.descendants_leaves(node_idx);
@@ -1369,7 +1640,15 @@ impl<'a> ShareSyncExecutor<'a> {
                 is_dir: leaf.is_dir,
             };
             if let Err(e) = self
-                .process_added_or_modified(captured, run_id, &item, SyncAction::Added, target, summary)
+                .process_added_or_modified(
+                    captured,
+                    run_id,
+                    &item,
+                    SyncAction::Added,
+                    target,
+                    record_kind,
+                    summary,
+                )
                 .await
             {
                 worst = Some(worst.map_or(e.category(), |w| max_category(w, e.category())));
@@ -1390,13 +1669,11 @@ impl<'a> ShareSyncExecutor<'a> {
         item: &ShareSnapshotItem,
         action: SyncAction,
         target: &SyncTarget,
+        record_kind: TargetKind,
         summary: &mut DiffSummary,
     ) -> Result<(), ShareSyncError> {
         let strategy = target.effective_conflict_strategy(self.subscription.conflict_strategy);
-        let target_kind = match target {
-            SyncTarget::Netdisk(_) => TargetKind::Netdisk,
-            SyncTarget::Local(_) => TargetKind::Local,
-        };
+        let target_kind = record_kind;
         let mut overwrote_existing = false;
 
         // 1) 按目标处理冲突策略。
@@ -1552,7 +1829,11 @@ impl<'a> ShareSyncExecutor<'a> {
             // 2) 提交 transfer / download
             let result: Result<(String, bool, RunItemStatus), ShareSyncError> = match target {
                 SyncTarget::Netdisk(t) => {
-                    let target_dir = netdisk_target_parent_dir(t, item);
+                    // 落点用 remote_path 根目录，由 TransferManager 内部按 item 路径
+                    // 重建子目录；submit_transfer 的实现注释要求 target_dir 即根目录。
+                    // 不能用 netdisk_target_parent_dir（根 + item 相对父目录），否则
+                    // group_files_by_parent_dir 会再拼一次相对父目录导致目录名翻倍。
+                    let target_dir = t.remote_path.clone();
                     self.hooks
                         .submit_transfer(
                             captured,
@@ -1563,11 +1844,13 @@ impl<'a> ShareSyncExecutor<'a> {
                         .await
                         .map(|task_id| (task_id, false, RunItemStatus::Transferring))
                 }
-                SyncTarget::Local(t) => self
-                    .hooks
-                    .submit_download(item, &t.local_path, strategy)
-                    .await
-                    .map(|task_id| (task_id, true, RunItemStatus::Downloading)),
+                SyncTarget::Local(t) => {
+                    let netdisk_dir = self.transfer_netdisk_dir_for_local(t);
+                    self.hooks
+                        .submit_download(item, &t.local_path, strategy, netdisk_dir.as_deref())
+                        .await
+                        .map(|task_id| (task_id, true, RunItemStatus::Downloading))
+                }
             };
 
             match result {
@@ -1937,10 +2220,6 @@ fn netdisk_target_file_path(target: &NetdiskTarget, item: &ShareSnapshotItem) ->
     join_netdisk_path(&target.remote_path, item.path.trim_start_matches('/'))
 }
 
-fn netdisk_target_parent_dir(target: &NetdiskTarget, item: &ShareSnapshotItem) -> String {
-    parent_netdisk_dir(&netdisk_target_file_path(target, item))
-}
-
 pub(crate) fn join_netdisk_path(base: &str, relative: &str) -> String {
     let base = base.trim_end_matches('/');
     let relative = relative.trim_start_matches('/');
@@ -1953,6 +2232,8 @@ pub(crate) fn join_netdisk_path(base: &str, relative: &str) -> String {
     }
 }
 
+/// 仅测试 mock 使用（生产路径改用 remote_path 根目录后不再需要回算父目录）。
+#[cfg(test)]
 pub(crate) fn parent_netdisk_dir(path: &str) -> String {
     let path = path.trim_end_matches('/');
     if path.is_empty() || path == "/" {
@@ -2118,99 +2399,6 @@ fn max_category(a: ErrorCategory, b: ErrorCategory) -> ErrorCategory {
     }
 }
 
-/// 恢复"等待超时但下载已完成"的 run_item (v1.2 新增)
-///
-/// ## 触发场景
-///
-/// `transfer_node_set` 里的 `wait_transfer_task` 触发 `TASK_WAIT_TIMEOUT` (30 分钟)
-/// 时会返回 `Err(DownloadError("等待任务完成超时"))`,category 判为 `Other`,落到
-/// marker 分支把整组叶子标 `Failed`。**但 DownloadManager 实际在后台继续把
-/// 文件落盘** —— 用户看到磁盘上文件齐全,前端却显示"部分成功" + N 个失败项。
-///
-/// 这个函数就是事后兜底:对 `target='local'` 的 `Failed` run_item,反查订阅里
-/// 的 local target 目录,只要文件确实在,就把它升级为 `Completed`,并把
-/// `summary.failed` 减 1。这样:
-/// - 详情页错误列表里不再有"假失败"项
-/// - `run` 终态从 `CompletedWithErrors` 降回 `Completed` (失败归零时)
-/// - 快照基线正常推进,下次轮询不会重下这些文件
-///
-/// ## 约束
-///
-/// - **只对 `target='local'` 生效** — netdisk 目标无法用本地文件存在判断
-/// - **不动 `Skipped` / `Transferring` / `Downloading` / `Completed`** ——
-///   只挑 `Failed` 升级
-/// - **文件路径 = `local_root/<item.path>`**,与 executor 的
-///   `local_file_exists` 拼法一致
-/// - **必须在 `reconcile_summary_from_run_items` 之前调用** ——
-///   后续 summary 重算时,DB 里 `status='completed'` 已生效
-fn recover_local_run_items(
-    persistence: &ShareSyncPersistence,
-    subscription: &ShareSubscription,
-    run_id: &str,
-    summary: &mut DiffSummary,
-) {
-    let local_roots: Vec<PathBuf> = subscription
-        .targets
-        .iter()
-        .filter_map(|t| match t {
-            SyncTarget::Local(t) => Some(t.local_path.clone()),
-            _ => None,
-        })
-        .collect();
-    if local_roots.is_empty() {
-        return;
-    }
-
-    let items = match persistence.list_run_items(run_id) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("share_sync_recover: 读 run_items 失败: {}", e);
-            return;
-        }
-    };
-
-    let mut upgraded = 0usize;
-    for item in items {
-        // 只挑"failed + 本地目标",其它状态(Skipped/Transferring/Downloading/
-        // Completed)都跳过;其中 Skipped(quota_full/disk_full)是资源类,不属
-        // "超时误判",也不该升级
-        if item.status != RunItemStatus::Failed.as_str()
-            || item.target != TargetKind::Local.as_str()
-        {
-            continue;
-        }
-        let rel = item.path.trim_start_matches('/');
-        // 多个 local target 时,任一目录下存在即认为已落盘
-        let exists = local_roots.iter().any(|root| root.join(rel).is_file());
-        if !exists {
-            continue;
-        }
-        // 升级为 completed(同时清掉 error 列,前端展示更干净)
-        if let Err(e) = persistence.update_run_item_status(
-            item.id,
-            RunItemStatus::Completed,
-            None,
-        ) {
-            warn!(
-                "share_sync_recover: 升级 run_item 失败: id={} path={} err={}",
-                item.id, item.path, e
-            );
-            continue;
-        }
-        upgraded += 1;
-        if summary.failed > 0 {
-            summary.failed -= 1;
-        }
-    }
-
-    if upgraded > 0 {
-        info!(
-            "share_sync_recover: run_id={} upgraded={} (文件已落盘但 wait 超时误判为失败)",
-            run_id, upgraded
-        );
-    }
-}
-
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _ = (
@@ -2222,6 +2410,7 @@ fn _suppress_unused() {
         LocalTarget {
             local_path: PathBuf::new(),
             conflict_strategy: None,
+            mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
         },
     );
 }
@@ -2243,6 +2432,7 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: PathBuf::from("/tmp/x"),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         )
     }
@@ -2252,6 +2442,7 @@ mod tests {
             short_key: "1abc".into(),
             shareid: "123".into(),
             uk: "456".into(),
+            share_uk: "456".into(),
             bdstoken: "tok".into(),
             password: None,
             randsk: None,
@@ -2293,6 +2484,9 @@ mod tests {
         download_submit_errors: Mutex<HashMap<u64, ShareSyncError>>,
         // v1.1 新增：注入 wait_transfer_task 错误（按 task_id 维度）
         wait_errors: Mutex<HashMap<String, ShareSyncError>>,
+        // 记录每次下载（单文件 + 整批）携带的「转存网盘中转目录」，None=分享直下。
+        // 用于断言「网盘+本地」合并腿确实把文件转存到网盘目录再下载。
+        download_netdisk_dirs: Mutex<Vec<Option<String>>>,
     }
     #[async_trait]
     impl ExecutorHooks for MockHooks {
@@ -2341,6 +2535,7 @@ mod tests {
             item: &ShareSnapshotItem,
             dir: &Path,
             strategy: ConflictStrategy,
+            transfer_netdisk_dir: Option<&str>,
         ) -> Result<String, ShareSyncError> {
             // 注入 submit_download 错误（按 fs_id 维度）
             if let Some(err) = self
@@ -2351,6 +2546,10 @@ mod tests {
             {
                 return Err(err);
             }
+            self.download_netdisk_dirs
+                .lock()
+                .unwrap()
+                .push(transfer_netdisk_dir.map(|s| s.to_string()));
             let mut g = self.downloads.lock().unwrap();
             let id = format!("dl-{}", g.len() + 1);
             g.push((item.fs_id, item.path.clone(), dir.to_path_buf(), strategy));
@@ -2403,10 +2602,15 @@ mod tests {
             items: &[ShareSnapshotItem],
             dir: &Path,
             _strategy: ConflictStrategy,
+            transfer_netdisk_dir: Option<&str>,
         ) -> Result<String, ShareSyncError> {
             if let Some(err) = self.batch_download_error.lock().unwrap().take() {
                 return Err(err);
             }
+            self.download_netdisk_dirs
+                .lock()
+                .unwrap()
+                .push(transfer_netdisk_dir.map(|s| s.to_string()));
             let fs_ids: Vec<u64> = items.iter().map(|i| i.fs_id).collect();
             let paths: Vec<String> = items.iter().map(|i| i.path.clone()).collect();
             let mut g = self.batch_downloads.lock().unwrap();
@@ -2441,6 +2645,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2589,8 +2794,10 @@ mod tests {
         assert_eq!(hooks.netdisk_renames.lock().unwrap().len(), 0);
     }
 
+    /// 网盘 + 本地两个目标都开 → 合并为「转存到网盘一次 + 从网盘副本下载」一条腿，
+    /// **不再**起独立网盘转存腿（消除重复转存、避免「文件已存在」撞车）。
     #[test]
-    fn test_two_targets_both_dispatch() {
+    fn test_two_targets_merge_into_single_leg() {
         let dir = tempdir().unwrap();
         let s = {
             let mut s = sub();
@@ -2603,6 +2810,8 @@ mod tests {
                 SyncTarget::Local(LocalTarget {
                     local_path: dir.path().to_path_buf(),
                     conflict_strategy: None,
+                    // 老订阅即便存了 ShareDirect，也按「有网盘目标」自动推导为转存并下载
+                    mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
                 }),
             ];
             s
@@ -2617,8 +2826,115 @@ mod tests {
         let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
         let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
         assert_eq!(outcome.status, RunStatus::Completed);
-        assert_eq!(hooks.transfers.lock().unwrap().len(), 1);
+        // 只有一条下载腿（合并），没有独立网盘转存腿
+        assert_eq!(hooks.transfers.lock().unwrap().len(), 0);
         assert_eq!(hooks.downloads.lock().unwrap().len(), 1);
+        // 该下载腿带着网盘中转目录（非 None）→ 先转存到网盘并保留这份副本再下载。
+        // 落点必须是网盘目标根目录 /x（由 TransferManager 按 item 路径重建子目录），
+        // 而不是 netdisk_target_parent_dir（会导致单文件目录名翻倍）。
+        let dirs = hooks.download_netdisk_dirs.lock().unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].as_deref(), Some("/x"), "合并腿落点应为网盘根目录");
+    }
+
+    /// 回归：合并腿下载子目录里的单文件时，网盘中转落点仍是 remote_path 根目录，
+    /// 不能带上 item 的相对父目录——否则 TransferManager 再拼一次会得到
+    /// `/x/测试2-1/测试2-1/...`（目录名翻倍），且与存在性判定路径不一致触发重复转存。
+    #[test]
+    fn test_merge_leg_nested_file_netdisk_dir_is_root_no_doubling() {
+        let dir = tempdir().unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![
+                SyncTarget::Netdisk(NetdiskTarget {
+                    remote_path: "/x".into(),
+                    save_fs_id: 0,
+                    conflict_strategy: None,
+                }),
+                SyncTarget::Local(LocalTarget {
+                    local_path: dir.path().to_path_buf(),
+                    conflict_strategy: None,
+                    mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                }),
+            ];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        // 子目录里新增单文件（增量场景）
+        let curr = ShareSnapshot::with_items(&s.id, vec![item("/测试2-1/CONFLICT.md", 7, 5)]);
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        let dirs = hooks.download_netdisk_dirs.lock().unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(
+            dirs[0].as_deref(),
+            Some("/x"),
+            "子目录单文件的网盘落点应为根目录 /x，不应为 /x/测试2-1（翻倍）"
+        );
+    }
+
+    /// 只开网盘目标 → 一条网盘转存腿，无下载。
+    #[test]
+    fn test_netdisk_only_transfers() {
+        let dir = tempdir().unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(&s.id, vec![item("/a", 1, 1)]);
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(hooks.transfers.lock().unwrap().len(), 1);
+        assert_eq!(hooks.downloads.lock().unwrap().len(), 0);
+    }
+
+    /// 只开本地目标 → 分享直下：一条下载腿，无网盘中转目录（None）。
+    #[test]
+    fn test_local_only_share_direct() {
+        let dir = tempdir().unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Local(LocalTarget {
+                local_path: dir.path().to_path_buf(),
+                conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(&s.id, vec![item("/a", 1, 1)]);
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = futures::executor::block_on(ex.apply(&captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(hooks.transfers.lock().unwrap().len(), 0);
+        assert_eq!(hooks.downloads.lock().unwrap().len(), 1);
+        assert_eq!(
+            *hooks.download_netdisk_dirs.lock().unwrap(),
+            vec![None]
+        );
     }
 
     #[test]
@@ -2638,6 +2954,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2679,6 +2996,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2704,6 +3022,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s.delete_missing = false;
             s
@@ -2732,6 +3051,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s.delete_missing = true;
             s
@@ -2808,6 +3128,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2835,6 +3156,164 @@ mod tests {
         assert_eq!(items[0].status, "completed");
         assert_eq!(items[0].transfer_task_id.as_deref(), Some("dl-2"));
         assert!(items[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_batch_transient_error_retries_then_succeeds() {
+        // 整批(tree 模式 transfer_node_set)提交遇到百度临时超时(errno=4
+        // 「请求超时，请稍后再试」)时,应退避重试而不是整批判失败。MockHooks 的
+        // batch_transfer_error 是单发(take),首次失败、重试即成功 → run Completed。
+        std::env::set_var("BAIDUPCS_SHARE_SYNC_TRANSIENT_BACKOFF_MS", "0");
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut s = sub();
+        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+            remote_path: "/同步".into(),
+            save_fs_id: 0,
+            conflict_strategy: None,
+        })];
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        // 真实目录节点(非 placeholder),这样 tree 模式才会走整批 submit_transfer_batch
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                ShareSnapshotItem::new("/d", "d", 10, 0, true),
+                item("/d/a.csv", 11, 1),
+                item("/d/b.csv", 12, 1),
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        hooks
+            .batch_transfer_error
+            .lock()
+            .unwrap()
+            .replace(ShareSyncError::TransferError("请求超时，请稍后再试".into()));
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = ex
+            .apply_with_run_id_tree("rt".into(), &captured(), &diff)
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(outcome.diff_summary.failed, 0);
+        // 重试成功的那次 submit 被记录(失败那次在 take 后直接返回 Err,不入列)。
+        assert_eq!(hooks.batch_transfers.lock().unwrap().len(), 1);
+        let items = pm.list_run_items(&outcome.run_id).unwrap();
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.status == "completed"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_already_exists_netdisk_marks_completed() {
+        // 纯网盘腿:整批转存撞「目标位置已存在同名文件」(errno=4 duplicated)时,
+        // 网盘里已经有这份内容 → 视为已转存,把叶子标 Completed,不判失败。
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut s = sub();
+        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+            remote_path: "/同步".into(),
+            save_fs_id: 0,
+            conflict_strategy: None,
+        })];
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                ShareSnapshotItem::new("/d", "d", 10, 0, true),
+                item("/d/a.csv", 11, 1),
+                item("/d/b.csv", 12, 1),
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        hooks
+            .batch_transfer_error
+            .lock()
+            .unwrap()
+            .replace(ShareSyncError::TransferError(
+                "目标位置已存在同名文件: d".into(),
+            ));
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = ex
+            .apply_with_run_id_tree("rt".into(), &captured(), &diff)
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(outcome.diff_summary.failed, 0);
+        // 撞重复名直接判「已存在」,不重试 → 仅一次失败的 submit(已 take),不入列。
+        assert_eq!(hooks.batch_transfers.lock().unwrap().len(), 0);
+        let items = pm.list_run_items(&outcome.run_id).unwrap();
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.status == "completed"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_already_exists_local_falls_back_to_share_direct() {
+        // 网盘+本地合并腿:转存到网盘目标撞「已存在同名」时,网盘副本已在,
+        // 本地副本仍缺 → 改走分享直下(transfer_netdisk_dir=None,临时目录→下载→清理)
+        // 补本地副本,绕开网盘目标同名冲突;成功后标 Completed,不判失败。
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut s = sub();
+        s.targets = vec![
+            SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/同步".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            }),
+            SyncTarget::Local(LocalTarget {
+                local_path: db_dir.join("local"),
+                conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            }),
+        ];
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                ShareSnapshotItem::new("/d", "d", 10, 0, true),
+                item("/d/a.csv", 11, 1),
+                item("/d/b.csv", 12, 1),
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        // 注入一次「已存在同名」错误:本地腿首次(转存到网盘目录)的 submit_download_batch
+        // 命中并被 take;随后分享直下回退那次不再注入 → 成功。
+        hooks
+            .batch_download_error
+            .lock()
+            .unwrap()
+            .replace(ShareSyncError::DownloadError(
+                "目标位置已存在同名文件: d".into(),
+            ));
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = ex
+            .apply_with_run_id_tree("rt".into(), &captured(), &diff)
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(outcome.diff_summary.failed, 0);
+        // 回退确实发生:成功的那次下载是分享直下(netdisk_dir=None)。
+        let dirs = hooks.download_netdisk_dirs.lock().unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0], None, "回退必须走分享直下(临时目录),netdisk_dir=None");
+        assert_eq!(hooks.batch_downloads.lock().unwrap().len(), 1);
+        let items = pm.list_run_items(&outcome.run_id).unwrap();
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.status == "completed"));
     }
 
     #[test]
@@ -2869,6 +3348,12 @@ mod tests {
         assert_eq!(outcome.diff_summary.failed, 0);
         assert_eq!(outcome.diff_summary.skipped, 1);
         assert!(outcome.diff_summary.added == 1);
+        // 资源类跳过必须置位 resource_skipped，调用方据此**不推进**快照基线，
+        // 否则被跳过的文件会被误标为已同步而永不重试（见 manager::execute_one）。
+        assert!(
+            outcome.resource_skipped,
+            "quota 跳过时 resource_skipped 必须为 true，以阻止基线推进"
+        );
         // run_item 行：status=Skipped, reason=quota_full
         let items = pm.list_run_items(&outcome.run_id).unwrap();
         assert_eq!(items.len(), 1);
@@ -2887,6 +3372,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2908,6 +3394,10 @@ mod tests {
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(outcome.diff_summary.skipped, 1);
         assert_eq!(outcome.diff_summary.failed, 0);
+        assert!(
+            outcome.resource_skipped,
+            "download quota 跳过时 resource_skipped 必须为 true"
+        );
         let items = pm.list_run_items(&outcome.run_id).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "skipped");
@@ -2925,6 +3415,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2963,6 +3454,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -2998,6 +3490,7 @@ mod tests {
             s.targets = vec![SyncTarget::Local(LocalTarget {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })];
             s
         };
@@ -3046,6 +3539,7 @@ mod tests {
         s.targets = vec![SyncTarget::Local(LocalTarget {
             local_path: p.to_path_buf(),
             conflict_strategy: None,
+            mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
         })];
         s.include_paths = vec!["/monthly".into()]; // 让 group_by_dir_root 把 /monthly/* 归一组
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
@@ -3115,6 +3609,7 @@ mod tests {
         s.targets = vec![SyncTarget::Local(LocalTarget {
             local_path: p.to_path_buf(),
             conflict_strategy: None,
+            mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
         })];
         s.include_paths = vec!["/monthly".into()];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
@@ -3165,332 +3660,5 @@ mod tests {
             downloads[0].0, 801,
             "successful fallback should be small.csv"
         );
-    }
-
-    // ============================================================
-    // v1.2: recover_local_run_items 单元测试
-    // 模拟 "wait 超时 → marker 标 failed → 实际文件已落盘" 的场景,
-    // 验证 recovery 能把 failed 项升级为 completed 并减 summary.failed
-    // ============================================================
-
-    fn sub_with_local(local_root: PathBuf) -> ShareSubscription {
-        let mut s = sub();
-        s.targets = vec![SyncTarget::Local(LocalTarget {
-            local_path: local_root,
-            conflict_strategy: None,
-        })];
-        s
-    }
-
-    /// 模拟 apply_with_run_id 留下的"timeout 失败"项,文件其实已落盘
-    #[test]
-    fn test_recover_local_run_items_upgrades_existing_local_file() {
-        let dir = tempdir().unwrap();
-        let local_root = dir.path().to_path_buf();
-        // 在 local_root 下创建一个真实文件
-        let target_file = local_root.join("weekly/000001.SZ.csv");
-        std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
-        std::fs::write(&target_file, b"data").unwrap();
-
-        let s = sub_with_local(local_root);
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-        pm.start_run("test-run", &s.id, 1234).unwrap();
-        // 模拟 marker 分支写入的 failed 项(error=None)
-        let row_id = pm
-            .add_run_item(
-                "test-run",
-                "/weekly/000001.SZ.csv",
-                SyncAction::Added,
-                TargetKind::Local,
-                None,
-                None,
-                RunItemStatus::Failed,
-                None,
-                None,
-            )
-            .unwrap();
-
-        let mut summary = DiffSummary::default();
-        summary.failed = 1;
-        recover_local_run_items(&pm, &s, "test-run", &mut summary);
-
-        // DB 状态应升级为 completed
-        let items = pm.list_run_items("test-run").unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, row_id);
-        assert_eq!(items[0].status, "completed", "落盘文件应被升级");
-        // summary 应减 1
-        assert_eq!(summary.failed, 0, "summary.failed 应同步减 1");
-    }
-
-    /// 文件不在 → 不应升级,保持 failed 状态
-    #[test]
-    fn test_recover_local_run_items_skips_missing_local_file() {
-        let dir = tempdir().unwrap();
-        let local_root = dir.path().to_path_buf();
-        // 不创建任何文件
-
-        let s = sub_with_local(local_root);
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-        pm.start_run("test-run", &s.id, 1234).unwrap();
-        pm.add_run_item(
-            "test-run",
-            "/missing/file.csv",
-            SyncAction::Added,
-            TargetKind::Local,
-            None,
-            None,
-            RunItemStatus::Failed,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let mut summary = DiffSummary::default();
-        summary.failed = 1;
-        recover_local_run_items(&pm, &s, "test-run", &mut summary);
-
-        let items = pm.list_run_items("test-run").unwrap();
-        assert_eq!(items[0].status, "failed", "文件不存在应保持 failed");
-        assert_eq!(summary.failed, 1, "summary.failed 应不变");
-    }
-
-    /// netdisk 目标失败 → 不应被 recovery 升级(只能本地查)
-    #[test]
-    fn test_recover_local_run_items_ignores_netdisk_targets() {
-        let dir = tempdir().unwrap();
-        let mut s = sub();
-        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
-            remote_path: "/我的资源/同步".into(),
-            save_fs_id: 0,
-            conflict_strategy: None,
-        })];
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-        pm.start_run("test-run", &s.id, 1234).unwrap();
-        pm.add_run_item(
-            "test-run",
-            "/some/file.csv",
-            SyncAction::Added,
-            TargetKind::Netdisk,
-            None,
-            None,
-            RunItemStatus::Failed,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let mut summary = DiffSummary::default();
-        summary.failed = 1;
-        recover_local_run_items(&pm, &s, "test-run", &mut summary);
-
-        let items = pm.list_run_items("test-run").unwrap();
-        assert_eq!(
-            items[0].status, "failed",
-            "netdisk 目标不应被 recovery 升级"
-        );
-        assert_eq!(summary.failed, 1);
-    }
-
-    /// Skipped 状态(quota/disk) → 不应被升级(它是资源类,不是超时误判)
-    #[test]
-    fn test_recover_local_run_items_ignores_skipped_status() {
-        let dir = tempdir().unwrap();
-        let local_root = dir.path().to_path_buf();
-        // 即使文件存在,Skipped 项也不应被升级
-        let target_file = local_root.join("data.csv");
-        std::fs::write(&target_file, b"data").unwrap();
-
-        let s = sub_with_local(local_root);
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-        pm.start_run("test-run", &s.id, 1234).unwrap();
-        pm.add_run_item(
-            "test-run",
-            "/data.csv",
-            SyncAction::Added,
-            TargetKind::Local,
-            None,
-            None,
-            RunItemStatus::Skipped,
-            None,
-            Some("quota_full"),
-        )
-        .unwrap();
-
-        let mut summary = DiffSummary::default();
-        summary.skipped = 1;
-        recover_local_run_items(&pm, &s, "test-run", &mut summary);
-
-        let items = pm.list_run_items("test-run").unwrap();
-        assert_eq!(
-            items[0].status, "skipped",
-            "Skipped 状态(quota/disk)不应被 recovery 升级"
-        );
-    }
-
-    /// 多个 local target 时,任一目录存在即升级
-    #[test]
-    fn test_recover_local_run_items_multi_local_targets() {
-        let dir = tempdir().unwrap();
-        let root_a = dir.path().join("a");
-        let root_b = dir.path().join("b");
-        std::fs::create_dir_all(&root_a).unwrap();
-        std::fs::create_dir_all(&root_b).unwrap();
-        // 文件只在 root_b 下
-        std::fs::write(root_b.join("x.csv"), b"data").unwrap();
-
-        let mut s = sub();
-        s.targets = vec![
-            SyncTarget::Local(LocalTarget {
-                local_path: root_a,
-                conflict_strategy: None,
-            }),
-            SyncTarget::Local(LocalTarget {
-                local_path: root_b,
-                conflict_strategy: None,
-            }),
-        ];
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-        pm.start_run("test-run", &s.id, 1234).unwrap();
-        pm.add_run_item(
-            "test-run",
-            "/x.csv",
-            SyncAction::Added,
-            TargetKind::Local,
-            None,
-            None,
-            RunItemStatus::Failed,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let mut summary = DiffSummary::default();
-        summary.failed = 1;
-        recover_local_run_items(&pm, &s, "test-run", &mut summary);
-
-        let items = pm.list_run_items("test-run").unwrap();
-        assert_eq!(items[0].status, "completed");
-        assert_eq!(summary.failed, 0);
-    }
-
-    /// 没有 local target 的订阅 → recovery 是 no-op
-    #[test]
-    fn test_recover_local_run_items_no_local_targets_is_noop() {
-        let dir = tempdir().unwrap();
-        let s = sub();
-        // 强制改成 netdisk-only
-        let mut s = s;
-        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
-            remote_path: "/backup".into(),
-            save_fs_id: 0,
-            conflict_strategy: None,
-        })];
-
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-        pm.start_run("test-run", &s.id, 1234).unwrap();
-        pm.add_run_item(
-            "test-run",
-            "/x.csv",
-            SyncAction::Added,
-            TargetKind::Netdisk,
-            None,
-            None,
-            RunItemStatus::Failed,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let mut summary = DiffSummary::default();
-        summary.failed = 1;
-        recover_local_run_items(&pm, &s, "test-run", &mut summary);
-
-        // 没有任何改动
-        let items = pm.list_run_items("test-run").unwrap();
-        assert_eq!(items[0].status, "failed");
-        assert_eq!(summary.failed, 1);
-    }
-
-    /// 端到端: simulate "marker 失败后 file 已落盘" → 调 apply 全流程
-    /// 验证 run 终态能从 CompletedWithErrors 降级为 Completed
-    #[tokio::test]
-    async fn test_end_to_end_recovery_downgrades_run_status_to_completed() {
-        let dir = tempdir().unwrap();
-        let local_root = dir.path().to_path_buf();
-        let s = sub_with_local(local_root.clone());
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-
-        // 准备 prev=空, curr=2 个文件
-        let prev = ShareSnapshot::with_items(&s.id, vec![]);
-        pm.save_snapshot(&prev).unwrap();
-        let curr = ShareSnapshot::with_items(
-            &s.id,
-            vec![item("/a.csv", 1, 100), item("/b.csv", 2, 200)],
-        );
-        let diff = diff_snapshots(Some(&prev), &curr);
-
-        // 用 mock hooks 让 submit 失败(wait 阶段模拟超时错误)
-        let hooks = MockHooks {
-            wait_errors: Mutex::new(HashMap::new()),
-            ..Default::default()
-        };
-        // 把"a.csv"和"b.csv"两个 task_id 都注入"超时"错误
-        {
-            let mut waits = hooks.wait_errors.lock().unwrap();
-            // 单文件路径会先 submit → tx-1, tx-2,再 wait 各自
-            // 实际 task_id 由 submit 顺序决定:tx-1, tx-2
-            waits.insert(
-                "tx-1".to_string(),
-                ShareSyncError::DownloadError("等待任务完成超时".to_string()),
-            );
-            waits.insert(
-                "tx-2".to_string(),
-                ShareSyncError::DownloadError("等待任务完成超时".to_string()),
-            );
-        }
-        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-
-        // 模拟"wait 超时后 downloader 实际把文件落盘":
-        // 在调 apply 之前先创建好文件,这样 recovery 阶段能查到
-        std::fs::write(local_root.join("a.csv"), b"data-a").unwrap();
-        std::fs::write(local_root.join("b.csv"), b"data-b").unwrap();
-
-        // 调单文件路径(不走 tree)— 用 apply_with_run_id 而不是 apply
-        // 因为我们的 mock 单文件路径会触发 process_added_or_modified 的重试,
-        // 重试用尽后才标 failed,这样就能完整测到 marker 失败 → recovery 升级
-        let run_id = "test-recover-run".to_string();
-        let _outcome = ex.apply_with_run_id(run_id.clone(), &captured(), &diff).await;
-
-        // DB 里所有项都应是 completed(recovery 升级)
-        let items = pm.list_run_items(&run_id).unwrap();
-        assert_eq!(items.len(), 2, "应记录 2 个 run_item");
-        for it in &items {
-            assert_eq!(
-                it.status, "completed",
-                "wait 超时后文件已落盘 → recovery 升级为 completed: path={}",
-                it.path
-            );
-        }
-
-        // run 终态应是 Completed(因为 summary.failed == 0)
-        // (apply_with_run_id 路径返回的 outcome.status,以及 DB 里存的 share_sync_runs.status)
-        let run = pm
-            .get_run(&run_id)
-            .expect("run 应能查到")
-            .expect("run 应存在");
-        assert_eq!(
-            run.status, "completed",
-            "所有失败项都被 recovery 升级 → run 应是 completed,实际是: {}",
-            run.status
-        );
-        assert_eq!(run.failed_count, 0, "failed_count 应为 0");
     }
 }

@@ -23,6 +23,19 @@ pub struct NetdiskTarget {
     pub conflict_strategy: Option<ConflictStrategy>,
 }
 
+/// 本地同步模式：决定「同步到本地」时网盘侧如何留存。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSyncMode {
+    /// 分享直下：转存到临时目录 → 下载到本地 → 清理临时目录（网盘不留存）。
+    /// 老订阅未带 `mode` 字段时默认此模式，保持既有行为不破。
+    #[default]
+    ShareDirect,
+    /// 转存并下载：转存到同订阅「网盘目标」的 remote_path（保留）→ 再下载到本地。
+    /// 要求该订阅已配置网盘目标，否则创建/保存时报错提示先添加网盘目标。
+    TransferAndDownload,
+}
+
 /// 本地目标
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalTarget {
@@ -31,6 +44,9 @@ pub struct LocalTarget {
     /// 仅本目标生效的冲突策略
     #[serde(default)]
     pub conflict_strategy: Option<ConflictStrategy>,
+    /// 本地同步模式（默认 `ShareDirect`，老订阅反序列化不报错）。
+    #[serde(default)]
+    pub mode: LocalSyncMode,
 }
 
 /// 同步目标（一份订阅可同时配多个）
@@ -114,6 +130,9 @@ impl PollConfig {
 pub struct ShareSubscription {
     /// 订阅 ID（UUID）
     pub id: String,
+    /// 所属账号 uid（多账号隔离）。0 表示历史/未归属数据，由上层在创建/导入时赋值。
+    #[serde(default)]
+    pub owner_uid: u64,
     /// 用户可见名称
     pub name: String,
     /// 分享链接（可含 pwd=xxxx）
@@ -147,6 +166,17 @@ pub struct ShareSubscription {
     /// 反之多账号低风控时可调高(如 8)。仅在 BAIDUPCS_BISECT_PARALLEL=1 时生效。
     #[serde(default)]
     pub max_concurrent_transfers: Option<u32>,
+    /// 连续「链接确定性失效」的失败次数。每次 run 因分享链接失效/提取码失效而失败时
+    /// +1，成功抓取一次即归零。达到阈值后置 `link_invalid=true` 自动暂停轮询。
+    #[serde(default)]
+    pub consecutive_link_failures: u32,
+    /// 链接已确定性失效并被自动暂停：`true` 时调度触发会直接跳过（不再访问百度），
+    /// 等用户更新链接后手动「恢复」清除。
+    #[serde(default)]
+    pub link_invalid: bool,
+    /// 链接失效的可读原因（前端展示，如「分享资源不存在或已失效」）。
+    #[serde(default)]
+    pub link_invalid_reason: Option<String>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 更新时间
@@ -159,6 +189,7 @@ impl ShareSubscription {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
+            owner_uid: 0,
             name,
             share_url,
             password: None,
@@ -170,6 +201,9 @@ impl ShareSubscription {
             poll_config: PollConfig::default(),
             enabled: true,
             max_concurrent_transfers: None,
+            consecutive_link_failures: 0,
+            link_invalid: false,
+            link_invalid_reason: None,
             created_at: now,
             updated_at: now,
         }
@@ -192,6 +226,24 @@ impl ShareSubscription {
         if self.targets.is_empty() {
             return Err("至少需要配置一个同步目标".into());
         }
+        // 目标模型收窄：最多 1 个网盘目标 + 1 个本地目标（可共存=转存直下）。
+        // 多个本地目标会让同一文件重复下载到多个目录、浪费带宽；多个网盘目标也无清晰需求。
+        let netdisk_count = self
+            .targets
+            .iter()
+            .filter(|t| matches!(t, SyncTarget::Netdisk(_)))
+            .count();
+        let local_count = self
+            .targets
+            .iter()
+            .filter(|t| matches!(t, SyncTarget::Local(_)))
+            .count();
+        if netdisk_count > 1 {
+            return Err("最多只能配置 1 个网盘目标".into());
+        }
+        if local_count > 1 {
+            return Err("最多只能配置 1 个本地目标".into());
+        }
         for (idx, target) in self.targets.iter().enumerate() {
             match target {
                 SyncTarget::Netdisk(t) => {
@@ -207,6 +259,24 @@ impl ShareSubscription {
                         .map_err(|e| format!("目标 #{} {}", idx + 1, e))?;
                 }
             }
+        }
+        // 「转存并下载」本地模式需复用同订阅「网盘目标」的 remote_path，
+        // 因此要求该订阅已配置网盘目标，否则提示先添加。
+        let has_transfer_and_download = self.targets.iter().any(|t| {
+            matches!(
+                t,
+                SyncTarget::Local(LocalTarget {
+                    mode: LocalSyncMode::TransferAndDownload,
+                    ..
+                })
+            )
+        });
+        let has_netdisk_target = self
+            .targets
+            .iter()
+            .any(|t| matches!(t, SyncTarget::Netdisk(_)));
+        if has_transfer_and_download && !has_netdisk_target {
+            return Err("「转存并下载」模式需复用网盘目标，请先为该订阅添加网盘目标".into());
         }
         if matches!(self.poll_config.mode, PollMode::Interval) {
             if self.poll_config.interval_secs < MIN_POLL_INTERVAL_SECS {
@@ -335,6 +405,10 @@ pub struct CreateShareSubscriptionRequest {
     pub delete_missing: Option<bool>,
     #[serde(default)]
     pub poll_config: Option<PollConfig>,
+    /// 显式指定订阅归属账号（多账号场景）。
+    /// 缺省回退到当前活跃账号；兼容前端发的 `owner_uid` 字段名。
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
 }
 
 impl CreateShareSubscriptionRequest {
@@ -506,6 +580,74 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_multiple_netdisk_targets() {
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![
+                SyncTarget::Netdisk(NetdiskTarget {
+                    remote_path: "/a".into(),
+                    save_fs_id: 0,
+                    conflict_strategy: None,
+                }),
+                SyncTarget::Netdisk(NetdiskTarget {
+                    remote_path: "/b".into(),
+                    save_fs_id: 0,
+                    conflict_strategy: None,
+                }),
+            ],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("最多只能配置 1 个网盘目标"), "实际错误: {}", err);
+    }
+
+    #[test]
+    fn test_validate_rejects_multiple_local_targets() {
+        let tmp = std::env::temp_dir();
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![
+                SyncTarget::Local(LocalTarget {
+                    local_path: tmp.clone(),
+                    conflict_strategy: None,
+                    mode: Default::default(),
+                }),
+                SyncTarget::Local(LocalTarget {
+                    local_path: tmp,
+                    conflict_strategy: None,
+                    mode: Default::default(),
+                }),
+            ],
+        );
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("最多只能配置 1 个本地目标"), "实际错误: {}", err);
+    }
+
+    #[test]
+    fn test_validate_allows_one_netdisk_plus_one_local() {
+        // 网盘 + 本地共存（转存直下）应当合法
+        let tmp = std::env::temp_dir();
+        let sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![
+                SyncTarget::Netdisk(NetdiskTarget {
+                    remote_path: "/a".into(),
+                    save_fs_id: 0,
+                    conflict_strategy: None,
+                }),
+                SyncTarget::Local(LocalTarget {
+                    local_path: tmp,
+                    conflict_strategy: None,
+                    mode: Default::default(),
+                }),
+            ],
+        );
+        assert!(sub.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_short_interval() {
         let tmp = std::env::temp_dir();
         let mut sub = ShareSubscription::new(
@@ -514,6 +656,7 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: tmp,
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         );
         sub.poll_config.interval_secs = 60;
@@ -529,6 +672,7 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: PathBuf::from("relative/path"),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -546,6 +690,7 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: tmp,
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -593,6 +738,7 @@ mod tests {
         let t = SyncTarget::Local(LocalTarget {
             local_path: PathBuf::from("/x"),
             conflict_strategy: Some(ConflictStrategy::Skip),
+            mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
         });
         assert_eq!(
             t.effective_conflict_strategy(ConflictStrategy::Overwrite),
@@ -640,8 +786,11 @@ mod tests {
                 schedule_hour: Some(3),
                 schedule_minute: Some(30),
             }),
+            uid: Some(42),
         };
         let sub = req.into_subscription();
+        // into_subscription 不消费 uid（归属由 handler 显式设置），默认仍为 0
+        assert_eq!(sub.owner_uid, 0);
         assert_eq!(sub.password.as_deref(), Some("1234"));
         assert!(sub.delete_missing);
         assert_eq!(sub.conflict_strategy, ConflictStrategy::Skip);

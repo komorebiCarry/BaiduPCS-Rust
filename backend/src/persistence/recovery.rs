@@ -633,6 +633,11 @@ pub struct TransferRecoveryInfo {
     /// 用于在恢复后稳定推导 share_root，避免回退到启发式时再次出现目录结构错乱。
     /// 详见 `docs/share-root-fix.md`。
     pub share_root_path: Option<String>,
+    /// 任务归属配置 id（自动备份 / 分享同步内部任务）。
+    ///
+    /// 带 `share-sync:` 前缀的为分享同步内部转存任务，恢复后据此还原 `is_internal`，
+    /// 避免重启后这些内部任务漏进「转存管理」列表（对齐运行期的隔离）。
+    pub backup_config_id: Option<String>,
 }
 
 impl TransferRecoveryInfo {
@@ -654,6 +659,7 @@ impl TransferRecoveryInfo {
             is_share_direct_download: metadata.is_share_direct_download.unwrap_or(false),
             file_list_json: metadata.file_list_json.clone(),
             share_root_path: metadata.share_root_path.clone(),
+            backup_config_id: metadata.backup_config_id.clone(),
         })
     }
 }

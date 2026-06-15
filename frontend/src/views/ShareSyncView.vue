@@ -1,175 +1,239 @@
 <template>
   <div class="share-sync-view">
-    <el-page-header :icon="ArrowRight" content="分享同步" class="page-header">
-      <template #content>
-        <span class="page-title">分享同步</span>
-      </template>
-    </el-page-header>
+    <!-- 顶部工具栏（与其他页面一致） -->
+    <div class="toolbar">
+      <div class="header-left">
+        <h2 v-if="!isMobile">分享同步</h2>
+        <AccountFilter
+            v-if="authStore.hasMultipleAccounts"
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            :total-count="subscriptions.length"
+            size="large"
+            class="account-filter-slot"
+        />
+      </div>
+      <div class="header-right">
+        <el-button type="primary" :icon="Plus" @click="showTransferDialog = true">新增</el-button>
+      </div>
+    </div>
 
-    <p class="page-desc">
-      订阅第三方分享链接，自动监听内容更新并按"覆盖式 / 新版本式 / 跳过"策略把变更同步到网盘目录或本地目录。
-    </p>
+    <div class="ss-content">
+      <!-- 订阅卡片列表（自动备份风格：卡片 + 内联进行中子任务），占满全宽 -->
+      <div class="ss-list-title">订阅列表（{{ displayedSubscriptions.length }}）</div>
 
-    <el-row :gutter="16">
-      <!-- 左侧：订阅列表 -->
-      <el-col :xs="24" :md="8">
-        <el-card shadow="hover" class="list-card">
-          <template #header>
-            <div class="card-header">
-              <span>订阅列表（{{ subscriptions.length }}）</span>
-              <el-button type="primary" size="small" :icon="Plus" @click="openCreate">新增</el-button>
-            </div>
-          </template>
-          <el-empty v-if="subscriptions.length === 0" description="还没有订阅" />
-          <div v-else class="sub-list">
-            <div
-              v-for="s in subscriptions"
-              :key="s.id"
-              class="sub-item"
-              :class="{ active: selected?.id === s.id }"
-              @click="select(s)"
-            >
-              <div class="sub-name">
-                <el-icon><Link /></el-icon>
-  <span>{{ s.name }}</span>
-                <el-tag v-if="!s.enabled" size="small" type="info">已停用</el-tag>
+      <el-empty
+          v-if="displayedSubscriptions.length === 0"
+          :description="ownerFilter === null ? '还没有订阅' : '当前账号下没有订阅'"
+      />
+
+      <div v-else class="config-list">
+        <el-card
+            v-for="s in displayedSubscriptions"
+            :key="s.id"
+            class="config-card"
+            :class="{ active: selected?.id === s.id, 'is-disabled': !s.enabled }"
+            shadow="hover"
+            @click="openDetail(s)"
+        >
+          <!-- 卡片头部 -->
+          <div class="config-header">
+            <div class="config-info">
+              <div class="config-title">
+                <el-icon :size="18" class="direction-icon"><Link /></el-icon>
+                <span class="config-name">{{ s.name }}</span>
+                <AccountBadge :owner-uid="s.owner_uid" size="small" class="task-account-badge" />
+                <el-tag :type="s.enabled ? 'success' : 'info'" size="small">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
+                <el-tooltip
+                    v-if="s.link_invalid"
+                    :content="s.link_invalid_reason || '分享链接已失效（被取消/过期/提取码失效），已暂停轮询；更新链接后点「恢复」'"
+                    placement="top"
+                >
+                  <el-tag type="danger" size="small" effect="dark">链接失效·已暂停</el-tag>
+                </el-tooltip>
+                <el-tag :type="strategyTagType(s.conflict_strategy)" size="small">{{ describeStrategy(s.conflict_strategy) }}</el-tag>
               </div>
-              <div class="sub-meta">
-                <span>{{ describeInterval(s.poll_config) }}</span>
-                <span>·</span>
+              <div class="config-path">
                 <span>{{ describeTargets(s.targets) }}</span>
+                <span class="dot">·</span>
+                <span>{{ describeInterval(s.poll_config) }}</span>
+                <template v-if="s.include_paths.length">
+                  <span class="dot">·</span><span>范围 {{ s.include_paths.length }} 条</span>
+                </template>
+                <template v-if="s.exclude_patterns.length">
+                  <span class="dot">·</span><span>排除 {{ s.exclude_patterns.length }} 条</span>
+                </template>
+                <template v-if="s.delete_missing">
+                  <span class="dot">·</span><span class="danger-text">删除缺失</span>
+                </template>
+              </div>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="config-actions" @click.stop>
+              <el-tooltip
+                  :disabled="ownerLoggedIn(s)"
+                  content="订阅所属账号未登录，请先登录该账号再触发同步"
+                  placement="top"
+              >
+                  <span>
+                    <el-button
+                        size="small"
+                        type="success"
+                        :icon="Refresh"
+                        :loading="triggeringId === s.id"
+                        :disabled="!ownerLoggedIn(s)"
+                        @click="triggerNow(s)"
+                    >
+                      立即同步
+                    </el-button>
+                  </span>
+              </el-tooltip>
+              <el-button
+                  v-if="s.link_invalid"
+                  size="small"
+                  type="primary"
+                  :icon="RefreshRight"
+                  :loading="resumingId === s.id"
+                  @click="resumeNow(s)"
+              >
+                我已更新链接，恢复
+              </el-button>
+              <el-button size="small" :icon="Edit" @click="openEdit(s)">编辑</el-button>
+              <el-button
+                  size="small"
+                  :type="s.enabled ? 'warning' : 'success'"
+                  :icon="s.enabled ? VideoPause : VideoPlay"
+                  @click="toggleEnabled(s)"
+              >
+                {{ s.enabled ? '停用' : '启用' }}
+              </el-button>
+              <el-button size="small" type="danger" :icon="Delete" @click="removeSubscription(s)" />
+            </div>
+          </div>
+
+          <!-- 进行中子任务（内联展示，无需展开；转存段 / 下载段各自独立进度条） -->
+          <div v-if="subtasksOf(s.id).length" class="active-task-container">
+            <div class="active-task-card">
+              <div class="task-progress-header is-toggle" @click.stop="toggleSubtasks(s.id)">
+                <div class="task-status-info">
+                  <el-icon :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
+                  <span class="task-status-text">进行中子任务（{{ subtasksOf(s.id).length }}）</span>
+                </div>
+                <el-icon :size="14" class="toggle-icon">
+                  <ArrowDown v-if="subtasksExpanded(s.id)" />
+                  <ArrowRight v-else />
+                </el-icon>
+              </div>
+              <div v-if="subtasksExpanded(s.id)" class="file-tasks-preview">
+                <div v-for="st in subtasksCapped(s.id)" :key="st.task_id" class="subtask-item">
+                  <div class="subtask-head">
+                    <el-tag :type="st.kind === 'download' ? 'success' : 'warning'" size="small">
+                      {{ st.kind === 'download' ? '下载' : '转存' }}
+                    </el-tag>
+                    <span class="file-name" :title="st.name">{{ st.name }}</span>
+                    <span class="subtask-stat">{{ subtaskStat(st) }}</span>
+                    <el-tag :type="subtaskStatusColor(st.status)" size="small">{{ subtaskStatusText(st.status) }}</el-tag>
+                  </div>
+                  <el-progress
+                      :percentage="clampPercent(st.progress)"
+                      :stroke-width="6"
+                      :show-text="false"
+                      :status="subtaskProgressStatus(st.status)"
+                  />
+                </div>
+                <div v-if="subtasksOverflow(s.id) > 0" class="subtask-overflow">
+                  仅显示前 {{ SUBTASK_RENDER_CAP }} 个，另有 {{ subtasksOverflow(s.id) }} 个进行中…
+                </div>
               </div>
             </div>
           </div>
+          <div v-else class="no-active-task">
+            <span class="idle-text">当前无进行中子任务</span>
+            <el-button size="small" text type="primary" @click.stop="openRunsDialog(s)">查看运行历史</el-button>
+          </div>
         </el-card>
-      </el-col>
+      </div>
+    </div>
 
-      <!-- 中间：详情 + 操作 -->
-      <el-col :xs="24" :md="10">
-        <el-card v-if="selected" shadow="hover" class="detail-card">
-          <template #header>
-            <div class="card-header">
-              <span>订阅详情</span>
-              <div>
-                <el-button size="small" :icon="Edit" @click="openEdit">编辑</el-button>
-                <el-button
-                  size="small"
-                  :type="selected.enabled ? 'warning' : 'success'"
-                  :icon="selected.enabled ? VideoPause : VideoPlay"
-                  @click="toggleEnabled"
-                >
-                  {{ selected.enabled ? '停用' : '启用' }}
-                </el-button>
-                <el-button size="small" type="success" :icon="Refresh" @click="triggerNow" :loading="triggering">
-                  立即同步
-                </el-button>
-                <el-button size="small" type="danger" :icon="Delete" @click="removeSubscription">删除</el-button>
-              </div>
-            </div>
-          </template>
-
-          <el-descriptions :column="1" border>
-            <el-descriptions-item label="名称">{{ selected.name }}</el-descriptions-item>
-            <el-descriptions-item label="分享链接">
-              <el-link type="primary" :href="selected.share_url" target="_blank" :underline="false">
-                {{ selected.share_url }}
-              </el-link>
-            </el-descriptions-item>
-            <el-descriptions-item label="冲突策略">
-              <el-tag :type="strategyTagType(selected.conflict_strategy)">
-                {{ describeStrategy(selected.conflict_strategy) }}
+    <!-- 订阅详情对话框 -->
+    <el-dialog v-model="detailDialogVisible" title="订阅详情" width="640px">
+      <template v-if="selected">
+        <div class="detail-dialog-toolbar">
+          <el-button text :icon="Clock" @click="runsDialogVisible = true">
+            运行历史<span v-if="runs.length > 0">（{{ runs.length }}）</span>
+          </el-button>
+        </div>
+        <el-descriptions :column="1" border>
+          <el-descriptions-item label="名称">{{ selected.name }}</el-descriptions-item>
+          <el-descriptions-item label="分享链接">
+            <el-link type="primary" :href="selected.share_url" target="_blank" :underline="false">
+              {{ selected.share_url }}
+            </el-link>
+          </el-descriptions-item>
+          <el-descriptions-item label="冲突策略">
+            <el-tag :type="strategyTagType(selected.conflict_strategy)">
+              {{ describeStrategy(selected.conflict_strategy) }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="目标">
+            <div v-for="(t, i) in selected.targets" :key="i" class="target-line">
+              <el-tag :type="t.kind === 'netdisk' ? 'success' : 'warning'" size="small">
+                {{ t.kind === 'netdisk' ? '网盘' : '本地' }}
               </el-tag>
-            </el-descriptions-item>
-            <el-descriptions-item label="目标">
-              <div v-for="(t, i) in selected.targets" :key="i" class="target-line">
-                <el-tag :type="t.kind === 'netdisk' ? 'success' : 'warning'" size="small">
-                  {{ t.kind === 'netdisk' ? '网盘' : '本地' }}
-                </el-tag>
-                <span style="margin-left: 6px">
-                  {{ t.kind === 'netdisk' ? t.remote_path : t.local_path }}
-                </span>
-              </div>
-            </el-descriptions-item>
-            <el-descriptions-item label="同步范围">
-              <div v-if="selected.include_paths.length > 0" class="path-tags">
-                <el-tag
+              <span style="margin-left: 6px">
+                {{ t.kind === 'netdisk' ? t.remote_path : t.local_path }}
+              </span>
+            </div>
+          </el-descriptions-item>
+          <el-descriptions-item label="同步范围">
+            <div v-if="selected.include_paths.length > 0" class="path-tags">
+              <el-tag
                   v-for="(p, i) in selected.include_paths"
                   :key="`inc-${i}`"
                   size="small"
                   type="info"
-                >
-                  {{ p }}
-                </el-tag>
-              </div>
-              <span v-else>同步整个分享</span>
-            </el-descriptions-item>
-            <el-descriptions-item label="排除规则">
-              <div v-if="selected.exclude_patterns.length > 0" class="path-tags">
-                <el-tag
+              >
+                {{ p }}
+              </el-tag>
+            </div>
+            <span v-else>同步整个分享</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="排除规则">
+            <div v-if="selected.exclude_patterns.length > 0" class="path-tags">
+              <el-tag
                   v-for="(p, i) in selected.exclude_patterns"
                   :key="`ex-${i}`"
                   size="small"
                   type="info"
-                >
-                  {{ p }}
-                </el-tag>
-              </div>
-              <span v-else>无</span>
-            </el-descriptions-item>
-            <el-descriptions-item label="轮询">
-              <span v-if="isPollEnabled(selected.poll_config)">
-                {{ describeInterval(selected.poll_config) }}
-              </span>
-              <span v-else>已禁用</span>
-            </el-descriptions-item>
-            <el-descriptions-item label="删除缺失">
-              <el-tag v-if="selected.delete_missing" type="danger" size="small">开启</el-tag>
-              <el-tag v-else type="info" size="small">关闭</el-tag>
-            </el-descriptions-item>
-          </el-descriptions>
-        </el-card>
-        <el-empty v-else description="请选择订阅查看详情" />
-      </el-col>
-
-      <!-- 右侧：运行历史 -->
-      <el-col :xs="24" :md="6">
-        <el-card v-if="selected" shadow="hover" class="runs-card">
-          <template #header>
-            <span>运行历史</span>
-          </template>
-          <el-empty v-if="runs.length === 0" description="暂无运行" />
-          <el-timeline v-else>
-            <el-timeline-item
-              v-for="r in runs"
-              :key="r.id"
-              :timestamp="formatTime(r.started_at)"
-              :type="runStatusType(r.status)"
-            >
-              <div @click="openRun(r.id)" class="run-item">
-                <strong>{{ describeRunStatus(r.status) }}</strong>
-                <div class="run-stats">
-                  总 {{ runTotalCount(r) }} / 需处理 {{ runChangedCount(r) }}
-                  <span> +{{ r.added_count }}</span>
-                  <span> 覆盖 {{ runOverwrittenCount(r) }}</span>
-                  <span> 一致跳过 {{ runUnchangedCount(r) }}</span>
-                  <span v-if="runSkippedCount(r) > 0" style="color: #e6a23c"> 跳过 {{ runSkippedCount(r) }}</span>
-                  <span v-if="r.failed_count > 0" style="color: #f56c6c"> 失败 {{ r.failed_count }}</span>
-                </div>
-              </div>
-            </el-timeline-item>
-          </el-timeline>
-        </el-card>
-      </el-col>
-    </el-row>
+              >
+                {{ p }}
+              </el-tag>
+            </div>
+            <span v-else>无</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="轮询">
+            <span v-if="isPollEnabled(selected.poll_config)">
+              {{ describeInterval(selected.poll_config) }}
+            </span>
+            <span v-else>已禁用</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="删除缺失">
+            <el-tag v-if="selected.delete_missing" type="danger" size="small">开启</el-tag>
+            <el-tag v-else type="info" size="small">关闭</el-tag>
+          </el-descriptions-item>
+        </el-descriptions>
+      </template>
+    </el-dialog>
 
     <!-- 创建/编辑对话框 -->
     <el-dialog
-      v-model="dialogVisible"
-      :title="dialogMode === 'create' ? '新增订阅' : '编辑订阅'"
-      width="640px"
-      @close="resetForm"
+        v-model="dialogVisible"
+        title="编辑订阅"
+        width="640px"
+        @close="resetForm"
     >
-    <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef">
+      <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef">
         <el-form-item label="名称" prop="name">
           <el-input v-model="form.name" placeholder="如：剧集合集同步" />
         </el-form-item>
@@ -179,65 +243,15 @@
         <el-form-item label="提取码">
           <el-input v-model="form.password" placeholder="可选" maxlength="4" />
         </el-form-item>
-        <el-form-item label="同步路径">
-          <div class="path-editor">
-            <div v-if="form.include_paths.length === 0" class="path-empty">
-              不填则同步整个分享；填写后只同步勾选的子路径（前缀匹配）。
-            </div>
-            <div v-else class="path-tags">
-              <el-tag
-                v-for="(p, i) in form.include_paths"
-                :key="p + i"
-                closable
-                @close="form.include_paths.splice(i, 1)"
-                style="margin: 2px 4px 2px 0"
-              >{{ p }}</el-tag>
-            </div>
-            <div class="path-actions">
-              <el-input
-                v-model="pathInput"
-                size="small"
-                placeholder="手动输入路径，如 /剧集"
-                style="width: 220px; margin-right: 8px"
-                @keyup.enter="addPath"
-              >
-                <template #append>
-                  <el-button :icon="Plus" @click="addPath" />
-                </template>
-              </el-input>
-              <el-button
-                size="small"
-                :icon="FolderOpened"
-                :loading="loadingTree"
-                :disabled="!form.share_url"
-                @click="openTreePicker"
-              >从分享浏览</el-button>
-            </div>
-          </div>
-        </el-form-item>
-        <el-form-item label="排除规则">
-          <div class="path-editor">
-            <div class="path-tags">
-              <el-tag
-                v-for="(p, i) in form.exclude_patterns"
-                :key="p + i"
-                closable
-                type="info"
-                @close="form.exclude_patterns.splice(i, 1)"
-                style="margin: 2px 4px 2px 0"
-              >{{ p }}</el-tag>
-              <span v-if="form.exclude_patterns.length === 0" class="path-empty-inline">
-                支持 glob：*.tmp、sample.*、*广告* 等
-              </span>
-            </div>
-            <el-input
-              v-model="excludeInput"
-              size="small"
-              placeholder="添加排除规则，按回车确认"
-              style="width: 280px; margin-top: 4px"
-              @keyup.enter="addExclude"
-            />
-          </div>
+        <el-form-item label="同步范围">
+          <ShareIncludeExcludeEditor
+              :share-url="form.share_url"
+              :password="form.password || null"
+              :owner-uid="selected?.owner_uid ?? null"
+              :owner-logged-in="selectedOwnerLoggedIn"
+              v-model:include-paths="form.include_paths"
+              v-model:exclude-patterns="form.exclude_patterns"
+          />
         </el-form-item>
         <el-form-item label="冲突策略">
           <el-radio-group v-model="form.conflict_strategy">
@@ -246,29 +260,41 @@
             <el-radio-button value="skip">跳过</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-form-item label="目标">
-          <div v-for="(t, i) in form.targets" :key="i" class="target-form-row">
-            <el-select v-model="t.kind" style="width: 110px" @change="onTargetKindChange(t)">
-              <el-option value="netdisk" label="网盘" />
-              <el-option value="local" label="本地" />
-            </el-select>
-            <el-input
-              v-if="t.kind === 'netdisk'"
-              v-model="(t as NetdiskTarget).remote_path"
-              placeholder="网盘路径，如 /我的资源/同步"
-              style="margin-left: 8px; flex: 1"
-            />
-            <el-input
-              v-else
-              v-model="(t as LocalTarget).local_path"
-              placeholder="本地路径"
-              style="margin-left: 8px; flex: 1"
-            />
-            <el-button :icon="Delete" link type="danger" @click="form.targets.splice(i, 1)" style="margin-left: 4px" />
+        <el-form-item label="同步目标">
+          <div class="sync-mode-editor">
+            <div class="sync-toggle-row">
+              <el-switch v-model="netdiskEnabled" />
+              <span class="sync-toggle-label">转存到网盘</span>
+            </div>
+            <div v-if="netdiskEnabled" class="mode-target-row">
+              <span class="mode-target-label">网盘目录</span>
+              <el-input
+                  v-model="netdiskRemotePath"
+                  placeholder="网盘路径，如 /我的资源/同步"
+                  style="flex: 1"
+              />
+            </div>
+
+            <div class="sync-toggle-row">
+              <el-switch v-model="localEnabled" />
+              <span class="sync-toggle-label">下载到本地</span>
+            </div>
+            <div v-if="localEnabled" class="mode-target-row">
+              <span class="mode-target-label">本地目录</span>
+              <span
+                  class="mode-target-value"
+                  :class="{ 'is-placeholder': !localTargetPath }"
+                  @click="openDirPicker()"
+              >
+                {{ localTargetPath || '点击选择本地目录' }}
+              </span>
+              <el-button :icon="FolderOpened" @click="openDirPicker()" style="margin-left: 4px">
+                选择
+              </el-button>
+            </div>
+
+            <div class="sync-mode-hint">{{ syncModeHint }}</div>
           </div>
-          <el-button :icon="Plus" link @click="form.targets.push(createDefaultTarget())">
-            添加目标
-          </el-button>
         </el-form-item>
         <el-form-item label="轮询">
           <el-radio-group v-model="form.poll_config.mode">
@@ -283,10 +309,10 @@
         </el-form-item>
         <el-form-item v-if="form.poll_config.mode === 'scheduled'" label="时刻">
           <el-time-picker
-            v-model="scheduledTime"
-            format="HH:mm"
-            value-format="HH:mm"
-            @change="onScheduledChange"
+              v-model="scheduledTime"
+              format="HH:mm"
+              value-format="HH:mm"
+              @change="onScheduledChange"
           />
         </el-form-item>
         <el-form-item label="删除缺失">
@@ -297,70 +323,6 @@
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="saveForm" :loading="saving">保存</el-button>
-      </template>
-    </el-dialog>
-
-    <!-- 目录树选择对话框 -->
-    <el-dialog
-      v-model="treePickerVisible"
-      title="从分享中选择要同步的子路径"
-      width="640px"
-      :close-on-click-modal="false"
-      @open="loadTree"
-    >
-      <div class="tree-picker-toolbar">
-        <el-input
-          v-model="treeFilterText"
-          placeholder="搜索路径/文件名"
-          clearable
-          size="small"
-          style="width: 240px"
-        />
-        <el-checkbox v-model="treeCheckStrictly" style="margin-left: 12px">
-          父子独立选择
-        </el-checkbox>
-        <el-radio-group v-model="treeDepth" size="small" style="margin-left: 12px">
-          <el-radio-button :value="1">仅根</el-radio-button>
-          <el-radio-button :value="2">2 层</el-radio-button>
-          <el-radio-button :value="3">3 层</el-radio-button>
-        </el-radio-group>
-        <el-button size="small" :loading="loadingTree" :icon="Refresh" style="margin-left: 12px" @click="loadTree">刷新</el-button>
-      </div>
-      <el-alert
-        v-if="treeError"
-        :title="treeError"
-        type="error"
-        :closable="false"
-        show-icon
-        style="margin-bottom: 8px"
-      />
-      <el-tree
-        ref="treeRef"
-        :data="treeData"
-        :props="treeProps"
-        node-key="path"
-        show-checkbox
-        :check-strictly="treeCheckStrictly"
-        :default-checked-keys="form.include_paths"
-        :filter-node-method="filterTreeNode"
-        :default-expand-all="false"
-        v-loading="loadingTree"
-        empty-text="暂无内容或分享已失效"
-        style="max-height: 420px; overflow: auto"
-      >
-        <template #default="{ node, data }">
-          <span class="tree-node">
-            <el-icon v-if="data.is_dir"><FolderOpened /></el-icon>
-            <el-icon v-else><Document /></el-icon>
-            <span style="margin-left: 4px">{{ data.name }}</span>
-            <span v-if="!data.is_dir" class="tree-size">{{ formatSize(data.size) }}</span>
-          </span>
-        </template>
-      </el-tree>
-      <template #footer>
-        <span class="tree-picker-hint">已选 {{ form.include_paths.length }} 个路径</span>
-        <el-button @click="treePickerVisible = false">取消</el-button>
-        <el-button type="primary" @click="confirmTreePicker">确定</el-button>
       </template>
     </el-dialog>
 
@@ -388,95 +350,267 @@
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
         </el-descriptions>
-        <h4 style="margin-top: 16px">
-          文件动作（{{ currentRun.items.length }} / {{ currentRun.items_total ?? currentRun.items.length }}）
-        </h4>
-        <el-alert
-          v-if="currentRun.items_truncated"
-          title="仅展示前 200 条文件动作，避免详情页卡死。其余明细仍保留在后端。"
-          type="warning"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 8px"
-        />
+        <h4 style="margin-top: 16px">文件动作（{{ currentRun.items.length }}）</h4>
         <el-table :data="currentRun.items" size="small" max-height="400">
           <el-table-column prop="path" label="路径" />
-          <el-table-column prop="action" label="动作" width="80" />
-          <el-table-column prop="target" label="目标" width="80" />
-          <el-table-column prop="status" label="状态" width="100" />
-          <el-table-column prop="reason" label="跳过原因" width="120" />
+          <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
+          <el-table-column prop="target" label="目标" width="80" :formatter="describeTarget" />
+          <el-table-column prop="status" label="状态" width="100" :formatter="describeItemStatus" />
+          <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
         </el-table>
       </div>
     </el-dialog>
+
+    <!-- 运行历史对话框 -->
+    <el-dialog v-model="runsDialogVisible" title="运行历史" width="640px">
+      <el-empty v-if="runs.length === 0" description="暂无运行" />
+      <el-timeline v-else>
+        <el-timeline-item
+            v-for="r in runs"
+            :key="r.id"
+            :timestamp="formatTime(r.started_at)"
+            :type="runStatusType(r.status)"
+        >
+          <div @click="openRun(r.id)" class="run-item">
+            <strong>{{ describeRunStatus(r.status) }}</strong>
+            <div class="run-stats">
+              总 {{ runTotalCount(r) }} / 需处理 {{ runChangedCount(r) }}
+              <span> +{{ r.added_count }}</span>
+              <span> 覆盖 {{ runOverwrittenCount(r) }}</span>
+              <span> 一致跳过 {{ runUnchangedCount(r) }}</span>
+              <span v-if="runSkippedCount(r) > 0" style="color: #e6a23c"> 跳过 {{ runSkippedCount(r) }}</span>
+              <span v-if="r.failed_count > 0" style="color: #f56c6c"> 失败 {{ r.failed_count }}</span>
+            </div>
+          </div>
+        </el-timeline-item>
+      </el-timeline>
+    </el-dialog>
+
+    <!-- 本地目录选择（对齐转存：FilePickerModal 选目录） -->
+    <FilePickerModal
+        v-model="dirPickerVisible"
+        mode="download"
+        select-type="directory"
+        title="选择本地目录"
+        :initial-path="dirPickerInitialPath"
+        :default-download-dir="dirPickerDefaultDir"
+        @confirm-download="handleDirConfirm"
+        @use-default="handleDirUseDefault"
+    />
+
+    <!-- 创建入口：复用转存对话框（默认勾“保持同步”→ 创建订阅） -->
+    <TransferDialog
+        v-model="showTransferDialog"
+        :default-keep-sync="true"
+        :lock-keep-sync="true"
+        @sync-created="onSyncCreated"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { ElMessage, ElMessageBox, type ElTree } from 'element-plus'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AxiosError } from 'axios'
+import { useAuthStore } from '@/stores/auth'
+import { useIsMobile } from '@/utils/responsive'
+import AccountFilter from '@/components/AccountFilter.vue'
+import AccountBadge from '@/components/AccountBadge.vue'
+import TransferDialog from '@/components/TransferDialog.vue'
+import ShareIncludeExcludeEditor from '@/components/ShareIncludeExcludeEditor.vue'
+import { FilePickerModal } from '@/components/FilePicker'
+import { getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig } from '@/api/config'
 import {
-  Plus, Edit, Delete, Refresh, ArrowRight, Link,
-  FolderOpened, Document, VideoPause, VideoPlay,
+  Plus, Edit, Delete, Refresh, RefreshRight, Link,
+  FolderOpened, VideoPause, VideoPlay, Loading, Clock, ArrowDown, ArrowRight,
 } from '@element-plus/icons-vue'
 import {
   type ShareSubscription,
   type SyncTarget,
   type NetdiskTarget,
   type LocalTarget,
-  type CreateShareSubscriptionRequest,
   type UpdateShareSubscriptionRequest,
   type RunRecord,
   type RunDetail,
   type ConflictStrategy,
   type PollConfig,
-  type TreeNode,
   type ShareSyncWsEvent,
-  listSubscriptions, createSubscription, updateSubscription,
-  deleteSubscription, setSubscriptionEnabled, triggerSubscription, listRuns, getRun,
-  previewTree,
+  type ShareSyncSubtask,
+  listSubscriptions, updateSubscription,
+  deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, listRuns, getRun, listSubtasks,
 } from '@/api/shareSync'
-import { getWebSocketClient, connectWebSocket } from '@/utils/websocket'
+import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
+import { createAdaptivePoller } from '@/utils/backendHealth'
 
 const subscriptions = ref<ShareSubscription[]>([])
-const DEFAULT_LOCAL_TARGET_PATH = '/home/hyx/codespace/one-family/data'
 const selected = ref<ShareSubscription | null>(null)
+
+const isMobile = useIsMobile()
+
+// 多账号：账号过滤（null=全部账号）
+const authStore = useAuthStore()
+const ownerFilter = ref<number | null>(null)
+
+// 按账号过滤后的订阅列表（与 transfer/autobackup 一致：null 显示全部）
+const displayedSubscriptions = computed(() => {
+  if (ownerFilter.value === null) return subscriptions.value
+  return subscriptions.value.filter(s => s.owner_uid === ownerFilter.value)
+})
+
+// 当前选中订阅的所属账号是否已登录：未登录则禁用依赖网盘 client 的操作（触发同步 / 预览目录树）
+// 并提示登录该账号（对齐 AutoBackup：不要求用户先切号，但 owner 未登录时网盘操作不可用）。
+const selectedOwnerLoggedIn = computed(() => {
+  if (!selected.value) return false
+  return authStore.accounts.some(a => a.uid === selected.value!.owner_uid)
+})
+
+// 各账号订阅数量（AccountFilter badge 展示）
+const ownerFilterCounts = computed(() => {
+  const map: Record<number, number> = {}
+  for (const s of subscriptions.value) {
+    if (typeof s.owner_uid === 'number') map[s.owner_uid] = (map[s.owner_uid] || 0) + 1
+  }
+  return map
+})
 const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
+
+// 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
+const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
+
+function subtasksOf(id: string): ShareSyncSubtask[] {
+  return activeSubtasks.value.get(id) ?? []
+}
+
+// 子任务列表默认折叠（几千文件时不铺满卡片）；按订阅记忆展开态。
+const expandedSubtasks = ref<Set<string>>(new Set())
+function subtasksExpanded(id: string): boolean {
+  return expandedSubtasks.value.has(id)
+}
+function toggleSubtasks(id: string) {
+  const next = new Set(expandedSubtasks.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedSubtasks.value = next
+}
+
+// 展开时也只渲染前 N 行（避免上千个 el-progress 撑爆 DOM），其余用计数提示。
+const SUBTASK_RENDER_CAP = 200
+function subtasksCapped(id: string): ShareSyncSubtask[] {
+  return subtasksOf(id).slice(0, SUBTASK_RENDER_CAP)
+}
+function subtasksOverflow(id: string): number {
+  return Math.max(0, subtasksOf(id).length - SUBTASK_RENDER_CAP)
+}
+
+// 某订阅所属账号是否已登录（卡片级触发同步前置条件）
+function ownerLoggedIn(s: ShareSubscription): boolean {
+  return authStore.accounts.some(a => a.uid === s.owner_uid)
+}
+
+// 本地目录选择（与转存一致：FilePickerModal 选目录 + 最近目录联动）
+const downloadConfig = ref<DownloadConfig | null>(null)
+const dirPickerVisible = ref(false)
+
 const dialogVisible = ref(false)
-const dialogMode = ref<'create' | 'edit'>('create')
+// 创建入口：复用转存对话框
+const showTransferDialog = ref(false)
 const runDialogVisible = ref(false)
+const runsDialogVisible = ref(false)
+const detailDialogVisible = ref(false)
 const saving = ref(false)
-const triggering = ref(false)
+const triggeringId = ref<string | null>(null)
+const resumingId = ref<string | null>(null)
 const formRef = ref()
 const scheduledTime = ref<string>('03:00')
 
 // 路径编辑
-const pathInput = ref('')
-const excludeInput = ref('')
+function createDefaultTarget(): SyncTarget {
+  return { kind: 'local', local_path: '', conflict_strategy: null, mode: 'share_direct' }
+}
 
-// 目录树选择
-const treePickerVisible = ref(false)
-const treeData = ref<TreeNode[]>([])
-const treeRef = ref<InstanceType<typeof ElTree>>()
-const treeProps = {
-  children: 'children',
-  label: 'name',
-  isLeaf: (d: TreeNode) => !d.is_dir,
-} as const
-const treeFilterText = ref('')
-const treeCheckStrictly = ref(false)
-const treeDepth = ref<number>(2)
-const loadingTree = ref(false)
-const treeError = ref('')
-watch(treeFilterText, (v) => {
-  treeRef.value?.filter(v)
+// 目标模型收窄：最多 1 个网盘 + 1 个本地（可共存=转存并下载）。
+function targetKindCounts(): { netdisk: number; local: number } {
+  let netdisk = 0
+  let local = 0
+  for (const t of form.value.targets) {
+    if (t.kind === 'netdisk') netdisk++
+    else if (t.kind === 'local') local++
+  }
+  return { netdisk, local }
+}
+
+// ==================== 同步目标开关 ====================
+// 不再让用户手选模式，改为「转存到网盘」「下载到本地」两个开关，行为由组合自动推导
+// （与后端 effective_transfer_ops 一致）：
+//   仅网盘        = 仅 Netdisk target
+//   网盘+本地     = Netdisk + Local{ mode: transfer_and_download }（后端合并成一条腿：转存一次→从副本下载）
+//   仅本地        = 仅 Local{ mode: share_direct }（分享直下：转临时目录→下载→清理，网盘不留存）
+// 约束：至少开启一个。
+
+function findNetdiskTarget(): NetdiskTarget | undefined {
+  return form.value.targets.find((t): t is NetdiskTarget => t.kind === 'netdisk')
+}
+function findLocalTarget(): LocalTarget | undefined {
+  return form.value.targets.find((t): t is LocalTarget => t.kind === 'local')
+}
+
+// 按开关重建目标列表，尽量保留已填的网盘/本地路径，避免误清空
+function rebuildTargets(netdisk: boolean, local: boolean) {
+  if (!netdisk && !local) {
+    ElMessage.warning('至少需要开启一个同步目标（网盘或本地）')
+    return
+  }
+  const nd = findNetdiskTarget()
+  const lo = findLocalTarget()
+  const remotePath = nd?.remote_path ?? '/'
+  const saveFsId = nd?.save_fs_id ?? 0
+  const localPath = lo?.local_path ?? ''
+  const ndStrategy = nd?.conflict_strategy ?? null
+  const loStrategy = lo?.conflict_strategy ?? null
+  const next: SyncTarget[] = []
+  if (netdisk) {
+    next.push({ kind: 'netdisk', remote_path: remotePath, save_fs_id: saveFsId, conflict_strategy: ndStrategy })
+  }
+  if (local) {
+    // 有网盘目标=转存并下载（复用网盘副本）；无=分享直下。后端最终按目标存在性推导，这里保持一致。
+    next.push({ kind: 'local', local_path: localPath, conflict_strategy: loStrategy, mode: netdisk ? 'transfer_and_download' : 'share_direct' })
+  }
+  form.value.targets = next
+}
+
+const netdiskEnabled = computed<boolean>({
+  get() { return !!findNetdiskTarget() },
+  set(on: boolean) { rebuildTargets(on, !!findLocalTarget()) },
+})
+const localEnabled = computed<boolean>({
+  get() { return !!findLocalTarget() },
+  set(on: boolean) { rebuildTargets(!!findNetdiskTarget(), on) },
 })
 
-function createDefaultTarget(): SyncTarget {
-  return { kind: 'local', local_path: DEFAULT_LOCAL_TARGET_PATH, conflict_strategy: null }
-}
+const syncModeHint = computed(() => {
+  const nd = netdiskEnabled.value
+  const lo = localEnabled.value
+  if (nd && lo) return '转存到网盘目录并保留，再从这份网盘副本下载到本地（只转存一次，不会重复转存）。'
+  if (nd) return '只把分享内容转存到指定网盘目录并保留，不下载到本地。'
+  return '分享直下：转存到临时目录后下载到本地，下载完成即清理，网盘不留存。'
+})
+
+const netdiskRemotePath = computed<string>({
+  get() { return findNetdiskTarget()?.remote_path ?? '' },
+  set(v: string) {
+    const nd = findNetdiskTarget()
+    if (nd) nd.remote_path = v
+  },
+})
+const localTargetPath = computed<string>({
+  get() { return findLocalTarget()?.local_path ?? '' },
+  set(v: string) {
+    const lo = findLocalTarget()
+    if (lo) lo.local_path = v
+  },
+})
 
 const defaultForm = (): {
   name: string
@@ -507,8 +641,8 @@ function normalizePollConfigForUi(p?: PollConfig | null): PollConfig {
   const enabled = p?.enabled !== false
   const mode = (!enabled || rawMode === 'disabled' ? 'disabled' : rawMode) as PollConfig['mode']
   const intervalSecs = Number.isFinite(Number(p?.interval_secs))
-    ? Math.max(600, Number(p?.interval_secs))
-    : 1800
+      ? Math.max(600, Number(p?.interval_secs))
+      : 1800
 
   return {
     enabled: mode !== 'disabled',
@@ -522,8 +656,8 @@ function normalizePollConfigForUi(p?: PollConfig | null): PollConfig {
 function normalizePollConfigForSubmit(p: PollConfig): PollConfig {
   const mode = (p.mode || 'interval') as PollConfig['mode']
   const intervalSecs = Number.isFinite(Number(p.interval_secs))
-    ? Math.max(600, Number(p.interval_secs))
-    : 1800
+      ? Math.max(600, Number(p.interval_secs))
+      : 1800
 
   if (mode === 'disabled') {
     return {
@@ -582,6 +716,27 @@ async function select(s: ShareSubscription) {
   await loadRuns(s.id)
 }
 
+// 打开订阅详情弹窗
+async function openDetail(s: ShareSubscription) {
+  await select(s)
+  detailDialogVisible.value = true
+}
+
+// 直接打开运行历史弹窗
+async function openRunsDialog(s: ShareSubscription) {
+  await select(s)
+  runsDialogVisible.value = true
+}
+
+// 切换账号过滤时，若当前选中项被过滤掉，则清空选择，保持详情面板与列表一致
+watch(ownerFilter, () => {
+  if (!selected.value) return
+  if (!displayedSubscriptions.value.some(s => s.id === selected.value!.id)) {
+    selected.value = null
+    runs.value = []
+  }
+})
+
 async function loadRuns(id: string) {
   try {
     runs.value = await listRuns(id, 1, 30)
@@ -594,14 +749,13 @@ async function loadRuns(id: string) {
   }
 }
 
-function openCreate() {
-  form.value = defaultForm()
-  scheduledTime.value = '03:00'
-  dialogMode.value = 'create'
-  dialogVisible.value = true
+// 转存对话框创建订阅后回调（WS 事件也会刷新，这里显式刷一次更可靠）
+function onSyncCreated() {
+  refresh()
 }
 
-function openEdit() {
+function openEdit(s?: ShareSubscription) {
+  if (s) selected.value = s
   if (!selected.value) return
   form.value = {
     name: selected.value.name,
@@ -623,18 +777,17 @@ function openEdit() {
     form.value.poll_config.schedule_hour = null
     form.value.poll_config.schedule_minute = null
   }
-  dialogMode.value = 'edit'
   dialogVisible.value = true
 }
 
 function getApiErrorMessage(e: unknown): string {
   const ax = e as AxiosError<{ message?: string; error?: string; msg?: string; details?: string }>
   return ax?.response?.data?.message
-    || ax?.response?.data?.error
-    || ax?.response?.data?.msg
-    || ax?.response?.data?.details
-    || (e as Error)?.message
-    || '未知错误'
+      || ax?.response?.data?.error
+      || ax?.response?.data?.msg
+      || ax?.response?.data?.details
+      || (e as Error)?.message
+      || '未知错误'
 }
 
 function resetForm() {
@@ -654,21 +807,7 @@ async function saveForm() {
   }
   saving.value = true
   try {
-    if (dialogMode.value === 'create') {
-      const req: CreateShareSubscriptionRequest = {
-        name: form.value.name,
-        share_url: form.value.share_url,
-        password: form.value.password || null,
-        include_paths: form.value.include_paths,
-        exclude_patterns: form.value.exclude_patterns,
-        targets: form.value.targets,
-        conflict_strategy: form.value.conflict_strategy,
-        delete_missing: form.value.delete_missing,
-        poll_config: form.value.poll_config,
-      }
-      await createSubscription(req)
-      ElMessage.success('已创建订阅')
-    } else if (selected.value) {
+    if (selected.value) {
       const req: UpdateShareSubscriptionRequest = {
         name: form.value.name,
         share_url: form.value.share_url,
@@ -698,6 +837,17 @@ function validateForm(): boolean {
     return false
   }
 
+  // 目标模型收窄：最多 1 网盘 + 1 本地（与后端 validate 一致）
+  const { netdisk, local } = targetKindCounts()
+  if (netdisk > 1) {
+    ElMessage.error('最多只能配置 1 个网盘目标')
+    return false
+  }
+  if (local > 1) {
+    ElMessage.error('最多只能配置 1 个本地目标')
+    return false
+  }
+
   for (let i = 0; i < form.value.targets.length; i++) {
     const t = form.value.targets[i] as NetdiskTarget | LocalTarget
     if (t.kind === 'netdisk') {
@@ -706,13 +856,11 @@ function validateForm(): boolean {
         return false
       }
     } else if (t.kind === 'local') {
+      // 仅校验非空；绝对路径/目录存在/可写交给后端 validate_local_path()
+      // （按平台用 Path::is_absolute() 判断，避免前端写死 Linux 的 / 前缀误伤 Windows 的 D:\）
       const lp = String(t.local_path || '').trim()
       if (!lp) {
         ElMessage.error(`目标 #${i + 1}：本地路径不能为空`)
-        return false
-      }
-      if (!lp.startsWith('/')) {
-        ElMessage.error(`目标 #${i + 1}：本地路径必须是绝对路径`)
         return false
       }
     } else {
@@ -766,14 +914,6 @@ function normalizeRemotePath(v: string): string {
   return normalizePath(v) || '/'
 }
 
-function normalizeLocalPath(v: string): string {
-  const s = v.trim().replace(/\/+/g, '/')
-  if (!s) return ''
-  const prefixed = s.startsWith('/') ? s : `/${s}`
-  if (prefixed.length === 1) return '/'
-  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
-}
-
 function buildSanitizedPayload() {
   const includeSet = new Set<string>()
   for (const p of form.value.include_paths) {
@@ -807,10 +947,12 @@ function buildSanitizedPayload() {
         ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
       })
     } else if (t.kind === 'local') {
-      const local = normalizeLocalPath(String(t.local_path || ''))
+      // 本地路径只做 trim，不做 / 归一化（保留 Windows 的 D:\ 等平台路径原样交后端）
+      const local = String(t.local_path || '').trim()
       nextTargets.push({
         kind: 'local',
         local_path: local,
+        mode: t.mode === 'transfer_and_download' ? 'transfer_and_download' : 'share_direct',
         ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
       })
     }
@@ -819,32 +961,37 @@ function buildSanitizedPayload() {
   form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
 }
 
-async function removeSubscription() {
-  if (!selected.value) return
+async function removeSubscription(s?: ShareSubscription) {
+  const target = s ?? selected.value
+  if (!target) return
   try {
     await ElMessageBox.confirm(
-      `确定删除订阅 "${selected.value.name}"？历史快照与运行记录将一并清理。`,
-      '删除确认',
-      { type: 'warning' }
+        `确定删除订阅 "${target.name}"？历史快照与运行记录将一并清理。`,
+        '删除确认',
+        { type: 'warning' }
     )
   } catch {
     return
   }
   try {
-    await deleteSubscription(selected.value.id)
+    await deleteSubscription(target.id)
     ElMessage.success('已删除')
-    selected.value = null
-    runs.value = []
+    if (selected.value?.id === target.id) {
+      selected.value = null
+      runs.value = []
+    }
+    activeSubtasks.value.delete(target.id)
     await refresh()
   } catch (e) {
     ElMessage.error(`删除失败: ${getApiErrorMessage(e)}`)
   }
 }
 
-async function toggleEnabled() {
-  if (!selected.value) return
+async function toggleEnabled(s?: ShareSubscription) {
+  const target = s ?? selected.value
+  if (!target) return
   try {
-    await setSubscriptionEnabled(selected.value.id, !selected.value.enabled)
+    await setSubscriptionEnabled(target.id, !target.enabled)
     ElMessage.success('已切换启用状态')
     await refresh()
   } catch (e) {
@@ -852,141 +999,93 @@ async function toggleEnabled() {
   }
 }
 
-async function triggerNow() {
-  if (!selected.value) return
-  triggering.value = true
+async function resumeNow(s?: ShareSubscription) {
+  const target = s ?? selected.value
+  if (!target) return
+  resumingId.value = target.id
   try {
-    await triggerSubscription(selected.value.id)
+    await resumeSubscription(target.id)
+    ElMessage.success('已恢复轮询并立即重试一次')
+    await refresh()
+  } catch (e) {
+    ElMessage.error(`恢复失败: ${getApiErrorMessage(e)}`)
+  } finally {
+    resumingId.value = null
+  }
+}
+
+async function triggerNow(s?: ShareSubscription) {
+  const target = s ?? selected.value
+  if (!target) return
+  triggeringId.value = target.id
+  try {
+    await triggerSubscription(target.id)
     ElMessage.success('已触发同步，结果将稍后出现在运行历史')
-    setTimeout(() => selected.value && loadRuns(selected.value.id), 1500)
+    setTimeout(() => {
+      if (selected.value?.id === target.id) loadRuns(target.id)
+      loadSubtasksFor(target.id)
+    }, 1500)
   } catch (e) {
     ElMessage.error(`触发失败: ${getApiErrorMessage(e)}`)
   } finally {
-    triggering.value = false
+    triggeringId.value = null
   }
 }
 
 async function openRun(runId: string) {
   try {
-    const r = await getRun(runId)
-    currentRun.value = {
-      ...r,
-      items: r.items.slice(0, 200),
-      items_total: r.items_total ?? r.items.length,
-      items_truncated: (r.items_total ?? r.items.length) > 200 || !!r.items_truncated,
-    }
+    currentRun.value = await getRun(runId)
     runDialogVisible.value = true
   } catch (e) {
     ElMessage.error(`加载运行详情失败: ${getApiErrorMessage(e)}`)
   }
 }
 
-function onTargetKindChange(t: SyncTarget) {
-  if (t.kind === 'netdisk') {
-    t.remote_path = normalizeRemotePath(String(t.remote_path || '/'))
-    t.save_fs_id = Number.isFinite(Number(t.save_fs_id)) ? Number(t.save_fs_id) : 0
-    delete (t as unknown as Record<string, unknown>).local_path
+// ==================== 本地目录选择（对齐转存） ====================
+
+const dirPickerInitialPath = computed(
+    () => downloadConfig.value?.recent_directory
+        || downloadConfig.value?.default_directory
+        || downloadConfig.value?.download_dir
+        || '',
+)
+const dirPickerDefaultDir = computed(
+    () => downloadConfig.value?.default_directory || downloadConfig.value?.download_dir || '',
+)
+
+function openDirPicker() {
+  dirPickerVisible.value = true
+}
+
+function applyPickedDir(path: string) {
+  const lo = findLocalTarget()
+  if (lo) {
+    lo.local_path = String(path || '').trim()
   }
-  if (t.kind === 'local') {
-    t.local_path = normalizeLocalPath(String(t.local_path || DEFAULT_LOCAL_TARGET_PATH))
-    delete (t as unknown as Record<string, unknown>).save_fs_id
-    delete (t as unknown as Record<string, unknown>).remote_path
+}
+
+// FilePickerModal mode="download"：选定目录（path 原样，不做归一化）
+function handleDirConfirm(payload: { path: string; setAsDefault: boolean }) {
+  const { path, setAsDefault } = payload
+  dirPickerVisible.value = false
+  applyPickedDir(path)
+  if (setAsDefault) {
+    setDefaultDownloadDir({ path })
+        .then(() => { if (downloadConfig.value) downloadConfig.value.default_directory = path })
+        .catch(() => { /* 设默认失败不阻断填写 */ })
   }
+  // 与转存一致：联动最近下载目录
+  updateRecentDirDebounced({ dir_type: 'download', path })
+  if (downloadConfig.value) downloadConfig.value.recent_directory = path
+}
+
+function handleDirUseDefault() {
+  dirPickerVisible.value = false
+  const target = dirPickerDefaultDir.value
+  if (target) applyPickedDir(target)
 }
 
 // ==================== 路径编辑 / 树选择 ====================
-
-function addPath() {
-  const v = normalizePath(pathInput.value)
-  if (!v) return
-  if (!form.value.include_paths.includes(v)) {
-    form.value.include_paths.push(v)
-  }
-  pathInput.value = ''
-}
-
-function addExclude() {
-  const v = excludeInput.value.trim()
-  if (!v) return
-  if (!form.value.exclude_patterns.includes(v)) {
-    form.value.exclude_patterns.push(v)
-  }
-  excludeInput.value = ''
-}
-
-function openTreePicker() {
-  if (!form.value.share_url) {
-    ElMessage.warning('请先填写分享链接')
-    return
-  }
-  treeError.value = ''
-  treePickerVisible.value = true
-}
-
-async function loadTree() {
-  loadingTree.value = true
-  treeError.value = ''
-  try {
-    const resp = await previewTree(
-      form.value.share_url,
-      form.value.password || null,
-      treeDepth.value
-    )
-    treeData.value = resp.root || []
-    // 重新设置已选
-    await nextTick()
-    form.value.include_paths.forEach((p: string) => {
-      treeRef.value?.setChecked?.(p, true, false)
-    })
-  } catch (e) {
-    const ax = e as AxiosError<{ message?: string; error?: string }>
-    treeError.value =
-      ax?.response?.data?.message ||
-      ax?.response?.data?.error ||
-      (e as Error)?.message ||
-      '加载目录树失败'
-  } finally {
-    loadingTree.value = false
-  }
-}
-
-function confirmTreePicker() {
-  const checked = treeRef.value?.getCheckedNodes?.(false, false) || []
-  const halfChecked = treeRef.value?.getHalfCheckedNodes?.() || []
-  const all = [...checked, ...halfChecked]
-  // 按照树节点路径回填，先标准化再去重
-  const nextInclude: string[] = []
-  const uniq = new Set<string>()
-  all
-    .map((n) => (n as unknown as TreeNode).path)
-    .map((p: string) => normalizePath(p))
-    .filter((p: string) => p.length > 0)
-    .forEach((p: string) => {
-      if (!uniq.has(p)) {
-        uniq.add(p)
-        nextInclude.push(p)
-      }
-    })
-  form.value.include_paths = nextInclude
-  treePickerVisible.value = false
-}
-
-function filterTreeNode(query: string, data: TreeNode) {
-  if (!query) return true
-  return (data.name as string)?.toLowerCase?.().includes(query.toLowerCase())
-}
-
-function formatSize(n: number): string {
-  if (!n) return ''
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let v = n
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024
-    i++
-  }
-  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + ' ' + u[i]
-}
 
 function onScheduledChange(val: string | null) {
   if (form.value.poll_config.mode !== 'scheduled') {
@@ -1031,15 +1130,58 @@ function strategyTagType(s: ConflictStrategy): 'success' | 'warning' | 'info' {
 
 function describeRunStatus(s: string): string {
   return s === 'running' ? '运行中' :
-    s === 'completed' ? '已完成' :
-    s === 'completed_with_errors' ? '完成（部分失败）' :
-    s === 'failed' ? '失败' : s
+      s === 'completed' ? '已完成' :
+          s === 'completed_with_errors' ? '完成（部分失败）' :
+              s === 'failed' ? '失败' :
+                  s === 'interrupted' ? '已中断（自动重跑）' : s
 }
 
 function runStatusType(s: string): 'success' | 'warning' | 'danger' | 'info' {
   return s === 'completed' ? 'success' :
-    s === 'completed_with_errors' ? 'warning' :
-    s === 'failed' ? 'danger' : 'info'
+      s === 'completed_with_errors' ? 'warning' :
+          s === 'failed' ? 'danger' : 'info'
+}
+
+// 运行历史「文件动作」表格里的列值原本是后端枚举英文（added/netdisk/failed…），
+// 这里统一汉化展示。
+const ACTION_LABELS: Record<string, string> = {
+  added: '新增',
+  modified: '修改',
+  removed: '删除',
+  skipped: '跳过',
+}
+const TARGET_LABELS: Record<string, string> = {
+  netdisk: '网盘',
+  local: '本地',
+  netdisk_and_local: '网盘+本地',
+}
+const ITEM_STATUS_LABELS: Record<string, string> = {
+  pending: '等待',
+  transferring: '转存中',
+  downloading: '下载中',
+  deleting: '删除中',
+  completed: '完成',
+  failed: '失败',
+  skipped: '跳过',
+}
+const REASON_LABELS: Record<string, string> = {
+  quota_full: '网盘空间不足',
+  local_disk_full: '本地磁盘空间不足',
+  skip_due_to_quota_full: '网盘空间不足',
+  skip_due_to_local_disk_full: '本地磁盘空间不足',
+}
+function describeAction(_r: unknown, _c: unknown, v: string): string {
+  return ACTION_LABELS[v] ?? v
+}
+function describeTarget(_r: unknown, _c: unknown, v: string): string {
+  return TARGET_LABELS[v] ?? v
+}
+function describeItemStatus(_r: unknown, _c: unknown, v: string): string {
+  return ITEM_STATUS_LABELS[v] ?? v
+}
+function describeReason(_r: unknown, _c: unknown, v: string | null | undefined): string {
+  if (!v) return '—'
+  return REASON_LABELS[v] ?? v
 }
 
 function runTotalCount(r: RunRecord | RunDetail): number {
@@ -1067,14 +1209,183 @@ function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString('zh-CN')
 }
 
+// ==================== 子任务进度（内联展示） ====================
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)))
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`
+}
+
+function formatSpeed(bps: number): string {
+  if (!bps || bps <= 0) return '0 B/s'
+  return `${formatBytes(bps)}/s`
+}
+
+function clampPercent(p: number): number {
+  if (!Number.isFinite(p)) return 0
+  return Math.min(100, Math.max(0, Math.round(p)))
+}
+
+// 预计剩余时间（秒）格式化，与自动备份 `formatETA` 口径一致
+function formatEtaSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '--'
+  if (seconds < 60) return `${Math.ceil(seconds)} 秒`
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60)
+    const secs = Math.ceil(seconds % 60)
+    return `${minutes} 分 ${secs} 秒`
+  }
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  return `${hours} 小时 ${minutes} 分`
+}
+
+// 下载段：已下载 / 总大小 · 速度 · 剩余预计；转存段：已完成 / 总文件数
+function subtaskStat(st: ShareSyncSubtask): string {
+  if (st.kind === 'download') {
+    let s = `${formatBytes(st.downloaded)} / ${formatBytes(st.total)}`
+    if (st.speed > 0) {
+      s += ` · ${formatSpeed(st.speed)}`
+      const eta = st.eta_seconds ?? (st.total > st.downloaded ? (st.total - st.downloaded) / st.speed : null)
+      if (eta != null && eta > 0) s += ` · 剩余 ${formatEtaSeconds(eta)}`
+    }
+    return s
+  }
+  return `${st.downloaded}/${st.total} 文件`
+}
+
+const SUBTASK_TERMINAL = new Set(['completed', 'failed', 'cancelled', 'success'])
+
+function subtaskStatusText(status: string): string {
+  const map: Record<string, string> = {
+    pending: '等待中',
+    queued: '排队中',
+    preparing: '准备中',
+    waiting_transfer: '等待传输',
+    transferring: '转存中',
+    downloading: '下载中',
+    paused: '已暂停',
+    completed: '已完成',
+    success: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+  }
+  return map[status] || status
+}
+
+function subtaskStatusColor(status: string): 'success' | 'warning' | 'danger' | 'info' | 'primary' {
+  switch (status) {
+    case 'completed':
+    case 'success': return 'success'
+    case 'failed': return 'danger'
+    case 'cancelled':
+    case 'paused': return 'warning'
+    case 'transferring':
+    case 'downloading':
+    case 'preparing':
+    case 'waiting_transfer': return 'primary'
+    default: return 'info'
+  }
+}
+
+function subtaskProgressStatus(status: string): '' | 'success' | 'exception' | 'warning' {
+  if (status === 'failed') return 'exception'
+  if (status === 'paused') return 'warning'
+  return ''
+}
+
+// WS item_progress 到达：按 task_id upsert；终态则移除（与 REST「仅返回进行中」语义一致）
+function upsertSubtask(sid: string, st: ShareSyncSubtask) {
+  const list = activeSubtasks.value.get(sid) ?? []
+  const idx = list.findIndex(x => x.task_id === st.task_id)
+  if (SUBTASK_TERMINAL.has(st.status)) {
+    if (idx >= 0) list.splice(idx, 1)
+  } else if (idx >= 0) {
+    list[idx] = st
+  } else {
+    list.push(st)
+  }
+  if (list.length > 0) {
+    activeSubtasks.value.set(sid, list)
+  } else {
+    activeSubtasks.value.delete(sid)
+  }
+  // 触发 Map 的响应式刷新（Map 的原地修改不会触发 ref 更新）
+  activeSubtasks.value = new Map(activeSubtasks.value)
+}
+
+async function loadSubtasksFor(id: string) {
+  try {
+    const list = await listSubtasks(id)
+    // 防御：只展示未到终态的子任务。后端「进行中」接口已过滤终态，这里再兜一层，
+    // 与 WS upsertSubtask 的剔除口径一致，避免切换页面后已完成的文件夹被当成进行中。
+    const active = list.filter(st => !SUBTASK_TERMINAL.has(st.status))
+    const next = new Map(activeSubtasks.value)
+    if (active.length > 0) {
+      next.set(id, active)
+    } else {
+      next.delete(id)
+    }
+    activeSubtasks.value = next
+  } catch {
+    // 子任务加载失败不阻断页面（账号未就绪时后端返回空，异常时静默）
+  }
+}
+
+async function loadSubtasksForAll() {
+  await Promise.all(subscriptions.value.map(s => loadSubtasksFor(s.id)))
+}
+
 // ==================== 生命周期 ====================
 
 let unsubWs: (() => void) | null = null
+let unsubConnState: (() => void) | null = null
+const wsConnected = ref(false)
+
+const hasActiveSubtasks = computed(() => {
+  for (const list of activeSubtasks.value.values()) {
+    if (list.length > 0) return true
+  }
+  return false
+})
+
+// 自适应轮询器：WS 未连接且存在活跃子任务时兜底刷新 /subtasks
+const subtaskPoller = createAdaptivePoller(() => {
+  if (wsConnected.value || !hasActiveSubtasks.value) {
+    subtaskPoller.stop()
+    return
+  }
+  loadSubtasksForAll()
+}, { baseDelayMs: 2000, maxDelayMs: 30000 })
+
+function updateSubtaskPolling() {
+  if (!wsConnected.value && hasActiveSubtasks.value) {
+    subtaskPoller.start()
+  } else {
+    subtaskPoller.stop()
+  }
+}
+
+watch(hasActiveSubtasks, updateSubtaskPolling)
 
 onMounted(async () => {
   await refresh()
   if (subscriptions.value.length > 0 && !selected.value) {
     await select(subscriptions.value[0])
+  }
+
+  // 初始拉取一次进行中子任务（与 AutoBackup 一致：进页面即有进度，不空窗）
+  await loadSubtasksForAll()
+
+  // 加载下载目录配置（本地目标选目录时用作初始/默认目录，与转存一致）
+  try {
+    const appConfig = await getConfig()
+    downloadConfig.value = appConfig.download
+  } catch {
+    // 配置加载失败不阻断页面；选目录时回退到根目录
   }
 
   // 订阅 WebSocket
@@ -1086,60 +1397,282 @@ onMounted(async () => {
     if (!evt || !evt.type) return
     const sid = evt.subscription_id
     if (!sid) return
+    if (evt.type === 'item_progress') {
+      upsertSubtask(sid, {
+        task_id: evt.task_id,
+        name: evt.name,
+        kind: evt.kind,
+        status: evt.status,
+        downloaded: evt.downloaded,
+        total: evt.total,
+        progress: evt.progress,
+        speed: evt.speed,
+        eta_seconds: evt.eta_seconds ?? null,
+        owner_uid: evt.owner_uid ?? 0,
+      })
+      return
+    }
     if (['subscription_created', 'subscription_updated', 'subscription_deleted', 'status_changed'].includes(evt.type)) {
       refresh()
-    } else if (sid === selected.value?.id) {
+      return
+    }
+    if (evt.type === 'run_started') {
+      // 新一轮开始：清掉旧的进度残留，随后由 item_progress / 轮询补齐
+      loadSubtasksFor(sid)
+    }
+    if (['run_completed', 'run_failed'].includes(evt.type)) {
+      // 一轮结束：清空该订阅的进行中子任务
+      const next = new Map(activeSubtasks.value)
+      next.delete(sid)
+      activeSubtasks.value = next
+    }
+    if (sid === selected.value?.id) {
       if (['run_started', 'run_completed', 'run_failed', 'diff_detected'].includes(evt.type)) {
         loadRuns(sid)
-        if (['run_completed', 'run_failed'].includes(evt.type)) {
-          ElMessage[evt.type === 'run_failed' ? 'error' : 'success'](describeRunStatus(evt.type))
-        }
+      }
+      // run_completed 不再弹提示（结果可在运行历史里看）；仅失败时提醒。
+      if (evt.type === 'run_failed') {
+        ElMessage.error(`同步失败：${evt.error || '未知错误'}`)
       }
     }
   }
   unsubWs = ws.onShareSyncEvent(handler)
+
+  // 连接状态：断线时启动轮询兜底，恢复后停止并刷新一次进行中子任务
+  unsubConnState = ws.onConnectionStateChange((state: ConnectionState) => {
+    const wasConnected = wsConnected.value
+    wsConnected.value = state === 'connected'
+    updateSubtaskPolling()
+    if (!wasConnected && wsConnected.value) {
+      loadSubtasksForAll()
+    }
+  })
+  updateSubtaskPolling()
 })
 
 onUnmounted(() => {
   unsubWs?.()
+  unsubConnState?.()
+  subtaskPoller.stop()
 })
 </script>
 
 <style scoped lang="scss">
 .share-sync-view {
-  padding: 16px;
-  .page-header { margin-bottom: 12px; }
-  .page-title { font-weight: 600; font-size: 18px; margin-left: 8px; }
-  .page-desc { color: #909399; font-size: 13px; margin-bottom: 16px; }
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #f5f5f5;
 }
 
-.list-card .card-header,
-.detail-card .card-header,
-.runs-card .card-header {
+// 顶部工具栏（与转存管理等页面一致）
+.toolbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  background: white;
+  border-bottom: 1px solid #e0e0e0;
+  padding: 16px 20px;
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+
+    h2 {
+      margin: 0;
+      font-size: 18px;
+      color: #333;
+    }
+  }
+
+  .header-right {
+    display: flex;
+    gap: 10px;
+  }
 }
 
-.sub-list {
+.ss-content {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 20px;
+}
+
+// ==================== 订阅卡片列表（自动备份风格） ====================
+.ss-list-title {
+  font-weight: 500;
+  color: #303133;
+  margin-bottom: 12px;
+}
+
+.config-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 16px;
 }
-.sub-item {
-  padding: 10px 12px;
-  border: 1px solid #ebeef5;
-  border-radius: 6px;
+
+.config-card {
+  border-left: 4px solid #409eff;
+  transition: all 0.3s;
   cursor: pointer;
-  transition: all 0.2s;
-  &:hover { border-color: #409eff; }
-  &.active { background: #ecf5ff; border-color: #409eff; }
-  .sub-name { display: flex; align-items: center; gap: 6px; font-weight: 500; }
-  .sub-meta { font-size: 12px; color: #909399; margin-top: 4px; display: flex; gap: 6px; }
+
+  &.is-disabled { border-left-color: #c0c4cc; }
+  &.active { box-shadow: 0 0 0 1px #409eff inset; }
+  &:hover { transform: translateY(-2px); }
+}
+
+.config-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+.config-info { flex: 1; min-width: 0; }
+.config-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  .direction-icon { flex-shrink: 0; color: #409eff; }
+  .config-name { font-size: 16px; font-weight: 500; color: #333; }
+}
+.config-path {
+  font-size: 12px;
+  color: #909399;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  .dot { color: #c0c4cc; }
+  .danger-text { color: #f56c6c; }
+}
+.config-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+// 进行中子任务（内联）
+.active-task-container {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #ebeef5;
+}
+.active-task-card {
+  background: #f5f7fa;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.task-progress-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px 4px;
+  &.is-toggle { cursor: pointer; user-select: none; }
+  .toggle-icon { margin-left: auto; color: #909399; }
+}
+.task-status-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  .task-status-text { font-size: 14px; font-weight: 500; color: #303133; }
+  .status-icon.text-blue-500 { color: #409eff; }
+  .is-loading { animation: ss-rotate 1.2s linear infinite; }
+}
+// 固定高度 + 滚动条：几千个子任务时不再撑满卡片
+.file-tasks-preview {
+  padding: 4px 12px 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.subtask-overflow {
+  padding: 8px 0 2px;
+  font-size: 12px;
+  color: #909399;
+  text-align: center;
+}
+.subtask-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #ebeef5;
+  &:last-child { border-bottom: none; }
+}
+.subtask-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  .file-name {
+    font-size: 13px;
+    color: #303133;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+  }
+  .subtask-stat { font-size: 12px; color: #909399; flex-shrink: 0; }
+}
+
+.no-active-task {
+  margin-top: 12px;
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #f5f7fa;
+  border-radius: 6px;
+  .idle-text { font-size: 13px; color: #909399; }
+}
+
+@keyframes ss-rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.detail-dialog-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 
 .target-line { margin: 4px 0; }
 .target-form-row { display: flex; align-items: center; margin-bottom: 8px; }
+.target-tip { margin-left: 8px; font-size: 12px; color: #909399; }
+
+.sync-mode-editor {
+  width: 100%;
+  .sync-mode-hint { margin: 8px 0 4px; font-size: 12px; color: #909399; }
+  .mode-target-row {
+    display: flex;
+    align-items: center;
+    margin-top: 8px;
+    .mode-target-label {
+      width: 64px;
+      flex-shrink: 0;
+      font-size: 13px;
+      color: #606266;
+    }
+    .mode-target-value {
+      flex: 1;
+      min-width: 0;
+      padding: 0 11px;
+      height: 32px;
+      line-height: 32px;
+      border: 1px solid var(--el-border-color);
+      border-radius: 4px;
+      font-size: 14px;
+      color: #303133;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      &:hover { border-color: var(--el-color-primary); }
+      &.is-placeholder { color: #a8abb2; }
+    }
+  }
+}
 
 .run-item { cursor: pointer; &:hover { color: #409eff; } }
 .run-stats { font-size: 12px; color: #909399; margin-top: 2px; }

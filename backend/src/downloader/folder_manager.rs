@@ -904,8 +904,7 @@ impl FolderDownloadManager {
                 // 获取该文件夹的所有活跃子任务
                 let tasks = dm.get_tasks_by_group(&folder_id).await;
 
-                // 🔥 计算活跃子任务的已下载字节数和速度
-                let active_downloaded: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
+                // 🔥 速度只统计仍在下载中的子任务
                 let speed: u64 = tasks
                     .iter()
                     .filter(|t| t.status == TaskStatus::Downloading)
@@ -917,6 +916,11 @@ impl FolderDownloadManager {
                 let downloaded_size = {
                     let mut folders_guard = folders.write().await;
                     if let Some(folder) = folders_guard.get_mut(&folder_id) {
+                        // 🔥 排除已计入 completed_downloaded_size 的子任务再求 active_sum，
+                        // 否则完成瞬间残留任务会被双重累加并被 max() 永久锁死（已下载翻倍 200%）。
+                        let active_downloaded = folder.active_downloaded_excluding_counted(
+                            tasks.iter().map(|t| (t.id.as_str(), t.downloaded_size)),
+                        );
                         folder.compute_downloaded_size(active_downloaded)
                     } else {
                         continue;
@@ -1511,6 +1515,30 @@ impl FolderDownloadManager {
         self.create_folder_download_with_name(remote_path, None, None, owner_uid).await
     }
 
+    /// 创建文件夹下载任务（指定下载目录 + 备份配置归属）
+    ///
+    /// `backup_config_id = Some("share-sync:{订阅id}")` 时，该文件夹下载为分享同步
+    /// 内部任务：从「下载管理」隐藏，并作为分享同步子任务被收集。
+    pub async fn create_folder_download_with_dir_backup(
+        &self,
+        remote_path: String,
+        target_dir: &std::path::Path,
+        original_name: Option<String>,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
+        backup_config_id: Option<String>,
+    ) -> Result<String> {
+        self.create_folder_download_with_dir_inner(
+            remote_path,
+            target_dir,
+            original_name,
+            conflict_strategy,
+            owner_uid,
+            backup_config_id,
+        )
+            .await
+    }
+
     /// 创建文件夹下载任务（支持指定原始文件夹名）
     ///
     /// 如果传入 original_name，则使用该名称作为本地文件夹名（用于加密文件夹还原）
@@ -1555,7 +1583,13 @@ impl FolderDownloadManager {
         let local_root = download_dir.join(&folder_name);
         drop(download_dir);
 
-        self.create_folder_download_internal(remote_path, local_root, conflict_strategy, owner_uid)
+        self.create_folder_download_internal(
+            remote_path,
+            local_root,
+            conflict_strategy,
+            owner_uid,
+            None,
+        )
             .await
     }
 
@@ -1574,6 +1608,26 @@ impl FolderDownloadManager {
         original_name: Option<String>,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
         owner_uid: crate::auth::Uid,
+    ) -> Result<String> {
+        self.create_folder_download_with_dir_inner(
+            remote_path,
+            target_dir,
+            original_name,
+            conflict_strategy,
+            owner_uid,
+            None,
+        )
+            .await
+    }
+
+    async fn create_folder_download_with_dir_inner(
+        &self,
+        remote_path: String,
+        target_dir: &std::path::Path,
+        original_name: Option<String>,
+        conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+        owner_uid: crate::auth::Uid,
+        backup_config_id: Option<String>,
     ) -> Result<String> {
         // 获取远程路径中的文件夹名
         let encrypted_folder_name = remote_path
@@ -1606,7 +1660,13 @@ impl FolderDownloadManager {
 
         let local_root = target_dir.join(&folder_name);
 
-        self.create_folder_download_internal(remote_path, local_root, conflict_strategy, owner_uid)
+        self.create_folder_download_internal(
+            remote_path,
+            local_root,
+            conflict_strategy,
+            owner_uid,
+            backup_config_id,
+        )
             .await
     }
 
@@ -1621,12 +1681,16 @@ impl FolderDownloadManager {
         local_root: PathBuf,
         conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
         owner_uid: crate::auth::Uid,
+        backup_config_id: Option<String>,
     ) -> Result<String> {
         let mut folder = FolderDownload::new(remote_path.clone(), local_root);
         let folder_id = folder.id.clone();
 
         // 🔥 多账号：设置 folder 归属 UID（与 ClientPool/per-uid downloader 路由对齐）
         folder.owner_uid = owner_uid;
+
+        // 🔥 分享同步内部隐藏文件夹下载：归属 backup_config_id
+        folder.backup_config_id = backup_config_id;
 
         // 🔥 设置冲突策略
         folder.conflict_strategy = conflict_strategy;
@@ -1774,15 +1838,20 @@ impl FolderDownloadManager {
                 // AccountBadge 在 WS 实时路径上不可靠（前端只能等 GET /downloads/all
                 // 全量拉刷新才能看到归属）。文件夹本身已有 owner_uid 字段（来自
                 // create_folder_download_with_dir 接收的 owner_uid 参数），直接透传。
-                self.publish_event(FolderEvent::Created {
-                    folder_id: folder_id.clone(),
-                    name: folder.name.clone(),
-                    remote_root: folder.remote_root.clone(),
-                    local_root: folder.local_root.to_string_lossy().to_string(),
+                // 🔥 内部隐藏文件夹（分享同步）不广播 folder 事件，避免泄漏进
+                // 「下载管理」（DownloadsView 依 Created 事件动态插入文件夹行）。
+                // 其进度改由分享同步 item_progress（collect_share_sync_subtasks）呈现。
+                if folder.backup_config_id.is_none() {
+                    self.publish_event(FolderEvent::Created {
+                        folder_id: folder_id.clone(),
+                        name: folder.name.clone(),
+                        remote_root: folder.remote_root.clone(),
+                        local_root: folder.local_root.to_string_lossy().to_string(),
 
-                    owner_uid: Some(folder.owner_uid.raw()),
-                })
-                    .await;
+                        owner_uid: Some(folder.owner_uid.raw()),
+                    })
+                        .await;
+                }
             }
         }
 
@@ -1994,7 +2063,33 @@ impl FolderDownloadManager {
             }
 
             // 获取文件列表
-            let file_list = client.get_file_list(current_path, page, page_size).await?;
+            //
+            // 🔥 刚转存到网盘的目录可能因百度侧最终一致性尚未就绪而短暂返回
+            // `API error -9`（文件不存在）等瞬时错误（分享同步 tree 模式整目录转存后
+            // 立即自动下载会撞上）。直接 `?` 会让整个文件夹下载判失败、子文件全标
+            // 「下载失败」。这里对扫描列表做有界重试（最多 4 次，递增 backoff），
+            // 真失败仍会在重试耗尽后向上抛出。
+            let file_list = {
+                const SCAN_LIST_MAX_ATTEMPTS: u32 = 4;
+                let mut attempt = 0u32;
+                loop {
+                    match client.get_file_list(current_path, page, page_size).await {
+                        Ok(list) => break list,
+                        Err(e) => {
+                            attempt += 1;
+                            if attempt >= SCAN_LIST_MAX_ATTEMPTS || cancel_token.is_cancelled() {
+                                return Err(e);
+                            }
+                            let backoff = tokio::time::Duration::from_millis(800 * attempt as u64);
+                            warn!(
+                                "扫描文件夹列表失败(第 {}/{} 次), {:?} 后重试: dir={}, page={}, err={}",
+                                attempt, SCAN_LIST_MAX_ATTEMPTS, backoff, current_path, page, e
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
+                    }
+                }
+            };
 
             let mut batch_files = Vec::new();
             let mut batch_size = 0u64;
@@ -2112,6 +2207,18 @@ impl FolderDownloadManager {
     pub async fn get_all_folders(&self) -> Vec<FolderDownload> {
         let folders = self.folders.read().await;
         folders.values().cloned().collect()
+    }
+
+    /// 🔥 获取归属指定 `backup_config_id`（如 `share-sync:{订阅id}`）的内存文件夹下载
+    ///
+    /// 供分享同步收集 tree 模式整目录下载产生的文件夹子任务进度。
+    pub async fn get_folders_by_backup_config(&self, backup_config_id: &str) -> Vec<FolderDownload> {
+        let folders = self.folders.read().await;
+        folders
+            .values()
+            .filter(|f| f.backup_config_id.as_deref() == Some(backup_config_id))
+            .cloned()
+            .collect()
     }
 
     /// 获取所有文件夹下载（内存 + 历史数据库）
@@ -2947,6 +3054,41 @@ impl FolderDownloadManager {
         Ok(())
     }
 
+    /// 🔥 删除归属指定 `backup_config_id`（如 `share-sync:{订阅id}`）的全部文件夹下载
+    ///
+    /// 用于删除分享同步订阅时，连带清掉 tree 模式整目录下载产生的内部隐藏文件夹任务，
+    /// 避免订阅删除后残留无法在任何界面看到的孤儿文件夹。返回处理的文件夹数。
+    pub async fn delete_folders_for_backup_config(&self, backup_config_id: &str) -> usize {
+        let target_ids: Vec<String> = {
+            let folders = self.folders.read().await;
+            folders
+                .values()
+                .filter(|f| f.backup_config_id.as_deref() == Some(backup_config_id))
+                .map(|f| f.id.clone())
+                .collect()
+        };
+
+        let count = target_ids.len();
+        for id in &target_ids {
+            // 取消正在运行的文件夹下载（停子任务 + 出内存），不删本地已下载文件。
+            if let Err(e) = self.cancel_folder(id, false).await {
+                warn!(
+                    "delete_folders_for_backup_config: 取消文件夹 {} 失败: {}",
+                    id, e
+                );
+            }
+            // 一并清掉历史记录，避免订阅删除后历史残留。
+            let _ = self.delete_folder_from_history(id).await;
+        }
+        if count > 0 {
+            info!(
+                "delete_folders_for_backup_config: cfg={} 清理 {} 个内部文件夹下载",
+                backup_config_id, count
+            );
+        }
+        count
+    }
+
     /// 删除文件夹下载记录
     pub async fn delete_folder(&self, folder_id: &str) -> Result<()> {
         let mut folders = self.folders.write().await;
@@ -3308,7 +3450,11 @@ impl FolderDownloadManager {
 
                 // 🔥 使用 compute_downloaded_size：completed_downloaded_size + active_sum
                 // max() 保证单调性
-                let active_downloaded: u64 = tasks.iter().map(|t| t.downloaded_size).sum();
+                // 🔥 排除已计入 completed_downloaded_size 的子任务，避免完成瞬间残留任务被
+                // active_sum 与 completed_downloaded_size 双重累加导致已下载翻倍（见进度监听器注释）。
+                let active_downloaded = folder.active_downloaded_excluding_counted(
+                    tasks.iter().map(|t| (t.id.as_str(), t.downloaded_size)),
+                );
                 folder.compute_downloaded_size(active_downloaded);
 
                 // 检查是否全部完成（成功 + 失败 >= 总数）

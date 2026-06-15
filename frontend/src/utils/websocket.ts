@@ -252,8 +252,10 @@ class WebSocketClient {
     const { category } = event
 
     // 🔥 记录接收到的事件
+    // 后端事件 payload 是内部 tag 枚举，判别字段为 `type`（如 diff_detected /
+    // item_progress / progress），此前误读 `event_type` 导致日志恒为 undefined。
     console.log(
-        `📡 [WS接收] 类别=${category} | 事件=${(event.event as any).event_type} | 任务=${
+        `📡 [WS接收] 类别=${category} | 事件=${(event.event as any).type} | 任务=${
             (event.event as any).task_id || (event.event as any).folder_id || 'unknown'
         } | 事件ID=${event.event_id} | 时间戳=${event.timestamp}`,
         event
@@ -288,7 +290,7 @@ class WebSocketClient {
         break
       case 'share_sync':
         document.dispatchEvent(
-          new CustomEvent('baidu-netdisk:share-sync', { detail: event.event })
+            new CustomEvent('baidu-netdisk:share-sync', { detail: event.event })
         )
         break
       default:

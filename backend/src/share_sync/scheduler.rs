@@ -6,6 +6,7 @@
 //! CancellationToken 控制优雅停机。
 
 use std::time::Duration;
+use super::config::MIN_POLL_INTERVAL_SECS;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -27,7 +28,7 @@ impl SubscriptionScheduler {
     pub fn new(subscription_id: String, interval_secs: u32) -> Self {
         Self {
             subscription_id,
-            interval_secs: interval_secs.max(60), // 防御：不低于 60s
+            interval_secs: interval_secs.max(MIN_POLL_INTERVAL_SECS), // 防御：不低于最小轮询间隔
             cancel_token: CancellationToken::new(),
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             trigger_notify: std::sync::Arc::new(Notify::new()),
@@ -125,15 +126,18 @@ impl Drop for SubscriptionScheduler {
 }
 
 /// interval ±ratio 的随机抖动
+///
+/// 抖动后强制不低于 `MIN_POLL_INTERVAL_SECS`（与 autobackup `add_jitter` 一致），
+/// 避免间隔逼近下限时抖动把实际间隔压到下限以下、增大风控压力。
 fn jitter(base_secs: u32, ratio: f64) -> u32 {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let delta = (base_secs as f64 * ratio) as i64;
     if delta <= 0 {
-        return base_secs;
+        return base_secs.max(MIN_POLL_INTERVAL_SECS);
     }
     let offset = rng.gen_range(-delta..=delta);
-    ((base_secs as i64 + offset).max(60) as u32).max(1)
+    ((base_secs as i64 + offset).max(MIN_POLL_INTERVAL_SECS as i64) as u32).max(1)
 }
 
 #[cfg(test)]
@@ -143,9 +147,20 @@ mod tests {
 
     #[test]
     fn test_jitter_within_range() {
+        // base 远大于下限时，抖动对称：1800 ±20% => [1440, 2160]
         for _ in 0..100 {
-            let j = jitter(600, 0.20);
-            assert!((480..=720).contains(&j), "jitter out of range: {}", j);
+            let j = jitter(1800, 0.20);
+            assert!((1440..=2160).contains(&j), "jitter out of range: {}", j);
+        }
+    }
+
+    #[test]
+    fn test_jitter_never_below_min_interval() {
+        // base 恰为下限时，抖动下半被钳到 MIN_POLL_INTERVAL_SECS（与 autobackup 一致）
+        for _ in 0..200 {
+            let j = jitter(MIN_POLL_INTERVAL_SECS, 0.20);
+            assert!(j >= MIN_POLL_INTERVAL_SECS, "jitter dipped below min: {}", j);
+            assert!(j <= MIN_POLL_INTERVAL_SECS + (MIN_POLL_INTERVAL_SECS / 5));
         }
     }
 

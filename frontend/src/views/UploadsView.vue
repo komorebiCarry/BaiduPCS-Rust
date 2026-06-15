@@ -499,7 +499,7 @@ function handleUploadEvent(event: UploadEvent) {
       // 新任务创建，刷新列表
       refreshTasks()
       break
-    case 'progress':
+    case 'progress': {
       // 进度更新
       const progressIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
       if (progressIdx !== -1) {
@@ -518,7 +518,8 @@ function handleUploadEvent(event: UploadEvent) {
         }
       }
       break
-    case 'encrypt_progress':
+    }
+    case 'encrypt_progress': {
       // 🔥 加密进度更新
       const encryptIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
       if (encryptIdx !== -1) {
@@ -526,7 +527,8 @@ function handleUploadEvent(event: UploadEvent) {
         uploadItems.value[encryptIdx].status = 'encrypting'
       }
       break
-    case 'encrypt_completed':
+    }
+    case 'encrypt_completed': {
       // 🔥 加密完成
       const encryptCompletedIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
       if (encryptCompletedIdx !== -1) {
@@ -536,19 +538,21 @@ function handleUploadEvent(event: UploadEvent) {
         uploadItems.value[encryptCompletedIdx].status = 'uploading'
       }
       break
-    case 'status_changed':
+    }
+    case 'status_changed': {
       // 状态变更
       const statusIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
       if (statusIdx !== -1) {
         uploadItems.value[statusIdx].status = event.new_status as UploadTaskStatus
       }
       break
+    }
     case 'completed':
     case 'failed':
       // 完成或失败，刷新列表获取最终状态
       refreshTasks()
       break
-    case 'paused':
+    case 'paused': {
       // 任务暂停，直接更新状态
       const pausedIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
       if (pausedIdx !== -1) {
@@ -556,7 +560,8 @@ function handleUploadEvent(event: UploadEvent) {
         uploadItems.value[pausedIdx].speed = 0
       }
       break
-    case 'resumed':
+    }
+    case 'resumed': {
       // 任务恢复，直接更新状态为 uploading
       const resumedIdx = uploadItems.value.findIndex(t => t.id === event.task_id)
       if (resumedIdx !== -1) {
@@ -565,6 +570,7 @@ function handleUploadEvent(event: UploadEvent) {
         uploadItems.value[resumedIdx].status = 'uploading'
       }
       break
+    }
     case 'deleted':
       uploadItems.value = uploadItems.value.filter(t => t.id !== event.task_id)
       break

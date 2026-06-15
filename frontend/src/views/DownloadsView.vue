@@ -197,7 +197,7 @@
           <!-- 进度条 -->
           <div class="task-progress" v-if="item.status !== 'decrypting'">
             <el-progress
-                :percentage="((item.downloaded_size || 0) / (item.total_size || 1) * 100)"
+                :percentage="Math.min(100, Math.max(0, (item.downloaded_size || 0) / (item.total_size || 1) * 100))"
                 :status="getProgressStatus(item.status!)"
                 :stroke-width="8"
             >
@@ -339,7 +339,7 @@
             <el-table-column label="进度" width="180">
               <template #default="{ row }">
                 <el-progress
-                    :percentage="((row.downloaded_size / row.total_size) * 100)"
+                    :percentage="Math.min(100, Math.max(0, (row.downloaded_size / (row.total_size || 1)) * 100))"
                     :status="getProgressStatus(row.status)"
                     :stroke-width="6"
                     :text-inside="false"

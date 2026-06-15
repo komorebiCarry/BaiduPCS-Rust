@@ -14,7 +14,7 @@
 //! - `execute_one(id)`  → 抓取 → diff → 提交 → 持久化 → 广播 WS
 //! - `shutdown()`  → 停所有 scheduler → 关闭连接
 
-use crate::downloader::DownloadManager;
+use crate::auth::Uid;
 use crate::netdisk::client::NetdiskClient;
 use crate::share_sync::config::{ShareSubscription, SyncTarget};
 use crate::share_sync::diff::{diff_snapshots, ShareDiff, ShareModifiedItem};
@@ -26,6 +26,7 @@ use crate::share_sync::executor::{
     ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
 };
 use crate::share_sync::persistence::ShareSyncPersistence;
+use crate::share_sync::resolver::ShareSyncAccountResolver;
 use crate::share_sync::scheduler::SubscriptionScheduler;
 use crate::share_sync::snapshot::{
     CapturedShare, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
@@ -34,11 +35,11 @@ use crate::share_sync::types::{ConflictStrategy, RunStatus};
 use crate::transfer::{TransferManager, TransferStatus};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// 顶层 Manager
@@ -47,16 +48,16 @@ pub struct ShareSyncManager {
     subscriptions: DashMap<String, ShareSubscription>,
     /// 订阅 ID → Scheduler
     schedulers: DashMap<String, SubscriptionScheduler>,
+    /// 正在执行中的订阅 ID 集合（并发触发去重；presence = 有 run 在跑）
+    running: DashMap<String, ()>,
     /// 持久化层
     persistence: Arc<ShareSyncPersistence>,
     /// 配置文件路径（JSON）
     config_path: PathBuf,
     /// 事件发布器
     publisher: Arc<dyn ShareSyncEventPublisher>,
-    /// NetdiskClient（Option 化以支持初始化时尚未登录）
-    netdisk_client: Arc<tokio::sync::RwLock<Option<NetdiskClient>>>,
-    /// TransferManager（同上）
-    transfer_manager: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
+    /// 账号解析器：按订阅 owner_uid 解析其 NetdiskClient / TransferManager（多账号隔离）
+    resolver: Arc<dyn ShareSyncAccountResolver>,
     /// v2 阶段 6:share-sync 全局风控限速器 — 阻挡 ProductionHooks 出去的
     /// submit_transfer/submit_download 调用,避免并行 worker 撞 errno=132 风控。
     /// 参数从 env(BAIDUPCS_RATE_LIMIT_*) 读, 默认 4 RPS / burst=8;
@@ -77,9 +78,8 @@ impl std::fmt::Debug for ShareSyncManager {
 pub struct ManagerConfig {
     pub config_path: PathBuf,
     pub db_path: PathBuf,
-    pub netdisk_client: Arc<tokio::sync::RwLock<Option<NetdiskClient>>>,
-    pub transfer_manager: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
-    pub download_manager: Arc<tokio::sync::RwLock<Option<Arc<DownloadManager>>>>,
+    /// 账号解析器：按订阅 owner_uid 解析对应账号的 NetdiskClient / TransferManager
+    pub resolver: Arc<dyn ShareSyncAccountResolver>,
     pub publisher: Option<Arc<dyn ShareSyncEventPublisher>>,
 }
 
@@ -88,30 +88,34 @@ impl ShareSyncManager {
     pub async fn new(cfg: ManagerConfig) -> Result<Arc<Self>, ShareSyncError> {
         let persistence = Arc::new(ShareSyncPersistence::new(&cfg.db_path)?);
 
-        // 启动期 stale-run 自愈:把崩溃/kill 后留下的 status='running' 但实际无
-        // manager task 在跑的孤儿 run 修复为 Failed,避免前端永远显示"运行中"。
-        // d17ae3f1 的 21384bbe 卡 1h47min 就是这个漏网。可用 env
-        // BAIDUPCS_STALE_FIXUP_ENABLED=0 关闭。阈值固定 120 分钟,兼顾安全与长 run。
+        // 启动期 stale-run 自愈:进程重启后,上次留下的 status='running' run 都是
+        // 孤儿(内存里的 run task 已随进程退出)。**不再粗暴标 Failed**——那对用户是
+        // "明明只是重启却显示失败"(用户反馈:"重启后那些要自动恢复跑吧,就跟自动备份
+        // 一样,怎么能直接标记失败呢")。改为标 Interrupted(中断),并在订阅恢复后对其
+        // 所属(且启用)订阅自动重跑一次:同步是增量的(基线只在成功后推进),被中断的
+        // run 没推进基线,重跑会重新 diff 把没跑完的补上。可用 env
+        // BAIDUPCS_STALE_FIXUP_ENABLED=0 关闭收编;BAIDUPCS_SHARE_SYNC_RESUME_ON_STARTUP=0
+        // 仅收编不自动重跑(交给下个轮询周期)。
         let stale_fixup_enabled = std::env::var("BAIDUPCS_STALE_FIXUP_ENABLED")
             .ok()
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
+        let resume_on_startup = std::env::var("BAIDUPCS_SHARE_SYNC_RESUME_ON_STARTUP")
+            .ok()
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+        // 被中断、待自动重跑的订阅 id(去重)。在订阅恢复后才知道哪些 enabled。
+        let mut interrupted_sub_ids: Vec<String> = Vec::new();
         if stale_fixup_enabled {
-            match persistence.mark_stale_runs_failed(120) {
-                Ok(stale) if !stale.is_empty() => {
+            match persistence.mark_running_runs_interrupted() {
+                Ok(interrupted) if !interrupted.is_empty() => {
                     info!(
-                        "share_sync 启动自愈: 收编 {} 条 stale running run",
-                        stale.len()
+                        "share_sync 启动自愈: 收编 {} 条中断 run,稍后自动重跑",
+                        interrupted.len()
                     );
-                    // 不在这里 publish — publisher 还没传进来; 用 cfg.publisher 的 clone
-                    if let Some(ref pubr) = cfg.publisher {
-                        for rec in &stale {
-                            pubr.publish(ShareSyncEvent::RunFailed {
-                                subscription_id: rec.subscription_id.clone(),
-                                run_id: rec.run_id.clone(),
-                                error: "stale_run_killed_on_startup".to_string(),
-                                reason: Some("stale_run".to_string()),
-                            });
+                    for rec in &interrupted {
+                        if !interrupted_sub_ids.contains(&rec.subscription_id) {
+                            interrupted_sub_ids.push(rec.subscription_id.clone());
                         }
                     }
                 }
@@ -124,30 +128,33 @@ impl ShareSyncManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        // 从 JSON 恢复（缺失则空）
-        let subs: Vec<ShareSubscription> = if cfg.config_path.exists() {
-            let s = std::fs::read_to_string(&cfg.config_path).unwrap_or_default();
-            serde_json::from_str(&s).unwrap_or_default()
-        } else {
+        // 数据库为唯一可信源（订阅已并入主库）。先尝试从 DB 恢复。
+        let mut subs = persistence.list_subscriptions().unwrap_or_else(|e| {
+            error!("share-sync: 从 DB 读取订阅失败，按空列表启动: {}", e);
             Vec::new()
-        };
+        });
+
+        // 一次性兼容旧版本：早期把订阅写在独立的 subscriptions.json。
+        // 仅当 DB 尚无订阅且存在旧 JSON 时导入，导入后把 JSON 改名为 .migrated，
+        // 之后不再读写 JSON（消除 JSON↔DB 双写漂移与损坏静默丢失问题）。
+        if subs.is_empty() && cfg.config_path.exists() {
+            subs = Self::import_legacy_json(&cfg.config_path, &persistence);
+        }
 
         let manager = Arc::new(Self {
             subscriptions: DashMap::new(),
             schedulers: DashMap::new(),
+            running: DashMap::new(),
             persistence,
             config_path: cfg.config_path,
             publisher: cfg
                 .publisher
                 .unwrap_or_else(|| Arc::new(NoopShareSyncEventPublisher)),
-            netdisk_client: cfg.netdisk_client,
-            transfer_manager: cfg.transfer_manager,
+            resolver: cfg.resolver,
             rate_limiter: crate::share_sync::rate_limit::QuotaLimiter::from_env(),
         });
 
         for sub in subs {
-            // 同步到 DB（便于诊断 / 后台 UI）
-            let _ = manager.persistence.upsert_subscription(&sub);
             manager.subscriptions.insert(sub.id.clone(), sub.clone());
             if sub.enabled && sub.poll_config.enabled {
                 let mgr_clone = Arc::clone(&manager);
@@ -159,7 +166,132 @@ impl ShareSyncManager {
             "ShareSyncManager 初始化完成: 恢复 {} 条订阅",
             manager.subscriptions.len()
         );
+
+        // 对被中断的、且仍启用的订阅自动重跑一次(像自动备份重启续跑)。只保留 enabled
+        // 的——已禁用的订阅不该被启动悄悄唤醒。后台 spawn,best-effort:账号尚未就绪时
+        // execute_one 在创建 run 前就报错(不留失败记录),退避重试若干次;始终不行则交给
+        // 调度器在下个轮询周期补上,不阻塞启动。
+        if resume_on_startup && !interrupted_sub_ids.is_empty() {
+            let resume_ids: Vec<String> = interrupted_sub_ids
+                .into_iter()
+                .filter(|id| {
+                    manager
+                        .subscriptions
+                        .get(id)
+                        .map(|s| s.enabled)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if !resume_ids.is_empty() {
+                let mgr = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    mgr.resume_interrupted_runs(resume_ids).await;
+                });
+            }
+        }
+
         Ok(manager)
+    }
+
+    /// 启动期对被中断的订阅自动重跑一次。best-effort:先**轮询等账号登录态就绪**
+    /// 再触发,避免账号没恢复时 execute_one 反复在「抓取阶段」失败、刷出一堆失败 run。
+    /// 等到就绪(或超时)后只触发一次;触发不成则交给轮询调度兜底。供 `new` 后台调用。
+    async fn resume_interrupted_runs(self: Arc<Self>, sub_ids: Vec<String>) {
+        // 给账号登录态恢复留点时间(进程刚起,resolver 可能还没就绪)。
+        const RESUME_INITIAL_DELAY_SECS: u64 = 5;
+        const READY_MAX_ATTEMPTS: u32 = 12;
+        const READY_RETRY_DELAY_SECS: u64 = 10;
+        tokio::time::sleep(std::time::Duration::from_secs(RESUME_INITIAL_DELAY_SECS)).await;
+        for id in sub_ids {
+            let owner_uid = match self.get_subscription(&id) {
+                Some(s) => s.owner_uid,
+                None => continue, // 订阅启动后被删,跳过
+            };
+            // 等账号(网盘客户端 + 转存管理器)就绪——execute_one 在抓取前需要它们。
+            let mut ready = false;
+            for _ in 0..READY_MAX_ATTEMPTS {
+                let has_netdisk = self.resolver.netdisk_client(owner_uid).await.is_some();
+                let has_transfer = self.resolver.transfer_manager(owner_uid).await.is_some();
+                if has_netdisk && has_transfer {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(READY_RETRY_DELAY_SECS)).await;
+            }
+            if !ready {
+                warn!(
+                    "share_sync 启动续跑: 订阅 {} 所属账号(uid={})迟迟未就绪,交给轮询调度兜底",
+                    id, owner_uid
+                );
+                continue;
+            }
+            match self.execute_one(&id).await {
+                Ok(_) => info!("share_sync 启动续跑: 订阅 {} 已重新同步", id),
+                // 调度器抢先触发了 —— 正常,无需重复。
+                Err(ShareSyncError::AlreadyRunning(_)) => {}
+                Err(e) => warn!(
+                    "share_sync 启动续跑: 订阅 {} 触发失败({}),交给轮询调度兜底",
+                    id, e
+                ),
+            }
+        }
+    }
+
+    /// 一次性导入旧版 `subscriptions.json` 到主库，成功后把文件改名为 `.migrated`。
+    ///
+    /// 读/解析失败不静默吞掉：读失败仅告警返回空；解析失败把损坏文件改名备份后告警，
+    /// 避免误判为"无旧数据"。导入的订阅 owner_uid 保持 JSON 中的值（旧数据通常为 0，
+    /// 由上层在初始化时按当前活跃账号补归属）。
+    fn import_legacy_json(
+        config_path: &Path,
+        persistence: &ShareSyncPersistence,
+    ) -> Vec<ShareSubscription> {
+        let content = match std::fs::read_to_string(config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "share-sync: 读取旧订阅配置 {} 失败，跳过导入: {}",
+                    config_path.display(),
+                    e
+                );
+                return Vec::new();
+            }
+        };
+        let list: Vec<ShareSubscription> = match serde_json::from_str(&content) {
+            Ok(l) => l,
+            Err(e) => {
+                let backup = config_path.with_extension(format!(
+                    "corrupt.{}.json",
+                    chrono::Utc::now().timestamp()
+                ));
+                let hint = match std::fs::rename(config_path, &backup) {
+                    Ok(()) => format!("已备份损坏文件到 {}", backup.display()),
+                    Err(re) => format!("备份损坏文件失败: {}", re),
+                };
+                error!(
+                    "share-sync: 旧订阅配置 {} 解析失败，跳过导入（{}）: {}",
+                    config_path.display(),
+                    hint,
+                    e
+                );
+                return Vec::new();
+            }
+        };
+        for sub in &list {
+            if let Err(e) = persistence.upsert_subscription(sub) {
+                error!("share-sync: 导入旧订阅 {} 到主库失败: {}", sub.id, e);
+            }
+        }
+        let migrated = config_path.with_extension("json.migrated");
+        if let Err(e) = std::fs::rename(config_path, &migrated) {
+            warn!(
+                "share-sync: 旧订阅配置已导入主库，但改名 {} 失败（下次启动会因 DB 已有数据而跳过导入）: {}",
+                migrated.display(),
+                e
+            );
+        }
+        info!("share-sync: 已从旧 JSON 导入 {} 条订阅到主库", list.len());
+        list
     }
 
     // ===================================================
@@ -173,8 +305,44 @@ impl ShareSyncManager {
             .collect()
     }
 
+    /// 列出归属指定账号的订阅（多账号隔离：handler 按 active_uid 过滤）
+    pub fn list_for_owner(&self, owner_uid: u64) -> Vec<ShareSubscription> {
+        self.subscriptions
+            .iter()
+            .filter(|kv| kv.value().owner_uid == owner_uid)
+            .map(|kv| kv.value().clone())
+            .collect()
+    }
+
     pub fn get_subscription(&self, id: &str) -> Option<ShareSubscription> {
         self.subscriptions.get(id).map(|kv| kv.value().clone())
+    }
+
+    /// 列出某订阅当前的子任务进度（下载段 + 内部转存段），供 REST 轮询兜底接口。
+    ///
+    /// 与「每个 run 的进度广播器」共用 `collect_share_sync_subtasks`，形状一致。
+    /// 账号转存管理器未就绪时返回空列表（视为暂无进行中子任务，不报错）。
+    pub async fn subtasks(&self, id: &str) -> Result<Vec<ShareSyncSubtask>, ShareSyncError> {
+        let sub = self
+            .get_subscription(id)
+            .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
+        let owner_uid = sub.owner_uid;
+        match self.resolver.transfer_manager(owner_uid).await {
+            Some(tm) => {
+                // 这是「进行中子任务」轮询兜底接口：必须只返回**未到终态**的子任务。
+                // 文件夹下载任务带 backup_config_id 归属后会**持久保留**(完成也不删),
+                // 若不过滤,切换页面后重新拉取会把已完成的文件夹当成「进行中」显示
+                // (前端 REST 路径直接信任后端,不像 WS upsert 那样剔除终态)。
+                // 与前端 SUBTASK_TERMINAL 口径一致,在源头过滤掉终态子任务。
+                let subs = collect_share_sync_subtasks(&tm, id, owner_uid)
+                    .await
+                    .into_iter()
+                    .filter(|s| !is_terminal_subtask_status(&s.status))
+                    .collect();
+                Ok(subs)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     pub fn create_subscription(
@@ -187,15 +355,19 @@ impl ShareSyncManager {
         }
         self.persistence.upsert_subscription(&sub)?;
         self.subscriptions.insert(sub.id.clone(), sub.clone());
-        self.persist_to_disk();
         if sub.enabled && sub.poll_config.enabled {
             self.start_scheduler_for(&sub);
         }
         self.publisher.publish(ShareSyncEvent::SubscriptionCreated {
             subscription_id: sub.id.clone(),
             name: sub.name.clone(),
+            owner_uid: sub.owner_uid,
         });
         info!("ShareSyncManager: 创建订阅 id={}", sub.id);
+        // 启用的订阅创建后立即执行一次首同步，无需等待首个轮询周期
+        if sub.enabled {
+            let _ = self.trigger_one(&sub.id);
+        }
         Ok(sub)
     }
 
@@ -216,7 +388,6 @@ impl ShareSyncManager {
         new_sub.touch();
         self.persistence.upsert_subscription(&new_sub)?;
         self.subscriptions.insert(id.into(), new_sub.clone());
-        self.persist_to_disk();
         // 重启 scheduler（间隔可能变了）
         self.stop_scheduler_for(id);
         if new_sub.enabled && new_sub.poll_config.enabled {
@@ -224,6 +395,7 @@ impl ShareSyncManager {
         }
         self.publisher.publish(ShareSyncEvent::SubscriptionUpdated {
             subscription_id: id.into(),
+            owner_uid: new_sub.owner_uid,
         });
         Ok(new_sub)
     }
@@ -238,7 +410,6 @@ impl ShareSyncManager {
         let sub_clone = sub.clone();
         drop(sub);
         self.persistence.upsert_subscription(&sub_clone)?;
-        self.persist_to_disk();
         if enabled && sub_clone.poll_config.enabled {
             self.start_scheduler_for(&sub_clone);
         } else {
@@ -247,20 +418,140 @@ impl ShareSyncManager {
         self.publisher.publish(ShareSyncEvent::StatusChanged {
             subscription_id: id.into(),
             enabled,
+            owner_uid: sub_clone.owner_uid,
         });
         Ok(())
     }
 
-    pub fn delete_subscription(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
-        if self.subscriptions.remove(id).is_none() {
-            return Err(ShareSyncError::SubscriptionNotFound(id.into()));
+    /// 「链接确定性失效」连续失败阈值：达到即自动暂停轮询。可用
+    /// `BAIDUPCS_SHARE_SYNC_LINK_FAIL_THRESHOLD` 覆盖（最小 1），默认 2。
+    fn link_fail_threshold() -> u32 {
+        std::env::var("BAIDUPCS_SHARE_SYNC_LINK_FAIL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(2)
+    }
+
+    /// 仅当错误属于「链接确定性失效」时才累加失效计数；临时网络/风控错误不计。
+    fn maybe_note_link_failure(&self, id: &str, err: &ShareSyncError) {
+        if err.is_link_invalid() {
+            self.note_link_failure(id, &err.to_string());
         }
+    }
+
+    /// 记一次「链接确定性失效」：连续计数 +1；达阈值则置 `link_invalid` 暂停轮询。
+    ///
+    /// 不在此处停 scheduler（本方法在 `execute_one` 内、即 scheduler tick 内被调用，
+    /// 显式 stop 会等自身 task 结束造成死锁）；改由 `execute_one` 在 `link_invalid`
+    /// 时提前返回（不发任何百度请求）实现「不再定时唤起」。
+    fn note_link_failure(&self, id: &str, reason: &str) {
+        let Some(mut sub) = self.subscriptions.get_mut(id) else {
+            return;
+        };
+        if sub.link_invalid {
+            return; // 已暂停，无需重复累加
+        }
+        sub.consecutive_link_failures = sub.consecutive_link_failures.saturating_add(1);
+        let threshold = Self::link_fail_threshold();
+        let mut paused = false;
+        if sub.consecutive_link_failures >= threshold {
+            sub.link_invalid = true;
+            sub.link_invalid_reason = Some(reason.to_string());
+            paused = true;
+        }
+        let count = sub.consecutive_link_failures;
+        let owner_uid = sub.owner_uid;
+        let sub_clone = sub.clone();
+        drop(sub);
+        let _ = self.persistence.upsert_subscription(&sub_clone);
+        if paused {
+            warn!(
+                "share-sync: 订阅 {} 连续 {}/{} 次链接失效，自动暂停轮询: {}",
+                id, count, threshold, reason
+            );
+            self.publisher.publish(ShareSyncEvent::StatusChanged {
+                subscription_id: id.into(),
+                enabled: sub_clone.enabled,
+                owner_uid,
+            });
+        } else {
+            info!(
+                "share-sync: 订阅 {} 链接失效计数 {}/{}（达阈值后将暂停）: {}",
+                id, count, threshold, reason
+            );
+        }
+    }
+
+    /// 成功抓取一次分享 → 链接可用：归零连续失效计数（若曾被标记失效也清除）。
+    fn clear_link_failure(&self, id: &str) {
+        let Some(mut sub) = self.subscriptions.get_mut(id) else {
+            return;
+        };
+        if sub.consecutive_link_failures == 0 && !sub.link_invalid {
+            return; // 无状态可清，省一次写库
+        }
+        sub.consecutive_link_failures = 0;
+        sub.link_invalid = false;
+        sub.link_invalid_reason = None;
+        let sub_clone = sub.clone();
+        drop(sub);
+        let _ = self.persistence.upsert_subscription(&sub_clone);
+    }
+
+    /// 用户「我已更新链接，恢复」：清除失效标记 + 计数，恢复轮询并立即触发一次。
+    pub fn resume_link_invalid(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
+        {
+            let mut sub = self
+                .subscriptions
+                .get_mut(id)
+                .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
+            sub.link_invalid = false;
+            sub.link_invalid_reason = None;
+            sub.consecutive_link_failures = 0;
+            sub.touch();
+            let sub_clone = sub.clone();
+            drop(sub);
+            self.persistence.upsert_subscription(&sub_clone)?;
+            // scheduler 从未停过（见 note_link_failure），但防御性确保它在跑
+            if sub_clone.enabled && sub_clone.poll_config.enabled {
+                self.start_scheduler_for(&sub_clone);
+            }
+            self.publisher.publish(ShareSyncEvent::StatusChanged {
+                subscription_id: id.into(),
+                enabled: sub_clone.enabled,
+                owner_uid: sub_clone.owner_uid,
+            });
+        }
+        // 立即重试一次（链接已更新）
+        let _ = self.trigger_one(id);
+        Ok(())
+    }
+
+    pub async fn delete_subscription(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
+        let removed = match self.subscriptions.remove(id) {
+            Some((_, sub)) => sub,
+            None => return Err(ShareSyncError::SubscriptionNotFound(id.into())),
+        };
         self.stop_scheduler_for(id);
         // DB 删除（级联清理 snapshots/runs）
         let _ = self.persistence.delete_subscription(id);
-        self.persist_to_disk();
+        // 清理该订阅名下的内部转存/下载任务（带 share-sync:{id} 归属），
+        // 否则删订阅后这些任务会成为孤儿（重启被恢复成永远跑不完的隐藏任务 → 脏数据）。
+        // 转存管理器会连带清理它持有的下载子任务。
+        let cfg_id = share_sync_backup_config_id(id);
+        if let Some(transfer) = self.resolver.transfer_manager(removed.owner_uid).await {
+            let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
+            if mem > 0 || hist > 0 {
+                info!(
+                    "share-sync: 删除订阅 {} 已清理内部转存任务（内存={}, 历史={}）",
+                    id, mem, hist
+                );
+            }
+        }
         self.publisher.publish(ShareSyncEvent::SubscriptionDeleted {
             subscription_id: id.into(),
+            owner_uid: removed.owner_uid,
         });
         Ok(())
     }
@@ -291,47 +582,105 @@ impl ShareSyncManager {
 
     /// 执行一次（由 scheduler 调用或 trigger_one 同步入口）
     pub async fn execute_one(&self, id: &str) -> Result<ApplyOutcome, ShareSyncError> {
+        // 全局并发去重：同一订阅同一时刻只允许一个 run 在执行。
+        // scheduler 的 running 标志只防它自己循环内重入；这里覆盖所有入口
+        // （手动 trigger / 被禁用订阅的 spawn 路径 / 多个调度器并存），
+        // 避免并发 run 重复转存同一批文件并产生快照基线竞争。
+        if self.running.insert(id.to_string(), ()).is_some() {
+            debug!("share-sync: 订阅 {} 已有 run 在执行，跳过本次触发", id);
+            return Err(ShareSyncError::AlreadyRunning(id.into()));
+        }
+        // RAII 守卫：无论从哪条分支返回都移除 in-flight 标记。
+        struct RunGuard<'g> {
+            running: &'g DashMap<String, ()>,
+            id: String,
+        }
+        impl Drop for RunGuard<'_> {
+            fn drop(&mut self) {
+                self.running.remove(&self.id);
+            }
+        }
+        let _run_guard = RunGuard {
+            running: &self.running,
+            id: id.to_string(),
+        };
+
         // v2 阶段 7:打 timing A/B metric 用
         let run_started = std::time::Instant::now();
         let sub = self
             .get_subscription(id)
             .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
-        let netdisk = {
-            let g = self.netdisk_client.read().await;
-            g.clone()
-        };
-        let netdisk = netdisk.ok_or_else(|| {
-            ShareSyncError::ConfigError("网盘客户端未登录，请先登录百度账号".into())
+
+        // 链接已确定性失效（自动暂停）：直接跳过，不发任何百度请求，等用户「恢复」。
+        // 这样调度器即便每轮 tick 也只是空转返回，不再徒劳访问已失效的分享、不增风控压力。
+        if sub.link_invalid {
+            debug!(
+                "share-sync: 订阅 {} 链接已失效（已暂停），跳过本次触发；等待用户更新链接后恢复",
+                id
+            );
+            return Err(ShareSyncError::ShareLinkError(
+                sub.link_invalid_reason
+                    .clone()
+                    .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into()),
+            ));
+        }
+
+        // 多账号隔离：按订阅 owner_uid 解析**该账号**的网盘客户端与转存管理器，
+        // 而非进程当前活跃账号。后台调度对账号 A 的订阅始终用账号 A 的实例，
+        // 账号切换无需 relink。任一未就绪 → 明确报错，绝不落到错误账号。
+        let owner_uid = sub.owner_uid;
+        let netdisk = self.resolver.netdisk_client(owner_uid).await.ok_or_else(|| {
+            ShareSyncError::ConfigError(format!(
+                "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
+                owner_uid
+            ))
         })?;
+        let transfer = self
+            .resolver
+            .transfer_manager(owner_uid)
+            .await
+            .ok_or_else(|| {
+                ShareSyncError::ConfigError(format!(
+                    "订阅所属账号(uid={})的转存管理器未就绪",
+                    owner_uid
+                ))
+            })?;
 
         let run_id = Uuid::new_v4().to_string();
         self.publisher.publish(ShareSyncEvent::RunStarted {
             run_id: run_id.clone(),
             subscription_id: id.into(),
+            owner_uid,
         });
 
         // 1) 抓取
         let (captured, curr_snapshot) = match SnapshotCollector::from_url(
-            &netdisk,
+            netdisk.as_ref(),
             &sub.share_url,
             sub.password.clone(),
             sub.include_paths.clone(),
             sub.exclude_patterns.clone(),
+            // 列目录抓快照与转存提交共用同一个全局风控限速器
+            self.rate_limiter.clone(),
         )
-        .await
+            .await
         {
             Ok(collector) => match collector.collect().await {
                 Ok(t) => t,
                 Err(e) => {
-                    self.fail_run(&run_id, id, &format!("抓取失败: {}", e));
+                    self.fail_run(&run_id, id, owner_uid, &format!("抓取失败: {}", e));
+                    self.maybe_note_link_failure(id, &e);
                     return Err(e);
                 }
             },
             Err(e) => {
-                self.fail_run(&run_id, id, &format!("抓取初始化失败: {}", e));
+                self.fail_run(&run_id, id, owner_uid, &format!("抓取初始化失败: {}", e));
+                self.maybe_note_link_failure(id, &e);
                 return Err(e);
             }
         };
+        // 成功抓取到分享内容 → 链接可用，归零失效计数（如曾标记失效也清除）。
+        self.clear_link_failure(id);
 
         // 2) 绑定 subscription_id 后，先读"上次成功应用的快照"再计算 diff。
         //    当前快照必须等执行成功后才能推进基线；否则下载/转存失败会把
@@ -345,7 +694,7 @@ impl ShareSyncManager {
         if let Err(e) =
             augment_diff_with_local_target_state(&sub, prev.as_ref(), &curr_snapshot, &mut diff)
         {
-            self.fail_run(&run_id, id, &format!("本地目标校验失败: {}", e));
+            self.fail_run(&run_id, id, owner_uid, &format!("本地目标校验失败: {}", e));
             return Err(e);
         }
 
@@ -355,14 +704,30 @@ impl ShareSyncManager {
             added: diff.added.iter().filter(|i| !i.is_dir).count(),
             modified: diff.modified.iter().filter(|i| !i.new.is_dir).count(),
             removed: diff.removed.iter().filter(|i| !i.is_dir).count(),
+            owner_uid,
         });
 
         // 4) 执行
+        // 启动「子任务进度广播器」：run 期间约 1s 推一次 ItemProgress（走 share_sync 频道，
+        // 不与自动备份 / 下载管理混淆）。run 结束后 abort。前端 WS 实时刷，REST 轮询兜底。
+        let progress_handle = {
+            let publisher = Arc::clone(&self.publisher);
+            let transfer = Arc::clone(&transfer);
+            let run_id = run_id.clone();
+            let subscription_id = id.to_string();
+            tokio::spawn(async move {
+                broadcast_subtask_progress(publisher, transfer, run_id, subscription_id, owner_uid)
+                    .await;
+            })
+        };
+
         let hooks = ProductionHooks {
-            netdisk: Arc::new(netdisk.clone()),
-            transfer: self.transfer_manager.clone(),
+            netdisk,
+            transfer,
             captured: captured.clone(),
+            owner_uid,
             rate_limiter: Arc::clone(&self.rate_limiter),
+            subscription_id: sub.id.clone(),
         };
         let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
         // v2 阶段 3:默认走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
@@ -394,14 +759,28 @@ impl ShareSyncManager {
                 .await
         };
 
-        if should_advance_snapshot_baseline(outcome.status) {
+        // run 结束，停止进度广播器（再补推一帧最终态，确保前端拿到 completed/failed）。
+        progress_handle.abort();
+        broadcast_subtask_progress_once(
+            Arc::clone(&self.publisher),
+            self.resolver.transfer_manager(owner_uid).await,
+            run_id.clone(),
+            id.to_string(),
+            owner_uid,
+        )
+            .await;
+
+        // 仅当 run 完成**且**没有任何子项因资源类原因（配额满 / 本地磁盘满）被跳过时，
+        // 才推进快照基线。否则被跳过、尚未真正落地的项会被写入新基线，导致下一次
+        // diff 不再包含它们 —— 即使后来腾出空间也不会补传。
+        if should_advance_snapshot_baseline(outcome.status) && !outcome.resource_skipped {
             if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
                 warn!("save_snapshot 失败，下一次同步会重试本次 diff: {}", e);
             }
         } else {
             warn!(
-                "share-sync: run 未完全成功，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}",
-                outcome.run_id, outcome.status, outcome.diff_summary.failed
+                "share-sync: run 未完全成功或有资源类跳过，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}, resource_skipped={}",
+                outcome.run_id, outcome.status, outcome.diff_summary.failed, outcome.resource_skipped
             );
         }
 
@@ -429,6 +808,7 @@ impl ShareSyncManager {
                     modified: outcome.diff_summary.modified,
                     removed: outcome.diff_summary.removed,
                     failed: outcome.diff_summary.failed,
+                    owner_uid,
                     duration_ms: Some(duration_ms),
                     n_bisects: None, // v2 阶段 4 的二分数未在 manager 层累积, 占 None
                     max_bisect_depth: None,
@@ -442,6 +822,7 @@ impl ShareSyncManager {
                         .error
                         .clone()
                         .unwrap_or_else(|| "unknown error".into()),
+                    owner_uid,
                     // v1: 目前 outcome.error 仍以原始字符串承载，reason 由 executor
                     // 在 quota/local_disk_full 早停时显式设置。
                     // 此分支对应 manager 自身检查到的失败（如 start_run 失败），
@@ -454,7 +835,7 @@ impl ShareSyncManager {
         Ok(outcome)
     }
 
-    fn fail_run(&self, run_id: &str, sub_id: &str, err: &str) {
+    fn fail_run(&self, run_id: &str, sub_id: &str, owner_uid: u64, err: &str) {
         use crate::share_sync::types::{DiffSummary, RunStatus};
         let now = chrono::Utc::now().timestamp();
         let _ = self.persistence.start_run(run_id, sub_id, now);
@@ -469,6 +850,7 @@ impl ShareSyncManager {
             run_id: run_id.into(),
             subscription_id: sub_id.into(),
             error: err.into(),
+            owner_uid,
             reason: None,
         });
     }
@@ -523,26 +905,6 @@ impl ShareSyncManager {
     pub fn persistence(&self) -> &Arc<ShareSyncPersistence> {
         &self.persistence
     }
-
-    // ===================================================
-    // 内部辅助
-    // ===================================================
-
-    fn persist_to_disk(&self) {
-        let all: Vec<ShareSubscription> = self
-            .subscriptions
-            .iter()
-            .map(|kv| kv.value().clone())
-            .collect();
-        match serde_json::to_string_pretty(&all) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&self.config_path, s) {
-                    error!("写订阅 JSON 失败: {}", e);
-                }
-            }
-            Err(e) => error!("序列化订阅失败: {}", e),
-        }
-    }
 }
 
 fn should_advance_snapshot_baseline(status: RunStatus) -> bool {
@@ -555,6 +917,14 @@ fn should_advance_snapshot_baseline(status: RunStatus) -> bool {
 /// `/dir/file` 造一个 fs_id=0 的 placeholder 目录，最终会退回逐文件提交。这里把
 /// 当前快照中真实存在的目录祖先补进 added，让 tree 路径优先用目录 fs_id 整体转存。
 /// 目录项不计入 summary，也不会被保存为新的基线；它们只影响本次执行计划。
+///
+/// **仅对「整目录全新」的目录补祖先**：树顶若是带真实 fs_id 的目录节点，会走整目录
+/// 转存+整目录下载(folder download 扫描网盘目标里**全部**文件)。若某个已同步目录里
+/// 只改动了个别文件，却把这个目录整体补进来，就会把目录里**未变动的文件也重新转存、
+/// 重新下载一遍**(默认 Overwrite 策略下物理重下)。所以这里加判据：只有当该目录在当前
+/// 快照下的**全部子文件**都属于本次变动集(added∪modified)时,才补成整目录转存;否则保留
+/// placeholder,让 tree 回退到逐文件提交,只下变动的那几个文件。首次同步/全新子目录的
+/// 目录项本就在 diff.added 里,不受此判据影响,仍走整目录高效转存。
 fn execution_diff_with_directory_ancestors(
     diff: &ShareDiff,
     curr: &ShareSnapshot,
@@ -568,8 +938,9 @@ fn execution_diff_with_directory_ancestors(
         .chain(diff.removed.iter().map(|item| item.path.clone()))
         .collect();
 
-    let mut out = diff.clone();
-    let action_paths: Vec<String> = diff
+    // 本次变动涉及的文件路径(added∪modified, 仅文件)。判断目录是否「整目录全新」时,
+    // 要求其全部子文件都落在这个集合里。
+    let changed_files: BTreeSet<String> = diff
         .added
         .iter()
         .chain(diff.modified.iter().map(|m| &m.new))
@@ -577,14 +948,20 @@ fn execution_diff_with_directory_ancestors(
         .map(|item| item.path.clone())
         .collect();
 
+    let mut out = diff.clone();
+    let action_paths: Vec<String> = changed_files.iter().cloned().collect();
+
     let mut added = 0usize;
     for path in action_paths {
         let mut current = parent_netdisk_dir(&path);
         while current != "/" {
             if existing_paths.insert(current.clone()) {
                 if let Some(item) = curr_index.get(&current).filter(|item| item.is_dir) {
-                    out.added.push((**item).clone());
-                    added += 1;
+                    // 仅当整目录子文件全部变动时才整体转存,避免重下未变动文件。
+                    if dir_subtree_fully_changed(&curr_index, &current, &changed_files) {
+                        out.added.push((**item).clone());
+                        added += 1;
+                    }
                 }
             }
             let parent = parent_netdisk_dir(&current);
@@ -599,16 +976,285 @@ fn execution_diff_with_directory_ancestors(
     (out, added)
 }
 
+/// 判断目录 `dir` 在当前快照下的**全部子文件**(递归)是否都属于本次变动集 `changed`。
+///
+/// 用于决定能否把这个目录整体补进 tree 的整目录转存:只有「整棵子树的文件都是本次新增/
+/// 修改」时才安全(否则会连带重传/重下未变动的文件)。目录里**没有**任何子文件时返回
+/// `false` —— 空目录/纯子目录壳没有整目录转存的价值,留给上层(若其子目录各自满足条件会
+/// 被单独补)处理,避免误把一个含未变动文件的祖先判成「全新」。
+fn dir_subtree_fully_changed(
+    curr_index: &BTreeMap<String, &ShareSnapshotItem>,
+    dir: &str,
+    changed: &BTreeSet<String>,
+) -> bool {
+    let prefix = format!("{}/", dir.trim_end_matches('/'));
+    let mut saw_file = false;
+    for (path, item) in curr_index.range(prefix.clone()..) {
+        if !path.starts_with(&prefix) {
+            break;
+        }
+        if item.is_dir {
+            continue;
+        }
+        saw_file = true;
+        if !changed.contains(path) {
+            return false;
+        }
+    }
+    saw_file
+}
+
 // =====================================================
 // 生产环境 ExecutorHooks
 // =====================================================
 
+/// 分享同步子任务的归属 id：`"share-sync:{订阅id}"`。
+///
+/// 永不与自动备份的 UUID 配置 id 冲突，故下载段 `is_backup=true` 复用不会挂到自动备份。
+pub fn share_sync_backup_config_id(subscription_id: &str) -> String {
+    format!("share-sync:{}", subscription_id)
+}
+
+/// 分享同步「进行中子任务」的进度快照（REST 轮询接口 + WS 广播共用同一形状）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShareSyncSubtask {
+    /// 底层任务 id（下载任务 id 或内部转存任务 id）
+    pub task_id: String,
+    /// 文件名 / 展示名
+    pub name: String,
+    /// 子任务种类:`"transfer"`(转存段) | `"download"`(下载段)
+    pub kind: String,
+    /// 状态字符串(downloading / completed / failed / transferring ...)
+    pub status: String,
+    /// 已完成字节(下载段);转存段用已完成文件数
+    pub downloaded: u64,
+    /// 总字节(下载段);转存段用总文件数
+    pub total: u64,
+    /// 进度百分比 0-100
+    pub progress: f64,
+    /// 瞬时速度(B/s,仅下载段有意义)
+    pub speed: u64,
+    /// 预计剩余时间(秒,仅下载段且 speed>0 时有值)，与自动备份 `eta_seconds` 对齐
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_seconds: Option<u64>,
+    /// 订阅所属账号 uid
+    pub owner_uid: u64,
+}
+
+/// 由「已下载/总字节/瞬时速度」推算预计剩余时间(秒)。
+///
+/// 仅在 `speed > 0` 且 `total > downloaded` 时返回 `Some`，否则 `None`
+/// (与自动备份 `SpeedCalculator::calculate_eta` 同义)。
+fn compute_eta_seconds(downloaded: u64, total: u64, speed: u64) -> Option<u64> {
+    if speed == 0 || total <= downloaded {
+        return None;
+    }
+    Some((total - downloaded) / speed)
+}
+
+fn basename_of(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// 收集某个订阅当前的子任务进度（下载段 + 内部转存段），按 `backup_config_id` 归属。
+///
+/// REST 轮询接口与「每个 run 的进度广播器」共用此函数，保证两条链路形状一致。
+pub async fn collect_share_sync_subtasks(
+    transfer: &TransferManager,
+    subscription_id: &str,
+    owner_uid: u64,
+) -> Vec<ShareSyncSubtask> {
+    let cfg = share_sync_backup_config_id(subscription_id);
+    let mut out: Vec<ShareSyncSubtask> = Vec::new();
+
+    // 下载管理器句柄：单文件下载段 + 文件夹聚合段(按 group 汇总子任务速度)共用。
+    let dm_handle = transfer.download_manager_handle().await;
+
+    // 下载段:复用自动备份同款查询(is_backup && backup_config_id==cfg)
+    if let Some(dm) = dm_handle.as_ref() {
+        for t in dm.get_tasks_by_backup_config(&cfg).await {
+            let name = t
+                .local_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| basename_of(&t.remote_path));
+            let progress = if t.total_size > 0 {
+                (t.downloaded_size as f64 / t.total_size as f64) * 100.0
+            } else {
+                0.0
+            };
+            out.push(ShareSyncSubtask {
+                task_id: t.id.clone(),
+                name,
+                kind: "download".to_string(),
+                status: format!("{:?}", t.status).to_lowercase(),
+                downloaded: t.downloaded_size,
+                total: t.total_size,
+                progress,
+                speed: t.speed,
+                eta_seconds: compute_eta_seconds(t.downloaded_size, t.total_size, t.speed),
+                owner_uid,
+            });
+        }
+    }
+
+    // 转存段:内部转存任务(is_internal && backup_config_id==cfg),用文件数做进度
+    for t in transfer.get_all_tasks().await {
+        if t.is_internal && t.backup_config_id.as_deref() == Some(cfg.as_str()) {
+            let progress = if t.total_count > 0 {
+                (t.transferred_count as f64 / t.total_count as f64) * 100.0
+            } else {
+                0.0
+            };
+            out.push(ShareSyncSubtask {
+                task_id: t.id.clone(),
+                name: t
+                    .file_name
+                    .clone()
+                    .unwrap_or_else(|| basename_of(&t.save_path)),
+                kind: "transfer".to_string(),
+                status: format!("{:?}", t.status).to_lowercase(),
+                downloaded: t.transferred_count as u64,
+                total: t.total_count as u64,
+                progress,
+                speed: 0,
+                eta_seconds: None,
+                owner_uid,
+            });
+        }
+    }
+
+    // 下载段(文件夹):tree 模式整目录转存 + 自动下载会产生文件夹下载任务
+    // (backup_config_id==cfg)。其子文件任务带 group_id 不会单独出现在下载管理,
+    // 也不走 is_backup 的 get_tasks_by_backup_config,因此在此按文件夹级聚合进度。
+    if let Some(fdm) = transfer.folder_download_manager_handle().await {
+        for f in fdm.get_folders_by_backup_config(&cfg).await {
+            // 文件夹本身不持有速度，按其活跃子文件任务(group_id==folder.id)的
+            // 瞬时速度求和聚合，口径与文件夹进度广播器(folder_manager)一致。
+            let speed: u64 = if let Some(dm) = dm_handle.as_ref() {
+                dm.get_tasks_by_group(&f.id)
+                    .await
+                    .iter()
+                    .filter(|t| t.status == crate::downloader::TaskStatus::Downloading)
+                    .map(|t| t.speed)
+                    .sum()
+            } else {
+                0
+            };
+            out.push(ShareSyncSubtask {
+                task_id: format!("folder:{}", f.id),
+                name: f.name.clone(),
+                kind: "download".to_string(),
+                status: format!("{:?}", f.status).to_lowercase(),
+                downloaded: f.downloaded_size,
+                total: f.total_size,
+                progress: f.progress(),
+                speed,
+                eta_seconds: compute_eta_seconds(f.downloaded_size, f.total_size, speed),
+                owner_uid,
+            });
+        }
+    }
+
+    out
+}
+
+/// 子任务状态是否已到终态（完成/失败/取消）。
+///
+/// 口径覆盖三个来源的状态枚举(lowercased `{:?}`):
+/// - 文件/文件夹下载(`TaskStatus`/`FolderStatus`): `completed` / `failed` / `cancelled`
+/// - 内部转存(`TransferStatus`): `completed` / `transferfailed` / `downloadfailed`
+///
+/// 与前端 `SUBTASK_TERMINAL`(completed/failed/cancelled/success) 对齐,额外纳入
+/// 转存段特有的失败态,确保「进行中子任务」轮询接口不会回包任何已结束的子任务。
+fn is_terminal_subtask_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "success" | "failed" | "cancelled" | "transferfailed" | "downloadfailed"
+    )
+}
+
+/// 收集当前子任务并逐个推送 `ShareSyncEvent::ItemProgress`（一帧）。
+async fn emit_subtask_progress(
+    publisher: &Arc<dyn ShareSyncEventPublisher>,
+    transfer: &TransferManager,
+    run_id: &str,
+    subscription_id: &str,
+    owner_uid: u64,
+) {
+    let subs = collect_share_sync_subtasks(transfer, subscription_id, owner_uid).await;
+    for s in subs {
+        publisher.publish(ShareSyncEvent::ItemProgress {
+            run_id: run_id.to_string(),
+            subscription_id: subscription_id.to_string(),
+            task_id: s.task_id,
+            name: s.name,
+            kind: s.kind,
+            status: s.status,
+            downloaded: s.downloaded,
+            total: s.total,
+            progress: s.progress,
+            speed: s.speed,
+            eta_seconds: s.eta_seconds,
+            owner_uid,
+        });
+    }
+}
+
+/// 「每个 run 的子任务进度广播器」：约 1s 推一帧，直到被 abort。
+async fn broadcast_subtask_progress(
+    publisher: Arc<dyn ShareSyncEventPublisher>,
+    transfer: Arc<TransferManager>,
+    run_id: String,
+    subscription_id: String,
+    owner_uid: u64,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        ticker.tick().await;
+        emit_subtask_progress(&publisher, &transfer, &run_id, &subscription_id, owner_uid).await;
+    }
+}
+
+/// 补推一帧最终态（run 结束后调用，确保前端拿到 completed/failed 终态）。
+async fn broadcast_subtask_progress_once(
+    publisher: Arc<dyn ShareSyncEventPublisher>,
+    transfer: Option<Arc<TransferManager>>,
+    run_id: String,
+    subscription_id: String,
+    owner_uid: u64,
+) {
+    if let Some(tm) = transfer {
+        emit_subtask_progress(&publisher, &tm, &run_id, &subscription_id, owner_uid).await;
+    }
+}
+
 struct ProductionHooks {
+    /// 该订阅所属账号的网盘客户端（已按 owner_uid 解析）
     netdisk: Arc<NetdiskClient>,
-    transfer: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
+    /// 该订阅所属账号的转存管理器（已按 owner_uid 解析）
+    transfer: Arc<TransferManager>,
     captured: CapturedShare,
+    /// 订阅所属账号 uid，透传给 transfer 的 owner_uid_override，确保落到正确账号
+    owner_uid: u64,
     /// v2 阶段 6:出站请求前 acquire().await 走全局风控限速门
     rate_limiter: Arc<crate::share_sync::rate_limit::QuotaLimiter>,
+    /// 当前订阅 id，用于构造下载子任务的 `backup_config_id = "share-sync:{id}"`，
+    /// 实现任务隔离（隐藏 + 优先级 + 归属，详见 TransferTask::backup_config_id）。
+    subscription_id: String,
+}
+
+impl ProductionHooks {
+    /// 分享同步子任务的归属 id：`"share-sync:{订阅id}"`。
+    /// 永不与自动备份的 UUID 配置 id 冲突，故 `is_backup=true` 复用不会挂到自动备份。
+    fn share_sync_backup_config_id(&self) -> String {
+        share_sync_backup_config_id(&self.subscription_id)
+    }
 }
 
 #[async_trait]
@@ -622,7 +1268,7 @@ impl ExecutorHooks for ProductionHooks {
     ) -> Result<String, ShareSyncError> {
         // v2 阶段 6:全局风控限速器
         self.rate_limiter.acquire().await;
-        let tm = self.transfer_manager().await?;
+        let tm = self.transfer_manager();
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
 
@@ -637,6 +1283,7 @@ impl ExecutorHooks for ProductionHooks {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
             randsk: captured.randsk.clone(),
+            prefetched_share: Some(prefetched_share_for_captured(captured)),
             save_path: target_dir.to_string(),
             save_fs_id: 0,
             auto_download: Some(false),
@@ -653,7 +1300,11 @@ impl ExecutorHooks for ProductionHooks {
                 size: item.size,
                 name: item.name.clone(),
             }]),
-            owner_uid_override: None,
+            owner_uid_override: Some(Uid::new(self.owner_uid)),
+            // 分享同步内部任务：从「转存管理」隐藏 + 归属 share-sync:{订阅id}
+            // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
+            is_internal: true,
+            backup_config_id: Some(self.share_sync_backup_config_id()),
         };
         let resp = tm
             .create_task(req)
@@ -760,11 +1411,30 @@ impl ExecutorHooks for ProductionHooks {
         item: &ShareSnapshotItem,
         local_dir: &Path,
         strategy: ConflictStrategy,
+        transfer_netdisk_dir: Option<&str>,
     ) -> Result<String, ShareSyncError> {
         // v2 阶段 6:全局风控限速器
         self.rate_limiter.acquire().await;
-        let local_download_root = share_direct_download_root(local_dir, item)?;
-        let tm = self.transfer_manager().await?;
+        // 本地同步模式分流：
+        // - 分享直下（transfer_netdisk_dir=None）：转存到临时目录，下载后清理（is_share_direct_download=true）。
+        // - 转存并下载（Some(网盘目录)）：转存到该网盘目录并保留，再下载（is_share_direct_download=false）。
+        // 两种模式的下载段都因 backup_config_id 走自动备份同款 create_backup_task。
+        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir {
+            Some(netdisk_dir) => (
+                netdisk_dir.to_string(),
+                local_dir.to_string_lossy().to_string(),
+                false,
+            ),
+            None => {
+                let local_download_root = share_direct_download_root(local_dir, item)?;
+                (
+                    String::new(),
+                    local_download_root.to_string_lossy().to_string(),
+                    true,
+                )
+            }
+        };
+        let tm = self.transfer_manager();
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
 
@@ -777,11 +1447,12 @@ impl ExecutorHooks for ProductionHooks {
             share_url: share_url_for_captured(&self.captured),
             password: self.captured.password.clone(),
             randsk: self.captured.randsk.clone(),
-            save_path: String::new(),
+            prefetched_share: Some(prefetched_share_for_captured(&self.captured)),
+            save_path: sync_save_path,
             save_fs_id: 0,
             auto_download: Some(true),
-            local_download_path: Some(local_download_root.to_string_lossy().to_string()),
-            is_share_direct_download: true,
+            local_download_path: Some(sync_local_download),
+            is_share_direct_download: sync_is_share_direct,
             download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
             selected_fs_ids: Some(vec![item.fs_id]),
             selected_files: Some(vec![SharedFileInfo {
@@ -791,7 +1462,11 @@ impl ExecutorHooks for ProductionHooks {
                 size: item.size,
                 name: item.name.clone(),
             }]),
-            owner_uid_override: None,
+            owner_uid_override: Some(Uid::new(self.owner_uid)),
+            // 分享同步内部任务：从「转存管理」隐藏 + 归属 share-sync:{订阅id}
+            // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
+            is_internal: true,
+            backup_config_id: Some(self.share_sync_backup_config_id()),
         };
 
         let resp = tm
@@ -808,8 +1483,8 @@ impl ExecutorHooks for ProductionHooks {
             .task_id
             .ok_or_else(|| ShareSyncError::DownloadError("TransferManager 未返回任务 ID".into()))?;
         info!(
-            "share-sync: share-direct download submitted task_id={} path={} local_root={:?}",
-            task_id, raw_path, local_download_root
+            "share-sync: download submitted task_id={} path={} share_direct={} netdisk_dir={:?}",
+            task_id, raw_path, sync_is_share_direct, transfer_netdisk_dir
         );
         Ok(task_id)
     }
@@ -820,7 +1495,7 @@ impl ExecutorHooks for ProductionHooks {
         require_download_completion: bool,
         timeout: Duration,
     ) -> Result<(), ShareSyncError> {
-        let tm = self.transfer_manager().await?;
+        let tm = self.transfer_manager();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let task = tm.get_task(task_id).await.ok_or_else(|| {
@@ -940,7 +1615,7 @@ impl ExecutorHooks for ProductionHooks {
         }
         // v2 阶段 6:全局风控限速器
         self.rate_limiter.acquire().await;
-        let tm = self.transfer_manager().await?;
+        let tm = self.transfer_manager();
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
 
@@ -960,6 +1635,7 @@ impl ExecutorHooks for ProductionHooks {
             share_url: share_url_for_captured(captured),
             password: captured.password.clone(),
             randsk: captured.randsk.clone(),
+            prefetched_share: Some(prefetched_share_for_captured(captured)),
             save_path: target_dir.to_string(),
             save_fs_id: 0,
             // 网盘目标不下载本地，与单文件版本一致
@@ -969,7 +1645,11 @@ impl ExecutorHooks for ProductionHooks {
             download_conflict_strategy: None,
             selected_fs_ids: Some(selected_fs_ids),
             selected_files: Some(selected_files),
-            owner_uid_override: None,
+            owner_uid_override: Some(Uid::new(self.owner_uid)),
+            // 分享同步内部任务：从「转存管理」隐藏 + 归属 share-sync:{订阅id}
+            // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
+            is_internal: true,
+            backup_config_id: Some(self.share_sync_backup_config_id()),
         };
         let resp = tm
             .create_task(req)
@@ -999,6 +1679,7 @@ impl ExecutorHooks for ProductionHooks {
         items: &[ShareSnapshotItem],
         local_dir: &Path,
         strategy: ConflictStrategy,
+        transfer_netdisk_dir: Option<&str>,
     ) -> Result<String, ShareSyncError> {
         if items.is_empty() {
             return Err(ShareSyncError::Internal(
@@ -1007,7 +1688,16 @@ impl ExecutorHooks for ProductionHooks {
         }
         // v2 阶段 6:全局风控限速器
         self.rate_limiter.acquire().await;
-        let tm = self.transfer_manager().await?;
+        // 本地同步模式分流（batch）：见 submit_download 单文件版说明。
+        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir {
+            Some(netdisk_dir) => (
+                netdisk_dir.to_string(),
+                local_dir.to_string_lossy().to_string(),
+                false,
+            ),
+            None => (String::new(), local_dir.to_string_lossy().to_string(), true),
+        };
+        let tm = self.transfer_manager();
         use crate::transfer::manager::CreateTransferRequest;
         use crate::transfer::types::SharedFileInfo;
 
@@ -1037,18 +1727,23 @@ impl ExecutorHooks for ProductionHooks {
             share_url: share_url_for_captured(&self.captured),
             password: self.captured.password.clone(),
             randsk: self.captured.randsk.clone(),
+            prefetched_share: Some(prefetched_share_for_captured(&self.captured)),
             // 走 is_share_direct_download=true 路径，save_path 在 transfer 里
             // 会被 temp_dir 强制覆盖——这是 transfer 的硬编码行为，不在 share-sync
             // 控制范围。最终落点是 `local_download_path`（自动下载阶段被消费）。
-            save_path: String::new(),
+            save_path: sync_save_path,
             save_fs_id: 0,
             auto_download: Some(true),
-            local_download_path: Some(local_dir.to_string_lossy().to_string()),
-            is_share_direct_download: true,
+            local_download_path: Some(sync_local_download),
+            is_share_direct_download: sync_is_share_direct,
             download_conflict_strategy: Some(download_conflict_strategy_for_share_sync(strategy)),
             selected_fs_ids: Some(selected_fs_ids),
             selected_files: Some(selected_files),
-            owner_uid_override: None,
+            owner_uid_override: Some(Uid::new(self.owner_uid)),
+            // 分享同步内部任务：从「转存管理」隐藏 + 归属 share-sync:{订阅id}
+            // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
+            is_internal: true,
+            backup_config_id: Some(self.share_sync_backup_config_id()),
         };
 
         let resp = tm
@@ -1075,12 +1770,21 @@ impl ExecutorHooks for ProductionHooks {
 }
 
 impl ProductionHooks {
-    async fn transfer_manager(&self) -> Result<Arc<TransferManager>, ShareSyncError> {
-        self.transfer
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| ShareSyncError::ConfigError("TransferManager 未初始化".into()))
+    fn transfer_manager(&self) -> Arc<TransferManager> {
+        self.transfer.clone()
+    }
+}
+
+/// 用已捕获的分享上下文构造 `SharePageInfo`，让 `create_task` 跳过逐批
+/// `access_share_page`（大目录二分拆批降频、规避风控）。
+fn prefetched_share_for_captured(
+    captured: &CapturedShare,
+) -> crate::transfer::types::SharePageInfo {
+    crate::transfer::types::SharePageInfo {
+        shareid: captured.shareid.clone(),
+        uk: captured.uk.clone(),
+        share_uk: captured.share_uk.clone(),
+        bdstoken: captured.bdstoken.clone(),
     }
 }
 
@@ -1287,6 +1991,7 @@ mod tests {
     use super::*;
     use crate::share_sync::config::{LocalTarget, NetdiskTarget, SyncTarget};
     use crate::share_sync::events::NoopShareSyncEventPublisher;
+    use crate::share_sync::resolver::StaticAccountResolver;
     use tempfile::tempdir;
 
     fn sub(name: &str) -> ShareSubscription {
@@ -1296,79 +2001,112 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: std::env::temp_dir(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         )
     }
 
-    fn empty_managers() -> (
-        Arc<tokio::sync::RwLock<Option<NetdiskClient>>>,
-        Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>>,
-        Arc<tokio::sync::RwLock<Option<Arc<DownloadManager>>>>,
-    ) {
-        (
-            Arc::new(tokio::sync::RwLock::new(None)),
-            Arc::new(tokio::sync::RwLock::new(None)),
-            Arc::new(tokio::sync::RwLock::new(None)),
-        )
+    #[test]
+    fn test_prefetched_share_for_captured_maps_all_fields() {
+        let captured = CapturedShare {
+            short_key: "1abc".into(),
+            shareid: "sid".into(),
+            uk: "uk-1".into(),
+            share_uk: "share-uk-2".into(),
+            bdstoken: "tok".into(),
+            password: Some("pwd".into()),
+            randsk: Some("rsk".into()),
+        };
+        let info = prefetched_share_for_captured(&captured);
+        assert_eq!(info.shareid, "sid");
+        assert_eq!(info.uk, "uk-1");
+        // share_uk 必须取 access_share_page 返回的 share_uk（转存接口用），
+        // 不能误用 uk —— 二者在部分分享场景下不同。
+        assert_eq!(info.share_uk, "share-uk-2");
+        assert_eq!(info.bdstoken, "tok");
     }
 
     #[tokio::test]
     async fn test_new_manager_empty() {
         let dir = tempdir().unwrap();
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: dir.path().join("subs.json"),
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         assert_eq!(m.list_subscriptions().len(), 0);
     }
 
     #[tokio::test]
     async fn test_create_get_delete() {
         let dir = tempdir().unwrap();
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: dir.path().join("subs.json"),
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         assert_eq!(m.list_subscriptions().len(), 1);
         assert!(m.get_subscription(&s.id).is_some());
 
-        // JSON 已写入
+        // DB 为唯一可信源：不再写 JSON（已移除 JSON 双写）
         let json_path = dir.path().join("subs.json");
-        assert!(json_path.exists());
+        assert!(!json_path.exists());
 
-        m.delete_subscription(&s.id).unwrap();
+        m.delete_subscription(&s.id).await.unwrap();
         assert_eq!(m.list_subscriptions().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_for_owner_isolates_accounts() {
+        let dir = tempdir().unwrap();
+        let m = ShareSyncManager::new(ManagerConfig {
+            config_path: dir.path().join("subs.json"),
+            db_path: dir.path().join("s.db"),
+            resolver: Arc::new(StaticAccountResolver::none()),
+            publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
+        })
+            .await
+            .unwrap();
+
+        let mut a = sub("a");
+        a.owner_uid = 1;
+        let mut b = sub("b");
+        b.owner_uid = 2;
+        m.create_subscription(a).unwrap();
+        m.create_subscription(b).unwrap();
+
+        // 账号 1 只看见自己的订阅，看不见账号 2 的
+        let owner1 = m.list_for_owner(1);
+        assert_eq!(owner1.len(), 1);
+        assert_eq!(owner1[0].name, "a");
+        assert!(owner1.iter().all(|s| s.owner_uid == 1));
+
+        let owner2 = m.list_for_owner(2);
+        assert_eq!(owner2.len(), 1);
+        assert_eq!(owner2[0].name, "b");
+
+        // 未知账号看不到任何订阅
+        assert_eq!(m.list_for_owner(999).len(), 0);
     }
 
     #[tokio::test]
     async fn test_update_subscription_preserves_id_and_created_at() {
         let dir = tempdir().unwrap();
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: dir.path().join("subs.json"),
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         let original_created = s.created_at;
 
@@ -1383,17 +2121,14 @@ mod tests {
     #[tokio::test]
     async fn test_set_enabled_persists_state() {
         let dir = tempdir().unwrap();
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: dir.path().join("subs.json"),
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         m.set_enabled(&s.id, false).unwrap();
         assert!(!m.get_subscription(&s.id).unwrap().enabled);
@@ -1430,6 +2165,125 @@ mod tests {
     }
 
     #[test]
+    fn test_is_terminal_subtask_status() {
+        // 终态：完成/成功/各类失败/取消 → 不应出现在「进行中子任务」
+        for s in [
+            "completed",
+            "success",
+            "failed",
+            "cancelled",
+            "transferfailed",
+            "downloadfailed",
+        ] {
+            assert!(is_terminal_subtask_status(s), "{s} 应判终态");
+        }
+        // 非终态：仍在进行 → 保留
+        for s in [
+            "pending",
+            "scanning",
+            "downloading",
+            "transferring",
+            "transferred",
+            "waiting_transfer",
+            "paused",
+        ] {
+            assert!(!is_terminal_subtask_status(s), "{s} 不应判终态");
+        }
+    }
+
+    // ===== execution_diff_with_directory_ancestors：整目录转存只在「整目录全新」时启用 =====
+
+    fn ss_file(path: &str, fs_id: u64, size: u64) -> ShareSnapshotItem {
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        ShareSnapshotItem::new(path, name, fs_id, size, false)
+    }
+    fn ss_dir(path: &str, fs_id: u64) -> ShareSnapshotItem {
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        ShareSnapshotItem::new(path, name, fs_id, 0, true)
+    }
+
+    #[test]
+    fn test_exec_diff_promotes_dir_only_when_subtree_fully_new() {
+        // 首次同步：/d 整目录全新（2 个文件 + 目录项都在 added）→ 应保留/补成整目录转存。
+        let curr = ShareSnapshot::with_items(
+            "sub",
+            vec![
+                ss_dir("/d", 100),
+                ss_file("/d/a", 1, 10),
+                ss_file("/d/b", 2, 20),
+            ],
+        );
+        let diff = diff_snapshots(None, &curr); // prev=None → 全部 added（含目录项 /d）
+        let (out, _added) = execution_diff_with_directory_ancestors(&diff, &curr);
+        // /d 已在 added 里（目录项），整目录转存可用。
+        assert!(out.added.iter().any(|i| i.path == "/d" && i.is_dir));
+    }
+
+    #[test]
+    fn test_exec_diff_does_not_promote_partially_changed_dir() {
+        // 增量：/d 已同步，仅新增 /d/c。/d 本身未变（不在 diff），不应被补成整目录转存，
+        // 否则会把未变动的 /d/a、/d/b 也整目录重下。
+        let prev = ShareSnapshot::with_items(
+            "sub",
+            vec![
+                ss_dir("/d", 100),
+                ss_file("/d/a", 1, 10),
+                ss_file("/d/b", 2, 20),
+            ],
+        );
+        let curr = ShareSnapshot::with_items(
+            "sub",
+            vec![
+                ss_dir("/d", 100),
+                ss_file("/d/a", 1, 10),
+                ss_file("/d/b", 2, 20),
+                ss_file("/d/c", 3, 30),
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+        assert_eq!(diff.added.len(), 1);
+        assert_eq!(diff.added[0].path, "/d/c");
+
+        let (out, added) = execution_diff_with_directory_ancestors(&diff, &curr);
+        // 不补 /d（含未变动文件），added 集合里不应出现目录 /d。
+        assert_eq!(added, 0, "含未变动文件的目录不应被补成整目录转存");
+        assert!(!out.added.iter().any(|i| i.path == "/d"));
+        // 仍只携带变动的那个文件。
+        assert_eq!(out.added.len(), 1);
+        assert_eq!(out.added[0].path, "/d/c");
+    }
+
+    #[test]
+    fn test_dir_subtree_fully_changed_predicate() {
+        let curr = ShareSnapshot::with_items(
+            "sub",
+            vec![
+                ss_dir("/d", 100),
+                ss_file("/d/a", 1, 10),
+                ss_file("/d/sub/x", 4, 40),
+            ],
+        );
+        let idx = curr.index_by_path();
+
+        // 全部子文件都变 → true
+        let all: BTreeSet<String> =
+            ["/d/a".to_string(), "/d/sub/x".to_string()].into_iter().collect();
+        assert!(dir_subtree_fully_changed(&idx, "/d", &all));
+
+        // 只变一部分（缺 /d/sub/x） → /d 整体 false
+        let some: BTreeSet<String> = ["/d/a".to_string()].into_iter().collect();
+        assert!(!dir_subtree_fully_changed(&idx, "/d", &some));
+
+        // 嵌套子目录视角：/d/sub 的全部文件(/d/sub/x)都变 → true
+        let sub_only: BTreeSet<String> = ["/d/sub/x".to_string()].into_iter().collect();
+        assert!(dir_subtree_fully_changed(&idx, "/d/sub", &sub_only));
+
+        // 空集合 / 无子文件 → false（不误判为全新）
+        let none: BTreeSet<String> = BTreeSet::new();
+        assert!(!dir_subtree_fully_changed(&idx, "/d", &none));
+    }
+
+    #[test]
     fn test_share_direct_download_root_avoids_duplicate_parent_dir() {
         let item =
             ShareSnapshotItem::new("/monthly/000009.SZ.csv", "000009.SZ.csv", 9, 1024, false);
@@ -1459,6 +2313,7 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         );
         let items = vec![
@@ -1486,6 +2341,7 @@ mod tests {
             vec![SyncTarget::Local(LocalTarget {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
             })],
         );
         let item = ShareSnapshotItem::new("/nested/a.csv", "a.csv", 1, 4, false);
@@ -1528,17 +2384,14 @@ mod tests {
     #[tokio::test]
     async fn test_create_invalid_subscription_rejected() {
         let dir = tempdir().unwrap();
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: dir.path().join("subs.json"),
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let mut bad = sub("a");
         bad.share_url = "https://example.com".into();
         let r = m.create_subscription(bad);
@@ -1554,17 +2407,14 @@ mod tests {
         let all = vec![s.clone()];
         std::fs::write(&json_path, serde_json::to_string(&all).unwrap()).unwrap();
 
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: json_path,
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let list = m.list_subscriptions();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "preloaded");
@@ -1573,17 +2423,14 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_one_when_not_logged_in_fails() {
         let dir = tempdir().unwrap();
-        let (net, tx, dl) = empty_managers();
         let m = ShareSyncManager::new(ManagerConfig {
             config_path: dir.path().join("subs.json"),
             db_path: dir.path().join("s.db"),
-            netdisk_client: net,
-            transfer_manager: tx,
-            download_manager: dl,
+            resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         // netdisk_client 为 None → 应报错
         let r = m.execute_one(&s.id).await;

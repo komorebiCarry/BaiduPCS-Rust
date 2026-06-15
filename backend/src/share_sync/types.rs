@@ -40,6 +40,8 @@ pub enum TargetKind {
     Netdisk,
     /// 下载到本地
     Local,
+    /// 转存到网盘并下载到本地（一次转存同时满足网盘 + 本地两个目标）
+    NetdiskAndLocal,
 }
 
 impl TargetKind {
@@ -48,6 +50,7 @@ impl TargetKind {
         match self {
             TargetKind::Netdisk => "netdisk",
             TargetKind::Local => "local",
+            TargetKind::NetdiskAndLocal => "netdisk_and_local",
         }
     }
 }
@@ -166,6 +169,8 @@ pub enum RunStatus {
     CompletedWithErrors,
     /// 整体失败（启动阶段就出错）
     Failed,
+    /// 进程重启时被打断（未跑完）——非失败,会在启动时自动重跑
+    Interrupted,
 }
 
 impl std::fmt::Display for RunStatus {
@@ -182,6 +187,7 @@ impl RunStatus {
             RunStatus::Completed => "completed",
             RunStatus::CompletedWithErrors => "completed_with_errors",
             RunStatus::Failed => "failed",
+            RunStatus::Interrupted => "interrupted",
         }
     }
 }
@@ -251,6 +257,7 @@ mod tests {
             RunStatus::Completed,
             RunStatus::CompletedWithErrors,
             RunStatus::Failed,
+            RunStatus::Interrupted,
         ] {
             let json = serde_json::to_string(&s).unwrap();
             let back: RunStatus = serde_json::from_str(&json).unwrap();
@@ -362,6 +369,7 @@ mod tests {
             (RunStatus::Completed, "completed"),
             (RunStatus::CompletedWithErrors, "completed_with_errors"),
             (RunStatus::Failed, "failed"),
+            (RunStatus::Interrupted, "interrupted"),
         ] {
             assert_eq!(value.as_str(), expected);
             assert_enum_str(value, expected);

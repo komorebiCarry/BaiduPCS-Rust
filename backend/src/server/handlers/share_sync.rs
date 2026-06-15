@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::server::error::ApiError;
+use crate::server::extractors::{ensure_client_available, resolve_owner_uid_for_create};
 use crate::server::AppState;
 use crate::share_sync::{
     infer_share_root, normalize_pagination, normalize_share_path, CreateShareSubscriptionRequest,
@@ -66,6 +67,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
     match e {
         ShareSyncError::SubscriptionNotFound(m) => err_not_found(&m),
         ShareSyncError::SubscriptionExists(m) => ApiError::Conflict(m),
+        ShareSyncError::AlreadyRunning(m) => ApiError::Conflict(m),
         ShareSyncError::ConfigError(m) => err_bad(&m),
         ShareSyncError::ShareLinkError(m) => err_bad(&m),
         ShareSyncError::FileSystemError(m) => err_bad(&m),
@@ -89,23 +91,45 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
     }
 }
 
-fn ensure_subscription_exists(manager: &Arc<ShareSyncManager>, id: &str) -> ApiResult<()> {
-    if manager.get_subscription(id).is_none() {
-        return Err(err_not_found("订阅不存在"));
-    }
-    Ok(())
+/// 按 id 取订阅；不存在 → 404。
+///
+/// 多账号策略对齐其它页面（autobackup/transfer/download）：后端不做按账号的访问拦截，
+/// 列表默认返回全部账号、各资源带 `owner_uid`，由前端 `AccountFilter` + `AccountBadge`
+/// 展示与过滤。执行同步时仍由 manager 按订阅 `owner_uid` 解析对应账号客户端，
+/// 保证转存/下载始终落到正确账号（与触发者当前活跃账号无关）。
+fn require_subscription(
+    manager: &Arc<ShareSyncManager>,
+    id: &str,
+) -> ApiResult<ShareSubscription> {
+    manager
+        .get_subscription(id)
+        .ok_or_else(|| err_not_found("订阅不存在"))
 }
 
 // =====================================================
 // Routes
 // =====================================================
 
+/// 列表查询参数：可选 `uid` 按账号过滤（缺省返回全部账号）。
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(default, alias = "owner_uid")]
+    pub uid: Option<u64>,
+}
+
 /// GET /api/v1/share-sync/subscriptions
+///
+/// 默认返回全部账号的订阅（与 transfer/autobackup 一致）；传 `?uid=` 时按账号过滤。
+/// 前端用 `AccountFilter` 控制可见性，每条带 `owner_uid` 由 `AccountBadge` 展示。
 pub async fn list_subscriptions(
     State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ApiResponse<Vec<ShareSubscription>>>> {
     let m = get_manager(&state).await?;
-    let list = m.list_subscriptions();
+    let list = match q.uid {
+        Some(uid) => m.list_for_owner(uid),
+        None => m.list_subscriptions(),
+    };
     Ok(Json(ApiResponse::success(list)))
 }
 
@@ -115,19 +139,24 @@ pub async fn get_subscription(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
     let m = get_manager(&state).await?;
-    match m.get_subscription(&id) {
-        Some(s) => Ok(Json(ApiResponse::success(s))),
-        None => Err(err_not_found("订阅不存在")),
-    }
+    let s = require_subscription(&m, &id)?;
+    Ok(Json(ApiResponse::success(s)))
 }
 
 /// POST /api/v1/share-sync/subscriptions
+///
+/// 归属账号：优先用请求里的 `uid`/`owner_uid`，缺省回退到当前活跃账号（与 download/autobackup 一致）。
+/// 创建前校验该账号确实已登录（`client_pool` 中存在），避免存下无法同步的孤儿订阅
+/// （传错 uid 时直接 400 `account_not_available`，而不是等到 resolver 执行阶段才失败）。
 pub async fn create_subscription(
     State(state): State<AppState>,
     Json(req): Json<CreateShareSubscriptionRequest>,
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
+    let owner_uid = resolve_owner_uid_for_create(&state, req.uid).await?;
+    ensure_client_available(&state, owner_uid).await?;
     let m = get_manager(&state).await?;
-    let sub = req.into_subscription();
+    let mut sub = req.into_subscription();
+    sub.owner_uid = owner_uid.raw();
     match m.create_subscription(sub) {
         Ok(s) => Ok(Json(ApiResponse::success(s))),
         Err(e) => Err(map_share_err(e)),
@@ -141,9 +170,7 @@ pub async fn update_subscription(
     Json(req): Json<UpdateShareSubscriptionRequest>,
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
     let m = get_manager(&state).await?;
-    let existing = m
-        .get_subscription(&id)
-        .ok_or_else(|| err_not_found("订阅不存在"))?;
+    let existing = require_subscription(&m, &id)?;
     let mut new_sub = existing.clone();
     if let Some(v) = req.name {
         new_sub.name = v;
@@ -187,7 +214,8 @@ pub async fn delete_subscription(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
-    m.delete_subscription(&id).map_err(map_share_err)?;
+    require_subscription(&m, &id)?;
+    m.delete_subscription(&id).await.map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"deleted": id}),
     )))
@@ -199,6 +227,7 @@ pub async fn enable_subscription(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
     m.set_enabled(&id, true).map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"enabled": true}),
@@ -211,9 +240,25 @@ pub async fn disable_subscription(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
     m.set_enabled(&id, false).map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"enabled": false}),
+    )))
+}
+
+/// POST /api/v1/share-sync/subscriptions/:id/resume
+///
+/// 「我已更新链接，恢复」：清除链接失效标记 + 连续失效计数，恢复轮询并立即重试一次。
+pub async fn resume_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
+    let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
+    m.resume_link_invalid(&id).map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({"subscription_id": id, "resumed": true}),
     )))
 }
 
@@ -223,6 +268,7 @@ pub async fn trigger_subscription(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
     m.trigger_one(&id).map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"subscription_id": id, "triggered": true}),
@@ -242,7 +288,7 @@ pub async fn list_runs(
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<ApiResponse<Vec<RunRecord>>>> {
     let m = get_manager(&state).await?;
-    ensure_subscription_exists(&m, &id)?;
+    require_subscription(&m, &id)?;
     let (page, ps) = normalize_pagination(q.page, q.page_size);
     let list = m
         .persistence()
@@ -255,7 +301,6 @@ pub async fn list_runs(
 pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(q): Query<RunDetailQuery>,
 ) -> ApiResult<Json<ApiResponse<RunDetailDto>>> {
     let m = get_manager(&state).await?;
     let rec = m
@@ -263,28 +308,8 @@ pub async fn get_run(
         .get_run(&id)
         .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
-    let items_total = m.persistence().count_run_items(&id).map_err(map_share_err)?;
-    let limit = q.items_limit.unwrap_or(DEFAULT_RUN_ITEM_LIMIT).clamp(1, MAX_RUN_ITEM_LIMIT);
-    let mut items = m.persistence().list_run_items(&id).map_err(map_share_err)?;
-    let items_truncated = items.len() > limit;
-    if items_truncated {
-        items.truncate(limit);
-    }
-    Ok(Json(ApiResponse::success(RunDetailDto {
-        run: rec,
-        items,
-        items_total,
-        items_truncated,
-    })))
-}
-
-const DEFAULT_RUN_ITEM_LIMIT: usize = 200;
-const MAX_RUN_ITEM_LIMIT: usize = 1000;
-
-#[derive(Debug, Deserialize)]
-pub struct RunDetailQuery {
-    #[serde(default)]
-    pub items_limit: Option<usize>,
+    let items = m.persistence().list_run_items(&id).map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(RunDetailDto { run: rec, items })))
 }
 
 #[derive(Debug, Serialize)]
@@ -292,8 +317,20 @@ pub struct RunDetailDto {
     #[serde(flatten)]
     pub run: RunRecord,
     pub items: Vec<RunItemRecord>,
-    pub items_total: usize,
-    pub items_truncated: bool,
+}
+
+/// GET /api/v1/share-sync/subscriptions/:id/subtasks
+///
+/// 列出该订阅当前「进行中子任务」的进度（下载段 + 内部转存段），供前端轮询兜底
+/// （WS `item_progress` 事件断线时使用）。与 WS 广播共用同一数据形状。
+pub async fn list_subtasks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ApiResponse<Vec<crate::share_sync::ShareSyncSubtask>>>> {
+    let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
+    let subs = m.subtasks(&id).await.map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(subs)))
 }
 
 /// GET /api/v1/share-sync/subscriptions/:id/snapshots/latest
@@ -302,7 +339,7 @@ pub async fn latest_snapshot(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
-    ensure_subscription_exists(&m, &id)?;
+    require_subscription(&m, &id)?;
     match m
         .persistence()
         .latest_snapshot(&id)
@@ -325,6 +362,11 @@ pub struct PreviewTreeRequest {
     pub share_url: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// 按订阅所属账号路由网盘 client（编辑订阅时传订阅自己的 owner_uid，
+    /// 不传则回退当前 active 账号——转存对话框创建场景 owner=active）。
+    /// 对齐 AutoBackup：操作按资源 owner_uid 路由，不要求用户先切号。
+    #[serde(default)]
+    pub owner_uid: Option<u64>,
     /// 展开深度（1 = 仅根，2 = 根 + 1 层子目录，默认 2）
     #[serde(default = "default_tree_depth")]
     pub depth: u32,
@@ -365,14 +407,43 @@ pub async fn preview_tree(
     }
     let depth = req.depth.clamp(1, 4);
 
-    // 取 NetdiskClient（必须已登录）
-    let client = {
-        let g = state.netdisk_client.read().await;
-        match &*g {
-            Some(c) => c.clone(),
-            None => return Err(err_bad("网盘客户端未初始化，请先登录百度账号")),
+    // 按订阅所属账号路由网盘 client（对齐 AutoBackup）：
+    // owner_uid 显式传入 = 编辑既有订阅（按订阅自己的账号路由）；未传 = 新建场景，
+    // 用当前 active 账号预览（“新建就是用我当前账号”）。据此区分报错措辞，新建时不提
+    // “订阅所属账号”这种令人困惑的说法。
+    let is_explicit_owner = req.owner_uid.is_some();
+    let owner_uid = match req.owner_uid {
+        Some(raw) => crate::auth::Uid::new(raw),
+        None => match *state.active_uid.read().await {
+            Some(active) => active,
+            None => return Err(err_bad("当前无已登录百度账号，请先登录后再预览目录树")),
+        },
+    };
+    // 启动期只急切注入「活跃账号」client，非活跃账号是懒加载的；活跃账号预热也可能
+    // 因网络/代理短暂失败而未入池。故取 client 前先 `ensure_client_for_uid` 兜底懒加载
+    // （用持久化 cookie 构造，不联网），对齐 cloud_dl/accounts handler 的做法，避免
+    // 「账号已登录却报未登录」的误报。仅当账号确实不在 AccountManager（需登录）或
+    // 凭证失效导致构造失败时才报错。
+    let unavailable_msg = |uid: u64, detail: String| {
+        if is_explicit_owner {
+            err_bad(&format!(
+                "订阅所属账号 uid={uid} 不可用（未登录或登录已失效），请登录该账号后再预览目录树：{detail}"
+            ))
+        } else {
+            err_bad(&format!(
+                "当前账号 uid={uid} 不可用（未登录或登录已失效），请重新登录后再预览目录树：{detail}"
+            ))
         }
     };
+    if let Err(e) = state.ensure_client_for_uid(owner_uid).await {
+        return Err(unavailable_msg(owner_uid.raw(), e.to_string()));
+    }
+    let client = state
+        .client_pool
+        .read()
+        .await
+        .get_client(owner_uid)
+        .ok_or_else(|| unavailable_msg(owner_uid.raw(), "client 未入池".to_string()))?;
 
     // 解析链接
     let share_link = client
@@ -441,7 +512,7 @@ pub async fn preview_tree(
             f,
             depth - 1,
         )
-        .await;
+            .await;
         out.push(node);
     }
 
@@ -495,7 +566,7 @@ fn build_tree_node<'a>(
                                 f,
                                 remaining_depth - 1,
                             )
-                            .await,
+                                .await,
                         );
                     }
                     node.children = Some(kids);

@@ -175,6 +175,9 @@ impl HistoryDbManager {
         // 否则 row_to_task_metadata 永远返回 None，前端 DownloadsView/UploadsView 显示 UID:0
         let _ = conn.execute("ALTER TABLE task_history ADD COLUMN owner_uid INTEGER", []);
         let _ = conn.execute("ALTER TABLE folder_history ADD COLUMN owner_uid INTEGER", []);
+        // 🔥 分享同步：文件夹下载也需要 backup_config_id 归属，否则重启后
+        // 内部隐藏文件夹会退回 None 而重新泄漏进「下载管理」。
+        let _ = conn.execute("ALTER TABLE folder_history ADD COLUMN backup_config_id TEXT", []);
 
         info!("历史数据库表初始化完成");
         Ok(())
@@ -1010,6 +1013,30 @@ impl HistoryDbManager {
         Ok(deleted)
     }
 
+    /// 按 backup_config_id 删除任务历史
+    ///
+    /// 用于删除分享同步订阅时,清掉其名下 `share-sync:{订阅id}` 归属的内部转存/下载
+    /// 历史记录,避免订阅删除后留下孤儿脏数据。
+    pub fn remove_tasks_by_backup_config(&self, backup_config_id: &str) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let deleted = conn.execute(
+            "DELETE FROM task_history WHERE backup_config_id = ?1",
+            params![backup_config_id],
+        )?;
+
+        if deleted > 0 {
+            info!(
+                "已从历史数据库删除归属 {} 的 {} 个任务",
+                backup_config_id, deleted
+            );
+        }
+        Ok(deleted)
+    }
+
     /// 清理过期的任务历史
     pub fn cleanup_expired_task_history(&self, retention_days: u64) -> Result<usize> {
         let conn = self
@@ -1058,13 +1085,13 @@ impl HistoryDbManager {
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
-                transfer_task_id, pending_files_json, owner_uid
+                transfer_task_id, pending_files_json, owner_uid, backup_config_id
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19
+                ?17, ?18, ?19, ?20
             )
             "#,
             params![
@@ -1088,6 +1115,7 @@ impl HistoryDbManager {
                 pending_files_json,
                 // 🔥 多账号归属：Some(0) 也当 None 写入
                 folder.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
+                folder.backup_config_id,
             ],
         )?;
 
@@ -1117,13 +1145,13 @@ impl HistoryDbManager {
                     total_files, total_size, created_count, completed_count, downloaded_size,
                     scan_completed, scan_progress,
                     created_at, started_at, completed_at, error,
-                    transfer_task_id, pending_files_json, owner_uid
+                    transfer_task_id, pending_files_json, owner_uid, backup_config_id
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5,
                     ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12,
                     ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19
+                    ?17, ?18, ?19, ?20
                 )
                 "#,
             )?;
@@ -1157,6 +1185,7 @@ impl HistoryDbManager {
                     pending_files_json,
                     // 🔥 多账号归属：Some(0) 也当 None 写入
                     folder.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
+                    folder.backup_config_id,
                 ])?;
                 count += 1;
             }
@@ -1181,7 +1210,7 @@ impl HistoryDbManager {
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
-                transfer_task_id, pending_files_json, owner_uid
+                transfer_task_id, pending_files_json, owner_uid, backup_config_id
             FROM folder_history
             ORDER BY completed_at DESC
             "#,
@@ -1208,6 +1237,7 @@ impl HistoryDbManager {
                 transfer_task_id: row.get(16)?,
                 pending_files_json: row.get(17)?,
                 owner_uid: row.get(18)?,
+                backup_config_id: row.get(19)?,
             })
         })?;
 
@@ -1487,6 +1517,7 @@ impl HistoryDbManager {
             completed_at: row.completed_at,
             error: row.error,
             transfer_task_id: row.transfer_task_id,
+            backup_config_id: row.backup_config_id,
             // 🔥 多账号归属：从列读出
             owner_uid: row.owner_uid.map(|u| u as u64),
             failure_reason: None,
@@ -1560,6 +1591,8 @@ struct FolderHistoryRow {
     pending_files_json: Option<String>,
     /// 多账号归属 UID
     owner_uid: Option<i64>,
+    /// 归属备份配置 ID（内部隐藏文件夹下载）
+    backup_config_id: Option<String>,
 }
 
 // ========================================================================

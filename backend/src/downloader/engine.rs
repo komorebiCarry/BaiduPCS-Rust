@@ -1430,7 +1430,7 @@ impl DownloadEngine {
                             let result = Self::probe_download_link_parallel(
                                 &client, &bduss, &url, total_size,
                             )
-                            .await;
+                                .await;
                             (global_idx, url, result)
                         }
                     })

@@ -83,6 +83,23 @@ pub struct CreateTransferRequest {
     /// `None` → 沿用 `TransferManager.owner_uid`（per-uid manager 架构下即该
     /// manager 自己的 uid；历史共享 Arc / 测试路径下默认是 startup active）。
     pub owner_uid_override: Option<crate::auth::Uid>,
+
+    /// 标记为「分享同步」内部转存任务：从「转存管理」列表隐藏（对齐自动备份隔离）。
+    pub is_internal: bool,
+
+    /// 同步配置 id（`"share-sync:{订阅id}"`）。
+    /// 设置后，本次转存的自动下载子任务改走 `DownloadManager::create_backup_task`，
+    /// 从而从「下载管理」隐藏并走自动备份同款下载槽优先级、归属到分享同步而非自动备份。
+    pub backup_config_id: Option<String>,
+
+    /// 已解析的分享上下文（share-sync 拆批复用）。
+    ///
+    /// 分享同步抓快照时已 `access_share_page` 解析过该分享；大目录二分拆批会对
+    /// 同一分享反复 `create_task`，若每批都重新 `access_share_page` 则请求频率翻倍、
+    /// 更易触发账号风控（errno=132）。`Some(_)` 时 `create_task` 跳过
+    /// `access_share_page`，直接复用此 `SharePageInfo`（密码分享仍会重新校验提取码
+    /// 以刷新本次转存所需的 cookie）。其它调用方传 `None`，行为不变。
+    pub prefetched_share: Option<SharePageInfo>,
 }
 
 /// 创建转存任务响应
@@ -224,6 +241,16 @@ impl TransferManager {
         let mut lock = self.download_manager.write().await;
         *lock = Some(dm);
         info!("转存管理器已设置下载管理器");
+    }
+
+    /// 取下载管理器句柄（供分享同步进度广播 / 轮询接口读取子任务下载进度）
+    pub async fn download_manager_handle(&self) -> Option<Arc<DownloadManager>> {
+        self.download_manager.read().await.clone()
+    }
+
+    /// 取文件夹下载管理器句柄（供分享同步收集 tree 模式产生的文件夹子任务进度）
+    pub async fn folder_download_manager_handle(&self) -> Option<Arc<FolderDownloadManager>> {
+        self.folder_download_manager.read().await.clone()
     }
 
     /// 设置文件夹下载管理器（用于自动下载文件夹）
@@ -416,13 +443,30 @@ impl TransferManager {
         task.selected_fs_ids = request.selected_fs_ids.clone();
         task.selected_files = request.selected_files.clone();
 
+        // 分享同步内部任务标记 + 同步配置 id（决定衍生下载是否走 create_backup_task）
+        task.is_internal = request.is_internal;
+        task.backup_config_id = request.backup_config_id.clone();
+
         let task_id = task.id.clone();
 
-        // 4. 访问分享页面，获取分享信息
+        // 4. 获取分享信息：share-sync 拆批复用已抓快照时解析的上下文，
+        //    跳过逐批 access_share_page（降低请求频率、规避账号风控）；
+        //    其它调用方仍走 access_share_page 解析。
         let client = self.client.read().unwrap().clone();
-        let share_info_result = client
-            .access_share_page(&share_link.short_key, &share_link.password, true)
-            .await;
+        let share_info_result = match request.prefetched_share.clone() {
+            Some(info) => {
+                info!(
+                    "复用已捕获分享上下文，跳过 access_share_page: shareid={}",
+                    info.shareid
+                );
+                Ok(info)
+            }
+            None => {
+                client
+                    .access_share_page(&share_link.short_key, &share_link.password, true)
+                    .await
+            }
+        };
 
         match share_info_result {
             Ok(info) => {
@@ -511,6 +555,18 @@ impl TransferManager {
                             temp_dir.clone(),
                         ) {
                             warn!("更新分享直下信息失败: {}", e);
+                        }
+                    }
+
+                    // 分享同步内部任务（不分模式）：持久化同步配置归属，
+                    // 供 get_all_tasks 历史段过滤，避免污染「转存管理」。
+                    if let Some(ref cfg_id) = request.backup_config_id {
+                        if let Err(e) = pm_arc
+                            .lock()
+                            .await
+                            .update_transfer_backup_config_id(&task_id, Some(cfg_id.clone()))
+                        {
+                            warn!("更新转存任务同步归属失败: {}", e);
                         }
                     }
                 }
@@ -1668,6 +1724,11 @@ impl TransferManager {
         let transfer_owner_uid = task.read().await.owner_uid;
         let owner_uid_raw = transfer_owner_uid.raw();
 
+        // 分享同步内部任务：若带同步归属 id，则下载段统一走自动备份同款
+        // `DownloadManager::create_backup_task`（is_backup=true → 从「下载管理」隐藏 +
+        // 走自动备份下载槽优先级 + 以 "share-sync:{订阅id}" 归属到分享同步）。
+        let backup_config_id = task.read().await.backup_config_id.clone();
+
         // 获取本地下载路径配置 + 缓存的分享根路径（用于 share_root 推导）
         let (local_download_path, ask_each_time, default_download_dir, task_share_root_path) = {
             let t = task.read().await;
@@ -1829,8 +1890,22 @@ impl TransferManager {
                     warn!("创建本地下载目录失败: {:?}, error={}", local_dir, e);
                 }
             }
-            match dm
-                .create_task_with_dir_and_owner(
+            let create_result = if let Some(ref cfg_id) = backup_config_id {
+                // 分享同步：下载段复用自动备份同款 create_backup_task
+                // （is_backup=true → 从「下载管理」隐藏 + 走自动备份下载槽优先级 +
+                //  以 "share-sync:{订阅id}" 归属到分享同步而非自动备份）。
+                dm.create_backup_task(
+                    fs_id,
+                    remote_path.clone(),
+                    local_dir.join(&filename),
+                    size,
+                    cfg_id.clone(),
+                    None,
+                    transfer_owner_uid,
+                )
+                    .await
+            } else {
+                dm.create_task_with_dir_and_owner(
                     fs_id,
                     remote_path.clone(),
                     filename.clone(),
@@ -1839,9 +1914,18 @@ impl TransferManager {
                     None,
                     transfer_owner_uid,
                 )
-                .await
-            {
+                    .await
+            };
+            match create_result {
                 Ok(download_task_id) => {
+                    // create_backup_task 命中冲突跳过（文件已存在）时返回 "skipped"
+                    if download_task_id == "skipped" {
+                        info!(
+                            "share-sync: 备份下载跳过（文件已存在） remote={}",
+                            remote_path
+                        );
+                        continue;
+                    }
                     // 🔥 设置下载任务关联的转存任务 ID（内存中）
                     // 注意：持久化会在 start_task -> register_download_task 时自动从内存任务中获取
                     if let Err(e) = dm.set_task_transfer_id(&download_task_id, task_id.to_string()).await {
@@ -1891,7 +1975,17 @@ impl TransferManager {
                         }
                     }
                     match fdm
-                        .create_folder_download_with_dir(folder_path.clone(), &local_dir, None, None, owner_uid)
+                        // 🔥 分享同步内部任务：把 backup_config_id 透传给文件夹下载，
+                        // 使其从「下载管理」隐藏并归属为分享同步子任务（与单文件下载段
+                        // 走 create_backup_task 对齐）。
+                        .create_folder_download_with_dir_backup(
+                            folder_path.clone(),
+                            &local_dir,
+                            None,
+                            None,
+                            owner_uid,
+                            backup_config_id.clone(),
+                        )
                         .await
                     {
                         Ok(folder_id) => {
@@ -3106,19 +3200,26 @@ impl TransferManager {
                     failed_count += 1;
                 }
             } else {
-                // 普通文件下载任务：查询 DownloadManager
-                if let Some(task) = dm.get_task(task_id).await {
-                    match task.status {
+                // 普通文件下载任务：查询 DownloadManager。
+                // 🔥 小文件下载极快，完成瞬间就会「归档到历史库 + 从内存移除」。本监听器
+                // 每 2s 才轮询一次，若仅查内存（get_task 返回 None）会把「已完成并归档」
+                // 误判为「已取消」→ cancelled==total → 转存状态回退成 Transferred →
+                // share-sync 把本已成功的子项标记为失败。改用 lookup_aggregate_outcome
+                // 补查历史库，区分「已归档完成/失败」与「真正丢失」。
+                use crate::downloader::manager::DownloadAggregateOutcome;
+                match dm.lookup_aggregate_outcome(task_id).await {
+                    DownloadAggregateOutcome::InMemory(status) => match status {
                         TaskStatus::Completed => completed_count += 1,
                         TaskStatus::Failed => failed_count += 1,
                         TaskStatus::Downloading => downloading_count += 1,
                         TaskStatus::Decrypting => downloading_count += 1, // 解密中视为进行中
                         TaskStatus::Paused => paused_count += 1,
                         TaskStatus::Pending => downloading_count += 1, // 视为进行中
-                    }
-                } else {
-                    // 任务不存在，视为已取消
-                    cancelled_count += 1;
+                    },
+                    DownloadAggregateOutcome::ArchivedCompleted => completed_count += 1,
+                    DownloadAggregateOutcome::ArchivedFailed => failed_count += 1,
+                    // 任务在内存与历史库均不存在，视为已取消
+                    DownloadAggregateOutcome::NotFound => cancelled_count += 1,
                 }
             }
         }
@@ -3181,6 +3282,10 @@ impl TransferManager {
         // 2) 跨 .await 顺序读取，确保每个任务都被收集（不跳过写锁占用的）
         for task_arc in task_arcs {
             let task = task_arc.read().await;
+            // 分享同步内部转存任务不在「转存管理」列表展示（对齐自动备份隔离）
+            if task.is_internal {
+                continue;
+            }
             result.push(task.clone());
         }
 
@@ -3204,6 +3309,14 @@ impl TransferManager {
             ) {
                 for metadata in history_tasks {
                     // 排除已在当前任务中的（避免重复）
+                    // 分享同步内部转存任务（带 share-sync: 归属）不在「转存管理」历史展示
+                    if metadata
+                        .backup_config_id
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with("share-sync:"))
+                    {
+                        continue;
+                    }
                     if !self.tasks.contains_key(&metadata.task_id) {
                         if let Some(task) = Self::convert_history_to_task(&metadata) {
                             result.push(task);
@@ -3286,6 +3399,12 @@ impl TransferManager {
             owner_uid: metadata.owner_uid.map(crate::auth::Uid::new).unwrap_or_default(),
             // 恢复分享根路径（老元数据缺该字段时为 None，调用方退化到启发式）
             share_root_path: metadata.share_root_path.clone(),
+            // 内部标记不持久化于独立列：从 backup_config_id 是否带 share-sync: 前缀推断
+            is_internal: metadata
+                .backup_config_id
+                .as_deref()
+                .is_some_and(|c| c.starts_with("share-sync:")),
+            backup_config_id: metadata.backup_config_id.clone(),
         })
     }
 
@@ -3662,6 +3781,89 @@ impl TransferManager {
         (memory_count, history_count)
     }
 
+    /// 删除归属某 `backup_config_id`（如 `share-sync:{订阅id}`）的全部转存任务
+    /// （内存运行中 + 历史），并连带清理其名下的下载子任务。
+    ///
+    /// 用于删除分享同步订阅时清掉内部转存/下载任务，避免订阅删除后残留孤儿脏数据。
+    /// 返回 `(转存内存数, 转存历史数)`。
+    pub async fn delete_tasks_for_backup_config(&self, cfg_id: &str) -> (usize, usize) {
+        // 1) 收集内存中归属该 cfg_id 的 task ids（先克隆 Arc，再按 .await 顺序取读锁，
+        //    避免 cross-await 持有 DashMap 锁）。
+        let task_arcs: Vec<(String, Arc<RwLock<TransferTask>>)> = self
+            .tasks
+            .iter()
+            .map(|e| (e.key().clone(), e.value().task.clone()))
+            .collect();
+
+        let mut target_ids: Vec<String> = Vec::new();
+        for (id, task_arc) in task_arcs {
+            let task = task_arc.read().await;
+            if task.backup_config_id.as_deref() == Some(cfg_id) {
+                target_ids.push(id);
+            }
+        }
+
+        let memory_count = target_ids.len();
+        for id in target_ids {
+            if let Err(e) = self.remove_task(&id).await {
+                warn!(
+                    "delete_tasks_for_backup_config: 删除转存任务 {} 失败: {}",
+                    id, e
+                );
+            }
+        }
+
+        // 2) 历史数据库：删除该 backup_config_id 的全部转存历史。
+        let mut history_count = 0;
+        if let Some(pm_arc) = self
+            .persistence_manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|pm| pm.clone())
+        {
+            let pm_guard = pm_arc.lock().await;
+            let history_db = pm_guard.history_db().cloned();
+            drop(pm_guard);
+
+            if let Some(db) = history_db {
+                match db.remove_tasks_by_backup_config(cfg_id) {
+                    Ok(count) => history_count = count,
+                    Err(e) => warn!(
+                        "delete_tasks_for_backup_config: 删除历史任务（cfg={}）失败: {}",
+                        cfg_id, e
+                    ),
+                }
+            }
+        }
+
+        // 3) 连带清理下载子任务（分享同步「转存并下载/分享直下」会建下载任务，
+        //    同样带 backup_config_id = share-sync:{id}）。
+        if let Some(dm) = self.download_manager_handle().await {
+            let (dl_mem, dl_hist) = dm.delete_tasks_for_backup_config(cfg_id).await;
+            info!(
+                "delete_tasks_for_backup_config: cfg={} 下载子任务清理（内存={}, 历史={}）",
+                cfg_id, dl_mem, dl_hist
+            );
+        }
+
+        // 4) 连带清理 tree 模式整目录下载产生的内部隐藏文件夹下载任务
+        //    （同样带 backup_config_id = share-sync:{id}）。
+        if let Some(fdm) = self.folder_download_manager_handle().await {
+            let folder_count = fdm.delete_folders_for_backup_config(cfg_id).await;
+            info!(
+                "delete_tasks_for_backup_config: cfg={} 文件夹子任务清理（{} 个）",
+                cfg_id, folder_count
+            );
+        }
+
+        info!(
+            "delete_tasks_for_backup_config: cfg={} 完成（转存内存={}, 转存历史={}）",
+            cfg_id, memory_count, history_count
+        );
+        (memory_count, history_count)
+    }
+
     /// 获取配置
     pub async fn get_config(&self) -> TransferConfig {
         self.config.read().await.clone()
@@ -3721,6 +3923,14 @@ impl TransferManager {
 
         // 恢复分享根路径，避免恢复后退化到启发式推导
         task.share_root_path = recovery_info.share_root_path.clone();
+
+        // 还原任务归属与内部标记：带 share-sync: 前缀的是分享同步内部转存任务，
+        // 必须恢复 is_internal，否则重启后会漏进「转存管理」列表（与运行期隔离不一致）。
+        task.backup_config_id = recovery_info.backup_config_id.clone();
+        task.is_internal = recovery_info
+            .backup_config_id
+            .as_deref()
+            .is_some_and(|c| c.starts_with("share-sync:"));
 
         // 恢复文件列表
         if let Some(ref json) = recovery_info.file_list_json {

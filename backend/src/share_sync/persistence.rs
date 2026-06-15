@@ -24,17 +24,23 @@ pub fn normalize_pagination(page: Option<usize>, page_size: Option<usize>) -> (u
     (p, ps)
 }
 
-/// 给 `share_sync_run_items(run_id, path)` 建 UNIQUE 索引。
+/// 给 `share_sync_run_items(run_id, path, target)` 建 UNIQUE 索引。
 ///
-/// 老库可能积累过重复行 — quota 退化、并发批量重试都会把同一 (run_id, path)
-/// 插多次。`CREATE UNIQUE INDEX` 在已有重复时会直接报错把启动卡死,所以这里
-/// 先按 `(run_id, path)` 去重(保留最大 id, 即最近一次写入,状态最新), 再建索引。
+/// 唯一键含 `target`（target_kind：netdisk / local）：一个文件在"网盘 + 本地"
+/// 共存的订阅里会产生两条动作（转存到网盘 + 下载到本地），若只按 (run_id, path)
+/// 唯一，两条会互相覆盖，运行详情里的 target/status/task_id 不可信。加上 target
+/// 后两条独立存在、各自可查。
+///
+/// 老库可能积累过重复行 — quota 退化、并发批量重试都会把同一三元组插多次；早期
+/// 版本还建过 `(run_id, path)` 的唯一索引。`CREATE UNIQUE INDEX` 在已有重复时会
+/// 直接报错把启动卡死,所以这里先按 `(run_id, path, target)` 去重(保留最大 id,
+/// 即最近一次写入,状态最新), 删掉旧的二元唯一索引, 再建三元索引。
 fn ensure_run_items_unique_index(conn: &Connection) -> Result<(), ShareSyncError> {
-    // 已有则直接返回(幂等);避免对大表反复跑 DELETE 扫描
+    // 新三元索引已存在则直接返回(幂等);避免对大表反复跑 DELETE 扫描
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master
-             WHERE type = 'index' AND name = 'idx_share_run_items_run_path'",
+             WHERE type = 'index' AND name = 'idx_share_run_items_run_path_target'",
             [],
             |row| row.get::<_, i64>(0).map(|_| true),
         )
@@ -43,23 +49,25 @@ fn ensure_run_items_unique_index(conn: &Connection) -> Result<(), ShareSyncError
     if exists {
         return Ok(());
     }
-    // 删除"同一 (run_id, path) 的重复行,只保留 id 最大的那条"
+    // 删除"同一 (run_id, path, target) 的重复行,只保留 id 最大的那条"
     let deleted = conn.execute(
         "DELETE FROM share_sync_run_items
          WHERE id NOT IN (
-             SELECT MAX(id) FROM share_sync_run_items GROUP BY run_id, path
+             SELECT MAX(id) FROM share_sync_run_items GROUP BY run_id, path, target
          )",
         [],
     )?;
     if deleted > 0 {
         warn!(
-            "share_sync schema 迁移: 去除 {} 条 (run_id, path) 重复 run_item",
+            "share_sync schema 迁移: 去除 {} 条 (run_id, path, target) 重复 run_item",
             deleted
         );
     }
+    // 旧的二元唯一索引（早期版本建的）会阻止"同 path 不同 target"两条共存,必须删掉
+    conn.execute("DROP INDEX IF EXISTS idx_share_run_items_run_path", [])?;
     conn.execute(
-        "CREATE UNIQUE INDEX idx_share_run_items_run_path
-         ON share_sync_run_items(run_id, path)",
+        "CREATE UNIQUE INDEX idx_share_run_items_run_path_target
+         ON share_sync_run_items(run_id, path, target)",
         [],
     )?;
     Ok(())
@@ -111,6 +119,7 @@ impl ShareSyncPersistence {
             r#"
             CREATE TABLE IF NOT EXISTS share_subscriptions (
                 id TEXT PRIMARY KEY,
+                owner_uid INTEGER NOT NULL DEFAULT 0,
                 name TEXT NOT NULL,
                 share_url TEXT NOT NULL,
                 password TEXT,
@@ -213,6 +222,8 @@ impl ShareSyncPersistence {
             "ALTER TABLE share_sync_runs ADD COLUMN unchanged_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE share_sync_runs ADD COLUMN skipped_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE share_sync_runs ADD COLUMN overwritten_count INTEGER NOT NULL DEFAULT 0",
+            // 多账号隔离：老库（含早期把 share_subscriptions 建在独立库的版本）补 owner_uid 列
+            "ALTER TABLE share_subscriptions ADD COLUMN owner_uid INTEGER NOT NULL DEFAULT 0",
         ] {
             if let Err(e) = conn.execute(ddl, []) {
                 let msg = e.to_string();
@@ -221,6 +232,13 @@ impl ShareSyncPersistence {
                 }
             }
         }
+        // owner_uid 索引必须在上面的 ALTER 补列**之后**建：老库的 share_subscriptions
+        // 没有 owner_uid 列，若放进前面的建表 batch 里会因 "no such column" 整体失败。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_subs_owner
+             ON share_subscriptions(owner_uid)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -238,9 +256,10 @@ impl ShareSyncPersistence {
         let updated = sub.updated_at.timestamp();
         conn.execute(
             r#"INSERT INTO share_subscriptions
-               (id, name, share_url, password, config_json, enabled, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               (id, owner_uid, name, share_url, password, config_json, enabled, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                ON CONFLICT(id) DO UPDATE SET
+                 owner_uid=excluded.owner_uid,
                  name=excluded.name,
                  share_url=excluded.share_url,
                  password=excluded.password,
@@ -249,6 +268,7 @@ impl ShareSyncPersistence {
                  updated_at=excluded.updated_at"#,
             params![
                 sub.id,
+                sub.owner_uid,
                 sub.name,
                 sub.share_url,
                 password,
@@ -283,6 +303,31 @@ impl ShareSyncPersistence {
         let mut stmt =
             conn.prepare("SELECT config_json FROM share_subscriptions ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let s: String = r?;
+            match serde_json::from_str::<ShareSubscription>(&s) {
+                Ok(sub) => out.push(sub),
+                Err(e) => warn!("反序列化订阅失败: {}", e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// 列出归属指定账号(owner_uid)的订阅（多账号隔离，按 created_at DESC）
+    pub fn list_subscriptions_for_owner(
+        &self,
+        owner_uid: u64,
+    ) -> Result<Vec<ShareSubscription>, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT config_json FROM share_subscriptions \
+             WHERE owner_uid = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![owner_uid], |row| {
             let s: String = row.get(0)?;
             Ok(s)
         })?;
@@ -480,16 +525,19 @@ impl ShareSyncPersistence {
         let cutoff = now - cutoff_minutes * 60;
         let conn = self.conn.lock().unwrap();
         // 先 SELECT 拿到将被收编的 run 列表(连带 subscription_id, started_at 给事件用)
+        // LEFT JOIN 订阅表带出 owner_uid（订阅可能已被删 → COALESCE 回退 0）
         let mut stmt = conn.prepare(
-            "SELECT id, subscription_id, started_at
-             FROM share_sync_runs
-             WHERE status = ?1 AND started_at < ?2",
+            "SELECT r.id, r.subscription_id, r.started_at, COALESCE(s.owner_uid, 0)
+             FROM share_sync_runs r
+             LEFT JOIN share_subscriptions s ON s.id = r.subscription_id
+             WHERE r.status = ?1 AND r.started_at < ?2",
         )?;
         let rows = stmt.query_map(params![RunStatus::Running.as_str(), cutoff], |row| {
             Ok(StaleRunRecord {
                 run_id: row.get(0)?,
                 subscription_id: row.get(1)?,
                 started_at: row.get(2)?,
+                owner_uid: row.get::<_, i64>(3)? as u64,
             })
         })?;
         let mut stale = Vec::new();
@@ -522,16 +570,73 @@ impl ShareSyncPersistence {
         Ok(stale)
     }
 
+    /// 启动期把**所有** `status='running'` 的 run 标记为 `Interrupted`,返回被收编
+    /// 的 run 列表(供 manager 在启动时自动重跑)。
+    ///
+    /// 与 `mark_stale_runs_failed` 的区别:
+    /// - 不标 `Failed` 而是 `Interrupted`(中断,非失败)——进程重启打断的 run 不该
+    ///   显示成失败(用户反馈:"怎么能直接标记失败呢")。
+    /// - 不设 cutoff:`ShareSyncManager::new` 只在进程启动时调一次,那一刻任何
+    ///   `running` 行都必然是上次进程残留的孤儿(内存里的 run task 已随进程退出),
+    ///   所以全部收编,manager 随后对其所属(且启用)的订阅自动重跑一次。
+    /// - 同步是增量的(基线快照只在成功后推进),被中断的 run 没推进基线,重跑会
+    ///   重新 diff 把没跑完的项补上。
+    pub fn mark_running_runs_interrupted(&self) -> Result<Vec<StaleRunRecord>, ShareSyncError> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.subscription_id, r.started_at, COALESCE(s.owner_uid, 0)
+             FROM share_sync_runs r
+             LEFT JOIN share_subscriptions s ON s.id = r.subscription_id
+             WHERE r.status = ?1",
+        )?;
+        let rows = stmt.query_map(params![RunStatus::Running.as_str()], |row| {
+            Ok(StaleRunRecord {
+                run_id: row.get(0)?,
+                subscription_id: row.get(1)?,
+                started_at: row.get(2)?,
+                owner_uid: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut interrupted = Vec::new();
+        for r in rows {
+            interrupted.push(r?);
+        }
+        drop(stmt);
+        if interrupted.is_empty() {
+            return Ok(interrupted);
+        }
+        let updated = conn.execute(
+            "UPDATE share_sync_runs
+             SET status = ?1,
+                 finished_at = ?2,
+                 error = ?3
+             WHERE status = ?4",
+            params![
+                RunStatus::Interrupted.as_str(),
+                now,
+                "interrupted_on_restart",
+                RunStatus::Running.as_str(),
+            ],
+        )?;
+        info!(
+            "share_sync 启动自愈: 收编 {} 条中断 run,将自动重跑",
+            updated
+        );
+        Ok(interrupted)
+    }
+
     ///
     /// `reason` 是 v1 新增字段，用于说明"为什么这条 item 没被真正执行"——
     /// 当前主要给 quota / local_disk_full 早停场景用，记录"skip_due_to_quota_full"
     /// 之类的语义化原因。普通成功 / 正常失败的 item 传 `None`。
     ///
-    /// v2: 内部走 `INSERT ... ON CONFLICT(run_id, path) DO UPDATE ... RETURNING id`,
-    /// 同一 (run_id, path) 重复调用会**覆盖**前一次的所有字段并返回原 row id。
+    /// v2: 内部走 `INSERT ... ON CONFLICT(run_id, path, target) DO UPDATE ... RETURNING id`,
+    /// 同一 (run_id, path, target) 重复调用会**覆盖**前一次的所有字段并返回原 row id。
     /// 这是 quota 退化 / 二分递归 / 并发批量重试场景下"状态以最后一次写入为准"
-    /// 的关键 — 老实现是裸 INSERT 会塞重复行,(run_id, path) 又没有 UNIQUE 约束,
-    /// 列表 API 拉出来会有多份。
+    /// 的关键 — 老实现是裸 INSERT 会塞重复行,没有 UNIQUE 约束, 列表 API 拉出来会
+    /// 有多份。唯一键含 `target` 是为了让"网盘 + 本地"共存订阅里同一文件的两条动作
+    /// （转存 / 下载）各自独立、互不覆盖。
     #[allow(clippy::too_many_arguments)]
     pub fn add_run_item(
         &self,
@@ -550,7 +655,7 @@ impl ShareSyncPersistence {
             "INSERT INTO share_sync_run_items
              (run_id, path, action, target, transfer_task_id, download_task_id, status, versioned_old_path, reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(run_id, path) DO UPDATE SET
+             ON CONFLICT(run_id, path, target) DO UPDATE SET
                  action = excluded.action,
                  target = excluded.target,
                  transfer_task_id = COALESCE(excluded.transfer_task_id, share_sync_run_items.transfer_task_id),
@@ -712,6 +817,22 @@ impl ShareSyncPersistence {
         Ok(rec)
     }
 
+    /// 取某 run 所属的 subscription_id（多账号隔离：用于校验访问者归属）
+    pub fn subscription_id_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<String>, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let sid: Option<String> = conn
+            .query_row(
+                "SELECT subscription_id FROM share_sync_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(sid)
+    }
+
     /// 列出 run 的所有 run_items
     pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItemRecord>, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
@@ -742,17 +863,6 @@ impl ShareSyncPersistence {
         }
         Ok(out)
     }
-
-    /// 统计某次 run 的 run_item 总数
-    pub fn count_run_items(&self, run_id: &str) -> Result<usize, ShareSyncError> {
-        let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM share_sync_run_items WHERE run_id = ?1",
-            params![run_id],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
 }
 
 /// 一次运行的摘要
@@ -779,6 +889,8 @@ pub struct StaleRunRecord {
     pub run_id: String,
     pub subscription_id: String,
     pub started_at: i64,
+    /// 该 run 所属订阅的归属账号（多账号隔离：自愈事件按账号过滤用）
+    pub owner_uid: u64,
 }
 
 /// 单条 run_item
@@ -868,6 +980,60 @@ mod tests {
     }
 
     #[test]
+    fn test_owner_uid_roundtrip() {
+        let (_dir, mgr) = fresh();
+        let mut s = sub("a");
+        s.owner_uid = 42;
+        mgr.upsert_subscription(&s).unwrap();
+        let got = mgr.get_subscription(&s.id).unwrap().unwrap();
+        assert_eq!(got.owner_uid, 42);
+    }
+
+    #[test]
+    fn test_list_subscriptions_for_owner_isolates_accounts() {
+        let (_dir, mgr) = fresh();
+        // 账号 1 两条，账号 2 一条
+        let mut a1 = sub("a1");
+        a1.owner_uid = 1;
+        a1.touch();
+        let mut a2 = sub("a2");
+        a2.owner_uid = 1;
+        a2.touch();
+        let mut b1 = sub("b1");
+        b1.owner_uid = 2;
+        b1.touch();
+        mgr.upsert_subscription(&a1).unwrap();
+        mgr.upsert_subscription(&a2).unwrap();
+        mgr.upsert_subscription(&b1).unwrap();
+
+        let owner1 = mgr.list_subscriptions_for_owner(1).unwrap();
+        assert_eq!(owner1.len(), 2);
+        assert!(owner1.iter().all(|s| s.owner_uid == 1));
+
+        let owner2 = mgr.list_subscriptions_for_owner(2).unwrap();
+        assert_eq!(owner2.len(), 1);
+        assert_eq!(owner2[0].owner_uid, 2);
+
+        // 不存在的账号看不到任何订阅
+        assert_eq!(mgr.list_subscriptions_for_owner(999).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_subscription_id_for_run_maps_to_owning_subscription() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let run_id = "run-1";
+        mgr.start_run(run_id, &s.id, 1000).unwrap();
+
+        let mapped = mgr.subscription_id_for_run(run_id).unwrap();
+        assert_eq!(mapped.as_deref(), Some(s.id.as_str()));
+
+        // 不存在的 run → None（handler 据此返回 404）
+        assert!(mgr.subscription_id_for_run("no-such-run").unwrap().is_none());
+    }
+
+    #[test]
     fn test_save_and_get_snapshot() {
         let (_dir, mgr) = fresh();
         let s = sub("a");
@@ -907,7 +1073,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
 
         mgr.delete_subscription(&s.id).unwrap();
         assert!(mgr.latest_snapshot(&s.id).unwrap().is_none());
@@ -931,7 +1097,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
         mgr.finish_run(
             "run-1",
             1100,
@@ -948,7 +1114,7 @@ mod tests {
             },
             None,
         )
-        .unwrap();
+            .unwrap();
 
         let rec = mgr.get_run("run-1").unwrap().unwrap();
         assert_eq!(rec.status, "completed_with_errors");
@@ -1050,7 +1216,7 @@ mod tests {
             Some("/old.bak"),
             Some("first_reason"),
         )
-        .unwrap();
+            .unwrap();
         // 第二次传 None 给 transfer_task_id / download_task_id / versioned_old_path / reason
         mgr.add_run_item(
             "run-c",
@@ -1063,7 +1229,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
         let items = mgr.list_run_items("run-c").unwrap();
         assert_eq!(items.len(), 1);
         // status / action 是 NOT NULL 用 excluded 覆盖
@@ -1074,6 +1240,51 @@ mod tests {
         assert_eq!(items[0].download_task_id.as_deref(), Some("dl-1"));
         assert_eq!(items[0].versioned_old_path.as_deref(), Some("/old.bak"));
         assert_eq!(items[0].reason.as_deref(), Some("first_reason"));
+    }
+
+    /// v2: 同一 (run_id, path) 但不同 target（网盘 + 本地）应当各存一条,互不覆盖。
+    /// 唯一键是 (run_id, path, target),这是"网盘 + 本地"共存订阅运行详情可信的前提。
+    #[test]
+    fn test_add_run_item_netdisk_and_local_coexist() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-d", &s.id, 1000).unwrap();
+        let id_net = mgr
+            .add_run_item(
+                "run-d",
+                "/movie.mkv",
+                SyncAction::Added,
+                TargetKind::Netdisk,
+                Some("tx-net"),
+                None,
+                RunItemStatus::Completed,
+                None,
+                None,
+            )
+            .unwrap();
+        let id_local = mgr
+            .add_run_item(
+                "run-d",
+                "/movie.mkv",
+                SyncAction::Added,
+                TargetKind::Local,
+                None,
+                Some("dl-local"),
+                RunItemStatus::Transferring,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_ne!(id_net, id_local, "不同 target 应当是两条独立 row");
+        let items = mgr.list_run_items("run-d").unwrap();
+        assert_eq!(items.len(), 2, "网盘 + 本地各一条,不互相覆盖");
+        let net = items.iter().find(|i| i.target == "netdisk").unwrap();
+        let local = items.iter().find(|i| i.target == "local").unwrap();
+        assert_eq!(net.transfer_task_id.as_deref(), Some("tx-net"));
+        assert_eq!(net.status, "completed");
+        assert_eq!(local.download_task_id.as_deref(), Some("dl-local"));
+        assert_eq!(local.status, "transferring");
     }
 
     /// v2: mark_stale_runs_failed — 把 status='running' 且 started_at 超阈值的 run
@@ -1097,7 +1308,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-        .unwrap();
+            .unwrap();
 
         let stale = mgr.mark_stale_runs_failed(120).unwrap();
         let ids: Vec<&str> = stale.iter().map(|r| r.run_id.as_str()).collect();
@@ -1109,6 +1320,43 @@ mod tests {
         assert_eq!(rec.error.as_deref(), Some("stale_run_killed_on_startup"));
         let fresh = mgr.get_run("run-fresh").unwrap().unwrap();
         assert_eq!(fresh.status, "running");
+    }
+
+    /// mark_running_runs_interrupted — 把**所有** running run(不论新旧)标记为
+    /// interrupted(非 failed),已完成的 run 不动。供启动续跑用。
+    #[test]
+    fn test_mark_running_runs_interrupted() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // 两条 running:一新一老,都应被收编(进程重启时都是孤儿)
+        mgr.start_run("run-old", &s.id, now - 3 * 3600).unwrap();
+        mgr.start_run("run-new", &s.id, now - 30).unwrap();
+        // 已完成的不动
+        mgr.start_run("run-done", &s.id, now - 100).unwrap();
+        mgr.finish_run(
+            "run-done",
+            now - 50,
+            RunStatus::Completed,
+            &DiffSummary::default(),
+            None,
+        )
+            .unwrap();
+
+        let mut got = mgr.mark_running_runs_interrupted().unwrap();
+        let mut ids: Vec<String> = got.drain(..).map(|r| r.run_id).collect();
+        ids.sort();
+        assert_eq!(ids, ["run-new", "run-old"], "所有 running 都应被收编");
+        assert_eq!(got.len(), 0);
+
+        for rid in ["run-old", "run-new"] {
+            let rec = mgr.get_run(rid).unwrap().unwrap();
+            assert_eq!(rec.status, "interrupted");
+            assert_eq!(rec.error.as_deref(), Some("interrupted_on_restart"));
+        }
+        // 已完成不受影响
+        assert_eq!(mgr.get_run("run-done").unwrap().unwrap().status, "completed");
     }
 
     /// v2: 老库已有 (run_id, path) 重复行时, init_tables 走 ensure_run_items_unique_index
@@ -1154,7 +1402,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
         let items = mgr.list_run_items("r1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "completed");

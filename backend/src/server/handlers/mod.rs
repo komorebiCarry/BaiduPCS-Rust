@@ -31,7 +31,7 @@ pub use share::*;
 pub use share_sync::{
     create_subscription, delete_subscription, disable_subscription, enable_subscription,
     get_run, get_subscription, latest_snapshot, list_runs, list_subscriptions,
-    preview_tree, trigger_subscription, update_subscription,
+    list_subtasks, preview_tree, resume_subscription, trigger_subscription, update_subscription,
 };
 pub use transfer::*;
 pub use upload::*;

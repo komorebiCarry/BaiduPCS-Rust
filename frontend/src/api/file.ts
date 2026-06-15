@@ -130,7 +130,9 @@ export async function deleteFiles(paths: string[]): Promise<DeleteFilesData> {
   })
 
   if (response.data.code !== 0 || !response.data.data) {
-    throw new Error(response.data.message || '删除文件失败')
+    const err = new Error(response.data.message || '删除文件失败') as Error & { code?: number }
+    err.code = response.data.code
+    throw err
   }
 
   return response.data.data

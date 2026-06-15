@@ -46,6 +46,10 @@ pub enum ShareSyncError {
     #[error("订阅已存在: {0}")]
     SubscriptionExists(String),
 
+    /// 同一订阅已有 run 在执行（并发触发去重）
+    #[error("订阅已有同步任务在执行中: {0}")]
+    AlreadyRunning(String),
+
     /// 内部错误
     #[error("内部错误: {0}")]
     Internal(String),
@@ -150,7 +154,17 @@ const TRANSIENT_KEYWORDS: &[&str] = &[
 /// 重试同一组只会再撞同一面墙,正确做法是拆小再试(阶段 4 二分)。
 /// - `-33`(文件数超限) — 百度对单次转存的 fs_id 总数有上限
 /// - `task_errno=-33` — 同上,只是写法不同
-const DIR_AMBIGUOUS_KEYWORDS: &[&str] = &["errno=-33", "task_errno=-33", "文件数量超出限制"];
+/// - `超过上限` / `转存文件数超限` — 同步转存接口 `errno=12 + info errno=130`
+///   返回的"转存文件数超限"(`target_file_nums > target_file_nums_limit`,
+///   非超级会员单次上限 500)。整目录(如 3499 个文件)一次性转存会撞这个上限,
+///   必须二分拆到每批 ≤ 上限。client.rs 把它格式化为"转存文件数 N 超过上限 M"。
+const DIR_AMBIGUOUS_KEYWORDS: &[&str] = &[
+    "errno=-33",
+    "task_errno=-33",
+    "文件数量超出限制",
+    "超过上限",
+    "转存文件数超限",
+];
 
 fn matches_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
@@ -200,22 +214,53 @@ impl ShareSyncError {
         matches!(self.category(), ErrorCategory::Transient)
     }
 
+    /// 是否属于「分享链接确定性失效」——分享被取消/过期、提取码失效等,重试也救不回来,
+    /// 应计入连续失效计数并在达阈值后自动暂停轮询。
+    ///
+    /// 注意:风控(errno=132)虽然也走 `Auth` 分类,但它是账号被临时标记、会自行恢复,
+    /// **不算**确定性失效;临时网络问题(被包成 `ShareLinkError` 文案里含超时关键字)也排除,
+    /// 避免抖动误判停用。
+    pub fn is_link_invalid(&self) -> bool {
+        match self {
+            // 访问分享页 / 验证提取码失败都会包成 ShareLinkError;排除临时网络抖动。
+            ShareSyncError::ShareLinkError(msg) => !matches_any(msg, TRANSIENT_KEYWORDS),
+            // 资源不存在 / 已失效
+            other => matches!(other.category(), ErrorCategory::NotFound),
+        }
+    }
+
     /// 是否触发"目录二分递归"(阶段 4 新增)
     ///
     /// 这三类失败有一个共同点:**重试同一组没用,但拆小可能成功**:
     /// - `Quota` / `LocalDiskFull`: 整组放不下,拆开后小目录可能放得下
     /// - `DirTransferAmbiguous`: 整组被一刀切失败但可能只是某个子文件挂了,
     ///   拆开后好的文件能继续转
-    /// - `NotFound`: 批量提交里常见的"某个文件已失效/被删除"会把整组一起打爆,
-    ///   继续二分能把真正失效的叶子隔离出来,避免把可用文件也标成失败
     pub fn is_bisect_trigger(&self) -> bool {
         matches!(
             self.category(),
             ErrorCategory::Quota
                 | ErrorCategory::LocalDiskFull
                 | ErrorCategory::DirTransferAmbiguous
-                | ErrorCategory::NotFound
         )
+    }
+
+    /// 是否为「目标位置已存在同名文件/目录」（百度转存 errno=4 duplicated /
+    /// 异步 task_errno=-30）。
+    ///
+    /// 这类「失败」其实意味着网盘目标里**已经有这份内容**，因此不该判失败:
+    /// - 纯网盘腿 → 目标已满足，视为已转存完成；
+    /// - 本地腿 → 网盘副本已在，改走分享直下（临时目录→下载→清理）补本地副本，
+    ///   绕开网盘目标的同名冲突。
+    ///
+    /// 注意排除「目标路径已存在同名目录，无法用文件覆盖」——那是文件/目录类型冲突，
+    /// 属于真实失败，不能当作「已存在可继续」。
+    pub fn is_already_exists(&self) -> bool {
+        match self {
+            ShareSyncError::TransferError(msg) | ShareSyncError::DownloadError(msg) => {
+                msg.contains("已存在同名") && !msg.contains("无法用文件覆盖")
+            }
+            _ => false,
+        }
     }
 
     /// 面向用户的可读消息
@@ -369,14 +414,51 @@ mod tests {
     }
 
     #[test]
+    fn test_dir_transfer_ambiguous_detected_for_file_count_over_limit() {
+        // 同步转存接口 errno=12 + info errno=130「转存文件数超限」：
+        // client.rs 把它格式化为「转存文件数 N 超过上限 M」。整目录一次转存
+        // 撞到非超级会员单次 500 上限时，必须二分拆批而不是整组判失败。
+        let e = ShareSyncError::TransferError("转存文件数 3499 超过上限 500".into());
+        assert_eq!(e.category(), ErrorCategory::DirTransferAmbiguous);
+        assert!(e.is_bisect_trigger());
+        assert!(!e.should_retry());
+
+        let e = ShareSyncError::TransferError("转存文件数超限".into());
+        assert_eq!(e.category(), ErrorCategory::DirTransferAmbiguous);
+    }
+
+    #[test]
+    fn test_is_already_exists_detection() {
+        // errno=4 duplicated 同步转存:client.rs 文案
+        let e = ShareSyncError::TransferError("目标位置已存在同名文件: 测试2-1".into());
+        assert!(e.is_already_exists());
+        let e = ShareSyncError::TransferError("目标位置已存在同名文件/文件夹".into());
+        assert!(e.is_already_exists());
+        // 异步 task_errno=-30 文案
+        let e = ShareSyncError::TransferError("转存失败：目标目录已存在同名文件".into());
+        assert!(e.is_already_exists());
+        // 下载腿包成 DownloadError 也算
+        let e = ShareSyncError::DownloadError("目标位置已存在同名文件: d".into());
+        assert!(e.is_already_exists());
+
+        // 文件/目录类型冲突 = 真实失败,不能当「已存在可继续」
+        let e = ShareSyncError::TransferError(
+            "目标路径已存在同名目录，无法用文件覆盖: /x".into(),
+        );
+        assert!(!e.is_already_exists());
+        // 无关错误
+        let e = ShareSyncError::TransferError("errno=132 风控".into());
+        assert!(!e.is_already_exists());
+        let e = ShareSyncError::NetworkError("已存在同名".into());
+        assert!(!e.is_already_exists());
+    }
+
+    #[test]
     fn test_is_bisect_trigger_covers_quota_and_disk() {
         let e = ShareSyncError::TransferError("网盘空间不足".into());
         assert!(e.is_bisect_trigger());
 
         let e = ShareSyncError::FileSystemError("ENOSPC".into());
-        assert!(e.is_bisect_trigger());
-
-        let e = ShareSyncError::TransferError("文件不存在".into());
         assert!(e.is_bisect_trigger());
 
         // 非 bisect 类失败
