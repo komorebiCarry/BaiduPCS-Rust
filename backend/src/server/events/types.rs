@@ -1177,6 +1177,7 @@ impl TaskEvent {
             TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
             TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected { .. }) => true,
             TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled { .. }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress { .. }) => true,
             _ => false,
         }
     }

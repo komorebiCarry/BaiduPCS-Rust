@@ -16,6 +16,7 @@ use crate::downloader::budget_scheduler::{
 use crate::downloader::{ChunkScheduler, DownloadManager, FolderDownloadManager};
 use tokio::sync::Semaphore;
 use crate::netdisk::{ClientPool, CloudDlMonitor, NetdiskClient};
+use crate::share_sync::resolver::ShareSyncAccountResolver;
 use crate::share_sync::ShareSyncManager;
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, create_pre_migration_backup,
@@ -45,6 +46,29 @@ pub struct ReadonlyReason {
     pub last_error: String,
     /// 给运维 / 排查者的建议。
     pub suggestion: String,
+}
+
+/// share_sync 的账号解析器：按订阅 owner_uid 实时解析对应账号的
+/// `NetdiskClient` / `TransferManager`（读 per-uid 池）。
+///
+/// 只持有所需的 `Arc` 句柄（而非整个 `AppState`），避免与 `AppState` 形成
+/// 循环依赖，也让 share_sync 模块无需反向依赖 server 层类型。
+struct AppStateShareSyncResolver {
+    client_pool: Arc<RwLock<ClientPool>>,
+    transfer_managers: Arc<DashMap<Uid, Arc<TransferManager>>>,
+}
+
+#[async_trait::async_trait]
+impl ShareSyncAccountResolver for AppStateShareSyncResolver {
+    async fn netdisk_client(&self, owner_uid: u64) -> Option<Arc<NetdiskClient>> {
+        self.client_pool.read().await.get_client(Uid::new(owner_uid))
+    }
+
+    async fn transfer_manager(&self, owner_uid: u64) -> Option<Arc<TransferManager>> {
+        self.transfer_managers
+            .get(&Uid::new(owner_uid))
+            .map(|e| Arc::clone(e.value()))
+    }
 }
 
 /// 应用全局状态
@@ -1454,18 +1478,19 @@ impl AppState {
 
         let config = self.config.read().await;
 
-        // 派生文件路径：<db_path 的父目录>/share_sync/
-        let db_path_buf = std::path::PathBuf::from(&config.persistence.db_path);
-        let parent = db_path_buf.parent().unwrap_or(std::path::Path::new("."));
-        let share_sync_dir = parent.join("share_sync");
-        let config_path = share_sync_dir.join("subscriptions.json");
-        let db_path = share_sync_dir.join("share_sync.db");
-        if let Some(p) = config_path.parent() {
-            let _ = std::fs::create_dir_all(p);
-        }
+        // 订阅表已并入主库 `baidu-pcs.db`：随主库一起备份/恢复，并天然支持
+        // 按 owner_uid 多账号隔离。`config_path` 仅用于一次性导入早期版本可能
+        // 残留的独立 `share_sync/subscriptions.json`（导入后改名 .migrated）。
+        let db_path = std::path::PathBuf::from(&config.persistence.db_path);
+        let parent = db_path.parent().unwrap_or(std::path::Path::new("."));
+        let config_path = parent.join("share_sync").join("subscriptions.json");
         drop(config);
 
-        // 把 WS Manager 包装为 ShareSyncEventPublisher
+        // 把 WS Manager 包装为 ShareSyncEventPublisher。
+        // WS 投递按订阅模式（category/type/task_id）匹配，`group_id` 用于子任务
+        // 分组、并非账号维度；should_send_event 对所有模块都不按 owner_uid 过滤，
+        // 故此处仍传 None。多账号访问隔离在 handler 层（按 active_uid 过滤
+        // 列表/CRUD/触发）与执行层（resolver 按 owner_uid 解析客户端）强制保证。
         struct WsPublisher {
             ws: Arc<crate::server::websocket::manager::WebSocketManager>,
         }
@@ -1480,31 +1505,18 @@ impl AppState {
             ws: Arc::clone(&self.ws_manager),
         });
 
-        let netdisk_client = Arc::clone(&self.netdisk_client);
-
-        // 多账号架构：main 的 transfer_manager / download_manager 是 per-uid DashMap，
-        // 而 share_sync 的 ManagerConfig 仍按单账号的 Arc<RwLock<Option<Arc<...>>>> 设计。
-        // 这里在初始化时取**当前活跃账号**的 manager 包成单账号形态塞进 share_sync。
-        // 账号切换后 share_sync 持有的引用会过时，但 share-sync 自身主要在
-        // 订阅触发瞬时调用 transfer/download，所以此语义先维持向后兼容；
-        // 真正多账号适配需要后续把 ManagerConfig 改为 AppState 引用 + per-uid
-        // 解析（不在本次迁移范围内）。
-        let active_uid = *self.active_uid.read().await;
-        let transfer_manager: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>> =
-            Arc::new(tokio::sync::RwLock::new(
-                active_uid.and_then(|uid| self.transfer_manager_for(uid)),
-            ));
-        let download_manager: Arc<tokio::sync::RwLock<Option<Arc<DownloadManager>>>> =
-            Arc::new(tokio::sync::RwLock::new(
-                active_uid.and_then(|uid| self.download_manager_for(uid)),
-            ));
+        // 多账号隔离核心：解析器按每条订阅的 owner_uid 实时解析**该账号**的
+        // NetdiskClient / TransferManager（读 per-uid 池）。后台调度对账号 A 的
+        // 订阅始终用账号 A 的实例；账号切换无需 relink。
+        let resolver: Arc<dyn ShareSyncAccountResolver> = Arc::new(AppStateShareSyncResolver {
+            client_pool: Arc::clone(&self.client_pool),
+            transfer_managers: Arc::clone(&self.transfer_managers),
+        });
 
         let cfg = ManagerConfig {
             config_path,
             db_path,
-            netdisk_client,
-            transfer_manager,
-            download_manager,
+            resolver,
             publisher: Some(publisher),
         };
 
