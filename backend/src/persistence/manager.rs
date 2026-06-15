@@ -1293,6 +1293,21 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// 更新转存任务的同步配置归属 id（`"share-sync:{订阅id}"`）。
+    ///
+    /// 用于把「分享同步」内部转存任务持久化为带归属的历史记录，
+    /// 从而在 `TransferManager::get_all_tasks()` 的历史段过滤掉，不污染「转存管理」。
+    pub fn update_transfer_backup_config_id(
+        &self,
+        task_id: &str,
+        backup_config_id: Option<String>,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.backup_config_id = backup_config_id;
+        })?;
+        Ok(())
+    }
+
     /// 更新转存任务的分享根路径（来自 share/list?root=1 响应的 title 字段）
     ///
     /// # Arguments

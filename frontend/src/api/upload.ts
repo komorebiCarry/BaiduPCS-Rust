@@ -178,7 +178,7 @@ export async function batchDeleteUploads(req: BatchOperationRequest): Promise<Ba
  */
 export function calculateProgress(task: UploadTask): number {
   if (task.total_size === 0) return 0
-  return (task.uploaded_size / task.total_size) * 100
+  return Math.min(100, Math.max(0, (task.uploaded_size / task.total_size) * 100))
 }
 
 // 重新导出共享工具函数，保持向后兼容

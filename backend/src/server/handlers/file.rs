@@ -475,7 +475,7 @@ pub async fn delete_files(
         }
     };
 
-    match client.delete_files(&request.paths).await {
+    match client.delete_files_chunked(&request.paths).await {
         Ok(response) => {
             if response.success {
                 // 百度异步删除，等待1秒让服务端完成处理，避免前端刷新时文件仍在
@@ -487,7 +487,9 @@ pub async fn delete_files(
                 })))
             } else {
                 let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
-                Ok(Json(ApiResponse::error(500, msg)))
+                // errno=132 透传为 code,让前端弹出明确的安全验证引导
+                let code = if response.errno == Some(132) { 132 } else { 500 };
+                Ok(Json(ApiResponse::error(code, msg)))
             }
         }
         Err(e) => {
@@ -497,7 +499,7 @@ pub async fn delete_files(
                 match state.trigger_warmup().await {
                     Ok(true) => {
                         if let Some(c) = state.active_client().await {
-                            match c.delete_files(&request.paths).await {
+                            match c.delete_files_chunked(&request.paths).await {
                                 Ok(response) if response.success => {
                                     // 百度异步删除，等待1秒让服务端完成处理
                                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -508,7 +510,8 @@ pub async fn delete_files(
                                 }
                                 Ok(response) => {
                                     let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
-                                    return Ok(Json(ApiResponse::error(500, msg)));
+                                    let code = if response.errno == Some(132) { 132 } else { 500 };
+                                    return Ok(Json(ApiResponse::error(code, msg)));
                                 }
                                 Err(retry_err) => {
                                     error!("预热重试后仍失败: {}", retry_err);

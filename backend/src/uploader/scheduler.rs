@@ -1390,10 +1390,12 @@ impl UploadChunkScheduler {
                         + chunk_size;
 
                     // 标记分片完成
-                    let (completed_chunks, total_chunks) = {
+                    // 🔥 uploaded_idempotent = 已完成分片大小之和（幂等、永不超过 total）。
+                    // 用它而非原子 fetch_add 计数来写回进度，详见下方 t.uploaded_size 赋值处。
+                    let (completed_chunks, total_chunks, uploaded_idempotent) = {
                         let mut cm = task_info.chunk_manager.lock().await;
                         cm.mark_completed(chunk.index, Some(response.md5.clone()));
-                        (cm.completed_count(), cm.chunk_count())
+                        (cm.completed_count(), cm.chunk_count(), cm.uploaded_bytes())
                     };
 
                     // 🔥 持久化回调：记录分片完成（带 MD5）
@@ -1435,7 +1437,12 @@ impl UploadChunkScheduler {
                     // 更新任务状态
                     let chunk_is_backup = {
                         let mut t = task_info.task.lock().await;
-                        t.uploaded_size = new_uploaded;
+                        // 🔥 用「已完成分片之和」作为已上传字节，而非原子 fetch_add 计数器。
+                        // 原子计数器在分片被重复上传（upload_id 过期重传、失败重派等）时会把同一
+                        // 段字节累加多次 → 「已上传 > 总大小」「进度 > 100%」(实测 142%)。而
+                        // chunk_manager.uploaded_bytes() 是已完成分片 size 之和，幂等、天然 ≤ total，
+                        // 重复上传同一分片也只计一次；并能在断点恢复时立即反映已完成进度。
+                        t.uploaded_size = std::cmp::min(uploaded_idempotent, t.total_size);
                         t.completed_chunks = completed_chunks;
                         t.total_chunks = total_chunks;
                         if speed > 0 {
@@ -1455,7 +1462,8 @@ impl UploadChunkScheduler {
                             if should_emit {
                                 let total_size = task_info.total_size;
                                 let progress = if total_size > 0 {
-                                    ( t.uploaded_size  as f64 / total_size as f64) * 100.0
+                                    ((t.uploaded_size as f64 / total_size as f64) * 100.0)
+                                        .clamp(0.0, 100.0)
                                 } else {
                                     0.0
                                 };

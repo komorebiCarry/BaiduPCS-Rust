@@ -288,7 +288,7 @@ export function getTransferStatusType(status: TransferStatus): 'success' | 'warn
  */
 export function calculateTransferProgress(task: TransferTask): number {
   if (task.total_count === 0) return 0
-  return (task.transferred_count / task.total_count) * 100
+  return Math.min(100, Math.max(0, (task.transferred_count / task.total_count) * 100))
 }
 
 /**

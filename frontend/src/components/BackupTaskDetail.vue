@@ -108,12 +108,12 @@ function getStatusIcon(status: string) {
 // 进度计算
 const progress = computed(() => {
   if (!task.value || task.value.total_count === 0) return 0
-  return Math.round((task.value.completed_count / task.value.total_count) * 100)
+  return Math.min(100, Math.max(0, Math.round((task.value.completed_count / task.value.total_count) * 100)))
 })
 
 const bytesProgress = computed(() => {
   if (!task.value || task.value.total_bytes === 0) return 0
-  return Math.round((task.value.transferred_bytes / task.value.total_bytes) * 100)
+  return Math.min(100, Math.max(0, Math.round((task.value.transferred_bytes / task.value.total_bytes) * 100)))
 })
 
 // 格式化

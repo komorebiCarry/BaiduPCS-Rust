@@ -1,12 +1,13 @@
 {
   "name": "baidu-netdisk-frontend",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
     "preview": "vite preview",
-    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
+    "lint": "eslint . --fix",
+    "lint:check": "eslint .",
     "test": "vitest --run",
     "test:watch": "vitest"
   },

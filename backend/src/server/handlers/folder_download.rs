@@ -126,7 +126,15 @@ pub async fn create_folder_download(
 pub async fn get_all_folder_downloads(
     State(app_state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<FolderDownload>>>, StatusCode> {
-    let folders = app_state.folder_download_manager.get_all_folders().await;
+    // 🔥 过滤掉内部隐藏文件夹下载（分享同步等，backup_config_id.is_some()），
+    // 这些不应出现在「下载管理」，由对应业务页（分享同步）展示。
+    let folders: Vec<FolderDownload> = app_state
+        .folder_download_manager
+        .get_all_folders()
+        .await
+        .into_iter()
+        .filter(|f| f.backup_config_id.is_none())
+        .collect();
     Ok(Json(ApiResponse::success(folders)))
 }
 
@@ -191,6 +199,8 @@ pub async fn get_all_downloads_mixed(
         .get_all_folders_with_history()
         .await
         .into_iter()
+        // 🔥 内部隐藏文件夹下载（分享同步等）不进「下载管理」混合列表
+        .filter(|f| f.backup_config_id.is_none())
         .filter(|f| match filter_uid {
             Some(uid) => f.owner_uid == uid,
             None => true,

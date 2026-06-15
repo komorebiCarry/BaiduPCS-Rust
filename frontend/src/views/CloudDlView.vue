@@ -309,7 +309,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, Loading, Document } from '@element-plus/icons-vue'
 import { useIsMobile } from '@/utils/responsive'
@@ -327,7 +327,6 @@ import {
   calculateProgress,
   formatTimestamp,
   type CloudDlTaskInfo,
-  type AddTaskRequest,
   CloudDlTaskStatus,
 } from '@/api/cloudDl'
 import {
@@ -458,7 +457,7 @@ const activeCountType = computed(() => {
 })
 
 // WebSocket 订阅
-const { isSubscribed, isRefreshing, refresh } = useCloudDlWebSocket({
+const { isRefreshing, refresh } = useCloudDlWebSocket({
   onStatusChanged: handleStatusChanged,
   onTaskCompleted: handleTaskCompleted,
   onProgressUpdate: handleProgressUpdate,

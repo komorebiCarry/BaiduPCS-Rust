@@ -272,7 +272,8 @@ impl UploadTask {
         if self.total_size == 0 {
             return 0.0;
         }
-        (self.uploaded_size as f64 / self.total_size as f64) * 100.0
+        // 钳到 [0,100]：防御分片重试/续传重复累加或源文件增长导致的 uploaded_size 超出。
+        ((self.uploaded_size as f64 / self.total_size as f64) * 100.0).clamp(0.0, 100.0)
     }
 
     /// 估算剩余时间 (秒)
@@ -419,6 +420,16 @@ mod tests {
 
         task.uploaded_size = 1000;
         assert_eq!(task.progress(), 100.0);
+    }
+
+    /// 回归：uploaded_size 超出 total_size（分片重试重复累加 / 上传期间源文件增长，
+    /// 如录制中的 .ts）时，进度百分比必须钳到 100%，不能出现 142% 这类显示。
+    #[test]
+    fn test_progress_clamped_when_uploaded_exceeds_total() {
+        let mut task = UploadTask::new(PathBuf::from("./rec.ts"), "/rec.ts".to_string(), 6_800);
+
+        task.uploaded_size = 9_660; // 9.66 vs 6.80（用户实测 142%）
+        assert_eq!(task.progress(), 100.0, "已上传超出总大小时进度应钳到 100%");
     }
 
     #[test]

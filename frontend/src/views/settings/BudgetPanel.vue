@@ -20,7 +20,7 @@
  */
 
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { Refresh, InfoFilled, WarningFilled, RefreshLeft } from '@element-plus/icons-vue'
 import { useBudgetStore } from '@/stores/budget'
 import { useAuthStore } from '@/stores/auth'
@@ -393,9 +393,8 @@ watch(
           // 用户改过未保存 → 不覆盖，记录警告（保留用户编辑值）
           // 同时更新 lastSyncedFingerprint 防止反复 warn
           // 注：不更新表单内容，但允许下次保存覆盖；如需"强提示"可改为 ElMessageBox.confirm
-          // eslint-disable-next-line no-console
           console.warn(
-            `账号 ${acc.uid} 自定义配置在其它端被修改，但本端表单有未保存编辑，跳过自动同步`,
+              `账号 ${acc.uid} 自定义配置在其它端被修改，但本端表单有未保存编辑，跳过自动同步`,
           )
           existing.lastSyncedFingerprint = fp
           continue

@@ -284,7 +284,9 @@ impl DownloadTask {
         if self.total_size == 0 {
             return 0.0;
         }
-        (self.downloaded_size as f64 / self.total_size as f64) * 100.0
+        // 钳到 [0,100]：downloaded_size 在分片回调处已封顶到 total_size，这里再做一层
+        // 防御，与上传 UploadTask::progress() 口径一致。
+        ((self.downloaded_size as f64 / self.total_size as f64) * 100.0).clamp(0.0, 100.0)
     }
 
     /// 估算剩余时间 (秒)
@@ -398,6 +400,20 @@ mod tests {
         assert_eq!(task.progress(), 50.0);
 
         task.downloaded_size = 1000;
+        assert_eq!(task.progress(), 100.0);
+    }
+
+    /// 防御：downloaded_size 异常超出 total_size 时，进度仍钳到 100%。
+    #[test]
+    fn test_progress_clamped_when_downloaded_exceeds_total() {
+        let mut task = DownloadTask::new(
+            1,
+            "/test".to_string(),
+            PathBuf::from("./test"),
+            1000,
+            Uid::default(),
+        );
+        task.downloaded_size = 1420; // 模拟异常超出
         assert_eq!(task.progress(), 100.0);
     }
 
