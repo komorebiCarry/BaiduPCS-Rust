@@ -548,13 +548,14 @@ function handleTransferEvent(event: TransferEvent) {
       // 新任务创建，刷新列表
       refreshTasks()
       break
-    case 'status_changed':
+    case 'status_changed': {
       // 状态变更
       const statusIdx = tasks.value.findIndex(t => t.id === event.task_id)
       if (statusIdx !== -1) {
         tasks.value[statusIdx].status = event.new_status as TransferStatus
       }
       break
+    }
     case 'completed':
     case 'failed':
       // 完成或失败，刷新列表

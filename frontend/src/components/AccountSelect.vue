@@ -53,7 +53,7 @@ import { useAuthStore } from '@/stores/auth'
 import { User } from '@element-plus/icons-vue'
 import type { AccountSummary } from '@/api/accounts'
 
-const props = withDefaults(
+withDefaults(
     defineProps<{
       modelValue: number | null
       /** 是否包含 "全部账号" 选项（默认 false） */

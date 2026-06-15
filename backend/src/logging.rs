@@ -222,7 +222,7 @@ pub fn init_logging(config: &LogConfig) -> LogGuard {
         .with_target(true)
         .with_level(true)
         .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string()))
-        .with_ansi(true);
+        .with_ansi(console_supports_ansi());
 
     if config.enabled {
         // 确保日志目录存在
@@ -404,6 +404,10 @@ fn check_by_modified_time(entry: &fs::DirEntry, retention_days: u32) -> bool {
     false
 }
 
+fn console_supports_ansi() -> bool {
+    !cfg!(windows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +420,10 @@ mod tests {
         assert_eq!(config.log_dir, PathBuf::from("logs"));
         assert_eq!(config.retention_days, 7);
         assert_eq!(config.level, "info");
+    }
+
+    #[test]
+    fn test_console_supports_ansi_matches_platform() {
+        assert_eq!(console_supports_ansi(), !cfg!(windows));
     }
 }

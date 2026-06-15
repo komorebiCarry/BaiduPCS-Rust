@@ -16,6 +16,7 @@ use crate::downloader::budget_scheduler::{
 use crate::downloader::{ChunkScheduler, DownloadManager, FolderDownloadManager};
 use tokio::sync::Semaphore;
 use crate::netdisk::{ClientPool, CloudDlMonitor, NetdiskClient};
+use crate::share_sync::ShareSyncManager;
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, create_pre_migration_backup,
     is_transient_sqlite_error, needs_pre_migration_backup, run_migration_matrix,
@@ -159,6 +160,9 @@ pub struct AppState {
     /// 后端诊断用：记录 `failed_step` / `last_error` / `suggestion`，
     /// 并在置位时以 `info` 级日志打印。前端不消费此字段（只展示固定友好文案）。
     pub readonly_reason: Arc<RwLock<Option<ReadonlyReason>>>,
+
+    /// 🔥 分享同步管理器
+    pub share_sync_manager: Arc<RwLock<Option<Arc<crate::share_sync::ShareSyncManager>>>>,
 }
 
 impl AppState {
@@ -398,6 +402,7 @@ impl AppState {
             scan_manager: Arc::new(RwLock::new(None)),
             budget_scheduler,
             decrypt_semaphore,
+            share_sync_manager: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -842,6 +847,9 @@ impl AppState {
                 );
             }
         }
+
+        // 🔥 初始化分享同步管理器
+        self.init_share_sync_manager().await;
 
         Ok(())
     }
@@ -1435,6 +1443,80 @@ impl AppState {
 
         self.cloud_dl_monitors.insert(uid, monitor_arc);
         info!("CloudDlMonitor uid={} 初始化完成", uid.raw());
+    }
+
+    /// 🔥 初始化分享同步管理器
+    pub async fn init_share_sync_manager(&self) {
+        use crate::share_sync::events::{ShareSyncEvent, ShareSyncEventPublisher};
+        use crate::share_sync::manager::ManagerConfig;
+        use crate::server::events::TaskEvent;
+        use std::sync::Arc;
+
+        let config = self.config.read().await;
+
+        // 派生文件路径：<db_path 的父目录>/share_sync/
+        let db_path_buf = std::path::PathBuf::from(&config.persistence.db_path);
+        let parent = db_path_buf.parent().unwrap_or(std::path::Path::new("."));
+        let share_sync_dir = parent.join("share_sync");
+        let config_path = share_sync_dir.join("subscriptions.json");
+        let db_path = share_sync_dir.join("share_sync.db");
+        if let Some(p) = config_path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        drop(config);
+
+        // 把 WS Manager 包装为 ShareSyncEventPublisher
+        struct WsPublisher {
+            ws: Arc<crate::server::websocket::manager::WebSocketManager>,
+        }
+        impl ShareSyncEventPublisher for WsPublisher {
+            fn publish(&self, event: ShareSyncEvent) {
+                self.ws
+                    .send_if_subscribed(TaskEvent::ShareSync(event), None);
+            }
+        }
+
+        let publisher: Arc<dyn ShareSyncEventPublisher> = Arc::new(WsPublisher {
+            ws: Arc::clone(&self.ws_manager),
+        });
+
+        let netdisk_client = Arc::clone(&self.netdisk_client);
+
+        // 多账号架构：main 的 transfer_manager / download_manager 是 per-uid DashMap，
+        // 而 share_sync 的 ManagerConfig 仍按单账号的 Arc<RwLock<Option<Arc<...>>>> 设计。
+        // 这里在初始化时取**当前活跃账号**的 manager 包成单账号形态塞进 share_sync。
+        // 账号切换后 share_sync 持有的引用会过时，但 share-sync 自身主要在
+        // 订阅触发瞬时调用 transfer/download，所以此语义先维持向后兼容；
+        // 真正多账号适配需要后续把 ManagerConfig 改为 AppState 引用 + per-uid
+        // 解析（不在本次迁移范围内）。
+        let active_uid = *self.active_uid.read().await;
+        let transfer_manager: Arc<tokio::sync::RwLock<Option<Arc<TransferManager>>>> =
+            Arc::new(tokio::sync::RwLock::new(
+                active_uid.and_then(|uid| self.transfer_manager_for(uid)),
+            ));
+        let download_manager: Arc<tokio::sync::RwLock<Option<Arc<DownloadManager>>>> =
+            Arc::new(tokio::sync::RwLock::new(
+                active_uid.and_then(|uid| self.download_manager_for(uid)),
+            ));
+
+        let cfg = ManagerConfig {
+            config_path,
+            db_path,
+            netdisk_client,
+            transfer_manager,
+            download_manager,
+            publisher: Some(publisher),
+        };
+
+        match ShareSyncManager::new(cfg).await {
+            Ok(manager) => {
+                info!("分享同步管理器初始化完成");
+                *self.share_sync_manager.write().await = Some(manager);
+            }
+            Err(e) => {
+                error!("分享同步管理器初始化失败: {}", e);
+            }
+        }
     }
 
     /// 🔥 初始化活跃账号的离线下载监听服务（兼容 legacy 调用点）
@@ -2725,6 +2807,12 @@ impl AppState {
         // 停止内存监控器
         self.memory_monitor.stop();
         info!("内存监控器已停止");
+
+        // 停止分享同步管理器（取消所有 scheduler）
+        if let Some(mgr) = self.share_sync_manager.read().await.as_ref() {
+            mgr.shutdown().await;
+            info!("分享同步管理器已停止");
+        }
 
         // 关闭持久化管理器
         let mut pm = self.persistence_manager.lock().await;

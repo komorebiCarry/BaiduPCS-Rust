@@ -57,6 +57,10 @@ pub struct FolderPersisted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_task_id: Option<String>,
 
+    /// 🔥 归属的备份配置 ID（`Some` 时为内部隐藏文件夹下载，如 `share-sync:{订阅id}`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_config_id: Option<String>,
+
     /// 🔥 多账号归属 UID（持久化层 `u64` 形式）
     ///
     /// 旧持久化数据为 `None`，由恢复链路填充为 `active_uid` 或
@@ -91,6 +95,7 @@ impl FolderPersisted {
             completed_at: folder.completed_at,
             error: folder.error.clone(),
             transfer_task_id: folder.transfer_task_id.clone(),
+            backup_config_id: folder.backup_config_id.clone(),
             owner_uid: {
                 let raw = folder.owner_uid.raw();
                 if raw == 0 { None } else { Some(raw) }
@@ -120,6 +125,7 @@ impl FolderPersisted {
             completed_at: self.completed_at,
             error: self.error.clone(),
             transfer_task_id: self.transfer_task_id.clone(),
+            backup_config_id: self.backup_config_id.clone(),
             owner_uid: self
                 .owner_uid
                 .map(crate::auth::types::Uid::new)

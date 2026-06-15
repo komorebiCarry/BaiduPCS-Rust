@@ -189,14 +189,20 @@ pub async fn create_transfer(
     let create_request = crate::transfer::manager::CreateTransferRequest {
         share_url: req.share_url,
         password: req.password,
+        randsk: None,
+        prefetched_share: None,
         save_path: req.save_path,
         save_fs_id: req.save_fs_id,
         auto_download: req.auto_download,
         local_download_path: req.local_download_path,
+        download_conflict_strategy: None,
         is_share_direct_download: req.is_share_direct_download,
         selected_fs_ids: req.selected_fs_ids,
         selected_files: req.selected_files,
         owner_uid_override: Some(effective_uid),
+        // 用户手动转存：非内部任务、无同步归属
+        is_internal: false,
+        backup_config_id: None,
     };
 
     // 创建任务

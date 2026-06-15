@@ -2,11 +2,11 @@
 
 # 本地部署脚本（不使用 Docker）
 # 直接在本机构建并启动后端（rust 二进制）+ 前端（vite）
-# 前端端口：5173
+# 前端端口：4923（vite preview，绑定 0.0.0.0）
 # 后端端口：取自 config/app.toml（默认 18888）
 #
 # 关键设计：
-#   - 后端：cargo build 后直接 exec 出 target/release 二进制，PID 即为服务进程，避免 cargo wrapper 残留
+#   - 后端：cargo build 后直接 exec 出 target/<profile> 二进制，PID 即为服务进程，避免 cargo wrapper 残留
 #   - 前端：直接调用 frontend/node_modules/.bin/vite，绕过 npx wrapper，避免 node 子进程残留
 #   - 启动用 setsid 建立独立进程组，停止时 kill -- -PGID 整组
 #   - 兜底再用 fuser/lsof 清理仍占端口的进程
@@ -36,12 +36,17 @@ BACKEND_PID_FILE="$PID_DIR/backend.pid"
 FRONTEND_PID_FILE="$PID_DIR/frontend.pid"
 BACKEND_PGID_FILE="$PID_DIR/backend.pgid"
 FRONTEND_PGID_FILE="$PID_DIR/frontend.pgid"
+FRONTEND_PORT_FILE="$PID_DIR/frontend.port"
 
 BACKEND_BIN_NAME="baidu-netdisk-rust"
-BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
+BACKEND_PROFILE="${BACKEND_PROFILE:-debug}"  # debug | release
+BACKEND_BIN="$BACKEND_DIR/target/debug/$BACKEND_BIN_NAME"
+BACKEND_CARGO_ARGS="build"
+SKIP_BACKEND_BUILD=false
 
 # ----------------- 配置 -----------------
-FRONTEND_PORT=5173
+FRONTEND_PORT=4923
+FRONTEND_HOST="0.0.0.0"
 BACKEND_HOST="127.0.0.1"
 BACKEND_PORT=18888
 MODE="prod"   # prod | dev
@@ -57,6 +62,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dev) MODE="dev"; shift ;;
         --prod) MODE="prod"; shift ;;
+        --fast|--debug-backend) BACKEND_PROFILE="debug"; shift ;;
+        --release-backend) BACKEND_PROFILE="release"; shift ;;
+        --skip-build|--skip-backend-build) SKIP_BACKEND_BUILD=true; shift ;;
         --port) FRONTEND_PORT="$2"; shift 2 ;;
         start)            ACTION="start"; shift ;;
         stop)             ACTION="stop"; shift ;;
@@ -76,7 +84,11 @@ while [ $# -gt 0 ]; do
 选项:
   --dev          以开发模式启动前端（vite dev，HMR）
   --prod         以生产模式启动前端（vite build + vite preview，默认）
-  --port <port>  指定前端端口（默认 5173）
+  --fast         后端使用 debug 构建（默认，适合本地验证，编译快）
+  --debug-backend 同 --fast
+  --release-backend 后端使用 release 构建（发布/压测时使用，编译慢）
+  --skip-build   跳过后端构建，直接使用已有 target/<profile> 二进制
+  --port <port>  指定前端端口（默认 4923）
 
 子命令（手动模式）:
   start              启动前后端服务（默认）
@@ -96,7 +108,7 @@ while [ $# -gt 0 ]; do
   run-frontend       前台运行前端（不要手动调用）
 
 示例:
-  $0                       # 生产模式启动，前端端口 5173
+  $0                       # 生产模式启动，前端端口 4923
   $0 --dev                 # 开发模式启动
   $0 stop                  # 停止服务
   sudo $0 install-systemd  # 安装为系统服务，开机自启
@@ -105,6 +117,21 @@ EOF
         *) echo -e "${RED}未知参数: $1${NC}"; exit 1 ;;
     esac
 done
+
+case "$BACKEND_PROFILE" in
+    debug)
+        BACKEND_BIN="$BACKEND_DIR/target/debug/$BACKEND_BIN_NAME"
+        BACKEND_CARGO_ARGS="build"
+        ;;
+    release)
+        BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
+        BACKEND_CARGO_ARGS="build --release"
+        ;;
+    *)
+        echo -e "${RED}未知后端构建 profile: $BACKEND_PROFILE${NC}"
+        exit 1
+        ;;
+esac
 
 # ----------------- 工具函数 -----------------
 log()   { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
@@ -118,6 +145,33 @@ is_running() {
     local pid
     pid=$(cat "$pid_file" 2>/dev/null || echo "")
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+detect_frontend_port() {
+    local port="$FRONTEND_PORT"
+
+    if [ -f "$FRONTEND_PORT_FILE" ]; then
+        local saved
+        saved=$(cat "$FRONTEND_PORT_FILE" 2>/dev/null || echo "")
+        case "$saved" in
+            ''|*[!0-9]*) ;;
+            *) echo "$saved"; return ;;
+        esac
+    fi
+
+    if [ -f "$FRONTEND_PID_FILE" ]; then
+        local pid detected
+        pid=$(cat "$FRONTEND_PID_FILE" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+            detected=$(tr '\0' '\n' < "/proc/$pid/cmdline" | awk 'prev=="--port"{print; exit} {prev=$0}')
+            case "$detected" in
+                ''|*[!0-9]*) ;;
+                *) port="$detected" ;;
+            esac
+        fi
+    fi
+
+    echo "$port"
 }
 
 # 释放占用某端口的所有进程（兜底）
@@ -227,7 +281,7 @@ import base from './vite.config'
 
 export default mergeConfig(base, defineConfig({
   server: {
-    host: '0.0.0.0',
+    host: '${FRONTEND_HOST}',
     port: ${FRONTEND_PORT},
     strictPort: true,
     allowedHosts: true,
@@ -238,7 +292,7 @@ export default mergeConfig(base, defineConfig({
     }
   },
   preview: {
-    host: '0.0.0.0',
+    host: '${FRONTEND_HOST}',
     port: ${FRONTEND_PORT},
     strictPort: true,
     allowedHosts: true,
@@ -253,8 +307,13 @@ EOF
 }
 
 build_backend() {
-    log "构建后端 (cargo build --release)..."
-    ( cd "$BACKEND_DIR" && cargo build --release 2>&1 | tee -a "$BACKEND_LOG" )
+    if [ "$SKIP_BACKEND_BUILD" = "true" ]; then
+        log "跳过后端构建 (profile=$BACKEND_PROFILE, bin=$BACKEND_BIN)"
+        [ -x "$BACKEND_BIN" ] || { err "未找到后端二进制 $BACKEND_BIN"; exit 1; }
+        return
+    fi
+    log "构建后端 (cargo $BACKEND_CARGO_ARGS, profile=$BACKEND_PROFILE)..."
+    ( cd "$BACKEND_DIR" && cargo $BACKEND_CARGO_ARGS 2>&1 | tee -a "$BACKEND_LOG" )
     [ -x "$BACKEND_BIN" ] || { err "未找到后端二进制 $BACKEND_BIN"; exit 1; }
 }
 
@@ -299,7 +358,10 @@ start_backend() {
 
 start_frontend() {
     if is_running "$FRONTEND_PID_FILE"; then
-        warn "前端已在运行 (PID $(cat "$FRONTEND_PID_FILE"))，跳过启动"
+        local running_port
+        running_port=$(detect_frontend_port)
+        echo "$running_port" > "$FRONTEND_PORT_FILE"
+        warn "前端已在运行 (PID $(cat "$FRONTEND_PID_FILE"), 端口 $running_port)，跳过启动"
         return
     fi
 
@@ -314,17 +376,18 @@ start_frontend() {
         setsid nohup "$vite_bin" --config vite.local.config.ts >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     else
         log "启动前端 (vite preview) 端口 $FRONTEND_PORT -> $FRONTEND_LOG"
-        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host 0.0.0.0 >>"$FRONTEND_LOG" 2>&1 < /dev/null &
+        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host "$FRONTEND_HOST" >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     fi
     local pid=$!
     echo "$pid" > "$FRONTEND_PID_FILE"
     local pgid
     pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || echo "$pid")
     echo "$pgid" > "$FRONTEND_PGID_FILE"
+    echo "$FRONTEND_PORT" > "$FRONTEND_PORT_FILE"
 
     sleep 2
     if is_running "$FRONTEND_PID_FILE"; then
-        ok "前端已启动 (PID $pid, PGID $pgid)，监听 0.0.0.0:${FRONTEND_PORT}"
+        ok "前端已启动 (PID $pid, PGID $pgid)，监听 ${FRONTEND_HOST}:${FRONTEND_PORT}"
     else
         err "前端启动失败，查看 $FRONTEND_LOG"
         exit 1
@@ -339,7 +402,9 @@ show_status() {
         warn "后端未运行"
     fi
     if is_running "$FRONTEND_PID_FILE"; then
-        ok "前端运行中 (PID $(cat "$FRONTEND_PID_FILE"))  http://localhost:${FRONTEND_PORT}"
+        local frontend_port
+        frontend_port=$(detect_frontend_port)
+        ok "前端运行中 (PID $(cat "$FRONTEND_PID_FILE"))  http://localhost:${frontend_port}"
     else
         warn "前端未运行"
     fi
@@ -533,6 +598,7 @@ do_start() {
 
     echo -e "${BLUE}=== 本地部署（无 Docker） ===${NC}"
     echo "模式:       $MODE"
+    echo "后端构建:   $BACKEND_PROFILE"
     echo "前端端口:   $FRONTEND_PORT"
     echo "后端端口:   $BACKEND_PORT"
     echo "项目目录:   $PROJECT_ROOT"
@@ -559,7 +625,10 @@ do_start() {
 
 do_stop() {
     read_backend_port
-    stop_service "前端" "$FRONTEND_PID_FILE" "$FRONTEND_PGID_FILE" "$FRONTEND_PORT"
+    local frontend_port
+    frontend_port=$(detect_frontend_port)
+    stop_service "前端" "$FRONTEND_PID_FILE" "$FRONTEND_PGID_FILE" "$frontend_port"
+    rm -f "$FRONTEND_PORT_FILE"
     stop_service "后端" "$BACKEND_PID_FILE"  "$BACKEND_PGID_FILE"  "$BACKEND_PORT"
 }
 

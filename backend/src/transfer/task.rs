@@ -136,6 +136,23 @@ pub struct TransferTask {
     /// 老任务或异常响应可能为 None，此时由调用方退化到启发式推导。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share_root_path: Option<String>,
+
+    /// 是否为「分享同步」内部转存任务。
+    ///
+    /// 由分享同步执行器创建的转存子任务会置 `true`，用于在
+    /// `TransferManager::get_all_tasks()` 中过滤掉，使其不出现在「转存管理」列表，
+    /// 与自动备份的 `is_backup` 隐藏机制对齐（互不影响调度）。
+    #[serde(default)]
+    pub is_internal: bool,
+
+    /// 关联的同步配置 id（仅内部任务设置）。
+    ///
+    /// 分享同步任务写入 `"share-sync:{订阅id}"`；其衍生的自动下载子任务会以
+    /// 此值调用 `DownloadManager::create_backup_task`，从而：①从「下载管理」隐藏
+    /// ②走自动备份同款下载槽优先级 ③归属到分享同步而非自动备份（自动备份配置 id
+    /// 是 UUID，永不与 `share-sync:` 前缀冲突）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_config_id: Option<String>,
 }
 
 impl TransferTask {
@@ -186,6 +203,8 @@ impl TransferTask {
             selected_fs_ids: None,
             selected_files: None,
             share_root_path: None,
+            is_internal: false,
+            backup_config_id: None,
         }
     }
 

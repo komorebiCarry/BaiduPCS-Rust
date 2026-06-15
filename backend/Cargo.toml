@@ -1,6 +1,6 @@
 [package]
 name = "baidu-netdisk-rust"
-version = "2.0.1"
+version = "2.1.0"
 edition = "2021"
 
 [dependencies]
@@ -57,6 +57,10 @@ thiserror = "1.0"
 # 时间处理
 chrono = { version = "0.4", features = ["serde"] }
 
+# v2 阶段 6:share-sync 全局风控限速器 — production-grade leaky bucket,
+# 自带 cancel-safe 与 jitter,避免并行 4 worker 撞百度风控(errno=132)
+governor = "0.6"
+
 # 二维码
 qrcode = "0.13"
 image = "0.24"
@@ -99,3 +103,10 @@ libc = "0.2"
 # 测试工具
 tempfile = "3.8"
 proptest = "1.4"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.dev.build-override]
+debug = 0

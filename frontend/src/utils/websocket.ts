@@ -252,8 +252,10 @@ class WebSocketClient {
     const { category } = event
 
     // 🔥 记录接收到的事件
+    // 后端事件 payload 是内部 tag 枚举，判别字段为 `type`（如 diff_detected /
+    // item_progress / progress），此前误读 `event_type` 导致日志恒为 undefined。
     console.log(
-        `📡 [WS接收] 类别=${category} | 事件=${(event.event as any).event_type} | 任务=${
+        `📡 [WS接收] 类别=${category} | 事件=${(event.event as any).type} | 任务=${
             (event.event as any).task_id || (event.event as any).folder_id || 'unknown'
         } | 事件ID=${event.event_id} | 时间戳=${event.timestamp}`,
         event
@@ -285,6 +287,11 @@ class WebSocketClient {
         // 多账号资源配额事件。
         // 订阅方：仅 BudgetPanel.vue 通过 stores/budget.ts 订阅。
         this.budgetListeners.forEach((cb) => cb(event.event as BudgetEvent))
+        break
+      case 'share_sync':
+        document.dispatchEvent(
+            new CustomEvent('baidu-netdisk:share-sync', { detail: event.event })
+        )
         break
       default:
         console.warn('[WS] 未知事件类别:', category)
@@ -399,6 +406,15 @@ class WebSocketClient {
   public onBackupEvent(callback: BackupEventCallback): () => void {
     this.backupListeners.add(callback)
     return () => this.backupListeners.delete(callback)
+  }
+
+  /**
+   * 订阅分享同步事件
+   */
+  public onShareSyncEvent(callback: (event: any) => void): () => void {
+    const handler = (ev: any) => callback(ev)
+    document.addEventListener('baidu-netdisk:share-sync', handler as EventListener)
+    return () => document.removeEventListener('baidu-netdisk:share-sync', handler as EventListener)
   }
 
   /**

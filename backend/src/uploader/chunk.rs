@@ -445,6 +445,30 @@ mod tests {
         assert!(manager.is_completed());
     }
 
+    /// 回归：同一分片被重复上传（upload_id 过期重传 / 失败重派）时，
+    /// uploaded_bytes() 必须幂等——只计一次、永不超过 total_size，
+    /// 从而避免「已上传 > 总大小」「进度 > 100%」(用户实测 142%)。
+    #[test]
+    fn test_uploaded_bytes_idempotent_on_repeated_completion() {
+        let mut manager = UploadChunkManager::new(16 * 1024 * 1024, 4 * 1024 * 1024);
+
+        // 重复标记同一分片完成（模拟该分片被上传多次）
+        manager.mark_completed(0, Some("md5_0".to_string()));
+        manager.mark_completed(0, Some("md5_0".to_string()));
+        manager.mark_completed(0, Some("md5_0".to_string()));
+        assert_eq!(manager.uploaded_bytes(), 4 * 1024 * 1024, "重复完成只计一次");
+        assert_eq!(manager.completed_count(), 1);
+
+        // 全部完成后正好等于 total，绝不超出
+        manager.mark_completed(1, None);
+        manager.mark_completed(2, None);
+        manager.mark_completed(3, None);
+        manager.mark_completed(3, None); // 再重复一次
+        assert_eq!(manager.uploaded_bytes(), 16 * 1024 * 1024);
+        assert!(manager.uploaded_bytes() <= manager.total_size);
+        assert_eq!(manager.progress(), 100.0);
+    }
+
     #[test]
     fn test_next_pending() {
         let mut manager = UploadChunkManager::new(16 * 1024 * 1024, 4 * 1024 * 1024);

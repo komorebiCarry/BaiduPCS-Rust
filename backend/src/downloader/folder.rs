@@ -78,6 +78,15 @@ pub struct FolderDownload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_task_id: Option<String>,
 
+    /// 🔥 归属的备份配置 ID（`Some` 时为内部隐藏文件夹下载）
+    ///
+    /// 与单文件下载的 `DownloadTask::backup_config_id` 同义：分享同步在 tree
+    /// 模式下整目录转存 + 自动下载会产生文件夹下载任务，需要据此从「下载管理」
+    /// 隐藏并归属到 `share-sync:{订阅id}`，否则会泄漏进下载管理且无法作为分享
+    /// 同步子任务被收集。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_config_id: Option<String>,
+
     /// 🔥 多账号归属 UID
     ///
     /// 旧持久化数据反序列化时为默认值 `Uid(0)`，恢复链路按
@@ -176,6 +185,7 @@ impl FolderDownload {
             completed_at: None,
             error: None,
             transfer_task_id: None,
+            backup_config_id: None,
             owner_uid: crate::auth::types::Uid::default(),
             failure_reason: None,
             // 任务位借调机制字段初始化
@@ -197,7 +207,9 @@ impl FolderDownload {
         if self.total_size == 0 {
             return 0.0;
         }
-        (self.downloaded_size as f64 / self.total_size as f64) * 100.0
+        // 钳到 [0,100]：聚合 downloaded_size 已在 PR #52 修掉双算，这里再做一层防御，
+        // 与上传 UploadTask::progress() 口径一致。
+        ((self.downloaded_size as f64 / self.total_size as f64) * 100.0).clamp(0.0, 100.0)
     }
 
     /// 标记为下载中
@@ -237,6 +249,23 @@ impl FolderDownload {
         let computed = self.completed_downloaded_size + active_sum;
         self.downloaded_size = self.downloaded_size.max(computed);
         self.downloaded_size
+    }
+
+    /// 🔥 统计「活跃子任务已下载字节」总和，排除已计入 completed_downloaded_size 的任务。
+    ///
+    /// 子任务成功时 completed_downloaded_size 先 += 该文件 total_size，但完成的任务可能仍短暂
+    /// 残留在内存任务表（downloaded_size 已钳到 total_size）。若此刻把它也计进 active_sum，
+    /// compute_downloaded_size 的 max() 会把「completed + active 双重累加」的翻倍值永久锁死，
+    /// 表现为已下载/进度翻倍（200%）。这里按 counted_task_ids 过滤掉这些任务。
+    pub fn active_downloaded_excluding_counted<'a, I>(&self, tasks: I) -> u64
+    where
+        I: IntoIterator<Item = (&'a str, u64)>,
+    {
+        tasks
+            .into_iter()
+            .filter(|(id, _)| !self.counted_task_ids.contains(*id))
+            .map(|(_, downloaded)| downloaded)
+            .sum()
     }
 }
 
@@ -316,5 +345,40 @@ mod tests {
         // 完成通知先到达，active_sum 短暂变为 0
         // computed = 1000 + 0 = 1000，但 max(1500, 1000) = 1500，不回退
         assert_eq!(folder.compute_downloaded_size(0), 1500);
+    }
+
+    #[test]
+    fn test_active_downloaded_excludes_counted_no_double_count() {
+        // 回归：单文件夹只有一个文件 A(total=3.25G)，下载完成。
+        // 完成时 completed_downloaded_size += A，但 A 仍短暂残留在内存任务表里（downloaded_size=A）。
+        // 旧逻辑把 A 同时计进 active_sum → compute = A + A = 2A，max() 锁死 → 200%。
+        // 新逻辑按 counted_task_ids 过滤掉 A，active_sum=0 → downloaded_size=A，不翻倍。
+        const A: u64 = 3_250_000_000;
+        let mut folder = FolderDownload::new("/测试2-1".to_string(), PathBuf::from("./t"));
+        folder.total_size = A;
+        folder.total_files = 1;
+
+        // A 完成：计入完成累计 + 标记 counted
+        folder.completed_downloaded_size += A;
+        folder.counted_task_ids.insert("task-A".to_string());
+
+        // A 仍残留在内存任务表，downloaded_size 已钳到 total_size=A
+        let lingering = [("task-A", A)];
+        let active = folder.active_downloaded_excluding_counted(lingering.iter().copied());
+        assert_eq!(active, 0, "已计数的完成任务必须从 active_sum 中排除");
+
+        let total = folder.compute_downloaded_size(active);
+        assert_eq!(total, A, "已下载不应翻倍");
+        assert!(folder.progress() <= 100.0, "进度不应超过 100%");
+        assert_eq!(folder.progress(), 100.0);
+    }
+
+    #[test]
+    fn test_active_downloaded_counts_uncounted_tasks() {
+        // 未完成（未计数）的活跃任务仍应计入 active_sum。
+        let folder = FolderDownload::new("/d".to_string(), PathBuf::from("./d"));
+        let tasks = [("task-A", 50u64), ("task-B", 80u64)];
+        let active = folder.active_downloaded_excluding_counted(tasks.iter().copied());
+        assert_eq!(active, 130);
     }
 }
