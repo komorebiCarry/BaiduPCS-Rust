@@ -97,10 +97,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
 /// 列表默认返回全部账号、各资源带 `owner_uid`，由前端 `AccountFilter` + `AccountBadge`
 /// 展示与过滤。执行同步时仍由 manager 按订阅 `owner_uid` 解析对应账号客户端，
 /// 保证转存/下载始终落到正确账号（与触发者当前活跃账号无关）。
-fn require_subscription(
-    manager: &Arc<ShareSyncManager>,
-    id: &str,
-) -> ApiResult<ShareSubscription> {
+fn require_subscription(manager: &Arc<ShareSyncManager>, id: &str) -> ApiResult<ShareSubscription> {
     manager
         .get_subscription(id)
         .ok_or_else(|| err_not_found("订阅不存在"))
@@ -282,6 +279,23 @@ pub struct RunsQuery {
     pub page_size: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RunItemsQuery {
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+const RUN_ITEM_DEFAULT_PAGE_SIZE: usize = 100;
+const RUN_ITEM_MAX_PAGE_SIZE: usize = 200;
+
+fn normalize_run_item_pagination(page: Option<usize>, page_size: Option<usize>) -> (usize, usize) {
+    let p = page.unwrap_or(1).max(1);
+    let ps = page_size
+        .unwrap_or(RUN_ITEM_DEFAULT_PAGE_SIZE)
+        .clamp(1, RUN_ITEM_MAX_PAGE_SIZE);
+    (p, ps)
+}
+
 /// GET /api/v1/share-sync/subscriptions/:id/runs
 pub async fn list_runs(
     State(state): State<AppState>,
@@ -302,6 +316,7 @@ pub async fn list_runs(
 pub async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunItemsQuery>,
 ) -> ApiResult<Json<ApiResponse<RunDetailDto>>> {
     let m = get_manager(&state).await?;
     let rec = m
@@ -309,8 +324,22 @@ pub async fn get_run(
         .get_run(&id)
         .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
-    let items = m.persistence().list_run_items(&id).map_err(map_share_err)?;
-    Ok(Json(ApiResponse::success(RunDetailDto { run: rec, items })))
+    let (page, page_size) = normalize_run_item_pagination(q.page, q.page_size);
+    let item_total_count = m
+        .persistence()
+        .count_run_items(&id)
+        .map_err(map_share_err)?;
+    let items = m
+        .persistence()
+        .list_run_items_page(&id, page, page_size)
+        .map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(RunDetailDto {
+        run: rec,
+        items,
+        item_total_count,
+        item_page: page,
+        item_page_size: page_size,
+    })))
 }
 
 #[derive(Debug, Serialize)]
@@ -318,6 +347,48 @@ pub struct RunDetailDto {
     #[serde(flatten)]
     pub run: RunRecord,
     pub items: Vec<RunItemRecord>,
+    pub item_total_count: usize,
+    pub item_page: usize,
+    pub item_page_size: usize,
+}
+
+/// GET /api/v1/share-sync/runs/:id/items
+pub async fn list_run_items(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunItemsQuery>,
+) -> ApiResult<Json<ApiResponse<RunItemsPageDto>>> {
+    let m = get_manager(&state).await?;
+    if m.persistence()
+        .get_run(&id)
+        .map_err(map_share_err)?
+        .is_none()
+    {
+        return Err(err_not_found("运行记录不存在"));
+    }
+    let (page, page_size) = normalize_run_item_pagination(q.page, q.page_size);
+    let total = m
+        .persistence()
+        .count_run_items(&id)
+        .map_err(map_share_err)?;
+    let items = m
+        .persistence()
+        .list_run_items_page(&id, page, page_size)
+        .map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(RunItemsPageDto {
+        items,
+        total,
+        page,
+        page_size,
+    })))
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunItemsPageDto {
+    pub items: Vec<RunItemRecord>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
 }
 
 /// GET /api/v1/share-sync/subscriptions/:id/subtasks
@@ -513,7 +584,7 @@ pub async fn preview_tree(
             f,
             depth - 1,
         )
-            .await;
+        .await;
         out.push(node);
     }
 
@@ -567,7 +638,7 @@ fn build_tree_node<'a>(
                                 f,
                                 remaining_depth - 1,
                             )
-                                .await,
+                            .await,
                         );
                     }
                     node.children = Some(kids);

@@ -171,10 +171,7 @@ impl ShareSyncManager {
                         );
                         sub.owner_uid = active;
                         if let Err(e) = manager.persistence.upsert_subscription(sub) {
-                            warn!(
-                                "share-sync: 迁移订阅 {} 写回 DB 失败: {}",
-                                sub.id, e
-                            );
+                            warn!("share-sync: 迁移订阅 {} 写回 DB 失败: {}", sub.id, e);
                         }
                         migrated += 1;
                     }
@@ -304,10 +301,8 @@ impl ShareSyncManager {
         let list: Vec<ShareSubscription> = match serde_json::from_str(&content) {
             Ok(l) => l,
             Err(e) => {
-                let backup = config_path.with_extension(format!(
-                    "corrupt.{}.json",
-                    chrono::Utc::now().timestamp()
-                ));
+                let backup = config_path
+                    .with_extension(format!("corrupt.{}.json", chrono::Utc::now().timestamp()));
                 let hint = match std::fs::rename(config_path, &backup) {
                     Ok(()) => format!("已备份损坏文件到 {}", backup.display()),
                     Err(re) => format!("备份损坏文件失败: {}", re),
@@ -649,7 +644,12 @@ impl ShareSyncManager {
                 sub.owner_uid
             )));
         }
-        if self.resolver.transfer_manager(sub.owner_uid).await.is_none() {
+        if self
+            .resolver
+            .transfer_manager(sub.owner_uid)
+            .await
+            .is_none()
+        {
             return Err(ShareSyncError::ConfigError(format!(
                 "订阅所属账号(uid={})的转存管理器未就绪",
                 sub.owner_uid
@@ -755,12 +755,16 @@ impl ShareSyncManager {
         // 而非进程当前活跃账号。后台调度对账号 A 的订阅始终用账号 A 的实例，
         // 账号切换无需 relink。任一未就绪 → 明确报错，绝不落到错误账号。
         let owner_uid = sub.owner_uid;
-        let netdisk = self.resolver.netdisk_client(owner_uid).await.ok_or_else(|| {
-            ShareSyncError::ConfigError(format!(
-                "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
-                owner_uid
-            ))
-        })?;
+        let netdisk = self
+            .resolver
+            .netdisk_client(owner_uid)
+            .await
+            .ok_or_else(|| {
+                ShareSyncError::ConfigError(format!(
+                    "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
+                    owner_uid
+                ))
+            })?;
         let transfer = self
             .resolver
             .transfer_manager(owner_uid)
@@ -799,7 +803,7 @@ impl ShareSyncManager {
             // 列目录抓快照与转存提交共用同一个全局风控限速器
             self.rate_limiter.clone(),
         )
-            .await
+        .await
         {
             Ok(collector) => match collector.collect().await {
                 Ok(t) => t,
@@ -904,7 +908,7 @@ impl ShareSyncManager {
             id.to_string(),
             owner_uid,
         )
-            .await;
+        .await;
 
         // 仅当 run 完成**且**没有任何子项因资源类原因（配额满 / 本地磁盘满）被跳过时，
         // 才推进快照基线。否则被跳过、尚未真正落地的项会被写入新基线，导致下一次
@@ -1319,6 +1323,97 @@ fn is_terminal_subtask_status(status: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtaskActivitySignature {
+    task_id: String,
+    kind: String,
+    status: String,
+    downloaded: u64,
+    total: u64,
+    progress_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskActivitySignature {
+    status: TransferStatus,
+    transferred_count: usize,
+    total_count: usize,
+    updated_at: i64,
+    download_task_ids: Vec<String>,
+    completed_download_ids: Vec<String>,
+    failed_download_ids: Vec<String>,
+    subtasks: Vec<SubtaskActivitySignature>,
+}
+
+fn task_activity_signature(
+    task: &crate::transfer::task::TransferTask,
+    subtasks: &[ShareSyncSubtask],
+) -> TaskActivitySignature {
+    let mut download_task_ids = task.download_task_ids.clone();
+    download_task_ids.sort();
+    let mut completed_download_ids = task.completed_download_ids.clone();
+    completed_download_ids.sort();
+    let mut failed_download_ids = task.failed_download_ids.clone();
+    failed_download_ids.sort();
+    let mut subtask_signatures: Vec<SubtaskActivitySignature> = subtasks
+        .iter()
+        .map(|s| {
+            let progress = if s.progress.is_finite() {
+                s.progress.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            SubtaskActivitySignature {
+                task_id: s.task_id.clone(),
+                kind: s.kind.clone(),
+                status: s.status.clone(),
+                downloaded: s.downloaded,
+                total: s.total,
+                progress_millis: (progress * 1000.0).round() as u64,
+            }
+        })
+        .collect();
+    subtask_signatures.sort_by(|a, b| {
+        a.task_id
+            .cmp(&b.task_id)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.status.cmp(&b.status))
+    });
+
+    TaskActivitySignature {
+        status: task.status.clone(),
+        transferred_count: task.transferred_count,
+        total_count: task.total_count,
+        updated_at: task.updated_at,
+        download_task_ids,
+        completed_download_ids,
+        failed_download_ids,
+        subtasks: subtask_signatures,
+    }
+}
+
+fn env_duration_secs(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn share_sync_task_idle_timeout(default: Duration) -> Duration {
+    env_duration_secs("BAIDUPCS_SHARE_SYNC_TASK_IDLE_TIMEOUT_SECS").unwrap_or(default)
+}
+
+fn share_sync_task_hard_timeout() -> Option<Duration> {
+    match std::env::var("BAIDUPCS_SHARE_SYNC_TASK_HARD_TIMEOUT_SECS") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(Duration::from_secs(7 * 24 * 60 * 60)),
+        },
+        Err(_) => Some(Duration::from_secs(7 * 24 * 60 * 60)),
+    }
+}
+
 /// 收集当前子任务并逐个推送 `ShareSyncEvent::ItemProgress`（一帧）。
 async fn emit_subtask_progress(
     publisher: &Arc<dyn ShareSyncEventPublisher>,
@@ -1559,7 +1654,8 @@ impl ExecutorHooks for ProductionHooks {
         // - 分享直下（transfer_netdisk_dir=None）：转存到临时目录，下载后清理（is_share_direct_download=true）。
         // - 转存并下载（Some(网盘目录)）：转存到该网盘目录并保留，再下载（is_share_direct_download=false）。
         // 两种模式的下载段都因 backup_config_id 走自动备份同款 create_backup_task。
-        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir {
+        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir
+        {
             Some(netdisk_dir) => (
                 netdisk_dir.to_string(),
                 local_dir.to_string_lossy().to_string(),
@@ -1636,12 +1732,17 @@ impl ExecutorHooks for ProductionHooks {
         timeout: Duration,
     ) -> Result<(), ShareSyncError> {
         let tm = self.transfer_manager();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let idle_timeout = share_sync_task_idle_timeout(timeout);
+        let hard_timeout = share_sync_task_hard_timeout();
+        let started_at = tokio::time::Instant::now();
+        let mut last_activity_at = started_at;
+        let mut last_signature: Option<TaskActivitySignature> = None;
         loop {
             let task = tm.get_task(task_id).await.ok_or_else(|| {
                 ShareSyncError::TransferError(format!("转存任务不存在: {}", task_id))
             })?;
-            match task.status {
+
+            match &task.status {
                 TransferStatus::Completed => return Ok(()),
                 TransferStatus::Transferred if !require_download_completion => return Ok(()),
                 TransferStatus::Transferred => {
@@ -1663,10 +1764,42 @@ impl ExecutorHooks for ProductionHooks {
                 _ => {}
             }
 
-            if tokio::time::Instant::now() >= deadline {
+            let subtasks = if require_download_completion {
+                collect_share_sync_subtasks(&tm, &self.subscription_id, self.owner_uid).await
+            } else {
+                Vec::new()
+            };
+            let signature = task_activity_signature(&task, &subtasks);
+            if last_signature.as_ref() != Some(&signature) {
+                last_activity_at = tokio::time::Instant::now();
+                last_signature = Some(signature);
+            }
+
+            let now = tokio::time::Instant::now();
+            if let Some(hard_timeout) = hard_timeout {
+                if now.duration_since(started_at) >= hard_timeout {
+                    let msg = format!(
+                        "等待任务完成超过硬上限: task_id={}, status={:?}, elapsed_secs={}, hard_timeout_secs={}",
+                        task_id,
+                        task.status,
+                        now.duration_since(started_at).as_secs(),
+                        hard_timeout.as_secs()
+                    );
+                    return if require_download_completion {
+                        Err(ShareSyncError::DownloadError(msg))
+                    } else {
+                        Err(ShareSyncError::TransferError(msg))
+                    };
+                }
+            }
+
+            if now.duration_since(last_activity_at) >= idle_timeout {
                 let msg = format!(
-                    "等待任务完成超时: task_id={}, status={:?}",
-                    task_id, task.status
+                    "等待任务完成超时: task_id={}, status={:?}, idle_secs={}, idle_timeout_secs={}",
+                    task_id,
+                    task.status,
+                    now.duration_since(last_activity_at).as_secs(),
+                    idle_timeout.as_secs()
                 );
                 return if require_download_completion {
                     Err(ShareSyncError::DownloadError(msg))
@@ -1829,7 +1962,8 @@ impl ExecutorHooks for ProductionHooks {
         // v2 阶段 6:全局风控限速器
         self.rate_limiter.acquire().await;
         // 本地同步模式分流（batch）：见 submit_download 单文件版说明。
-        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir {
+        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir
+        {
             Some(netdisk_dir) => (
                 netdisk_dir.to_string(),
                 local_dir.to_string_lossy().to_string(),
@@ -2175,8 +2309,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert_eq!(m.list_subscriptions().len(), 0);
     }
 
@@ -2189,8 +2323,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         assert_eq!(m.list_subscriptions().len(), 1);
         assert!(m.get_subscription(&s.id).is_some());
@@ -2212,8 +2346,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let mut a = sub("a");
         a.owner_uid = 1;
@@ -2245,8 +2379,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         let original_created = s.created_at;
 
@@ -2267,8 +2401,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         m.set_enabled(&s.id, false).unwrap();
         assert!(!m.get_subscription(&s.id).unwrap().enabled);
@@ -2329,6 +2463,53 @@ mod tests {
         ] {
             assert!(!is_terminal_subtask_status(s), "{s} 不应判终态");
         }
+    }
+
+    fn wait_signature_task() -> crate::transfer::task::TransferTask {
+        let mut task = crate::transfer::task::TransferTask::new(
+            "https://pan.baidu.com/s/1abc".into(),
+            None,
+            "/target".into(),
+            0,
+            true,
+            Some("/downloads".into()),
+        );
+        task.status = TransferStatus::Downloading;
+        task.download_task_ids = vec!["dl-1".into()];
+        task.updated_at = 1;
+        task
+    }
+
+    fn wait_signature_subtask(downloaded: u64, speed: u64) -> ShareSyncSubtask {
+        let total = 100;
+        ShareSyncSubtask {
+            task_id: "dl-1".into(),
+            name: "large.bin".into(),
+            kind: "download".into(),
+            status: "downloading".into(),
+            downloaded,
+            total,
+            progress: downloaded as f64 / total as f64 * 100.0,
+            speed,
+            eta_seconds: None,
+            owner_uid: 1,
+        }
+    }
+
+    #[test]
+    fn test_task_activity_signature_tracks_downloaded_bytes() {
+        let task = wait_signature_task();
+        let a = task_activity_signature(&task, &[wait_signature_subtask(10, 1024)]);
+        let b = task_activity_signature(&task, &[wait_signature_subtask(20, 1024)]);
+        assert_ne!(a, b, "下载字节增长应刷新等待活动指纹");
+    }
+
+    #[test]
+    fn test_task_activity_signature_ignores_speed_only_noise() {
+        let task = wait_signature_task();
+        let a = task_activity_signature(&task, &[wait_signature_subtask(10, 1024)]);
+        let b = task_activity_signature(&task, &[wait_signature_subtask(10, 4096)]);
+        assert_eq!(a, b, "只有速度抖动不应重置空闲超时");
     }
 
     // ===== execution_diff_with_directory_ancestors：整目录转存只在「整目录全新」时启用 =====
@@ -2406,8 +2587,9 @@ mod tests {
         let idx = curr.index_by_path();
 
         // 全部子文件都变 → true
-        let all: BTreeSet<String> =
-            ["/d/a".to_string(), "/d/sub/x".to_string()].into_iter().collect();
+        let all: BTreeSet<String> = ["/d/a".to_string(), "/d/sub/x".to_string()]
+            .into_iter()
+            .collect();
         assert!(dir_subtree_fully_changed(&idx, "/d", &all));
 
         // 只变一部分（缺 /d/sub/x） → /d 整体 false
@@ -2530,8 +2712,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let mut bad = sub("a");
         bad.share_url = "https://example.com".into();
         let r = m.create_subscription(bad);
@@ -2553,8 +2735,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let list = m.list_subscriptions();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "preloaded");
@@ -2569,8 +2751,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         // netdisk_client 为 None → 应报错
         let r = m.execute_one(&s.id).await;
@@ -2588,8 +2770,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let mut sub = sub("a");
         sub.owner_uid = 1;
         let s = m.create_subscription(sub).unwrap();

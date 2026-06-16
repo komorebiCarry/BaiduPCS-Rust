@@ -137,6 +137,16 @@ export interface RunDetail {
   overwritten_count: number
   error: string | null
   items: RunItemRecord[]
+  item_total_count: number
+  item_page: number
+  item_page_size: number
+}
+
+export interface RunItemsPage {
+  items: RunItemRecord[]
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface ShareSnapshotItem {
@@ -267,8 +277,17 @@ export async function listRuns(id: string, page = 1, pageSize = 20): Promise<Run
   return r.data.data
 }
 
-export async function getRun(runId: string): Promise<RunDetail> {
-  const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`)
+export async function getRun(runId: string, page = 1, pageSize = 100): Promise<RunDetail> {
+  const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`, {
+    params: { page, page_size: pageSize }
+  })
+  return r.data.data
+}
+
+export async function listRunItems(runId: string, page = 1, pageSize = 100): Promise<RunItemsPage> {
+  const r = await rawApiClient.get<{ success: boolean; data: RunItemsPage }>(`${BASE}/runs/${runId}/items`, {
+    params: { page, page_size: pageSize }
+  })
   return r.data.data
 }
 
