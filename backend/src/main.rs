@@ -451,6 +451,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/share-sync/subscriptions/:id/runs", get(handlers::list_runs))
         .route("/share-sync/subscriptions/:id/subtasks", get(handlers::list_subtasks))
         .route("/share-sync/runs/:id", get(handlers::get_run))
+        .route("/share-sync/runs/:id/items", get(handlers::list_run_items))
         .route("/share-sync/subscriptions/:id/snapshots/latest", get(handlers::latest_snapshot))
         .route("/share-sync/preview-tree", post(handlers::preview_tree))
         // 🔥 加密数据导出 API
