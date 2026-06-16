@@ -1324,6 +1324,128 @@ fn is_terminal_subtask_status(status: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum RestartableShareSyncDownload {
+    Task(String),
+    Folder(String),
+}
+
+fn restartable_share_sync_download(
+    subtask: &ShareSyncSubtask,
+) -> Option<RestartableShareSyncDownload> {
+    if subtask.kind != "download" || is_terminal_subtask_status(&subtask.status) {
+        return None;
+    }
+
+    if let Some(folder_id) = subtask.task_id.strip_prefix("folder:") {
+        return matches!(subtask.status.as_str(), "scanning" | "downloading")
+            .then(|| RestartableShareSyncDownload::Folder(folder_id.to_string()));
+    }
+
+    (subtask.status == "downloading")
+        .then(|| RestartableShareSyncDownload::Task(subtask.task_id.clone()))
+}
+
+async fn restart_stalled_share_sync_downloads(
+    transfer: &TransferManager,
+    subtasks: &[ShareSyncSubtask],
+    resume_delay: Duration,
+) -> usize {
+    let mut task_ids = Vec::new();
+    let mut folder_ids = Vec::new();
+
+    for subtask in subtasks {
+        match restartable_share_sync_download(subtask) {
+            Some(RestartableShareSyncDownload::Task(task_id)) => task_ids.push(task_id),
+            Some(RestartableShareSyncDownload::Folder(folder_id)) => folder_ids.push(folder_id),
+            None => {}
+        }
+    }
+
+    task_ids.sort();
+    task_ids.dedup();
+    folder_ids.sort();
+    folder_ids.dedup();
+
+    let mut restarted = 0usize;
+
+    if !folder_ids.is_empty() {
+        match transfer.folder_download_manager_handle().await {
+            Some(folder_manager) => {
+                for folder_id in folder_ids {
+                    match folder_manager.pause_folder(&folder_id).await {
+                        Ok(()) => {
+                            if resume_delay > Duration::from_secs(0) {
+                                tokio::time::sleep(resume_delay).await;
+                            }
+                            match folder_manager.resume_folder(&folder_id).await {
+                                Ok(()) => {
+                                    restarted += 1;
+                                    warn!(
+                                        "share-sync: stalled folder download restarted: folder_id={}",
+                                        folder_id
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    "share-sync: resume stalled folder download failed: folder_id={}, error={}",
+                                    folder_id, e
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "share-sync: pause stalled folder download failed: folder_id={}, error={}",
+                            folder_id, e
+                        ),
+                    }
+                }
+            }
+            None => warn!(
+                "share-sync: stalled folder downloads found but folder download manager is unavailable"
+            ),
+        }
+    }
+
+    if !task_ids.is_empty() {
+        match transfer.download_manager_handle().await {
+            Some(download_manager) => {
+                for task_id in task_ids {
+                    match download_manager.pause_task(&task_id, true).await {
+                        Ok(()) => {
+                            if resume_delay > Duration::from_secs(0) {
+                                tokio::time::sleep(resume_delay).await;
+                            }
+                            match download_manager.resume_task(&task_id).await {
+                                Ok(()) => {
+                                    restarted += 1;
+                                    warn!(
+                                        "share-sync: stalled download task restarted: task_id={}",
+                                        task_id
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    "share-sync: resume stalled download task failed: task_id={}, error={}",
+                                    task_id, e
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "share-sync: pause stalled download task failed: task_id={}, error={}",
+                            task_id, e
+                        ),
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    "share-sync: stalled download tasks found but download manager is unavailable"
+                )
+            }
+        }
+    }
+
+    restarted
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SubtaskActivitySignature {
     task_id: String,
     kind: String,
@@ -1399,6 +1521,10 @@ fn env_duration_secs(name: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
+}
+
 fn share_sync_task_idle_timeout(default: Duration) -> Duration {
     env_duration_secs("BAIDUPCS_SHARE_SYNC_TASK_IDLE_TIMEOUT_SECS").unwrap_or(default)
 }
@@ -1412,6 +1538,32 @@ fn share_sync_task_hard_timeout() -> Option<Duration> {
         },
         Err(_) => Some(Duration::from_secs(7 * 24 * 60 * 60)),
     }
+}
+
+fn share_sync_stall_retry_after(idle_timeout: Duration) -> Option<Duration> {
+    let configured = env_duration_secs("BAIDUPCS_SHARE_SYNC_STALL_RETRY_SECS")
+        .unwrap_or_else(|| Duration::from_secs(5 * 60));
+    if configured == Duration::from_secs(0) || idle_timeout == Duration::from_secs(0) {
+        return None;
+    }
+    if configured >= idle_timeout {
+        let one_second = Duration::from_secs(1);
+        return Some(if idle_timeout > one_second {
+            idle_timeout - one_second
+        } else {
+            idle_timeout
+        });
+    }
+    Some(configured)
+}
+
+fn share_sync_stall_retry_max() -> u32 {
+    env_u32("BAIDUPCS_SHARE_SYNC_STALL_RETRY_MAX").unwrap_or(3)
+}
+
+fn share_sync_stall_retry_cooldown() -> Duration {
+    env_duration_secs("BAIDUPCS_SHARE_SYNC_STALL_RETRY_COOLDOWN_SECS")
+        .unwrap_or_else(|| Duration::from_secs(5))
 }
 
 /// 收集当前子任务并逐个推送 `ShareSyncEvent::ItemProgress`（一帧）。
@@ -1734,8 +1886,13 @@ impl ExecutorHooks for ProductionHooks {
         let tm = self.transfer_manager();
         let idle_timeout = share_sync_task_idle_timeout(timeout);
         let hard_timeout = share_sync_task_hard_timeout();
+        let stall_retry_after = share_sync_stall_retry_after(idle_timeout);
+        let stall_retry_max = share_sync_stall_retry_max();
+        let stall_retry_cooldown = share_sync_stall_retry_cooldown();
         let started_at = tokio::time::Instant::now();
         let mut last_activity_at = started_at;
+        let mut last_stall_retry_at: Option<tokio::time::Instant> = None;
+        let mut stall_retry_attempts = 0u32;
         let mut last_signature: Option<TaskActivitySignature> = None;
         loop {
             let task = tm.get_task(task_id).await.ok_or_else(|| {
@@ -1793,12 +1950,47 @@ impl ExecutorHooks for ProductionHooks {
                 }
             }
 
-            if now.duration_since(last_activity_at) >= idle_timeout {
+            let idle_for = now.duration_since(last_activity_at);
+            if require_download_completion {
+                if let Some(retry_after) = stall_retry_after {
+                    let retry_due = idle_for >= retry_after
+                        && stall_retry_attempts < stall_retry_max
+                        && last_stall_retry_at
+                            .map(|last| now.duration_since(last) >= retry_after)
+                            .unwrap_or(true);
+                    if retry_due {
+                        last_stall_retry_at = Some(now);
+                        let restarted = restart_stalled_share_sync_downloads(
+                            &tm,
+                            &subtasks,
+                            stall_retry_cooldown,
+                        )
+                        .await;
+                        if restarted > 0 {
+                            stall_retry_attempts += 1;
+                            last_activity_at = tokio::time::Instant::now();
+                            warn!(
+                                "share-sync: 下载子任务长时间无进度, 已尝试暂停后继续: task_id={}, attempt={}/{}, restarted={}, idle_secs={}, retry_after_secs={}",
+                                task_id,
+                                stall_retry_attempts,
+                                stall_retry_max,
+                                restarted,
+                                idle_for.as_secs(),
+                                retry_after.as_secs()
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if idle_for >= idle_timeout {
                 let msg = format!(
                     "等待任务完成超时: task_id={}, status={:?}, idle_secs={}, idle_timeout_secs={}",
                     task_id,
                     task.status,
-                    now.duration_since(last_activity_at).as_secs(),
+                    idle_for.as_secs(),
                     idle_timeout.as_secs()
                 );
                 return if require_download_completion {
@@ -2493,6 +2685,46 @@ mod tests {
             speed,
             eta_seconds: None,
             owner_uid: 1,
+        }
+    }
+
+    #[test]
+    fn test_restartable_share_sync_download_detects_active_downloads() {
+        let task = wait_signature_subtask(10, 1024);
+        assert_eq!(
+            restartable_share_sync_download(&task),
+            Some(RestartableShareSyncDownload::Task("dl-1".into()))
+        );
+
+        let mut folder = task.clone();
+        folder.task_id = "folder:folder-1".into();
+        assert_eq!(
+            restartable_share_sync_download(&folder),
+            Some(RestartableShareSyncDownload::Folder("folder-1".into()))
+        );
+
+        folder.status = "scanning".into();
+        assert_eq!(
+            restartable_share_sync_download(&folder),
+            Some(RestartableShareSyncDownload::Folder("folder-1".into()))
+        );
+    }
+
+    #[test]
+    fn test_restartable_share_sync_download_skips_terminal_and_non_running_tasks() {
+        let mut subtask = wait_signature_subtask(10, 1024);
+
+        subtask.kind = "transfer".into();
+        assert_eq!(restartable_share_sync_download(&subtask), None);
+
+        subtask.kind = "download".into();
+        for status in ["completed", "failed", "cancelled", "paused", "pending"] {
+            subtask.status = status.into();
+            assert_eq!(
+                restartable_share_sync_download(&subtask),
+                None,
+                "status {status} 不应自动暂停/继续"
+            );
         }
     }
 
