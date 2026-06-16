@@ -772,16 +772,22 @@ impl ShareSyncManager {
                 ))
             })?;
 
-        let run_id = Uuid::new_v4().to_string();
-        let started_at = chrono::Utc::now().timestamp();
-        if let Err(e) = self.persistence.start_run(&run_id, id, started_at) {
-            return Err(e);
-        }
-        self.publisher.publish(ShareSyncEvent::RunStarted {
-            run_id: run_id.clone(),
-            subscription_id: id.into(),
-            owner_uid,
-        });
+        let run_id = match given_run_id {
+            Some(rid) => rid,
+            None => {
+                let rid = Uuid::new_v4().to_string();
+                let started_at = chrono::Utc::now().timestamp();
+                if let Err(e) = self.persistence.start_run(&rid, id, started_at) {
+                    return Err(e);
+                }
+                self.publisher.publish(ShareSyncEvent::RunStarted {
+                    run_id: rid.clone(),
+                    subscription_id: id.into(),
+                    owner_uid,
+                });
+                rid
+            }
+        };
 
         // 1) 抓取
         let (captured, curr_snapshot) = match SnapshotCollector::from_url(
@@ -2584,7 +2590,9 @@ mod tests {
         })
             .await
             .unwrap();
-        let s = m.create_subscription(sub("a")).unwrap();
+        let mut sub = sub("a");
+        sub.owner_uid = 1;
+        let s = m.create_subscription(sub).unwrap();
         m.running.insert(s.id.clone(), ());
         let r = m.trigger_one(&s.id).await;
         m.running.remove(&s.id);

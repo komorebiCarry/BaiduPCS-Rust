@@ -181,6 +181,12 @@ export interface ShareSyncSubtask {
   owner_uid: number
 }
 
+export interface TriggerSubscriptionResponse {
+  subscription_id: string
+  triggered?: boolean
+  run_id?: string
+}
+
 /**
  * 分享同步 WS 事件载荷（与后端 ShareSyncEvent 对齐）
  */
@@ -244,8 +250,9 @@ export async function setSubscriptionEnabled(id: string, enabled: boolean): Prom
   await rawApiClient.post(`${BASE}/subscriptions/${id}/${path}`)
 }
 
-export async function triggerSubscription(id: string): Promise<void> {
-  await rawApiClient.post(`${BASE}/subscriptions/${id}/trigger`)
+export async function triggerSubscription(id: string): Promise<TriggerSubscriptionResponse> {
+  const r = await rawApiClient.post<{ success: boolean; data: TriggerSubscriptionResponse }>(`${BASE}/subscriptions/${id}/trigger`)
+  return r.data.data
 }
 
 /** 「我已更新链接，恢复」：清除链接失效标记，恢复轮询并立即重试一次 */

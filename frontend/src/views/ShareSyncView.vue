@@ -44,6 +44,9 @@
                 <span class="config-name">{{ s.name }}</span>
                 <AccountBadge :owner-uid="s.owner_uid" size="small" class="task-account-badge" />
                 <el-tag :type="s.enabled ? 'success' : 'info'" size="small">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
+                <el-tag v-if="runningProgressTag(s).show" type="warning" size="small" effect="dark">
+                  {{ runningProgressTag(s).text }}
+                </el-tag>
                 <el-tooltip
                     v-if="s.link_invalid"
                     :content="s.link_invalid_reason || '分享链接已失效（被取消/过期/提取码失效），已暂停轮询；更新链接后点「恢复」'"
@@ -503,6 +506,27 @@ const runningRuns = ref<Map<string, RunRecord>>(new Map())
 
 function subtasksOf(id: string): ShareSyncSubtask[] {
   return activeSubtasks.value.get(id) ?? []
+}
+
+// 卡片级进度只聚合活跃子任务；抓取/diff 阶段没有子任务时显示"同步中"。
+function aggregateSubtaskProgress(id: string): number | null {
+  const subs = subtasksOf(id)
+  if (subs.length === 0) return null
+  const active = subs.filter(
+    (s) => s.status !== 'completed' && s.status !== 'success' && s.status !== 'failed' && s.status !== 'cancelled',
+  )
+  if (active.length === 0) return 100
+  const sum = active.reduce((acc, s) => acc + clampPercent(s.progress), 0)
+  return Math.round(sum / active.length)
+}
+
+function runningProgressTag(s: ShareSubscription): { show: boolean; text: string } {
+  if (!runningRunOf(s.id)) return { show: false, text: '' }
+  const pct = aggregateSubtaskProgress(s.id)
+  return {
+    show: true,
+    text: pct === null ? '同步中' : `同步中 (${pct}%)`,
+  }
 }
 
 function runningRunOf(id: string): RunRecord | null {
@@ -1108,8 +1132,9 @@ async function triggerNow(s?: ShareSubscription) {
   if (!target) return
   triggeringId.value = target.id
   try {
-    await triggerSubscription(target.id)
-    markRunStarted(target.id, `manual-${target.id}-${Date.now()}`)
+    // 后端同步返回新 run_id；用它直接订阅进度 / 跳到 run 详情。
+    const trigger = await triggerSubscription(target.id)
+    markRunStarted(target.id, trigger.run_id || `manual-${target.id}-${Date.now()}`)
     ElMessage.success('已开始同步，结果将稍后出现在运行历史')
     setTimeout(() => {
       if (selected.value?.id === target.id) loadRuns(target.id)
