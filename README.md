@@ -3,7 +3,7 @@
 <div align="center">
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
-![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)
+![Rust](https://img.shields.io/badge/Rust-1.87-orange.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.3+-green.svg)
 ![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)
 
@@ -713,7 +713,7 @@ open http://localhost:18888
 
 #### 前提条件
 
-- Rust 1.75+
+- Rust 1.87（项目通过 `rust-toolchain.toml` 固定为 1.87.0，本地 / Docker / CI 保持一致）
 - Node.js 18+
 - npm 或 pnpm
 
@@ -768,7 +768,7 @@ npm run dev
 
 ### 后端
 
-- **语言**: Rust 1.75+
+- **语言**: Rust 1.87
 - **框架**: Axum 0.7（Web 框架）
 - **异步运行时**: Tokio
 - **HTTP 客户端**: Reqwest
@@ -966,7 +966,7 @@ cargo test
 
 1. Fork 本仓库
 2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
+3. 提交更改（提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)，例如 `git commit -m 'feat: add some amazing feature'`）
 4. 推送到分支 (`git push origin feature/AmazingFeature`)
 5. 开启 Pull Request
 
@@ -974,7 +974,7 @@ cargo test
 
 - **Rust**: 遵循 Rust 官方代码风格（使用 `cargo fmt` 和 `cargo clippy`）
 - **TypeScript**: 遵循 Vue 3 最佳实践
-- **提交信息**: 使用清晰的提交信息
+- **提交信息**: 遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范（`feat`/`fix`/`docs`/`chore` 等）；PR 标题与每个 commit 都会被 CI 校验
 
 ---
 
