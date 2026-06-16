@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::config::MIN_POLL_INTERVAL_SECS;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// 单个订阅的调度状态
 pub struct SubscriptionScheduler {
@@ -38,11 +38,13 @@ impl SubscriptionScheduler {
 
     /// 启动主循环
     ///
-    /// `on_tick` 由调用方提供；通常会调用 `ShareSyncManager::execute_one(id)`
+    /// `on_tick` 由调用方提供；通常会调用 `ShareSyncManager::execute_one(id)`，
+    /// 返回 `Result<(), ShareSyncError>`，scheduler 会把 Err 记到日志（之前用
+    /// `let _ = ...` 吞掉,owner_uid=0 这类失败会变成静默执行)。
     pub fn start<F, Fut>(&mut self, on_tick: F)
     where
         F: Fn(String) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        Fut: std::future::Future<Output = Result<(), super::ShareSyncError>> + Send,
     {
         if self.task.is_some() {
             return; // 已经启动
@@ -79,7 +81,17 @@ impl SubscriptionScheduler {
                 if running.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     debug!("scheduler: 订阅 {} 上次 run 还在进行，跳过本轮", sub_id);
                 } else {
-                    on_tick(sub_id.clone()).await;
+                    match on_tick(sub_id.clone()).await {
+                        Ok(()) => {
+                            debug!("scheduler: 订阅 {} on_tick 正常完成", sub_id);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "scheduler: 订阅 {} on_tick 失败: {} (静默吞掉, 不影响下次 tick)",
+                                sub_id, e
+                            );
+                        }
+                    }
                     running.store(false, std::sync::atomic::Ordering::SeqCst);
                 }
 
@@ -175,6 +187,7 @@ mod tests {
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(())
             }
         });
         // 触发两次：第二次应被合并（因为第一次还在跑）
