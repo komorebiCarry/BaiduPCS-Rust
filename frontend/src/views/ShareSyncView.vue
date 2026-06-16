@@ -72,8 +72,8 @@
             <!-- 操作按钮 -->
             <div class="config-actions" @click.stop>
               <el-tooltip
-                  :disabled="ownerLoggedIn(s)"
-                  content="订阅所属账号未登录，请先登录该账号再触发同步"
+                  :disabled="!triggerDisabledReason(s)"
+                  :content="triggerDisabledReason(s)"
                   placement="top"
               >
                   <span>
@@ -82,7 +82,7 @@
                         type="success"
                         :icon="Refresh"
                         :loading="triggeringId === s.id"
-                        :disabled="!ownerLoggedIn(s)"
+                        :disabled="!!triggerDisabledReason(s)"
                         @click="triggerNow(s)"
                     >
                       立即同步
@@ -146,6 +146,26 @@
                   仅显示前 {{ SUBTASK_RENDER_CAP }} 个，另有 {{ subtasksOverflow(s.id) }} 个进行中…
                 </div>
               </div>
+            </div>
+          </div>
+          <div v-else-if="runningRunOf(s.id)" class="active-run-container">
+            <div class="active-run-card">
+              <div class="task-progress-header">
+                <div class="task-status-info">
+                  <el-icon :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
+                  <span class="task-status-text">同步运行中</span>
+                  <span class="active-run-meta">开始于 {{ formatRunningStarted(s.id) }}</span>
+                </div>
+                <el-button size="small" text type="primary" @click.stop="openRunsDialog(s)">查看运行历史</el-button>
+              </div>
+              <el-progress
+                  :percentage="100"
+                  :indeterminate="true"
+                  :duration="2"
+                  :stroke-width="6"
+                  :show-text="false"
+              />
+              <div class="active-run-hint">正在抓取或比对分享内容，生成子任务后会显示文件进度</div>
             </div>
           </div>
           <div v-else class="no-active-task">
@@ -478,9 +498,53 @@ const currentRun = ref<RunDetail | null>(null)
 
 // 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
 const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
+// 抓取 / diff 阶段还没有子任务；用最新 running run 补齐卡片状态。
+const runningRuns = ref<Map<string, RunRecord>>(new Map())
 
 function subtasksOf(id: string): ShareSyncSubtask[] {
   return activeSubtasks.value.get(id) ?? []
+}
+
+function runningRunOf(id: string): RunRecord | null {
+  return runningRuns.value.get(id) ?? null
+}
+
+function setRunningRun(id: string, run: RunRecord | null) {
+  const next = new Map(runningRuns.value)
+  if (run && run.status === 'running') next.set(id, run)
+  else next.delete(id)
+  runningRuns.value = next
+}
+
+function syncRunningRunFromList(id: string, list: RunRecord[]) {
+  const latest = list[0]
+  setRunningRun(id, latest?.status === 'running' ? latest : null)
+}
+
+function makePendingRun(runId: string): RunRecord {
+  return {
+    id: runId,
+    started_at: Math.floor(Date.now() / 1000),
+    finished_at: null,
+    status: 'running',
+    total_count: 0,
+    added_count: 0,
+    modified_count: 0,
+    removed_count: 0,
+    unchanged_count: 0,
+    failed_count: 0,
+    skipped_count: 0,
+    overwritten_count: 0,
+    error: null,
+  }
+}
+
+function markRunStarted(id: string, runId: string) {
+  setRunningRun(id, makePendingRun(runId))
+}
+
+function markRunFinished(id: string) {
+  setRunningRun(id, null)
 }
 
 // 子任务列表默认折叠（几千文件时不铺满卡片）；按订阅记忆展开态。
@@ -507,6 +571,12 @@ function subtasksOverflow(id: string): number {
 // 某订阅所属账号是否已登录（卡片级触发同步前置条件）
 function ownerLoggedIn(s: ShareSubscription): boolean {
   return authStore.accounts.some(a => a.uid === s.owner_uid)
+}
+
+function triggerDisabledReason(s: ShareSubscription): string {
+  if (!ownerLoggedIn(s)) return '订阅所属账号未登录，请先登录该账号再触发同步'
+  if (runningRunOf(s.id)) return '该订阅正在同步中，请等待当前运行结束'
+  return ''
 }
 
 // 本地目录选择（与转存一致：FilePickerModal 选目录 + 最近目录联动）
@@ -705,6 +775,8 @@ async function refresh() {
     ElMessage.error(`加载订阅失败: ${getApiErrorMessage(e)}`)
     return
   }
+  const liveIds = new Set(subscriptions.value.map(s => s.id))
+  runningRuns.value = new Map([...runningRuns.value].filter(([id]) => liveIds.has(id)))
   if (selected.value) {
     const fresh = subscriptions.value.find(s => s.id === selected.value!.id)
     if (fresh) selected.value = fresh
@@ -739,14 +811,30 @@ watch(ownerFilter, () => {
 
 async function loadRuns(id: string) {
   try {
-    runs.value = await listRuns(id, 1, 30)
+    const list = await listRuns(id, 1, 30)
+    runs.value = list
+    syncRunningRunFromList(id, list)
   } catch (e) {
     runs.value = []
+    setRunningRun(id, null)
     const status = (e as AxiosError)?.response?.status
     if (status !== 404) {
       console.error('load runs failed', e)
     }
   }
+}
+
+async function loadLatestRunFor(id: string) {
+  try {
+    const list = await listRuns(id, 1, 1)
+    syncRunningRunFromList(id, list)
+  } catch {
+    setRunningRun(id, null)
+  }
+}
+
+async function loadLatestRunsForAll() {
+  await Promise.all(subscriptions.value.map(s => loadLatestRunFor(s.id)))
 }
 
 // 转存对话框创建订阅后回调（WS 事件也会刷新，这里显式刷一次更可靠）
@@ -1005,6 +1093,7 @@ async function resumeNow(s?: ShareSubscription) {
   resumingId.value = target.id
   try {
     await resumeSubscription(target.id)
+    markRunStarted(target.id, `resume-${target.id}-${Date.now()}`)
     ElMessage.success('已恢复轮询并立即重试一次')
     await refresh()
   } catch (e) {
@@ -1020,9 +1109,11 @@ async function triggerNow(s?: ShareSubscription) {
   triggeringId.value = target.id
   try {
     await triggerSubscription(target.id)
-    ElMessage.success('已触发同步，结果将稍后出现在运行历史')
+    markRunStarted(target.id, `manual-${target.id}-${Date.now()}`)
+    ElMessage.success('已开始同步，结果将稍后出现在运行历史')
     setTimeout(() => {
       if (selected.value?.id === target.id) loadRuns(target.id)
+      else loadLatestRunFor(target.id)
       loadSubtasksFor(target.id)
     }, 1500)
   } catch (e) {
@@ -1209,6 +1300,11 @@ function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString('zh-CN')
 }
 
+function formatRunningStarted(id: string): string {
+  const run = runningRunOf(id)
+  return run?.started_at ? formatTime(run.started_at) : '刚刚'
+}
+
 // ==================== 子任务进度（内联展示） ====================
 
 function formatBytes(bytes: number): string {
@@ -1373,6 +1469,7 @@ watch(hasActiveSubtasks, updateSubtaskPolling)
 
 onMounted(async () => {
   await refresh()
+  await loadLatestRunsForAll()
   if (subscriptions.value.length > 0 && !selected.value) {
     await select(subscriptions.value[0])
   }
@@ -1418,6 +1515,7 @@ onMounted(async () => {
     }
     if (evt.type === 'run_started') {
       // 新一轮开始：清掉旧的进度残留，随后由 item_progress / 轮询补齐
+      markRunStarted(sid, evt.run_id)
       loadSubtasksFor(sid)
     }
     if (['run_completed', 'run_failed'].includes(evt.type)) {
@@ -1425,6 +1523,7 @@ onMounted(async () => {
       const next = new Map(activeSubtasks.value)
       next.delete(sid)
       activeSubtasks.value = next
+      markRunFinished(sid)
     }
     if (sid === selected.value?.id) {
       if (['run_started', 'run_completed', 'run_failed', 'diff_detected'].includes(evt.type)) {
@@ -1561,10 +1660,30 @@ onUnmounted(() => {
   padding-top: 16px;
   border-top: 1px solid #ebeef5;
 }
+.active-run-container {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #ebeef5;
+}
 .active-task-card {
   background: #f5f7fa;
   border-radius: 8px;
   overflow: hidden;
+}
+.active-run-card {
+  background: #f5f7fa;
+  border-radius: 8px;
+  overflow: hidden;
+  padding: 0 12px 12px;
+}
+.active-run-meta {
+  font-size: 12px;
+  color: #909399;
+}
+.active-run-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #909399;
 }
 .task-progress-header {
   display: flex;
