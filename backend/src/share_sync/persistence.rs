@@ -818,10 +818,7 @@ impl ShareSyncPersistence {
     }
 
     /// 取某 run 所属的 subscription_id（多账号隔离：用于校验访问者归属）
-    pub fn subscription_id_for_run(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<String>, ShareSyncError> {
+    pub fn subscription_id_for_run(&self, run_id: &str) -> Result<Option<String>, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
         let sid: Option<String> = conn
             .query_row(
@@ -833,35 +830,63 @@ impl ShareSyncPersistence {
         Ok(sid)
     }
 
-    /// 列出 run 的所有 run_items
-    pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItemRecord>, ShareSyncError> {
+    fn map_run_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunItemRecord> {
+        Ok(RunItemRecord {
+            id: row.get::<_, i64>(0)?,
+            path: row.get(1)?,
+            action: row.get(2)?,
+            target: row.get(3)?,
+            transfer_task_id: row.get(4)?,
+            download_task_id: row.get(5)?,
+            status: row.get(6)?,
+            versioned_old_path: row.get(7)?,
+            error: row.get(8)?,
+            reason: row.get(9)?,
+        })
+    }
+
+    pub fn count_run_items(&self, run_id: &str) -> Result<usize, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM share_sync_run_items WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0) as usize)
+    }
+
+    /// 分页列出 run_items。用于运行详情页，避免大目录同步一次性返回几千条明细。
+    pub fn list_run_items_page(
+        &self,
+        run_id: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<Vec<RunItemRecord>, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let offset = (page.saturating_sub(1) * page_size) as i64;
         let mut stmt = conn.prepare(
             "SELECT id, path, action, target, transfer_task_id, download_task_id,
                     status, versioned_old_path, error, reason
              FROM share_sync_run_items
              WHERE run_id = ?1
-             ORDER BY id ASC",
+             ORDER BY id ASC
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok(RunItemRecord {
-                id: row.get::<_, i64>(0)?,
-                path: row.get(1)?,
-                action: row.get(2)?,
-                target: row.get(3)?,
-                transfer_task_id: row.get(4)?,
-                download_task_id: row.get(5)?,
-                status: row.get(6)?,
-                versioned_old_path: row.get(7)?,
-                error: row.get(8)?,
-                reason: row.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![run_id, page_size as i64, offset],
+            Self::map_run_item_row,
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// 列出 run 的所有 run_items。保留给内部测试和少量小数据调用；用户界面应走分页接口。
+    pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItemRecord>, ShareSyncError> {
+        let total = self.count_run_items(run_id)?;
+        self.list_run_items_page(run_id, 1, total.max(1))
     }
 }
 
@@ -1030,7 +1055,10 @@ mod tests {
         assert_eq!(mapped.as_deref(), Some(s.id.as_str()));
 
         // 不存在的 run → None（handler 据此返回 404）
-        assert!(mgr.subscription_id_for_run("no-such-run").unwrap().is_none());
+        assert!(mgr
+            .subscription_id_for_run("no-such-run")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1073,7 +1101,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
 
         mgr.delete_subscription(&s.id).unwrap();
         assert!(mgr.latest_snapshot(&s.id).unwrap().is_none());
@@ -1097,7 +1125,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
         mgr.finish_run(
             "run-1",
             1100,
@@ -1114,7 +1142,7 @@ mod tests {
             },
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let rec = mgr.get_run("run-1").unwrap().unwrap();
         assert_eq!(rec.status, "completed_with_errors");
@@ -1123,6 +1151,39 @@ mod tests {
         let items = mgr.list_run_items("run-1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].transfer_task_id.as_deref(), Some("tx-1"));
+    }
+
+    #[test]
+    fn test_run_items_pagination_uses_stable_id_order() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-page", &s.id, 1000).unwrap();
+        for i in 0..125 {
+            mgr.add_run_item(
+                "run-page",
+                &format!("/file-{i:03}.bin"),
+                SyncAction::Added,
+                TargetKind::Local,
+                Some(&format!("tx-{i}")),
+                None,
+                RunItemStatus::Downloading,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(mgr.count_run_items("run-page").unwrap(), 125);
+        let first = mgr.list_run_items_page("run-page", 1, 100).unwrap();
+        assert_eq!(first.len(), 100);
+        assert_eq!(first[0].path, "/file-000.bin");
+        assert_eq!(first[99].path, "/file-099.bin");
+
+        let second = mgr.list_run_items_page("run-page", 2, 100).unwrap();
+        assert_eq!(second.len(), 25);
+        assert_eq!(second[0].path, "/file-100.bin");
+        assert_eq!(second[24].path, "/file-124.bin");
     }
 
     #[test]
@@ -1216,7 +1277,7 @@ mod tests {
             Some("/old.bak"),
             Some("first_reason"),
         )
-            .unwrap();
+        .unwrap();
         // 第二次传 None 给 transfer_task_id / download_task_id / versioned_old_path / reason
         mgr.add_run_item(
             "run-c",
@@ -1229,7 +1290,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
         let items = mgr.list_run_items("run-c").unwrap();
         assert_eq!(items.len(), 1);
         // status / action 是 NOT NULL 用 excluded 覆盖
@@ -1308,7 +1369,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let stale = mgr.mark_stale_runs_failed(120).unwrap();
         let ids: Vec<&str> = stale.iter().map(|r| r.run_id.as_str()).collect();
@@ -1342,7 +1403,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let mut got = mgr.mark_running_runs_interrupted().unwrap();
         let mut ids: Vec<String> = got.drain(..).map(|r| r.run_id).collect();
@@ -1356,7 +1417,10 @@ mod tests {
             assert_eq!(rec.error.as_deref(), Some("interrupted_on_restart"));
         }
         // 已完成不受影响
-        assert_eq!(mgr.get_run("run-done").unwrap().unwrap().status, "completed");
+        assert_eq!(
+            mgr.get_run("run-done").unwrap().unwrap().status,
+            "completed"
+        );
     }
 
     /// v2: 老库已有 (run_id, path) 重复行时, init_tables 走 ensure_run_items_unique_index
@@ -1402,7 +1466,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
         let items = mgr.list_run_items("r1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "completed");
