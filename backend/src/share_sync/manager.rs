@@ -154,6 +154,50 @@ impl ShareSyncManager {
             rate_limiter: crate::share_sync::rate_limit::QuotaLimiter::from_env(),
         });
 
+        // 多账号时代之前的旧订阅 owner_uid 默认为 0（#[serde(default)] u64）。
+        // 设计上由"上层在创建/导入时赋值"(见 config.rs:133 注释),但实际跑起来
+        // 发现历史数据没补过,导致 trigger 后静默失败:resolver.netdisk_client(0)
+        // 拿不到 client,execute_one 抛 ConfigError 被 scheduler on_tick 闭包吞掉,
+        // 前端却拿到 `{"triggered": true}` 误以为成功。启动期集中补齐到当前活跃账号。
+        let active_uid = manager.resolver.active_uid().await;
+        match active_uid {
+            Some(active) => {
+                let mut migrated = 0usize;
+                for sub in subs.iter_mut() {
+                    if sub.owner_uid == 0 {
+                        info!(
+                            "share-sync: 迁移旧订阅 {} owner_uid 0 -> {} (历史/未归属数据)",
+                            sub.id, active
+                        );
+                        sub.owner_uid = active;
+                        if let Err(e) = manager.persistence.upsert_subscription(sub) {
+                            warn!(
+                                "share-sync: 迁移订阅 {} 写回 DB 失败: {}",
+                                sub.id, e
+                            );
+                        }
+                        migrated += 1;
+                    }
+                }
+                if migrated > 0 {
+                    info!(
+                        "share-sync: 启动期 owner_uid 迁移完成, 共 {} 条 (active_uid={})",
+                        migrated, active
+                    );
+                }
+            }
+            None => {
+                let legacy = subs.iter().filter(|s| s.owner_uid == 0).count();
+                if legacy > 0 {
+                    warn!(
+                        "share-sync: 启动时发现 {} 条 owner_uid=0 的旧订阅, 但当前无活跃账号, \
+                         无法迁移 —— 用户登录后下次启动会自动迁移,或在前端编辑订阅以重设归属",
+                        legacy
+                    );
+                }
+            }
+        }
+
         for sub in subs {
             manager.subscriptions.insert(sub.id.clone(), sub.clone());
             if sub.enabled && sub.poll_config.enabled {
@@ -565,16 +609,38 @@ impl ShareSyncManager {
         let sub = self
             .get_subscription(id)
             .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
+        info!(
+            "share-sync: trigger subscription id={} name={} owner_uid={} enabled={}",
+            sub.id, sub.name, sub.owner_uid, sub.enabled
+        );
+        // owner_uid=0 表示历史脏数据:resolver 拿不到 client,execute_one 会抛
+        // ConfigError,被 scheduler on_tick 闭包吞掉,前端却拿到 success 误判。
+        // 启动期迁移应当把 owner_uid 补上;若仍为 0(无活跃账号等情形),直接报错。
+        if sub.owner_uid == 0 {
+            return Err(ShareSyncError::ConfigError(
+                "订阅所属账号未设置（owner_uid=0），请等待启动迁移完成或在前端编辑订阅".into(),
+            ));
+        }
         if let Some(sched) = self.schedulers.get(id) {
             sched.trigger_now();
+            info!("share-sync: 已唤醒订阅 {} 的 scheduler", id);
             // 实际 run 由 scheduler 的 on_tick 触发
             Ok(sub.id)
         } else {
             // 没有 scheduler（被禁用），后台执行一次
+            warn!(
+                "share-sync: 订阅 {} 无 scheduler（被禁用或未启动），后台执行一次",
+                id
+            );
             let mgr = Arc::clone(self);
             let id_owned = id.to_string();
             tokio::spawn(async move {
-                let _ = mgr.execute_one(&id_owned).await;
+                if let Err(e) = mgr.execute_one(&id_owned).await {
+                    warn!(
+                        "share-sync: 订阅 {} spawn 执行的 execute_one 失败: {}",
+                        id_owned, e
+                    );
+                }
             });
             Ok(sub.id)
         }
@@ -873,7 +939,8 @@ impl ShareSyncManager {
         sched.start(move |id| {
             let mgr2 = Arc::clone(&mgr);
             async move {
-                let _ = mgr2.execute_one(&id).await;
+                // 无论成功/失败都映射为 ()，由 scheduler 把 Err 记到日志
+                mgr2.execute_one(&id).await.map(|_| ())
             }
         });
         info!("scheduler: 启动订阅 {} (interval={}s)", sub_id, interval);
