@@ -3,7 +3,7 @@
 <div align="center">
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
-![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)
+![Rust](https://img.shields.io/badge/Rust-1.87-orange.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.3+-green.svg)
 ![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)
 
@@ -713,7 +713,7 @@ open http://localhost:18888
 
 #### 前提条件
 
-- Rust 1.75+
+- Rust 1.87（项目通过 `rust-toolchain.toml` 固定为 1.87.0，本地 / Docker / CI 保持一致）
 - Node.js 18+
 - npm 或 pnpm
 
@@ -768,7 +768,7 @@ npm run dev
 
 ### 后端
 
-- **语言**: Rust 1.75+
+- **语言**: Rust 1.87
 - **框架**: Axum 0.7（Web 框架）
 - **异步运行时**: Tokio
 - **HTTP 客户端**: Reqwest
