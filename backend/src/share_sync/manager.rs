@@ -410,7 +410,13 @@ impl ShareSyncManager {
         info!("ShareSyncManager: 创建订阅 id={}", sub.id);
         // 启用的订阅创建后立即执行一次首同步，无需等待首个轮询周期
         if sub.enabled {
-            let _ = self.trigger_one(&sub.id);
+            let mgr = Arc::clone(self);
+            let sub_id = sub.id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mgr.trigger_one(&sub_id).await {
+                    warn!("share-sync: 订阅 {} 创建后首同步触发失败: {}", sub_id, e);
+                }
+            });
         }
         Ok(sub)
     }
@@ -544,7 +550,7 @@ impl ShareSyncManager {
     }
 
     /// 用户「我已更新链接，恢复」：清除失效标记 + 计数，恢复轮询并立即触发一次。
-    pub fn resume_link_invalid(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
+    pub async fn resume_link_invalid(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
         {
             let mut sub = self
                 .subscriptions
@@ -568,7 +574,7 @@ impl ShareSyncManager {
             });
         }
         // 立即重试一次（链接已更新）
-        let _ = self.trigger_one(id);
+        self.trigger_one(id).await?;
         Ok(())
     }
 
@@ -604,8 +610,11 @@ impl ShareSyncManager {
     // 触发 / 执行
     // ===================================================
 
-    /// 立即触发一次（HTTP / 手动）
-    pub fn trigger_one(self: &Arc<Self>, id: &str) -> Result<String, ShareSyncError> {
+    /// 立即触发一次（HTTP / 手动）。
+    ///
+    /// 手动触发不再只唤醒 scheduler：scheduler 的错误只会落日志，HTTP 调用方会误以为
+    /// 已成功开始。这里同步完成可判定的前置校验，然后直接排一个后台 run。
+    pub async fn trigger_one(self: &Arc<Self>, id: &str) -> Result<String, ShareSyncError> {
         let sub = self
             .get_subscription(id)
             .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
@@ -621,33 +630,84 @@ impl ShareSyncManager {
                 "订阅所属账号未设置（owner_uid=0），请等待启动迁移完成或在前端编辑订阅".into(),
             ));
         }
-        if let Some(sched) = self.schedulers.get(id) {
-            sched.trigger_now();
-            info!("share-sync: 已唤醒订阅 {} 的 scheduler", id);
-            // 实际 run 由 scheduler 的 on_tick 触发
-            Ok(sub.id)
-        } else {
-            // 没有 scheduler（被禁用），后台执行一次
-            warn!(
-                "share-sync: 订阅 {} 无 scheduler（被禁用或未启动），后台执行一次",
-                id
-            );
-            let mgr = Arc::clone(self);
-            let id_owned = id.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = mgr.execute_one(&id_owned).await {
-                    warn!(
-                        "share-sync: 订阅 {} spawn 执行的 execute_one 失败: {}",
-                        id_owned, e
-                    );
-                }
-            });
-            Ok(sub.id)
+        if sub.link_invalid {
+            return Err(ShareSyncError::ShareLinkError(
+                sub.link_invalid_reason
+                    .clone()
+                    .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into()),
+            ));
         }
+        if self.running.contains_key(id) {
+            return Err(ShareSyncError::AlreadyRunning(format!(
+                "订阅 {} 正在同步中，请等待当前运行结束",
+                id
+            )));
+        }
+        if self.resolver.netdisk_client(sub.owner_uid).await.is_none() {
+            return Err(ShareSyncError::ConfigError(format!(
+                "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
+                sub.owner_uid
+            )));
+        }
+        if self.resolver.transfer_manager(sub.owner_uid).await.is_none() {
+            return Err(ShareSyncError::ConfigError(format!(
+                "订阅所属账号(uid={})的转存管理器未就绪",
+                sub.owner_uid
+            )));
+        }
+
+        // 同步落库 + 广播：让 HTTP 调用方在拿到响应瞬间就能拿到一个"已经写进 runs 表、
+        // status=running、WS 端能监听到 RunStarted"的真实 run_id。
+        // 前端可以直接跳到 run 详情页拿进度 / 子任务列表，不用再做"我刚点的触发是不是真的
+        // 排队成功了"的二次轮询判断。
+        let run_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().timestamp();
+        if let Err(e) = self.persistence.start_run(&run_id, id, started_at) {
+            return Err(e);
+        }
+        self.publisher.publish(ShareSyncEvent::RunStarted {
+            run_id: run_id.clone(),
+            subscription_id: id.into(),
+            owner_uid: sub.owner_uid,
+        });
+
+        let mgr = Arc::clone(self);
+        let id_owned = id.to_string();
+        let run_id_for_spawn = run_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mgr
+                .execute_one_with_run_id(&id_owned, Some(run_id_for_spawn))
+                .await
+            {
+                warn!(
+                    "share-sync: 订阅 {} 手动触发的 execute_one 失败: {}",
+                    id_owned, e
+                );
+            }
+        });
+        info!(
+            "share-sync: 已启动订阅 {} 的手动同步 run, run_id={}",
+            id, run_id
+        );
+        Ok(run_id)
     }
 
-    /// 执行一次（由 scheduler 调用或 trigger_one 同步入口）
+    /// 执行一次（由 scheduler 调用或 trigger_one 同步入口）。
+    ///
+    /// 内部委托给 [`execute_one_with_run_id`] 并自动 mint 新 run_id；scheduler tick
+    /// 路径与外部调用继续走这里即可，无需自己管 run_id 生成。
     pub async fn execute_one(&self, id: &str) -> Result<ApplyOutcome, ShareSyncError> {
+        self.execute_one_with_run_id(id, None).await
+    }
+
+    /// `execute_one` 的内部版本：当 `given_run_id` 为 `Some(rid)` 时，复用预先生成的
+    /// run_id（不再重新 mint），跳过 `start_run` / `RunStarted` 广播——用于 `trigger_one`
+    /// 这类"已经让前端拿到 run_id"的入口；为 `None` 时由本函数自管整个 run 生命周期。
+    pub async fn execute_one_with_run_id(
+        &self,
+        id: &str,
+        given_run_id: Option<String>,
+    ) -> Result<ApplyOutcome, ShareSyncError> {
         // 全局并发去重：同一订阅同一时刻只允许一个 run 在执行。
         // scheduler 的 running 标志只防它自己循环内重入；这里覆盖所有入口
         // （手动 trigger / 被禁用订阅的 spawn 路径 / 多个调度器并存），
@@ -713,6 +773,10 @@ impl ShareSyncManager {
             })?;
 
         let run_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().timestamp();
+        if let Err(e) = self.persistence.start_run(&run_id, id, started_at) {
+            return Err(e);
+        }
         self.publisher.publish(ShareSyncEvent::RunStarted {
             run_id: run_id.clone(),
             subscription_id: id.into(),
@@ -1203,11 +1267,14 @@ pub async fn collect_share_sync_subtasks(
         for f in fdm.get_folders_by_backup_config(&cfg).await {
             // 文件夹本身不持有速度，按其活跃子文件任务(group_id==folder.id)的
             // 瞬时速度求和聚合，口径与文件夹进度广播器(folder_manager)一致。
+            // 必须用 is_active_download_status 而非单匹配 Downloading：
+            // folder group 子任务会在 Downloading ↔ Decrypting ↔ Pending 之间切换，
+            // 仅 Downloading 会漏掉解密中/等待中的子任务的速度贡献 → 前端恒为 0。
             let speed: u64 = if let Some(dm) = dm_handle.as_ref() {
                 dm.get_tasks_by_group(&f.id)
                     .await
                     .iter()
-                    .filter(|t| t.status == crate::downloader::TaskStatus::Downloading)
+                    .filter(|t| t.status.is_active_download_status())
                     .map(|t| t.speed)
                     .sum()
             } else {
@@ -2502,5 +2569,25 @@ mod tests {
         // netdisk_client 为 None → 应报错
         let r = m.execute_one(&s.id).await;
         assert!(r.is_err());
+        let r = m.trigger_one(&s.id).await;
+        assert!(matches!(r, Err(ShareSyncError::ConfigError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_trigger_one_when_already_running_fails_fast() {
+        let dir = tempdir().unwrap();
+        let m = ShareSyncManager::new(ManagerConfig {
+            config_path: dir.path().join("subs.json"),
+            db_path: dir.path().join("s.db"),
+            resolver: Arc::new(StaticAccountResolver::none()),
+            publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
+        })
+            .await
+            .unwrap();
+        let s = m.create_subscription(sub("a")).unwrap();
+        m.running.insert(s.id.clone(), ());
+        let r = m.trigger_one(&s.id).await;
+        m.running.remove(&s.id);
+        assert!(matches!(r, Err(ShareSyncError::AlreadyRunning(_))));
     }
 }

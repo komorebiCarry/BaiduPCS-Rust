@@ -256,7 +256,7 @@ pub async fn resume_subscription(
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
     let m = get_manager(&state).await?;
     require_subscription(&m, &id)?;
-    m.resume_link_invalid(&id).map_err(map_share_err)?;
+    m.resume_link_invalid(&id).await.map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"subscription_id": id, "resumed": true}),
     )))
@@ -270,7 +270,7 @@ pub async fn trigger_subscription(
     tracing::info!("share-sync: POST /subscriptions/{}/trigger", id);
     let m = get_manager(&state).await?;
     require_subscription(&m, &id)?;
-    m.trigger_one(&id).map_err(map_share_err)?;
+    m.trigger_one(&id).await.map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
         serde_json::json!({"subscription_id": id, "triggered": true}),
     )))

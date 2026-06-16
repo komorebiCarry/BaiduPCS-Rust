@@ -455,7 +455,7 @@ impl ShareSyncPersistence {
     ) -> Result<(), ShareSyncError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO share_sync_runs
+            "INSERT OR IGNORE INTO share_sync_runs
              (id, subscription_id, started_at, status)
              VALUES (?1, ?2, ?3, ?4)",
             params![
