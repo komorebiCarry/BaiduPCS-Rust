@@ -267,6 +267,7 @@ pub async fn trigger_subscription(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
+    tracing::info!("share-sync: POST /subscriptions/{}/trigger", id);
     let m = get_manager(&state).await?;
     require_subscription(&m, &id)?;
     m.trigger_one(&id).map_err(map_share_err)?;

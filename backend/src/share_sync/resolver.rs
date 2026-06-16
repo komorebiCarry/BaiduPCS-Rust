@@ -26,6 +26,13 @@ pub trait ShareSyncAccountResolver: Send + Sync {
     async fn netdisk_client(&self, owner_uid: u64) -> Option<Arc<NetdiskClient>>;
     /// 解析某账号的 `TransferManager`
     async fn transfer_manager(&self, owner_uid: u64) -> Option<Arc<TransferManager>>;
+    /// 进程当前活跃账号 uid（多账号场景下）。无活跃账号返回 None。
+    ///
+    /// 主要给 share_sync 启动期"owner_uid=0 历史数据"迁移使用（见 manager.rs::new）。
+    /// 默认实现返回 None —— 静态/单元测试用 StaticAccountResolver 时无需强制实现。
+    async fn active_uid(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// 固定解析器：忽略 `owner_uid`，始终返回构造时给定的实例。
