@@ -270,9 +270,9 @@ pub async fn trigger_subscription(
     tracing::info!("share-sync: POST /subscriptions/{}/trigger", id);
     let m = get_manager(&state).await?;
     require_subscription(&m, &id)?;
-    m.trigger_one(&id).await.map_err(map_share_err)?;
+    let run_id = m.trigger_one(&id).await.map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(
-        serde_json::json!({"subscription_id": id, "triggered": true}),
+        serde_json::json!({"subscription_id": id, "triggered": true, "run_id": run_id}),
     )))
 }
 
