@@ -623,6 +623,8 @@ const ownerFilterCounts = computed(() => {
 })
 const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
+const currentRunId = ref<string | null>(null)
+const runItemsLoading = ref(false)
 
 // 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
 const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
@@ -751,7 +753,6 @@ const showTransferDialog = ref(false)
 const runDialogVisible = ref(false)
 const runsDialogVisible = ref(false)
 const detailDialogVisible = ref(false)
-const runItemsLoading = ref(false)
 const runItemPage = ref(1)
 const saving = ref(false)
 const triggeringId = ref<string | null>(null)
@@ -1299,6 +1300,7 @@ async function openRun(runId: string) {
   runItemPage.value = 1
   runItemsLoading.value = true
   try {
+    currentRunId.value = runId
     currentRun.value = await getRun(runId, 1, DETAIL_PAGE_SIZE)
     runItemPage.value = currentRun.value.item_page || 1
     runDialogVisible.value = true
@@ -1350,6 +1352,20 @@ async function clearOldRuns() {
     ElMessage.error(`清理失败: ${getApiErrorMessage(e)}`)
   } finally {
     clearingRuns.value = false
+  }
+}
+
+async function onRunItemsPageChange(page: number) {
+  if (!currentRunId.value || !currentRun.value) return
+  runItemsLoading.value = true
+  try {
+    const res = await listRunItems(currentRunId.value, page, currentRun.value.item_page_size)
+    currentRun.value.items = res.items
+    currentRun.value.item_page = res.page
+  } catch (e) {
+    ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
+  } finally {
+    runItemsLoading.value = false
   }
 }
 

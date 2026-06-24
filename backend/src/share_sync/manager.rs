@@ -568,8 +568,15 @@ impl ShareSyncManager {
                 owner_uid: sub_clone.owner_uid,
             });
         }
-        // 立即重试一次（链接已更新）
-        self.trigger_one(id).await?;
+        // 立即重试一次（链接已更新）。恢复动作本身（清除失效标记 + 恢复轮询）此时已成功，
+        // 立即触发只是锦上添花；若该账号未登录等导致触发失败，不应让整个「恢复」接口报错，
+        // 否则会出现「标记已清、轮询已恢复，接口却返回失败」的状态不一致。降级为只记日志。
+        if let Err(e) = self.trigger_one(id).await {
+            warn!(
+                "share-sync: 订阅 {} 恢复后立即触发失败（已恢复轮询，下个周期会自动重试）: {}",
+                id, e
+            );
+        }
         Ok(())
     }
 
@@ -714,6 +721,12 @@ impl ShareSyncManager {
         // 避免并发 run 重复转存同一批文件并产生快照基线竞争。
         if self.running.insert(id.to_string(), ()).is_some() {
             debug!("share-sync: 订阅 {} 已有 run 在执行，跳过本次触发", id);
+            // trigger_one 预建的 run 已写库并广播 RunStarted，但本次执行被去重拦下、
+            // 不会再走到收尾，需在此 fail_run，避免留下永远 running 的孤儿 run。
+            if let Some(rid) = given_run_id.as_deref() {
+                let owner_uid = self.get_subscription(id).map(|s| s.owner_uid).unwrap_or(0);
+                self.fail_run(rid, id, owner_uid, "已有同步任务在执行，已取消本次触发");
+            }
             return Err(ShareSyncError::AlreadyRunning(id.into()));
         }
         // RAII 守卫：无论从哪条分支返回都移除 in-flight 标记。
@@ -744,37 +757,46 @@ impl ShareSyncManager {
                 "share-sync: 订阅 {} 链接已失效（已暂停），跳过本次触发；等待用户更新链接后恢复",
                 id
             );
-            return Err(ShareSyncError::ShareLinkError(
-                sub.link_invalid_reason
-                    .clone()
-                    .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into()),
-            ));
+            let reason = sub
+                .link_invalid_reason
+                .clone()
+                .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into());
+            // 同上：收尾 trigger_one 预建的 run，避免孤儿 running。
+            if let Some(rid) = given_run_id.as_deref() {
+                self.fail_run(rid, id, sub.owner_uid, &reason);
+            }
+            return Err(ShareSyncError::ShareLinkError(reason));
         }
 
         // 多账号隔离：按订阅 owner_uid 解析**该账号**的网盘客户端与转存管理器，
         // 而非进程当前活跃账号。后台调度对账号 A 的订阅始终用账号 A 的实例，
         // 账号切换无需 relink。任一未就绪 → 明确报错，绝不落到错误账号。
         let owner_uid = sub.owner_uid;
-        let netdisk = self
-            .resolver
-            .netdisk_client(owner_uid)
-            .await
-            .ok_or_else(|| {
-                ShareSyncError::ConfigError(format!(
+        let netdisk = match self.resolver.netdisk_client(owner_uid).await {
+            Some(c) => c,
+            None => {
+                let msg = format!(
                     "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
                     owner_uid
-                ))
-            })?;
-        let transfer = self
-            .resolver
-            .transfer_manager(owner_uid)
-            .await
-            .ok_or_else(|| {
-                ShareSyncError::ConfigError(format!(
-                    "订阅所属账号(uid={})的转存管理器未就绪",
-                    owner_uid
-                ))
-            })?;
+                );
+                // 收尾 trigger_one 预建的 run，避免孤儿 running。
+                if let Some(rid) = given_run_id.as_deref() {
+                    self.fail_run(rid, id, owner_uid, &msg);
+                }
+                return Err(ShareSyncError::ConfigError(msg));
+            }
+        };
+        let transfer = match self.resolver.transfer_manager(owner_uid).await {
+            Some(t) => t,
+            None => {
+                let msg = format!("订阅所属账号(uid={})的转存管理器未就绪", owner_uid);
+                // 收尾 trigger_one 预建的 run，避免孤儿 running。
+                if let Some(rid) = given_run_id.as_deref() {
+                    self.fail_run(rid, id, owner_uid, &msg);
+                }
+                return Err(ShareSyncError::ConfigError(msg));
+            }
+        };
 
         let run_id = match given_run_id {
             Some(rid) => rid,
