@@ -1606,8 +1606,12 @@ function formatDate(dateStr: string): string {
 // 锚点导航：平滑滚动到指定分区
 function scrollToSection(id: string) {
   const el = document.getElementById(id)
-  if (el) {
-    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  const container = contentRef.value
+  if (el && container) {
+    // 仅滚动设置内容容器，避免 scrollIntoView 连带滚动外层（overflow:hidden 仍可被程序滚动），
+    // 否则会把顶部「保存设置」栏一起顶出可视区。
+    const top = el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop
+    container.scrollTo({ top, behavior: 'smooth' })
   }
 }
 
@@ -1650,9 +1654,8 @@ onMounted(() => {
       // 在表单 v-if=formData 完成后才挂载；用 requestAnimationFrame 链等待 1 帧通常足够，
       // 复杂场景下用 nextTick 多次等待。账号 section 不依赖 formData，所以可立即滚动）
       nextTick(() => {
-        const el = document.getElementById(targetId)
-        if (el) {
-          el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        if (document.getElementById(targetId)) {
+          scrollToSection(targetId)
           activeSection.value = targetId
         }
       })
@@ -1673,7 +1676,7 @@ onUnmounted(() => {
 <style scoped lang="scss">
 .settings-container {
   width: 100%;
-  height: 100vh;
+  height: 100%;
   background: #f5f5f5;
 }
 
