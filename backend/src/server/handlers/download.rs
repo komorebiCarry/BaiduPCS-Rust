@@ -146,11 +146,15 @@ pub async fn create_download(
                 info!("文件已存在，已跳过下载");
                 return Ok(Json(ApiResponse::success_with_message(
                     task_id,
-                    "文件已存在，已跳过"
+                    "文件已存在，已跳过",
                 )));
             }
 
-            info!("创建下载任务成功: {} (effective_uid={})", task_id, effective_uid.raw());
+            info!(
+                "创建下载任务成功: {} (effective_uid={})",
+                task_id,
+                effective_uid.raw()
+            );
 
             // 自动开始下载
             if let Err(e) = download_manager.start_task(&task_id).await {
@@ -244,8 +248,7 @@ pub async fn get_active_downloads(
         .filter(|t| {
             matches!(
                 t.status,
-                crate::downloader::TaskStatus::Downloading
-                    | crate::downloader::TaskStatus::Pending
+                crate::downloader::TaskStatus::Downloading | crate::downloader::TaskStatus::Pending
             )
         })
         .collect();
@@ -487,7 +490,13 @@ pub async fn create_batch_download(
         if item.is_dir {
             // 文件夹下载
             match folder_download_manager
-                .create_folder_download_with_dir(item.path.clone(), &target_dir, item.original_name.clone(), conflict_strategy, owner_uid)
+                .create_folder_download_with_dir(
+                    item.path.clone(),
+                    &target_dir,
+                    item.original_name.clone(),
+                    conflict_strategy,
+                    owner_uid,
+                )
                 .await
             {
                 Ok(folder_id) => {
@@ -563,7 +572,7 @@ pub async fn create_batch_download(
 
 // ==================== 批量操作 ====================
 
-use super::common::{BatchOperationRequest, BatchOperationItem, BatchOperationResponse};
+use super::common::{BatchOperationItem, BatchOperationRequest, BatchOperationResponse};
 
 /// POST /api/v1/downloads/batch/pause
 pub async fn batch_pause_downloads(
@@ -575,7 +584,8 @@ pub async fn batch_pause_downloads(
         Some(u) => u,
         None => return Err(StatusCode::UNAUTHORIZED),
     };
-    let mgr = app_state.download_manager_for(uid)
+    let mgr = app_state
+        .download_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // 显式 task_ids 必须每条校验 owner_uid，不能直接下发到底层 manager
@@ -587,16 +597,27 @@ pub async fn batch_pause_downloads(
     };
 
     let raw = mgr.batch_pause(&allowed_ids).await;
-    let mut results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let mut results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
     // 合并 denied 项（owner 不匹配 / 任务不存在 / 备份任务）
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
 
 /// POST /api/v1/downloads/batch/resume
@@ -608,7 +629,8 @@ pub async fn batch_resume_downloads(
         Some(u) => u,
         None => return Err(StatusCode::UNAUTHORIZED),
     };
-    let mgr = app_state.download_manager_for(uid)
+    let mgr = app_state
+        .download_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let (allowed_ids, denied_pairs) = if req.all == Some(true) {
@@ -619,15 +641,26 @@ pub async fn batch_resume_downloads(
     };
 
     let raw = mgr.batch_resume(&allowed_ids).await;
-    let mut results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let mut results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }
 
 /// POST /api/v1/downloads/batch/delete
@@ -639,7 +672,8 @@ pub async fn batch_delete_downloads(
         Some(u) => u,
         None => return Err(StatusCode::UNAUTHORIZED),
     };
-    let mgr = app_state.download_manager_for(uid)
+    let mgr = app_state
+        .download_manager_for(uid)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let delete_files = req.delete_files.unwrap_or(false);
@@ -651,13 +685,24 @@ pub async fn batch_delete_downloads(
     };
 
     let raw = mgr.batch_delete(&allowed_ids, delete_files).await;
-    let mut results: Vec<BatchOperationItem> = raw.into_iter()
-        .map(|(id, ok, err)| BatchOperationItem { task_id: id, success: ok, error: err })
+    let mut results: Vec<BatchOperationItem> = raw
+        .into_iter()
+        .map(|(id, ok, err)| BatchOperationItem {
+            task_id: id,
+            success: ok,
+            error: err,
+        })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
-    Ok(Json(ApiResponse::success(BatchOperationResponse::from_results(results))))
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
+    Ok(Json(ApiResponse::success(
+        BatchOperationResponse::from_results(results),
+    )))
 }

@@ -14,10 +14,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::autobackup::config::BackupConfig;
-use crate::encryption::EncryptionService;
 use crate::autobackup::priority::{PrepareResourcePool, Priority, PriorityContext, SlotManager};
 use crate::autobackup::record::BackupRecordManager;
 use crate::autobackup::task::BackupFileTask;
+use crate::encryption::EncryptionService;
 
 /// 文件任务执行上下文
 #[derive(Debug, Clone)]
@@ -218,12 +218,8 @@ impl BackupScheduler {
                 };
 
                 // 执行加密（不可中断）
-                let encryption_result = Self::encrypt_file(
-                    &context.local_path,
-                    &temp_dir,
-                    &encryption_service,
-                )
-                .await;
+                let encryption_result =
+                    Self::encrypt_file(&context.local_path, &temp_dir, &encryption_service).await;
 
                 match encryption_result {
                     Ok((temp_path, encrypted_name)) => {
@@ -360,7 +356,13 @@ impl BackupScheduler {
     }
 
     /// 标记文件上传失败
-    pub fn mark_file_failed(&self, file_task_id: &str, backup_task_id: &str, error: String, retryable: bool) {
+    pub fn mark_file_failed(
+        &self,
+        file_task_id: &str,
+        backup_task_id: &str,
+        error: String,
+        retryable: bool,
+    ) {
         // 释放槽位
         self.slot_manager.release(file_task_id);
         self.uploading_count
@@ -409,8 +411,12 @@ impl BackupScheduler {
     /// 获取调度器状态
     pub fn get_status(&self) -> SchedulerStatus {
         let queue_len = self.upload_queue.read().len();
-        let preparing = self.preparing_count.load(std::sync::atomic::Ordering::SeqCst);
-        let uploading = self.uploading_count.load(std::sync::atomic::Ordering::SeqCst);
+        let preparing = self
+            .preparing_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let uploading = self
+            .uploading_count
+            .load(std::sync::atomic::Ordering::SeqCst);
         let (scan_used, scan_total) = self.prepare_pool.scan_slots_info();
         let (encrypt_used, encrypt_total) = self.prepare_pool.encrypt_slots_info();
 

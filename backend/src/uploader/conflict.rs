@@ -14,7 +14,6 @@ pub enum UploadConflictStrategy {
     Overwrite,
 }
 
-
 /// 下载冲突策略
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,7 +27,6 @@ pub enum DownloadConflictStrategy {
     /// 自动重命名：目标文件存在时生成唯一名称
     AutoRename,
 }
-
 
 /// 冲突解决方案
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,9 +56,9 @@ pub enum ConflictResolution {
 /// - rtype=3: 直接覆盖已存在的文件（危险操作，可能导致数据丢失）
 pub fn conflict_strategy_to_rtype(strategy: UploadConflictStrategy) -> &'static str {
     match strategy {
-        UploadConflictStrategy::SmartDedup => "2",   // block_list 不同时重命名，相同则秒传
-        UploadConflictStrategy::AutoRename => "1",   // 路径冲突时重命名
-        UploadConflictStrategy::Overwrite => "3",    // 覆盖已存在文件
+        UploadConflictStrategy::SmartDedup => "2", // block_list 不同时重命名，相同则秒传
+        UploadConflictStrategy::AutoRename => "1", // 路径冲突时重命名
+        UploadConflictStrategy::Overwrite => "3",  // 覆盖已存在文件
     }
 }
 
@@ -96,10 +94,10 @@ mod tests {
         ) {
             // 序列化
             let serialized = serde_json::to_string(&strategy).unwrap();
-            
+
             // 反序列化
             let deserialized: UploadConflictStrategy = serde_json::from_str(&serialized).unwrap();
-            
+
             // 验证等价性
             prop_assert_eq!(strategy, deserialized);
         }
@@ -110,10 +108,10 @@ mod tests {
         ) {
             // 序列化
             let serialized = serde_json::to_string(&strategy).unwrap();
-            
+
             // 反序列化
             let deserialized: DownloadConflictStrategy = serde_json::from_str(&serialized).unwrap();
-            
+
             // 验证等价性
             prop_assert_eq!(strategy, deserialized);
         }
@@ -121,12 +119,18 @@ mod tests {
 
     #[test]
     fn test_upload_strategy_default() {
-        assert_eq!(UploadConflictStrategy::default(), UploadConflictStrategy::SmartDedup);
+        assert_eq!(
+            UploadConflictStrategy::default(),
+            UploadConflictStrategy::SmartDedup
+        );
     }
 
     #[test]
     fn test_download_strategy_default() {
-        assert_eq!(DownloadConflictStrategy::default(), DownloadConflictStrategy::Overwrite);
+        assert_eq!(
+            DownloadConflictStrategy::default(),
+            DownloadConflictStrategy::Overwrite
+        );
     }
 
     #[test]

@@ -81,10 +81,7 @@ impl AccountManager {
                 // 用 save_no_rolling 重写 accounts.json，
                 // 避免把坏的 accounts.json 滚动成新 .bak 覆盖掉刚刚被验证为好的 .bak。
                 if let Err(e) = mgr.save_no_rolling().await {
-                    warn!(
-                        "AccountManager: .bak 恢复后重写 accounts.json 失败: {}",
-                        e
-                    );
+                    warn!("AccountManager: .bak 恢复后重写 accounts.json 失败: {}", e);
                 }
                 Ok(mgr)
             }
@@ -98,9 +95,7 @@ impl AccountManager {
                 })
             }
             Err(e) => {
-                bail!(
-                    "AccountManager: accounts.json 与 accounts.json.bak 均损坏: bak err={e}"
-                );
+                bail!("AccountManager: accounts.json 与 accounts.json.bak 均损坏: bak err={e}");
             }
         }
     }
@@ -153,8 +148,7 @@ impl AccountManager {
             .with_extension(format!("json.tmp.{}", std::process::id()));
         let bak = self.accounts_file.with_extension("json.bak");
 
-        let json =
-            serde_json::to_string_pretty(&self.data).context("序列化 accounts.json 失败")?;
+        let json = serde_json::to_string_pretty(&self.data).context("序列化 accounts.json 失败")?;
 
         // 1) 写临时文件
         fs::write(&tmp, &json)
@@ -363,17 +357,12 @@ impl AccountManager {
                 // 用 save_no_rolling 重写主文件，
                 // 避免把损坏的 accounts.json 滚成新 .bak 覆盖好备份。
                 if let Err(e) = mgr.save_no_rolling().await {
-                    warn!(
-                        "AccountManager: .bak 恢复后重写 accounts.json 失败: {}",
-                        e
-                    );
+                    warn!("AccountManager: .bak 恢复后重写 accounts.json 失败: {}", e);
                 }
                 return Ok(mgr);
             }
             Ok(None) => {
-                info!(
-                    "AccountManager: accounts.json.bak 不存在，尝试 session.json 回退链路"
-                );
+                info!("AccountManager: accounts.json.bak 不存在，尝试 session.json 回退链路");
             }
             Err(e) => {
                 warn!(
@@ -392,9 +381,7 @@ impl AccountManager {
         if let Some(mgr) =
             Self::try_migrate_from_legacy(&migrated_session, accounts_file, false).await?
         {
-            warn!(
-                "AccountManager: 已从 session.json.migrated 历史快照恢复（最后兜底）"
-            );
+            warn!("AccountManager: 已从 session.json.migrated 历史快照恢复（最后兜底）");
             return Ok(mgr);
         }
 
@@ -561,7 +548,10 @@ mod tests {
 
         // 不存在的 uid 返回 false
         let cc = AccountConfig::default();
-        let r = mgr.update_user_custom_config(Uid::new(8), cc.clone()).await.unwrap();
+        let r = mgr
+            .update_user_custom_config(Uid::new(8), cc.clone())
+            .await
+            .unwrap();
         assert!(!r);
 
         // 存在的 uid 更新成功并落盘
@@ -574,7 +564,10 @@ mod tests {
             upload: AccountUploadConfig::default(),
         };
         new_cc.upload.max_global_threads = 6;
-        let r = mgr.update_user_custom_config(Uid::new(7), new_cc.clone()).await.unwrap();
+        let r = mgr
+            .update_user_custom_config(Uid::new(7), new_cc.clone())
+            .await
+            .unwrap();
         assert!(r);
 
         // 重新 load 验证持久化
@@ -642,8 +635,8 @@ mod tests {
             &accounts_file,
             serde_json::to_string_pretty(&existing).unwrap(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // 迁移应跳过
         let mgr = AccountManager::migrate_from_session(&session_file, &accounts_file)
@@ -690,9 +683,7 @@ mod tests {
             .unwrap();
 
         // accounts.json 是损坏的（非合法 JSON）
-        fs::write(&file, "{{ this is not json")
-            .await
-            .unwrap();
+        fs::write(&file, "{{ this is not json").await.unwrap();
 
         let mgr = AccountManager::load(&file).await.unwrap();
         assert_eq!(mgr.active_uid(), Some(Uid::new(11)));
@@ -854,10 +845,7 @@ mod tests {
 
         // .bak 应当保持不变（不能被损坏的 accounts.json 滚成新 .bak）
         let bak_after = fs::read_to_string(&bak).await.unwrap();
-        assert_eq!(
-            bak_after, good_json,
-            ".bak 在恢复路径里被错误覆盖了"
-        );
+        assert_eq!(bak_after, good_json, ".bak 在恢复路径里被错误覆盖了");
 
         // accounts.json 应当被修好（写入 .bak 内容）
         let main_after = fs::read_to_string(&file).await.unwrap();
@@ -902,9 +890,12 @@ mod tests {
 
         // 旧 session.json（要迁移的当前数据）
         let user_curr = UserAuth::new(42, "current".into(), "bduss_curr".into());
-        fs::write(&session_file, serde_json::to_string_pretty(&user_curr).unwrap())
-            .await
-            .unwrap();
+        fs::write(
+            &session_file,
+            serde_json::to_string_pretty(&user_curr).unwrap(),
+        )
+        .await
+        .unwrap();
 
         // 已存在的 .migrated（历史快照，必须保留）
         let user_old = UserAuth::new(7, "ancient".into(), "bduss_old".into());

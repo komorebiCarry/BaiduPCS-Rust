@@ -1,6 +1,6 @@
 // 认证API处理器
 
-use crate::auth::{CookieLoginAuth, CookieLoginApiRequest, QRCode, QRCodeStatus, Uid, UserAuth};
+use crate::auth::{CookieLoginApiRequest, CookieLoginAuth, QRCode, QRCodeStatus, Uid, UserAuth};
 use crate::common::ProxyType;
 use crate::server::{broadcast_account_list_changed, set_active_uid, AppState};
 use crate::transfer::TransferManager;
@@ -105,12 +105,15 @@ pub async fn qrcode_status(
     // 否则会在尚未扫码时直接用旧账号返回 Success，误报"账号添加成功"。
     if !params.add {
         if let Some(user) = state.active_user_auth().await {
-            info!(
-                "检测到已有活跃账号: UID={}, 验证 BDUSS 有效性...",
-                user.uid
-            );
+            info!("检测到已有活跃账号: UID={}, 验证 BDUSS 有效性...", user.uid);
 
-            match state.qrcode_auth.read().await.verify_bduss(&user.bduss).await {
+            match state
+                .qrcode_auth
+                .read()
+                .await
+                .verify_bduss(&user.bduss)
+                .await
+            {
                 Ok(true) => {
                     info!("✅ BDUSS 仍然有效，直接返回登录成功状态");
 
@@ -144,7 +147,13 @@ pub async fn qrcode_status(
         }
     }
 
-    match state.qrcode_auth.read().await.poll_status(&params.sign).await {
+    match state
+        .qrcode_auth
+        .read()
+        .await
+        .poll_status(&params.sign)
+        .await
+    {
         Ok(status) => {
             // 如果登录成功，保存会话并初始化用户资源
             if let QRCodeStatus::Success { ref user, .. } = status {
@@ -179,7 +188,8 @@ pub async fn qrcode_status(
                 drop(config_guard);
 
                 // 设置代理回退管理器的用户代理配置
-                state.fallback_mgr
+                state
+                    .fallback_mgr
                     .set_user_proxy_config(proxy_config.clone())
                     .await;
 
@@ -188,7 +198,11 @@ pub async fn qrcode_status(
                 } else {
                     None
                 };
-                let client = match crate::netdisk::NetdiskClient::new_with_proxy(user.clone(), proxy_config.as_ref(), fallback_for_client.clone()) {
+                let client = match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user.clone(),
+                    proxy_config.as_ref(),
+                    fallback_for_client.clone(),
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("初始化网盘客户端失败: {}", e);
@@ -234,7 +248,8 @@ pub async fn qrcode_status(
                 let config = state.config.read().await;
                 let download_dir = config.download.download_dir.clone();
                 let cc = &updated_user.custom_config;
-                let vip = crate::downloader::budget_scheduler::VipType::from_raw(updated_user.vip_type);
+                let vip =
+                    crate::downloader::budget_scheduler::VipType::from_raw(updated_user.vip_type);
                 let recommended_threads = match vip {
                     crate::downloader::budget_scheduler::VipType::Normal => {
                         config.multi_account_vip_recommended.normal.threads
@@ -420,31 +435,22 @@ pub async fn qrcode_status(
 
                         // 初始化扫描管理器（如尚未存在）+ 注入 upload manager 池
                         {
-                            let scan_already_set =
-                                state.scan_manager.read().await.is_some();
+                            let scan_already_set = state.scan_manager.read().await.is_some();
                             if !scan_already_set {
-                                let max_pending = state
-                                    .config
-                                    .read()
-                                    .await
-                                    .scan
-                                    .max_pending_tasks;
-                                let wal_dir =
-                                    pm_arc.lock().await.wal_dir().clone();
-                                let scan_mgr =
-                                    crate::uploader::ScanManager::new_with_owner(
-                                        Arc::clone(&upload_manager_arc),
-                                        Arc::clone(&state.ws_manager),
-                                        Arc::clone(&state.memory_monitor),
-                                        wal_dir,
-                                        max_pending,
-                                        Some(crate::auth::Uid::new(updated_user.uid)),
-                                    );
+                                let max_pending = state.config.read().await.scan.max_pending_tasks;
+                                let wal_dir = pm_arc.lock().await.wal_dir().clone();
+                                let scan_mgr = crate::uploader::ScanManager::new_with_owner(
+                                    Arc::clone(&upload_manager_arc),
+                                    Arc::clone(&state.ws_manager),
+                                    Arc::clone(&state.memory_monitor),
+                                    wal_dir,
+                                    max_pending,
+                                    Some(crate::auth::Uid::new(updated_user.uid)),
+                                );
                                 scan_mgr
                                     .set_upload_manager_pool(Arc::clone(&state.upload_managers))
                                     .await;
-                                *state.scan_manager.write().await =
-                                    Some(Arc::new(scan_mgr));
+                                *state.scan_manager.write().await = Some(Arc::new(scan_mgr));
                                 info!("✅ 扫描管理器已初始化（含 per-uid upload 池）");
                             } else if let Some(scan_mgr) =
                                 state.scan_manager.read().await.as_ref().cloned()
@@ -472,11 +478,8 @@ pub async fn qrcode_status(
                         // 🔥 autobackup 提供 encryption_config_store 后，
                         // 统一为所有 per-uid manager 注入运行时依赖
                         // （folder_manager / snapshot / encryption_config_store / sender 共享）
-                        let registered_uids: Vec<crate::auth::Uid> = state
-                            .download_managers
-                            .iter()
-                            .map(|e| *e.key())
-                            .collect();
+                        let registered_uids: Vec<crate::auth::Uid> =
+                            state.download_managers.iter().map(|e| *e.key()).collect();
                         for uid in registered_uids {
                             if let Err(e) = state.wire_manager_runtime_deps_for_uid(uid).await {
                                 warn!(
@@ -496,8 +499,7 @@ pub async fn qrcode_status(
                         info!("✅ 离线下载监听服务初始化完成");
 
                         // 🔥 登录成功后激活账号 + 广播事件
-                        if let Err(e) =
-                            add_account_and_activate(&state, updated_user.clone()).await
+                        if let Err(e) = add_account_and_activate(&state, updated_user.clone()).await
                         {
                             error!("qrcode_status add_account_and_activate 失败: {}", e);
                         }
@@ -540,7 +542,10 @@ pub async fn get_current_user(
         }
     };
 
-    info!("✅ 找到活跃账号: UID={}, 用户名={}", user.uid, user.username);
+    info!(
+        "✅ 找到活跃账号: UID={}, 用户名={}",
+        user.uid, user.username
+    );
 
     // 验证 BDUSS 是否仍然有效
     match state
@@ -730,12 +735,7 @@ pub async fn cookie_login(
     }
 
     // 返回最新内存中的用户信息（包含预热后更新的字段）
-    let final_user = state
-        .current_user
-        .read()
-        .await
-        .clone()
-        .unwrap_or(user);
+    let final_user = state.current_user.read().await.clone().unwrap_or(user);
 
     // 根据预热结果决定响应 message
     let warmup_ok = final_user.panpsc.is_some() && final_user.csrf_token.is_some();
@@ -750,8 +750,11 @@ pub async fn cookie_login(
     if warmup_ok {
         info!("✅ Cookie 登录完成，预热成功: UID={}", final_user.uid);
     } else {
-        warn!("⚠️ Cookie 登录完成，但预热未成功: ptoken={}, panpsc={}",
-            has_ptoken, final_user.panpsc.is_some());
+        warn!(
+            "⚠️ Cookie 登录完成，但预热未成功: ptoken={}, panpsc={}",
+            has_ptoken,
+            final_user.panpsc.is_some()
+        );
     }
 
     Ok(Json(ApiResponse::success_with_message(final_user, message)))
@@ -806,7 +809,10 @@ pub async fn add_account_and_activate(state: &AppState, user: UserAuth) -> anyho
     }
 
     // Step 2: 注册到 BudgetScheduler
-    state.budget_scheduler.add_account(uid, vip, dl_req, up_req).await;
+    state
+        .budget_scheduler
+        .add_account(uid, vip, dl_req, up_req)
+        .await;
     info!(
         "add_account_and_activate: uid={} 已注册到 BudgetScheduler (vip={:?}, auto={}, dl_req={:?}, up_req={:?})",
         uid.raw(), vip, auto, dl_req, up_req

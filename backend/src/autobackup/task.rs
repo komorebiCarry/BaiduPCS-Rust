@@ -1,9 +1,9 @@
 //! 备份任务数据结构
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::collections::{HashSet, HashMap};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// 备份任务状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,11 +359,13 @@ impl BackupTaskRuntime {
     }
 
     pub fn increment_completed(&self) {
-        self.completed_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn add_transferred_bytes(&self, bytes: u64) {
-        self.transferred_bytes.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.transferred_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -375,7 +377,8 @@ impl BackupTaskRuntime {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn pause(&self) {
@@ -383,6 +386,7 @@ impl BackupTaskRuntime {
     }
 
     pub fn resume(&self) {
-        self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }

@@ -153,7 +153,11 @@ impl PriorityManager {
     }
 
     /// 获取应该被抢占的任务优先级
-    pub fn get_preempt_target(&self, priority: Priority, context: &PriorityContext) -> Option<Priority> {
+    pub fn get_preempt_target(
+        &self,
+        priority: Priority,
+        context: &PriorityContext,
+    ) -> Option<Priority> {
         if context.active_count >= self.max_concurrent {
             // 需要抢占
             match priority {
@@ -279,7 +283,9 @@ impl SlotManager {
         if active.total() < self.max_concurrent {
             // 对于备份任务，还需要检查是否有高优先级任务在等待
             if priority == Priority::Backup {
-                let has_higher_waiting = waiting.iter().any(|w| w.priority.value() < priority.value());
+                let has_higher_waiting = waiting
+                    .iter()
+                    .any(|w| w.priority.value() < priority.value());
                 if has_higher_waiting {
                     return SlotAcquireResult::Wait;
                 }
@@ -316,7 +322,9 @@ impl SlotManager {
             queued_at: std::time::Instant::now(),
         };
 
-        let pos = queue.iter().position(|w| w.priority.value() > priority.value())
+        let pos = queue
+            .iter()
+            .position(|w| w.priority.value() > priority.value())
             .unwrap_or(queue.len());
         queue.insert(pos, task);
     }
@@ -399,7 +407,9 @@ impl PrepareResourcePool {
     }
 
     /// 获取扫描许可
-    pub async fn acquire_scan_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    pub async fn acquire_scan_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.scan_semaphore.clone().acquire_owned().await
     }
 
@@ -409,7 +419,9 @@ impl PrepareResourcePool {
     }
 
     /// 获取加密许可
-    pub async fn acquire_encrypt_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    pub async fn acquire_encrypt_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.encrypt_semaphore.clone().acquire_owned().await
     }
 
@@ -421,13 +433,19 @@ impl PrepareResourcePool {
     /// 获取当前扫描槽位使用情况
     pub fn scan_slots_info(&self) -> (usize, usize) {
         let available = self.scan_semaphore.available_permits();
-        (self.max_concurrent_scans - available, self.max_concurrent_scans)
+        (
+            self.max_concurrent_scans - available,
+            self.max_concurrent_scans,
+        )
     }
 
     /// 获取当前加密槽位使用情况
     pub fn encrypt_slots_info(&self) -> (usize, usize) {
         let available = self.encrypt_semaphore.available_permits();
-        (self.max_concurrent_encrypts - available, self.max_concurrent_encrypts)
+        (
+            self.max_concurrent_encrypts - available,
+            self.max_concurrent_encrypts,
+        )
     }
 }
 
@@ -599,9 +617,18 @@ mod tests {
             active_subtask_count: 0,
             active_backup_count: 1,
         };
-        assert_eq!(manager.get_preempt_target(Priority::Normal, &context_full), Some(Priority::Backup));
-        assert_eq!(manager.get_preempt_target(Priority::SubTask, &context_full), Some(Priority::Backup));
-        assert_eq!(manager.get_preempt_target(Priority::Backup, &context_full), None);
+        assert_eq!(
+            manager.get_preempt_target(Priority::Normal, &context_full),
+            Some(Priority::Backup)
+        );
+        assert_eq!(
+            manager.get_preempt_target(Priority::SubTask, &context_full),
+            Some(Priority::Backup)
+        );
+        assert_eq!(
+            manager.get_preempt_target(Priority::Backup, &context_full),
+            None
+        );
     }
 
     #[test]
@@ -620,7 +647,10 @@ mod tests {
 
         // Slots full, normal task should preempt backup
         let result4 = manager.try_acquire("task4", Priority::Normal);
-        assert!(matches!(result4, SlotAcquireResult::Preempt(Priority::Backup)));
+        assert!(matches!(
+            result4,
+            SlotAcquireResult::Preempt(Priority::Backup)
+        ));
 
         // Backup task should wait
         let result5 = manager.try_acquire("task5", Priority::Backup);

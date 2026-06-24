@@ -96,20 +96,17 @@ pub async fn switch_account(
 
     // 🔥 切换前确保 NetdiskClient 在 client_pool 中已存在；
     // preheat 启动期可能失败，此处兜底懒加载，避免切换后 active_client() 返回 None 导致 401 误报。
-    state
-        .ensure_client_for_uid(target_uid)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "切换前懒加载 client 失败: uid={}, err={:?}",
-                target_uid.raw(),
-                e
-            );
-            ApiError::Internal(anyhow::anyhow!(
-                "切换账号失败: 无法构造目标账号客户端 ({})",
-                e
-            ))
-        })?;
+    state.ensure_client_for_uid(target_uid).await.map_err(|e| {
+        tracing::error!(
+            "切换前懒加载 client 失败: uid={}, err={:?}",
+            target_uid.raw(),
+            e
+        );
+        ApiError::Internal(anyhow::anyhow!(
+            "切换账号失败: 无法构造目标账号客户端 ({})",
+            e
+        ))
+    })?;
 
     // 🔥 切换前补建/补齐 manager + 运行时依赖
     //
@@ -333,10 +330,7 @@ async fn scan_running_tasks_for_uid(state: &AppState, target_uid: Uid) -> Option
     let mut fd_running = 0usize;
     for f in state.folder_download_manager.get_all_folders().await {
         if f.owner_uid == target_uid
-            && matches!(
-                f.status,
-                FolderStatus::Scanning | FolderStatus::Downloading
-            )
+            && matches!(f.status, FolderStatus::Scanning | FolderStatus::Downloading)
         {
             fd_running += 1;
         }

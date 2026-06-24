@@ -11,11 +11,11 @@
 //! - 执行中触发会被合并，不丢、不并发
 //! - 轮询和监听共用一套逻辑
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use parking_lot::RwLock;
 
 /// 触发来源
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +125,8 @@ impl TaskController {
         if self.cancel_token.is_cancelled() {
             tracing::debug!(
                 "配置 {} 控制器已取消，忽略触发（来源: {}）",
-                self.config_id, source
+                self.config_id,
+                source
             );
             return false;
         }
@@ -141,12 +142,14 @@ impl TaskController {
             if !was_pending {
                 tracing::debug!(
                     "配置 {} 正在执行，标记 pending（来源: {}）",
-                    self.config_id, source
+                    self.config_id,
+                    source
                 );
             } else {
                 tracing::trace!(
                     "配置 {} 正在执行且已有 pending，忽略重复触发（来源: {}）",
-                    self.config_id, source
+                    self.config_id,
+                    source
                 );
             }
             return true;
@@ -215,7 +218,7 @@ impl TaskController {
     }
 
     /// 请求暂停（用于优雅关闭）
-    /// 
+    ///
     /// 暂停请求不会立即停止正在执行的任务，而是：
     /// - 阻止新的触发被处理
     /// - 让当前执行的任务完成后不再继续
@@ -257,10 +260,8 @@ impl TaskController {
 ///     do_backup().await
 /// }).await;
 /// ```
-pub async fn task_loop<F, Fut>(
-    controller: Arc<TaskController>,
-    mut task_fn: F,
-) where
+pub async fn task_loop<F, Fut>(controller: Arc<TaskController>, mut task_fn: F)
+where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
@@ -302,13 +303,15 @@ pub async fn task_loop<F, Fut>(
             // 增加执行计数
             controller.execution_count.fetch_add(1, Ordering::Relaxed);
 
-            let trigger_source = controller.last_trigger_source()
+            let trigger_source = controller
+                .last_trigger_source()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
             tracing::info!(
                 "配置 {} 开始执行扫描任务（触发来源: {}）",
-                config_id, trigger_source
+                config_id,
+                trigger_source
             );
             let start = std::time::Instant::now();
 
@@ -327,15 +330,14 @@ pub async fn task_loop<F, Fut>(
             let elapsed = start.elapsed();
             match result {
                 Ok(()) => {
-                    tracing::info!(
-                        "配置 {} 扫描任务完成，耗时 {:.2?}",
-                        config_id, elapsed
-                    );
+                    tracing::info!("配置 {} 扫描任务完成，耗时 {:.2?}", config_id, elapsed);
                 }
                 Err(e) => {
                     tracing::error!(
                         "配置 {} 扫描任务失败: {}，耗时 {:.2?}",
-                        config_id, e, elapsed
+                        config_id,
+                        e,
+                        elapsed
                     );
                 }
             }
@@ -345,10 +347,7 @@ pub async fn task_loop<F, Fut>(
 
             // 检查执行期间是否又被触发过
             if controller.pending.load(Ordering::Acquire) {
-                tracing::info!(
-                    "配置 {} 执行期间有新触发，立即重新执行",
-                    config_id
-                );
+                tracing::info!("配置 {} 执行期间有新触发，立即重新执行", config_id);
                 // 重新标记为执行中
                 controller.running.store(true, Ordering::Release);
                 continue;
@@ -448,7 +447,8 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     Ok(())
                 }
-            }).await;
+            })
+            .await;
         });
 
         // 等待一小段时间让循环启动
@@ -486,7 +486,8 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     Ok(())
                 }
-            }).await;
+            })
+            .await;
         });
 
         // 等待循环启动
@@ -547,7 +548,8 @@ mod tests {
                     }
                     Ok(())
                 }
-            }).await;
+            })
+            .await;
         });
 
         // 等待循环启动

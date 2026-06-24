@@ -45,7 +45,10 @@ impl EncryptionService {
     pub fn from_base64_key(key_base64: &str, algorithm: EncryptionAlgorithm) -> Result<Self> {
         let key_bytes = BASE64.decode(key_base64)?;
         if key_bytes.len() != 32 {
-            return Err(anyhow!("Invalid key length: expected 32, got {}", key_bytes.len()));
+            return Err(anyhow!(
+                "Invalid key length: expected 32, got {}",
+                key_bytes.len()
+            ));
         }
 
         let mut master_key = [0u8; 32];
@@ -144,7 +147,11 @@ impl EncryptionService {
     }
 
     /// 加密文件（分块模式，适合大文件）
-    pub fn encrypt_file_chunked(&self, input_path: &Path, output_path: &Path) -> Result<EncryptionMetadata> {
+    pub fn encrypt_file_chunked(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+    ) -> Result<EncryptionMetadata> {
         let input_file = std::fs::File::open(input_path)?;
         let file_size = input_file.metadata()?.len();
         let total_chunks = (file_size as usize).div_ceil(DEFAULT_CHUNK_SIZE) as u32;
@@ -550,7 +557,8 @@ impl EncryptionService {
     /// 判断文件名是否为加密文件（通过文件名判断）
     /// 检查文件名是否为 UUID.dat 格式
     pub fn is_encrypted_filename(filename: &str) -> bool {
-        filename.strip_suffix(ENCRYPTED_FILE_EXTENSION)
+        filename
+            .strip_suffix(ENCRYPTED_FILE_EXTENSION)
             .and_then(|stem| uuid::Uuid::parse_str(stem).ok())
             .is_some()
     }
@@ -558,7 +566,8 @@ impl EncryptionService {
     /// 从加密文件名提取 UUID
     /// 返回 None 如果文件名格式不正确
     pub fn extract_uuid_from_encrypted_name(filename: &str) -> Option<&str> {
-        filename.strip_suffix(ENCRYPTED_FILE_EXTENSION)
+        filename
+            .strip_suffix(ENCRYPTED_FILE_EXTENSION)
             .filter(|stem| uuid::Uuid::parse_str(stem).is_ok())
     }
 }
@@ -618,7 +627,11 @@ impl StreamingEncryptionService {
     }
 
     /// 创建带自定义分块大小的流式加密服务
-    pub fn with_chunk_size(master_key: [u8; 32], algorithm: EncryptionAlgorithm, chunk_size: usize) -> Self {
+    pub fn with_chunk_size(
+        master_key: [u8; 32],
+        algorithm: EncryptionAlgorithm,
+        chunk_size: usize,
+    ) -> Self {
         Self {
             master_key,
             algorithm,
@@ -630,7 +643,10 @@ impl StreamingEncryptionService {
     pub fn from_base64_key(key_base64: &str, algorithm: EncryptionAlgorithm) -> Result<Self> {
         let key_bytes = BASE64.decode(key_base64)?;
         if key_bytes.len() != 32 {
-            return Err(anyhow!("Invalid key length: expected 32, got {}", key_bytes.len()));
+            return Err(anyhow!(
+                "Invalid key length: expected 32, got {}",
+                key_bytes.len()
+            ));
         }
 
         let mut master_key = [0u8; 32];
@@ -725,7 +741,9 @@ impl StreamingEncryptionService {
 
             // 写入块 Nonce 和密文长度和密文
             writer.write_all(&chunk_nonce).await?;
-            writer.write_all(&(ciphertext.len() as u32).to_le_bytes()).await?;
+            writer
+                .write_all(&(ciphertext.len() as u32).to_le_bytes())
+                .await?;
             writer.write_all(&ciphertext).await?;
 
             chunk_index += 1;
@@ -900,7 +918,9 @@ impl StreamingEncryptionService {
 
             // 写入块 Nonce 和密文长度和密文
             writer.write_all(&chunk_nonce).await?;
-            writer.write_all(&(ciphertext.len() as u32).to_le_bytes()).await?;
+            writer
+                .write_all(&(ciphertext.len() as u32).to_le_bytes())
+                .await?;
             writer.write_all(&ciphertext).await?;
 
             // 🔥 更新进度
@@ -1068,7 +1088,9 @@ mod tests {
         let service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
 
         // 加密
-        let metadata = service.encrypt_file_chunked(&input_path, &encrypted_path).unwrap();
+        let metadata = service
+            .encrypt_file_chunked(&input_path, &encrypted_path)
+            .unwrap();
         assert!(metadata.encrypted_size > 0);
         assert_eq!(metadata.version, 1); // v1 格式
 
@@ -1076,7 +1098,9 @@ mod tests {
         assert!(EncryptionService::is_encrypted_file(&encrypted_path).unwrap());
 
         // 解密
-        service.decrypt_file(&encrypted_path, &decrypted_path).unwrap();
+        service
+            .decrypt_file(&encrypted_path, &decrypted_path)
+            .unwrap();
 
         // 验证内容
         let original = std::fs::read_to_string(&input_path).unwrap();
@@ -1099,7 +1123,9 @@ mod tests {
         let service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
 
         // 使用分块加密
-        let metadata = service.encrypt_file_chunked(&input_path, &encrypted_path).unwrap();
+        let metadata = service
+            .encrypt_file_chunked(&input_path, &encrypted_path)
+            .unwrap();
         assert!(metadata.encrypted_size > 0);
         assert_eq!(metadata.version, 1); // 统一使用 v1 格式
 
@@ -1107,7 +1133,9 @@ mod tests {
         assert!(EncryptionService::is_encrypted_file(&encrypted_path).unwrap());
 
         // 解密
-        service.decrypt_file(&encrypted_path, &decrypted_path).unwrap();
+        service
+            .decrypt_file(&encrypted_path, &decrypted_path)
+            .unwrap();
 
         // 验证内容
         let decrypted = std::fs::read(&decrypted_path).unwrap();
@@ -1156,7 +1184,9 @@ mod tests {
         let service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
 
         let key_base64 = service.get_key_base64();
-        let service2 = EncryptionService::from_base64_key(&key_base64, EncryptionAlgorithm::Aes256Gcm).unwrap();
+        let service2 =
+            EncryptionService::from_base64_key(&key_base64, EncryptionAlgorithm::Aes256Gcm)
+                .unwrap();
 
         // 验证两个服务可以互相解密
         let plaintext = b"Test data for key roundtrip";
@@ -1198,13 +1228,16 @@ mod tests {
     #[test]
     fn test_is_encrypted_filename() {
         // 有效的加密文件名：UUID.dat
-        assert!(EncryptionService::is_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"));
+        assert!(EncryptionService::is_encrypted_filename(
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"
+        ));
         // 无效的文件名
         assert!(!EncryptionService::is_encrypted_filename("normal_file.txt"));
-        assert!(!EncryptionService::is_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.txt"));
+        assert!(!EncryptionService::is_encrypted_filename(
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.txt"
+        ));
         assert!(!EncryptionService::is_encrypted_filename("not-a-uuid.dat"));
     }
-
 
     #[test]
     fn test_is_encrypted_file() {
@@ -1219,14 +1252,17 @@ mod tests {
         let encrypted_file = dir.path().join("encrypted.bkup");
         let key = EncryptionService::generate_master_key();
         let service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
-        service.encrypt_file_chunked(&normal_file, &encrypted_file).unwrap();
+        service
+            .encrypt_file_chunked(&normal_file, &encrypted_file)
+            .unwrap();
         assert!(EncryptionService::is_encrypted_file(&encrypted_file).unwrap());
     }
 
     #[test]
     fn test_invalid_key_length() {
         let invalid_key = "dG9vX3Nob3J0"; // "too_short" in base64
-        let result = EncryptionService::from_base64_key(invalid_key, EncryptionAlgorithm::Aes256Gcm);
+        let result =
+            EncryptionService::from_base64_key(invalid_key, EncryptionAlgorithm::Aes256Gcm);
         assert!(result.is_err());
     }
 
@@ -1260,11 +1296,15 @@ mod tests {
         let service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
 
         // 加密空文件
-        let metadata = service.encrypt_file_chunked(&input_path, &encrypted_path).unwrap();
+        let metadata = service
+            .encrypt_file_chunked(&input_path, &encrypted_path)
+            .unwrap();
         assert_eq!(metadata.original_size, 0);
 
         // 解密
-        service.decrypt_file(&encrypted_path, &decrypted_path).unwrap();
+        service
+            .decrypt_file(&encrypted_path, &decrypted_path)
+            .unwrap();
 
         // 验证内容
         let decrypted = std::fs::read(&decrypted_path).unwrap();
@@ -1301,7 +1341,10 @@ mod tests {
         let service = StreamingEncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
 
         // 流式加密
-        let metadata = service.encrypt_file_streaming(&input_path, &encrypted_path).await.unwrap();
+        let metadata = service
+            .encrypt_file_streaming(&input_path, &encrypted_path)
+            .await
+            .unwrap();
         assert!(metadata.encrypted_size > 0);
         assert_eq!(metadata.version, 1);
         assert_eq!(metadata.algorithm, EncryptionAlgorithm::Aes256Gcm);
@@ -1310,7 +1353,10 @@ mod tests {
         assert!(EncryptionService::is_encrypted_file(&encrypted_path).unwrap());
 
         // 流式解密
-        let original_size = service.decrypt_file_streaming(&encrypted_path, &decrypted_path).await.unwrap();
+        let original_size = service
+            .decrypt_file_streaming(&encrypted_path, &decrypted_path)
+            .await
+            .unwrap();
         assert_eq!(original_size, test_data.len() as u64);
 
         // 验证内容
@@ -1333,12 +1379,18 @@ mod tests {
         let service = StreamingEncryptionService::new(key, EncryptionAlgorithm::ChaCha20Poly1305);
 
         // 流式加密
-        let metadata = service.encrypt_file_streaming(&input_path, &encrypted_path).await.unwrap();
+        let metadata = service
+            .encrypt_file_streaming(&input_path, &encrypted_path)
+            .await
+            .unwrap();
         assert_eq!(metadata.version, 1);
         assert_eq!(metadata.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
 
         // 流式解密
-        service.decrypt_file_streaming(&encrypted_path, &decrypted_path).await.unwrap();
+        service
+            .decrypt_file_streaming(&encrypted_path, &decrypted_path)
+            .await
+            .unwrap();
 
         // 验证内容
         let decrypted = std::fs::read_to_string(&decrypted_path).unwrap();
@@ -1355,21 +1407,33 @@ mod tests {
         // 创建一个大于分块大小的测试文件（使用小分块测试多块场景）
         // 使用 1MB 分块，创建 2.5MB 文件
         let chunk_size = 1024 * 1024; // 1MB
-        let test_data: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2)).map(|i| (i % 256) as u8).collect();
+        let test_data: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2))
+            .map(|i| (i % 256) as u8)
+            .collect();
         std::fs::write(&input_path, &test_data).unwrap();
 
         let key = EncryptionService::generate_master_key();
-        let service = StreamingEncryptionService::with_chunk_size(key, EncryptionAlgorithm::Aes256Gcm, chunk_size);
+        let service = StreamingEncryptionService::with_chunk_size(
+            key,
+            EncryptionAlgorithm::Aes256Gcm,
+            chunk_size,
+        );
 
         assert_eq!(service.chunk_size(), chunk_size);
 
         // 流式加密
-        let metadata = service.encrypt_file_streaming(&input_path, &encrypted_path).await.unwrap();
+        let metadata = service
+            .encrypt_file_streaming(&input_path, &encrypted_path)
+            .await
+            .unwrap();
         assert_eq!(metadata.version, 1);
         assert_eq!(metadata.original_size, test_data.len() as u64);
 
         // 流式解密
-        let original_size = service.decrypt_file_streaming(&encrypted_path, &decrypted_path).await.unwrap();
+        let original_size = service
+            .decrypt_file_streaming(&encrypted_path, &decrypted_path)
+            .await
+            .unwrap();
         assert_eq!(original_size, test_data.len() as u64);
 
         // 验证内容
@@ -1391,12 +1455,18 @@ mod tests {
         let key = EncryptionService::generate_master_key();
 
         // 使用流式服务加密
-        let streaming_service = StreamingEncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
-        streaming_service.encrypt_file_streaming(&input_path, &encrypted_path).await.unwrap();
+        let streaming_service =
+            StreamingEncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
+        streaming_service
+            .encrypt_file_streaming(&input_path, &encrypted_path)
+            .await
+            .unwrap();
 
         // 使用同步服务解密
         let sync_service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
-        sync_service.decrypt_file(&encrypted_path, &decrypted_path).unwrap();
+        sync_service
+            .decrypt_file(&encrypted_path, &decrypted_path)
+            .unwrap();
 
         // 验证内容
         let decrypted = std::fs::read_to_string(&decrypted_path).unwrap();
@@ -1408,7 +1478,11 @@ mod tests {
         let key = EncryptionService::generate_master_key();
         let key_base64 = BASE64.encode(key);
 
-        let service = StreamingEncryptionService::from_base64_key(&key_base64, EncryptionAlgorithm::Aes256Gcm).unwrap();
+        let service = StreamingEncryptionService::from_base64_key(
+            &key_base64,
+            EncryptionAlgorithm::Aes256Gcm,
+        )
+        .unwrap();
 
         let dir = tempdir().unwrap();
         let input_path = dir.path().join("base64_key_test.txt");
@@ -1417,8 +1491,14 @@ mod tests {
 
         std::fs::write(&input_path, "Test with base64 key").unwrap();
 
-        service.encrypt_file_streaming(&input_path, &encrypted_path).await.unwrap();
-        service.decrypt_file_streaming(&encrypted_path, &decrypted_path).await.unwrap();
+        service
+            .encrypt_file_streaming(&input_path, &encrypted_path)
+            .await
+            .unwrap();
+        service
+            .decrypt_file_streaming(&encrypted_path, &decrypted_path)
+            .await
+            .unwrap();
 
         let decrypted = std::fs::read_to_string(&decrypted_path).unwrap();
         assert_eq!("Test with base64 key", decrypted);
@@ -1434,11 +1514,17 @@ mod tests {
         std::fs::write(&invalid_file, "This is not an encrypted file").unwrap();
 
         let key = EncryptionService::generate_master_key();
-        let streaming_service = StreamingEncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
-        let result = streaming_service.decrypt_file_streaming(&invalid_file, &dir.path().join("output.txt")).await;
+        let streaming_service =
+            StreamingEncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
+        let result = streaming_service
+            .decrypt_file_streaming(&invalid_file, &dir.path().join("output.txt"))
+            .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid encrypted file format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid encrypted file format"));
     }
 
     #[tokio::test]
@@ -1483,7 +1569,10 @@ mod tests {
                 &input_path,
                 &encrypted_path,
                 move |processed, total| {
-                    progress_calls_clone.lock().unwrap().push((processed, total));
+                    progress_calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((processed, total));
                 },
             )
             .unwrap();
@@ -1523,7 +1612,9 @@ mod tests {
         let service = EncryptionService::new(key, EncryptionAlgorithm::Aes256Gcm);
 
         // 加密
-        service.encrypt_file_chunked(&input_path, &encrypted_path).unwrap();
+        service
+            .encrypt_file_chunked(&input_path, &encrypted_path)
+            .unwrap();
 
         // 解密（带进度回调）
         let progress_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1534,7 +1625,10 @@ mod tests {
                 &encrypted_path,
                 &decrypted_path,
                 move |processed, total| {
-                    progress_calls_clone.lock().unwrap().push((processed, total));
+                    progress_calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((processed, total));
                 },
             )
             .unwrap();
@@ -1574,7 +1668,10 @@ mod tests {
                 &input_path,
                 &encrypted_path,
                 move |processed, total| {
-                    progress_calls_clone.lock().unwrap().push((processed, total));
+                    progress_calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((processed, total));
                 },
             )
             .unwrap();
@@ -1598,11 +1695,17 @@ mod tests {
 
         // 创建测试文件
         let chunk_size = 1024 * 1024; // 1MB
-        let test_data: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2)).map(|i| (i % 256) as u8).collect();
+        let test_data: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2))
+            .map(|i| (i % 256) as u8)
+            .collect();
         std::fs::write(&input_path, &test_data).unwrap();
 
         let key = EncryptionService::generate_master_key();
-        let service = StreamingEncryptionService::with_chunk_size(key, EncryptionAlgorithm::Aes256Gcm, chunk_size);
+        let service = StreamingEncryptionService::with_chunk_size(
+            key,
+            EncryptionAlgorithm::Aes256Gcm,
+            chunk_size,
+        );
 
         let progress_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_calls_clone = progress_calls.clone();
@@ -1612,7 +1715,10 @@ mod tests {
                 &input_path,
                 &encrypted_path,
                 move |processed, total| {
-                    progress_calls_clone.lock().unwrap().push((processed, total));
+                    progress_calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((processed, total));
                 },
             )
             .await
@@ -1637,18 +1743,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let input_path = dir.path().join("streaming_decrypt_progress_test.bin");
         let encrypted_path = dir.path().join("streaming_decrypt_progress_test.bkup");
-        let decrypted_path = dir.path().join("streaming_decrypt_progress_test_decrypted.bin");
+        let decrypted_path = dir
+            .path()
+            .join("streaming_decrypt_progress_test_decrypted.bin");
 
         // 创建并加密测试文件
         let chunk_size = 1024 * 1024; // 1MB
-        let test_data: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2)).map(|i| (i % 256) as u8).collect();
+        let test_data: Vec<u8> = (0..(chunk_size * 2 + chunk_size / 2))
+            .map(|i| (i % 256) as u8)
+            .collect();
         std::fs::write(&input_path, &test_data).unwrap();
 
         let key = EncryptionService::generate_master_key();
-        let service = StreamingEncryptionService::with_chunk_size(key, EncryptionAlgorithm::Aes256Gcm, chunk_size);
+        let service = StreamingEncryptionService::with_chunk_size(
+            key,
+            EncryptionAlgorithm::Aes256Gcm,
+            chunk_size,
+        );
 
         // 加密
-        service.encrypt_file_streaming(&input_path, &encrypted_path).await.unwrap();
+        service
+            .encrypt_file_streaming(&input_path, &encrypted_path)
+            .await
+            .unwrap();
 
         // 解密（带进度回调）
         let progress_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1659,7 +1776,10 @@ mod tests {
                 &encrypted_path,
                 &decrypted_path,
                 move |processed, total| {
-                    progress_calls_clone.lock().unwrap().push((processed, total));
+                    progress_calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((processed, total));
                 },
             )
             .await

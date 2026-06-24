@@ -4,9 +4,11 @@ use axum::{
     Json, Router,
 };
 use baidu_netdisk_rust::{
-    config::LogConfig, logging, server::{self, handlers, websocket},
-    web_auth::{self, WebAuthState},
     common::proxy_fallback::ProxyHotUpdater,
+    config::LogConfig,
+    logging,
+    server::{self, handlers, websocket},
+    web_auth::{self, WebAuthState},
     AppState,
 };
 use serde::Serialize;
@@ -173,7 +175,9 @@ async fn ensure_download_dir_accessible(download_dir: &std::path::Path) {
 /// 初始化 Web 认证状态
 ///
 /// 从配置和凭证文件加载认证状态，并根据认证模式启动清理任务。
-async fn init_web_auth_state(config: &baidu_netdisk_rust::config::WebAuthConfig) -> Arc<WebAuthState> {
+async fn init_web_auth_state(
+    config: &baidu_netdisk_rust::config::WebAuthConfig,
+) -> Arc<WebAuthState> {
     use baidu_netdisk_rust::web_auth::create_auth_store;
 
     // 创建凭证存储并加载
@@ -222,9 +226,10 @@ async fn main() -> anyhow::Result<()> {
         ensure_download_dir_accessible(&download_dir).await;
     }
     // 注入热更新执行器到代理回退管理器（使回退触发时能自动执行热更新和启动探测任务）
-    app_state.fallback_mgr.set_updater(
-        Arc::new(app_state.clone()) as Arc<dyn ProxyHotUpdater>
-    ).await;
+    app_state
+        .fallback_mgr
+        .set_updater(Arc::new(app_state.clone()) as Arc<dyn ProxyHotUpdater>)
+        .await;
 
     // 启动时探测代理连通性，失败则立即回退直连
     // 必须在 load_initial_session 之前执行，否则预热和 BDUSS 验证会走死代理
@@ -237,14 +242,16 @@ async fn main() -> anyhow::Result<()> {
             drop(cfg);
 
             // 🔥 先保存用户代理配置（供探测任务恢复时使用）
-            app_state.fallback_mgr
+            app_state
+                .fallback_mgr
                 .set_user_proxy_config(Some(proxy_clone.clone()))
                 .await;
 
             match baidu_netdisk_rust::common::probe_proxy(&proxy_clone).await {
                 Ok(()) => {
                     info!("✓ 启动代理探测成功");
-                    app_state.fallback_mgr
+                    app_state
+                        .fallback_mgr
                         .set_runtime_status(baidu_netdisk_rust::common::ProxyRuntimeStatus::Normal)
                         .await;
                 }
@@ -253,8 +260,11 @@ async fn main() -> anyhow::Result<()> {
                     if allow_fallback {
                         app_state.fallback_mgr.execute_fallback().await;
                     } else {
-                        app_state.fallback_mgr
-                            .set_runtime_status(baidu_netdisk_rust::common::ProxyRuntimeStatus::FallenBackToDirect)
+                        app_state
+                            .fallback_mgr
+                            .set_runtime_status(
+                                baidu_netdisk_rust::common::ProxyRuntimeStatus::FallenBackToDirect,
+                            )
                             .await;
                     }
                 }
@@ -317,9 +327,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/downloads/clear/failed", delete(handlers::clear_failed))
         // 下载批量操作
-        .route("/downloads/batch/pause", post(handlers::batch_pause_downloads))
-        .route("/downloads/batch/resume", post(handlers::batch_resume_downloads))
-        .route("/downloads/batch/delete", post(handlers::batch_delete_downloads))
+        .route(
+            "/downloads/batch/pause",
+            post(handlers::batch_pause_downloads),
+        )
+        .route(
+            "/downloads/batch/resume",
+            post(handlers::batch_resume_downloads),
+        )
+        .route(
+            "/downloads/batch/delete",
+            post(handlers::batch_delete_downloads),
+        )
         // 文件夹下载API
         .route("/downloads/folder", post(handlers::create_folder_download))
         .route(
@@ -360,14 +379,23 @@ async fn main() -> anyhow::Result<()> {
         )
         // 上传批量操作
         .route("/uploads/batch/pause", post(handlers::batch_pause_uploads))
-        .route("/uploads/batch/resume", post(handlers::batch_resume_uploads))
-        .route("/uploads/batch/delete", post(handlers::batch_delete_uploads))
+        .route(
+            "/uploads/batch/resume",
+            post(handlers::batch_resume_uploads),
+        )
+        .route(
+            "/uploads/batch/delete",
+            post(handlers::batch_delete_uploads),
+        )
         // 转存API
         .route("/transfers", post(handlers::create_transfer))
         .route("/transfers", get(handlers::get_all_transfers))
         .route("/transfers/preview", post(handlers::preview_share_files))
         .route("/transfers/preview/dir", post(handlers::preview_share_dir))
-        .route("/transfers/cleanup", post(handlers::cleanup_orphaned_temp_dirs))
+        .route(
+            "/transfers/cleanup",
+            post(handlers::cleanup_orphaned_temp_dirs),
+        )
         .route("/transfers/:id", get(handlers::get_transfer))
         .route("/transfers/:id", delete(handlers::delete_transfer))
         .route("/transfers/:id/cancel", post(handlers::cancel_transfer))
@@ -378,7 +406,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/fs/roots", get(handlers::get_roots))
         // 本地文件API
         .route("/local-files", get(handlers::local_files::list_local_files))
-        .route("/local-files/delete", post(handlers::local_files::delete_local_files))
+        .route(
+            "/local-files/delete",
+            post(handlers::local_files::delete_local_files),
+        )
         // 配置API
         .route("/config", get(handlers::get_config))
         .route("/config", put(handlers::update_config))
@@ -410,49 +441,170 @@ async fn main() -> anyhow::Result<()> {
         .route("/proxy/status", get(handlers::get_proxy_status))
         .route("/proxy/test", post(handlers::test_proxy_connection))
         // 🔥 自动备份API
-        .route("/autobackup/configs", get(handlers::autobackup::list_backup_configs))
-        .route("/autobackup/configs", post(handlers::autobackup::create_backup_config))
-        .route("/autobackup/configs/:id", get(handlers::autobackup::get_backup_config))
-        .route("/autobackup/configs/:id", put(handlers::autobackup::update_backup_config))
-        .route("/autobackup/configs/:id", delete(handlers::autobackup::delete_backup_config))
-        .route("/autobackup/configs/:id/enable", post(handlers::autobackup::enable_backup_config))
-        .route("/autobackup/configs/:id/disable", post(handlers::autobackup::disable_backup_config))
-        .route("/autobackup/configs/:id/trigger", post(handlers::autobackup::trigger_backup))
-        .route("/autobackup/configs/:id/tasks", get(handlers::autobackup::list_backup_tasks))
-        .route("/autobackup/tasks/:id", get(handlers::autobackup::get_backup_task))
-        .route("/autobackup/tasks/:id/cancel", post(handlers::autobackup::cancel_backup_task))
-        .route("/autobackup/tasks/:id/pause", post(handlers::autobackup::pause_backup_task))
-        .route("/autobackup/tasks/:id/resume", post(handlers::autobackup::resume_backup_task))
-        .route("/autobackup/tasks/:id", delete(handlers::autobackup::delete_backup_task))
-        .route("/autobackup/tasks/:id/files", get(handlers::autobackup::list_file_tasks))
-        .route("/autobackup/tasks/:task_id/files/:file_task_id/retry", post(handlers::autobackup::retry_file_task))
-        .route("/autobackup/configs/:id/sync-state/reset", post(handlers::autobackup::reset_sync_state))
-        .route("/autobackup/configs/:id/sync-state/tombstones", get(handlers::autobackup::list_tombstones))
-        .route("/autobackup/status", get(handlers::autobackup::get_manager_status))
-        .route("/autobackup/stats", get(handlers::autobackup::get_record_stats))
-        .route("/autobackup/cleanup", post(handlers::autobackup::cleanup_records))
+        .route(
+            "/autobackup/configs",
+            get(handlers::autobackup::list_backup_configs),
+        )
+        .route(
+            "/autobackup/configs",
+            post(handlers::autobackup::create_backup_config),
+        )
+        .route(
+            "/autobackup/configs/:id",
+            get(handlers::autobackup::get_backup_config),
+        )
+        .route(
+            "/autobackup/configs/:id",
+            put(handlers::autobackup::update_backup_config),
+        )
+        .route(
+            "/autobackup/configs/:id",
+            delete(handlers::autobackup::delete_backup_config),
+        )
+        .route(
+            "/autobackup/configs/:id/enable",
+            post(handlers::autobackup::enable_backup_config),
+        )
+        .route(
+            "/autobackup/configs/:id/disable",
+            post(handlers::autobackup::disable_backup_config),
+        )
+        .route(
+            "/autobackup/configs/:id/trigger",
+            post(handlers::autobackup::trigger_backup),
+        )
+        .route(
+            "/autobackup/configs/:id/tasks",
+            get(handlers::autobackup::list_backup_tasks),
+        )
+        .route(
+            "/autobackup/tasks/:id",
+            get(handlers::autobackup::get_backup_task),
+        )
+        .route(
+            "/autobackup/tasks/:id/cancel",
+            post(handlers::autobackup::cancel_backup_task),
+        )
+        .route(
+            "/autobackup/tasks/:id/pause",
+            post(handlers::autobackup::pause_backup_task),
+        )
+        .route(
+            "/autobackup/tasks/:id/resume",
+            post(handlers::autobackup::resume_backup_task),
+        )
+        .route(
+            "/autobackup/tasks/:id",
+            delete(handlers::autobackup::delete_backup_task),
+        )
+        .route(
+            "/autobackup/tasks/:id/files",
+            get(handlers::autobackup::list_file_tasks),
+        )
+        .route(
+            "/autobackup/tasks/:task_id/files/:file_task_id/retry",
+            post(handlers::autobackup::retry_file_task),
+        )
+        .route(
+            "/autobackup/configs/:id/sync-state/reset",
+            post(handlers::autobackup::reset_sync_state),
+        )
+        .route(
+            "/autobackup/configs/:id/sync-state/tombstones",
+            get(handlers::autobackup::list_tombstones),
+        )
+        .route(
+            "/autobackup/status",
+            get(handlers::autobackup::get_manager_status),
+        )
+        .route(
+            "/autobackup/stats",
+            get(handlers::autobackup::get_record_stats),
+        )
+        .route(
+            "/autobackup/cleanup",
+            post(handlers::autobackup::cleanup_records),
+        )
         // 🔥 加密API
-        .route("/encryption/status", get(handlers::autobackup::get_encryption_status))
-        .route("/encryption/key/generate", post(handlers::autobackup::generate_encryption_key))
-        .route("/encryption/key/import", post(handlers::autobackup::import_encryption_key))
-        .route("/encryption/key/export", get(handlers::autobackup::export_encryption_key))
-        .route("/encryption/key", delete(handlers::autobackup::delete_encryption_key))
-        .route("/encryption/key/force", delete(handlers::autobackup::force_delete_encryption_key))
+        .route(
+            "/encryption/status",
+            get(handlers::autobackup::get_encryption_status),
+        )
+        .route(
+            "/encryption/key/generate",
+            post(handlers::autobackup::generate_encryption_key),
+        )
+        .route(
+            "/encryption/key/import",
+            post(handlers::autobackup::import_encryption_key),
+        )
+        .route(
+            "/encryption/key/export",
+            get(handlers::autobackup::export_encryption_key),
+        )
+        .route(
+            "/encryption/key",
+            delete(handlers::autobackup::delete_encryption_key),
+        )
+        .route(
+            "/encryption/key/force",
+            delete(handlers::autobackup::force_delete_encryption_key),
+        )
         // 🔥 分享同步 API
-        .route("/share-sync/subscriptions", get(handlers::list_subscriptions))
-        .route("/share-sync/subscriptions", post(handlers::create_subscription))
-        .route("/share-sync/subscriptions/:id", get(handlers::get_subscription))
-        .route("/share-sync/subscriptions/:id", put(handlers::update_subscription))
-        .route("/share-sync/subscriptions/:id", delete(handlers::delete_subscription))
-        .route("/share-sync/subscriptions/:id/enable", post(handlers::enable_subscription))
-        .route("/share-sync/subscriptions/:id/disable", post(handlers::disable_subscription))
-        .route("/share-sync/subscriptions/:id/trigger", post(handlers::trigger_subscription))
-        .route("/share-sync/subscriptions/:id/resume", post(handlers::resume_subscription))
-        .route("/share-sync/subscriptions/:id/runs", get(handlers::list_runs))
-        .route("/share-sync/subscriptions/:id/subtasks", get(handlers::list_subtasks))
+        .route(
+            "/share-sync/subscriptions",
+            get(handlers::list_subscriptions),
+        )
+        .route(
+            "/share-sync/subscriptions",
+            post(handlers::create_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id",
+            get(handlers::get_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id",
+            put(handlers::update_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id",
+            delete(handlers::delete_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/enable",
+            post(handlers::enable_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/disable",
+            post(handlers::disable_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/trigger",
+            post(handlers::trigger_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/resume",
+            post(handlers::resume_subscription),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/runs",
+            get(handlers::list_runs),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/runs",
+            delete(handlers::clear_runs_before_days),
+        )
+        .route(
+            "/share-sync/subscriptions/:id/subtasks",
+            get(handlers::list_subtasks),
+        )
         .route("/share-sync/runs/:id", get(handlers::get_run))
         .route("/share-sync/runs/:id/items", get(handlers::list_run_items))
-        .route("/share-sync/subscriptions/:id/snapshots/latest", get(handlers::latest_snapshot))
+        .route(
+            "/share-sync/subscriptions/:id/snapshots/latest",
+            get(handlers::latest_snapshot),
+        )
         .route("/share-sync/preview-tree", post(handlers::preview_tree))
         // 🔥 加密数据导出 API
         .route("/encryption/export-bundle", post(handlers::export_bundle))
@@ -461,21 +613,45 @@ async fn main() -> anyhow::Result<()> {
         // 🔥 离线下载 API
         .route("/cloud-dl/tasks", post(handlers::cloud_dl::add_task))
         .route("/cloud-dl/tasks", get(handlers::cloud_dl::list_tasks))
-        .route("/cloud-dl/tasks/clear", delete(handlers::cloud_dl::clear_tasks))
-        .route("/cloud-dl/tasks/refresh", post(handlers::cloud_dl::refresh_tasks))
-        .route("/cloud-dl/tasks/:task_id", get(handlers::cloud_dl::query_task))
-        .route("/cloud-dl/tasks/:task_id", delete(handlers::cloud_dl::delete_task))
-        .route("/cloud-dl/tasks/:task_id/cancel", post(handlers::cloud_dl::cancel_task))
+        .route(
+            "/cloud-dl/tasks/clear",
+            delete(handlers::cloud_dl::clear_tasks),
+        )
+        .route(
+            "/cloud-dl/tasks/refresh",
+            post(handlers::cloud_dl::refresh_tasks),
+        )
+        .route(
+            "/cloud-dl/tasks/:task_id",
+            get(handlers::cloud_dl::query_task),
+        )
+        .route(
+            "/cloud-dl/tasks/:task_id",
+            delete(handlers::cloud_dl::delete_task),
+        )
+        .route(
+            "/cloud-dl/tasks/:task_id/cancel",
+            post(handlers::cloud_dl::cancel_task),
+        )
         // 🔥 分享 API
         .route("/shares", post(handlers::create_share))
         .route("/shares", get(handlers::get_share_list))
         .route("/shares/cancel", post(handlers::cancel_share))
         .route("/shares/:id", get(handlers::get_share_detail))
         // 🔥 系统能力检测 API
-        .route("/system/watch-capability", get(handlers::autobackup::get_watch_capability))
+        .route(
+            "/system/watch-capability",
+            get(handlers::autobackup::get_watch_capability),
+        )
         // 🔥 自动备份全局触发配置 API
-        .route("/config/autobackup/trigger", get(handlers::autobackup::get_trigger_config))
-        .route("/config/autobackup/trigger", put(handlers::autobackup::update_trigger_config))
+        .route(
+            "/config/autobackup/trigger",
+            get(handlers::autobackup::get_trigger_config),
+        )
+        .route(
+            "/config/autobackup/trigger",
+            put(handlers::autobackup::update_trigger_config),
+        )
         // 🔥 WebSocket 路由
         .route("/ws", get(websocket::handle_websocket))
         // 🔥 全局只读模式中间件：放在 with_state 之前以共享 AppState
@@ -502,7 +678,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/totp/setup", post(web_auth::totp_setup))
         .route("/totp/verify", post(web_auth::totp_verify))
         .route("/totp/disable", post(web_auth::totp_disable))
-        .route("/recovery-codes/regenerate", post(web_auth::regenerate_recovery_codes))
+        .route(
+            "/recovery-codes/regenerate",
+            post(web_auth::regenerate_recovery_codes),
+        )
         .with_state(web_auth_state.clone());
 
     // 自动检测前端资源目录

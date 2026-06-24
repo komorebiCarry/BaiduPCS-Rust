@@ -64,7 +64,10 @@ pub async fn list_local_files(
         Ok(response) => Ok(Json(ApiResponse::success(response))),
         Err(e) => {
             error!("列出本地文件失败: {}", e);
-            Ok(Json(ApiResponse::error(500, format!("列出本地文件失败: {}", e))))
+            Ok(Json(ApiResponse::error(
+                500,
+                format!("列出本地文件失败: {}", e),
+            )))
         }
     }
 }
@@ -87,7 +90,10 @@ pub async fn delete_local_files(
     info!("API: 删除本地文件 paths={:?}", request.paths);
 
     if request.paths.is_empty() {
-        return Ok(Json(ApiResponse::error(400, "路径列表不能为空".to_string())));
+        return Ok(Json(ApiResponse::error(
+            400,
+            "路径列表不能为空".to_string(),
+        )));
     }
 
     let download_dir = state.config.read().await.download.download_dir.clone();
@@ -127,7 +133,11 @@ pub async fn delete_local_files(
         }
     }
 
-    info!("本地文件删除完成: 成功={}, 失败={}", deleted_count, failed_paths.len());
+    info!(
+        "本地文件删除完成: 成功={}, 失败={}",
+        deleted_count,
+        failed_paths.len()
+    );
     Ok(Json(ApiResponse::success(DeleteLocalFilesData {
         deleted_count,
         failed_paths,

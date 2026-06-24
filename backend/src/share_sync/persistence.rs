@@ -888,6 +888,46 @@ impl ShareSyncPersistence {
         let total = self.count_run_items(run_id)?;
         self.list_run_items_page(run_id, 1, total.max(1))
     }
+
+    /// 删除某订阅下早于 cutoff_ts 的运行历史，并同步删除 run_items。
+    ///
+    /// 表结构声明了 ON DELETE CASCADE，但老库可能未完全开启外键或曾从旧版本迁移；
+    /// 这里显式先删 run_items 再删 runs，保证一键清理不会留下孤儿明细。
+    pub fn delete_runs_before(
+        &self,
+        subscription_id: &str,
+        cutoff_ts: i64,
+    ) -> Result<usize, ShareSyncError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let run_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM share_sync_runs
+                 WHERE subscription_id = ?1 AND started_at < ?2",
+            )?;
+            let rows = stmt.query_map(params![subscription_id, cutoff_ts], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut ids = Vec::new();
+            for r in rows {
+                ids.push(r?);
+            }
+            ids
+        };
+        for run_id in &run_ids {
+            tx.execute(
+                "DELETE FROM share_sync_run_items WHERE run_id = ?1",
+                params![run_id],
+            )?;
+        }
+        let deleted = tx.execute(
+            "DELETE FROM share_sync_runs
+             WHERE subscription_id = ?1 AND started_at < ?2",
+            params![subscription_id, cutoff_ts],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
 }
 
 /// 一次运行的摘要

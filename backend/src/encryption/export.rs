@@ -1,7 +1,7 @@
 //! 加密数据导出模块
 //!
 //! 实现解密数据包导出功能，用于 decrypt-cli 工具解密加密文件。
-//! 
+//!
 //! 导出内容包括：
 //! - encryption.json: 密钥配置（current_key + key_history）
 //! - mapping.json: 加密文件映射表
@@ -17,7 +17,7 @@ use crate::autobackup::record::BackupRecordManager;
 use crate::encryption::config_store::{EncryptionConfigStore, EncryptionKeyConfig};
 
 /// 映射记录（用于导出）
-/// 
+///
 /// 包含解密所需的所有必须字段
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MappingRecord {
@@ -61,7 +61,7 @@ pub struct MappingExport {
 }
 
 /// 映射生成器
-/// 
+///
 /// 从数据库生成映射 JSON，用于导出解密数据包
 pub struct MappingGenerator {
     record_manager: Arc<BackupRecordManager>,
@@ -74,18 +74,18 @@ impl MappingGenerator {
     }
 
     /// 生成所有映射记录
-    /// 
+    ///
     /// 从 encryption_snapshots 表查询所有已完成的加密映射记录
     pub fn generate_mapping(&self) -> Result<MappingExport> {
         let conn = self.record_manager.get_conn_for_export()?;
-        
+
         let mut stmt = conn.prepare(
             "SELECT config_id, encrypted_name, original_path, original_name, 
                     is_directory, version, key_version, file_size, nonce, 
                     algorithm, remote_path, status
              FROM encryption_snapshots
              WHERE status = 'completed'
-             ORDER BY config_id, original_path, original_name"
+             ORDER BY config_id, original_path, original_name",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -120,14 +120,14 @@ impl MappingGenerator {
     /// 生成指定配置的映射记录
     pub fn generate_mapping_by_config(&self, config_id: &str) -> Result<MappingExport> {
         let conn = self.record_manager.get_conn_for_export()?;
-        
+
         let mut stmt = conn.prepare(
             "SELECT config_id, encrypted_name, original_path, original_name, 
                     is_directory, version, key_version, file_size, nonce, 
                     algorithm, remote_path, status
              FROM encryption_snapshots
              WHERE config_id = ?1 AND status = 'completed'
-             ORDER BY original_path, original_name"
+             ORDER BY original_path, original_name",
         )?;
 
         let rows = stmt.query_map([config_id], |row| {
@@ -161,7 +161,7 @@ impl MappingGenerator {
 }
 
 /// 解密数据包导出器
-/// 
+///
 /// 将密钥配置和映射数据打包为 ZIP 文件
 pub struct DecryptBundleExporter {
     config_store: Arc<EncryptionConfigStore>,
@@ -193,7 +193,7 @@ impl DecryptBundleExporter {
     }
 
     /// 导出完整的解密数据包（ZIP 格式）
-    /// 
+    ///
     /// 返回 ZIP 文件的字节数据
     pub fn export_bundle(&self) -> Result<Vec<u8>> {
         // 获取密钥配置
@@ -230,8 +230,8 @@ impl DecryptBundleExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::autobackup::record::EncryptionSnapshot;
+    use tempfile::tempdir;
 
     fn create_test_record_manager() -> Arc<BackupRecordManager> {
         let dir = tempdir().unwrap();
@@ -243,7 +243,7 @@ mod tests {
     fn test_mapping_generator_empty() {
         let record_manager = create_test_record_manager();
         let generator = MappingGenerator::new(record_manager);
-        
+
         let mapping = generator.generate_mapping().unwrap();
         assert_eq!(mapping.version, "1.0");
         assert!(mapping.records.is_empty());
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn test_mapping_generator_with_records() {
         let record_manager = create_test_record_manager();
-        
+
         // 添加测试快照
         let snapshot = EncryptionSnapshot {
             config_id: "test-config".to_string(),
@@ -272,12 +272,15 @@ mod tests {
 
         let generator = MappingGenerator::new(record_manager);
         let mapping = generator.generate_mapping().unwrap();
-        
+
         assert_eq!(mapping.records.len(), 1);
         let record = &mapping.records[0];
         assert_eq!(record.config_id, "test-config");
         assert_eq!(record.original_name, "test.txt");
-        assert_eq!(record.encrypted_name, "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat");
+        assert_eq!(
+            record.encrypted_name,
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"
+        );
         assert_eq!(record.key_version, 1);
         assert!(!record.is_directory);
     }
@@ -301,7 +304,7 @@ mod tests {
 
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: MappingRecord = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(deserialized.config_id, record.config_id);
         assert_eq!(deserialized.encrypted_name, record.encrypted_name);
         assert_eq!(deserialized.key_version, record.key_version);

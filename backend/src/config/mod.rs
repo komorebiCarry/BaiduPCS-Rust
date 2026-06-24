@@ -243,19 +243,17 @@ impl Default for ConflictStrategyConfig {
         Self {
             default_upload_strategy: crate::uploader::conflict::UploadConflictStrategy::SmartDedup,
             default_download_strategy:
-            crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
+                crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
         }
     }
 }
 
 /// 网络配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
 }
-
 
 /// 自动备份配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -802,8 +800,7 @@ impl Default for TransferConfig {
 }
 
 /// 文件系统配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FilesystemConfig {
     /// 允许访问的路径白名单（空表示允许所有）
     #[serde(default)]
@@ -825,7 +822,6 @@ pub struct FilesystemConfig {
     pub enforce_allowlist_on_followed_symlinks: bool,
 }
 
-
 impl FilesystemConfig {
     /// 校验文件系统配置的结构合法性
     ///
@@ -844,19 +840,18 @@ impl FilesystemConfig {
             if !path.is_absolute() {
                 anyhow::bail!(
                     "filesystem.allowed_paths[{}] 必须是绝对路径，当前值: {:?}",
-                    i, path_str
+                    i,
+                    path_str
                 );
             }
             if !path.exists() {
                 tracing::warn!(
                     "filesystem.allowed_paths[{}] 路径不存在（运行时将跳过该条目）: {:?}",
-                    i, path_str
+                    i,
+                    path_str
                 );
             } else if !path.is_dir() {
-                anyhow::bail!(
-                    "filesystem.allowed_paths[{}] 不是目录: {:?}",
-                    i, path_str
-                );
+                anyhow::bail!("filesystem.allowed_paths[{}] 不是目录: {:?}", i, path_str);
             }
         }
 
@@ -878,10 +873,7 @@ impl FilesystemConfig {
                 return Ok(());
             }
             if !path.is_dir() {
-                anyhow::bail!(
-                    "filesystem.default_path 不是目录: {:?}",
-                    default_path
-                );
+                anyhow::bail!("filesystem.default_path 不是目录: {:?}", default_path);
             }
             // default_path 必须位于 allowed_paths 内（如果白名单非空）
             if !self.allowed_paths.is_empty() {

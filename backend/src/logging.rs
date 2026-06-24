@@ -214,8 +214,8 @@ pub struct LogGuard {
 /// * `LogGuard` - 日志守卫，需要保持存活直到程序结束
 pub fn init_logging(config: &LogConfig) -> LogGuard {
     // 创建环境过滤器
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
     // 控制台输出层
     let console_layer = fmt::layer()
@@ -239,10 +239,7 @@ pub fn init_logging(config: &LogConfig) -> LogGuard {
 
         // 创建自定义日志文件管理器
         // 文件名格式: baidu-pcs-rust.YYYY-MM-DD-HHMMSS.log
-        let file_manager = match LogFileManager::new(
-            config.log_dir.clone(),
-            config.max_file_size,
-        ) {
+        let file_manager = match LogFileManager::new(config.log_dir.clone(), config.max_file_size) {
             Ok(manager) => manager,
             Err(e) => {
                 eprintln!("创建日志文件管理器失败: {}, 回退到仅控制台输出", e);
@@ -274,7 +271,10 @@ pub fn init_logging(config: &LogConfig) -> LogGuard {
 
         info!(
             "日志系统初始化完成: 目录={:?}, 保留天数={}, 级别={}, 单文件最大={:.1}MB",
-            config.log_dir, config.retention_days, config.level, config.max_file_size as f64 / 1024.0 / 1024.0
+            config.log_dir,
+            config.retention_days,
+            config.level,
+            config.max_file_size as f64 / 1024.0 / 1024.0
         );
 
         // 启动过期日志清理

@@ -1199,7 +1199,7 @@ impl<'a> ShareSyncExecutor<'a> {
             summary,
             0,
         )
-            .await
+        .await
     }
 
     /// 提交一组节点(可能是 1 个目录、N 个散文件、混合)的 transfer
@@ -1237,7 +1237,15 @@ impl<'a> ShareSyncExecutor<'a> {
             let mut worst: Option<ErrorCategory> = None;
             for idx in &indices {
                 if let Err(c) = self
-                    .submit_subtree_as_leaves(captured, run_id, tree, *idx, target, record_kind, summary)
+                    .submit_subtree_as_leaves(
+                        captured,
+                        run_id,
+                        tree,
+                        *idx,
+                        target,
+                        record_kind,
+                        summary,
+                    )
                     .await
                 {
                     worst = Some(worst.map_or(c, |w| max_category(w, c)));
@@ -1247,8 +1255,10 @@ impl<'a> ShareSyncExecutor<'a> {
         }
         let target_kind = record_kind;
         let strategy = target.effective_conflict_strategy(self.subscription.conflict_strategy);
-        let internal_label =
-            format!("share-sync/{}/tree/d{}/{}", self.subscription.id, depth, run_id);
+        let internal_label = format!(
+            "share-sync/{}/tree/d{}/{}",
+            self.subscription.id, depth, run_id
+        );
 
         let first_path = tree.get(indices[0]).path.clone();
         info!(
@@ -1271,8 +1281,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 .ok()
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(true);
-            if bisect_enabled && self.op_transfers_to_netdisk(target) && depth < BISECT_MAX_DEPTH
-            {
+            if bisect_enabled && self.op_transfers_to_netdisk(target) && depth < BISECT_MAX_DEPTH {
                 let leaf_count: usize = indices
                     .iter()
                     .map(|&i| tree.descendants_leaves(i).len())
@@ -1659,7 +1668,6 @@ impl<'a> ShareSyncExecutor<'a> {
             Some(c) => Err(c),
         }
     }
-
 
     /// 处理 added/modified 文件
     async fn process_added_or_modified(
@@ -2931,10 +2939,7 @@ mod tests {
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(hooks.transfers.lock().unwrap().len(), 0);
         assert_eq!(hooks.downloads.lock().unwrap().len(), 1);
-        assert_eq!(
-            *hooks.download_netdisk_dirs.lock().unwrap(),
-            vec![None]
-        );
+        assert_eq!(*hooks.download_netdisk_dirs.lock().unwrap(), vec![None]);
     }
 
     #[test]
@@ -3309,7 +3314,10 @@ mod tests {
         // 回退确实发生:成功的那次下载是分享直下(netdisk_dir=None)。
         let dirs = hooks.download_netdisk_dirs.lock().unwrap();
         assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs[0], None, "回退必须走分享直下(临时目录),netdisk_dir=None");
+        assert_eq!(
+            dirs[0], None,
+            "回退必须走分享直下(临时目录),netdisk_dir=None"
+        );
         assert_eq!(hooks.batch_downloads.lock().unwrap().len(), 1);
         let items = pm.list_run_items(&outcome.run_id).unwrap();
         assert!(!items.is_empty());

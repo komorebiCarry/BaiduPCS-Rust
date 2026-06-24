@@ -7,10 +7,10 @@
 // - 任务级并发控制（资源利用 +50-80%）
 // - 全局上传调度器（Round-Robin 公平调度）
 
+pub mod block_list_comparator;
 pub mod chunk;
 pub mod conflict;
 pub mod conflict_resolver;
-pub mod block_list_comparator;
 pub mod engine;
 pub mod folder;
 pub mod health;
@@ -20,6 +20,7 @@ pub mod scan_manager;
 pub mod scheduler;
 pub mod task;
 
+pub use block_list_comparator::BlockListComparator;
 pub use chunk::{
     calculate_recommended_chunk_size, get_chunk_size_limit, get_file_size_limit, UploadChunk,
     UploadChunkManager, DEFAULT_UPLOAD_CHUNK_SIZE, MAX_UPLOAD_CHUNK_SIZE, MIN_UPLOAD_CHUNK_SIZE,
@@ -28,14 +29,13 @@ pub use chunk::{
 };
 pub use conflict::{ConflictResolution, DownloadConflictStrategy, UploadConflictStrategy};
 pub use conflict_resolver::ConflictResolver;
-pub use block_list_comparator::BlockListComparator;
 pub use engine::UploadEngine;
-pub use folder::{FolderScanner, ScanOptions, ScannedFile, BatchedScanIterator, SCAN_BATCH_SIZE};
+pub use folder::{BatchedScanIterator, FolderScanner, ScanOptions, ScannedFile, SCAN_BATCH_SIZE};
 pub use health::PcsServerHealthManager;
 pub use manager::{UploadManager, UploadTaskInfo};
 pub use rapid_upload::{RapidCheckResult, RapidUploadChecker, RapidUploadHash};
+pub use scan_manager::{ScanCheckpoint, ScanManager, ScanTaskInfo, ScanTaskStatus};
 pub use scheduler::{UploadChunkScheduler, UploadTaskScheduleInfo};
-pub use scan_manager::{ScanManager, ScanTaskInfo, ScanTaskStatus, ScanCheckpoint};
 pub use task::{UploadTask, UploadTaskStatus};
 
 /// 🔥 根据文件大小计算上传任务最大并发分片数

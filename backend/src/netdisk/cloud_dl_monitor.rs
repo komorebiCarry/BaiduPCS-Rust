@@ -123,10 +123,10 @@ pub struct PollingConfig {
 impl Default for PollingConfig {
     fn default() -> Self {
         Self {
-            active_interval: Duration::from_secs(15),      // 🔥 用户在页面时 15 秒轮询，平衡体验和风控
+            active_interval: Duration::from_secs(15), // 🔥 用户在页面时 15 秒轮询，平衡体验和风控
             idle_interval: Duration::from_secs(60),
             backoff_multiplier: 1.5,
-            min_interval: Duration::from_secs(15),         // 🔥 自动下载最小间隔也调整为 15 秒
+            min_interval: Duration::from_secs(15), // 🔥 自动下载最小间隔也调整为 15 秒
             max_check_interval: Duration::from_secs(3600), // 60 分钟
             check_before_completion: 0.8,
             jitter_percent: 0.15,
@@ -292,8 +292,7 @@ impl CloudDlMonitor {
     /// `owner_uid`：监听服务绑定的账号 UID。
     /// 该 UID 将被 stamp 到所有从本 monitor 推送的 WS 事件 `owner_uid` 字段。
     pub fn new(owner_uid: crate::auth::Uid, client: Arc<NetdiskClient>) -> Self {
-        let client_inner = Arc::try_unwrap(client)
-            .unwrap_or_else(|arc| (*arc).clone());
+        let client_inner = Arc::try_unwrap(client).unwrap_or_else(|arc| (*arc).clone());
         Self {
             owner_uid,
             client: Arc::new(StdRwLock::new(client_inner)),
@@ -317,8 +316,7 @@ impl CloudDlMonitor {
         client: Arc<NetdiskClient>,
         config: PollingConfig,
     ) -> Self {
-        let client_inner = Arc::try_unwrap(client)
-            .unwrap_or_else(|arc| (*arc).clone());
+        let client_inner = Arc::try_unwrap(client).unwrap_or_else(|arc| (*arc).clone());
         Self {
             owner_uid,
             client: Arc::new(StdRwLock::new(client_inner)),
@@ -354,7 +352,10 @@ impl CloudDlMonitor {
     }
 
     /// 设置文件夹下载管理器（用于自动下载文件夹）
-    pub async fn set_folder_download_manager(&self, fdm: Arc<crate::downloader::FolderDownloadManager>) {
+    pub async fn set_folder_download_manager(
+        &self,
+        fdm: Arc<crate::downloader::FolderDownloadManager>,
+    ) {
         *self.folder_download_manager.write().await = Some(fdm);
         info!("离线下载监听服务已设置文件夹下载管理器");
     }
@@ -404,12 +405,15 @@ impl CloudDlMonitor {
                         // 如果获取失败，仍然加载配置（保守策略）
                         let mut auto_configs = self.auto_download_configs.write().await;
                         for config in configs {
-                            auto_configs.insert(config.task_id, AutoDownloadConfig {
-                                task_id: config.task_id,
-                                enabled: config.enabled,
-                                local_path: config.local_path,
-                                ask_each_time: config.ask_each_time,
-                            });
+                            auto_configs.insert(
+                                config.task_id,
+                                AutoDownloadConfig {
+                                    task_id: config.task_id,
+                                    enabled: config.enabled,
+                                    local_path: config.local_path,
+                                    ask_each_time: config.ask_each_time,
+                                },
+                            );
                         }
                         self.new_task_notify.notify_one();
                         return config_count;
@@ -430,12 +434,15 @@ impl CloudDlMonitor {
                     match task_status_map.get(&config.task_id) {
                         Some(&status) if status == 1 => {
                             // 任务仍在进行中，保留配置
-                            auto_configs.insert(config.task_id, AutoDownloadConfig {
-                                task_id: config.task_id,
-                                enabled: config.enabled,
-                                local_path: config.local_path,
-                                ask_each_time: config.ask_each_time,
-                            });
+                            auto_configs.insert(
+                                config.task_id,
+                                AutoDownloadConfig {
+                                    task_id: config.task_id,
+                                    enabled: config.enabled,
+                                    local_path: config.local_path,
+                                    ask_each_time: config.ask_each_time,
+                                },
+                            );
                             valid_count += 1;
                         }
                         Some(&status) => {
@@ -444,18 +451,19 @@ impl CloudDlMonitor {
                                 "清理已完成的自动下载配置: task_id={}, status={}",
                                 config.task_id, status
                             );
-                            if let Err(e) = history_db.mark_cloud_dl_auto_download_triggered(config.task_id) {
+                            if let Err(e) =
+                                history_db.mark_cloud_dl_auto_download_triggered(config.task_id)
+                            {
                                 warn!("标记自动下载配置为已触发失败: {}", e);
                             }
                             cleaned_count += 1;
                         }
                         None => {
                             // 任务不存在，清理配置
-                            info!(
-                                "清理不存在的自动下载配置: task_id={}",
-                                config.task_id
-                            );
-                            if let Err(e) = history_db.mark_cloud_dl_auto_download_triggered(config.task_id) {
+                            info!("清理不存在的自动下载配置: task_id={}", config.task_id);
+                            if let Err(e) =
+                                history_db.mark_cloud_dl_auto_download_triggered(config.task_id)
+                            {
                                 warn!("标记自动下载配置为已触发失败: {}", e);
                             }
                             cleaned_count += 1;
@@ -535,36 +543,49 @@ impl CloudDlMonitor {
             cloned
         };
         match event {
-            CloudDlEvent::StatusChanged { task_id, old_status, new_status, task, .. } => {
-                TaskEvent::CloudDl(WsCloudDlEvent::StatusChanged {
-                    task_id: *task_id,
-                    old_status: *old_status,
-                    new_status: *new_status,
-                    task: serde_json::to_value(stamp_task(task)).unwrap_or_default(),
-                    owner_uid: owner,
-                })
-            }
-            CloudDlEvent::TaskCompleted { task_id, task, auto_download_config, .. } => {
-                TaskEvent::CloudDl(WsCloudDlEvent::TaskCompleted {
-                    task_id: *task_id,
-                    task: serde_json::to_value(stamp_task(task)).unwrap_or_default(),
-                    auto_download_config: auto_download_config.as_ref()
-                        .and_then(|c| serde_json::to_value(c).ok()),
-                    owner_uid: owner,
-                })
-            }
-            CloudDlEvent::ProgressUpdate { task_id, finished_size, file_size, progress_percent, .. } => {
-                TaskEvent::CloudDl(WsCloudDlEvent::ProgressUpdate {
-                    task_id: *task_id,
-                    finished_size: *finished_size,
-                    file_size: *file_size,
-                    progress_percent: *progress_percent,
-                    owner_uid: owner,
-                })
-            }
+            CloudDlEvent::StatusChanged {
+                task_id,
+                old_status,
+                new_status,
+                task,
+                ..
+            } => TaskEvent::CloudDl(WsCloudDlEvent::StatusChanged {
+                task_id: *task_id,
+                old_status: *old_status,
+                new_status: *new_status,
+                task: serde_json::to_value(stamp_task(task)).unwrap_or_default(),
+                owner_uid: owner,
+            }),
+            CloudDlEvent::TaskCompleted {
+                task_id,
+                task,
+                auto_download_config,
+                ..
+            } => TaskEvent::CloudDl(WsCloudDlEvent::TaskCompleted {
+                task_id: *task_id,
+                task: serde_json::to_value(stamp_task(task)).unwrap_or_default(),
+                auto_download_config: auto_download_config
+                    .as_ref()
+                    .and_then(|c| serde_json::to_value(c).ok()),
+                owner_uid: owner,
+            }),
+            CloudDlEvent::ProgressUpdate {
+                task_id,
+                finished_size,
+                file_size,
+                progress_percent,
+                ..
+            } => TaskEvent::CloudDl(WsCloudDlEvent::ProgressUpdate {
+                task_id: *task_id,
+                finished_size: *finished_size,
+                file_size: *file_size,
+                progress_percent: *progress_percent,
+                owner_uid: owner,
+            }),
             CloudDlEvent::TaskListRefreshed { tasks, .. } => {
                 TaskEvent::CloudDl(WsCloudDlEvent::TaskListRefreshed {
-                    tasks: tasks.iter()
+                    tasks: tasks
+                        .iter()
                         .map(|t| serde_json::to_value(stamp_task(t)).unwrap_or_default())
                         .collect(),
                     owner_uid: owner,
@@ -587,7 +608,6 @@ impl CloudDlMonitor {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
-
 
     // ==================== 主循环方法 ====================
 
@@ -822,7 +842,10 @@ impl CloudDlMonitor {
 
         if unchanged_count >= 3 {
             let backoff = base.as_secs_f32()
-                * self.config.backoff_multiplier.powi(unchanged_count as i32 - 2);
+                * self
+                    .config
+                    .backoff_multiplier
+                    .powi(unchanged_count as i32 - 2);
             Duration::from_secs_f32(backoff.min(self.config.idle_interval.as_secs_f32()))
         } else {
             base
@@ -888,10 +911,7 @@ impl CloudDlMonitor {
                 match history_db.get_cloud_dl_auto_download(task.task_id) {
                     Ok(Some(db_config)) => {
                         if db_config.triggered {
-                            info!(
-                                "离线任务 {} 的自动下载已触发过，跳过",
-                                task.task_id
-                            );
+                            info!("离线任务 {} 的自动下载已触发过，跳过", task.task_id);
                             true
                         } else {
                             false
@@ -929,26 +949,32 @@ impl CloudDlMonitor {
 
                         // 🔥 先查询任务详情获取 file_list（因为轮询时只查询进行中的任务详情）
                         let client_snap2 = self.client.read().unwrap().clone();
-                        let task_with_details = match client_snap2.cloud_dl_query_task(&[task.task_id]).await {
-                            Ok(details) if !details.is_empty() => {
-                                let detail = &details[0];
-                                info!(
-                                    "获取离线任务详情成功: task_id={}, file_list_count={}",
-                                    task.task_id, detail.file_list.len()
-                                );
-                                detail.clone()
-                            }
-                            Ok(_) => {
-                                warn!("获取离线任务详情返回空: task_id={}", task.task_id);
-                                task.clone()
-                            }
-                            Err(e) => {
-                                warn!("获取离线任务详情失败: task_id={}, 错误: {}", task.task_id, e);
-                                task.clone()
-                            }
-                        };
+                        let task_with_details =
+                            match client_snap2.cloud_dl_query_task(&[task.task_id]).await {
+                                Ok(details) if !details.is_empty() => {
+                                    let detail = &details[0];
+                                    info!(
+                                        "获取离线任务详情成功: task_id={}, file_list_count={}",
+                                        task.task_id,
+                                        detail.file_list.len()
+                                    );
+                                    detail.clone()
+                                }
+                                Ok(_) => {
+                                    warn!("获取离线任务详情返回空: task_id={}", task.task_id);
+                                    task.clone()
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "获取离线任务详情失败: task_id={}, 错误: {}",
+                                        task.task_id, e
+                                    );
+                                    task.clone()
+                                }
+                            };
 
-                        self.execute_auto_download(&task_with_details, local_path).await;
+                        self.execute_auto_download(&task_with_details, local_path)
+                            .await;
                     }
                 }
             }
@@ -1072,13 +1098,16 @@ impl CloudDlMonitor {
                         if let Some(ref fdm) = *folder_download_manager {
                             // 多账号：folder 归属当前 DownloadManager 所属账号
                             let owner_uid = dm.owner_uid();
-                            match fdm.create_folder_download_with_dir(
-                                file.path.clone(),
-                                target_dir,
-                                None,
-                                None,
-                                owner_uid,
-                            ).await {
+                            match fdm
+                                .create_folder_download_with_dir(
+                                    file.path.clone(),
+                                    target_dir,
+                                    None,
+                                    None,
+                                    owner_uid,
+                                )
+                                .await
+                            {
                                 Ok(folder_id) => {
                                     info!(
                                         "自动下载文件夹任务创建成功: folder_id={}, name={}",
@@ -1095,19 +1124,25 @@ impl CloudDlMonitor {
                                 }
                             }
                         } else {
-                            warn!("文件夹下载管理器未设置，跳过文件夹: {}", file.server_filename);
+                            warn!(
+                                "文件夹下载管理器未设置，跳过文件夹: {}",
+                                file.server_filename
+                            );
                             fail_count += 1;
                         }
                     } else {
                         // 单文件下载
-                        match dm.create_task_with_dir(
-                            file.fs_id,
-                            file.path.clone(),
-                            file.server_filename.clone(),
-                            file.size,
-                            target_dir,
-                            None,
-                        ).await {
+                        match dm
+                            .create_task_with_dir(
+                                file.fs_id,
+                                file.path.clone(),
+                                file.server_filename.clone(),
+                                file.size,
+                                target_dir,
+                                None,
+                            )
+                            .await
+                        {
                             Ok(task_id) => {
                                 // 自动开始下载
                                 if let Err(e) = dm.start_task(&task_id).await {
@@ -1212,7 +1247,11 @@ impl CloudDlMonitor {
 
     /// 获取自动下载配置
     pub async fn get_auto_download_config(&self, task_id: i64) -> Option<AutoDownloadConfig> {
-        self.auto_download_configs.read().await.get(&task_id).cloned()
+        self.auto_download_configs
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
     }
 
     /// 增加订阅者
@@ -1366,7 +1405,8 @@ mod tests {
         };
         assert_eq!(event.event_type_name(), "progress_update");
 
-        let event = CloudDlEvent::TaskListRefreshed { tasks: vec![],
+        let event = CloudDlEvent::TaskListRefreshed {
+            tasks: vec![],
             owner_uid: None,
         };
         assert_eq!(event.event_type_name(), "task_list_refreshed");
@@ -1384,7 +1424,8 @@ mod tests {
         };
         assert_eq!(event.task_id(), Some(123));
 
-        let event = CloudDlEvent::TaskListRefreshed { tasks: vec![],
+        let event = CloudDlEvent::TaskListRefreshed {
+            tasks: vec![],
             owner_uid: None,
         };
         assert_eq!(event.task_id(), None);

@@ -110,7 +110,12 @@ pub async fn create_folder_download(
 
     match app_state
         .folder_download_manager
-        .create_folder_download_with_name(req.path, req.original_name, conflict_strategy, effective_uid)
+        .create_folder_download_with_name(
+            req.path,
+            req.original_name,
+            conflict_strategy,
+            effective_uid,
+        )
         .await
     {
         Ok(folder_id) => Ok(Json(ApiResponse::success(folder_id))),
@@ -335,7 +340,8 @@ mod tests {
     #[test]
     fn folder_item_keeps_folder_level_progress_stats() {
         // 模拟：文件夹已完成 10 个文件（累计 1000 字节），当前 1 个活跃子任务已下载 300 字节
-        let mut folder = FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
+        let mut folder =
+            FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
         folder.status = FolderStatus::Downloading;
         folder.total_files = 48;
         folder.total_size = 4_800;
@@ -356,7 +362,8 @@ mod tests {
     #[test]
     fn failed_subtask_not_counted_as_completed() {
         // 验证失败的子任务不应计入 completed_count 和 completed_downloaded_size
-        let mut folder = FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
+        let mut folder =
+            FolderDownload::new("/test/folder".to_string(), PathBuf::from("/tmp/folder"));
         folder.total_files = 10;
         folder.total_size = 10_000;
         folder.completed_count = 5;

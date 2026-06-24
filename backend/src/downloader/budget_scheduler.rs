@@ -380,10 +380,28 @@ impl BudgetScheduler {
     ) {
         let _guard = self.recompute_lock.lock().await;
         let cfg = self.config.lock().await.clone();
-        Self::upsert_account(&self.download, uid, vip, download_requested, &cfg.download_recommended);
-        Self::upsert_account(&self.upload, uid, vip, upload_requested, &cfg.upload_recommended);
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::upsert_account(
+            &self.download,
+            uid,
+            vip,
+            download_requested,
+            &cfg.download_recommended,
+        );
+        Self::upsert_account(
+            &self.upload,
+            uid,
+            vip,
+            upload_requested,
+            &cfg.upload_recommended,
+        );
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
         info!("BudgetScheduler upsert 账号: uid={}, vip={:?}", uid, vip);
     }
 
@@ -399,10 +417,8 @@ impl BudgetScheduler {
             let slot = slot_ref.value();
             slot.vip_encoded
                 .store(AccountSlot::encode_vip(vip), Ordering::SeqCst);
-            slot.requested_source_encoded.store(
-                AccountSlot::encode_requested(requested),
-                Ordering::SeqCst,
-            );
+            slot.requested_source_encoded
+                .store(AccountSlot::encode_requested(requested), Ordering::SeqCst);
             debug!(
                 "upsert_account: 更新已有 uid={} vip={:?} requested={:?}",
                 uid, vip, requested
@@ -435,8 +451,14 @@ impl BudgetScheduler {
         self.download.accounts.remove(&uid);
         self.upload.accounts.remove(&uid);
         let cfg = self.config.lock().await.clone();
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
         info!("BudgetScheduler 移除账号: uid={}", uid);
     }
 
@@ -454,11 +476,7 @@ impl BudgetScheduler {
     /// 3. `priority = if prev < base then P0 else P1`（基于唯一 prev，串行化）
     /// 4. 拿全局 priority sem permit
     /// 5. 构造 `ChunkPermit`；drop 时自动 `used.fetch_sub(1)`
-    pub async fn acquire_chunk_permit(
-        &self,
-        uid: Uid,
-        kind: BudgetKind,
-    ) -> Option<ChunkPermit> {
+    pub async fn acquire_chunk_permit(&self, uid: Uid, kind: BudgetKind) -> Option<ChunkPermit> {
         let track = self.track(kind);
         let slot = track.accounts.get(&uid).map(|r| Arc::clone(&*r))?;
 
@@ -514,8 +532,14 @@ impl BudgetScheduler {
     pub async fn recompute_budget(&self) {
         let _guard = self.recompute_lock.lock().await;
         let cfg = self.config.lock().await.clone();
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
     }
 
     /// 🔥 更新机器总上限 `M_download` / `M_upload`
@@ -549,8 +573,14 @@ impl BudgetScheduler {
         }
         // 内联 recompute（不能再调 self.recompute_budget()，否则会再次取同一把锁死锁）
         let cfg = self.config.lock().await.clone();
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
     }
 
     /// 🔥 更新 VIP 权重表
@@ -572,8 +602,14 @@ impl BudgetScheduler {
             }
         }
         let cfg = self.config.lock().await.clone();
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
     }
 
     /// 🔥 一次更新机器总上限 + VIP 权重
@@ -623,8 +659,14 @@ impl BudgetScheduler {
 
         // 2) 单次 recompute（事务尾部，确保 M + weights 都已写入）
         let cfg = self.config.lock().await.clone();
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
     }
 
     /// 🔥 更新 VIP 推荐表
@@ -646,8 +688,14 @@ impl BudgetScheduler {
             }
         }
         let cfg = self.config.lock().await.clone();
-        Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+        Self::recompute_locked_inner(
+            &self.download,
+            &cfg.download_weights,
+            &cfg.download_recommended,
+        )
+        .await;
+        Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended)
+            .await;
     }
 
     /// 🔥 更新单账号 `RequestedSource`
@@ -684,8 +732,18 @@ impl BudgetScheduler {
         }
         if found {
             let cfg = self.config.lock().await.clone();
-            Self::recompute_locked_inner(&self.download, &cfg.download_weights, &cfg.download_recommended).await;
-            Self::recompute_locked_inner(&self.upload, &cfg.upload_weights, &cfg.upload_recommended).await;
+            Self::recompute_locked_inner(
+                &self.download,
+                &cfg.download_weights,
+                &cfg.download_recommended,
+            )
+            .await;
+            Self::recompute_locked_inner(
+                &self.upload,
+                &cfg.upload_weights,
+                &cfg.upload_recommended,
+            )
+            .await;
             info!("BudgetScheduler 更新账号请求: uid={}", uid);
         }
         found
@@ -749,7 +807,8 @@ impl BudgetScheduler {
         }
 
         // 第 4 步：保底
-        let mut base: HashMap<Uid, usize> = entries.iter().map(|(u, _)| (*u, MIN_PER_ACCOUNT)).collect();
+        let mut base: HashMap<Uid, usize> =
+            entries.iter().map(|(u, _)| (*u, MIN_PER_ACCOUNT)).collect();
 
         // 第 5 步：剩余
         let remainder = m.saturating_sub(total_min);
@@ -933,10 +992,7 @@ impl BudgetScheduler {
             );
         }
 
-        info!(
-            "BudgetScheduler.recompute 完成: M={}, accounts={}",
-            m, n
-        );
+        info!("BudgetScheduler.recompute 完成: M={}, accounts={}", m, n);
     }
 
     /// 全量快照
@@ -969,15 +1025,17 @@ impl BudgetScheduler {
         }
         for r in self.upload.accounts.iter() {
             let s = r.value();
-            let entry = by_uid.entry(*r.key()).or_insert_with(|| AccountBudgetSnapshot {
-                uid: *r.key(),
-                vip_cap_download: 0,
-                base_download: 0,
-                used_download: 0,
-                vip_cap_upload: 0,
-                base_upload: 0,
-                used_upload: 0,
-            });
+            let entry = by_uid
+                .entry(*r.key())
+                .or_insert_with(|| AccountBudgetSnapshot {
+                    uid: *r.key(),
+                    vip_cap_download: 0,
+                    base_download: 0,
+                    used_download: 0,
+                    vip_cap_upload: 0,
+                    base_upload: 0,
+                    used_upload: 0,
+                });
             entry.vip_cap_upload = s.effective_cap.load(Ordering::SeqCst);
             entry.base_upload = s.base.load(Ordering::SeqCst);
             entry.used_upload = s.used.load(Ordering::SeqCst);
@@ -1078,8 +1136,16 @@ mod tests {
         let cfg = BudgetSchedulerConfig {
             download_machine_budget: 16,
             upload_machine_budget: 16,
-            download_weights: WeightTable { normal: 1, vip: 3, svip: 5 },
-            upload_weights: WeightTable { normal: 1, vip: 3, svip: 5 },
+            download_weights: WeightTable {
+                normal: 1,
+                vip: 3,
+                svip: 5,
+            },
+            upload_weights: WeightTable {
+                normal: 1,
+                vip: 3,
+                svip: 5,
+            },
             download_recommended: VipRecommendedTable {
                 normal_threads: 1,
                 vip_threads: 5,
@@ -1092,9 +1158,27 @@ mod tests {
             },
         };
         let bs = BudgetScheduler::new(cfg);
-        bs.add_account(Uid::new(1), VipType::Normal, RequestedSource::Auto, RequestedSource::Auto).await;
-        bs.add_account(Uid::new(2), VipType::Vip, RequestedSource::Auto, RequestedSource::Auto).await;
-        bs.add_account(Uid::new(3), VipType::Svip, RequestedSource::Auto, RequestedSource::Auto).await;
+        bs.add_account(
+            Uid::new(1),
+            VipType::Normal,
+            RequestedSource::Auto,
+            RequestedSource::Auto,
+        )
+        .await;
+        bs.add_account(
+            Uid::new(2),
+            VipType::Vip,
+            RequestedSource::Auto,
+            RequestedSource::Auto,
+        )
+        .await;
+        bs.add_account(
+            Uid::new(3),
+            VipType::Svip,
+            RequestedSource::Auto,
+            RequestedSource::Auto,
+        )
+        .await;
 
         let snap = bs.snapshot().await;
         let sum_base_dl: usize = snap.per_account.iter().map(|a| a.base_download).sum();
@@ -1107,7 +1191,11 @@ mod tests {
 
         // 每个账号 base ≥ MIN
         for a in &snap.per_account {
-            assert!(a.base_download >= MIN_PER_ACCOUNT, "uid={} base < MIN", a.uid);
+            assert!(
+                a.base_download >= MIN_PER_ACCOUNT,
+                "uid={} base < MIN",
+                a.uid
+            );
             assert!(
                 a.base_download <= a.vip_cap_download,
                 "uid={} base ({}) > vip_cap ({})",
@@ -1146,9 +1234,11 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
-        let p1 = bs.acquire_chunk_permit(Uid::new(100), BudgetKind::Download).await;
+        let p1 = bs
+            .acquire_chunk_permit(Uid::new(100), BudgetKind::Download)
+            .await;
         assert!(p1.is_some());
         let snap = bs.snapshot().await;
         let used = snap
@@ -1200,10 +1290,14 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
-        let p1 = bs.acquire_chunk_permit(Uid::new(7), BudgetKind::Download).await;
-        let p2 = bs.acquire_chunk_permit(Uid::new(7), BudgetKind::Download).await;
+        let p1 = bs
+            .acquire_chunk_permit(Uid::new(7), BudgetKind::Download)
+            .await;
+        let p2 = bs
+            .acquire_chunk_permit(Uid::new(7), BudgetKind::Download)
+            .await;
         assert!(p1.is_some() && p2.is_some());
 
         // 第三个应阻塞
@@ -1224,8 +1318,20 @@ mod tests {
     #[tokio::test]
     async fn test_remove_account_recomputes() {
         let bs = BudgetScheduler::new(BudgetSchedulerConfig::default());
-        bs.add_account(Uid::new(1), VipType::Normal, RequestedSource::Auto, RequestedSource::Auto).await;
-        bs.add_account(Uid::new(2), VipType::Vip, RequestedSource::Auto, RequestedSource::Auto).await;
+        bs.add_account(
+            Uid::new(1),
+            VipType::Normal,
+            RequestedSource::Auto,
+            RequestedSource::Auto,
+        )
+        .await;
+        bs.add_account(
+            Uid::new(2),
+            VipType::Vip,
+            RequestedSource::Auto,
+            RequestedSource::Auto,
+        )
+        .await;
 
         let snap_before = bs.snapshot().await;
         assert_eq!(snap_before.per_account.len(), 2);
@@ -1266,26 +1372,30 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
         bs.add_account(
             Uid::new(2),
             VipType::Normal,
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
         bs.add_account(
             Uid::new(3),
             VipType::Normal,
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         let track = &bs.download;
         let slot = track.accounts.get(&Uid::new(1)).unwrap();
         let base = slot.base.load(Ordering::SeqCst);
-        assert!(base >= 1 && base < 5, "base 应在 [1, cap=5) 区间，实际={}", base);
+        assert!(
+            base >= 1 && base < 5,
+            "base 应在 [1, cap=5) 区间，实际={}",
+            base
+        );
         // 拷贝一份独立 slot Arc 让 task 内部直接用，避免重新 DashMap 查找
         let slot_arc = Arc::clone(slot.value());
         drop(slot);
@@ -1364,14 +1474,10 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         let snap1 = bs.snapshot().await;
-        let acct1 = snap1
-            .per_account
-            .iter()
-            .find(|a| a.uid.raw() == 1)
-            .unwrap();
+        let acct1 = snap1.per_account.iter().find(|a| a.uid.raw() == 1).unwrap();
         assert_eq!(acct1.vip_cap_download, 1, "Normal vip_cap=1");
 
         // 重新登录（同 uid）但变成 SVIP
@@ -1381,14 +1487,10 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         let snap2 = bs.snapshot().await;
-        let acct2 = snap2
-            .per_account
-            .iter()
-            .find(|a| a.uid.raw() == 1)
-            .unwrap();
+        let acct2 = snap2.per_account.iter().find(|a| a.uid.raw() == 1).unwrap();
         assert_eq!(
             acct2.vip_cap_download, 10,
             "upsert 后 SVIP vip_cap=10（旧实现因 contains_key 早返回会保持 1）"
@@ -1401,14 +1503,10 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         let snap3 = bs.snapshot().await;
-        let acct3 = snap3
-            .per_account
-            .iter()
-            .find(|a| a.uid.raw() == 1)
-            .unwrap();
+        let acct3 = snap3.per_account.iter().find(|a| a.uid.raw() == 1).unwrap();
         assert_eq!(acct3.vip_cap_download, 1, "再降回 Normal vip_cap=1");
     }
 
@@ -1438,10 +1536,14 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         let snap1 = bs.snapshot().await;
-        let acct1 = snap1.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
+        let acct1 = snap1
+            .per_account
+            .iter()
+            .find(|a| a.uid.raw() == 42)
+            .unwrap();
         assert_eq!(acct1.vip_cap_download, 10, "初始 cap=10");
 
         // 把 SVIP threads 调到 5（vip_cap 10 → 5）
@@ -1453,10 +1555,14 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
 
         let snap2 = bs.snapshot().await;
-        let acct2 = snap2.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
+        let acct2 = snap2
+            .per_account
+            .iter()
+            .find(|a| a.uid.raw() == 42)
+            .unwrap();
         assert_eq!(acct2.vip_cap_download, 5, "downscale 后 cap=5");
 
         // 再连续触发两次 recompute（模拟权重 / 请求 / 账号增删等多种触发路径）
@@ -1464,8 +1570,15 @@ mod tests {
         bs.recompute_budget().await;
 
         let snap3 = bs.snapshot().await;
-        let acct3 = snap3.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
-        assert_eq!(acct3.vip_cap_download, 5, "多次 recompute 后 cap 仍为 5（不被重复扣减）");
+        let acct3 = snap3
+            .per_account
+            .iter()
+            .find(|a| a.uid.raw() == 42)
+            .unwrap();
+        assert_eq!(
+            acct3.vip_cap_download, 5,
+            "多次 recompute 后 cap 仍为 5（不被重复扣减）"
+        );
 
         // sem 当前可用 permit 数应该 == 5（无 acquire 时 = 容量）
         let track = &bs.download;
@@ -1485,10 +1598,14 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
 
         let snap4 = bs.snapshot().await;
-        let acct4 = snap4.per_account.iter().find(|a| a.uid.raw() == 42).unwrap();
+        let acct4 = snap4
+            .per_account
+            .iter()
+            .find(|a| a.uid.raw() == 42)
+            .unwrap();
         assert_eq!(acct4.vip_cap_download, 10, "upscale 回 10");
 
         let slot = track.accounts.get(&Uid::new(42)).unwrap();
@@ -1527,7 +1644,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         // acquire 8 个 permit
         let mut held: Vec<ChunkPermit> = Vec::new();
@@ -1553,10 +1670,14 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
 
         // 此时 forget_permits 只消耗了 available 的 2 个；剩余 3 进入 shrink_debt
-        assert_eq!(slot.sem.available_permits(), 0, "available 被 forget 消耗光");
+        assert_eq!(
+            slot.sem.available_permits(),
+            0,
+            "available 被 forget 消耗光"
+        );
         assert_eq!(
             slot.shrink_debt.load(Ordering::SeqCst),
             3,
@@ -1577,7 +1698,11 @@ mod tests {
             "shrink_debt 被释放路径完整抵消"
         );
         assert_eq!(slot.used.load(Ordering::SeqCst), 0);
-        assert_eq!(slot.sem.available_permits(), 5, "sem 容量稳定为 5（不反弹到 8）");
+        assert_eq!(
+            slot.sem.available_permits(),
+            5,
+            "sem 容量稳定为 5（不反弹到 8）"
+        );
 
         // 验收：再连续 acquire，最多只能拿到 5 个（不能超过新 vip_cap）
         let mut held2: Vec<ChunkPermit> = Vec::new();
@@ -1598,7 +1723,10 @@ mod tests {
                 .await
         });
         let r = tokio::time::timeout(std::time::Duration::from_millis(50), acquire_handle).await;
-        assert!(r.is_err(), "第 6 个 acquire 必须阻塞（不能突破新 vip_cap=5）");
+        assert!(
+            r.is_err(),
+            "第 6 个 acquire 必须阻塞（不能突破新 vip_cap=5）"
+        );
         let _ = Priority::P0; // suppress unused warning
     }
 
@@ -1635,7 +1763,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         // acquire 8 个 permit
         let mut held: Vec<ChunkPermit> = Vec::new();
@@ -1660,7 +1788,7 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
         assert_eq!(slot.shrink_debt.load(Ordering::SeqCst), 3, "debt=3");
         assert_eq!(slot.sem.available_permits(), 0);
 
@@ -1673,7 +1801,7 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
 
         // 验收：debt 必须先被 diff(=5) 抵消 3 个 → debt=0，剩 2 真正 add_permits
         assert_eq!(
@@ -1697,7 +1825,11 @@ mod tests {
                 .expect("应能拿到 permit");
             held2.push(p);
         }
-        assert_eq!(slot.used.load(Ordering::SeqCst), 10, "总 in-flight 严格 ≤ cap=10");
+        assert_eq!(
+            slot.used.load(Ordering::SeqCst),
+            10,
+            "总 in-flight 严格 ≤ cap=10"
+        );
         assert_eq!(slot.sem.available_permits(), 0);
 
         // 第 11 个必须阻塞
@@ -1717,7 +1849,11 @@ mod tests {
 
         // 全部 drop 后：debt 已为 0 → drop 路径全部归还到 sem → available=10
         assert_eq!(slot.shrink_debt.load(Ordering::SeqCst), 0);
-        assert_eq!(slot.sem.available_permits(), 10, "所有 permit 归还 → sem.available=10");
+        assert_eq!(
+            slot.sem.available_permits(),
+            10,
+            "所有 permit 归还 → sem.available=10"
+        );
     }
 
     /// 回归测试：`recompute_budget` 必须串行化。
@@ -1749,7 +1885,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         let track = &bs.download;
         let slot = Arc::clone(track.accounts.get(&Uid::new(1)).unwrap().value());
@@ -1784,7 +1920,7 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
         assert_eq!(slot.effective_cap.load(Ordering::SeqCst), 5);
         assert_eq!(slot.sem.available_permits(), 5);
 
@@ -1841,7 +1977,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         // 32 个 task 同时启动，每个 task 跑 ROUNDS 轮
         const TASKS: usize = 32;
@@ -1903,7 +2039,12 @@ mod tests {
                                 VipType::Svip
                             };
                             bs_clone
-                                .add_account(Uid::new(99), vip, RequestedSource::Auto, RequestedSource::Auto)
+                                .add_account(
+                                    Uid::new(99),
+                                    vip,
+                                    RequestedSource::Auto,
+                                    RequestedSource::Auto,
+                                )
                                 .await;
                         }
                     }
@@ -1921,7 +2062,7 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
         bs.update_recommended(
             Some(VipRecommendedTable {
                 normal_threads: 1,
@@ -1930,7 +2071,7 @@ mod tests {
             }),
             None,
         )
-            .await;
+        .await;
 
         // 验收：sem.available_permits() 必须严格等于 effective_cap
         // （旧无锁实现：会出现并发下 sem 容量被多次 add，比 effective_cap 大几倍）
@@ -1982,14 +2123,14 @@ mod tests {
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
         bs.add_account(
             Uid::new(2),
             VipType::Vip,
             RequestedSource::Auto,
             RequestedSource::Auto,
         )
-            .await;
+        .await;
 
         // 并发 reader：不断快照
         let bs_r = Arc::clone(&bs);

@@ -18,7 +18,6 @@ pub enum ProxyType {
     Socks5,
 }
 
-
 /// 代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProxyConfig {

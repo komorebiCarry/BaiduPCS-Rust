@@ -144,10 +144,7 @@ impl MemoryMonitor {
         let mut system = self.system.write();
         system.refresh_process(self.pid);
 
-        system
-            .process(self.pid)
-            .map(|p| p.memory())
-            .unwrap_or(0)
+        system.process(self.pid).map(|p| p.memory()).unwrap_or(0)
     }
 
     /// 获取峰值内存使用量（字节）
@@ -224,16 +221,18 @@ impl MemoryMonitor {
         let window_start = now - self.anomaly_window;
 
         // 找到时间窗口内的最早采样
-        let earliest_in_window = samples
-            .iter()
-            .find(|s| s.timestamp >= window_start)?;
+        let earliest_in_window = samples.iter().find(|s| s.timestamp >= window_start)?;
 
         // 获取最新采样
         let latest = samples.back()?;
 
         // 计算增长量
-        let growth = latest.usage_bytes.saturating_sub(earliest_in_window.usage_bytes);
-        let duration = latest.timestamp.duration_since(earliest_in_window.timestamp);
+        let growth = latest
+            .usage_bytes
+            .saturating_sub(earliest_in_window.usage_bytes);
+        let duration = latest
+            .timestamp
+            .duration_since(earliest_in_window.timestamp);
 
         if growth > self.growth_threshold {
             Some(MemoryAnomaly {
@@ -264,7 +263,8 @@ impl MemoryMonitor {
                 "内存监控器启动，采样间隔: {:?}，异常阈值: {} MB，绝对阈值: {}",
                 monitor.sample_interval,
                 monitor.growth_threshold / (1024 * 1024),
-                monitor.absolute_threshold
+                monitor
+                    .absolute_threshold
                     .map(|t| format!("{} MB", t / (1024 * 1024)))
                     .unwrap_or_else(|| "未设置".to_string())
             );
@@ -377,10 +377,10 @@ mod tests {
     #[test]
     fn test_memory_sampling() {
         let monitor = MemoryMonitor::with_defaults();
-        
+
         // 执行采样
         let sample = monitor.sample();
-        
+
         // 验证采样结果
         assert!(sample.usage_bytes > 0);
         assert_eq!(monitor.sample_count(), 1);
@@ -390,12 +390,12 @@ mod tests {
     #[test]
     fn test_peak_tracking() {
         let monitor = MemoryMonitor::with_defaults();
-        
+
         // 执行多次采样
         for _ in 0..5 {
             monitor.sample();
         }
-        
+
         // 峰值应该被记录
         assert!(monitor.peak_usage() > 0);
     }
@@ -407,12 +407,12 @@ mod tests {
             ..Default::default()
         };
         let monitor = MemoryMonitor::new(config);
-        
+
         // 执行超过限制的采样
         for _ in 0..5 {
             monitor.sample();
         }
-        
+
         // 采样数量应该被限制
         assert_eq!(monitor.sample_count(), 3);
     }
@@ -461,7 +461,7 @@ mod tests {
             ..Default::default()
         };
         let monitor = MemoryMonitor::new(config);
-        
+
         // 当前内存使用肯定超过 1 字节
         let result = monitor.check_absolute_threshold();
         assert!(result.is_some());

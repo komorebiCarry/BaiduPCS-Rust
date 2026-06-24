@@ -2,4 +2,4 @@
 
 pub mod file_watcher;
 
-pub use file_watcher::{FileWatcher, FileChangeEvent, FilterService};
+pub use file_watcher::{FileChangeEvent, FileWatcher, FilterService};

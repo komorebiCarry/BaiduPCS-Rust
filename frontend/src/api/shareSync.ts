@@ -277,6 +277,14 @@ export async function listRuns(id: string, page = 1, pageSize = 20): Promise<Run
   return r.data.data
 }
 
+export async function clearRunsBeforeDays(id: string, days: number): Promise<{ deleted: number; days: number }> {
+  const r = await rawApiClient.delete<{ success: boolean; data: { deleted: number; days: number } }>(
+      `${BASE}/subscriptions/${id}/runs`,
+      { params: { days } },
+  )
+  return r.data.data
+}
+
 export async function getRun(runId: string, page = 1, pageSize = 100): Promise<RunDetail> {
   const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`, {
     params: { page, page_size: pageSize }

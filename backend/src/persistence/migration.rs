@@ -97,7 +97,11 @@ pub fn migrate_backup_configs_schema(db_path: &Path) -> Result<bool> {
             Ok(true)
         }
         // 守卫 3：列名冲突视为幂等成功（多进程并发执行时可能命中）
-        Err(e) if e.to_string().to_lowercase().contains("duplicate column name") => {
+        Err(e)
+            if e.to_string()
+                .to_lowercase()
+                .contains("duplicate column name") =>
+        {
             info!("migrate_backup_configs_schema: owner_uid 已被并发迁移添加，幂等跳过");
             Ok(false)
         }

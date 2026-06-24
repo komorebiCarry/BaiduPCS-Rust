@@ -195,7 +195,9 @@ mod tests {
 
     #[test]
     fn test_budget_message_serialization() {
-        let msg = WsServerMessage::budget(BudgetEvent::UsageSnapshot { per_account: vec![] });
+        let msg = WsServerMessage::budget(BudgetEvent::UsageSnapshot {
+            per_account: vec![],
+        });
         let json = serde_json::to_string(&msg).unwrap();
         // outer tag
         assert!(json.contains("\"type\":\"budget\""));

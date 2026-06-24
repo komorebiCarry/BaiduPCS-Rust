@@ -81,7 +81,9 @@ pub async fn broadcast_budget_recomputed(app_state: &AppState) {
         machine_budget_upload: dto.machine_budget_upload,
         per_account: dto.per_account,
     };
-    app_state.ws_manager.broadcast(WsServerMessage::budget(event));
+    app_state
+        .ws_manager
+        .broadcast(WsServerMessage::budget(event));
 }
 
 /// 仅推送 `used` 增量（高频，1s tick 用）。
@@ -100,7 +102,9 @@ pub async fn broadcast_usage_snapshot(app_state: &AppState) {
         })
         .collect();
     let event = BudgetEvent::UsageSnapshot { per_account };
-    app_state.ws_manager.broadcast(WsServerMessage::budget(event));
+    app_state
+        .ws_manager
+        .broadcast(WsServerMessage::budget(event));
 }
 
 // ============================================================================
@@ -189,9 +193,7 @@ pub async fn update_vip_recommended(
         ("svip", &body.svip),
     ] {
         if entry.threads == 0 || entry.chunk_size_mb == 0 || entry.max_concurrent_tasks == 0 {
-            return Err(ApiError::BadRequest(format!(
-                "VIP 推荐表 {name} 项含 0 值"
-            )));
+            return Err(ApiError::BadRequest(format!("VIP 推荐表 {name} 项含 0 值")));
         }
     }
 
@@ -229,7 +231,10 @@ pub async fn update_vip_recommended(
     // 面板上看到新 vip_cap，运行中的分片仍卡在旧本地闸门，必须重启或其它配置
     // 更新才生效。
     {
-        let auto_users: Vec<(crate::auth::Uid, crate::downloader::budget_scheduler::VipType)> = {
+        let auto_users: Vec<(
+            crate::auth::Uid,
+            crate::downloader::budget_scheduler::VipType,
+        )> = {
             let am = app_state.account_manager.lock().await;
             am.list_users()
                 .iter()
@@ -244,18 +249,15 @@ pub async fn update_vip_recommended(
         };
         for (uid, vip) in auto_users {
             let (new_threads, new_max_concurrent) = match vip {
-                crate::downloader::budget_scheduler::VipType::Normal => (
-                    body.normal.threads,
-                    body.normal.max_concurrent_tasks,
-                ),
-                crate::downloader::budget_scheduler::VipType::Vip => (
-                    body.vip.threads,
-                    body.vip.max_concurrent_tasks,
-                ),
-                crate::downloader::budget_scheduler::VipType::Svip => (
-                    body.svip.threads,
-                    body.svip.max_concurrent_tasks,
-                ),
+                crate::downloader::budget_scheduler::VipType::Normal => {
+                    (body.normal.threads, body.normal.max_concurrent_tasks)
+                }
+                crate::downloader::budget_scheduler::VipType::Vip => {
+                    (body.vip.threads, body.vip.max_concurrent_tasks)
+                }
+                crate::downloader::budget_scheduler::VipType::Svip => {
+                    (body.svip.threads, body.svip.max_concurrent_tasks)
+                }
             };
             if let Some(dm) = app_state.download_manager_for(uid) {
                 dm.update_max_threads(new_threads);
@@ -417,13 +419,19 @@ pub async fn update_account_custom_config(
         }
         Ok(())
     }
-    validate_positive_usize(merged.download.max_global_threads, "download.max_global_threads")?;
+    validate_positive_usize(
+        merged.download.max_global_threads,
+        "download.max_global_threads",
+    )?;
     validate_positive_u64(merged.download.chunk_size_mb, "download.chunk_size_mb")?;
     validate_positive_usize(
         merged.download.max_concurrent_tasks,
         "download.max_concurrent_tasks",
     )?;
-    validate_positive_usize(merged.upload.max_global_threads, "upload.max_global_threads")?;
+    validate_positive_usize(
+        merged.upload.max_global_threads,
+        "upload.max_global_threads",
+    )?;
     validate_positive_u64(merged.upload.chunk_size_mb, "upload.chunk_size_mb")?;
     validate_positive_usize(
         merged.upload.max_concurrent_tasks,
@@ -488,20 +496,19 @@ pub async fn update_account_custom_config(
                 am.get_user(uid).cloned()
             };
             let cfg_guard = app_state.config.read().await;
-            let (eff_dl_threads, eff_dl_concurrent, _, _, _, _) = if let Some(ref user) =
-                user_for_uid
-            {
-                crate::server::state::resolve_effective_account_config(user, &cfg_guard)
-            } else {
-                (
-                    merged.download.max_global_threads,
-                    merged.download.max_concurrent_tasks,
-                    merged.download.max_retries,
-                    merged.upload.max_global_threads,
-                    merged.upload.max_concurrent_tasks,
-                    merged.upload.max_retries,
-                )
-            };
+            let (eff_dl_threads, eff_dl_concurrent, _, _, _, _) =
+                if let Some(ref user) = user_for_uid {
+                    crate::server::state::resolve_effective_account_config(user, &cfg_guard)
+                } else {
+                    (
+                        merged.download.max_global_threads,
+                        merged.download.max_concurrent_tasks,
+                        merged.download.max_retries,
+                        merged.upload.max_global_threads,
+                        merged.upload.max_concurrent_tasks,
+                        merged.upload.max_retries,
+                    )
+                };
             drop(cfg_guard);
             if dl_effective_threads_changed {
                 dm.update_max_threads(eff_dl_threads);
@@ -534,20 +541,19 @@ pub async fn update_account_custom_config(
                 am.get_user(uid).cloned()
             };
             let cfg_guard = app_state.config.read().await;
-            let (_, _, _, eff_up_threads, eff_up_concurrent, _) = if let Some(ref user) =
-                user_for_uid
-            {
-                crate::server::state::resolve_effective_account_config(user, &cfg_guard)
-            } else {
-                (
-                    merged.download.max_global_threads,
-                    merged.download.max_concurrent_tasks,
-                    merged.download.max_retries,
-                    merged.upload.max_global_threads,
-                    merged.upload.max_concurrent_tasks,
-                    merged.upload.max_retries,
-                )
-            };
+            let (_, _, _, eff_up_threads, eff_up_concurrent, _) =
+                if let Some(ref user) = user_for_uid {
+                    crate::server::state::resolve_effective_account_config(user, &cfg_guard)
+                } else {
+                    (
+                        merged.download.max_global_threads,
+                        merged.download.max_concurrent_tasks,
+                        merged.download.max_retries,
+                        merged.upload.max_global_threads,
+                        merged.upload.max_concurrent_tasks,
+                        merged.upload.max_retries,
+                    )
+                };
             drop(cfg_guard);
             if up_effective_threads_changed {
                 um.update_max_threads(eff_up_threads);

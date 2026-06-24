@@ -190,8 +190,8 @@ impl RetryPolicy {
             return Duration::from_millis(0);
         }
 
-        let delay = self.initial_delay_ms as f64
-            * self.backoff_multiplier.powi((retry_count - 1) as i32);
+        let delay =
+            self.initial_delay_ms as f64 * self.backoff_multiplier.powi((retry_count - 1) as i32);
         let delay = delay.min(self.max_delay_ms as f64) as u64;
 
         let delay = if self.add_jitter {
@@ -260,15 +260,13 @@ pub fn to_user_message(error: &BackupError) -> String {
         BackupError::ConfigError(msg) => format!("配置有误：{}，请检查备份配置", msg),
         BackupError::FileSystemError(msg) => format!("文件操作失败：{}，请检查文件权限", msg),
         BackupError::NetworkError(_) => "网络连接失败，请检查网络后重试".to_string(),
-        BackupError::ApiError { code, message } => {
-            match *code {
-                429 | 31034 => "请求过于频繁，请稍后再试".to_string(),
-                401 => "登录已过期，请重新登录".to_string(),
-                403 => "没有访问权限，请检查账号状态".to_string(),
-                404 => "文件或目录不存在".to_string(),
-                _ => format!("服务器错误 ({}): {}", code, message),
-            }
-        }
+        BackupError::ApiError { code, message } => match *code {
+            429 | 31034 => "请求过于频繁，请稍后再试".to_string(),
+            401 => "登录已过期，请重新登录".to_string(),
+            403 => "没有访问权限，请检查账号状态".to_string(),
+            404 => "文件或目录不存在".to_string(),
+            _ => format!("服务器错误 ({}): {}", code, message),
+        },
         BackupError::EncryptionError(_) => "文件加密失败，请检查加密配置".to_string(),
         BackupError::DecryptionError(_) => "文件解密失败，请确认密钥正确".to_string(),
         BackupError::DedupError(_) => "去重检查失败，将重新上传".to_string(),
@@ -291,15 +289,11 @@ impl From<anyhow::Error> for BackupError {
         // 尝试向下转换为具体错误类型
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             return match io_err.kind() {
-                std::io::ErrorKind::NotFound => {
-                    BackupError::FileNotFound(io_err.to_string())
-                }
+                std::io::ErrorKind::NotFound => BackupError::FileNotFound(io_err.to_string()),
                 std::io::ErrorKind::PermissionDenied => {
                     BackupError::PermissionDenied(io_err.to_string())
                 }
-                std::io::ErrorKind::TimedOut => {
-                    BackupError::Timeout(io_err.to_string())
-                }
+                std::io::ErrorKind::TimedOut => BackupError::Timeout(io_err.to_string()),
                 _ => BackupError::FileSystemError(io_err.to_string()),
             };
         }

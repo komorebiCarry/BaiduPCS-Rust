@@ -106,8 +106,8 @@ fn parse_filename(filename: &str) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use proptest::prelude::*;
+    use std::collections::HashSet;
 
     // Feature: file-conflict-strategy, Property 12: 自动重命名唯一性（上传）
     // Feature: file-conflict-strategy, Property 13: 自动重命名唯一性（下载）
@@ -124,17 +124,17 @@ mod tests {
             let original = format!("{}.{}", filename, ext);
             let mut existing = HashSet::new();
             existing.insert(original.clone());
-            
+
             // 添加一些已存在的重命名版本
             for i in 1..=existing_count {
                 existing.insert(format!("{} ({}).{}", filename, i, ext));
             }
-            
+
             let result = generate_unique_path(&original, |p| existing.contains(p)).unwrap();
-            
+
             // 验证生成的路径不在已存在集合中
             assert!(!existing.contains(&result));
-            
+
             // 验证格式正确
             let expected_counter = existing_count + 1;
             let expected_pattern = format!("({}).{}", expected_counter, ext);
@@ -148,9 +148,9 @@ mod tests {
         ) {
             let original = format!("{}.{}", filename, ext);
             let existing = HashSet::from([original.clone()]);
-            
+
             let result = generate_unique_path(&original, |p| existing.contains(p)).unwrap();
-            
+
             // 验证格式为 "filename (N).ext"
             let expected = format!("{} (1).{}", filename, ext);
             assert_eq!(result, expected);
@@ -161,9 +161,9 @@ mod tests {
             filename in "[a-zA-Z0-9_-]{1,20}"
         ) {
             let existing = HashSet::from([filename.clone()]);
-            
+
             let result = generate_unique_path(&filename, |p| existing.contains(p)).unwrap();
-            
+
             // 验证格式为 "filename (N)"
             let expected = format!("{} (1)", filename);
             assert_eq!(result, expected);
@@ -196,7 +196,11 @@ mod tests {
         let existing = HashSet::from(["/path/to/file.txt"]);
         let result = generate_unique_path("/path/to/file.txt", |p| existing.contains(p)).unwrap();
         // On Windows, PathBuf will use backslashes, so we need to check for the pattern
-        assert!(result.contains("file (1).txt"), "Expected 'file (1).txt' in result: {}", result);
+        assert!(
+            result.contains("file (1).txt"),
+            "Expected 'file (1).txt' in result: {}",
+            result
+        );
     }
 
     #[test]
@@ -209,8 +213,7 @@ mod tests {
     #[test]
     fn test_special_characters() {
         let existing = HashSet::from(["file (test).txt"]);
-        let result =
-            generate_unique_path("file (test).txt", |p| existing.contains(p)).unwrap();
+        let result = generate_unique_path("file (test).txt", |p| existing.contains(p)).unwrap();
         assert_eq!(result, "file (test) (1).txt");
     }
 
@@ -229,10 +232,7 @@ mod tests {
         // Create a closure that always returns true (file always exists)
         let result = generate_unique_path("file.txt", |_| true);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("已尝试 9999 次"));
+        assert!(result.unwrap_err().to_string().contains("已尝试 9999 次"));
     }
 }
 
@@ -247,21 +247,39 @@ fn test_incremental_rename_from_numbered() {
 
 #[test]
 fn test_parse_filename_basic() {
-    assert_eq!(parse_filename("file.txt"), ("file".to_string(), Some("txt".to_string())));
+    assert_eq!(
+        parse_filename("file.txt"),
+        ("file".to_string(), Some("txt".to_string()))
+    );
     assert_eq!(parse_filename("file"), ("file".to_string(), None));
 }
 
 #[test]
 fn test_parse_filename_numbered() {
-    assert_eq!(parse_filename("file (1).txt"), ("file".to_string(), Some("txt".to_string())));
-    assert_eq!(parse_filename("file (2).txt"), ("file".to_string(), Some("txt".to_string())));
-    assert_eq!(parse_filename("file (10).txt"), ("file".to_string(), Some("txt".to_string())));
+    assert_eq!(
+        parse_filename("file (1).txt"),
+        ("file".to_string(), Some("txt".to_string()))
+    );
+    assert_eq!(
+        parse_filename("file (2).txt"),
+        ("file".to_string(), Some("txt".to_string()))
+    );
+    assert_eq!(
+        parse_filename("file (10).txt"),
+        ("file".to_string(), Some("txt".to_string()))
+    );
     assert_eq!(parse_filename("file (1)"), ("file".to_string(), None));
 }
 
 #[test]
 fn test_parse_filename_special_cases() {
     // 括号内不是数字，不应该被解析为编号格式
-    assert_eq!(parse_filename("file (test).txt"), ("file (test)".to_string(), Some("txt".to_string())));
-    assert_eq!(parse_filename("file (a1).txt"), ("file (a1)".to_string(), Some("txt".to_string())));
+    assert_eq!(
+        parse_filename("file (test).txt"),
+        ("file (test)".to_string(), Some("txt".to_string()))
+    );
+    assert_eq!(
+        parse_filename("file (a1).txt"),
+        ("file (a1)".to_string(), Some("txt".to_string()))
+    );
 }

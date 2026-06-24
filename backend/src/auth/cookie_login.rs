@@ -56,9 +56,7 @@ impl CookieLoginAuth {
 
     /// 创建新的 Cookie 登录客户端（支持代理配置）
     pub fn new_with_proxy(proxy_config: Option<&ProxyConfig>) -> Result<Self> {
-        let mut builder = Client::builder()
-            .cookie_store(false)
-            .user_agent(USER_AGENT);
+        let mut builder = Client::builder().cookie_store(false).user_agent(USER_AGENT);
 
         if let Some(proxy) = proxy_config {
             builder = proxy.apply_to_builder(builder)?;
@@ -80,7 +78,9 @@ impl CookieLoginAuth {
             .get("BDUSS")
             .cloned()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("Cookie 中缺少必填字段 BDUSS，请确认完整粘贴了 Cookie 字符串"))?;
+            .ok_or_else(|| {
+                anyhow!("Cookie 中缺少必填字段 BDUSS，请确认完整粘贴了 Cookie 字符串")
+            })?;
 
         let ptoken = map.get("PTOKEN").cloned().filter(|s| !s.is_empty());
         if ptoken.is_none() {
@@ -92,7 +92,8 @@ impl CookieLoginAuth {
         let passid = map.get("PASSID").cloned().filter(|s| !s.is_empty());
         // 浏览器已登录状态下 Cookie 中通常携带这些预热令牌，直接复用可跳过重新预热
         let panpsc = map.get("PANPSC").cloned().filter(|s| !s.is_empty());
-        let csrf_token = map.get("csrfToken")
+        let csrf_token = map
+            .get("csrfToken")
             .or_else(|| map.get("csrftoken"))
             .or_else(|| map.get("CSRFTOKEN"))
             .cloned()

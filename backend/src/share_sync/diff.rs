@@ -227,7 +227,7 @@ mod tests {
             file("/keep", 1, 100), // unchanged
             file("/grow", 2, 100), // modified (size)
             file("/vanish", 3, 100), // removed
-            // /new is added
+                                   // /new is added
         ]);
         let curr = snap(vec![
             file("/keep", 1, 100),

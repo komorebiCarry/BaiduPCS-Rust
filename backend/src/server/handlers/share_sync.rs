@@ -280,6 +280,11 @@ pub struct RunsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ClearRunsQuery {
+    pub days: u32,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RunItemsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
@@ -310,6 +315,25 @@ pub async fn list_runs(
         .list_runs(&id, page, ps)
         .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(list)))
+}
+
+/// DELETE /api/v1/share-sync/subscriptions/:id/runs?days=N
+pub async fn clear_runs_before_days(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ClearRunsQuery>,
+) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
+    let days = q.days.clamp(1, 3650);
+    let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
+    let cutoff = chrono::Utc::now().timestamp() - i64::from(days) * 24 * 60 * 60;
+    let deleted = m
+        .persistence()
+        .delete_runs_before(&id, cutoff)
+        .map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({"deleted": deleted, "days": days}),
+    )))
 }
 
 /// GET /api/v1/share-sync/runs/:id

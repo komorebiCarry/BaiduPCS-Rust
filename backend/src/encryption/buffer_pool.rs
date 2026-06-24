@@ -57,7 +57,9 @@ impl BufferPool {
     /// 如果池中有可用缓冲区，则复用；否则分配新的。
     /// 返回的缓冲区已清零并调整到正确大小。
     pub fn acquire(&self) -> PooledBuffer {
-        self.inner.acquire_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .acquire_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let buffer = {
             let mut buffers = self.inner.buffers.lock();
@@ -66,7 +68,9 @@ impl BufferPool {
 
         let buffer = match buffer {
             Some(mut buf) => {
-                self.inner.hit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner
+                    .hit_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // 确保大小正确
                 buf.resize(self.inner.buffer_size, 0);
                 buf
@@ -130,8 +134,14 @@ impl BufferPool {
 
     /// 获取统计信息
     pub fn stats(&self) -> BufferPoolStats {
-        let acquire_count = self.inner.acquire_count.load(std::sync::atomic::Ordering::Relaxed);
-        let hit_count = self.inner.hit_count.load(std::sync::atomic::Ordering::Relaxed);
+        let acquire_count = self
+            .inner
+            .acquire_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let hit_count = self
+            .inner
+            .hit_count
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         BufferPoolStats {
             acquire_count,

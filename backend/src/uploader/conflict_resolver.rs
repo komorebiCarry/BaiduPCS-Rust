@@ -84,11 +84,9 @@ mod tests {
         let file_path = temp_dir.path().join("test.txt");
         std::fs::write(&file_path, "content").unwrap();
 
-        let result = ConflictResolver::resolve_download_conflict(
-            &file_path,
-            DownloadConflictStrategy::Skip,
-        )
-        .unwrap();
+        let result =
+            ConflictResolver::resolve_download_conflict(&file_path, DownloadConflictStrategy::Skip)
+                .unwrap();
 
         assert_eq!(result, ConflictResolution::Skip);
     }
@@ -98,11 +96,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("nonexistent.txt");
 
-        let result = ConflictResolver::resolve_download_conflict(
-            &file_path,
-            DownloadConflictStrategy::Skip,
-        )
-        .unwrap();
+        let result =
+            ConflictResolver::resolve_download_conflict(&file_path, DownloadConflictStrategy::Skip)
+                .unwrap();
 
         assert_eq!(result, ConflictResolution::Proceed);
     }
@@ -167,38 +163,38 @@ mod tests {
     // 或者需要一个 mock 框架。由于时间限制，我们先实现下载相关的单元测试
     // 上传相关的测试可以在集成测试中完成
 }
-    
-    #[test]
-    fn test_root_path_parsing() {
-        // 测试根目录路径解析逻辑
-        let path = "/file.txt";
-        let is_absolute = path.starts_with('/');
-        assert!(is_absolute);
-        
-        let parts: Vec<&str> = path.rsplitn(2, '/').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "file.txt"); // filename
-        assert_eq!(parts[1], ""); // parent (empty for root)
-    }
 
-    #[test]
-    fn test_nested_path_parsing() {
-        // 测试嵌套路径解析逻辑
-        let path = "/path/to/file.txt";
-        let parts: Vec<&str> = path.rsplitn(2, '/').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "file.txt"); // filename
-        assert_eq!(parts[1], "/path/to"); // parent
-    }
+#[test]
+fn test_root_path_parsing() {
+    // 测试根目录路径解析逻辑
+    let path = "/file.txt";
+    let is_absolute = path.starts_with('/');
+    assert!(is_absolute);
 
-    #[test]
-    fn test_relative_path_parsing() {
-        // 测试相对路径解析逻辑
-        let path = "file.txt";
-        let is_absolute = path.starts_with('/');
-        assert!(!is_absolute);
-        
-        let parts: Vec<&str> = path.rsplitn(2, '/').collect();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0], "file.txt");
-    }
+    let parts: Vec<&str> = path.rsplitn(2, '/').collect();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], "file.txt"); // filename
+    assert_eq!(parts[1], ""); // parent (empty for root)
+}
+
+#[test]
+fn test_nested_path_parsing() {
+    // 测试嵌套路径解析逻辑
+    let path = "/path/to/file.txt";
+    let parts: Vec<&str> = path.rsplitn(2, '/').collect();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], "file.txt"); // filename
+    assert_eq!(parts[1], "/path/to"); // parent
+}
+
+#[test]
+fn test_relative_path_parsing() {
+    // 测试相对路径解析逻辑
+    let path = "file.txt";
+    let is_absolute = path.starts_with('/');
+    assert!(!is_absolute);
+
+    let parts: Vec<&str> = path.rsplitn(2, '/').collect();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0], "file.txt");
+}

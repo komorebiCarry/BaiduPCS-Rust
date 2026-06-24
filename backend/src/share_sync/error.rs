@@ -136,6 +136,9 @@ const LOCAL_DISK_FULL_KEYWORDS: &[&str] = &[
 /// 这些错误通常来自百度接口的临时服务端超时，可能被包在 `TransferError` /
 /// `DownloadError` 里，而不是 `NetworkError`。
 const TRANSIENT_KEYWORDS: &[&str] = &[
+    "创建文件夹请求失败",
+    "创建临时目录失败",
+    "解析验证响应失败",
     "请求超时",
     "超时",
     "请稍后",
@@ -442,9 +445,7 @@ mod tests {
         assert!(e.is_already_exists());
 
         // 文件/目录类型冲突 = 真实失败,不能当「已存在可继续」
-        let e = ShareSyncError::TransferError(
-            "目标路径已存在同名目录，无法用文件覆盖: /x".into(),
-        );
+        let e = ShareSyncError::TransferError("目标路径已存在同名目录，无法用文件覆盖: /x".into());
         assert!(!e.is_already_exists());
         // 无关错误
         let e = ShareSyncError::TransferError("errno=132 风控".into());

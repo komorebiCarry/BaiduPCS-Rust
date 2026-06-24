@@ -39,11 +39,7 @@ pub async fn readonly_middleware(
     );
 
     if is_write && state.readonly_mode.load(Ordering::Relaxed) {
-        tracing::warn!(
-            "readonly_mode 拦截写请求: {} {}",
-            method,
-            req.uri().path()
-        );
+        tracing::warn!("readonly_mode 拦截写请求: {} {}", method, req.uri().path());
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({

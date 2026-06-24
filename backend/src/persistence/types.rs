@@ -1228,8 +1228,8 @@ mod tests {
             1024 * 1024,
             256 * 1024,
             4,
-            None,  // is_encrypted
-            None,  // encryption_key_version
+            None, // is_encrypted
+            None, // encryption_key_version
         );
 
         assert_eq!(metadata.task_type, TaskType::Download);
@@ -1246,8 +1246,8 @@ mod tests {
             2 * 1024 * 1024,
             512 * 1024,
             4,
-            None,  // encrypt_enabled
-            None,  // encryption_key_version
+            None, // encrypt_enabled
+            None, // encryption_key_version
         );
 
         assert_eq!(metadata.task_type, TaskType::Upload);
@@ -1266,14 +1266,17 @@ mod tests {
             "https://pan.baidu.com/s/xxx".to_string(),
             Some("1234".to_string()),
             "/save/path".to_string(),
-            true, // auto_download
+            true,                              // auto_download
             Some("test_file.zip".to_string()), // file_name
         );
 
         assert_eq!(metadata.task_type, TaskType::Transfer);
         assert_eq!(metadata.transfer_status, Some("checking_share".to_string()));
         assert_eq!(metadata.auto_download, Some(true));
-        assert_eq!(metadata.transfer_file_name, Some("test_file.zip".to_string()));
+        assert_eq!(
+            metadata.transfer_file_name,
+            Some("test_file.zip".to_string())
+        );
 
         // 设置转存状态
         metadata.set_transfer_status("downloading");
@@ -1288,7 +1291,10 @@ mod tests {
         assert_eq!(metadata.auto_download, Some(false));
 
         metadata.set_transfer_file_name("new_file.zip".to_string());
-        assert_eq!(metadata.transfer_file_name, Some("new_file.zip".to_string()));
+        assert_eq!(
+            metadata.transfer_file_name,
+            Some("new_file.zip".to_string())
+        );
 
         metadata.set_transfer_task_id("transfer_001".to_string());
         assert_eq!(metadata.transfer_task_id, Some("transfer_001".to_string()));
@@ -1316,13 +1322,21 @@ mod tests {
             "status": "pending"
         }"#;
 
-        let metadata: TaskMetadata = serde_json::from_str(legacy_json).expect("旧 .meta 必须可反序列化");
+        let metadata: TaskMetadata =
+            serde_json::from_str(legacy_json).expect("旧 .meta 必须可反序列化");
         assert_eq!(metadata.task_id, "legacy_001");
-        assert_eq!(metadata.owner_uid, None, "旧 .meta 反序列化后 owner_uid 必须为 None");
+        assert_eq!(
+            metadata.owner_uid, None,
+            "旧 .meta 反序列化后 owner_uid 必须为 None"
+        );
 
         // 序列化再反序列化（None 不应被写入 JSON）
         let json = serde_json::to_string(&metadata).expect("序列化失败");
-        assert!(!json.contains("owner_uid"), "owner_uid=None 不应写入 JSON，实际：{}", json);
+        assert!(
+            !json.contains("owner_uid"),
+            "owner_uid=None 不应写入 JSON，实际：{}",
+            json
+        );
 
         let round_trip: TaskMetadata = serde_json::from_str(&json).expect("回环失败");
         assert_eq!(round_trip.owner_uid, None);
@@ -1342,12 +1356,16 @@ mod tests {
             None,
             None,
         )
-            .with_owner_uid(7890123456);
+        .with_owner_uid(7890123456);
 
         assert_eq!(metadata.owner_uid, Some(7890123456));
 
         let json = serde_json::to_string(&metadata).expect("序列化失败");
-        assert!(json.contains("\"owner_uid\":7890123456"), "owner_uid 应被写入 JSON，实际：{}", json);
+        assert!(
+            json.contains("\"owner_uid\":7890123456"),
+            "owner_uid 应被写入 JSON，实际：{}",
+            json
+        );
 
         let parsed: TaskMetadata = serde_json::from_str(&json).expect("反序列化失败");
         assert_eq!(parsed.owner_uid, Some(7890123456));

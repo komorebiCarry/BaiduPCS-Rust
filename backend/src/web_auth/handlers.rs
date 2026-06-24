@@ -368,7 +368,10 @@ pub async fn login(
 
     // 检查是否被速率限制
     if let Some(remaining) = state.rate_limiter.is_locked(&client_ip) {
-        warn!("Login blocked due to rate limiting: IP={}, remaining={}s", client_ip, remaining);
+        warn!(
+            "Login blocked due to rate limiting: IP={}, remaining={}s",
+            client_ip, remaining
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(LoginResponse::rate_limited(remaining as u64)),
@@ -389,7 +392,14 @@ pub async fn login(
 
     // 处理恢复码登录
     if let Some(recovery_code) = &req.recovery_code {
-        return handle_recovery_code_login(&state, &client_ip, &credentials, recovery_code, &req.pending_token).await;
+        return handle_recovery_code_login(
+            &state,
+            &client_ip,
+            &credentials,
+            recovery_code,
+            &req.pending_token,
+        )
+        .await;
     }
 
     // 根据认证模式处理登录
@@ -397,9 +407,7 @@ pub async fn login(
         AuthMode::Password => {
             handle_password_only_login(&state, &client_ip, &credentials, &req).await
         }
-        AuthMode::Totp => {
-            handle_totp_only_login(&state, &client_ip, &credentials, &req).await
-        }
+        AuthMode::Totp => handle_totp_only_login(&state, &client_ip, &credentials, &req).await,
         AuthMode::PasswordTotp => {
             handle_password_totp_login(&state, &client_ip, &credentials, &req).await
         }
@@ -639,7 +647,10 @@ async fn handle_password_totp_login(
                 // 密码正确，返回 pending_token，要求 TOTP 验证
                 let pending_token = generate_pending_token();
                 debug!("Password verified, requiring TOTP: IP={}", client_ip);
-                (StatusCode::OK, Json(LoginResponse::need_totp(pending_token)))
+                (
+                    StatusCode::OK,
+                    Json(LoginResponse::need_totp(pending_token)),
+                )
             }
             Ok(false) | Err(_) => {
                 state.rate_limiter.record_failure(client_ip);
@@ -718,7 +729,6 @@ async fn handle_recovery_code_login(
         }
     }
 }
-
 
 // ============================================================================
 // Token Refresh and Logout API (Task 7.2)
@@ -819,7 +829,10 @@ pub async fn status(
     let authenticated = if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                state.token_service.verify_access_token(token.trim()).is_ok()
+                state
+                    .token_service
+                    .verify_access_token(token.trim())
+                    .is_ok()
             } else {
                 false
             }
@@ -890,7 +903,7 @@ pub async fn update_config(
 
     // 验证配置有效性
     let credentials = state.credentials.read().await;
-    
+
     // 如果启用密码认证但未设置密码
     if config.mode.requires_password() && !credentials.has_password() {
         return (
@@ -926,7 +939,10 @@ pub async fn update_config(
 
     // 如果模式发生变化，记录日志
     if old_mode != config.mode {
-        info!("Auth config changed and persisted: {:?} -> {:?}", old_mode, config.mode);
+        info!(
+            "Auth config changed and persisted: {:?} -> {:?}",
+            old_mode, config.mode
+        );
     }
 
     (StatusCode::OK, Json(SuccessResponse::ok())).into_response()
@@ -938,38 +954,38 @@ async fn persist_web_auth_config(config: &crate::web_auth::WebAuthConfig) -> Res
     use tokio::fs;
 
     let config_path = "config/app.toml";
-    
+
     // 读取现有配置
     let content = fs::read_to_string(config_path)
         .await
         .map_err(|e| format!("读取配置文件失败: {}", e))?;
-    
+
     // 解析为 toml::Value 以便修改
-    let mut toml_value: toml::Value = toml::from_str(&content)
-        .map_err(|e| format!("解析配置文件失败: {}", e))?;
-    
+    let mut toml_value: toml::Value =
+        toml::from_str(&content).map_err(|e| format!("解析配置文件失败: {}", e))?;
+
     // 更新 web_auth 部分
     if let Some(table) = toml_value.as_table_mut() {
         let web_auth_value = toml::Value::try_from(config)
             .map_err(|e| format!("序列化 web_auth 配置失败: {}", e))?;
         table.insert("web_auth".to_string(), web_auth_value);
     }
-    
+
     // 写回文件
-    let new_content = toml::to_string_pretty(&toml_value)
-        .map_err(|e| format!("序列化配置失败: {}", e))?;
-    
+    let new_content =
+        toml::to_string_pretty(&toml_value).map_err(|e| format!("序列化配置失败: {}", e))?;
+
     // 确保目录存在
     if let Some(parent) = Path::new(config_path).parent() {
         fs::create_dir_all(parent)
             .await
             .map_err(|e| format!("创建目录失败: {}", e))?;
     }
-    
+
     fs::write(config_path, new_content)
         .await
         .map_err(|e| format!("写入配置文件失败: {}", e))?;
-    
+
     debug!("Web auth config persisted to {}", config_path);
     Ok(())
 }
@@ -1049,7 +1065,11 @@ pub async fn set_password(
     }
 
     info!("Password set/updated successfully");
-    (StatusCode::OK, Json(SuccessResponse::with_message("密码设置成功"))).into_response()
+    (
+        StatusCode::OK,
+        Json(SuccessResponse::with_message("密码设置成功")),
+    )
+        .into_response()
 }
 
 // ============================================================================
@@ -1219,7 +1239,11 @@ pub async fn totp_disable(
     }
 
     info!("TOTP disabled successfully");
-    (StatusCode::OK, Json(SuccessResponse::with_message("双因素认证已禁用"))).into_response()
+    (
+        StatusCode::OK,
+        Json(SuccessResponse::with_message("双因素认证已禁用")),
+    )
+        .into_response()
 }
 
 // ============================================================================

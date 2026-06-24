@@ -142,15 +142,37 @@
             <div class="ss-column-title">执行历史</div>
             <div class="ss-column-subtitle">{{ selected ? selected.name : '未选择订阅' }}</div>
           </div>
-          <el-button
-              size="small"
-              text
-              :icon="Refresh"
-              :disabled="!selected"
-              @click="refreshSelectedRuntime"
-          >
-            刷新
-          </el-button>
+          <div class="history-actions">
+            <el-input-number
+                v-model="clearHistoryDays"
+                :min="1"
+                :max="3650"
+                :step="1"
+                size="small"
+                controls-position="right"
+                :disabled="!selected || clearingRuns"
+            />
+            <el-button
+                size="small"
+                text
+                type="danger"
+                :icon="Delete"
+                :disabled="!selected"
+                :loading="clearingRuns"
+                @click="clearOldRuns"
+            >
+              清理
+            </el-button>
+            <el-button
+                size="small"
+                text
+                :icon="Refresh"
+                :disabled="!selected"
+                @click="refreshSelectedRuntime"
+            >
+              刷新
+            </el-button>
+          </div>
         </div>
 
         <el-empty v-if="!selected" class="ss-panel-empty" description="请选择订阅" />
@@ -564,7 +586,7 @@ import {
   type ShareSyncWsEvent,
   type ShareSyncSubtask,
   listSubscriptions, updateSubscription,
-  deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, listRuns, getRun, listRunItems, listSubtasks,
+  clearRunsBeforeDays, deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, listRuns, getRun, listRunItems, listSubtasks,
 } from '@/api/shareSync'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { createAdaptivePoller } from '@/utils/backendHealth'
@@ -734,6 +756,8 @@ const runItemPage = ref(1)
 const saving = ref(false)
 const triggeringId = ref<string | null>(null)
 const resumingId = ref<string | null>(null)
+const clearingRuns = ref(false)
+const clearHistoryDays = ref(30)
 const formRef = ref()
 const scheduledTime = ref<string>('03:00')
 
@@ -1305,6 +1329,30 @@ async function loadRunItemsPage(page: number) {
   }
 }
 
+async function clearOldRuns() {
+  if (!selected.value) return
+  const days = Math.max(1, Math.round(Number(clearHistoryDays.value) || 30))
+  try {
+    await ElMessageBox.confirm(
+        `确定清理 "${selected.value.name}" 中 ${days} 天之前的运行记录？`,
+        '清理历史',
+        { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  clearingRuns.value = true
+  try {
+    const result = await clearRunsBeforeDays(selected.value.id, days)
+    ElMessage.success(`已清理 ${result.deleted} 条运行记录`)
+    await loadRuns(selected.value.id)
+  } catch (e) {
+    ElMessage.error(`清理失败: ${getApiErrorMessage(e)}`)
+  } finally {
+    clearingRuns.value = false
+  }
+}
+
 // ==================== 本地目录选择（对齐转存） ====================
 
 const dirPickerInitialPath = computed(
@@ -1799,6 +1847,18 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   flex-shrink: 0;
+}
+
+.history-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+
+  :deep(.el-input-number) {
+    width: 92px;
+  }
 }
 
 .ss-column-title {

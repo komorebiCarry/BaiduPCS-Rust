@@ -60,7 +60,10 @@ impl WebAuthState {
     pub async fn start_cleanup_tasks(&self) {
         let config = self.config.read().await;
         if config.mode != AuthMode::None {
-            info!("Starting cleanup tasks for web auth (mode: {:?})", config.mode);
+            info!(
+                "Starting cleanup tasks for web auth (mode: {:?})",
+                config.mode
+            );
             self.rate_limiter.start_cleanup_task().await;
             self.token_service.start_cleanup_task().await;
         } else {
@@ -86,10 +89,7 @@ impl WebAuthState {
     /// * `old_mode` - 变更前的认证模式
     /// * `new_mode` - 变更后的认证模式
     pub async fn on_config_changed(&self, old_mode: AuthMode, new_mode: AuthMode) {
-        info!(
-            "Auth config changed: {:?} -> {:?}",
-            old_mode, new_mode
-        );
+        info!("Auth config changed: {:?} -> {:?}", old_mode, new_mode);
 
         // 使所有会话失效（无论模式如何变化）
         self.token_service.revoke_all_tokens();
@@ -179,10 +179,12 @@ mod tests {
     #[tokio::test]
     async fn test_update_config() {
         let state = create_test_state();
-        
+
         // Generate a token first
         let pair = state.token_service.generate_token_pair().unwrap();
-        assert!(state.token_service.is_refresh_token_valid(&pair.refresh_token));
+        assert!(state
+            .token_service
+            .is_refresh_token_valid(&pair.refresh_token));
 
         // Update config to enable password auth
         let new_config = WebAuthConfig {
@@ -192,17 +194,21 @@ mod tests {
         state.update_config(new_config).await;
 
         // Token should be invalidated
-        assert!(!state.token_service.is_refresh_token_valid(&pair.refresh_token));
+        assert!(!state
+            .token_service
+            .is_refresh_token_valid(&pair.refresh_token));
         assert_eq!(state.get_auth_mode().await, AuthMode::Password);
     }
 
     #[tokio::test]
     async fn test_on_config_changed_none_to_password() {
         let state = create_test_state();
-        
+
         // Simulate config change from None to Password
-        state.on_config_changed(AuthMode::None, AuthMode::Password).await;
-        
+        state
+            .on_config_changed(AuthMode::None, AuthMode::Password)
+            .await;
+
         // Cleanup tasks should be started (we can't easily verify this without more infrastructure)
         // But we can verify the state is consistent
         assert_eq!(state.token_service.active_token_count(), 0);
@@ -211,17 +217,19 @@ mod tests {
     #[tokio::test]
     async fn test_on_config_changed_password_to_none() {
         let state = create_test_state();
-        
+
         // Add some data
         state.rate_limiter.record_failure("192.168.1.1");
         let _pair = state.token_service.generate_token_pair().unwrap();
-        
+
         assert_eq!(state.rate_limiter.active_records_count(), 1);
         assert_eq!(state.token_service.active_token_count(), 1);
 
         // Simulate config change from Password to None
-        state.on_config_changed(AuthMode::Password, AuthMode::None).await;
-        
+        state
+            .on_config_changed(AuthMode::Password, AuthMode::None)
+            .await;
+
         // Data should be cleared
         assert_eq!(state.rate_limiter.active_records_count(), 0);
         assert_eq!(state.token_service.active_token_count(), 0);
@@ -230,15 +238,21 @@ mod tests {
     #[tokio::test]
     async fn test_on_config_changed_password_to_totp() {
         let state = create_test_state();
-        
+
         // Add a token
         let pair = state.token_service.generate_token_pair().unwrap();
-        assert!(state.token_service.is_refresh_token_valid(&pair.refresh_token));
+        assert!(state
+            .token_service
+            .is_refresh_token_valid(&pair.refresh_token));
 
         // Simulate config change from Password to Totp
-        state.on_config_changed(AuthMode::Password, AuthMode::Totp).await;
-        
+        state
+            .on_config_changed(AuthMode::Password, AuthMode::Totp)
+            .await;
+
         // Token should be invalidated
-        assert!(!state.token_service.is_refresh_token_valid(&pair.refresh_token));
+        assert!(!state
+            .token_service
+            .is_refresh_token_valid(&pair.refresh_token));
     }
 }

@@ -81,4 +81,7 @@ pub use config::PersistenceConfig;
 pub use persistence::{TaskMetadata, TaskPersistenceInfo, TaskType, WalRecord};
 
 // 🔥 导出任务槽池相关类型
-pub use task_slot_pool::{TaskSlot, TaskSlotPool, TaskSlotType, TaskPriority, SlotTouchThrottler, STALE_WARNING_THRESHOLD, STALE_RELEASE_THRESHOLD, CLEANUP_INTERVAL};
+pub use task_slot_pool::{
+    SlotTouchThrottler, TaskPriority, TaskSlot, TaskSlotPool, TaskSlotType, CLEANUP_INTERVAL,
+    STALE_RELEASE_THRESHOLD, STALE_WARNING_THRESHOLD,
+};

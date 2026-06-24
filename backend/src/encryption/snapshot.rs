@@ -90,7 +90,7 @@ impl SnapshotManager {
             version,
             key_version,
             remote_path: remote_path.to_string(),
-            is_directory: false,  // 文件快照，不是文件夹
+            is_directory: false, // 文件快照，不是文件夹
             status: SnapshotStatus::Pending.as_str().to_string(),
         };
 
@@ -99,12 +99,15 @@ impl SnapshotManager {
 
     /// 更新快照状态
     pub fn update_status(&self, encrypted_name: &str, status: SnapshotStatus) -> Result<bool> {
-        self.record_manager.update_snapshot_status(encrypted_name, status.as_str())
+        self.record_manager
+            .update_snapshot_status(encrypted_name, status.as_str())
     }
 
     /// 根据加密文件名查找快照
     pub fn find_by_encrypted_name(&self, encrypted_name: &str) -> Result<Option<SnapshotInfo>> {
-        let snapshot = self.record_manager.find_snapshot_by_encrypted_name(encrypted_name)?;
+        let snapshot = self
+            .record_manager
+            .find_snapshot_by_encrypted_name(encrypted_name)?;
         Ok(snapshot.map(SnapshotInfo::from))
     }
 
@@ -114,7 +117,9 @@ impl SnapshotManager {
         original_path: &str,
         original_name: &str,
     ) -> Result<Option<SnapshotInfo>> {
-        let snapshot = self.record_manager.find_snapshot_by_original(original_path, original_name)?;
+        let snapshot = self
+            .record_manager
+            .find_snapshot_by_original(original_path, original_name)?;
         Ok(snapshot.map(SnapshotInfo::from))
     }
 
@@ -147,13 +152,20 @@ impl SnapshotManager {
         algorithm: &str,
         version: i32,
     ) -> Result<bool> {
-        self.record_manager.update_snapshot_encryption_metadata(encrypted_name, nonce, algorithm, version)
+        self.record_manager.update_snapshot_encryption_metadata(
+            encrypted_name,
+            nonce,
+            algorithm,
+            version,
+        )
     }
 
     /// 批量根据加密文件名查找快照
     /// 用于文件列表显示时批量查询原始文件名
     pub fn find_by_encrypted_names(&self, encrypted_names: &[String]) -> Result<Vec<SnapshotInfo>> {
-        let snapshots = self.record_manager.find_snapshots_by_encrypted_names(encrypted_names)?;
+        let snapshots = self
+            .record_manager
+            .find_snapshots_by_encrypted_names(encrypted_names)?;
 
         Ok(snapshots.into_iter().map(SnapshotInfo::from).collect())
     }
@@ -250,18 +262,20 @@ mod tests {
         let snapshot_manager = SnapshotManager::new(record_manager);
 
         // 创建快照
-        let id = snapshot_manager.create_snapshot(
-            "config_1",
-            "/path/to/file",
-            "test.txt",
-            "BPR_BKUP_uuid-1234.bkup",
-            1024,
-            "base64_nonce",
-            "aes256gcm",
-            1,
-            1,  // key_version
-            "/remote/path",
-        ).unwrap();
+        let id = snapshot_manager
+            .create_snapshot(
+                "config_1",
+                "/path/to/file",
+                "test.txt",
+                "BPR_BKUP_uuid-1234.bkup",
+                1024,
+                "base64_nonce",
+                "aes256gcm",
+                1,
+                1, // key_version
+                "/remote/path",
+            )
+            .unwrap();
 
         assert!(id > 0);
     }
@@ -274,21 +288,25 @@ mod tests {
         let encrypted_name = "BPR_BKUP_test-uuid.bkup";
 
         // 创建快照
-        snapshot_manager.create_snapshot(
-            "config_1",
-            "/path/to/file",
-            "original.txt",
-            encrypted_name,
-            2048,
-            "nonce_base64",
-            "aes256gcm",
-            1,
-            1,  // key_version
-            "/remote/backup",
-        ).unwrap();
+        snapshot_manager
+            .create_snapshot(
+                "config_1",
+                "/path/to/file",
+                "original.txt",
+                encrypted_name,
+                2048,
+                "nonce_base64",
+                "aes256gcm",
+                1,
+                1, // key_version
+                "/remote/backup",
+            )
+            .unwrap();
 
         // 查找快照
-        let found = snapshot_manager.find_by_encrypted_name(encrypted_name).unwrap();
+        let found = snapshot_manager
+            .find_by_encrypted_name(encrypted_name)
+            .unwrap();
         assert!(found.is_some());
 
         let snapshot = found.unwrap();
@@ -306,21 +324,25 @@ mod tests {
         let snapshot_manager = SnapshotManager::new(record_manager);
 
         // 创建快照
-        snapshot_manager.create_snapshot(
-            "config_2",
-            "/documents",
-            "report.pdf",
-            "BPR_BKUP_report-uuid.bkup",
-            4096,
-            "nonce_123",
-            "chacha20poly1305",
-            2,
-            1,  // key_version
-            "/backup/documents",
-        ).unwrap();
+        snapshot_manager
+            .create_snapshot(
+                "config_2",
+                "/documents",
+                "report.pdf",
+                "BPR_BKUP_report-uuid.bkup",
+                4096,
+                "nonce_123",
+                "chacha20poly1305",
+                2,
+                1, // key_version
+                "/backup/documents",
+            )
+            .unwrap();
 
         // 通过原始路径查找
-        let found = snapshot_manager.find_by_original("/documents", "report.pdf").unwrap();
+        let found = snapshot_manager
+            .find_by_original("/documents", "report.pdf")
+            .unwrap();
         assert!(found.is_some());
 
         let snapshot = found.unwrap();
@@ -337,36 +359,50 @@ mod tests {
         let encrypted_name = "BPR_BKUP_status-test.bkup";
 
         // 创建快照
-        snapshot_manager.create_snapshot(
-            "config_3",
-            "/path",
-            "file.txt",
-            encrypted_name,
-            512,
-            "nonce",
-            "aes256gcm",
-            1,
-            1,  // key_version
-            "/remote",
-        ).unwrap();
+        snapshot_manager
+            .create_snapshot(
+                "config_3",
+                "/path",
+                "file.txt",
+                encrypted_name,
+                512,
+                "nonce",
+                "aes256gcm",
+                1,
+                1, // key_version
+                "/remote",
+            )
+            .unwrap();
 
         // 验证初始状态
-        let snapshot = snapshot_manager.find_by_encrypted_name(encrypted_name).unwrap().unwrap();
+        let snapshot = snapshot_manager
+            .find_by_encrypted_name(encrypted_name)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.status, SnapshotStatus::Pending);
 
         // 更新为加密中
         snapshot_manager.mark_encrypting(encrypted_name).unwrap();
-        let snapshot = snapshot_manager.find_by_encrypted_name(encrypted_name).unwrap().unwrap();
+        let snapshot = snapshot_manager
+            .find_by_encrypted_name(encrypted_name)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.status, SnapshotStatus::Encrypting);
 
         // 更新为上传中
         snapshot_manager.mark_uploading(encrypted_name).unwrap();
-        let snapshot = snapshot_manager.find_by_encrypted_name(encrypted_name).unwrap().unwrap();
+        let snapshot = snapshot_manager
+            .find_by_encrypted_name(encrypted_name)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.status, SnapshotStatus::Uploading);
 
         // 更新为已完成
         snapshot_manager.mark_completed(encrypted_name).unwrap();
-        let snapshot = snapshot_manager.find_by_encrypted_name(encrypted_name).unwrap().unwrap();
+        let snapshot = snapshot_manager
+            .find_by_encrypted_name(encrypted_name)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.status, SnapshotStatus::Completed);
     }
 
@@ -377,22 +413,27 @@ mod tests {
 
         let encrypted_name = "BPR_BKUP_fail-test.bkup";
 
-        snapshot_manager.create_snapshot(
-            "config_4",
-            "/path",
-            "file.txt",
-            encrypted_name,
-            256,
-            "nonce",
-            "aes256gcm",
-            1,
-            1,  // key_version
-            "/remote",
-        ).unwrap();
+        snapshot_manager
+            .create_snapshot(
+                "config_4",
+                "/path",
+                "file.txt",
+                encrypted_name,
+                256,
+                "nonce",
+                "aes256gcm",
+                1,
+                1, // key_version
+                "/remote",
+            )
+            .unwrap();
 
         // 标记为失败
         snapshot_manager.mark_failed(encrypted_name).unwrap();
-        let snapshot = snapshot_manager.find_by_encrypted_name(encrypted_name).unwrap().unwrap();
+        let snapshot = snapshot_manager
+            .find_by_encrypted_name(encrypted_name)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.status, SnapshotStatus::Failed);
     }
 
@@ -402,10 +443,14 @@ mod tests {
         let snapshot_manager = SnapshotManager::new(record_manager);
 
         // 查找不存在的快照
-        let result = snapshot_manager.find_by_encrypted_name("nonexistent.bkup").unwrap();
+        let result = snapshot_manager
+            .find_by_encrypted_name("nonexistent.bkup")
+            .unwrap();
         assert!(result.is_none());
 
-        let result = snapshot_manager.find_by_original("config", "/path").unwrap();
+        let result = snapshot_manager
+            .find_by_original("config", "/path")
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -418,11 +463,21 @@ mod tests {
         assert_eq!(SnapshotStatus::Failed.as_str(), "failed");
 
         assert_eq!(SnapshotStatus::from_str("pending"), SnapshotStatus::Pending);
-        assert_eq!(SnapshotStatus::from_str("encrypting"), SnapshotStatus::Encrypting);
-        assert_eq!(SnapshotStatus::from_str("uploading"), SnapshotStatus::Uploading);
-        assert_eq!(SnapshotStatus::from_str("completed"), SnapshotStatus::Completed);
+        assert_eq!(
+            SnapshotStatus::from_str("encrypting"),
+            SnapshotStatus::Encrypting
+        );
+        assert_eq!(
+            SnapshotStatus::from_str("uploading"),
+            SnapshotStatus::Uploading
+        );
+        assert_eq!(
+            SnapshotStatus::from_str("completed"),
+            SnapshotStatus::Completed
+        );
         assert_eq!(SnapshotStatus::from_str("failed"), SnapshotStatus::Failed);
-        assert_eq!(SnapshotStatus::from_str("unknown"), SnapshotStatus::Pending); // 默认值
+        assert_eq!(SnapshotStatus::from_str("unknown"), SnapshotStatus::Pending);
+        // 默认值
     }
 
     #[test]
@@ -432,25 +487,30 @@ mod tests {
 
         let encrypted_name = "BPR_BKUP_display-test.bkup";
 
-        snapshot_manager.create_snapshot(
-            "config_5",
-            "/documents/work",
-            "important.docx",
-            encrypted_name,
-            8192,
-            "nonce",
-            "aes256gcm",
-            1,
-            1,  // key_version
-            "/backup/work",
-        ).unwrap();
+        snapshot_manager
+            .create_snapshot(
+                "config_5",
+                "/documents/work",
+                "important.docx",
+                encrypted_name,
+                8192,
+                "nonce",
+                "aes256gcm",
+                1,
+                1, // key_version
+                "/backup/work",
+            )
+            .unwrap();
 
         let display_info = get_file_display_info(&snapshot_manager, encrypted_name).unwrap();
 
         assert!(display_info.is_encrypted);
         assert_eq!(display_info.display_name, "important.docx");
         assert_eq!(display_info.display_path, "/documents/work");
-        assert_eq!(display_info.encrypted_name, Some(encrypted_name.to_string()));
+        assert_eq!(
+            display_info.encrypted_name,
+            Some(encrypted_name.to_string())
+        );
         assert_eq!(display_info.original_size, Some(8192));
     }
 
@@ -481,7 +541,7 @@ mod tests {
             version: 1,
             key_version: 1,
             remote_path: "/remote".to_string(),
-            is_directory:false,
+            is_directory: false,
             status: "completed".to_string(),
         };
 

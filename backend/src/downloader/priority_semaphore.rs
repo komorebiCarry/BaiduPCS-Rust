@@ -187,8 +187,7 @@ impl PrioritySemaphore {
             let mut g = self.inner.lock().await;
             // P0 总是可以走 fast path（如果 available > 0）
             // P1 只有在 P0 队列为空时才能走 fast path（避免 P0 饥饿）
-            let can_fast = g.available > 0
-                && (priority == Priority::P0 || g.p0_waiters.is_empty());
+            let can_fast = g.available > 0 && (priority == Priority::P0 || g.p0_waiters.is_empty());
             if can_fast {
                 g.available -= 1;
                 return PriorityPermit {
@@ -403,8 +402,7 @@ mod tests {
         drop(_hold);
 
         // P0 必须先收到（在 100ms 内）
-        let p0_result =
-            tokio::time::timeout(Duration::from_millis(100), p0_acquired_rx).await;
+        let p0_result = tokio::time::timeout(Duration::from_millis(100), p0_acquired_rx).await;
         assert!(
             p0_result.is_ok() && p0_result.unwrap().is_ok(),
             "P0 应先获得 permit"
@@ -449,7 +447,10 @@ mod tests {
         sem.add_permits(1).await;
 
         let r = tokio::time::timeout(Duration::from_millis(100), rx).await;
-        assert!(r.is_ok() && r.unwrap().is_ok(), "add_permits 后等待者应被唤醒");
+        assert!(
+            r.is_ok() && r.unwrap().is_ok(),
+            "add_permits 后等待者应被唤醒"
+        );
     }
 
     /// 验收基础：forget_permits 下调容量后，新 acquire 阻塞，已持有不中断
@@ -470,9 +471,7 @@ mod tests {
 
         // 新 acquire 必须阻塞（因为 available=0）
         let sem_clone = Arc::clone(&sem);
-        let acquire_handle = tokio::spawn(async move {
-            sem_clone.acquire(Priority::P1).await
-        });
+        let acquire_handle = tokio::spawn(async move { sem_clone.acquire(Priority::P1).await });
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(sem.waiters_count().await, (0, 1), "新 acquire 应被阻塞");
@@ -481,7 +480,11 @@ mod tests {
         drop(h1);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(sem.available_permits().await, 0);
-        assert_eq!(sem.waiters_count().await, (0, 1), "h1 归还被 forgotten 吸收，等待者仍阻塞");
+        assert_eq!(
+            sem.waiters_count().await,
+            (0, 1),
+            "h1 归还被 forgotten 吸收，等待者仍阻塞"
+        );
 
         // 再归还 h2：forgotten 已为 0，唤醒等待者
         drop(h2);
@@ -584,7 +587,10 @@ mod tests {
         // 释放 hold → P0 应先拿到（队头插队）
         drop(_hold);
         let r = tokio::time::timeout(Duration::from_millis(100), p0_rx).await;
-        assert!(r.is_ok() && r.unwrap().is_ok(), "P0 应在 P1 之前获得 permit");
+        assert!(
+            r.is_ok() && r.unwrap().is_ok(),
+            "P0 应在 P1 之前获得 permit"
+        );
 
         // 清理
         for h in p1_handles {
@@ -639,11 +645,8 @@ mod tests {
         );
 
         // 验证可正常 acquire
-        let new_permit = tokio::time::timeout(
-            Duration::from_millis(100),
-            sem.acquire(Priority::P1),
-        )
-            .await;
+        let new_permit =
+            tokio::time::timeout(Duration::from_millis(100), sem.acquire(Priority::P1)).await;
         assert!(new_permit.is_ok(), "acquire 在 cancel 之后应能正常成功");
     }
 

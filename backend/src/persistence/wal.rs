@@ -154,9 +154,7 @@ impl WalWriter {
             );
             Ok(())
         } else {
-            Err(io::Error::other(
-                "WAL writer already closed",
-            ))
+            Err(io::Error::other("WAL writer already closed"))
         }
     }
 
@@ -169,9 +167,7 @@ impl WalWriter {
             debug!("已刷写 WAL 到磁盘 (task_id={})", self.task_id);
             Ok(())
         } else {
-            Err(io::Error::other(
-                "WAL writer already closed",
-            ))
+            Err(io::Error::other("WAL writer already closed"))
         }
     }
 

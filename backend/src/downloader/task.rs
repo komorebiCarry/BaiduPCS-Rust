@@ -30,7 +30,10 @@ impl TaskStatus {
     /// 仅过滤 `Downloading` 会漏掉 `Decrypting`/`Pending` 子任务的速度贡献，
     /// 导致前端展示速度恒为 0。
     pub fn is_active_download_status(&self) -> bool {
-        matches!(self, TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting)
+        matches!(
+            self,
+            TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
+        )
     }
 }
 
@@ -527,7 +530,9 @@ mod tests {
     #[test]
     fn test_detect_encrypted_filename() {
         // 有效的加密文件名：UUID.dat
-        assert!(DownloadTask::detect_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"));
+        assert!(DownloadTask::detect_encrypted_filename(
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"
+        ));
         // 无效的文件名
         assert!(!DownloadTask::detect_encrypted_filename("normal_file.txt"));
         assert!(!DownloadTask::detect_encrypted_filename("not-a-uuid.dat"));

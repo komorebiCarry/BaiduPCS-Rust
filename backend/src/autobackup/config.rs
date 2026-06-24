@@ -69,7 +69,8 @@ impl BackupConfig {
 
         // 检测并迁移上传策略
         if self.direction == BackupDirection::Upload && self.upload_conflict_strategy.is_none() {
-            self.upload_conflict_strategy = Some(crate::uploader::conflict::UploadConflictStrategy::SmartDedup);
+            self.upload_conflict_strategy =
+                Some(crate::uploader::conflict::UploadConflictStrategy::SmartDedup);
             migrated = true;
             tracing::info!(
                 "备份配置迁移: 备份任务 '{}' (ID: {}) 缺少上传冲突策略，应用默认值 SmartDedup",
@@ -79,8 +80,10 @@ impl BackupConfig {
         }
 
         // 检测并迁移下载策略
-        if self.direction == BackupDirection::Download && self.download_conflict_strategy.is_none() {
-            self.download_conflict_strategy = Some(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+        if self.direction == BackupDirection::Download && self.download_conflict_strategy.is_none()
+        {
+            self.download_conflict_strategy =
+                Some(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
             migrated = true;
             tracing::info!(
                 "备份配置迁移: 备份任务 '{}' (ID: {}) 缺少下载冲突策略，应用默认值 Overwrite",
@@ -118,21 +121,21 @@ impl BackupConfig {
     }
 
     /// 获取有效的下载冲突策略（考虑默认值）
-    pub fn effective_download_strategy(&self) -> crate::uploader::conflict::DownloadConflictStrategy {
+    pub fn effective_download_strategy(
+        &self,
+    ) -> crate::uploader::conflict::DownloadConflictStrategy {
         self.download_conflict_strategy
             .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite)
     }
 
     /// 获取有效的同步冲突策略（考虑默认值）
     pub fn effective_sync_strategy(&self) -> SyncConflictStrategy {
-        self.sync_conflict_strategy
-            .unwrap_or_default()
+        self.sync_conflict_strategy.unwrap_or_default()
     }
 
     /// 获取有效的同步初始化模式（考虑默认值）
     pub fn effective_sync_init_mode(&self) -> SyncInitMode {
-        self.sync_init_mode
-            .unwrap_or_default()
+        self.sync_init_mode.unwrap_or_default()
     }
 }
 
@@ -171,7 +174,6 @@ pub enum SyncConflictStrategy {
     Skip,
 }
 
-
 /// 首次初始化模式（仅 Sync 方向使用）
 ///
 /// 大目录首次启用同步时，控制 Case A3（两端都有文件、无 SyncState）的处理方式。
@@ -186,7 +188,6 @@ pub enum SyncInitMode {
     /// 适合"两端已基本一致"的场景，避免首次启用时大量伪冲突
     AdoptBothSides,
 }
-
 
 /// 监听配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,9 +330,8 @@ impl EncryptionConfig {
 
     /// 获取密钥年龄（天数）
     pub fn key_age_days(&self) -> Option<i64> {
-        self.key_created_at.map(|created| {
-            (chrono::Utc::now() - created).num_days()
-        })
+        self.key_created_at
+            .map(|created| (chrono::Utc::now() - created).num_days())
     }
 }
 
@@ -463,8 +463,8 @@ pub struct UpdateBackupConfigRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uploader::conflict::{DownloadConflictStrategy, UploadConflictStrategy};
     use proptest::prelude::*;
-    use crate::uploader::conflict::{UploadConflictStrategy, DownloadConflictStrategy};
 
     // 生成器：上传冲突策略
     fn prop_upload_strategy() -> impl Strategy<Value = Option<UploadConflictStrategy>> {

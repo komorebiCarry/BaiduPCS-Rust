@@ -25,7 +25,14 @@ fn can_write_path(path: &Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::W_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -63,10 +70,20 @@ fn lookup_user_name(uid: u32) -> String {
     let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
     let mut result: *mut libc::passwd = std::ptr::null_mut();
     let ret = unsafe {
-        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
     };
     if ret == 0 && !result.is_null() {
-        unsafe { std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().to_string() }
+        unsafe {
+            std::ffi::CStr::from_ptr(pwd.pw_name)
+                .to_string_lossy()
+                .to_string()
+        }
     } else {
         uid.to_string()
     }
@@ -78,10 +95,20 @@ fn lookup_group_name(gid: u32) -> String {
     let mut grp = unsafe { std::mem::zeroed::<libc::group>() };
     let mut result: *mut libc::group = std::ptr::null_mut();
     let ret = unsafe {
-        libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+        libc::getgrgid_r(
+            gid,
+            &mut grp,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
     };
     if ret == 0 && !result.is_null() {
-        unsafe { std::ffi::CStr::from_ptr(grp.gr_name).to_string_lossy().to_string() }
+        unsafe {
+            std::ffi::CStr::from_ptr(grp.gr_name)
+                .to_string_lossy()
+                .to_string()
+        }
     } else {
         gid.to_string()
     }
@@ -118,7 +145,9 @@ impl FilesystemService {
         })?;
 
         // 搜索关键词（小写化，用于大小写不敏感匹配）
-        let keyword_lower = req.keyword.as_ref()
+        let keyword_lower = req
+            .keyword
+            .as_ref()
             .map(|k| k.trim().to_lowercase())
             .filter(|k| !k.is_empty());
 
@@ -166,20 +195,19 @@ impl FilesystemService {
         let parent_path = if self.guard.is_allowed_root(&path) {
             None
         } else {
-            path.parent()
-                .and_then(|p| {
-                    #[cfg(target_os = "windows")]
-                    {
-                        if p.as_os_str().is_empty() {
-                            return None;
-                        }
-                        Some(p.to_string_lossy().to_string())
+            path.parent().and_then(|p| {
+                #[cfg(target_os = "windows")]
+                {
+                    if p.as_os_str().is_empty() {
+                        return None;
                     }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        Some(p.to_string_lossy().to_string())
-                    }
-                })
+                    Some(p.to_string_lossy().to_string())
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    Some(p.to_string_lossy().to_string())
+                }
+            })
         };
 
         #[cfg(not(target_os = "windows"))]
@@ -398,11 +426,7 @@ impl FilesystemService {
                 let basename = &basenames[i];
                 if name_count.get(basename.as_str()).copied().unwrap_or(0) > 1 {
                     // 同名冲突：使用完整路径作为显示名
-                    let display_name = format!(
-                        "{} ({})",
-                        basename,
-                        path.to_string_lossy()
-                    );
+                    let display_name = format!("{} ({})", basename, path.to_string_lossy());
                     self.create_directory_entry(&path, display_name)
                 } else {
                     self.create_root_entry(&path)

@@ -15,7 +15,9 @@ use axum::{
 use serde::Serialize;
 use std::sync::Arc;
 
-use crate::encryption::{DecryptBundleExporter, EncryptionConfigStore, MappingExport, MappingGenerator};
+use crate::encryption::{
+    DecryptBundleExporter, EncryptionConfigStore, MappingExport, MappingGenerator,
+};
 use crate::server::{ApiError, ApiResult, AppState};
 
 /// API 响应包装
@@ -75,20 +77,17 @@ pub struct KeyInfo {
 ///
 /// 导出完整的解密数据包（ZIP 格式）
 /// 包含 encryption.json 和 mapping.json
-pub async fn export_bundle(
-    State(state): State<AppState>,
-) -> Result<Response, ApiError> {
+pub async fn export_bundle(State(state): State<AppState>) -> Result<Response, ApiError> {
     // 获取加密配置存储
     let config_store = get_encryption_config_store(&state).await?;
 
     // 创建导出器
-    let exporter = DecryptBundleExporter::new(
-        config_store,
-        Arc::clone(&state.backup_record_manager),
-    );
+    let exporter =
+        DecryptBundleExporter::new(config_store, Arc::clone(&state.backup_record_manager));
 
     // 生成 ZIP 数据
-    let zip_data = exporter.export_bundle()
+    let zip_data = exporter
+        .export_bundle()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("导出失败: {}", e)))?;
 
     // 生成文件名（包含时间戳）
@@ -120,7 +119,8 @@ pub async fn export_mapping(
     let generator = MappingGenerator::new(Arc::clone(&state.backup_record_manager));
 
     // 生成映射数据
-    let mapping = generator.generate_mapping()
+    let mapping = generator
+        .generate_mapping()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("生成映射失败: {}", e)))?;
 
     Ok(Json(ApiResponse::success(mapping)))
@@ -136,7 +136,8 @@ pub async fn export_keys(
     let config_store = get_encryption_config_store(&state).await?;
 
     // 加载密钥配置
-    let config = config_store.load()
+    let config = config_store
+        .load()
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("加载密钥配置失败: {}", e)))?
         .ok_or_else(|| ApiError::NotFound("没有密钥配置".to_string()))?;
 
@@ -150,14 +151,18 @@ pub async fn export_keys(
             last_used_at: config.current.last_used_at,
             deprecated_at: config.current.deprecated_at,
         },
-        key_history: config.history.into_iter().map(|k| KeyInfo {
-            master_key: k.master_key,
-            algorithm: format!("{:?}", k.algorithm).to_lowercase(),
-            key_version: k.key_version,
-            created_at: k.created_at,
-            last_used_at: k.last_used_at,
-            deprecated_at: k.deprecated_at,
-        }).collect(),
+        key_history: config
+            .history
+            .into_iter()
+            .map(|k| KeyInfo {
+                master_key: k.master_key,
+                algorithm: format!("{:?}", k.algorithm).to_lowercase(),
+                key_version: k.key_version,
+                created_at: k.created_at,
+                last_used_at: k.last_used_at,
+                deprecated_at: k.deprecated_at,
+            })
+            .collect(),
     };
 
     Ok(Json(ApiResponse::success(response)))
@@ -166,10 +171,14 @@ pub async fn export_keys(
 /// 获取加密配置存储
 ///
 /// 从 AutoBackupManager 获取 EncryptionConfigStore
-async fn get_encryption_config_store(state: &AppState) -> Result<Arc<EncryptionConfigStore>, ApiError> {
+async fn get_encryption_config_store(
+    state: &AppState,
+) -> Result<Arc<EncryptionConfigStore>, ApiError> {
     match state.autobackup_manager_for_active().await {
         Some(manager) => Ok(manager.get_encryption_config_store()),
-        None => Err(ApiError::Internal(anyhow::anyhow!("自动备份管理器未初始化"))),
+        None => Err(ApiError::Internal(anyhow::anyhow!(
+            "自动备份管理器未初始化"
+        ))),
     }
 }
 

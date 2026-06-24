@@ -98,7 +98,11 @@ pub async fn add_task(
 
     // 多账号路由：按 effective_uid 取客户端（懒加载兜底）
     if let Err(e) = state.ensure_client_for_uid(effective_uid).await {
-        error!("add_task: 懒加载 client 失败: uid={}, err={:?}", effective_uid.raw(), e);
+        error!(
+            "add_task: 懒加载 client 失败: uid={}, err={:?}",
+            effective_uid.raw(),
+            e
+        );
         return Ok(Json(ApiResponse::error(
             500,
             format!("无法构造目标账号客户端: {}", e),
@@ -115,9 +119,16 @@ pub async fn add_task(
     };
 
     // 调用 API 添加任务
-    match client.cloud_dl_add_task(&req.source_url, &req.save_path).await {
+    match client
+        .cloud_dl_add_task(&req.source_url, &req.save_path)
+        .await
+    {
         Ok(task_id) => {
-            info!("添加离线下载任务成功: task_id={}, owner_uid={}", task_id, effective_uid.raw());
+            info!(
+                "添加离线下载任务成功: task_id={}, owner_uid={}",
+                task_id,
+                effective_uid.raw()
+            );
 
             // 如果启用了自动下载，注册自动下载配置到监听服务
             if req.auto_download {
@@ -235,7 +246,11 @@ pub async fn list_tasks(
             for task in &mut tasks {
                 task.owner_uid = Some(active_uid.raw());
             }
-            info!("获取离线下载任务列表成功: {} 个任务 (uid={})", tasks.len(), active_uid.raw());
+            info!(
+                "获取离线下载任务列表成功: {} 个任务 (uid={})",
+                tasks.len(),
+                active_uid.raw()
+            );
             Ok(Json(ApiResponse::success(TaskListResponse { tasks })))
         }
         Err(e) => {
@@ -299,7 +314,11 @@ pub async fn query_task(
             if let Some(mut task) = tasks.into_iter().next() {
                 // 🔥 stamp active_uid（同 list_tasks）
                 task.owner_uid = Some(active_uid.raw());
-                info!("查询离线下载任务详情成功: task_id={} (uid={})", task_id, active_uid.raw());
+                info!(
+                    "查询离线下载任务详情成功: task_id={} (uid={})",
+                    task_id,
+                    active_uid.raw()
+                );
                 Ok(Json(ApiResponse::success(task)))
             } else {
                 Ok(Json(ApiResponse::error(404, "任务不存在".to_string())))

@@ -828,7 +828,12 @@ mod tests {
     fn test_remap_include_absolute_path_to_share_root() {
         // 用户实际场景：分享根是单个目录 scan_test，分享内真实路径
         // /13/a测试上传1/scan_test；前端按根级勾选把真实绝对路径存进 include。
-        let files = vec![shared_file("/13/a测试上传1/scan_test", "scan_test", 1, true)];
+        let files = vec![shared_file(
+            "/13/a测试上传1/scan_test",
+            "scan_test",
+            1,
+            true,
+        )];
         let share_root = infer_share_root(&files);
         assert_eq!(share_root, "/13/a测试上传1");
 

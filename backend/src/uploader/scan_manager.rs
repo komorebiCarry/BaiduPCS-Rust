@@ -86,8 +86,7 @@ pub struct ScanManager {
     ///
     /// 注入后扫描子任务按 `owner_uid` 路由到对应账号的 `UploadManager`，
     /// 避免共享单例导致 owner=B 的扫描任务被加进 A 的 manager。
-    upload_manager_pool:
-        Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
+    upload_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
     ws_manager: Arc<WebSocketManager>,
     memory_monitor: Arc<MemoryMonitor>,
     wal_dir: PathBuf,
@@ -104,7 +103,14 @@ impl ScanManager {
         wal_dir: PathBuf,
         max_pending_tasks: usize,
     ) -> Self {
-        Self::new_with_owner(upload_manager, ws_manager, memory_monitor, wal_dir, max_pending_tasks, None)
+        Self::new_with_owner(
+            upload_manager,
+            ws_manager,
+            memory_monitor,
+            wal_dir,
+            max_pending_tasks,
+            None,
+        )
     }
 
     /// 多账号版本构造器
@@ -148,10 +154,7 @@ impl ScanManager {
     ///    - 命中 uid → 该账号独立 manager
     ///    - **miss → `None`**（不再 fallback 到 active 单例，避免悄悄归并到错账号）
     /// 2. **未注入**（legacy 单账号兼容）：返回全局 `upload_manager`
-    pub async fn upload_manager_for(
-        &self,
-        uid: crate::auth::Uid,
-    ) -> Option<Arc<UploadManager>> {
+    pub async fn upload_manager_for(&self, uid: crate::auth::Uid) -> Option<Arc<UploadManager>> {
         if let Some(pool_arc) = self.upload_manager_pool.read().await.as_ref() {
             return pool_arc.get(&uid).map(|e| Arc::clone(e.value()));
         }
@@ -186,7 +189,7 @@ impl ScanManager {
             conflict_strategy,
             owner,
         )
-            .await
+        .await
     }
 
     /// 启动文件夹扫描（显式指定 owner_uid）
@@ -211,7 +214,7 @@ impl ScanManager {
             conflict_strategy,
             Some(owner_uid),
         )
-            .await
+        .await
     }
 
     async fn start_scan_internal(
@@ -273,7 +276,13 @@ impl ScanManager {
         let opts_clone = options.clone();
         let token_clone = cancel_token.clone();
         tokio::task::spawn_blocking(move || {
-            Self::scan_producer(scan_id_clone, local_clone, opts_clone, batch_tx, token_clone);
+            Self::scan_producer(
+                scan_id_clone,
+                local_clone,
+                opts_clone,
+                batch_tx,
+                token_clone,
+            );
         });
 
         // tokio::spawn: 消费端（异步任务创建）
@@ -316,7 +325,7 @@ impl ScanManager {
                 max_pending,
                 owner_uid,
             )
-                .await;
+            .await;
         });
 
         info!("扫描任务已启动: {}", scan_task_id);
@@ -411,18 +420,22 @@ impl ScanManager {
             // 创建任务（带去重）
             // 显式传 owner_uid，使每个上传子任务都用 effective_uid 而非共享 manager 的 startup owner。
             let result = match owner_uid {
-                Some(uid) => upload_manager
-                    .create_batch_tasks_dedup_with_owner(
-                        files,
-                        encrypt,
-                        true,
-                        conflict_strategy,
-                        uid,
-                    )
-                    .await,
-                None => upload_manager
-                    .create_batch_tasks_dedup(files, encrypt, true, conflict_strategy)
-                    .await,
+                Some(uid) => {
+                    upload_manager
+                        .create_batch_tasks_dedup_with_owner(
+                            files,
+                            encrypt,
+                            true,
+                            conflict_strategy,
+                            uid,
+                        )
+                        .await
+                }
+                None => {
+                    upload_manager
+                        .create_batch_tasks_dedup(files, encrypt, true, conflict_strategy)
+                        .await
+                }
             };
 
             match result {
@@ -600,14 +613,12 @@ impl ScanManager {
                         cp.scan_task_id, cp.owner_uid
                     );
                     // 优先用 checkpoint 里的 owner_uid
-                    let resume_owner: Option<crate::auth::Uid> = cp
-                        .owner_uid
-                        .map(crate::auth::Uid::new)
-                        .or(self.owner_uid);
+                    let resume_owner: Option<crate::auth::Uid> =
+                        cp.owner_uid.map(crate::auth::Uid::new).or(self.owner_uid);
 
                     let result = match resume_owner {
-                        Some(uid) => self
-                            .start_scan_with_owner(
+                        Some(uid) => {
+                            self.start_scan_with_owner(
                                 cp.local_folder,
                                 cp.remote_folder,
                                 Some(cp.scan_options),
@@ -615,16 +626,18 @@ impl ScanManager {
                                 None, // conflict_strategy - use default for resumed scans
                                 uid,
                             )
-                            .await,
-                        None => self
-                            .start_scan(
+                            .await
+                        }
+                        None => {
+                            self.start_scan(
                                 cp.local_folder,
                                 cp.remote_folder,
                                 Some(cp.scan_options),
                                 cp.encrypt,
                                 None,
                             )
-                            .await,
+                            .await
+                        }
                     };
 
                     if let Err(e) = result {

@@ -264,9 +264,11 @@ pub async fn create_folder_upload(
         }
         None => match *app_state.active_uid.read().await {
             Some(uid) => uid,
-            None => return Err(ApiError::BadRequest(
-                "无活跃账号，无法启动文件夹扫描".to_string(),
-            )),
+            None => {
+                return Err(ApiError::BadRequest(
+                    "无活跃账号，无法启动文件夹扫描".to_string(),
+                ))
+            }
         },
     };
 
@@ -572,7 +574,11 @@ pub async fn clear_completed_uploads(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let count = upload_manager.clear_completed_for_uid(uid).await;
-    info!("清除了 {} 个已完成的上传任务（owner_uid={}）", count, uid.raw());
+    info!(
+        "清除了 {} 个已完成的上传任务（owner_uid={}）",
+        count,
+        uid.raw()
+    );
     Ok(Json(ApiResponse::success(count)))
 }
 
@@ -591,7 +597,11 @@ pub async fn clear_failed_uploads(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let count = upload_manager.clear_failed_for_uid(uid).await;
-    info!("清除了 {} 个失败的上传任务（owner_uid={}）", count, uid.raw());
+    info!(
+        "清除了 {} 个失败的上传任务（owner_uid={}）",
+        count,
+        uid.raw()
+    );
     Ok(Json(ApiResponse::success(count)))
 }
 
@@ -693,11 +703,15 @@ pub async fn batch_pause_uploads(
             error: err,
         })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
@@ -732,11 +746,15 @@ pub async fn batch_resume_uploads(
             error: err,
         })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
@@ -771,11 +789,15 @@ pub async fn batch_delete_uploads(
             error: err,
         })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))

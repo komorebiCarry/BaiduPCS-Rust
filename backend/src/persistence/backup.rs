@@ -226,7 +226,10 @@ pub async fn create_pre_migration_backup(
             }
         }
     } else {
-        warn!("迁移前备份：db_path 无文件名，跳过 DB 复制: {}", db_path.display());
+        warn!(
+            "迁移前备份：db_path 无文件名，跳过 DB 复制: {}",
+            db_path.display()
+        );
     }
 
     // 3) 整个 wal_dir 目录（任务 `.meta` 状态）：源端存在则计入 required。
@@ -244,7 +247,11 @@ pub async fn create_pre_migration_backup(
         let dest = backup_dir.join(&dest_name);
         match copy_dir_recursive(wal_dir, &dest).await {
             Ok(stats) if stats.failed == 0 => {
-                copied.push(format!("{} (目录, {} 个文件)", dest.display(), stats.copied()));
+                copied.push(format!(
+                    "{} (目录, {} 个文件)",
+                    dest.display(),
+                    stats.copied()
+                ));
                 let name = dest_name.to_string_lossy().into_owned();
                 required.push(name.clone());
                 wal_backup_name = Some(name);
@@ -258,7 +265,11 @@ pub async fn create_pre_migration_backup(
                     stats.failed
                 );
             }
-            Err(e) => anyhow::bail!("迁移前备份：复制 wal 目录 {} 失败（{}）", wal_dir.display(), e),
+            Err(e) => anyhow::bail!(
+                "迁移前备份：复制 wal 目录 {} 失败（{}）",
+                wal_dir.display(),
+                e
+            ),
         }
     }
 
@@ -401,7 +412,9 @@ mod tests {
         ));
 
         // 残缺备份（只建了目录但无 manifest 完成标记）→ 不算有效备份，仍需备份
-        let incomplete = config_dir.join("backups").join("pre_migration_20240101_000000");
+        let incomplete = config_dir
+            .join("backups")
+            .join("pre_migration_20240101_000000");
         std::fs::create_dir_all(&incomplete).unwrap();
         assert!(
             needs_pre_migration_backup(&config_dir, &db_path, &session_path, &accounts_path),
@@ -456,7 +469,10 @@ mod tests {
             "session.json",
             "wal",
         ] {
-            assert!(required.contains(&expect.to_string()), "required 应含 {expect}");
+            assert!(
+                required.contains(&expect.to_string()),
+                "required 应含 {expect}"
+            );
         }
         // manifest 应记录 wal 目录名与其下文件相对路径清单（含子目录，用 / 分隔）
         assert_eq!(json["wal_backup_dir"].as_str(), Some("wal"));
@@ -511,7 +527,9 @@ mod tests {
         // 向后兼容：旧 manifest（#10）只有 wal_file_count、无 wal_files → 回退到数量校验
         let root = tempfile::tempdir().unwrap();
         let config_dir = root.path().join("config");
-        let dir = config_dir.join("backups").join("pre_migration_20230101_000000");
+        let dir = config_dir
+            .join("backups")
+            .join("pre_migration_20230101_000000");
         std::fs::create_dir_all(dir.join("wal")).unwrap();
         std::fs::write(dir.join("wal").join("a.meta"), b"m").unwrap();
         std::fs::write(dir.join("wal").join("b.meta"), b"m").unwrap();
@@ -567,7 +585,9 @@ mod tests {
         // 向后兼容：旧 manifest 不含 required 字段 → 仍按「存在即有效」处理
         let root = tempfile::tempdir().unwrap();
         let config_dir = root.path().join("config");
-        let dir = config_dir.join("backups").join("pre_migration_20230101_000000");
+        let dir = config_dir
+            .join("backups")
+            .join("pre_migration_20230101_000000");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(BACKUP_MANIFEST), br#"{"completed_at":"x"}"#).unwrap();
         assert!(valid_pre_migration_backup_exists(&config_dir));
@@ -586,7 +606,9 @@ mod tests {
         // 损坏 / 半写入的 manifest（JSON 解析失败）→ 不算有效备份
         let root = tempfile::tempdir().unwrap();
         let config_dir = root.path().join("config");
-        let dir = config_dir.join("backups").join("pre_migration_20230101_000000");
+        let dir = config_dir
+            .join("backups")
+            .join("pre_migration_20230101_000000");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(BACKUP_MANIFEST), b"{not valid json").unwrap();
         assert!(

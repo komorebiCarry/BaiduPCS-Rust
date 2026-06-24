@@ -5,8 +5,8 @@
 //!
 //! CancellationToken 控制优雅停机。
 
-use std::time::Duration;
 use super::config::MIN_POLL_INTERVAL_SECS;
+use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -171,7 +171,11 @@ mod tests {
         // base 恰为下限时，抖动下半被钳到 MIN_POLL_INTERVAL_SECS（与 autobackup 一致）
         for _ in 0..200 {
             let j = jitter(MIN_POLL_INTERVAL_SECS, 0.20);
-            assert!(j >= MIN_POLL_INTERVAL_SECS, "jitter dipped below min: {}", j);
+            assert!(
+                j >= MIN_POLL_INTERVAL_SECS,
+                "jitter dipped below min: {}",
+                j
+            );
             assert!(j <= MIN_POLL_INTERVAL_SECS + (MIN_POLL_INTERVAL_SECS / 5));
         }
     }

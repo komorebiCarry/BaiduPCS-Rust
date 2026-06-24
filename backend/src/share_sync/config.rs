@@ -598,7 +598,11 @@ mod tests {
             ],
         );
         let err = sub.validate().unwrap_err();
-        assert!(err.contains("最多只能配置 1 个网盘目标"), "实际错误: {}", err);
+        assert!(
+            err.contains("最多只能配置 1 个网盘目标"),
+            "实际错误: {}",
+            err
+        );
     }
 
     #[test]
@@ -621,7 +625,11 @@ mod tests {
             ],
         );
         let err = sub.validate().unwrap_err();
-        assert!(err.contains("最多只能配置 1 个本地目标"), "实际错误: {}", err);
+        assert!(
+            err.contains("最多只能配置 1 个本地目标"),
+            "实际错误: {}",
+            err
+        );
     }
 
     #[test]

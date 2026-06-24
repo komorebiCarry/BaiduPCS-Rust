@@ -456,7 +456,11 @@ mod tests {
         manager.mark_completed(0, Some("md5_0".to_string()));
         manager.mark_completed(0, Some("md5_0".to_string()));
         manager.mark_completed(0, Some("md5_0".to_string()));
-        assert_eq!(manager.uploaded_bytes(), 4 * 1024 * 1024, "重复完成只计一次");
+        assert_eq!(
+            manager.uploaded_bytes(),
+            4 * 1024 * 1024,
+            "重复完成只计一次"
+        );
         assert_eq!(manager.completed_count(), 1);
 
         // 全部完成后正好等于 total，绝不超出

@@ -56,8 +56,7 @@ pub async fn set_active_uid(state: &AppState, new_uid: Option<Uid>) -> Result<()
             let client_opt = state.client_pool.read().await.get_client(uid);
 
             *state.current_user.write().await = user_opt;
-            *state.netdisk_client.write().await =
-                client_opt.map(|arc| (*arc).clone());
+            *state.netdisk_client.write().await = client_opt.map(|arc| (*arc).clone());
         }
         None => {
             // 进入未登录状态：legacy 字段同步清空（与 logout handler 等价）
@@ -102,7 +101,6 @@ pub async fn broadcast_account_list_changed(state: &AppState) {
     state.ws_manager.send_if_subscribed(event, None);
     info!("broadcast_account_list_changed: 已广播 ListChanged");
 }
-
 
 /// 解析批量操作 `req.uid` 为 effective_uid。
 ///

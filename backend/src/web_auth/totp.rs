@@ -66,9 +66,10 @@ impl TOTPManager {
     ) -> Result<String, WebAuthError> {
         let totp = Self::create_totp(secret, issuer, account)?;
 
-        let base64 = totp.get_qr_base64()
+        let base64 = totp
+            .get_qr_base64()
             .map_err(|e| WebAuthError::TotpError(format!("生成 QR 码失败: {}", e)))?;
-        
+
         // 返回完整的 data URL，以便前端直接在 <img> 标签中使用
         Ok(format!("data:image/png;base64,{}", base64))
     }
@@ -240,7 +241,9 @@ mod tests {
     #[test]
     fn test_is_valid_secret() {
         // Valid Base32 secrets
-        assert!(TOTPManager::is_valid_secret("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"));
+        assert!(TOTPManager::is_valid_secret(
+            "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+        ));
         assert!(TOTPManager::is_valid_secret(&TOTPManager::generate_secret()));
 
         // 无效的 Base32
