@@ -21,6 +21,19 @@ pub enum TaskStatus {
     Failed,
 }
 
+impl TaskStatus {
+    /// 任务是否处于"活跃下载"状态：尚未到达终态（Completed/Failed/Paused），
+    /// 且当前正在消耗/即将消耗下载槽位的状态。
+    ///
+    /// 用法：上层聚合瞬时下载速度 / 文件夹子任务活跃计数时使用，
+    /// 不能只看 `Downloading` —— folder group 的子任务在下载/解密/等待之间切换，
+    /// 仅过滤 `Downloading` 会漏掉 `Decrypting`/`Pending` 子任务的速度贡献，
+    /// 导致前端展示速度恒为 0。
+    pub fn is_active_download_status(&self) -> bool {
+        matches!(self, TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting)
+    }
+}
+
 /// 下载任务
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadTask {

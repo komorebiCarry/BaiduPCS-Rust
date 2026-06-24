@@ -56,6 +56,8 @@ pub struct ReadonlyReason {
 struct AppStateShareSyncResolver {
     client_pool: Arc<RwLock<ClientPool>>,
     transfer_managers: Arc<DashMap<Uid, Arc<TransferManager>>>,
+    /// 进程当前活跃账号（多账号运行时真源）
+    active_uid: Arc<RwLock<Option<Uid>>>,
 }
 
 #[async_trait::async_trait]
@@ -68,6 +70,10 @@ impl ShareSyncAccountResolver for AppStateShareSyncResolver {
         self.transfer_managers
             .get(&Uid::new(owner_uid))
             .map(|e| Arc::clone(e.value()))
+    }
+
+    async fn active_uid(&self) -> Option<u64> {
+        self.active_uid.read().await.map(|u| u.raw())
     }
 }
 
@@ -1511,6 +1517,7 @@ impl AppState {
         let resolver: Arc<dyn ShareSyncAccountResolver> = Arc::new(AppStateShareSyncResolver {
             client_pool: Arc::clone(&self.client_pool),
             transfer_managers: Arc::clone(&self.transfer_managers),
+            active_uid: Arc::clone(&self.active_uid),
         });
 
         let cfg = ManagerConfig {

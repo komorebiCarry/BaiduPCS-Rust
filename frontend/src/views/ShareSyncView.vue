@@ -350,8 +350,8 @@
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
         </el-descriptions>
-        <h4 style="margin-top: 16px">文件动作（{{ currentRun.items.length }}）</h4>
-        <el-table :data="currentRun.items" size="small" max-height="400">
+        <h4 style="margin-top: 16px">文件动作（{{ currentRun.item_total_count }}）</h4>
+        <el-table :data="currentRun.items" size="small" max-height="400" v-loading="runItemsLoading">
           <el-table-column prop="path" label="路径" />
           <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
           <el-table-column prop="target" label="目标" width="80" :formatter="describeTarget" />
@@ -359,6 +359,17 @@
           <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
         </el-table>
+        <el-pagination
+            v-if="currentRun.item_total_count > currentRun.item_page_size"
+            style="margin-top: 12px; justify-content: flex-end"
+            layout="prev, pager, next, total"
+            background
+            small
+            :current-page="currentRun.item_page"
+            :page-size="currentRun.item_page_size"
+            :total="currentRun.item_total_count"
+            @current-change="onRunItemsPageChange"
+        />
       </div>
     </el-dialog>
 
@@ -438,7 +449,7 @@ import {
   type ShareSyncWsEvent,
   type ShareSyncSubtask,
   listSubscriptions, updateSubscription,
-  deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, listRuns, getRun, listSubtasks,
+  deleteSubscription, setSubscriptionEnabled, triggerSubscription, resumeSubscription, listRuns, getRun, listRunItems, listSubtasks,
 } from '@/api/shareSync'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { createAdaptivePoller } from '@/utils/backendHealth'
@@ -475,6 +486,8 @@ const ownerFilterCounts = computed(() => {
 })
 const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
+const currentRunId = ref<string | null>(null)
+const runItemsLoading = ref(false)
 
 // 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
 const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
@@ -1034,10 +1047,25 @@ async function triggerNow(s?: ShareSubscription) {
 
 async function openRun(runId: string) {
   try {
+    currentRunId.value = runId
     currentRun.value = await getRun(runId)
     runDialogVisible.value = true
   } catch (e) {
     ElMessage.error(`加载运行详情失败: ${getApiErrorMessage(e)}`)
+  }
+}
+
+async function onRunItemsPageChange(page: number) {
+  if (!currentRunId.value || !currentRun.value) return
+  runItemsLoading.value = true
+  try {
+    const res = await listRunItems(currentRunId.value, page, currentRun.value.item_page_size)
+    currentRun.value.items = res.items
+    currentRun.value.item_page = res.page
+  } catch (e) {
+    ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
+  } finally {
+    runItemsLoading.value = false
   }
 }
 

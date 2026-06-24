@@ -154,6 +154,47 @@ impl ShareSyncManager {
             rate_limiter: crate::share_sync::rate_limit::QuotaLimiter::from_env(),
         });
 
+        // 多账号时代之前的旧订阅 owner_uid 默认为 0（#[serde(default)] u64）。
+        // 设计上由"上层在创建/导入时赋值"(见 config.rs:133 注释),但实际跑起来
+        // 发现历史数据没补过,导致 trigger 后静默失败:resolver.netdisk_client(0)
+        // 拿不到 client,execute_one 抛 ConfigError 被 scheduler on_tick 闭包吞掉,
+        // 前端却拿到 `{"triggered": true}` 误以为成功。启动期集中补齐到当前活跃账号。
+        let active_uid = manager.resolver.active_uid().await;
+        match active_uid {
+            Some(active) => {
+                let mut migrated = 0usize;
+                for sub in subs.iter_mut() {
+                    if sub.owner_uid == 0 {
+                        info!(
+                            "share-sync: 迁移旧订阅 {} owner_uid 0 -> {} (历史/未归属数据)",
+                            sub.id, active
+                        );
+                        sub.owner_uid = active;
+                        if let Err(e) = manager.persistence.upsert_subscription(sub) {
+                            warn!("share-sync: 迁移订阅 {} 写回 DB 失败: {}", sub.id, e);
+                        }
+                        migrated += 1;
+                    }
+                }
+                if migrated > 0 {
+                    info!(
+                        "share-sync: 启动期 owner_uid 迁移完成, 共 {} 条 (active_uid={})",
+                        migrated, active
+                    );
+                }
+            }
+            None => {
+                let legacy = subs.iter().filter(|s| s.owner_uid == 0).count();
+                if legacy > 0 {
+                    warn!(
+                        "share-sync: 启动时发现 {} 条 owner_uid=0 的旧订阅, 但当前无活跃账号, \
+                         无法迁移 —— 用户登录后下次启动会自动迁移,或在前端编辑订阅以重设归属",
+                        legacy
+                    );
+                }
+            }
+        }
+
         for sub in subs {
             manager.subscriptions.insert(sub.id.clone(), sub.clone());
             if sub.enabled && sub.poll_config.enabled {
@@ -260,10 +301,8 @@ impl ShareSyncManager {
         let list: Vec<ShareSubscription> = match serde_json::from_str(&content) {
             Ok(l) => l,
             Err(e) => {
-                let backup = config_path.with_extension(format!(
-                    "corrupt.{}.json",
-                    chrono::Utc::now().timestamp()
-                ));
+                let backup = config_path
+                    .with_extension(format!("corrupt.{}.json", chrono::Utc::now().timestamp()));
                 let hint = match std::fs::rename(config_path, &backup) {
                     Ok(()) => format!("已备份损坏文件到 {}", backup.display()),
                     Err(re) => format!("备份损坏文件失败: {}", re),
@@ -366,7 +405,13 @@ impl ShareSyncManager {
         info!("ShareSyncManager: 创建订阅 id={}", sub.id);
         // 启用的订阅创建后立即执行一次首同步，无需等待首个轮询周期
         if sub.enabled {
-            let _ = self.trigger_one(&sub.id);
+            let mgr = Arc::clone(self);
+            let sub_id = sub.id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = mgr.trigger_one(&sub_id).await {
+                    warn!("share-sync: 订阅 {} 创建后首同步触发失败: {}", sub_id, e);
+                }
+            });
         }
         Ok(sub)
     }
@@ -500,7 +545,7 @@ impl ShareSyncManager {
     }
 
     /// 用户「我已更新链接，恢复」：清除失效标记 + 计数，恢复轮询并立即触发一次。
-    pub fn resume_link_invalid(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
+    pub async fn resume_link_invalid(self: &Arc<Self>, id: &str) -> Result<(), ShareSyncError> {
         {
             let mut sub = self
                 .subscriptions
@@ -523,8 +568,15 @@ impl ShareSyncManager {
                 owner_uid: sub_clone.owner_uid,
             });
         }
-        // 立即重试一次（链接已更新）
-        let _ = self.trigger_one(id);
+        // 立即重试一次（链接已更新）。恢复动作本身（清除失效标记 + 恢复轮询）此时已成功，
+        // 立即触发只是锦上添花；若该账号未登录等导致触发失败，不应让整个「恢复」接口报错，
+        // 否则会出现「标记已清、轮询已恢复，接口却返回失败」的状态不一致。降级为只记日志。
+        if let Err(e) = self.trigger_one(id).await {
+            warn!(
+                "share-sync: 订阅 {} 恢复后立即触发失败（已恢复轮询，下个周期会自动重试）: {}",
+                id, e
+            );
+        }
         Ok(())
     }
 
@@ -560,34 +612,121 @@ impl ShareSyncManager {
     // 触发 / 执行
     // ===================================================
 
-    /// 立即触发一次（HTTP / 手动）
-    pub fn trigger_one(self: &Arc<Self>, id: &str) -> Result<String, ShareSyncError> {
+    /// 立即触发一次（HTTP / 手动）。
+    ///
+    /// 手动触发不再只唤醒 scheduler：scheduler 的错误只会落日志，HTTP 调用方会误以为
+    /// 已成功开始。这里同步完成可判定的前置校验，然后直接排一个后台 run。
+    pub async fn trigger_one(self: &Arc<Self>, id: &str) -> Result<String, ShareSyncError> {
         let sub = self
             .get_subscription(id)
             .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
-        if let Some(sched) = self.schedulers.get(id) {
-            sched.trigger_now();
-            // 实际 run 由 scheduler 的 on_tick 触发
-            Ok(sub.id)
-        } else {
-            // 没有 scheduler（被禁用），后台执行一次
-            let mgr = Arc::clone(self);
-            let id_owned = id.to_string();
-            tokio::spawn(async move {
-                let _ = mgr.execute_one(&id_owned).await;
-            });
-            Ok(sub.id)
+        info!(
+            "share-sync: trigger subscription id={} name={} owner_uid={} enabled={}",
+            sub.id, sub.name, sub.owner_uid, sub.enabled
+        );
+        // owner_uid=0 表示历史脏数据:resolver 拿不到 client,execute_one 会抛
+        // ConfigError,被 scheduler on_tick 闭包吞掉,前端却拿到 success 误判。
+        // 启动期迁移应当把 owner_uid 补上;若仍为 0(无活跃账号等情形),直接报错。
+        if sub.owner_uid == 0 {
+            return Err(ShareSyncError::ConfigError(
+                "订阅所属账号未设置（owner_uid=0），请等待启动迁移完成或在前端编辑订阅".into(),
+            ));
         }
+        if sub.link_invalid {
+            return Err(ShareSyncError::ShareLinkError(
+                sub.link_invalid_reason
+                    .clone()
+                    .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into()),
+            ));
+        }
+        if self.running.contains_key(id) {
+            return Err(ShareSyncError::AlreadyRunning(format!(
+                "订阅 {} 正在同步中，请等待当前运行结束",
+                id
+            )));
+        }
+        if self.resolver.netdisk_client(sub.owner_uid).await.is_none() {
+            return Err(ShareSyncError::ConfigError(format!(
+                "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
+                sub.owner_uid
+            )));
+        }
+        if self
+            .resolver
+            .transfer_manager(sub.owner_uid)
+            .await
+            .is_none()
+        {
+            return Err(ShareSyncError::ConfigError(format!(
+                "订阅所属账号(uid={})的转存管理器未就绪",
+                sub.owner_uid
+            )));
+        }
+
+        // 同步落库 + 广播：让 HTTP 调用方在拿到响应瞬间就能拿到一个"已经写进 runs 表、
+        // status=running、WS 端能监听到 RunStarted"的真实 run_id。
+        // 前端可以直接跳到 run 详情页拿进度 / 子任务列表，不用再做"我刚点的触发是不是真的
+        // 排队成功了"的二次轮询判断。
+        let run_id = Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().timestamp();
+        if let Err(e) = self.persistence.start_run(&run_id, id, started_at) {
+            return Err(e);
+        }
+        self.publisher.publish(ShareSyncEvent::RunStarted {
+            run_id: run_id.clone(),
+            subscription_id: id.into(),
+            owner_uid: sub.owner_uid,
+        });
+
+        let mgr = Arc::clone(self);
+        let id_owned = id.to_string();
+        let run_id_for_spawn = run_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mgr
+                .execute_one_with_run_id(&id_owned, Some(run_id_for_spawn))
+                .await
+            {
+                warn!(
+                    "share-sync: 订阅 {} 手动触发的 execute_one 失败: {}",
+                    id_owned, e
+                );
+            }
+        });
+        info!(
+            "share-sync: 已启动订阅 {} 的手动同步 run, run_id={}",
+            id, run_id
+        );
+        Ok(run_id)
     }
 
-    /// 执行一次（由 scheduler 调用或 trigger_one 同步入口）
+    /// 执行一次（由 scheduler 调用或 trigger_one 同步入口）。
+    ///
+    /// 内部委托给 [`execute_one_with_run_id`] 并自动 mint 新 run_id；scheduler tick
+    /// 路径与外部调用继续走这里即可，无需自己管 run_id 生成。
     pub async fn execute_one(&self, id: &str) -> Result<ApplyOutcome, ShareSyncError> {
+        self.execute_one_with_run_id(id, None).await
+    }
+
+    /// `execute_one` 的内部版本：当 `given_run_id` 为 `Some(rid)` 时，复用预先生成的
+    /// run_id（不再重新 mint），跳过 `start_run` / `RunStarted` 广播——用于 `trigger_one`
+    /// 这类"已经让前端拿到 run_id"的入口；为 `None` 时由本函数自管整个 run 生命周期。
+    pub async fn execute_one_with_run_id(
+        &self,
+        id: &str,
+        given_run_id: Option<String>,
+    ) -> Result<ApplyOutcome, ShareSyncError> {
         // 全局并发去重：同一订阅同一时刻只允许一个 run 在执行。
         // scheduler 的 running 标志只防它自己循环内重入；这里覆盖所有入口
         // （手动 trigger / 被禁用订阅的 spawn 路径 / 多个调度器并存），
         // 避免并发 run 重复转存同一批文件并产生快照基线竞争。
         if self.running.insert(id.to_string(), ()).is_some() {
             debug!("share-sync: 订阅 {} 已有 run 在执行，跳过本次触发", id);
+            // trigger_one 预建的 run 已写库并广播 RunStarted，但本次执行被去重拦下、
+            // 不会再走到收尾，需在此 fail_run，避免留下永远 running 的孤儿 run。
+            if let Some(rid) = given_run_id.as_deref() {
+                let owner_uid = self.get_subscription(id).map(|s| s.owner_uid).unwrap_or(0);
+                self.fail_run(rid, id, owner_uid, "已有同步任务在执行，已取消本次触发");
+            }
             return Err(ShareSyncError::AlreadyRunning(id.into()));
         }
         // RAII 守卫：无论从哪条分支返回都移除 in-flight 标记。
@@ -618,40 +757,63 @@ impl ShareSyncManager {
                 "share-sync: 订阅 {} 链接已失效（已暂停），跳过本次触发；等待用户更新链接后恢复",
                 id
             );
-            return Err(ShareSyncError::ShareLinkError(
-                sub.link_invalid_reason
-                    .clone()
-                    .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into()),
-            ));
+            let reason = sub
+                .link_invalid_reason
+                .clone()
+                .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into());
+            // 同上：收尾 trigger_one 预建的 run，避免孤儿 running。
+            if let Some(rid) = given_run_id.as_deref() {
+                self.fail_run(rid, id, sub.owner_uid, &reason);
+            }
+            return Err(ShareSyncError::ShareLinkError(reason));
         }
 
         // 多账号隔离：按订阅 owner_uid 解析**该账号**的网盘客户端与转存管理器，
         // 而非进程当前活跃账号。后台调度对账号 A 的订阅始终用账号 A 的实例，
         // 账号切换无需 relink。任一未就绪 → 明确报错，绝不落到错误账号。
         let owner_uid = sub.owner_uid;
-        let netdisk = self.resolver.netdisk_client(owner_uid).await.ok_or_else(|| {
-            ShareSyncError::ConfigError(format!(
-                "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
-                owner_uid
-            ))
-        })?;
-        let transfer = self
-            .resolver
-            .transfer_manager(owner_uid)
-            .await
-            .ok_or_else(|| {
-                ShareSyncError::ConfigError(format!(
-                    "订阅所属账号(uid={})的转存管理器未就绪",
+        let netdisk = match self.resolver.netdisk_client(owner_uid).await {
+            Some(c) => c,
+            None => {
+                let msg = format!(
+                    "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
                     owner_uid
-                ))
-            })?;
+                );
+                // 收尾 trigger_one 预建的 run，避免孤儿 running。
+                if let Some(rid) = given_run_id.as_deref() {
+                    self.fail_run(rid, id, owner_uid, &msg);
+                }
+                return Err(ShareSyncError::ConfigError(msg));
+            }
+        };
+        let transfer = match self.resolver.transfer_manager(owner_uid).await {
+            Some(t) => t,
+            None => {
+                let msg = format!("订阅所属账号(uid={})的转存管理器未就绪", owner_uid);
+                // 收尾 trigger_one 预建的 run，避免孤儿 running。
+                if let Some(rid) = given_run_id.as_deref() {
+                    self.fail_run(rid, id, owner_uid, &msg);
+                }
+                return Err(ShareSyncError::ConfigError(msg));
+            }
+        };
 
-        let run_id = Uuid::new_v4().to_string();
-        self.publisher.publish(ShareSyncEvent::RunStarted {
-            run_id: run_id.clone(),
-            subscription_id: id.into(),
-            owner_uid,
-        });
+        let run_id = match given_run_id {
+            Some(rid) => rid,
+            None => {
+                let rid = Uuid::new_v4().to_string();
+                let started_at = chrono::Utc::now().timestamp();
+                if let Err(e) = self.persistence.start_run(&rid, id, started_at) {
+                    return Err(e);
+                }
+                self.publisher.publish(ShareSyncEvent::RunStarted {
+                    run_id: rid.clone(),
+                    subscription_id: id.into(),
+                    owner_uid,
+                });
+                rid
+            }
+        };
 
         // 1) 抓取
         let (captured, curr_snapshot) = match SnapshotCollector::from_url(
@@ -873,7 +1035,8 @@ impl ShareSyncManager {
         sched.start(move |id| {
             let mgr2 = Arc::clone(&mgr);
             async move {
-                let _ = mgr2.execute_one(&id).await;
+                // 无论成功/失败都映射为 ()，由 scheduler 把 Err 记到日志
+                mgr2.execute_one(&id).await.map(|_| ())
             }
         });
         info!("scheduler: 启动订阅 {} (interval={}s)", sub_id, interval);
@@ -1136,11 +1299,14 @@ pub async fn collect_share_sync_subtasks(
         for f in fdm.get_folders_by_backup_config(&cfg).await {
             // 文件夹本身不持有速度，按其活跃子文件任务(group_id==folder.id)的
             // 瞬时速度求和聚合，口径与文件夹进度广播器(folder_manager)一致。
+            // 必须用 is_active_download_status 而非单匹配 Downloading：
+            // folder group 子任务会在 Downloading ↔ Decrypting ↔ Pending 之间切换，
+            // 仅 Downloading 会漏掉解密中/等待中的子任务的速度贡献 → 前端恒为 0。
             let speed: u64 = if let Some(dm) = dm_handle.as_ref() {
                 dm.get_tasks_by_group(&f.id)
                     .await
                     .iter()
-                    .filter(|t| t.status == crate::downloader::TaskStatus::Downloading)
+                    .filter(|t| t.status.is_active_download_status())
                     .map(|t| t.speed)
                     .sum()
             } else {
@@ -1177,6 +1343,249 @@ fn is_terminal_subtask_status(status: &str) -> bool {
         status,
         "completed" | "success" | "failed" | "cancelled" | "transferfailed" | "downloadfailed"
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestartableShareSyncDownload {
+    Task(String),
+    Folder(String),
+}
+
+fn restartable_share_sync_download(
+    subtask: &ShareSyncSubtask,
+) -> Option<RestartableShareSyncDownload> {
+    if subtask.kind != "download" || is_terminal_subtask_status(&subtask.status) {
+        return None;
+    }
+
+    if let Some(folder_id) = subtask.task_id.strip_prefix("folder:") {
+        return matches!(subtask.status.as_str(), "scanning" | "downloading")
+            .then(|| RestartableShareSyncDownload::Folder(folder_id.to_string()));
+    }
+
+    (subtask.status == "downloading")
+        .then(|| RestartableShareSyncDownload::Task(subtask.task_id.clone()))
+}
+
+async fn restart_stalled_share_sync_downloads(
+    transfer: &TransferManager,
+    subtasks: &[ShareSyncSubtask],
+    resume_delay: Duration,
+) -> usize {
+    let mut task_ids = Vec::new();
+    let mut folder_ids = Vec::new();
+
+    for subtask in subtasks {
+        match restartable_share_sync_download(subtask) {
+            Some(RestartableShareSyncDownload::Task(task_id)) => task_ids.push(task_id),
+            Some(RestartableShareSyncDownload::Folder(folder_id)) => folder_ids.push(folder_id),
+            None => {}
+        }
+    }
+
+    task_ids.sort();
+    task_ids.dedup();
+    folder_ids.sort();
+    folder_ids.dedup();
+
+    let mut restarted = 0usize;
+
+    if !folder_ids.is_empty() {
+        match transfer.folder_download_manager_handle().await {
+            Some(folder_manager) => {
+                for folder_id in folder_ids {
+                    match folder_manager.pause_folder(&folder_id).await {
+                        Ok(()) => {
+                            if resume_delay > Duration::from_secs(0) {
+                                tokio::time::sleep(resume_delay).await;
+                            }
+                            match folder_manager.resume_folder(&folder_id).await {
+                                Ok(()) => {
+                                    restarted += 1;
+                                    warn!(
+                                        "share-sync: stalled folder download restarted: folder_id={}",
+                                        folder_id
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    "share-sync: resume stalled folder download failed: folder_id={}, error={}",
+                                    folder_id, e
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "share-sync: pause stalled folder download failed: folder_id={}, error={}",
+                            folder_id, e
+                        ),
+                    }
+                }
+            }
+            None => warn!(
+                "share-sync: stalled folder downloads found but folder download manager is unavailable"
+            ),
+        }
+    }
+
+    if !task_ids.is_empty() {
+        match transfer.download_manager_handle().await {
+            Some(download_manager) => {
+                for task_id in task_ids {
+                    match download_manager.pause_task(&task_id, true).await {
+                        Ok(()) => {
+                            if resume_delay > Duration::from_secs(0) {
+                                tokio::time::sleep(resume_delay).await;
+                            }
+                            match download_manager.resume_task(&task_id).await {
+                                Ok(()) => {
+                                    restarted += 1;
+                                    warn!(
+                                        "share-sync: stalled download task restarted: task_id={}",
+                                        task_id
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    "share-sync: resume stalled download task failed: task_id={}, error={}",
+                                    task_id, e
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "share-sync: pause stalled download task failed: task_id={}, error={}",
+                            task_id, e
+                        ),
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    "share-sync: stalled download tasks found but download manager is unavailable"
+                )
+            }
+        }
+    }
+
+    restarted
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtaskActivitySignature {
+    task_id: String,
+    kind: String,
+    status: String,
+    downloaded: u64,
+    total: u64,
+    progress_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskActivitySignature {
+    status: TransferStatus,
+    transferred_count: usize,
+    total_count: usize,
+    updated_at: i64,
+    download_task_ids: Vec<String>,
+    completed_download_ids: Vec<String>,
+    failed_download_ids: Vec<String>,
+    subtasks: Vec<SubtaskActivitySignature>,
+}
+
+fn task_activity_signature(
+    task: &crate::transfer::task::TransferTask,
+    subtasks: &[ShareSyncSubtask],
+) -> TaskActivitySignature {
+    let mut download_task_ids = task.download_task_ids.clone();
+    download_task_ids.sort();
+    let mut completed_download_ids = task.completed_download_ids.clone();
+    completed_download_ids.sort();
+    let mut failed_download_ids = task.failed_download_ids.clone();
+    failed_download_ids.sort();
+    let mut subtask_signatures: Vec<SubtaskActivitySignature> = subtasks
+        .iter()
+        .map(|s| {
+            let progress = if s.progress.is_finite() {
+                s.progress.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            SubtaskActivitySignature {
+                task_id: s.task_id.clone(),
+                kind: s.kind.clone(),
+                status: s.status.clone(),
+                downloaded: s.downloaded,
+                total: s.total,
+                progress_millis: (progress * 1000.0).round() as u64,
+            }
+        })
+        .collect();
+    subtask_signatures.sort_by(|a, b| {
+        a.task_id
+            .cmp(&b.task_id)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.status.cmp(&b.status))
+    });
+
+    TaskActivitySignature {
+        status: task.status.clone(),
+        transferred_count: task.transferred_count,
+        total_count: task.total_count,
+        updated_at: task.updated_at,
+        download_task_ids,
+        completed_download_ids,
+        failed_download_ids,
+        subtasks: subtask_signatures,
+    }
+}
+
+fn env_duration_secs(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
+}
+
+fn share_sync_task_idle_timeout(default: Duration) -> Duration {
+    env_duration_secs("BAIDUPCS_SHARE_SYNC_TASK_IDLE_TIMEOUT_SECS").unwrap_or(default)
+}
+
+fn share_sync_task_hard_timeout() -> Option<Duration> {
+    match std::env::var("BAIDUPCS_SHARE_SYNC_TASK_HARD_TIMEOUT_SECS") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(Duration::from_secs(7 * 24 * 60 * 60)),
+        },
+        Err(_) => Some(Duration::from_secs(7 * 24 * 60 * 60)),
+    }
+}
+
+fn share_sync_stall_retry_after(idle_timeout: Duration) -> Option<Duration> {
+    let configured = env_duration_secs("BAIDUPCS_SHARE_SYNC_STALL_RETRY_SECS")
+        .unwrap_or_else(|| Duration::from_secs(5 * 60));
+    if configured == Duration::from_secs(0) || idle_timeout == Duration::from_secs(0) {
+        return None;
+    }
+    if configured >= idle_timeout {
+        let one_second = Duration::from_secs(1);
+        return Some(if idle_timeout > one_second {
+            idle_timeout - one_second
+        } else {
+            idle_timeout
+        });
+    }
+    Some(configured)
+}
+
+fn share_sync_stall_retry_max() -> u32 {
+    env_u32("BAIDUPCS_SHARE_SYNC_STALL_RETRY_MAX").unwrap_or(3)
+}
+
+fn share_sync_stall_retry_cooldown() -> Duration {
+    env_duration_secs("BAIDUPCS_SHARE_SYNC_STALL_RETRY_COOLDOWN_SECS")
+        .unwrap_or_else(|| Duration::from_secs(5))
 }
 
 /// 收集当前子任务并逐个推送 `ShareSyncEvent::ItemProgress`（一帧）。
@@ -1419,7 +1828,8 @@ impl ExecutorHooks for ProductionHooks {
         // - 分享直下（transfer_netdisk_dir=None）：转存到临时目录，下载后清理（is_share_direct_download=true）。
         // - 转存并下载（Some(网盘目录)）：转存到该网盘目录并保留，再下载（is_share_direct_download=false）。
         // 两种模式的下载段都因 backup_config_id 走自动备份同款 create_backup_task。
-        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir {
+        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir
+        {
             Some(netdisk_dir) => (
                 netdisk_dir.to_string(),
                 local_dir.to_string_lossy().to_string(),
@@ -1496,12 +1906,22 @@ impl ExecutorHooks for ProductionHooks {
         timeout: Duration,
     ) -> Result<(), ShareSyncError> {
         let tm = self.transfer_manager();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let idle_timeout = share_sync_task_idle_timeout(timeout);
+        let hard_timeout = share_sync_task_hard_timeout();
+        let stall_retry_after = share_sync_stall_retry_after(idle_timeout);
+        let stall_retry_max = share_sync_stall_retry_max();
+        let stall_retry_cooldown = share_sync_stall_retry_cooldown();
+        let started_at = tokio::time::Instant::now();
+        let mut last_activity_at = started_at;
+        let mut last_stall_retry_at: Option<tokio::time::Instant> = None;
+        let mut stall_retry_attempts = 0u32;
+        let mut last_signature: Option<TaskActivitySignature> = None;
         loop {
             let task = tm.get_task(task_id).await.ok_or_else(|| {
                 ShareSyncError::TransferError(format!("转存任务不存在: {}", task_id))
             })?;
-            match task.status {
+
+            match &task.status {
                 TransferStatus::Completed => return Ok(()),
                 TransferStatus::Transferred if !require_download_completion => return Ok(()),
                 TransferStatus::Transferred => {
@@ -1523,10 +1943,77 @@ impl ExecutorHooks for ProductionHooks {
                 _ => {}
             }
 
-            if tokio::time::Instant::now() >= deadline {
+            let subtasks = if require_download_completion {
+                collect_share_sync_subtasks(&tm, &self.subscription_id, self.owner_uid).await
+            } else {
+                Vec::new()
+            };
+            let signature = task_activity_signature(&task, &subtasks);
+            if last_signature.as_ref() != Some(&signature) {
+                last_activity_at = tokio::time::Instant::now();
+                last_signature = Some(signature);
+            }
+
+            let now = tokio::time::Instant::now();
+            if let Some(hard_timeout) = hard_timeout {
+                if now.duration_since(started_at) >= hard_timeout {
+                    let msg = format!(
+                        "等待任务完成超过硬上限: task_id={}, status={:?}, elapsed_secs={}, hard_timeout_secs={}",
+                        task_id,
+                        task.status,
+                        now.duration_since(started_at).as_secs(),
+                        hard_timeout.as_secs()
+                    );
+                    return if require_download_completion {
+                        Err(ShareSyncError::DownloadError(msg))
+                    } else {
+                        Err(ShareSyncError::TransferError(msg))
+                    };
+                }
+            }
+
+            let idle_for = now.duration_since(last_activity_at);
+            if require_download_completion {
+                if let Some(retry_after) = stall_retry_after {
+                    let retry_due = idle_for >= retry_after
+                        && stall_retry_attempts < stall_retry_max
+                        && last_stall_retry_at
+                        .map(|last| now.duration_since(last) >= retry_after)
+                        .unwrap_or(true);
+                    if retry_due {
+                        last_stall_retry_at = Some(now);
+                        let restarted = restart_stalled_share_sync_downloads(
+                            &tm,
+                            &subtasks,
+                            stall_retry_cooldown,
+                        )
+                            .await;
+                        if restarted > 0 {
+                            stall_retry_attempts += 1;
+                            last_activity_at = tokio::time::Instant::now();
+                            warn!(
+                                "share-sync: 下载子任务长时间无进度, 已尝试暂停后继续: task_id={}, attempt={}/{}, restarted={}, idle_secs={}, retry_after_secs={}",
+                                task_id,
+                                stall_retry_attempts,
+                                stall_retry_max,
+                                restarted,
+                                idle_for.as_secs(),
+                                retry_after.as_secs()
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if idle_for >= idle_timeout {
                 let msg = format!(
-                    "等待任务完成超时: task_id={}, status={:?}",
-                    task_id, task.status
+                    "等待任务完成超时: task_id={}, status={:?}, idle_secs={}, idle_timeout_secs={}",
+                    task_id,
+                    task.status,
+                    idle_for.as_secs(),
+                    idle_timeout.as_secs()
                 );
                 return if require_download_completion {
                     Err(ShareSyncError::DownloadError(msg))
@@ -1689,7 +2176,8 @@ impl ExecutorHooks for ProductionHooks {
         // v2 阶段 6:全局风控限速器
         self.rate_limiter.acquire().await;
         // 本地同步模式分流（batch）：见 submit_download 单文件版说明。
-        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir {
+        let (sync_save_path, sync_local_download, sync_is_share_direct) = match transfer_netdisk_dir
+        {
             Some(netdisk_dir) => (
                 netdisk_dir.to_string(),
                 local_dir.to_string_lossy().to_string(),
@@ -2191,6 +2679,93 @@ mod tests {
         }
     }
 
+    fn wait_signature_task() -> crate::transfer::task::TransferTask {
+        let mut task = crate::transfer::task::TransferTask::new(
+            "https://pan.baidu.com/s/1abc".into(),
+            None,
+            "/target".into(),
+            0,
+            true,
+            Some("/downloads".into()),
+        );
+        task.status = TransferStatus::Downloading;
+        task.download_task_ids = vec!["dl-1".into()];
+        task.updated_at = 1;
+        task
+    }
+
+    fn wait_signature_subtask(downloaded: u64, speed: u64) -> ShareSyncSubtask {
+        let total = 100;
+        ShareSyncSubtask {
+            task_id: "dl-1".into(),
+            name: "large.bin".into(),
+            kind: "download".into(),
+            status: "downloading".into(),
+            downloaded,
+            total,
+            progress: downloaded as f64 / total as f64 * 100.0,
+            speed,
+            eta_seconds: None,
+            owner_uid: 1,
+        }
+    }
+
+    #[test]
+    fn test_restartable_share_sync_download_detects_active_downloads() {
+        let task = wait_signature_subtask(10, 1024);
+        assert_eq!(
+            restartable_share_sync_download(&task),
+            Some(RestartableShareSyncDownload::Task("dl-1".into()))
+        );
+
+        let mut folder = task.clone();
+        folder.task_id = "folder:folder-1".into();
+        assert_eq!(
+            restartable_share_sync_download(&folder),
+            Some(RestartableShareSyncDownload::Folder("folder-1".into()))
+        );
+
+        folder.status = "scanning".into();
+        assert_eq!(
+            restartable_share_sync_download(&folder),
+            Some(RestartableShareSyncDownload::Folder("folder-1".into()))
+        );
+    }
+
+    #[test]
+    fn test_restartable_share_sync_download_skips_terminal_and_non_running_tasks() {
+        let mut subtask = wait_signature_subtask(10, 1024);
+
+        subtask.kind = "transfer".into();
+        assert_eq!(restartable_share_sync_download(&subtask), None);
+
+        subtask.kind = "download".into();
+        for status in ["completed", "failed", "cancelled", "paused", "pending"] {
+            subtask.status = status.into();
+            assert_eq!(
+                restartable_share_sync_download(&subtask),
+                None,
+                "status {status} 不应自动暂停/继续"
+            );
+        }
+    }
+
+    #[test]
+    fn test_task_activity_signature_tracks_downloaded_bytes() {
+        let task = wait_signature_task();
+        let a = task_activity_signature(&task, &[wait_signature_subtask(10, 1024)]);
+        let b = task_activity_signature(&task, &[wait_signature_subtask(20, 1024)]);
+        assert_ne!(a, b, "下载字节增长应刷新等待活动指纹");
+    }
+
+    #[test]
+    fn test_task_activity_signature_ignores_speed_only_noise() {
+        let task = wait_signature_task();
+        let a = task_activity_signature(&task, &[wait_signature_subtask(10, 1024)]);
+        let b = task_activity_signature(&task, &[wait_signature_subtask(10, 4096)]);
+        assert_eq!(a, b, "只有速度抖动不应重置空闲超时");
+    }
+
     // ===== execution_diff_with_directory_ancestors：整目录转存只在「整目录全新」时启用 =====
 
     fn ss_file(path: &str, fs_id: u64, size: u64) -> ShareSnapshotItem {
@@ -2266,8 +2841,9 @@ mod tests {
         let idx = curr.index_by_path();
 
         // 全部子文件都变 → true
-        let all: BTreeSet<String> =
-            ["/d/a".to_string(), "/d/sub/x".to_string()].into_iter().collect();
+        let all: BTreeSet<String> = ["/d/a".to_string(), "/d/sub/x".to_string()]
+            .into_iter()
+            .collect();
         assert!(dir_subtree_fully_changed(&idx, "/d", &all));
 
         // 只变一部分（缺 /d/sub/x） → /d 整体 false
@@ -2435,5 +3011,27 @@ mod tests {
         // netdisk_client 为 None → 应报错
         let r = m.execute_one(&s.id).await;
         assert!(r.is_err());
+        let r = m.trigger_one(&s.id).await;
+        assert!(matches!(r, Err(ShareSyncError::ConfigError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_trigger_one_when_already_running_fails_fast() {
+        let dir = tempdir().unwrap();
+        let m = ShareSyncManager::new(ManagerConfig {
+            config_path: dir.path().join("subs.json"),
+            db_path: dir.path().join("s.db"),
+            resolver: Arc::new(StaticAccountResolver::none()),
+            publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
+        })
+            .await
+            .unwrap();
+        let mut sub = sub("a");
+        sub.owner_uid = 1;
+        let s = m.create_subscription(sub).unwrap();
+        m.running.insert(s.id.clone(), ());
+        let r = m.trigger_one(&s.id).await;
+        m.running.remove(&s.id);
+        assert!(matches!(r, Err(ShareSyncError::AlreadyRunning(_))));
     }
 }

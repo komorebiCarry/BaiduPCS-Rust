@@ -137,6 +137,16 @@ export interface RunDetail {
   overwritten_count: number
   error: string | null
   items: RunItemRecord[]
+  item_total_count: number
+  item_page: number
+  item_page_size: number
+}
+
+export interface RunItemsPage {
+  items: RunItemRecord[]
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface ShareSnapshotItem {
@@ -179,6 +189,12 @@ export interface ShareSyncSubtask {
   eta_seconds?: number | null
   /** 订阅所属账号 uid */
   owner_uid: number
+}
+
+export interface TriggerSubscriptionResponse {
+  subscription_id: string
+  triggered?: boolean
+  run_id?: string
 }
 
 /**
@@ -244,8 +260,9 @@ export async function setSubscriptionEnabled(id: string, enabled: boolean): Prom
   await rawApiClient.post(`${BASE}/subscriptions/${id}/${path}`)
 }
 
-export async function triggerSubscription(id: string): Promise<void> {
-  await rawApiClient.post(`${BASE}/subscriptions/${id}/trigger`)
+export async function triggerSubscription(id: string): Promise<TriggerSubscriptionResponse> {
+  const r = await rawApiClient.post<{ success: boolean; data: TriggerSubscriptionResponse }>(`${BASE}/subscriptions/${id}/trigger`)
+  return r.data.data
 }
 
 /** 「我已更新链接，恢复」：清除链接失效标记，恢复轮询并立即重试一次 */
@@ -260,8 +277,17 @@ export async function listRuns(id: string, page = 1, pageSize = 20): Promise<Run
   return r.data.data
 }
 
-export async function getRun(runId: string): Promise<RunDetail> {
-  const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`)
+export async function getRun(runId: string, page = 1, pageSize = 100): Promise<RunDetail> {
+  const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`, {
+    params: { page, page_size: pageSize }
+  })
+  return r.data.data
+}
+
+export async function listRunItems(runId: string, page = 1, pageSize = 100): Promise<RunItemsPage> {
+  const r = await rawApiClient.get<{ success: boolean; data: RunItemsPage }>(`${BASE}/runs/${runId}/items`, {
+    params: { page, page_size: pageSize }
+  })
   return r.data.data
 }
 
