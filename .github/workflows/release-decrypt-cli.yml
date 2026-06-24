@@ -74,7 +74,8 @@ jobs:
         if: matrix.use_zigbuild == true
         run: |
           pip3 install ziglang
-          cargo install cargo-zigbuild
+          # Pin to a version compatible with the pinned rustc (1.87); 0.23+ requires rustc 1.88
+          cargo install cargo-zigbuild --version 0.21.8 --locked
           command -v cargo-zigbuild || which cargo-zigbuild || echo "cargo-zigbuild installed"
 
       - name: Build decrypt-cli
