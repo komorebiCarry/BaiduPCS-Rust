@@ -568,8 +568,15 @@ impl ShareSyncManager {
                 owner_uid: sub_clone.owner_uid,
             });
         }
-        // 立即重试一次（链接已更新）
-        self.trigger_one(id).await?;
+        // 立即重试一次（链接已更新）。恢复动作本身（清除失效标记 + 恢复轮询）此时已成功，
+        // 立即触发只是锦上添花；若该账号未登录等导致触发失败，不应让整个「恢复」接口报错，
+        // 否则会出现「标记已清、轮询已恢复，接口却返回失败」的状态不一致。降级为只记日志。
+        if let Err(e) = self.trigger_one(id).await {
+            warn!(
+                "share-sync: 订阅 {} 恢复后立即触发失败（已恢复轮询，下个周期会自动重试）: {}",
+                id, e
+            );
+        }
         Ok(())
     }
 
@@ -714,6 +721,12 @@ impl ShareSyncManager {
         // 避免并发 run 重复转存同一批文件并产生快照基线竞争。
         if self.running.insert(id.to_string(), ()).is_some() {
             debug!("share-sync: 订阅 {} 已有 run 在执行，跳过本次触发", id);
+            // trigger_one 预建的 run 已写库并广播 RunStarted，但本次执行被去重拦下、
+            // 不会再走到收尾，需在此 fail_run，避免留下永远 running 的孤儿 run。
+            if let Some(rid) = given_run_id.as_deref() {
+                let owner_uid = self.get_subscription(id).map(|s| s.owner_uid).unwrap_or(0);
+                self.fail_run(rid, id, owner_uid, "已有同步任务在执行，已取消本次触发");
+            }
             return Err(ShareSyncError::AlreadyRunning(id.into()));
         }
         // RAII 守卫：无论从哪条分支返回都移除 in-flight 标记。
@@ -744,37 +757,46 @@ impl ShareSyncManager {
                 "share-sync: 订阅 {} 链接已失效（已暂停），跳过本次触发；等待用户更新链接后恢复",
                 id
             );
-            return Err(ShareSyncError::ShareLinkError(
-                sub.link_invalid_reason
-                    .clone()
-                    .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into()),
-            ));
+            let reason = sub
+                .link_invalid_reason
+                .clone()
+                .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into());
+            // 同上：收尾 trigger_one 预建的 run，避免孤儿 running。
+            if let Some(rid) = given_run_id.as_deref() {
+                self.fail_run(rid, id, sub.owner_uid, &reason);
+            }
+            return Err(ShareSyncError::ShareLinkError(reason));
         }
 
         // 多账号隔离：按订阅 owner_uid 解析**该账号**的网盘客户端与转存管理器，
         // 而非进程当前活跃账号。后台调度对账号 A 的订阅始终用账号 A 的实例，
         // 账号切换无需 relink。任一未就绪 → 明确报错，绝不落到错误账号。
         let owner_uid = sub.owner_uid;
-        let netdisk = self
-            .resolver
-            .netdisk_client(owner_uid)
-            .await
-            .ok_or_else(|| {
-                ShareSyncError::ConfigError(format!(
+        let netdisk = match self.resolver.netdisk_client(owner_uid).await {
+            Some(c) => c,
+            None => {
+                let msg = format!(
                     "订阅所属账号(uid={})未登录，请先登录该账号后再同步",
                     owner_uid
-                ))
-            })?;
-        let transfer = self
-            .resolver
-            .transfer_manager(owner_uid)
-            .await
-            .ok_or_else(|| {
-                ShareSyncError::ConfigError(format!(
-                    "订阅所属账号(uid={})的转存管理器未就绪",
-                    owner_uid
-                ))
-            })?;
+                );
+                // 收尾 trigger_one 预建的 run，避免孤儿 running。
+                if let Some(rid) = given_run_id.as_deref() {
+                    self.fail_run(rid, id, owner_uid, &msg);
+                }
+                return Err(ShareSyncError::ConfigError(msg));
+            }
+        };
+        let transfer = match self.resolver.transfer_manager(owner_uid).await {
+            Some(t) => t,
+            None => {
+                let msg = format!("订阅所属账号(uid={})的转存管理器未就绪", owner_uid);
+                // 收尾 trigger_one 预建的 run，避免孤儿 running。
+                if let Some(rid) = given_run_id.as_deref() {
+                    self.fail_run(rid, id, owner_uid, &msg);
+                }
+                return Err(ShareSyncError::ConfigError(msg));
+            }
+        };
 
         let run_id = match given_run_id {
             Some(rid) => rid,
@@ -803,7 +825,7 @@ impl ShareSyncManager {
             // 列目录抓快照与转存提交共用同一个全局风控限速器
             self.rate_limiter.clone(),
         )
-        .await
+            .await
         {
             Ok(collector) => match collector.collect().await {
                 Ok(t) => t,
@@ -908,7 +930,7 @@ impl ShareSyncManager {
             id.to_string(),
             owner_uid,
         )
-        .await;
+            .await;
 
         // 仅当 run 完成**且**没有任何子项因资源类原因（配额满 / 本地磁盘满）被跳过时，
         // 才推进快照基线。否则被跳过、尚未真正落地的项会被写入新基线，导致下一次
@@ -1956,8 +1978,8 @@ impl ExecutorHooks for ProductionHooks {
                     let retry_due = idle_for >= retry_after
                         && stall_retry_attempts < stall_retry_max
                         && last_stall_retry_at
-                            .map(|last| now.duration_since(last) >= retry_after)
-                            .unwrap_or(true);
+                        .map(|last| now.duration_since(last) >= retry_after)
+                        .unwrap_or(true);
                     if retry_due {
                         last_stall_retry_at = Some(now);
                         let restarted = restart_stalled_share_sync_downloads(
@@ -1965,7 +1987,7 @@ impl ExecutorHooks for ProductionHooks {
                             &subtasks,
                             stall_retry_cooldown,
                         )
-                        .await;
+                            .await;
                         if restarted > 0 {
                             stall_retry_attempts += 1;
                             last_activity_at = tokio::time::Instant::now();
@@ -2501,8 +2523,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         assert_eq!(m.list_subscriptions().len(), 0);
     }
 
@@ -2515,8 +2537,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         assert_eq!(m.list_subscriptions().len(), 1);
         assert!(m.get_subscription(&s.id).is_some());
@@ -2538,8 +2560,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let mut a = sub("a");
         a.owner_uid = 1;
@@ -2571,8 +2593,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         let original_created = s.created_at;
 
@@ -2593,8 +2615,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         m.set_enabled(&s.id, false).unwrap();
         assert!(!m.get_subscription(&s.id).unwrap().enabled);
@@ -2944,8 +2966,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let mut bad = sub("a");
         bad.share_url = "https://example.com".into();
         let r = m.create_subscription(bad);
@@ -2967,8 +2989,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let list = m.list_subscriptions();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "preloaded");
@@ -2983,8 +3005,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         // netdisk_client 为 None → 应报错
         let r = m.execute_one(&s.id).await;
@@ -3002,8 +3024,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let mut sub = sub("a");
         sub.owner_uid = 1;
         let s = m.create_subscription(sub).unwrap();
