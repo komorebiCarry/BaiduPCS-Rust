@@ -19,98 +19,75 @@
     </div>
 
     <div class="ss-content">
-      <section class="ss-column ss-subscription-column">
-        <div class="ss-column-header">
-          <div>
-            <div class="ss-column-title">订阅</div>
-            <div class="ss-column-subtitle">{{ displayedSubscriptions.length }} 个配置</div>
-          </div>
-        </div>
+      <!-- 订阅卡片列表（自动备份风格：卡片 + 内联进行中子任务），占满全宽 -->
+      <div class="ss-list-title">订阅列表（{{ displayedSubscriptions.length }}）</div>
 
-        <el-empty
-            v-if="displayedSubscriptions.length === 0"
-            class="ss-panel-empty"
-            :description="ownerFilter === null ? '还没有订阅' : '当前账号下没有订阅'"
-        />
+      <el-empty
+          v-if="displayedSubscriptions.length === 0"
+          :description="ownerFilter === null ? '还没有订阅' : '当前账号下没有订阅'"
+      />
 
-        <div v-else class="config-list">
-          <el-card
-              v-for="s in displayedSubscriptions"
-              :key="s.id"
-              class="config-card"
-              :class="{ active: selected?.id === s.id, 'is-disabled': !s.enabled }"
-              shadow="hover"
-              @click="select(s)"
-          >
-            <div class="config-header">
-              <div class="config-info">
-                <div class="config-title">
-                  <el-icon :size="18" class="direction-icon"><Link /></el-icon>
-                  <span class="config-name">{{ s.name }}</span>
-                  <AccountBadge :owner-uid="s.owner_uid" size="small" class="task-account-badge" />
-                </div>
-                <div class="config-tags">
-                  <el-tag :type="s.enabled ? 'success' : 'info'" size="small">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
-                  <el-tag v-if="runningProgressTag(s).show" type="warning" size="small" effect="dark">
-                    {{ runningProgressTag(s).text }}
-                  </el-tag>
-                  <el-tooltip
-                      v-if="s.link_invalid"
-                      :content="s.link_invalid_reason || '分享链接已失效（被取消/过期/提取码失效），已暂停轮询；更新链接后点「恢复」'"
-                      placement="top"
-                  >
-                    <el-tag type="danger" size="small" effect="dark">链接失效·已暂停</el-tag>
-                  </el-tooltip>
-                  <el-tag :type="strategyTagType(s.conflict_strategy)" size="small">{{ describeStrategy(s.conflict_strategy) }}</el-tag>
-                </div>
-                <div class="config-path">
-                  <span>{{ describeTargets(s.targets) }}</span>
-                  <span class="dot">·</span>
-                  <span>{{ describeInterval(s.poll_config) }}</span>
-                  <template v-if="s.include_paths.length">
-                    <span class="dot">·</span><span>范围 {{ s.include_paths.length }} 条</span>
-                  </template>
-                  <template v-if="s.exclude_patterns.length">
-                    <span class="dot">·</span><span>排除 {{ s.exclude_patterns.length }} 条</span>
-                  </template>
-                  <template v-if="s.delete_missing">
-                    <span class="dot">·</span><span class="danger-text">删除缺失</span>
-                  </template>
-                </div>
+      <div v-else class="config-list">
+        <el-card
+            v-for="s in displayedSubscriptions"
+            :key="s.id"
+            class="config-card"
+            :class="{ active: selected?.id === s.id, 'is-disabled': !s.enabled }"
+            shadow="hover"
+            @click="openDetail(s)"
+        >
+          <!-- 卡片头部 -->
+          <div class="config-header">
+            <div class="config-info">
+              <div class="config-title">
+                <el-icon :size="18" class="direction-icon"><Link /></el-icon>
+                <span class="config-name">{{ s.name }}</span>
+                <AccountBadge :owner-uid="s.owner_uid" size="small" class="task-account-badge" />
+                <el-tag :type="s.enabled ? 'success' : 'info'" size="small">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
+                <el-tooltip
+                    v-if="s.link_invalid"
+                    :content="s.link_invalid_reason || '分享链接已失效（被取消/过期/提取码失效），已暂停轮询；更新链接后点「恢复」'"
+                    placement="top"
+                >
+                  <el-tag type="danger" size="small" effect="dark">链接失效·已暂停</el-tag>
+                </el-tooltip>
+                <el-tag :type="strategyTagType(s.conflict_strategy)" size="small">{{ describeStrategy(s.conflict_strategy) }}</el-tag>
+              </div>
+              <div class="config-path">
+                <span>{{ describeTargets(s.targets) }}</span>
+                <span class="dot">·</span>
+                <span>{{ describeInterval(s.poll_config) }}</span>
+                <template v-if="s.include_paths.length">
+                  <span class="dot">·</span><span>范围 {{ s.include_paths.length }} 条</span>
+                </template>
+                <template v-if="s.exclude_patterns.length">
+                  <span class="dot">·</span><span>排除 {{ s.exclude_patterns.length }} 条</span>
+                </template>
+                <template v-if="s.delete_missing">
+                  <span class="dot">·</span><span class="danger-text">删除缺失</span>
+                </template>
               </div>
             </div>
 
-            <div class="config-status-row">
-              <span v-if="subtasksOf(s.id).length" class="status-inline">
-                <el-icon :size="14" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
-                {{ subtasksOf(s.id).length }} 个子任务
-              </span>
-              <span v-else-if="runningRunOf(s.id)" class="status-inline">
-                <el-icon :size="14" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
-                同步运行中
-              </span>
-              <span v-else class="status-inline is-idle">无进行中任务</span>
-              <span v-if="runningRunOf(s.id)" class="status-time">{{ formatRunningStarted(s.id) }}</span>
-            </div>
-
+            <!-- 操作按钮 -->
             <div class="config-actions" @click.stop>
               <el-tooltip
-                  :disabled="!triggerDisabledReason(s)"
-                  :content="triggerDisabledReason(s)"
+                  :disabled="ownerLoggedIn(s)"
+                  content="订阅所属账号未登录，请先登录该账号再触发同步"
                   placement="top"
               >
-                <span>
-                  <el-button
-                      size="small"
-                      type="success"
-                      :icon="Refresh"
-                      :loading="triggeringId === s.id"
-                      :disabled="!!triggerDisabledReason(s)"
-                      @click="triggerNow(s)"
-                  >
-                    同步
-                  </el-button>
-                </span>
+                  <span>
+                    <el-button
+                        size="small"
+                        type="success"
+                        :icon="Refresh"
+                        :loading="triggeringId === s.id"
+                        :disabled="!ownerLoggedIn(s)"
+                        @click="triggerNow(s)"
+                    >
+                      立即同步
+                    </el-button>
+                  </span>
               </el-tooltip>
               <el-button
                   v-if="s.link_invalid"
@@ -120,156 +97,63 @@
                   :loading="resumingId === s.id"
                   @click="resumeNow(s)"
               >
-                恢复
+                我已更新链接，恢复
               </el-button>
-              <el-button size="small" @click="openDetail(s)">详情</el-button>
-              <el-button size="small" :icon="Edit" @click="openEdit(s)" />
+              <el-button size="small" :icon="Edit" @click="openEdit(s)">编辑</el-button>
               <el-button
                   size="small"
                   :type="s.enabled ? 'warning' : 'success'"
                   :icon="s.enabled ? VideoPause : VideoPlay"
                   @click="toggleEnabled(s)"
-              />
+              >
+                {{ s.enabled ? '停用' : '启用' }}
+              </el-button>
               <el-button size="small" type="danger" :icon="Delete" @click="removeSubscription(s)" />
             </div>
-          </el-card>
-        </div>
-      </section>
-
-      <section class="ss-column ss-runs-column">
-        <div class="ss-column-header">
-          <div>
-            <div class="ss-column-title">执行历史</div>
-            <div class="ss-column-subtitle">{{ selected ? selected.name : '未选择订阅' }}</div>
-          </div>
-          <el-button
-              size="small"
-              text
-              :icon="Refresh"
-              :disabled="!selected"
-              @click="refreshSelectedRuntime"
-          >
-            刷新
-          </el-button>
-        </div>
-
-        <el-empty v-if="!selected" class="ss-panel-empty" description="请选择订阅" />
-        <el-empty v-else-if="runs.length === 0" class="ss-panel-empty" description="暂无运行历史" />
-        <div v-else class="run-list">
-          <div
-              v-for="r in runs"
-              :key="r.id"
-              class="run-row"
-              @click="openRun(r.id)"
-          >
-            <div class="run-row-head">
-              <el-tag :type="runStatusType(r.status)" size="small">{{ describeRunStatus(r.status) }}</el-tag>
-              <span class="run-time">{{ formatTime(r.started_at) }}</span>
-            </div>
-            <div class="run-row-stats">
-              <span>总 {{ runTotalCount(r) }}</span>
-              <span>需处理 {{ runChangedCount(r) }}</span>
-              <span>新增 {{ r.added_count }}</span>
-              <span>修改 {{ r.modified_count }}</span>
-              <span>删除 {{ r.removed_count }}</span>
-              <span>跳过 {{ runSkippedCount(r) }}</span>
-              <span :class="{ 'is-danger': r.failed_count > 0 }">失败 {{ r.failed_count }}</span>
-            </div>
-            <div v-if="r.error" class="run-row-error">{{ r.error }}</div>
-          </div>
-        </div>
-      </section>
-
-      <section class="ss-column ss-tasks-column">
-        <div class="ss-column-header">
-          <div>
-            <div class="ss-column-title">任务下载情况</div>
-            <div class="ss-column-subtitle">
-              <template v-if="selected">
-                {{ selectedTaskSummaryText }}
-              </template>
-              <template v-else>未选择订阅</template>
-            </div>
-          </div>
-          <el-button
-              size="small"
-              text
-              :icon="Refresh"
-              :disabled="!selected"
-              @click="refreshSelectedRuntime"
-          >
-            刷新
-          </el-button>
-        </div>
-
-        <el-empty v-if="!selected" class="ss-panel-empty" description="请选择订阅" />
-        <template v-else>
-          <div v-if="selectedSubtasks.length" class="task-summary">
-            <div class="task-summary-main">
-              <span>{{ selectedSubtasks.length }} 个活跃子任务</span>
-              <span v-if="selectedTaskProgress !== null">{{ selectedTaskProgress }}%</span>
-            </div>
-            <el-progress
-                :percentage="selectedTaskProgress ?? 0"
-                :stroke-width="8"
-                :show-text="false"
-            />
-            <div class="task-summary-meta">
-              <span>下载 {{ selectedDownloadCount }}</span>
-              <span>转存 {{ selectedTransferCount }}</span>
-              <span v-if="selectedTaskSpeed > 0">{{ formatSpeed(selectedTaskSpeed) }}</span>
-            </div>
           </div>
 
-          <div v-if="selectedSubtasks.length" class="file-tasks-preview is-column">
-            <div v-for="st in selectedSubtasksPageItems" :key="st.task_id" class="subtask-item">
-              <div class="subtask-head">
-                <el-tag :type="st.kind === 'download' ? 'success' : 'warning'" size="small">
-                  {{ st.kind === 'download' ? '下载' : '转存' }}
-                </el-tag>
-                <span class="file-name" :title="st.name">{{ st.name }}</span>
-                <el-tag :type="subtaskStatusColor(st.status)" size="small">{{ subtaskStatusText(st.status) }}</el-tag>
+          <!-- 进行中子任务（内联展示，无需展开；转存段 / 下载段各自独立进度条） -->
+          <div v-if="subtasksOf(s.id).length" class="active-task-container">
+            <div class="active-task-card">
+              <div class="task-progress-header is-toggle" @click.stop="toggleSubtasks(s.id)">
+                <div class="task-status-info">
+                  <el-icon :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
+                  <span class="task-status-text">进行中子任务（{{ subtasksOf(s.id).length }}）</span>
+                </div>
+                <el-icon :size="14" class="toggle-icon">
+                  <ArrowDown v-if="subtasksExpanded(s.id)" />
+                  <ArrowRight v-else />
+                </el-icon>
               </div>
-              <div class="subtask-stat-line">{{ subtaskStat(st) }}</div>
-              <el-progress
-                  :percentage="clampPercent(st.progress)"
-                  :stroke-width="6"
-                  :show-text="false"
-                  :status="subtaskProgressStatus(st.status)"
-              />
-            </div>
-          </div>
-          <div v-if="selectedSubtasksNeedPagination" class="detail-pagination">
-            <el-pagination
-                v-model:current-page="selectedSubtaskPage"
-                :page-size="DETAIL_PAGE_SIZE"
-                :total="selectedSubtasks.length"
-                layout="total, prev, pager, next"
-                small
-            />
-          </div>
-
-          <div v-else-if="selectedRunningRun" class="active-run-card standalone">
-            <div class="task-progress-header">
-              <div class="task-status-info">
-                <el-icon :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
-                <span class="task-status-text">同步运行中</span>
-                <span class="active-run-meta">开始于 {{ formatRunningStarted(selected.id) }}</span>
+              <div v-if="subtasksExpanded(s.id)" class="file-tasks-preview">
+                <div v-for="st in subtasksCapped(s.id)" :key="st.task_id" class="subtask-item">
+                  <div class="subtask-head">
+                    <el-tag :type="st.kind === 'download' ? 'success' : 'warning'" size="small">
+                      {{ st.kind === 'download' ? '下载' : '转存' }}
+                    </el-tag>
+                    <span class="file-name" :title="st.name">{{ st.name }}</span>
+                    <span class="subtask-stat">{{ subtaskStat(st) }}</span>
+                    <el-tag :type="subtaskStatusColor(st.status)" size="small">{{ subtaskStatusText(st.status) }}</el-tag>
+                  </div>
+                  <el-progress
+                      :percentage="clampPercent(st.progress)"
+                      :stroke-width="6"
+                      :show-text="false"
+                      :status="subtaskProgressStatus(st.status)"
+                  />
+                </div>
+                <div v-if="subtasksOverflow(s.id) > 0" class="subtask-overflow">
+                  仅显示前 {{ SUBTASK_RENDER_CAP }} 个，另有 {{ subtasksOverflow(s.id) }} 个进行中…
+                </div>
               </div>
             </div>
-            <el-progress
-                :percentage="100"
-                :indeterminate="true"
-                :duration="2"
-                :stroke-width="6"
-                :show-text="false"
-            />
-            <div class="active-run-hint">正在抓取或比对分享内容，生成子任务后会显示文件进度</div>
           </div>
-
-          <el-empty v-else class="ss-panel-empty" description="当前无进行中下载任务" />
-        </template>
-      </section>
+          <div v-else class="no-active-task">
+            <span class="idle-text">当前无进行中子任务</span>
+            <el-button size="small" text type="primary" @click.stop="openRunsDialog(s)">查看运行历史</el-button>
+          </div>
+        </el-card>
+      </div>
     </div>
 
     <!-- 订阅详情对话框 -->
@@ -443,7 +327,7 @@
     </el-dialog>
 
     <!-- 运行详情对话框 -->
-    <el-dialog v-model="runDialogVisible" title="运行详情" width="820px">
+    <el-dialog v-model="runDialogVisible" title="运行详情" width="700px">
       <div v-if="currentRun" class="run-detail">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="状态">
@@ -475,16 +359,17 @@
           <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
         </el-table>
-        <div v-if="currentRun.item_total_count > DETAIL_PAGE_SIZE" class="detail-pagination">
-          <el-pagination
-              v-model:current-page="runItemPage"
-              :page-size="DETAIL_PAGE_SIZE"
-              :total="currentRun.item_total_count"
-              layout="total, prev, pager, next, jumper"
-              small
-              @current-change="loadRunItemsPage"
-          />
-        </div>
+        <el-pagination
+            v-if="currentRun.item_total_count > currentRun.item_page_size"
+            style="margin-top: 12px; justify-content: flex-end"
+            layout="prev, pager, next, total"
+            background
+            small
+            :current-page="currentRun.item_page"
+            :page-size="currentRun.item_page_size"
+            :total="currentRun.item_total_count"
+            @current-change="onRunItemsPageChange"
+        />
       </div>
     </el-dialog>
 
@@ -549,7 +434,7 @@ import { FilePickerModal } from '@/components/FilePicker'
 import { getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig } from '@/api/config'
 import {
   Plus, Edit, Delete, Refresh, RefreshRight, Link,
-  FolderOpened, VideoPause, VideoPlay, Loading, Clock,
+  FolderOpened, VideoPause, VideoPlay, Loading, Clock, ArrowDown, ArrowRight,
 } from '@element-plus/icons-vue'
 import {
   type ShareSubscription,
@@ -601,122 +486,40 @@ const ownerFilterCounts = computed(() => {
 })
 const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
+const currentRunId = ref<string | null>(null)
+const runItemsLoading = ref(false)
 
 // 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
 const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
-// 抓取 / diff 阶段还没有子任务；用最新 running run 补齐卡片状态。
-const runningRuns = ref<Map<string, RunRecord>>(new Map())
 
 function subtasksOf(id: string): ShareSyncSubtask[] {
   return activeSubtasks.value.get(id) ?? []
 }
 
-// 卡片级进度只聚合活跃子任务；抓取/diff 阶段没有子任务时显示"同步中"。
-function aggregateSubtaskProgress(id: string): number | null {
-  const subs = subtasksOf(id)
-  if (subs.length === 0) return null
-  const active = subs.filter(
-    (s) => s.status !== 'completed' && s.status !== 'success' && s.status !== 'failed' && s.status !== 'cancelled',
-  )
-  if (active.length === 0) return 100
-  const sum = active.reduce((acc, s) => acc + clampPercent(s.progress), 0)
-  return Math.round(sum / active.length)
+// 子任务列表默认折叠（几千文件时不铺满卡片）；按订阅记忆展开态。
+const expandedSubtasks = ref<Set<string>>(new Set())
+function subtasksExpanded(id: string): boolean {
+  return expandedSubtasks.value.has(id)
+}
+function toggleSubtasks(id: string) {
+  const next = new Set(expandedSubtasks.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedSubtasks.value = next
 }
 
-function runningProgressTag(s: ShareSubscription): { show: boolean; text: string } {
-  if (!runningRunOf(s.id)) return { show: false, text: '' }
-  const pct = aggregateSubtaskProgress(s.id)
-  return {
-    show: true,
-    text: pct === null ? '同步中' : `同步中 (${pct}%)`,
-  }
+// 展开时也只渲染前 N 行（避免上千个 el-progress 撑爆 DOM），其余用计数提示。
+const SUBTASK_RENDER_CAP = 200
+function subtasksCapped(id: string): ShareSyncSubtask[] {
+  return subtasksOf(id).slice(0, SUBTASK_RENDER_CAP)
 }
-
-function runningRunOf(id: string): RunRecord | null {
-  return runningRuns.value.get(id) ?? null
+function subtasksOverflow(id: string): number {
+  return Math.max(0, subtasksOf(id).length - SUBTASK_RENDER_CAP)
 }
-
-function setRunningRun(id: string, run: RunRecord | null) {
-  const next = new Map(runningRuns.value)
-  if (run && run.status === 'running') next.set(id, run)
-  else next.delete(id)
-  runningRuns.value = next
-}
-
-function syncRunningRunFromList(id: string, list: RunRecord[]) {
-  const latest = list[0]
-  setRunningRun(id, latest?.status === 'running' ? latest : null)
-}
-
-function makePendingRun(runId: string): RunRecord {
-  return {
-    id: runId,
-    started_at: Math.floor(Date.now() / 1000),
-    finished_at: null,
-    status: 'running',
-    total_count: 0,
-    added_count: 0,
-    modified_count: 0,
-    removed_count: 0,
-    unchanged_count: 0,
-    failed_count: 0,
-    skipped_count: 0,
-    overwritten_count: 0,
-    error: null,
-  }
-}
-
-function markRunStarted(id: string, runId: string) {
-  setRunningRun(id, makePendingRun(runId))
-}
-
-function markRunFinished(id: string) {
-  setRunningRun(id, null)
-}
-
-// 详情分页阈值：100 条/页。超过 100 条时分页，避免大目录同步时 DOM/表格卡顿。
-const DETAIL_PAGE_SIZE = 100
-
-const selectedSubtasks = computed(() => selected.value ? subtasksOf(selected.value.id) : [])
-const selectedRunningRun = computed(() => selected.value ? runningRunOf(selected.value.id) : null)
-const selectedTaskProgress = computed(() => selected.value ? aggregateSubtaskProgress(selected.value.id) : null)
-const selectedSubtaskPage = ref(1)
-const selectedSubtasksNeedPagination = computed(() => selectedSubtasks.value.length > DETAIL_PAGE_SIZE)
-const selectedSubtasksPageItems = computed(() => {
-  const start = (selectedSubtaskPage.value - 1) * DETAIL_PAGE_SIZE
-  return selectedSubtasks.value.slice(start, start + DETAIL_PAGE_SIZE)
-})
-const selectedDownloadCount = computed(() => selectedSubtasks.value.filter(st => st.kind === 'download').length)
-const selectedTransferCount = computed(() => selectedSubtasks.value.filter(st => st.kind === 'transfer').length)
-const selectedTaskSpeed = computed(() => selectedSubtasks.value.reduce((sum, st) => sum + (st.kind === 'download' ? st.speed || 0 : 0), 0))
-const selectedTaskSummaryText = computed(() => {
-  if (!selected.value) return ''
-  if (selectedSubtasks.value.length > 0) {
-    const pct = selectedTaskProgress.value
-    return pct === null ? `${selectedSubtasks.value.length} 个活跃子任务` : `${selectedSubtasks.value.length} 个活跃子任务 · ${pct}%`
-  }
-  if (selectedRunningRun.value) return '同步运行中'
-  return '无进行中任务'
-})
-
-watch(() => selected.value?.id, () => {
-  selectedSubtaskPage.value = 1
-})
-
-watch(() => selectedSubtasks.value.length, (len) => {
-  const maxPage = Math.max(1, Math.ceil(len / DETAIL_PAGE_SIZE))
-  if (selectedSubtaskPage.value > maxPage) selectedSubtaskPage.value = maxPage
-})
 
 // 某订阅所属账号是否已登录（卡片级触发同步前置条件）
 function ownerLoggedIn(s: ShareSubscription): boolean {
   return authStore.accounts.some(a => a.uid === s.owner_uid)
-}
-
-function triggerDisabledReason(s: ShareSubscription): string {
-  if (!ownerLoggedIn(s)) return '订阅所属账号未登录，请先登录该账号再触发同步'
-  if (runningRunOf(s.id)) return '该订阅正在同步中，请等待当前运行结束'
-  return ''
 }
 
 // 本地目录选择（与转存一致：FilePickerModal 选目录 + 最近目录联动）
@@ -729,8 +532,6 @@ const showTransferDialog = ref(false)
 const runDialogVisible = ref(false)
 const runsDialogVisible = ref(false)
 const detailDialogVisible = ref(false)
-const runItemsLoading = ref(false)
-const runItemPage = ref(1)
 const saving = ref(false)
 const triggeringId = ref<string | null>(null)
 const resumingId = ref<string | null>(null)
@@ -917,8 +718,6 @@ async function refresh() {
     ElMessage.error(`加载订阅失败: ${getApiErrorMessage(e)}`)
     return
   }
-  const liveIds = new Set(subscriptions.value.map(s => s.id))
-  runningRuns.value = new Map([...runningRuns.value].filter(([id]) => liveIds.has(id)))
   if (selected.value) {
     const fresh = subscriptions.value.find(s => s.id === selected.value!.id)
     if (fresh) selected.value = fresh
@@ -927,7 +726,7 @@ async function refresh() {
 
 async function select(s: ShareSubscription) {
   selected.value = s
-  await Promise.all([loadRuns(s.id), loadSubtasksFor(s.id)])
+  await loadRuns(s.id)
 }
 
 // 打开订阅详情弹窗
@@ -953,35 +752,14 @@ watch(ownerFilter, () => {
 
 async function loadRuns(id: string) {
   try {
-    const list = await listRuns(id, 1, 30)
-    runs.value = list
-    syncRunningRunFromList(id, list)
+    runs.value = await listRuns(id, 1, 30)
   } catch (e) {
     runs.value = []
-    setRunningRun(id, null)
     const status = (e as AxiosError)?.response?.status
     if (status !== 404) {
       console.error('load runs failed', e)
     }
   }
-}
-
-async function loadLatestRunFor(id: string) {
-  try {
-    const list = await listRuns(id, 1, 1)
-    syncRunningRunFromList(id, list)
-  } catch {
-    setRunningRun(id, null)
-  }
-}
-
-async function loadLatestRunsForAll() {
-  await Promise.all(subscriptions.value.map(s => loadLatestRunFor(s.id)))
-}
-
-async function refreshSelectedRuntime() {
-  if (!selected.value) return
-  await Promise.all([loadRuns(selected.value.id), loadSubtasksFor(selected.value.id)])
 }
 
 // 转存对话框创建订阅后回调（WS 事件也会刷新，这里显式刷一次更可靠）
@@ -1240,7 +1018,6 @@ async function resumeNow(s?: ShareSubscription) {
   resumingId.value = target.id
   try {
     await resumeSubscription(target.id)
-    markRunStarted(target.id, `resume-${target.id}-${Date.now()}`)
     ElMessage.success('已恢复轮询并立即重试一次')
     await refresh()
   } catch (e) {
@@ -1255,13 +1032,10 @@ async function triggerNow(s?: ShareSubscription) {
   if (!target) return
   triggeringId.value = target.id
   try {
-    // 后端同步返回新 run_id；用它直接订阅进度 / 跳到 run 详情。
-    const trigger = await triggerSubscription(target.id)
-    markRunStarted(target.id, trigger.run_id || `manual-${target.id}-${Date.now()}`)
-    ElMessage.success('已开始同步，结果将稍后出现在运行历史')
+    await triggerSubscription(target.id)
+    ElMessage.success('已触发同步，结果将稍后出现在运行历史')
     setTimeout(() => {
       if (selected.value?.id === target.id) loadRuns(target.id)
-      else loadLatestRunFor(target.id)
       loadSubtasksFor(target.id)
     }, 1500)
   } catch (e) {
@@ -1272,34 +1046,24 @@ async function triggerNow(s?: ShareSubscription) {
 }
 
 async function openRun(runId: string) {
-  runItemPage.value = 1
-  runItemsLoading.value = true
   try {
-    currentRun.value = await getRun(runId, 1, DETAIL_PAGE_SIZE)
-    runItemPage.value = currentRun.value.item_page || 1
+    currentRunId.value = runId
+    currentRun.value = await getRun(runId)
     runDialogVisible.value = true
   } catch (e) {
     ElMessage.error(`加载运行详情失败: ${getApiErrorMessage(e)}`)
-  } finally {
-    runItemsLoading.value = false
   }
 }
 
-async function loadRunItemsPage(page: number) {
-  if (!currentRun.value) return
+async function onRunItemsPageChange(page: number) {
+  if (!currentRunId.value || !currentRun.value) return
   runItemsLoading.value = true
   try {
-    const data = await listRunItems(currentRun.value.id, page, DETAIL_PAGE_SIZE)
-    currentRun.value = {
-      ...currentRun.value,
-      items: data.items,
-      item_total_count: data.total,
-      item_page: data.page,
-      item_page_size: data.page_size,
-    }
-    runItemPage.value = data.page
+    const res = await listRunItems(currentRunId.value, page, currentRun.value.item_page_size)
+    currentRun.value.items = res.items
+    currentRun.value.item_page = res.page
   } catch (e) {
-    ElMessage.error(`加载文件动作失败: ${getApiErrorMessage(e)}`)
+    ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
   } finally {
     runItemsLoading.value = false
   }
@@ -1473,11 +1237,6 @@ function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleString('zh-CN')
 }
 
-function formatRunningStarted(id: string): string {
-  const run = runningRunOf(id)
-  return run?.started_at ? formatTime(run.started_at) : '刚刚'
-}
-
 // ==================== 子任务进度（内联展示） ====================
 
 function formatBytes(bytes: number): string {
@@ -1526,7 +1285,7 @@ function subtaskStat(st: ShareSyncSubtask): string {
   return `${st.downloaded}/${st.total} 文件`
 }
 
-const SUBTASK_TERMINAL = new Set(['completed', 'failed', 'cancelled', 'success', 'transferfailed', 'downloadfailed'])
+const SUBTASK_TERMINAL = new Set(['completed', 'failed', 'cancelled', 'success'])
 
 function subtaskStatusText(status: string): string {
   const map: Record<string, string> = {
@@ -1540,8 +1299,6 @@ function subtaskStatusText(status: string): string {
     completed: '已完成',
     success: '已完成',
     failed: '失败',
-    transferfailed: '转存失败',
-    downloadfailed: '下载失败',
     cancelled: '已取消',
   }
   return map[status] || status
@@ -1552,8 +1309,6 @@ function subtaskStatusColor(status: string): 'success' | 'warning' | 'danger' | 
     case 'completed':
     case 'success': return 'success'
     case 'failed': return 'danger'
-    case 'transferfailed':
-    case 'downloadfailed': return 'danger'
     case 'cancelled':
     case 'paused': return 'warning'
     case 'transferring':
@@ -1565,7 +1320,7 @@ function subtaskStatusColor(status: string): 'success' | 'warning' | 'danger' | 
 }
 
 function subtaskProgressStatus(status: string): '' | 'success' | 'exception' | 'warning' {
-  if (status === 'failed' || status === 'transferfailed' || status === 'downloadfailed') return 'exception'
+  if (status === 'failed') return 'exception'
   if (status === 'paused') return 'warning'
   return ''
 }
@@ -1646,7 +1401,6 @@ watch(hasActiveSubtasks, updateSubtaskPolling)
 
 onMounted(async () => {
   await refresh()
-  await loadLatestRunsForAll()
   if (subscriptions.value.length > 0 && !selected.value) {
     await select(subscriptions.value[0])
   }
@@ -1692,7 +1446,6 @@ onMounted(async () => {
     }
     if (evt.type === 'run_started') {
       // 新一轮开始：清掉旧的进度残留，随后由 item_progress / 轮询补齐
-      markRunStarted(sid, evt.run_id)
       loadSubtasksFor(sid)
     }
     if (['run_completed', 'run_failed'].includes(evt.type)) {
@@ -1700,7 +1453,6 @@ onMounted(async () => {
       const next = new Map(activeSubtasks.value)
       next.delete(sid)
       activeSubtasks.value = next
-      markRunFinished(sid)
     }
     if (sid === selected.value?.id) {
       if (['run_started', 'run_completed', 'run_failed', 'diff_detected'].includes(evt.type)) {
@@ -1771,91 +1523,38 @@ onUnmounted(() => {
 
 .ss-content {
   flex: 1;
-  min-height: 0;
-  overflow: hidden;
+  overflow: auto;
   padding: 16px 20px;
-  display: grid;
-  grid-template-columns: minmax(320px, 1.05fr) minmax(300px, 0.9fr) minmax(360px, 1.1fr);
-  gap: 16px;
 }
 
-.ss-column {
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: #fff;
-  border: 1px solid #e4e7ed;
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.ss-column-header {
-  min-height: 58px;
-  padding: 12px 14px;
-  border-bottom: 1px solid #ebeef5;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  flex-shrink: 0;
-}
-
-.ss-column-title {
-  font-weight: 600;
+// ==================== 订阅卡片列表（自动备份风格） ====================
+.ss-list-title {
+  font-weight: 500;
   color: #303133;
-  line-height: 20px;
-}
-
-.ss-column-subtitle {
-  margin-top: 2px;
-  font-size: 12px;
-  color: #909399;
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ss-panel-empty {
-  flex: 1;
-  min-height: 180px;
-}
-
-// ==================== 订阅卡片列表 ====================
-.ss-subscription-column,
-.ss-runs-column,
-.ss-tasks-column {
-  > .config-list,
-  > .run-list,
-  > .file-tasks-preview {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-  }
+  margin-bottom: 12px;
 }
 
 .config-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 12px;
+  gap: 16px;
 }
 
 .config-card {
   border-left: 4px solid #409eff;
-  transition: box-shadow 0.2s, border-color 0.2s;
+  transition: all 0.3s;
   cursor: pointer;
-  border-radius: 8px;
 
   &.is-disabled { border-left-color: #c0c4cc; }
   &.active { box-shadow: 0 0 0 1px #409eff inset; }
-  &:hover { border-color: #c6e2ff; }
+  &:hover { transform: translateY(-2px); }
 }
 
 .config-header {
   display: flex;
+  justify-content: space-between;
   align-items: flex-start;
+  gap: 16px;
 }
 .config-info { flex: 1; min-width: 0; }
 .config-title {
@@ -1866,13 +1565,6 @@ onUnmounted(() => {
   flex-wrap: wrap;
   .direction-icon { flex-shrink: 0; color: #409eff; }
   .config-name { font-size: 16px; font-weight: 500; color: #333; }
-}
-.config-tags {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 8px;
 }
 .config-path {
   font-size: 12px;
@@ -1886,64 +1578,28 @@ onUnmounted(() => {
 }
 .config-actions {
   display: flex;
-  gap: 6px;
+  gap: 8px;
+  flex-shrink: 0;
   flex-wrap: wrap;
-  margin-top: 12px;
-  padding-top: 12px;
+}
+
+// 进行中子任务（内联）
+.active-task-container {
+  margin-top: 16px;
+  padding-top: 16px;
   border-top: 1px solid #ebeef5;
 }
-
-.config-status-row {
-  margin-top: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
-  color: #606266;
-}
-
-.status-inline {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-
-  &.is-idle {
-    color: #909399;
-  }
-}
-
-.status-time {
-  color: #909399;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.active-run-card {
+.active-task-card {
   background: #f5f7fa;
   border-radius: 8px;
   overflow: hidden;
-  padding: 0 12px 12px;
-
-  &.standalone {
-    margin: 12px;
-  }
-}
-.active-run-meta {
-  font-size: 12px;
-  color: #909399;
-}
-.active-run-hint {
-  margin-top: 8px;
-  font-size: 12px;
-  color: #909399;
 }
 .task-progress-header {
   display: flex;
   align-items: center;
   padding: 10px 12px 4px;
+  &.is-toggle { cursor: pointer; user-select: none; }
+  .toggle-icon { margin-left: auto; color: #909399; }
 }
 .task-status-info {
   display: flex;
@@ -1955,25 +1611,15 @@ onUnmounted(() => {
 }
 // 固定高度 + 滚动条：几千个子任务时不再撑满卡片
 .file-tasks-preview {
-  padding: 0 12px 12px;
+  padding: 4px 12px 12px;
+  max-height: 320px;
   overflow-y: auto;
-
-  &.is-column {
-    max-height: none;
-  }
 }
 .subtask-overflow {
   padding: 8px 0 2px;
   font-size: 12px;
   color: #909399;
   text-align: center;
-}
-
-.detail-pagination {
-  padding: 10px 12px 12px;
-  display: flex;
-  justify-content: flex-end;
-  flex-shrink: 0;
 }
 .subtask-item {
   padding: 8px 0;
@@ -1994,124 +1640,18 @@ onUnmounted(() => {
     flex: 1;
     min-width: 0;
   }
+  .subtask-stat { font-size: 12px; color: #909399; flex-shrink: 0; }
 }
 
-.subtask-stat-line {
-  margin: 0 0 6px;
-  font-size: 12px;
-  color: #909399;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-summary {
-  margin: 12px;
+.no-active-task {
+  margin-top: 12px;
   padding: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   background: #f5f7fa;
-  border-radius: 8px;
-  flex-shrink: 0;
-}
-
-.task-summary-main,
-.task-summary-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.task-summary-main {
-  margin-bottom: 8px;
-  font-size: 14px;
-  font-weight: 500;
-  color: #303133;
-}
-
-.task-summary-meta {
-  margin-top: 8px;
-  font-size: 12px;
-  color: #909399;
-  flex-wrap: wrap;
-}
-
-.run-list {
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.run-row {
-  padding: 10px 12px;
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  cursor: pointer;
-  background: #fff;
-
-  &:hover {
-    border-color: #c6e2ff;
-    background: #f8fbff;
-  }
-}
-
-.run-row-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.run-time {
-  font-size: 12px;
-  color: #909399;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.run-row-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 5px 10px;
-  font-size: 12px;
-  color: #606266;
-
-  .is-danger {
-    color: #f56c6c;
-  }
-}
-
-.run-row-error {
-  margin-top: 8px;
-  color: #f56c6c;
-  font-size: 12px;
-  line-height: 18px;
-  word-break: break-word;
-}
-
-@media (max-width: 1280px) {
-  .ss-content {
-    grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr);
-    overflow: auto;
-  }
-
-  .ss-tasks-column {
-    grid-column: 1 / -1;
-    min-height: 420px;
-  }
-}
-
-@media (max-width: 900px) {
-  .ss-content {
-    grid-template-columns: minmax(0, 1fr);
-    overflow: auto;
-  }
-
-  .ss-column {
-    min-height: 360px;
-  }
+  border-radius: 6px;
+  .idle-text { font-size: 13px; color: #909399; }
 }
 
 @keyframes ss-rotate {
