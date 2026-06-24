@@ -487,19 +487,24 @@ impl QRCodeAuth {
 
             // 调用确认登录接口，获取真正的 BDUSS 和用户信息
             match self.confirm_qrcode_login(v_code, sign).await {
-                Ok(user) => {
+                Ok(user) if user.uid != 0 => {
                     info!("登录成功！用户: {}, UID: {}", user.username, user.uid);
                     Ok(QRCodeStatus::Success {
                         token: user.bduss.clone(),
                         user,
                     })
                 }
+                Ok(user) => {
+                    // uid=0 说明没换到真实账号信息，不能算登录成功
+                    warn!("确认登录返回 uid=0，视为登录失败: 用户名={}", user.username);
+                    Ok(QRCodeStatus::Failed {
+                        reason: "登录确认未获取到有效账号，请重新扫码".to_string(),
+                    })
+                }
                 Err(e) => {
                     warn!("确认登录失败: {}", e);
-                    // 降级：返回临时用户
-                    Ok(QRCodeStatus::Success {
-                        user: UserAuth::new(0, "临时用户".to_string(), v_code.to_string()),
-                        token: v_code.to_string(),
+                    Ok(QRCodeStatus::Failed {
+                        reason: format!("登录确认失败，请重新扫码: {}", e),
                     })
                 }
             }
@@ -517,11 +522,10 @@ impl QRCodeAuth {
                     Ok(QRCodeStatus::Scanned)
                 }
                 2 => {
-                    // 这个状态可能不会出现，但保留判断
-                    info!("登录成功（status=2）");
-                    Ok(QRCodeStatus::Success {
-                        user: UserAuth::new(0, "临时用户".to_string(), "".to_string()),
-                        token: "temp_token".to_string(),
+                    // 没有 v 字段就拿不到 BDUSS，无法构成真正登录，不要伪造临时用户
+                    warn!("收到 status=2 但无 v 字段，无法换取 BDUSS");
+                    Ok(QRCodeStatus::Failed {
+                        reason: "登录状态异常(status=2)，请重新扫码".to_string(),
                     })
                 }
                 -1 | -2 => {
