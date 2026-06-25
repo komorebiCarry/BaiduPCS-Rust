@@ -54,7 +54,19 @@ fn transfer_file_limit() -> usize {
         .filter(|&n| n > 0)
         .unwrap_or(TRANSFER_FILE_LIMIT_DEFAULT)
 }
+
+fn share_sync_leaf_batch_limit() -> usize {
+    const DEFAULT_LEAF_BATCH_LIMIT: usize = 1000;
+
+    std::env::var("BAIDUPCS_SHARE_SYNC_LEAF_BATCH_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_LEAF_BATCH_LIMIT)
+}
 const TASK_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
+
+type ActionByPath = std::collections::BTreeMap<String, SyncAction>;
 
 /// 把"环境资源不足"类错误（Quota / LocalDiskFull）映射到 run_item reason
 ///
@@ -71,6 +83,13 @@ fn quota_skip_reason(err: &ShareSyncError) -> Option<&'static str> {
         ErrorCategory::LocalDiskFull => Some("local_disk_full"),
         _ => None,
     }
+}
+
+fn action_for_path(action_by_path: &ActionByPath, path: &str) -> SyncAction {
+    action_by_path
+        .get(path)
+        .copied()
+        .unwrap_or(SyncAction::Added)
 }
 
 fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
@@ -974,6 +993,18 @@ impl<'a> ShareSyncExecutor<'a> {
         items.extend(diff.added.iter().cloned());
         items.extend(diff.modified.iter().map(|m| m.new.clone()));
 
+        let mut action_by_path: ActionByPath = ActionByPath::new();
+        for item in &diff.added {
+            if !item.is_dir {
+                action_by_path.insert(item.path.clone(), SyncAction::Added);
+            }
+        }
+        for ShareModifiedItem { old: _, new } in &diff.modified {
+            if !new.is_dir {
+                action_by_path.insert(new.path.clone(), SyncAction::Modified);
+            }
+        }
+
         // 2) 重建树(虚拟根的 children 就是顶层节点)
         let t = tree::build(&items);
 
@@ -1034,6 +1065,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 let t_ref = &t;
                 let captured_ref = captured;
                 let run_id_ref = run_id.as_str();
+                let action_by_path_ref = &action_by_path;
                 stream::iter(work.into_iter())
                     .map(|(node_idx, target_idx, record_kind)| {
                         let target = &self.subscription.targets[target_idx];
@@ -1047,6 +1079,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                     node_idx,
                                     target,
                                     record_kind,
+                                    action_by_path_ref,
                                     &mut local,
                                 )
                                 .await;
@@ -1069,6 +1102,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             node_idx,
                             target,
                             record_kind,
+                            &action_by_path,
                             &mut local,
                         )
                         .await;
@@ -1187,6 +1221,7 @@ impl<'a> ShareSyncExecutor<'a> {
         node_idx: usize,
         target: &SyncTarget,
         record_kind: TargetKind,
+        action_by_path: &ActionByPath,
         summary: &mut DiffSummary,
     ) -> Result<(), ErrorCategory> {
         self.transfer_node_set(
@@ -1196,6 +1231,7 @@ impl<'a> ShareSyncExecutor<'a> {
             vec![node_idx],
             target,
             record_kind,
+            action_by_path,
             summary,
             0,
         )
@@ -1223,6 +1259,7 @@ impl<'a> ShareSyncExecutor<'a> {
         indices: Vec<usize>,
         target: &SyncTarget,
         record_kind: TargetKind,
+        action_by_path: &'async_recursion ActionByPath,
         summary: &mut DiffSummary,
         depth: u32,
     ) -> Result<(), ErrorCategory> {
@@ -1244,6 +1281,8 @@ impl<'a> ShareSyncExecutor<'a> {
                         *idx,
                         target,
                         record_kind,
+                        depth,
+                        action_by_path,
                         summary,
                     )
                     .await
@@ -1315,6 +1354,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                     group,
                                     target,
                                     record_kind,
+                                    action_by_path,
                                     summary,
                                     depth + 1,
                                 )
@@ -1336,7 +1376,7 @@ impl<'a> ShareSyncExecutor<'a> {
         let transient_max_retries: u32 = std::env::var("BAIDUPCS_SHARE_SYNC_TRANSIENT_RETRIES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+            .unwrap_or(8);
         let transient_base_delay_ms: u64 =
             std::env::var("BAIDUPCS_SHARE_SYNC_TRANSIENT_BACKOFF_MS")
                 .ok()
@@ -1392,7 +1432,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                 let _ = self.persistence.add_run_item(
                                     run_id,
                                     &leaf.path,
-                                    SyncAction::Added,
+                                    action_for_path(action_by_path, &leaf.path),
                                     target_kind,
                                     Some(task_id.as_str()),
                                     None,
@@ -1449,16 +1489,24 @@ impl<'a> ShareSyncExecutor<'a> {
                         "share_sync_already_exists_netdisk: run_id={} depth={} first_path={} → 视为已转存,标记完成",
                         run_id, depth, first_path
                     );
+                    let existing_status = if strategy == ConflictStrategy::Skip {
+                        RunItemStatus::Skipped
+                    } else {
+                        RunItemStatus::Completed
+                    };
                     for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i)) {
                         let leaf = tree.get(leaf_idx);
+                        if existing_status == RunItemStatus::Skipped {
+                            summary.skipped += 1;
+                        }
                         let _ = self.persistence.add_run_item(
                             run_id,
                             &leaf.path,
-                            SyncAction::Added,
+                            action_for_path(action_by_path, &leaf.path),
                             target_kind,
                             None,
                             None,
-                            RunItemStatus::Completed,
+                            existing_status,
                             None,
                             None,
                         );
@@ -1490,7 +1538,7 @@ impl<'a> ShareSyncExecutor<'a> {
                                 let _ = self.persistence.add_run_item(
                                     run_id,
                                     &leaf.path,
-                                    SyncAction::Added,
+                                    action_for_path(action_by_path, &leaf.path),
                                     target_kind,
                                     Some(task_id.as_str()),
                                     None,
@@ -1553,6 +1601,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             group,
                             target,
                             record_kind,
+                            action_by_path,
                             summary,
                             depth + 1,
                         )
@@ -1570,36 +1619,63 @@ impl<'a> ShareSyncExecutor<'a> {
         // Failed 的叶子把真实失败原因（百度错误信息）写进 run_item 的 error 字段，
         // 让运行历史能逐文件显示「为什么失败」，而不是只剩一个笼统的「完成(部分失败)」。
         let fail_msg = final_err.to_string();
+        let local_recovery_dir = match target {
+            SyncTarget::Local(t) => Some(t.local_path.as_path()),
+            _ => None,
+        };
         let all_leaves: Vec<usize> = indices
             .iter()
             .flat_map(|&i| tree.descendants_leaves(i))
             .collect();
+        let mut unresolved_count = 0usize;
         for leaf_idx in all_leaves {
             let leaf = tree.get(leaf_idx);
+
+            if let Some(local_dir) = local_recovery_dir {
+                if local_file_matches(local_dir, &leaf.path, leaf.size) {
+                    let _ = self.persistence.add_run_item(
+                        run_id,
+                        &leaf.path,
+                        action_for_path(action_by_path, &leaf.path),
+                        target_kind,
+                        None,
+                        None,
+                        RunItemStatus::Completed,
+                        None,
+                        None,
+                    );
+                    continue;
+                }
+            }
+
             let (status, reason) = match category {
                 ErrorCategory::Quota => {
                     summary.skipped += 1;
+                    unresolved_count += 1;
                     (RunItemStatus::Skipped, Some("quota_full"))
                 }
                 ErrorCategory::LocalDiskFull => {
                     summary.skipped += 1;
+                    unresolved_count += 1;
                     (RunItemStatus::Skipped, Some("local_disk_full"))
                 }
                 ErrorCategory::DirTransferAmbiguous => {
                     // 已二分到叶子仍失败 → 当作 Failed(实际是该单文件出问题, 比如
                     // 被分享者删除); 暂不区分独立 reason, 走 Failed 让用户看到
                     summary.failed += 1;
+                    unresolved_count += 1;
                     (RunItemStatus::Failed, None)
                 }
                 _ => {
                     summary.failed += 1;
+                    unresolved_count += 1;
                     (RunItemStatus::Failed, None)
                 }
             };
             match self.persistence.add_run_item(
                 run_id,
                 &leaf.path,
-                SyncAction::Added,
+                action_for_path(action_by_path, &leaf.path),
                 target_kind,
                 None,
                 None,
@@ -1618,11 +1694,23 @@ impl<'a> ShareSyncExecutor<'a> {
                 Err(e) => warn!("记录 share-sync 叶子终态失败: {}", e),
             }
         }
-        Err(category)
+        if unresolved_count == 0 {
+            Ok(())
+        } else {
+            Err(category)
+        }
     }
 
-    /// 当 process_subtree 遇到 placeholder / 空 items 时,降级为按叶子(单文件)
-    /// 提交。阶段 4 的二分递归到底也会复用这条路径。
+    /// 当 process_subtree 遇到 placeholder / 空 items 时,降级为按叶子集合批量提交。
+    ///
+    /// 典型场景是增量同步:目录本身未变化,只有目录下大量文件 modified/added。
+    /// tree 里父目录会是 placeholder(没有真实 fs_id),不能直接整目录转存;但也不能
+    /// 回退到逐文件 `process_added_or_modified`,否则上万 CSV 会变成上万个
+    /// TransferManager.create_task,重复解析/验证分享链接并触发百度风控。
+    ///
+    /// 这里改为把叶子文件按百度单次转存上限分块,每块复用 `transfer_node_set` 的批量
+    /// selected_files 提交、等待、瞬时错误重试与失败后二分逻辑。这样只处理本次变更
+    /// 文件,不会重下未变化文件,同时任务数从 N 降为 ceil(N / limit)。
     async fn submit_subtree_as_leaves(
         &self,
         captured: &CapturedShare,
@@ -1631,36 +1719,85 @@ impl<'a> ShareSyncExecutor<'a> {
         node_idx: usize,
         target: &SyncTarget,
         record_kind: TargetKind,
+        depth: u32,
+        action_by_path: &ActionByPath,
         summary: &mut DiffSummary,
     ) -> Result<(), ErrorCategory> {
-        let leaves = tree.descendants_leaves(node_idx);
+        let mut leaves = tree.descendants_leaves(node_idx);
         if leaves.is_empty() {
             return Ok(());
         }
+        let original_leaf_count = leaves.len();
+        let mut skipped_existing_count = 0usize;
+        if let SyncTarget::Local(t) = target {
+            let strategy = target.effective_conflict_strategy(self.subscription.conflict_strategy);
+            if strategy == ConflictStrategy::Skip {
+                let mut pending = Vec::with_capacity(leaves.len());
+                for leaf_idx in leaves {
+                    let leaf = tree.get(leaf_idx);
+                    if local_file_exists(&t.local_path, &leaf.path) {
+                        skipped_existing_count += 1;
+                        summary.skipped += 1;
+                        let _ = self.persistence.add_run_item(
+                            run_id,
+                            &leaf.path,
+                            action_for_path(action_by_path, &leaf.path),
+                            record_kind,
+                            None,
+                            None,
+                            RunItemStatus::Skipped,
+                            None,
+                            None,
+                        );
+                    } else {
+                        pending.push(leaf_idx);
+                    }
+                }
+                leaves = pending;
+                if leaves.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
         let mut worst: Option<ErrorCategory> = None;
-        for leaf_idx in leaves {
-            let leaf = tree.get(leaf_idx);
-            let item = ShareSnapshotItem {
-                path: leaf.path.clone(),
-                raw_path: leaf.path.clone(),
-                fs_id: leaf.fs_id,
-                size: leaf.size,
-                name: leaf.name.clone(),
-                is_dir: leaf.is_dir,
-            };
-            if let Err(e) = self
-                .process_added_or_modified(
+        let chunk_size = share_sync_leaf_batch_limit().max(1);
+        let batch_count = (leaves.len() + chunk_size - 1) / chunk_size;
+        let (added_count, modified_count) =
+            leaves.iter().fold((0usize, 0usize), |(added, modified), &leaf_idx| {
+                match action_for_path(action_by_path, &tree.get(leaf_idx).path) {
+                    SyncAction::Modified => (added, modified + 1),
+                    _ => (added + 1, modified),
+                }
+            });
+        info!(
+            "share_sync_placeholder_leaf_batch: run_id={} node_path={} original_leaves={} pending_leaves={} skipped_existing={} added={} modified={} chunk_size={} batches={} target={:?}",
+            run_id,
+            tree.get(node_idx).path.as_str(),
+            original_leaf_count,
+            leaves.len(),
+            skipped_existing_count,
+            added_count,
+            modified_count,
+            chunk_size,
+            batch_count,
+            record_kind
+        );
+        for chunk in leaves.chunks(chunk_size) {
+            if let Err(c) = self
+                .transfer_node_set(
                     captured,
                     run_id,
-                    &item,
-                    SyncAction::Added,
+                    tree,
+                    chunk.to_vec(),
                     target,
                     record_kind,
+                    action_by_path,
                     summary,
+                    depth,
                 )
                 .await
             {
-                worst = Some(worst.map_or(e.category(), |w| max_category(w, e.category())));
+                worst = Some(worst.map_or(c, |w| max_category(w, c)));
             }
         }
         match worst {
@@ -2222,6 +2359,14 @@ impl<'a> ShareSyncExecutor<'a> {
 /// 本地文件是否存在（按 path 拼接到 local_dir）
 fn local_file_exists(local_dir: &Path, relative: &str) -> bool {
     local_dir.join(relative.trim_start_matches('/')).exists()
+}
+
+fn local_file_matches(local_dir: &Path, relative: &str, expected_size: u64) -> bool {
+    let local_path = local_dir.join(relative.trim_start_matches('/'));
+    match std::fs::metadata(local_path) {
+        Ok(meta) => meta.is_file() && meta.len() == expected_size,
+        Err(_) => false,
+    }
 }
 
 fn netdisk_target_file_path(target: &NetdiskTarget, item: &ShareSnapshotItem) -> String {

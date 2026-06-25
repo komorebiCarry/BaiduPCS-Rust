@@ -139,6 +139,8 @@ const TRANSIENT_KEYWORDS: &[&str] = &[
     "创建文件夹请求失败",
     "创建临时目录失败",
     "解析验证响应失败",
+    "解析文件列表响应失败",
+    "解析子目录文件列表响应失败",
     "请求超时",
     "超时",
     "请稍后",
@@ -178,7 +180,13 @@ impl ShareSyncError {
     pub fn category(&self) -> ErrorCategory {
         match self {
             ShareSyncError::NetworkError(_) => ErrorCategory::Transient,
-            ShareSyncError::ShareLinkError(_) => ErrorCategory::Auth,
+            ShareSyncError::ShareLinkError(msg) => {
+                if matches_any(msg, TRANSIENT_KEYWORDS) {
+                    ErrorCategory::Transient
+                } else {
+                    ErrorCategory::Auth
+                }
+            }
             ShareSyncError::TransferError(msg) | ShareSyncError::DownloadError(msg) => {
                 // 顺序敏感:先查资源/鉴权/不存在,再把明确的服务端临时错误归为可重试。
                 // DirTransferAmbiguous 放在 quota 之后, transient 之前 — 它不是

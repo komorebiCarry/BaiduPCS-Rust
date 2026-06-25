@@ -816,29 +816,60 @@ impl ShareSyncManager {
         };
 
         // 1) 抓取
-        let (captured, curr_snapshot) = match SnapshotCollector::from_url(
-            netdisk.as_ref(),
-            &sub.share_url,
-            sub.password.clone(),
-            sub.include_paths.clone(),
-            sub.exclude_patterns.clone(),
-            // 列目录抓快照与转存提交共用同一个全局风控限速器
-            self.rate_limiter.clone(),
-        )
-        .await
-        {
-            Ok(collector) => match collector.collect().await {
-                Ok(t) => t,
-                Err(e) => {
-                    self.fail_run(&run_id, id, owner_uid, &format!("抓取失败: {}", e));
+        //
+        // 百度分享页/列表接口在高频同步时会偶发返回 HTML 风控页或半截响应，
+        // 下层表现为"解析验证响应失败"/"解析子目录文件列表响应失败"。这不是
+        // 链接失效，不应直接失败整次 run 或累加 link_invalid；先做短退避重试。
+        let snapshot_max_retries: u32 = std::env::var("BAIDUPCS_SHARE_SYNC_SNAPSHOT_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let snapshot_base_delay_ms: u64 =
+            std::env::var("BAIDUPCS_SHARE_SYNC_SNAPSHOT_BACKOFF_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000);
+        let mut snapshot_attempt: u32 = 0;
+        let (captured, curr_snapshot) = loop {
+            let attempt_result = match SnapshotCollector::from_url(
+                netdisk.as_ref(),
+                &sub.share_url,
+                sub.password.clone(),
+                sub.include_paths.clone(),
+                sub.exclude_patterns.clone(),
+                // 列目录抓快照与转存提交共用同一个全局风控限速器
+                self.rate_limiter.clone(),
+            )
+            .await
+            {
+                Ok(collector) => collector.collect().await.map_err(|e| ("抓取失败", e)),
+                Err(e) => Err(("抓取初始化失败", e)),
+            };
+
+            match attempt_result {
+                Ok(t) => break t,
+                Err((stage, e)) if e.should_retry() && snapshot_attempt < snapshot_max_retries => {
+                    let backoff = snapshot_base_delay_ms.saturating_mul(1u64 << snapshot_attempt);
+                    warn!(
+                        "share-sync: {} 临时失败，{}ms 后重试 subscription={} run_id={} attempt={}/{} err={}",
+                        stage,
+                        backoff,
+                        id,
+                        run_id,
+                        snapshot_attempt + 1,
+                        snapshot_max_retries,
+                        e
+                    );
+                    if backoff > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    }
+                    snapshot_attempt += 1;
+                }
+                Err((stage, e)) => {
+                    self.fail_run(&run_id, id, owner_uid, &format!("{}: {}", stage, e));
                     self.maybe_note_link_failure(id, &e);
                     return Err(e);
                 }
-            },
-            Err(e) => {
-                self.fail_run(&run_id, id, owner_uid, &format!("抓取初始化失败: {}", e));
-                self.maybe_note_link_failure(id, &e);
-                return Err(e);
             }
         };
         // 成功抓取到分享内容 → 链接可用，归零失效计数（如曾标记失效也清除）。
@@ -1359,11 +1390,11 @@ fn restartable_share_sync_download(
     }
 
     if let Some(folder_id) = subtask.task_id.strip_prefix("folder:") {
-        return matches!(subtask.status.as_str(), "scanning" | "downloading")
+        return matches!(subtask.status.as_str(), "scanning" | "downloading" | "paused")
             .then(|| RestartableShareSyncDownload::Folder(folder_id.to_string()));
     }
 
-    (subtask.status == "downloading")
+    matches!(subtask.status.as_str(), "downloading" | "paused")
         .then(|| RestartableShareSyncDownload::Task(subtask.task_id.clone()))
 }
 
@@ -1374,9 +1405,17 @@ async fn restart_stalled_share_sync_downloads(
 ) -> usize {
     let mut task_ids = Vec::new();
     let mut folder_ids = Vec::new();
+    let mut paused_task_ids = Vec::new();
+    let mut paused_folder_ids = Vec::new();
 
     for subtask in subtasks {
         match restartable_share_sync_download(subtask) {
+            Some(RestartableShareSyncDownload::Task(task_id)) if subtask.status == "paused" => {
+                paused_task_ids.push(task_id)
+            }
+            Some(RestartableShareSyncDownload::Folder(folder_id)) if subtask.status == "paused" => {
+                paused_folder_ids.push(folder_id)
+            }
             Some(RestartableShareSyncDownload::Task(task_id)) => task_ids.push(task_id),
             Some(RestartableShareSyncDownload::Folder(folder_id)) => folder_ids.push(folder_id),
             None => {}
@@ -1387,12 +1426,31 @@ async fn restart_stalled_share_sync_downloads(
     task_ids.dedup();
     folder_ids.sort();
     folder_ids.dedup();
+    paused_task_ids.sort();
+    paused_task_ids.dedup();
+    paused_folder_ids.sort();
+    paused_folder_ids.dedup();
 
     let mut restarted = 0usize;
 
-    if !folder_ids.is_empty() {
+    if !folder_ids.is_empty() || !paused_folder_ids.is_empty() {
         match transfer.folder_download_manager_handle().await {
             Some(folder_manager) => {
+                for folder_id in paused_folder_ids {
+                    match folder_manager.resume_folder(&folder_id).await {
+                        Ok(()) => {
+                            restarted += 1;
+                            warn!(
+                                "share-sync: paused folder download resumed: folder_id={}",
+                                folder_id
+                            );
+                        }
+                        Err(e) => warn!(
+                            "share-sync: resume paused folder download failed: folder_id={}, error={}",
+                            folder_id, e
+                        ),
+                    }
+                }
                 for folder_id in folder_ids {
                     match folder_manager.pause_folder(&folder_id).await {
                         Ok(()) => {
@@ -1426,9 +1484,21 @@ async fn restart_stalled_share_sync_downloads(
         }
     }
 
-    if !task_ids.is_empty() {
+    if !task_ids.is_empty() || !paused_task_ids.is_empty() {
         match transfer.download_manager_handle().await {
             Some(download_manager) => {
+                for task_id in paused_task_ids {
+                    match download_manager.resume_task(&task_id).await {
+                        Ok(()) => {
+                            restarted += 1;
+                            warn!("share-sync: paused download task resumed: task_id={}", task_id);
+                        }
+                        Err(e) => warn!(
+                            "share-sync: resume paused download task failed: task_id={}, error={}",
+                            task_id, e
+                        ),
+                    }
+                }
                 for task_id in task_ids {
                     match download_manager.pause_task(&task_id, true).await {
                         Ok(()) => {
@@ -1914,6 +1984,7 @@ impl ExecutorHooks for ProductionHooks {
         let started_at = tokio::time::Instant::now();
         let mut last_activity_at = started_at;
         let mut last_stall_retry_at: Option<tokio::time::Instant> = None;
+        let mut last_paused_resume_at: Option<tokio::time::Instant> = None;
         let mut stall_retry_attempts = 0u32;
         let mut last_signature: Option<TaskActivitySignature> = None;
         loop {
@@ -1948,13 +2019,38 @@ impl ExecutorHooks for ProductionHooks {
             } else {
                 Vec::new()
             };
+            let now = tokio::time::Instant::now();
+            if require_download_completion {
+                let paused_subtasks: Vec<ShareSyncSubtask> = subtasks
+                    .iter()
+                    .filter(|s| s.status == "paused")
+                    .cloned()
+                    .collect();
+                let paused_resume_due = !paused_subtasks.is_empty()
+                    && last_paused_resume_at
+                        .map(|last| now.duration_since(last) >= Duration::from_secs(10))
+                        .unwrap_or(true);
+                if paused_resume_due {
+                    last_paused_resume_at = Some(now);
+                    let restarted =
+                        restart_stalled_share_sync_downloads(&tm, &paused_subtasks, Duration::ZERO)
+                            .await;
+                    if restarted > 0 {
+                        warn!(
+                            "share-sync: paused download subtasks resumed immediately: task_id={}, restarted={}",
+                            task_id, restarted
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
             let signature = task_activity_signature(&task, &subtasks);
             if last_signature.as_ref() != Some(&signature) {
                 last_activity_at = tokio::time::Instant::now();
                 last_signature = Some(signature);
             }
 
-            let now = tokio::time::Instant::now();
             if let Some(hard_timeout) = hard_timeout {
                 if now.duration_since(started_at) >= hard_timeout {
                     let msg = format!(
@@ -2730,6 +2826,19 @@ mod tests {
             restartable_share_sync_download(&folder),
             Some(RestartableShareSyncDownload::Folder("folder-1".into()))
         );
+
+        folder.status = "paused".into();
+        assert_eq!(
+            restartable_share_sync_download(&folder),
+            Some(RestartableShareSyncDownload::Folder("folder-1".into()))
+        );
+
+        let mut paused_task = task.clone();
+        paused_task.status = "paused".into();
+        assert_eq!(
+            restartable_share_sync_download(&paused_task),
+            Some(RestartableShareSyncDownload::Task("dl-1".into()))
+        );
     }
 
     #[test]
@@ -2740,7 +2849,7 @@ mod tests {
         assert_eq!(restartable_share_sync_download(&subtask), None);
 
         subtask.kind = "download".into();
-        for status in ["completed", "failed", "cancelled", "paused", "pending"] {
+        for status in ["completed", "failed", "cancelled", "pending"] {
             subtask.status = status.into();
             assert_eq!(
                 restartable_share_sync_download(&subtask),

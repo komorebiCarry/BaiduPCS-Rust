@@ -13,7 +13,7 @@ use crate::transfer::types::{
 };
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
@@ -499,8 +499,9 @@ impl TransferManager {
                         )
                         .await
                     {
-                        Ok(_randsk) => {
+                        Ok(verified_randsk) => {
                             info!("提取码验证成功");
+                            task.randsk = Some(verified_randsk);
                         }
                         Err(e) => {
                             let err_msg = e.to_string();
@@ -520,6 +521,10 @@ impl TransferManager {
                             });
                         }
                     }
+                }
+
+                if task.randsk.is_none() {
+                    task.randsk = request.randsk.clone();
                 }
 
                 let task_arc = Arc::new(RwLock::new(task));
@@ -788,6 +793,12 @@ impl TransferManager {
             t.share_info.clone().context("分享信息未设置")?
         };
 
+        // 获取 randsk（由 create_task 从 verify_share_password 或调用方存入）
+        let randsk = {
+            let t = task.read().await;
+            t.randsk.clone()
+        };
+
         // 检查取消
         if cancellation_token.is_cancelled() {
             return Ok(());
@@ -807,7 +818,13 @@ impl TransferManager {
             if has_selected_fs_ids {
                 // 用户已选择文件，只拉第一页用于展示文件名
                 let result = client
-                    .list_share_files(&share_link.short_key, &share_info.bdstoken, 1, 100)
+                    .list_share_files_with_randsk(
+                        &share_link.short_key,
+                        &share_info.bdstoken,
+                        1,
+                        100,
+                        randsk.as_deref(),
+                    )
                     .await?;
                 (result.files, result.share_root_path)
             } else {
@@ -818,11 +835,12 @@ impl TransferManager {
                 let mut page: u32 = 1;
                 loop {
                     let result = client
-                        .list_share_files(
+                        .list_share_files_with_randsk(
                             &share_link.short_key,
                             &share_info.bdstoken,
                             page,
                             page_size,
+                            randsk.as_deref(),
                         )
                         .await?;
                     let batch_len = result.files.len();
@@ -1219,7 +1237,7 @@ impl TransferManager {
 
                 // 转存该组
                 let result = client
-                    .transfer_share_files(
+                    .transfer_share_files_with_randsk(
                         &share_info.shareid,
                         &share_info.share_uk,
                         &share_info.bdstoken,
@@ -1227,6 +1245,7 @@ impl TransferManager {
                         &group_target_dir,
                         &referer,
                         Some(task_id),
+                        randsk.as_deref(),
                     )
                     .await;
 
@@ -1243,7 +1262,7 @@ impl TransferManager {
                                 warn!("重试时创建目录失败: {}", e);
                             }
                             client
-                                .transfer_share_files(
+                                .transfer_share_files_with_randsk(
                                     &share_info.shareid,
                                     &share_info.share_uk,
                                     &share_info.bdstoken,
@@ -1251,6 +1270,7 @@ impl TransferManager {
                                     &group_target_dir,
                                     &referer,
                                     Some(task_id),
+                                    randsk.as_deref(),
                                 )
                                 .await
                         } else {
@@ -2030,10 +2050,23 @@ impl TransferManager {
         );
 
         // 创建文件下载任务
+        //
+        // 大量小文件场景下，逐个 `start_task().await` 会把"任务位分配/入队"
+        // 串成一条长链。这里改为创建完成后立即并发投递启动请求；真正下载并发仍由
+        // DownloadManager 的任务槽、ChunkScheduler 的全局线程预算控制。
         let mut download_task_ids = Vec::new();
+        let mut ensured_local_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut start_join_set = tokio::task::JoinSet::new();
+        let start_task_concurrency_limit = std::env::var(
+            "BAIDUPCS_AUTO_DOWNLOAD_START_CONCURRENCY",
+        )
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128);
         for (fs_id, remote_path, filename, size, local_dir) in download_files {
             // 确保本地下载目录存在（分批模式下可能是按原始结构还原出的父目录）
-            if !local_dir.exists() {
+            if ensured_local_dirs.insert(local_dir.clone()) && !local_dir.exists() {
                 if let Err(e) = tokio::fs::create_dir_all(&local_dir).await {
                     warn!("创建本地下载目录失败: {:?}, error={}", local_dir, e);
                 }
@@ -2096,8 +2129,28 @@ impl TransferManager {
                     // 启动下载任务
                     // 🔥 修复：transfer_task_id 会在 start_task -> register_download_task 时
                     // 从内存任务对象中获取并持久化，解决了之前调用顺序导致的问题
-                    if let Err(e) = dm.start_task(&download_task_id).await {
-                        warn!("启动下载任务失败: {}, error={}", download_task_id, e);
+                    let dm_for_start = Arc::clone(dm);
+                    let start_task_id = download_task_id.clone();
+                    start_join_set.spawn(async move {
+                        let result = dm_for_start
+                            .start_task(&start_task_id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        (start_task_id, result)
+                    });
+                    if start_join_set.len() >= start_task_concurrency_limit {
+                        match start_join_set.join_next().await {
+                            Some(Ok((download_task_id, Ok(())))) => {
+                                debug!("下载任务启动请求已投递: {}", download_task_id);
+                            }
+                            Some(Ok((download_task_id, Err(e)))) => {
+                                warn!("启动下载任务失败: {}, error={}", download_task_id, e);
+                            }
+                            Some(Err(e)) => {
+                                warn!("启动下载任务 join 失败: {}", e);
+                            }
+                            None => {}
+                        }
                     }
                     download_task_ids.push(download_task_id);
                 }
@@ -2106,6 +2159,19 @@ impl TransferManager {
                         "创建下载任务失败: {} -> {}, error={}",
                         remote_path, filename, e
                     );
+                }
+            }
+        }
+        while let Some(joined) = start_join_set.join_next().await {
+            match joined {
+                Ok((download_task_id, Ok(()))) => {
+                    debug!("下载任务启动请求已投递: {}", download_task_id);
+                }
+                Ok((download_task_id, Err(e))) => {
+                    warn!("启动下载任务失败: {}, error={}", download_task_id, e);
+                }
+                Err(e) => {
+                    warn!("启动下载任务 join 失败: {}", e);
                 }
             }
         }
@@ -2123,7 +2189,7 @@ impl TransferManager {
             if let Some(ref fdm) = *fdm_lock {
                 for (folder_path, local_dir) in download_folders {
                     // 确保本地目录存在
-                    if !local_dir.exists() {
+                    if ensured_local_dirs.insert(local_dir.clone()) && !local_dir.exists() {
                         if let Err(e) = tokio::fs::create_dir_all(&local_dir).await {
                             warn!("创建本地文件夹下载目录失败: {:?}, error={}", local_dir, e);
                         }
@@ -2274,6 +2340,9 @@ impl TransferManager {
             let client = Arc::new(client.read().unwrap().clone());
             const CHECK_INTERVAL: Duration = Duration::from_secs(2);
             const DOWNLOAD_TIMEOUT_HOURS: i64 = 24;
+            let share_sync_download_failure_retry_max =
+                Self::share_sync_download_failure_retry_max();
+            let mut share_sync_download_failure_retry_attempts = 0u32;
 
             loop {
                 tokio::time::sleep(CHECK_INTERVAL).await;
@@ -2297,15 +2366,29 @@ impl TransferManager {
                 drop(task_info);
 
                 // 🔥 本 loop 内所有 TransferEvent 用 task.owner_uid
-                let (status, download_task_ids, download_started_at, owner_uid_raw) = {
+                let (
+                    status,
+                    download_task_ids,
+                    download_started_at,
+                    owner_uid_raw,
+                    is_internal,
+                    backup_config_id,
+                ) = {
                     let t = task.read().await;
                     (
                         t.status.clone(),
                         t.download_task_ids.clone(),
                         t.download_started_at,
                         t.owner_uid.raw(),
+                        t.is_internal,
+                        t.backup_config_id.clone(),
                     )
                 };
+                let is_share_sync_internal_download = is_internal
+                    && backup_config_id
+                        .as_deref()
+                        .map(|id| id.starts_with("share-sync:"))
+                        .unwrap_or(false);
 
                 // 非下载中状态，停止监听
                 if status != TransferStatus::Downloading {
@@ -2379,6 +2462,29 @@ impl TransferManager {
                         }
 
                         break;
+                    }
+                }
+
+                if is_share_sync_internal_download
+                    && share_sync_download_failure_retry_attempts
+                        < share_sync_download_failure_retry_max
+                {
+                    let restarted = Self::restart_failed_downloads_once(
+                        &download_manager,
+                        &folder_download_manager,
+                        &download_task_ids,
+                    )
+                    .await;
+                    if restarted > 0 {
+                        share_sync_download_failure_retry_attempts += 1;
+                        warn!(
+                            "share-sync: failed download subtasks resumed: task_id={}, attempt={}/{}, restarted={}",
+                            task_id,
+                            share_sync_download_failure_retry_attempts,
+                            share_sync_download_failure_retry_max,
+                            restarted
+                        );
+                        continue;
                     }
                 }
 
@@ -2689,6 +2795,83 @@ impl TransferManager {
                 }
             }
         });
+    }
+
+    fn share_sync_download_failure_retry_max() -> u32 {
+        std::env::var("BAIDUPCS_SHARE_SYNC_DOWNLOAD_FAILURE_RETRY_MAX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(20)
+    }
+
+    async fn restart_failed_downloads_once(
+        download_manager: &Arc<RwLock<Option<Arc<DownloadManager>>>>,
+        folder_download_manager: &Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+        download_task_ids: &[String],
+    ) -> usize {
+        let dm = {
+            let dm_lock = download_manager.read().await;
+            dm_lock.as_ref().cloned()
+        };
+        let fdm = {
+            let fdm_lock = folder_download_manager.read().await;
+            fdm_lock.as_ref().cloned()
+        };
+
+        let mut restarted = 0usize;
+
+        for task_id in download_task_ids {
+            if let Some(folder_id) = task_id.strip_prefix("folder:") {
+                let Some(folder_manager) = fdm.as_ref() else {
+                    continue;
+                };
+                let should_resume = folder_manager
+                    .get_folder(folder_id)
+                    .await
+                    .map(|folder| folder.status == FolderStatus::Failed)
+                    .unwrap_or(false);
+                if should_resume {
+                    match folder_manager.resume_folder(folder_id).await {
+                        Ok(()) => {
+                            restarted += 1;
+                            warn!(
+                                "share-sync: failed folder download resumed: folder_id={}",
+                                folder_id
+                            );
+                        }
+                        Err(e) => warn!(
+                            "share-sync: resume failed folder download failed: folder_id={}, error={}",
+                            folder_id, e
+                        ),
+                    }
+                }
+                continue;
+            }
+
+            let Some(download_manager) = dm.as_ref() else {
+                continue;
+            };
+            let should_resume = download_manager
+                .get_task(task_id)
+                .await
+                .map(|task| task.status == TaskStatus::Failed)
+                .unwrap_or(false);
+            if should_resume {
+                match download_manager.resume_task(task_id).await {
+                    Ok(()) => {
+                        restarted += 1;
+                        warn!("share-sync: failed download task resumed: task_id={}", task_id);
+                    }
+                    Err(e) => warn!(
+                        "share-sync: resume failed download task failed: task_id={}, error={}",
+                        task_id, e
+                    ),
+                }
+            }
+        }
+
+        restarted
     }
 
     /// 清理临时目录（内部方法，带超时机制）
@@ -3696,6 +3879,7 @@ impl TransferManager {
                 .as_deref()
                 .is_some_and(|c| c.starts_with("share-sync:")),
             backup_config_id: metadata.backup_config_id.clone(),
+            randsk: None,
         })
     }
 
