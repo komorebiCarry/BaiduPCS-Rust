@@ -601,79 +601,41 @@ impl BackupRecordManager {
             params![cutoff_str],
         )?;
 
-        let snapshot_deleted = conn.execute(
-            "DELETE FROM encryption_snapshots WHERE updated_at < ?1 AND status = 'completed'",
-            params![cutoff_str],
-        )?;
+        // 注意：不清理 encryption_snapshots 表。
+        // 加密映射表是 uuid.age 与原始文件名的唯一关联线索，由加密模块独立管理生命周期。
+        // 删除去重记录时不应连带删除加密映射，否则已加密文件将无法还原原名和目录结构。
 
-        Ok((upload_deleted, download_deleted, snapshot_deleted))
+        Ok((upload_deleted, download_deleted, 0))
     }
 
     /// 删除指定配置的所有加密快照记录
     ///
-    /// 当删除备份配置时调用，清理该配置关联的所有加密映射数据
-    pub fn delete_snapshots_by_config(&self, config_id: &str) -> Result<usize> {
-        let conn = self.get_conn()?;
+    // ==================== 以下删除函数已废弃 ====================
+    //
+    // encryption_snapshots 表是 uuid.age 与原始文件名的唯一关联线索，
+    // UUID v4 几乎不可能碰撞，因此禁止任何删除操作。
+    // 之前存在的删除函数（按 config_id、按状态、按 encrypted_name）均已移除。
+    // ==========================================================
 
-        let deleted = conn.execute(
-            "DELETE FROM encryption_snapshots WHERE config_id = ?1",
-            params![config_id],
-        )?;
-
-        tracing::info!("已删除配置 {} 的 {} 条加密快照记录", config_id, deleted);
-        Ok(deleted)
+    /// 删除指定配置的加密快照记录
+    /// 此函数已弃用，保留仅用于编译兼容，不做任何操作。
+    pub fn delete_snapshots_by_config(&self, _config_id: &str) -> Result<usize> {
+        tracing::warn!("delete_snapshots_by_config 已弃用，encryption_snapshots 表禁止删除");
+        Ok(0)
     }
 
     /// 删除指定配置下未完成的加密快照记录
-    ///
-    /// 当取消备份任务时调用，清理该配置下未完成（非 completed 状态）的加密映射记录
-    /// 已完成的记录会保留，用于下次去重和解密
-    pub fn delete_incomplete_snapshots_by_config(&self, config_id: &str) -> Result<usize> {
-        let conn = self.get_conn()?;
-
-        let deleted = conn.execute(
-            "DELETE FROM encryption_snapshots WHERE config_id = ?1 AND status != 'completed'",
-            params![config_id],
-        )?;
-
-        if deleted > 0 {
-            tracing::info!("已删除配置 {} 的 {} 条未完成加密快照记录", config_id, deleted);
-        }
-        Ok(deleted)
+    /// 此函数已弃用，保留仅用于编译兼容，不做任何操作。
+    pub fn delete_incomplete_snapshots_by_config(&self, _config_id: &str) -> Result<usize> {
+        tracing::warn!("delete_incomplete_snapshots_by_config 已弃用，encryption_snapshots 表禁止删除");
+        Ok(0)
     }
 
     /// 批量删除指定加密文件名的快照记录
-    ///
-    /// 当取消备份任务时调用，清理该任务中已创建但未完成的加密映射记录
-    pub fn delete_snapshots_by_encrypted_names(&self, encrypted_names: &[String]) -> Result<usize> {
-        if encrypted_names.is_empty() {
-            return Ok(0);
-        }
-
-        let conn = self.get_conn()?;
-
-        // 构建 IN 子句的占位符
-        let placeholders: Vec<String> = encrypted_names.iter()
-            .map(|_| "?".to_string())
-            .collect();
-        let placeholders_str = placeholders.join(", ");
-
-        let sql = format!(
-            "DELETE FROM encryption_snapshots WHERE encrypted_name IN ({})",
-            placeholders_str
-        );
-
-        let params: Vec<&dyn rusqlite::ToSql> = encrypted_names
-            .iter()
-            .map(|s| s as &dyn rusqlite::ToSql)
-            .collect();
-
-        let deleted = conn.execute(&sql, params.as_slice())?;
-
-        if deleted > 0 {
-            tracing::info!("已删除 {} 条加密快照记录", deleted);
-        }
-        Ok(deleted)
+    /// 此函数已弃用，保留仅用于编译兼容，不做任何操作。
+    pub fn delete_snapshots_by_encrypted_names(&self, _encrypted_names: &[String]) -> Result<usize> {
+        tracing::warn!("delete_snapshots_by_encrypted_names 已弃用，encryption_snapshots 表禁止删除");
+        Ok(0)
     }
 
     /// 获取数据库统计信息

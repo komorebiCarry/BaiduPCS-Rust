@@ -252,6 +252,11 @@ impl AutoBackupManager {
         // 恢复未完成的任务
         manager.restore_incomplete_tasks()?;
 
+        // 🔥 启动时清理孤立的临时加密文件
+        // 服务重启后，所有 .age / .age.tmp 文件均为孤儿（encrypted_temp_path 不持久化），
+        // 且加密速度远快于上传，直接删除最安全。
+        manager.cleanup_stale_temp_files()?;
+
         // 🔥 执行兜底同步：同步历史归档中已完成的备份任务到 backup_file_tasks 表
         manager.sync_completed_backup_tasks_from_history()?;
 
@@ -264,6 +269,61 @@ impl AutoBackupManager {
     /// - 当上传/下载任务已归档到 task_history 表（is_backup=1, status='completed'）
     /// - 但对应的 backup_file_tasks 表中的状态可能还未更新
     /// - 此方法会根据 related_task_id 找到对应的备份文件任务并更新状态
+    /// 启动时清理孤立的临时加密文件
+    ///
+    /// 服务重启后 temp_dir 中的 .age / .age.tmp 文件均为孤儿：
+    /// - encrypted_temp_path 不持久化到数据库，无法追溯归属
+    /// - 即使存在对应任务，重启后也会重新加密
+    /// - 加密速度远快于上传，直接删除最安全
+    fn cleanup_stale_temp_files(&self) -> anyhow::Result<()> {
+        let dir = &self.temp_dir;
+        if !dir.exists() {
+            return Ok(());
+        }
+        let mut cleaned = 0usize;
+        let mut errors = 0usize;
+
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let name = match path.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    // 只清理 age 加密相关的临时文件
+                    if name.ends_with(".age") || name.ends_with(".age.tmp") {
+                        match std::fs::remove_file(&path) {
+                            Ok(_) => cleaned += 1,
+                            Err(e) => {
+                                tracing::warn!("清理孤儿临时文件失败: {:?}, error={}", path, e);
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("读取临时目录失败，跳过清理: {:?}, error={}", dir, e);
+                return Ok(());
+            }
+        }
+
+        if cleaned > 0 || errors > 0 {
+            tracing::info!(
+                "孤儿临时文件清理完成: cleaned={}, errors={}, dir={:?}",
+                cleaned, errors, dir
+            );
+        } else {
+            tracing::debug!("无需清理孤儿临时文件: dir={:?}", dir);
+        }
+
+        Ok(())
+    }
+
     fn sync_completed_backup_tasks_from_history(&self) -> anyhow::Result<()> {
         use crate::persistence::HistoryDbManager;
 
@@ -818,7 +878,10 @@ impl AutoBackupManager {
         let config = self.configs.remove(id)
             .ok_or_else(|| anyhow!("配置不存在: {}", id))?;
 
-        // 删除相关记录
+        // 删除相关记录（不影响云端持久化数据）
+        // 注意：不删除加密映射表 (encryption_snapshots) 中的记录。
+        // 加密映射是 uuid.age 与原始文件名的唯一关联线索，由加密模块独立管理，
+        // 删除备份配置不应导致已加密文件无法解密恢复。
         self.record_manager.delete_upload_records_by_config(id)?;
 
         // 删除扫描缓存
@@ -826,10 +889,7 @@ impl AutoBackupManager {
             tracing::warn!("删除配置 {} 的扫描缓存失败: {}", id, e);
         }
 
-        // 删除加密映射表数据
-        if let Err(e) = self.record_manager.delete_snapshots_by_config(id) {
-            tracing::warn!("删除配置 {} 的加密快照记录失败: {}", id, e);
-        }
+        // 🔥 移除旧的快照删除逻辑 —— 加密映射表由加密模块独立管理生命周期
 
         // 保存配置
         self.save_configs().await?;
@@ -3424,11 +3484,11 @@ impl AutoBackupManager {
 
     /// 取消任务（步骤7: 仅限活跃任务）
     ///
-    /// 取消备份任务时，会同时取消所有关联的底层上传/下载任务，并清理未完成的加密映射表
+    /// 取消备份任务时，会同时取消所有关联的底层上传/下载任务，保留加密映射表
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
         // 步骤7: 操作接口限制为活跃任务
-        // 先收集需要取消的底层任务ID和config_id，避免持有 DashMap 锁时调用 async 方法
-        let (pending_uploads, pending_downloads, config_id) = {
+        // 先收集需要取消的底层任务ID，避免持有 DashMap 锁时调用 async 方法
+        let (pending_uploads, pending_downloads) = {
             let task = self.tasks.get(task_id)
                 .ok_or_else(|| anyhow!("任务已完成或不存在，无法操作: {}", task_id))?;
 
@@ -3437,7 +3497,6 @@ impl AutoBackupManager {
                     (
                         task.pending_upload_task_ids.iter().cloned().collect::<Vec<_>>(),
                         task.pending_download_task_ids.iter().cloned().collect::<Vec<_>>(),
-                        task.config_id.clone(),
                     )
                 }
                 BackupTaskStatus::Completed | BackupTaskStatus::PartiallyCompleted | BackupTaskStatus::Cancelled | BackupTaskStatus::Failed => {
@@ -3482,25 +3541,9 @@ impl AutoBackupManager {
             }
         }
 
-        // 清理该配置下未完成的加密映射记录（直接从数据库删除，不依赖内存中的 encrypted_name）
-        let deleted_snapshots = match self.record_manager.delete_incomplete_snapshots_by_config(&config_id) {
-            Ok(count) => {
-                if count > 0 {
-                    tracing::debug!(
-                        "已清理未完成的加密映射记录: backup_task={}, config_id={}, count={}",
-                        task_id, config_id, count
-                    );
-                }
-                count
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "清理加密映射记录失败: backup_task={}, config_id={}, error={}",
-                    task_id, config_id, e
-                );
-                0
-            }
-        };
+        // 注意：不清理 encryption_snapshots 表。UUID v4 几乎不可能碰撞，
+        // 加密映射表是 uuid.age 与原始文件名的唯一关联线索，应永久保留。
+        let _deleted_snapshots: usize = 0;
 
         // 更新备份任务状态
         // 🔥 防自死锁：在 get_mut 写 guard 内先取出 old_status/owner_uid，
@@ -3529,8 +3572,8 @@ impl AutoBackupManager {
         self.cleanup_completed_task(task_id);
 
         tracing::info!(
-            "Cancelled backup task: {}, deleted uploads: {}, deleted downloads: {}, deleted snapshots: {}",
-            task_id, deleted_uploads, deleted_downloads, deleted_snapshots
+            "Cancelled backup task: {}, deleted uploads: {}, deleted downloads: {}",
+            task_id, deleted_uploads, deleted_downloads
         );
         Ok(())
     }
@@ -7766,7 +7809,7 @@ impl AutoBackupManager {
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                             // 只清理备份相关的临时文件
-                            if name.ends_with(".age.tmp") || name.starts_with("backup_") {
+                            if name.ends_with(".age") || name.ends_with(".age.tmp") || name.starts_with("backup_") {
                                 match std::fs::remove_file(&path) {
                                     Ok(_) => result.cleaned_temp_files += 1,
                                     Err(e) => {
