@@ -2408,7 +2408,7 @@ impl NetdiskClient {
                     132 => "您的帐号可能存在安全风险，为了确保为您本人操作，请先进行安全验证"
                         .to_string(),
                     -7 => "该分享已删除或已取消".to_string(),
-                    -9 => "文件不存在".to_string(),
+                    -9 => "提取码验证失败，请重试".to_string(),
                     -12 => "访问密码错误".to_string(),
                     -19 => "需要输入验证码".to_string(),
                     -62 => "可能需要输入验证码".to_string(),
@@ -2635,6 +2635,30 @@ impl NetdiskClient {
         referer: &str,
         internal_task_id: Option<&str>,
     ) -> Result<crate::transfer::TransferResult> {
+        self.transfer_share_files_with_randsk(
+            shareid,
+            share_uk,
+            bdstoken,
+            fs_ids,
+            target_path,
+            referer,
+            internal_task_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn transfer_share_files_with_randsk(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        fs_ids: &[u64],
+        target_path: &str,
+        referer: &str,
+        internal_task_id: Option<&str>,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
         // 构建转存URL
         let url = format!(
             "https://pan.baidu.com/share/transfer?\
@@ -2652,15 +2676,28 @@ impl NetdiskClient {
                 .join(",")
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .header("User-Agent", &self.web_user_agent)
-            .header("Referer", referer)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
-            .send()
-            .await;
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .post(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Cookie", cookie_header)
+                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+                .send()
+                .await
+        } else {
+            self.client
+                .post(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+                .send()
+                .await
+        };
 
         let response = match response {
             Ok(resp) => {

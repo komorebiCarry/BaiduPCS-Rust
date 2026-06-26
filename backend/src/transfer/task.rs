@@ -153,6 +153,14 @@ pub struct TransferTask {
     /// 是 UUID，永不与 `share-sync:` 前缀冲突）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_config_id: Option<String>,
+
+    /// 分享 randsk（密码校验返回的 cookie 值）。
+    ///
+    /// 并发转存多个有密码的分享时，共享 CookieJar 只有一个 randsk 槽位，
+    /// 互相覆盖会导致 `list_share_files` / `transfer_share_files` 返回 errno=-9。
+    /// 将 randsk 存入 task，`execute_task` 可显式传入 API 调用而非依赖 CookieJar。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub randsk: Option<String>,
 }
 
 impl TransferTask {
@@ -205,6 +213,7 @@ impl TransferTask {
             share_root_path: None,
             is_internal: false,
             backup_config_id: None,
+            randsk: None,
         }
     }
 
