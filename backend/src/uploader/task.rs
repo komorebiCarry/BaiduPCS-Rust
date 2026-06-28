@@ -135,14 +135,6 @@ pub struct UploadTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_name: Option<String>,
 
-    /// 加密随机数（Base64 编码，用于解密）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption_nonce: Option<String>,
-
-    /// 加密算法（固定为 "age"，即 age-encryption.org/v1）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption_algorithm: Option<String>,
-
     /// 加密格式版本号
     #[serde(default)]
     pub encryption_version: u8,
@@ -211,8 +203,6 @@ impl UploadTask {
             original_size: total_size,
             // 加密映射元数据初始化
             encrypted_name: None,
-            encryption_nonce: None,
-            encryption_algorithm: None,
             encryption_version: 0,
             encryption_key_version: 1,
             // 冲突策略初始化
@@ -309,31 +299,17 @@ impl UploadTask {
     /// 标记加密完成，设置加密后的临时文件路径和加密元数据
     ///
     /// 注意：此方法会同时将状态更新为 Uploading，确保状态一致性
-    /// 这样在发送 EncryptCompleted 事件时，前端查询状态就能得到正确的 Uploading 状态
-    ///
-    /// # 参数
-    /// * `encrypted_path` - 加密后的临时文件路径
-    /// * `encrypted_size` - 加密后的文件大小
-    /// * `encrypted_name` - 加密后的文件名（如 "uuid.age"）
-    /// * `nonce` - 加密随机数（Base64 编码）
-    /// * `algorithm` - 加密算法名称
-    /// * `version` - 加密格式版本号
     pub fn mark_encrypt_completed(
         &mut self,
         encrypted_path: PathBuf,
         encrypted_size: u64,
         encrypted_name: String,
-        nonce: String,
-        algorithm: String,
         version: u8,
     ) {
         self.encrypted_temp_path = Some(encrypted_path);
-        self.total_size = encrypted_size; // 更新为加密后的大小
+        self.total_size = encrypted_size;
         self.encrypt_progress = 100.0;
-        // 🔥 保存加密映射元数据（用于上传完成后写入 encryption_snapshots 表）
         self.encrypted_name = Some(encrypted_name);
-        self.encryption_nonce = Some(nonce);
-        self.encryption_algorithm = Some(algorithm);
         self.encryption_version = version;
         // 🔥 加密完成后立即将状态更新为 Uploading，避免前端查询时状态不一致
         // 这解决了 EncryptCompleted 事件发送后、mark_uploading() 调用前的时间窗口问题
@@ -556,20 +532,14 @@ mod tests {
             PathBuf::from("./test/file.age"),
             1100,
             "BPR_BKUP_test-uuid.bkup".to_string(),
-            "age_internal".to_string(),
-            "age".to_string(),
             1,
         );
 
         assert_eq!(task.encrypt_progress, 100.0);
         assert_eq!(task.total_size, 1100);
         assert!(task.encrypted_temp_path.is_some());
-        // 🔥 验证加密完成后状态自动转换为 Uploading
         assert_eq!(task.status, UploadTaskStatus::Uploading);
-        // 🔥 验证加密元数据已保存
-        assert_eq!(task.encrypted_name, Some("test-uuid.age".to_string()));
-        assert_eq!(task.encryption_nonce, Some("age_internal".to_string()));
-        assert_eq!(task.encryption_algorithm, Some("age".to_string()));
+        assert_eq!(task.encrypted_name, Some("BPR_BKUP_test-uuid.bkup".to_string()));
         assert_eq!(task.encryption_version, 1);
     }
 

@@ -829,9 +829,7 @@ impl UploadManager {
                         encrypted_path.clone(),
                         encrypted_size,
                         encrypted_filename.clone(),
-                        "age_internal".to_string(),              // nonce: age 内部处理，无需外部存储
-                        "age".to_string(),                       // algorithm: age-encryption.org/v1
-                        1,                                       // version: age-encryption.org/v1
+                        1,
                     );
 
                     // 🔥 注意：remote_path 已经在 create_task/create_backup_task 时设置好了
@@ -1312,12 +1310,10 @@ impl UploadManager {
                 use crate::autobackup::record::EncryptionSnapshot;
                 let snapshot = EncryptionSnapshot {
                     config_id: "manual_upload".to_string(),
-                    original_path: encrypted_parent.clone(),  // 父路径（已加密）
+                    original_path: encrypted_parent.clone(),
                     original_name: original_filename.clone(),
                     encrypted_name: encrypted_filename.clone(),
                     file_size,
-                    nonce: String::new(),      // 上传时还没有 nonce，上传完成后更新
-                    algorithm: String::new(),  // 上传时还没有算法，上传完成后更新
                     version: 1,
                     key_version: snapshot_key_version,
                     remote_path: task.remote_path.clone(),
@@ -2944,8 +2940,6 @@ impl UploadManager {
                     original_name: original_filename.clone(),
                     encrypted_name: enc_filename.clone(),
                     file_size,
-                    nonce: String::new(),      // 上传时还没有 nonce，上传完成后更新
-                    algorithm: String::new(),  // 上传时还没有算法，上传完成后更新
                     version: 1,
                     key_version: snapshot_key_version,
                     remote_path: actual_remote_path.clone(),
@@ -3107,8 +3101,6 @@ impl UploadManager {
             original_size: file_size,
             // 加密映射元数据（历史任务无加密映射）
             encrypted_name: None,
-            encryption_nonce: None,
-            encryption_algorithm: None,
             encryption_version: 0,
             // 🔥 从 metadata 恢复 key_version，如果没有则使用默认值 1
             encryption_key_version: metadata.encryption_key_version.unwrap_or(1),

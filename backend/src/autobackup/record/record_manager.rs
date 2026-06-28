@@ -153,8 +153,6 @@ impl BackupRecordManager {
                 original_name TEXT NOT NULL,            -- 原始文件名/文件夹名
                 encrypted_name TEXT NOT NULL,           -- 加密后的文件名/文件夹名 (随机生成)
                 file_size INTEGER NOT NULL DEFAULT 0,   -- 原始文件大小 (字节，文件夹为0)
-                nonce TEXT NOT NULL DEFAULT '',         -- 加密随机数 (Base64编码，文件夹为空)
-                algorithm TEXT NOT NULL DEFAULT '',     -- 加密算法 (文件夹为空)
                 version INTEGER NOT NULL DEFAULT 1,     -- 加密格式版本号
                 key_version INTEGER NOT NULL DEFAULT 1, -- 密钥版本号（关联加密时使用的密钥）
                 remote_path TEXT NOT NULL,              -- 远程存储路径 (百度网盘路径)
@@ -401,16 +399,14 @@ impl BackupRecordManager {
         conn.execute(
             "INSERT OR REPLACE INTO encryption_snapshots
              (config_id, original_path, original_name, encrypted_name, file_size,
-              nonce, algorithm, version, key_version, remote_path, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+              version, key_version, remote_path, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
             params![
                 snapshot.config_id,
                 snapshot.original_path,
                 snapshot.original_name,
                 snapshot.encrypted_name,
                 snapshot.file_size as i64,
-                snapshot.nonce,
-                snapshot.algorithm,
                 snapshot.version,
                 snapshot.key_version as i64,
                 snapshot.remote_path,
@@ -429,7 +425,7 @@ impl BackupRecordManager {
         let result = conn
             .query_row(
                 "SELECT config_id, original_path, original_name, encrypted_name,
-                        file_size, nonce, algorithm, version, key_version, remote_path, is_directory, status
+                        file_size, version, key_version, remote_path, is_directory, status
                  FROM encryption_snapshots
                  WHERE encrypted_name = ?1",
                 params![encrypted_name],
@@ -440,13 +436,11 @@ impl BackupRecordManager {
                         original_name: row.get(2)?,
                         encrypted_name: row.get(3)?,
                         file_size: row.get::<_, i64>(4)? as u64,
-                        nonce: row.get(5)?,
-                        algorithm: row.get(6)?,
-                        version: row.get(7)?,
-                        key_version: row.get::<_, i64>(8)? as u32,
-                        remote_path: row.get(9)?,
-                        is_directory: row.get::<_, i32>(10)? == 1,
-                        status: row.get(11)?,
+                        version: row.get(5)?,
+                        key_version: row.get::<_, i64>(6)? as u32,
+                        remote_path: row.get(7)?,
+                        is_directory: row.get::<_, i32>(8)? == 1,
+                        status: row.get(9)?,
                     })
                 },
             )
@@ -466,7 +460,7 @@ impl BackupRecordManager {
         let result = conn
             .query_row(
                 "SELECT config_id, original_path, original_name, encrypted_name,
-                        file_size, nonce, algorithm, version, key_version, remote_path, is_directory, status
+                        file_size, version, key_version, remote_path, is_directory, status
                  FROM encryption_snapshots
                  WHERE original_path = ?1 AND original_name = ?2",
                 params![original_path, original_name],
@@ -477,13 +471,11 @@ impl BackupRecordManager {
                         original_name: row.get(2)?,
                         encrypted_name: row.get(3)?,
                         file_size: row.get::<_, i64>(4)? as u64,
-                        nonce: row.get(5)?,
-                        algorithm: row.get(6)?,
-                        version: row.get(7)?,
-                        key_version: row.get::<_, i64>(8)? as u32,
-                        remote_path: row.get(9)?,
-                        is_directory: row.get::<_, i32>(10)? == 1,
-                        status: row.get(11)?,
+                        version: row.get(5)?,
+                        key_version: row.get::<_, i64>(6)? as u32,
+                        remote_path: row.get(7)?,
+                        is_directory: row.get::<_, i32>(8)? == 1,
+                        status: row.get(9)?,
                     })
                 },
             )
@@ -505,13 +497,11 @@ impl BackupRecordManager {
         Ok(rows > 0)
     }
 
-    /// 更新快照的加密元数据（nonce、algorithm）并标记为已完成
+    /// 标记快照为已完成并更新版本号
     /// 用于上传完成时更新之前创建的 pending 状态的快照
-    pub fn update_snapshot_encryption_metadata(
+    pub fn mark_snapshot_completed(
         &self,
         encrypted_name: &str,
-        nonce: &str,
-        algorithm: &str,
         version: i32,
     ) -> Result<bool> {
         let conn = self.get_conn()?;
@@ -519,9 +509,9 @@ impl BackupRecordManager {
 
         let rows = conn.execute(
             "UPDATE encryption_snapshots
-             SET nonce = ?1, algorithm = ?2, version = ?3, status = 'completed', updated_at = ?4
-             WHERE encrypted_name = ?5",
-            params![nonce, algorithm, version, now, encrypted_name],
+             SET version = ?1, status = 'completed', updated_at = ?2
+             WHERE encrypted_name = ?3",
+            params![version, now, encrypted_name],
         )?;
 
         Ok(rows > 0)
@@ -544,7 +534,7 @@ impl BackupRecordManager {
 
         let sql = format!(
             "SELECT config_id, original_path, original_name, encrypted_name,
-                    file_size, nonce, algorithm, version, key_version, remote_path, is_directory, status
+                    file_size, version, key_version, remote_path, is_directory, status
              FROM encryption_snapshots
              WHERE encrypted_name IN ({})",
             placeholders_str
@@ -552,7 +542,6 @@ impl BackupRecordManager {
 
         let mut stmt = conn.prepare(&sql)?;
 
-        // 将参数转换为 rusqlite 可接受的格式
         let params: Vec<&dyn rusqlite::ToSql> = encrypted_names
             .iter()
             .map(|s| s as &dyn rusqlite::ToSql)
@@ -565,13 +554,11 @@ impl BackupRecordManager {
                 original_name: row.get(2)?,
                 encrypted_name: row.get(3)?,
                 file_size: row.get::<_, i64>(4)? as u64,
-                nonce: row.get(5)?,
-                algorithm: row.get(6)?,
-                version: row.get(7)?,
-                key_version: row.get::<_, i64>(8)? as u32,
-                remote_path: row.get(9)?,
-                is_directory: row.get::<_, i32>(10)? == 1,
-                status: row.get(11)?,
+                version: row.get(5)?,
+                key_version: row.get::<_, i64>(6)? as u32,
+                remote_path: row.get(7)?,
+                is_directory: row.get::<_, i32>(8)? == 1,
+                status: row.get(9)?,
             })
         })?;
 
@@ -689,9 +676,9 @@ impl BackupRecordManager {
 
         conn.execute(
             "INSERT OR REPLACE INTO encryption_snapshots
-             (config_id, original_path, original_name, encrypted_name, file_size, nonce, algorithm,
+             (config_id, original_path, original_name, encrypted_name, file_size,
               version, key_version, remote_path, is_directory, status, created_at, updated_at)
-             VALUES ('', ?1, ?2, ?3, 0, '', '', 1, ?4, ?5, 1, 'completed', ?6, ?6)",
+             VALUES ('', ?1, ?2, ?3, 0, 1, ?4, ?5, 1, 'completed', ?6, ?6)",
             params![parent_path, original_name, encrypted_name, key_version as i64, remote_path, now],
         )?;
 
@@ -742,8 +729,8 @@ impl BackupRecordManager {
         let conn = self.get_conn()?;
 
         let mut stmt = conn.prepare(
-            "SELECT config_id, original_path, original_name, encrypted_name, file_size, nonce,
-                    algorithm, version, key_version, remote_path, is_directory, status
+            "SELECT config_id, original_path, original_name, encrypted_name, file_size,
+                    version, key_version, remote_path, is_directory, status
              FROM encryption_snapshots WHERE encrypted_name = ?1 AND is_directory = 1"
         )?;
 
@@ -753,14 +740,12 @@ impl BackupRecordManager {
                 original_path: row.get(1)?,
                 original_name: row.get(2)?,
                 encrypted_name: row.get(3)?,
-                file_size: row.get(4)?,
-                nonce: row.get(5)?,
-                algorithm: row.get(6)?,
-                version: row.get(7)?,
-                key_version: row.get(8)?,
-                remote_path: row.get(9)?,
-                is_directory: row.get::<_, i32>(10)? == 1,
-                status: row.get(11)?,
+                file_size: row.get::<_, i64>(4)? as u64,
+                version: row.get(5)?,
+                key_version: row.get::<_, i64>(6)? as u32,
+                remote_path: row.get(7)?,
+                is_directory: row.get::<_, i32>(8)? == 1,
+                status: row.get(9)?,
             })
         })?;
 
@@ -809,8 +794,6 @@ pub struct EncryptionSnapshot {
     pub original_name: String,      // 原始文件名/文件夹名
     pub encrypted_name: String,     // 加密后的名称
     pub file_size: u64,             // 文件大小（文件夹为0）
-    pub nonce: String,              // 加密随机数（文件夹为空）
-    pub algorithm: String,          // 加密算法（文件夹为空）
     pub version: i32,
     pub key_version: u32,
     pub remote_path: String,        // 远程完整路径

@@ -37,10 +37,6 @@ pub struct MappingRecord {
     pub key_version: u32,
     /// 原始文件大小（字节）
     pub file_size: u64,
-    /// 加密随机数（Base64 编码）
-    pub nonce: String,
-    /// 加密算法（固定为 "age"，即 age-encryption.org/v1）
-    pub algorithm: String,
     /// 网盘路径（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_path: Option<String>,
@@ -80,9 +76,9 @@ impl MappingGenerator {
         let conn = self.record_manager.get_conn_for_export()?;
         
         let mut stmt = conn.prepare(
-            "SELECT config_id, encrypted_name, original_path, original_name, 
-                    is_directory, version, key_version, file_size, nonce, 
-                    algorithm, remote_path, status
+            "SELECT config_id, encrypted_name, original_path, original_name,
+                    is_directory, version, key_version, file_size,
+                    remote_path, status
              FROM encryption_snapshots
              WHERE status = 'completed'
              ORDER BY config_id, original_path, original_name"
@@ -98,10 +94,8 @@ impl MappingGenerator {
                 version: row.get(5)?,
                 key_version: row.get::<_, i64>(6)? as u32,
                 file_size: row.get::<_, i64>(7)? as u64,
-                nonce: row.get(8)?,
-                algorithm: row.get(9)?,
-                remote_path: row.get::<_, Option<String>>(10)?,
-                status: row.get::<_, Option<String>>(11)?,
+                remote_path: row.get::<_, Option<String>>(8)?,
+                status: row.get::<_, Option<String>>(9)?,
             })
         })?;
 
@@ -122,9 +116,9 @@ impl MappingGenerator {
         let conn = self.record_manager.get_conn_for_export()?;
         
         let mut stmt = conn.prepare(
-            "SELECT config_id, encrypted_name, original_path, original_name, 
-                    is_directory, version, key_version, file_size, nonce, 
-                    algorithm, remote_path, status
+            "SELECT config_id, encrypted_name, original_path, original_name,
+                    is_directory, version, key_version, file_size,
+                    remote_path, status
              FROM encryption_snapshots
              WHERE config_id = ?1 AND status = 'completed'
              ORDER BY original_path, original_name"
@@ -140,10 +134,8 @@ impl MappingGenerator {
                 version: row.get(5)?,
                 key_version: row.get::<_, i64>(6)? as u32,
                 file_size: row.get::<_, i64>(7)? as u64,
-                nonce: row.get(8)?,
-                algorithm: row.get(9)?,
-                remote_path: row.get::<_, Option<String>>(10)?,
-                status: row.get::<_, Option<String>>(11)?,
+                remote_path: row.get::<_, Option<String>>(8)?,
+                status: row.get::<_, Option<String>>(9)?,
             })
         })?;
 
@@ -260,8 +252,6 @@ mod tests {
             original_name: "test.txt".to_string(),
             encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
             file_size: 1024,
-            nonce: "dGVzdG5vbmNl".to_string(),
-            algorithm: "age".to_string(),
             version: 1,
             key_version: 1,
             remote_path: "/backup/documents".to_string(),
@@ -293,8 +283,6 @@ mod tests {
             version: 1,
             key_version: 1,
             file_size: 1024,
-            nonce: "base64nonce".to_string(),
-            algorithm: "age".to_string(),
             remote_path: Some("/remote/path".to_string()),
             status: Some("completed".to_string()),
         };

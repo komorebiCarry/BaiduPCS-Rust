@@ -145,8 +145,6 @@ mod tests {
             version: 1,
             key_version: 1,
             file_size: 1024,
-            nonce: "dGVzdG5vbmNl".to_string(),
-            algorithm: "aes256gcm".to_string(),
             remote_path: None,
             status: None,
         }
@@ -354,8 +352,7 @@ mod tests {
         assert_eq!(record.version, 1);
         assert_eq!(record.key_version, 1);
         assert_eq!(record.file_size, 1024);
-        assert_eq!(record.nonce, "dGVzdG5vbmNl");
-        assert_eq!(record.algorithm, "aes256gcm");
+        assert_eq!(record.file_size, 1024);
         assert!(record.remote_path.is_none());
         assert!(record.status.is_none());
     }
@@ -433,8 +430,6 @@ mod proptests {
                         version: 1,
                         key_version,
                         file_size,
-                        nonce: "dGVzdG5vbmNl".to_string(),
-                        algorithm: "aes256gcm".to_string(),
                         remote_path: None,
                         status: None,
                     }
@@ -453,19 +448,17 @@ mod proptests {
             while records.len() < count && i < 1000 {
                 let mut new_record = records.last().cloned().unwrap_or_else(|| MappingRecord {
                     config_id: "config-1".to_string(),
-                    encrypted_name: format!("fallback-{}.dat", i),
+                    encrypted_name: format!("fallback-{}.age", i),
                     original_path: "/".to_string(),
                     original_name: format!("file{}.txt", i),
                     is_directory: false,
                     version: 1,
                     key_version: 1,
                     file_size: 1024,
-                    nonce: "dGVzdG5vbmNl".to_string(),
-                    algorithm: "aes256gcm".to_string(),
                     remote_path: None,
                     status: None,
                 });
-                new_record.encrypted_name = format!("unique-{}.dat", i);
+                new_record.encrypted_name = format!("unique-{}.age", i);
                 new_record.original_name = format!("file{}.txt", i);
                 if seen.insert(new_record.encrypted_name.clone()) {
                     records.push(new_record);
@@ -639,8 +632,6 @@ mod proptests {
             prop_assert!(!found.config_id.is_empty(), "config_id 不应为空");
             prop_assert!(!found.encrypted_name.is_empty(), "encrypted_name 不应为空");
             prop_assert!(!found.original_name.is_empty(), "original_name 不应为空");
-            prop_assert!(!found.nonce.is_empty(), "nonce 不应为空");
-            prop_assert!(!found.algorithm.is_empty(), "algorithm 不应为空");
             prop_assert!(found.key_version > 0, "key_version 应大于 0");
         }
     }

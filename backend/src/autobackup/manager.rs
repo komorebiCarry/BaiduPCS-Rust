@@ -7258,15 +7258,13 @@ impl AutoBackupManager {
             .unwrap_or(&config.remote_path);
         let encrypted_remote_path = format!("{}/{}", remote_dir, encrypted_name);
 
-        // 创建快照（先用占位 nonce，加密后更新）
+        // 创建快照（状态为 pending，上传完成后标记 completed）
         self.snapshot_manager.create_snapshot(
             &config.id,
             &relative_path,
             file_name,
             &encrypted_name,
             file_task.file_size,
-            "pending", // 占位，加密后更新
-            algorithm_str,
             1,
             key_version,
             &encrypted_remote_path,

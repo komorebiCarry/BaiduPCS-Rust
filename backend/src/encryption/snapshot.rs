@@ -73,8 +73,6 @@ impl SnapshotManager {
         original_name: &str,
         encrypted_name: &str,
         file_size: u64,
-        nonce: &str,
-        algorithm: &str,
         version: i32,
         key_version: u32,
         remote_path: &str,
@@ -85,12 +83,10 @@ impl SnapshotManager {
             original_name: original_name.to_string(),
             encrypted_name: encrypted_name.to_string(),
             file_size,
-            nonce: nonce.to_string(),
-            algorithm: algorithm.to_string(),
             version,
             key_version,
             remote_path: remote_path.to_string(),
-            is_directory: false,  // 文件快照，不是文件夹
+            is_directory: false,
             status: SnapshotStatus::Pending.as_str().to_string(),
         };
 
@@ -138,16 +134,14 @@ impl SnapshotManager {
         self.update_status(encrypted_name, SnapshotStatus::Failed)
     }
 
-    /// 更新快照的加密元数据（nonce、algorithm）并标记为已完成
+    /// 标记快照为已完成并更新版本号
     /// 用于上传完成时更新之前创建的 pending 状态的快照
-    pub fn update_encryption_metadata(
+    pub fn mark_snapshot_completed(
         &self,
         encrypted_name: &str,
-        nonce: &str,
-        algorithm: &str,
         version: i32,
     ) -> Result<bool> {
-        self.record_manager.update_snapshot_encryption_metadata(encrypted_name, nonce, algorithm, version)
+        self.record_manager.mark_snapshot_completed(encrypted_name, version)
     }
 
     /// 批量根据加密文件名查找快照
@@ -167,8 +161,6 @@ pub struct SnapshotInfo {
     pub original_name: String,
     pub encrypted_name: String,
     pub file_size: u64,
-    pub nonce: String,
-    pub algorithm: String,
     pub version: i32,
     pub key_version: u32,
     pub remote_path: String,
@@ -183,8 +175,6 @@ impl From<EncryptionSnapshot> for SnapshotInfo {
             original_name: s.original_name,
             encrypted_name: s.encrypted_name,
             file_size: s.file_size,
-            nonce: s.nonce,
-            algorithm: s.algorithm,
             version: s.version,
             key_version: s.key_version,
             remote_path: s.remote_path,
@@ -256,8 +246,6 @@ mod tests {
             "test.txt",
             "uuid-1234.age",
             1024,
-            "base64_nonce",
-            "age",
             1,
             1,  // key_version
             "/remote/path",
@@ -280,8 +268,6 @@ mod tests {
             "original.txt",
             encrypted_name,
             2048,
-            "nonce_base64",
-            "age",
             1,
             1,  // key_version
             "/remote/backup",
@@ -312,8 +298,6 @@ mod tests {
             "report.pdf",
             "report-uuid.age",
             4096,
-            "nonce_123",
-            "age",
             2,
             1,  // key_version
             "/backup/documents",
@@ -325,7 +309,6 @@ mod tests {
 
         let snapshot = found.unwrap();
         assert_eq!(snapshot.encrypted_name, "report-uuid.age");
-        assert_eq!(snapshot.algorithm, "age");
         assert_eq!(snapshot.version, 2);
     }
 
@@ -343,8 +326,6 @@ mod tests {
             "file.txt",
             encrypted_name,
             512,
-            "nonce",
-            "age",
             1,
             1,  // key_version
             "/remote",
@@ -383,8 +364,6 @@ mod tests {
             "file.txt",
             encrypted_name,
             256,
-            "nonce",
-            "age",
             1,
             1,  // key_version
             "/remote",
@@ -438,8 +417,6 @@ mod tests {
             "important.docx",
             encrypted_name,
             8192,
-            "nonce",
-            "age",
             1,
             1,  // key_version
             "/backup/work",
@@ -476,12 +453,10 @@ mod tests {
             original_name: "file.txt".to_string(),
             encrypted_name: "encrypted.age".to_string(),
             file_size: 1024,
-            nonce: "nonce".to_string(),
-            algorithm: "age".to_string(),
             version: 1,
             key_version: 1,
             remote_path: "/remote".to_string(),
-            is_directory:false,
+            is_directory: false,
             status: "completed".to_string(),
         };
 

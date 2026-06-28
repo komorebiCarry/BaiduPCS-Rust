@@ -225,64 +225,50 @@ pub struct UploadTaskScheduleInfo {
 
 /// 更新加密映射到 encryption_snapshots 表
 ///
-/// 在任务完成时调用，更新 nonce、algorithm、version 并标记为 completed
-/// 此函数被调度循环触发和回调触发两处共用
+/// 在任务完成时调用，标记 snapshot 为 completed
 async fn update_encryption_mapping(
     task_id: &str,
     task_info: &UploadTaskScheduleInfo,
     is_backup: bool,
 ) {
-    // 获取加密信息
-    let encryption_info = {
+    let (encrypt_enabled, remote_path, encrypted_name, version) = {
         let t = task_info.task.lock().await;
-        if t.encrypt_enabled {
-            Some((
-                t.remote_path.clone(),
-                t.encrypted_name.clone(),
-                t.encryption_nonce.clone(),
-                t.encryption_algorithm.clone(),
-                t.encryption_version,
-            ))
-        } else {
-            None
-        }
+        (
+            t.encrypt_enabled,
+            t.remote_path.clone(),
+            t.encrypted_name.clone(),
+            t.encryption_version,
+        )
     };
 
-    // 更新加密映射到 encryption_snapshots 表（所有加密任务，包括备份任务）
-    // 注意：snapshot 在 create_task 时已创建（状态为 pending），这里只更新 nonce、algorithm 并标记为 completed
-    // 每个文件有独立的 nonce，需要在单个文件上传完成时立即更新
-    if let Some((remote_path, encrypted_name, nonce, algorithm, version)) = encryption_info {
-        if let (Some(_enc_name), Some(enc_nonce), Some(enc_algo)) = (encrypted_name, nonce, algorithm) {
-            if let Some(ref snapshot_manager) = task_info.snapshot_manager {
-                // 从 remote_path 提取实际的加密文件名（网盘上的真实文件名）
-                // remote_path 格式如: /13/上传/<uuid>.age
-                let actual_encrypted_name = std::path::Path::new(&remote_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
+    if !encrypt_enabled {
+        return;
+    }
 
-                // 更新已有的 snapshot（在 create_task 时创建的）
-                // 更新 nonce、algorithm、version 并标记为 completed
-                match snapshot_manager.update_encryption_metadata(
-                    &actual_encrypted_name,
-                    &enc_nonce,
-                    &enc_algo,
-                    version as i32,
-                ) {
-                    Ok(true) => {
-                        info!("上传任务 {} 加密映射已更新: {} (is_backup={})", task_id, actual_encrypted_name, is_backup);
-                    }
-                    Ok(false) => {
-                        warn!("上传任务 {} 未找到对应的加密映射记录: {} (is_backup={})", task_id, actual_encrypted_name, is_backup);
-                    }
-                    Err(e) => {
-                        error!("更新加密映射失败: task_id={}, is_backup={}, error={}", task_id, is_backup, e);
-                    }
+    if let Some(_enc_name) = encrypted_name {
+        if let Some(ref snapshot_manager) = task_info.snapshot_manager {
+            let actual_encrypted_name = std::path::Path::new(&remote_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            match snapshot_manager.mark_snapshot_completed(
+                &actual_encrypted_name,
+                version as i32,
+            ) {
+                Ok(true) => {
+                    info!("上传任务 {} 加密映射已更新: {} (is_backup={})", task_id, actual_encrypted_name, is_backup);
                 }
-            } else {
-                warn!("上传任务 {} 启用了加密但未设置 SnapshotManager，无法更新加密映射 (is_backup={})", task_id, is_backup);
+                Ok(false) => {
+                    warn!("上传任务 {} 未找到对应的加密映射记录: {} (is_backup={})", task_id, actual_encrypted_name, is_backup);
+                }
+                Err(e) => {
+                    error!("更新加密映射失败: task_id={}, is_backup={}, error={}", task_id, is_backup, e);
+                }
             }
+        } else {
+            warn!("上传任务 {} 启用了加密但未设置 SnapshotManager，无法更新加密映射 (is_backup={})", task_id, is_backup);
         }
     }
 }

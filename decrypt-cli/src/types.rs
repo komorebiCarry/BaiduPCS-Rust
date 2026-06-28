@@ -90,7 +90,7 @@ pub struct EncryptionConfig {
 pub struct MappingRecord {
     /// 备份配置 ID
     pub config_id: String,
-    /// 加密后的文件名（UUID.dat 格式）
+    /// 加密后的文件名（UUID.age 格式）
     pub encrypted_name: String,
     /// 原始文件相对路径
     pub original_path: String,
@@ -104,10 +104,6 @@ pub struct MappingRecord {
     pub key_version: u32,
     /// 原始文件大小（字节）
     pub file_size: u64,
-    /// 加密随机数（Base64 编码）
-    pub nonce: String,
-    /// 加密算法（aes256gcm 或 chacha20poly1305）
-    pub algorithm: String,
     /// 网盘路径（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_path: Option<String>,
@@ -372,33 +368,23 @@ mod tests {
 
     #[test]
     fn test_encryption_algorithm_display() {
-        assert_eq!(format!("{}", EncryptionAlgorithm::Aes256Gcm), "aes-256-gcm");
-        assert_eq!(
-            format!("{}", EncryptionAlgorithm::ChaCha20Poly1305),
-            "chacha20-poly1305"
-        );
+        assert_eq!(format!("{}", EncryptionAlgorithm::Age), "age");
     }
 
     #[test]
     fn test_encryption_algorithm_serde() {
-        let algo = EncryptionAlgorithm::Aes256Gcm;
+        let algo = EncryptionAlgorithm::Age;
         let json = serde_json::to_string(&algo).unwrap();
-        assert_eq!(json, "\"AES256-GCM\"");
-
-        let algo2 = EncryptionAlgorithm::ChaCha20Poly1305;
-        let json2 = serde_json::to_string(&algo2).unwrap();
-        assert_eq!(json2, "\"CHA-CHA20-POLY1305\"");
-
-        // 反序列化
-        let parsed: EncryptionAlgorithm = serde_json::from_str("\"AES256-GCM\"").unwrap();
-        assert_eq!(parsed, EncryptionAlgorithm::Aes256Gcm);
+        assert_eq!(json, "\"age\"");
+        let parsed: EncryptionAlgorithm = serde_json::from_str("\"age\"").unwrap();
+        assert_eq!(parsed, EncryptionAlgorithm::Age);
     }
 
     #[test]
     fn test_encryption_key_info_is_valid() {
         let valid_key = EncryptionKeyInfo {
             master_key: "dGVzdGtleQ==".to_string(),
-            algorithm: EncryptionAlgorithm::Aes256Gcm,
+            algorithm: EncryptionAlgorithm::Age,
             key_version: 1,
             created_at: 1702454400000,
             last_used_at: None,
@@ -408,7 +394,7 @@ mod tests {
 
         let empty_key = EncryptionKeyInfo {
             master_key: "".to_string(),
-            algorithm: EncryptionAlgorithm::Aes256Gcm,
+            algorithm: EncryptionAlgorithm::Age,
             key_version: 1,
             created_at: 1702454400000,
             last_used_at: None,
@@ -418,7 +404,7 @@ mod tests {
 
         let zero_version_key = EncryptionKeyInfo {
             master_key: "dGVzdGtleQ==".to_string(),
-            algorithm: EncryptionAlgorithm::Aes256Gcm,
+            algorithm: EncryptionAlgorithm::Age,
             key_version: 0,
             created_at: 1702454400000,
             last_used_at: None,
@@ -432,7 +418,7 @@ mod tests {
         let config = EncryptionConfig {
             current: EncryptionKeyInfo {
                 master_key: "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 2,
                 created_at: 1702454400000,
                 last_used_at: Some(1702454500000),
@@ -440,7 +426,7 @@ mod tests {
             },
             history: vec![EncryptionKeyInfo {
                 master_key: "b2xka2V5b2xka2V5b2xka2V5b2xka2V5MQ==".to_string(),
-                algorithm: EncryptionAlgorithm::Aes256Gcm,
+                algorithm: EncryptionAlgorithm::Age,
                 key_version: 1,
                 created_at: 1700000000000,
                 last_used_at: Some(1702454399000),
@@ -460,15 +446,13 @@ mod tests {
     fn test_mapping_record_serde() {
         let record = MappingRecord {
             config_id: "config-1".to_string(),
-            encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat".to_string(),
+            encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
             original_path: "/documents/work".to_string(),
             original_name: "report.pdf".to_string(),
             is_directory: false,
             version: 1,
             key_version: 1,
             file_size: 1024000,
-            nonce: "dGVzdG5vbmNl".to_string(),
-            algorithm: "aes256gcm".to_string(),
             remote_path: Some("/backup/documents/work".to_string()),
             status: Some("completed".to_string()),
         };
@@ -479,7 +463,7 @@ mod tests {
         assert_eq!(parsed.config_id, "config-1");
         assert_eq!(
             parsed.encrypted_name,
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age"
         );
         assert_eq!(parsed.key_version, 1);
         assert!(!parsed.is_directory);
@@ -487,47 +471,22 @@ mod tests {
 
     #[test]
     fn test_mapping_record_optional_fields() {
-        // 测试可选字段为 None 时的序列化
         let record = MappingRecord {
             config_id: "config-1".to_string(),
-            encrypted_name: "uuid.dat".to_string(),
+            encrypted_name: "uuid.age".to_string(),
             original_path: "/path".to_string(),
             original_name: "file.txt".to_string(),
             is_directory: false,
             version: 1,
             key_version: 1,
             file_size: 1024,
-            nonce: "nonce".to_string(),
-            algorithm: "aes256gcm".to_string(),
             remote_path: None,
             status: None,
         };
 
         let json = serde_json::to_string(&record).unwrap();
-        // 可选字段为 None 时不应该出现在 JSON 中
         assert!(!json.contains("remote_path"));
         assert!(!json.contains("status"));
-    }
-
-    #[test]
-    fn test_file_header_validate_magic() {
-        let valid_header = FileHeader {
-            magic: FILE_MAGIC,
-            algorithm: EncryptionAlgorithm::Aes256Gcm,
-            master_nonce: [0u8; 12],
-            original_size: 1024,
-            total_chunks: 1,
-        };
-        assert!(valid_header.validate_magic());
-
-        let invalid_header = FileHeader {
-            magic: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            algorithm: EncryptionAlgorithm::Aes256Gcm,
-            master_nonce: [0u8; 12],
-            original_size: 1024,
-            total_chunks: 1,
-        };
-        assert!(!invalid_header.validate_magic());
     }
 
     #[test]
@@ -618,14 +577,4 @@ mod tests {
         assert_eq!(summary.exit_code(), ExitCode::InvalidFormat);
     }
 
-    #[test]
-    fn test_file_magic_constant() {
-        assert_eq!(FILE_MAGIC, [0xA3, 0x7F, 0x2C, 0x91, 0xE4, 0x5B]);
-    }
-
-    #[test]
-    fn test_file_header_size_constant() {
-        // magic[6] + algo[1] + master_nonce[12] + original_size[8] + total_chunks[4] = 31
-        assert_eq!(FILE_HEADER_SIZE, 31);
-    }
 }
