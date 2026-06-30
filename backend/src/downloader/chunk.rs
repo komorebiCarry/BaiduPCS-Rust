@@ -108,6 +108,26 @@ impl Chunk {
             .unwrap_or("unnamed")
             .to_string();
 
+        // 🔥 续传安全校验：若已记录下载进度，但目标文件缺失或长度不足，
+        // 说明此前的局部数据已随文件被竞态清理而失效（大批量文件夹下载中
+        // 失败清理/重试可能删掉半成品文件）。此时若直接 create(true)+seek 续传，
+        // 会在 0..effective_start 写出稀疏空洞（全 0），而文件逻辑大小仍等于完整大小，
+        // 使仅按大小判定的完成校验把损坏文件误标为完成。故重置进度，从头重下本分片。
+        if self.bytes_downloaded > 0 {
+            let resume_start = self.range.start + self.bytes_downloaded;
+            let resume_invalid = match tokio::fs::metadata(output_path).await {
+                Ok(meta) => !meta.is_file() || meta.len() < resume_start,
+                Err(_) => true,
+            };
+            if resume_invalid {
+                warn!(
+                    "[分片线程{}] 分片 #{} 续传校验失败：目标文件缺失或长度不足（期望 ≥ {} bytes），重置进度从头重下",
+                    chunk_thread_id, self.index, resume_start
+                );
+                self.bytes_downloaded = 0;
+            }
+        }
+
         // 🔥 分片内断点续传：从已下载偏移开始
         let effective_start = self.range.start + self.bytes_downloaded;
         let remaining = self.remaining();
