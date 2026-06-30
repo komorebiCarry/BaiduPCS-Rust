@@ -2408,7 +2408,7 @@ impl NetdiskClient {
                     132 => "您的帐号可能存在安全风险，为了确保为您本人操作，请先进行安全验证"
                         .to_string(),
                     -7 => "该分享已删除或已取消".to_string(),
-                    -9 => "提取码验证失败，请重试".to_string(),
+                    -9 => "分享链接失效或提取码错误".to_string(),
                     -12 => "访问密码错误".to_string(),
                     -19 => "需要输入验证码".to_string(),
                     -62 => "可能需要输入验证码".to_string(),
@@ -2645,7 +2645,7 @@ impl NetdiskClient {
             internal_task_id,
             None,
         )
-        .await
+            .await
     }
 
     pub async fn transfer_share_files_with_randsk(
