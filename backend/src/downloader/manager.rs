@@ -5274,6 +5274,9 @@ impl DownloadManager {
                 t.slot_id = None;
                 t.is_borrowed_slot = false;
                 t.uses_folder_fixed_slot = false;
+                // 🔥 复位收尾标记：文件夹恢复的无槽位分支不经过 resume_task，
+                //   这里一并复位，避免重试后的下载因标记残留而跳过收尾 spawn
+                t.finalize_spawned = false;
                 (old, gid, backup, owner_raw)
             } else {
                 anyhow::bail!("任务不存在: {}", task_id);
