@@ -1405,7 +1405,14 @@ impl ChunkScheduler {
             {
                 CompletionOutcome::Stale
             } else if let Err(ref e) = decrypt_result {
-                let error_msg = format!("解密失败: {}", e);
+                // 🔥 文案修正：明文文件根本不走解密，收尾阶段只有 finalize（rename）。
+                //   统一拼成"解密失败"会误导（用户下完明文 mp4 却看到"解密失败"）。
+                //   仅加密文件才可能真正解密失败；明文一律报"文件收尾失败"。
+                let error_msg = if t.is_encrypted {
+                    format!("解密失败: {}", e)
+                } else {
+                    format!("文件收尾失败: {}", e)
+                };
                 t.mark_failed(error_msg.clone());
                 CompletionOutcome::Failed {
                     group_id: t.group_id.clone(),
