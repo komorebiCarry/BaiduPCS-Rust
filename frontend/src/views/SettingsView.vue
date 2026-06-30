@@ -871,7 +871,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">v2.1.1</span>
+                      <span class="value">v2.1.2</span>
                     </div>
                     <div class="about-item">
                       <span class="label">后端技术:</span>

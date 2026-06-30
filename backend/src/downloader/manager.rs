@@ -1196,6 +1196,24 @@ impl DownloadManager {
             }
         };
 
+        // 🔥 收尾/解密窗口保护：任务已下完（downloaded==total）、已 spawn 收尾协程、
+        //   或已进入 Decrypting 时，绝不退回重排——否则会把一个其实已完成的任务
+        //   重新下载/重新调度，触发"双 finalize 抢同一临时文件"（错误一）以及新旧
+        //   写者并发写同一文件导致"大小对但内容坏"（错误二）。
+        {
+            let t = task.lock().await;
+            if t.status == TaskStatus::Decrypting
+                || t.finalize_spawned
+                || (t.total_size > 0 && t.downloaded_size >= t.total_size)
+            {
+                debug!(
+                    "auto_requeue_task: 任务 {} 处于收尾/解密窗口（status={:?}, finalize_spawned={}, downloaded={}/{}），跳过退回重排",
+                    task_id, t.status, t.finalize_spawned, t.downloaded_size, t.total_size
+                );
+                return Ok(());
+            }
+        }
+
         // 同时取出真实 owner_uid
         let (old_status, group_id, is_backup, slot_id, is_borrowed_slot, uses_folder_fixed_slot, task_owner_uid_raw) = {
             let t = task.lock().await;
@@ -3667,7 +3685,17 @@ impl DownloadManager {
         let is_borrowed = t.is_borrowed_slot;
         let uses_folder_fixed_slot = t.uses_folder_fixed_slot;
 
+        // 🔥 收尾窗口保护：所有分片下完后调度器已 spawn 收尾/解密协程（先 rename
+        //   再 mark_decrypting），从 spawn 到 mark_decrypting 之间状态仍是
+        //   Downloading。此处单文件暂停若不作废在飞的旧协程，恢复后会出现两个同
+        //   epoch 的收尾协程并发收尾/解密同一文件 → 「100% 却打不开」。
+        //   与 cancel_tasks_by_group 的 epoch 失效逻辑对齐。
+        let finalize_in_flight = t.finalize_spawned;
+
         t.mark_paused();
+        if finalize_in_flight {
+            t.invalidate_decrypt_epoch();
+        }
 
         // 🔥 清除任务的槽位字段（与 release_task_slot_by_kind 的契约一致：
         //    folder_manager / task_slot_pool 端的释放由后面 release_task_slot_by_kind 负责，
@@ -4350,6 +4378,8 @@ impl DownloadManager {
 
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
+            // 🔥 用户主动重试：复位收尾标记，允许重试后的下载重新收尾
+            t.finalize_spawned = false;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
             task_owner_uid_raw = t.owner_uid.raw();
@@ -4590,6 +4620,8 @@ impl DownloadManager {
 
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
+            // 🔥 用户主动重试：复位收尾标记，允许重试后的下载重新收尾
+            t.finalize_spawned = false;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
             task_owner_uid_raw = t.owner_uid.raw();
@@ -5252,6 +5284,9 @@ impl DownloadManager {
                 t.slot_id = None;
                 t.is_borrowed_slot = false;
                 t.uses_folder_fixed_slot = false;
+                // 🔥 复位收尾标记：文件夹恢复的无槽位分支不经过 resume_task，
+                //   这里一并复位，避免重试后的下载因标记残留而跳过收尾 spawn
+                t.finalize_spawned = false;
                 (old, gid, backup, owner_raw)
             } else {
                 anyhow::bail!("任务不存在: {}", task_id);
@@ -5651,6 +5686,8 @@ impl DownloadManager {
             decrypt_epoch: 0,
             // 🔥 R22: 解密原子提交标志（历史任务已是 Completed，无关运行时收尾）
             decrypt_committed: false,
+            // 🔥 收尾/解密协程已 spawn 标记（历史任务无遗留协程，从 false 开始）
+            finalize_spawned: false,
         })
     }
 
@@ -6575,6 +6612,12 @@ impl DownloadManager {
             let (slot_id, is_borrowed_slot, uses_folder_fixed_slot, was_active) = {
                 let mut task = task_arc.lock().await;
                 let was_decrypting = task.status == TaskStatus::Decrypting;
+                // 🔥 收尾窗口也要作废在飞的收尾/解密协程：所有分片下完后调度器已
+                //   spawn 收尾协程（先 rename 再 mark_decrypting），从 spawn 到
+                //   mark_decrypting 之间状态仍是 Downloading。若只在 Decrypting 时
+                //   bump epoch，这段窗口里暂停就漏作废旧协程，恢复后会出现两个同
+                //   epoch 的收尾协程并发解密同一加密文件（错误二的另一来源）。
+                let finalize_in_flight = task.finalize_spawned;
 
                 // 🔥 R22: 解密原子提交协作——已提交的任务跳过暂停
                 //
@@ -6611,9 +6654,9 @@ impl DownloadManager {
                     task.is_borrowed_slot = false;
                     task.uses_folder_fixed_slot = false;
 
-                    // 🔥 R20: 仅当从 Decrypting 暂停时才递增 decrypt_epoch
+                    // 🔥 R20: 从 Decrypting 或收尾窗口暂停时递增 decrypt_epoch
                     //
-                    // 这个 epoch 是给"当前正在跑的解密协程"发的失效信号——
+                    // 这个 epoch 是给"当前正在跑的收尾/解密协程"发的失效信号——
                     // 它会让旧协程在所有破坏性操作前的检查点（spawn_blocking 前
                     // 预检 / spawn_blocking 后硬检查 / 进度回调 / handle_task_completion
                     // 入口原子判定 / 7.8 锁内提交点）比对发现 my_epoch != task.decrypt_epoch，
@@ -6623,10 +6666,11 @@ impl DownloadManager {
                     // 任何检查点都不可能再看到"status 不是 Paused 但 epoch 仍然
                     // 一致"的中间态。
                     //
-                    // 仅 Decrypting 路径需要：Pending / Downloading 阶段没有
-                    // spawn 解密协程，递增 epoch 是 no-op，但保留范围聚焦的
-                    // 写法更清晰。
-                    if was_decrypting {
+                    // 除 Decrypting 外还要覆盖 finalize_in_flight（finalize_spawned）：
+                    // 收尾协程从 spawn 到 mark_decrypting 之间状态仍是 Downloading，
+                    // 这段窗口里的暂停也必须作废旧协程，否则恢复后会有两个同 epoch
+                    // 的收尾协程并发收尾/解密同一文件。
+                    if was_decrypting || finalize_in_flight {
                         task.invalidate_decrypt_epoch();
                     }
                 } else if already_committed {
