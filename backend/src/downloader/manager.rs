@@ -1196,6 +1196,24 @@ impl DownloadManager {
             }
         };
 
+        // 🔥 收尾/解密窗口保护：任务已下完（downloaded==total）、已 spawn 收尾协程、
+        //   或已进入 Decrypting 时，绝不退回重排——否则会把一个其实已完成的任务
+        //   重新下载/重新调度，触发"双 finalize 抢同一临时文件"（错误一）以及新旧
+        //   写者并发写同一文件导致"大小对但内容坏"（错误二）。
+        {
+            let t = task.lock().await;
+            if t.status == TaskStatus::Decrypting
+                || t.finalize_spawned
+                || (t.total_size > 0 && t.downloaded_size >= t.total_size)
+            {
+                debug!(
+                    "auto_requeue_task: 任务 {} 处于收尾/解密窗口（status={:?}, finalize_spawned={}, downloaded={}/{}），跳过退回重排",
+                    task_id, t.status, t.finalize_spawned, t.downloaded_size, t.total_size
+                );
+                return Ok(());
+            }
+        }
+
         // 同时取出真实 owner_uid
         let (old_status, group_id, is_backup, slot_id, is_borrowed_slot, uses_folder_fixed_slot, task_owner_uid_raw) = {
             let t = task.lock().await;
@@ -4350,6 +4368,8 @@ impl DownloadManager {
 
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
+            // 🔥 用户主动重试：复位收尾标记，允许重试后的下载重新收尾
+            t.finalize_spawned = false;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
             task_owner_uid_raw = t.owner_uid.raw();
@@ -4590,6 +4610,8 @@ impl DownloadManager {
 
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
+            // 🔥 用户主动重试：复位收尾标记，允许重试后的下载重新收尾
+            t.finalize_spawned = false;
             group_id = t.group_id.clone();
             is_backup = t.is_backup;
             task_owner_uid_raw = t.owner_uid.raw();
@@ -5651,6 +5673,8 @@ impl DownloadManager {
             decrypt_epoch: 0,
             // 🔥 R22: 解密原子提交标志（历史任务已是 Completed，无关运行时收尾）
             decrypt_committed: false,
+            // 🔥 收尾/解密协程已 spawn 标记（历史任务无遗留协程，从 false 开始）
+            finalize_spawned: false,
         })
     }
 

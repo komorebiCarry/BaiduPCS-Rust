@@ -817,9 +817,35 @@ impl ChunkScheduler {
 
                             // 检查是否所有分片都完成且没有活跃下载
                             if task_info.active_chunk_count.load(Ordering::SeqCst) == 0 {
+                                // 🔥 防重复 spawn：收尾/解密协程对同一任务只允许 spawn 一次。
+                                //   闭合"所有分片完成 → spawn 收尾协程"窗口里任务被重排
+                                //   （auto_requeue/resume）后再次进入调度器、第二次 spawn 收尾
+                                //   协程的 race（双 finalize 抢同一临时文件）。
+                                let first_spawn = {
+                                    let mut t = task_info.task.lock().await;
+                                    if t.finalize_spawned {
+                                        false
+                                    } else {
+                                        t.finalize_spawned = true;
+                                        true
+                                    }
+                                };
+
                                 // 所有分片完成，从调度器移除
                                 info!("任务 {} 所有分片完成，从调度器移除", task_id);
                                 active_tasks.write().await.remove(task_id);
+
+                                if !first_spawn {
+                                    warn!(
+                                        "任务 {} 收尾/解密协程已 spawn，跳过重复 spawn",
+                                        task_id
+                                    );
+                                    consecutive_empty_rounds += 1;
+                                    if consecutive_empty_rounds >= task_count {
+                                        break;
+                                    }
+                                    continue;
+                                }
 
                                 // 🔥 修复：取消 cancellation_token，停止速度异常检测和线程停滞检测循环
                                 task_info.cancellation_token.cancel();
@@ -1558,9 +1584,24 @@ impl ChunkScheduler {
         }
 
         // 新任务：校验临时文件大小
-        let metadata = tokio::fs::metadata(&task_info.output_path)
-            .await
-            .context("获取临时下载文件元数据失败")?;
+        let metadata = match tokio::fs::metadata(&task_info.output_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                // 🔥 幂等：临时文件已不存在，但最终文件已就位且大小正确 →
+                // 说明同一任务的另一个收尾协程已经完成 rename（双 finalize race），
+                // 按"已完成"处理而不是报「获取临时下载文件元数据失败」误标失败。
+                if let Ok(final_meta) = tokio::fs::metadata(&final_path).await {
+                    if final_meta.len() == task_info.total_size {
+                        info!(
+                            "临时文件已不存在但最终文件已就位且大小正确，判定为已完成（幂等收尾）: {:?}",
+                            final_path
+                        );
+                        return Ok(());
+                    }
+                }
+                return Err(e).context("获取临时下载文件元数据失败");
+            }
+        };
         if metadata.len() != task_info.total_size {
             anyhow::bail!(
                 "临时下载文件大小不匹配: 实际 {} bytes, 期望 {} bytes (路径: {:?})",

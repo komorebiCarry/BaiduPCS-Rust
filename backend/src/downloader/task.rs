@@ -200,6 +200,26 @@ pub struct DownloadTask {
     /// 一旦置位永不回退（任务即将进入 Completed 终态，回退无意义）。
     #[serde(skip)]
     pub decrypt_committed: bool,
+
+    /// 🔥 收尾/解密协程已 spawn 标记（防重复 spawn）
+    ///
+    /// 闭合"所有分片完成 → spawn 收尾/解密协程"这段窗口里任务被重排
+    /// （auto_requeue / resume）后再次进入调度器、第二次 spawn 收尾协程的
+    /// race。两个协程会抢同一个 `.downloading` 临时文件：一个 rename 成功、
+    /// 另一个 `metadata(temp)` 失败 → 「解密失败: 获取临时下载文件元数据失败」，
+    /// 已完成的任务被误标 Failed；并发写还会让"大小对但内容坏"。
+    ///
+    /// **协作机制**：
+    /// - 调度器在确认所有分片完成、`tokio::spawn` 收尾协程之前，于同一锁段内
+    ///   用它做 compare-and-set：已置位 → 跳过本次 spawn；未置位 → 置位后才 spawn。
+    /// - `auto_requeue_task` 见此标记（或任务已下完 / Decrypting）直接拒绝退回重排。
+    /// - `resume_task`（用户主动重试 Paused/Failed 任务）把它复位为 false，
+    ///   允许重试后的下载重新收尾。
+    ///
+    /// 仅 `#[serde(skip)]`：纯运行时状态，重启后从 false 开始也安全
+    /// （重启不会有遗留协程）。
+    #[serde(skip)]
+    pub finalize_spawned: bool,
 }
 
 impl DownloadTask {
@@ -251,6 +271,8 @@ impl DownloadTask {
             decrypt_epoch: 0,
             // 🔥 解密原子提交标志初始化
             decrypt_committed: false,
+            // 🔥 收尾/解密协程已 spawn 标记初始化
+            finalize_spawned: false,
         }
     }
 
