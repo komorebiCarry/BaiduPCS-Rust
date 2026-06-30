@@ -276,7 +276,19 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v2.1.1 (当前版本)
+### v2.1.2 (当前版本)
+
+**问题修复：**
+- 🐛 **分享同步·批量下载可靠性**（@hamr-hub PR #121）：≥2 文件整批 submit 合并任务；本地目标缺失/大小不一致自动补同步；分片下载兜底创建父目录；`errno=-9` 提示明确为链接失效或提取码错误
+- 🐛 **下载·断点续传**：恢复时目标文件缺失或截断则重置分片进度，避免损坏文件误标完成
+- 🐛 **下载·收尾竞争**：修复 100% 后双 finalize 竞争（误报/文件损坏）；收尾窗口暂停作废旧 epoch；明文文件不再误报「解密失败」
+
+**工程：** 新增分享同步诊断脚本 `share_sync_probe.py` / `share_sync_status.py` / `share_sync_restore_snapshot.py`。
+
+<details>
+<summary><b>v2.1.1 / v2.1.0 / v2.0.1 / v2.0.0 版本详情</b>（点击展开）</summary>
+
+### v2.1.1
 
 **问题修复：**
 - 🐛 **扫码登录**：确认失败/无真实 uid 时不再降级成 `uid=0`「临时用户」假成功，改为如实报错——修复假登录导致网盘 API 全部 `errno=-6`
@@ -320,6 +332,8 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 - ✨ **数据安全兜底·全局只读模式**（迁移/持久化失败时自动只读并提示用户，防数据不一致扩散）+ **断线自适应退避重连**（下载/上传页失败不清空列表、阶梯退避重试）
 
 **问题修复（通用）：** 取链 8002 阶梯重试、filemetas 按路径解析 fs_id、创建即持久化下载任务。
+
+</details>
 
 <details>
 <summary><b>v1.14.1 / v1.14.0 / v1.13.0 / v1.12.2 / v1.12.1 / v1.12.0 / v1.11.2 / v1.11.1 / v1.11.0 / v1.10.0 / v1.9.1 / v1.9.0 / v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
