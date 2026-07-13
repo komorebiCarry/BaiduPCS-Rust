@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::autobackup::record::{BackupRecordManager, EncryptionSnapshot};
@@ -77,15 +78,86 @@ impl SnapshotManager {
         key_version: u32,
         remote_path: &str,
     ) -> Result<i64> {
+        // 旧调用方只提供逻辑原始路径，保留原有兼容语义；拥有真实本地路径
+        // 的上传链路应调用 create_snapshot_with_local_path。
+        self.create_snapshot_with_mapping(
+            config_id,
+            original_path,
+            original_name,
+            original_path,
+            original_name,
+            encrypted_name,
+            file_size,
+            version,
+            key_version,
+            remote_path,
+        )
+    }
+
+    /// 创建带完整本地路径的文件快照。
+    pub fn create_snapshot_with_local_path(
+        &self,
+        config_id: &str,
+        original_path: &str,
+        original_name: &str,
+        local_path: &str,
+        encrypted_name: &str,
+        file_size: u64,
+        version: i32,
+        key_version: u32,
+        remote_path: &str,
+    ) -> Result<i64> {
+        let local_name = Path::new(local_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(original_name);
+        self.create_snapshot_with_mapping(
+            config_id,
+            original_path,
+            original_name,
+            local_path,
+            local_name,
+            encrypted_name,
+            file_size,
+            version,
+            key_version,
+            remote_path,
+        )
+    }
+
+    fn create_snapshot_with_mapping(
+        &self,
+        config_id: &str,
+        original_path: &str,
+        original_name: &str,
+        local_path: &str,
+        local_name: &str,
+        encrypted_name: &str,
+        file_size: u64,
+        version: i32,
+        key_version: u32,
+        remote_path: &str,
+    ) -> Result<i64> {
+        let remote_name = remote_path
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         let snapshot = EncryptionSnapshot {
             config_id: config_id.to_string(),
             original_path: original_path.to_string(),
             original_name: original_name.to_string(),
+            local_path: local_path.to_string(),
+            local_name: local_name.to_string(),
             encrypted_name: encrypted_name.to_string(),
             file_size,
             version,
             key_version,
             remote_path: remote_path.to_string(),
+            remote_name,
             is_directory: false,
             status: SnapshotStatus::Pending.as_str().to_string(),
         };
@@ -111,6 +183,19 @@ impl SnapshotManager {
         original_name: &str,
     ) -> Result<Option<SnapshotInfo>> {
         let snapshot = self.record_manager.find_snapshot_by_original(original_path, original_name)?;
+        Ok(snapshot.map(SnapshotInfo::from))
+    }
+
+    /// 根据配置和原始路径查找快照，避免跨配置同名文件串用映射。
+    pub fn find_by_config_original(
+        &self,
+        config_id: &str,
+        original_path: &str,
+        original_name: &str,
+    ) -> Result<Option<SnapshotInfo>> {
+        let snapshot = self
+            .record_manager
+            .find_snapshot_by_config_original(config_id, original_path, original_name)?;
         Ok(snapshot.map(SnapshotInfo::from))
     }
 
@@ -159,11 +244,17 @@ pub struct SnapshotInfo {
     pub config_id: String,
     pub original_path: String,
     pub original_name: String,
+    #[serde(default)]
+    pub local_path: String,
+    #[serde(default)]
+    pub local_name: String,
     pub encrypted_name: String,
     pub file_size: u64,
     pub version: i32,
     pub key_version: u32,
     pub remote_path: String,
+    #[serde(default)]
+    pub remote_name: String,
     pub status: SnapshotStatus,
 }
 
@@ -173,11 +264,14 @@ impl From<EncryptionSnapshot> for SnapshotInfo {
             config_id: s.config_id,
             original_path: s.original_path,
             original_name: s.original_name,
+            local_path: s.local_path,
+            local_name: s.local_name,
             encrypted_name: s.encrypted_name,
             file_size: s.file_size,
             version: s.version,
             key_version: s.key_version,
             remote_path: s.remote_path,
+            remote_name: s.remote_name,
             status: SnapshotStatus::from_str(&s.status),
         }
     }
@@ -451,11 +545,14 @@ mod tests {
             config_id: "config".to_string(),
             original_path: "/path".to_string(),
             original_name: "file.txt".to_string(),
+            local_path: "/local/path/file.txt".to_string(),
+            local_name: "file.txt".to_string(),
             encrypted_name: "encrypted.age".to_string(),
             file_size: 1024,
             version: 1,
             key_version: 1,
             remote_path: "/remote".to_string(),
+            remote_name: "encrypted.age".to_string(),
             is_directory: false,
             status: "completed".to_string(),
         };

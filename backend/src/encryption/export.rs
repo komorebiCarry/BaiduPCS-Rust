@@ -29,6 +29,12 @@ pub struct MappingRecord {
     pub original_path: String,
     /// 原始文件名
     pub original_name: String,
+    /// 本地文件完整路径
+    #[serde(default)]
+    pub local_path: String,
+    /// 本地文件名
+    #[serde(default)]
+    pub local_name: String,
     /// 是否为文件夹
     pub is_directory: bool,
     /// 加密格式版本
@@ -40,6 +46,9 @@ pub struct MappingRecord {
     /// 网盘路径（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_path: Option<String>,
+    /// 网盘文件名（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_name: Option<String>,
     /// 状态（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -77,8 +86,8 @@ impl MappingGenerator {
         
         let mut stmt = conn.prepare(
             "SELECT config_id, encrypted_name, original_path, original_name,
-                    is_directory, version, key_version, file_size,
-                    remote_path, status
+                    local_path, local_name, is_directory, version, key_version, file_size,
+                    remote_path, remote_name, status
              FROM encryption_snapshots
              WHERE status = 'completed'
              ORDER BY config_id, original_path, original_name"
@@ -90,12 +99,15 @@ impl MappingGenerator {
                 encrypted_name: row.get(1)?,
                 original_path: row.get(2)?,
                 original_name: row.get(3)?,
-                is_directory: row.get::<_, i32>(4)? == 1,
-                version: row.get(5)?,
-                key_version: row.get::<_, i64>(6)? as u32,
-                file_size: row.get::<_, i64>(7)? as u64,
-                remote_path: row.get::<_, Option<String>>(8)?,
-                status: row.get::<_, Option<String>>(9)?,
+                local_path: row.get(4)?,
+                local_name: row.get(5)?,
+                is_directory: row.get::<_, i32>(6)? == 1,
+                version: row.get(7)?,
+                key_version: row.get::<_, i64>(8)? as u32,
+                file_size: row.get::<_, i64>(9)? as u64,
+                remote_path: row.get::<_, Option<String>>(10)?,
+                remote_name: row.get::<_, Option<String>>(11)?,
+                status: row.get::<_, Option<String>>(12)?,
             })
         })?;
 
@@ -117,8 +129,8 @@ impl MappingGenerator {
         
         let mut stmt = conn.prepare(
             "SELECT config_id, encrypted_name, original_path, original_name,
-                    is_directory, version, key_version, file_size,
-                    remote_path, status
+                    local_path, local_name, is_directory, version, key_version, file_size,
+                    remote_path, remote_name, status
              FROM encryption_snapshots
              WHERE config_id = ?1 AND status = 'completed'
              ORDER BY original_path, original_name"
@@ -130,12 +142,15 @@ impl MappingGenerator {
                 encrypted_name: row.get(1)?,
                 original_path: row.get(2)?,
                 original_name: row.get(3)?,
-                is_directory: row.get::<_, i32>(4)? == 1,
-                version: row.get(5)?,
-                key_version: row.get::<_, i64>(6)? as u32,
-                file_size: row.get::<_, i64>(7)? as u64,
-                remote_path: row.get::<_, Option<String>>(8)?,
-                status: row.get::<_, Option<String>>(9)?,
+                local_path: row.get(4)?,
+                local_name: row.get(5)?,
+                is_directory: row.get::<_, i32>(6)? == 1,
+                version: row.get(7)?,
+                key_version: row.get::<_, i64>(8)? as u32,
+                file_size: row.get::<_, i64>(9)? as u64,
+                remote_path: row.get::<_, Option<String>>(10)?,
+                remote_name: row.get::<_, Option<String>>(11)?,
+                status: row.get::<_, Option<String>>(12)?,
             })
         })?;
 
@@ -250,11 +265,14 @@ mod tests {
             config_id: "test-config".to_string(),
             original_path: "/documents".to_string(),
             original_name: "test.txt".to_string(),
+            local_path: "/local/documents/test.txt".to_string(),
+            local_name: "test.txt".to_string(),
             encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
             file_size: 1024,
             version: 1,
             key_version: 1,
             remote_path: "/backup/documents".to_string(),
+            remote_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
             is_directory: false,
             status: "completed".to_string(),
         };
@@ -279,11 +297,14 @@ mod tests {
             encrypted_name: "uuid.age".to_string(),
             original_path: "/path".to_string(),
             original_name: "file.txt".to_string(),
+            local_path: "/local/path/file.txt".to_string(),
+            local_name: "file.txt".to_string(),
             is_directory: false,
             version: 1,
             key_version: 1,
             file_size: 1024,
             remote_path: Some("/remote/path".to_string()),
+            remote_name: Some("uuid.age".to_string()),
             status: Some("completed".to_string()),
         };
 

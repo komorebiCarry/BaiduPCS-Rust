@@ -9,7 +9,7 @@
 use crate::auth::UserAuth;
 use crate::encryption::{EncryptionConfigStore, SnapshotManager};
 use crate::autobackup::events::BackupTransferNotification;
-use crate::autobackup::record::BackupRecordManager;
+use crate::autobackup::record::{BackupRecordManager, EncryptionSnapshot};
 use crate::config::{UploadConfig, VipType};
 use crate::netdisk::NetdiskClient;
 use crate::persistence::{
@@ -1233,11 +1233,17 @@ impl UploadManager {
                     config_id: "manual_upload".to_string(),
                     original_path: encrypted_parent.clone(),
                     original_name: original_filename.clone(),
+                    local_path: local_path.to_string_lossy().replace('\\', "/"),
+                    local_name: local_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| original_filename.clone()),
                     encrypted_name: encrypted_filename.clone(),
                     file_size,
                     version: 1,
                     key_version: snapshot_key_version,
                     remote_path: task.remote_path.clone(),
+                    remote_name: encrypted_filename.clone(),
                     is_directory: false,
                     status: "pending".to_string(),
                 };
@@ -2761,6 +2767,37 @@ impl UploadManager {
         conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
         owner_uid: crate::auth::Uid,
     ) -> Result<String> {
+        self.create_backup_task_with_mapping(
+            local_path,
+            remote_path,
+            backup_config_id,
+            encrypt_enabled,
+            backup_task_id,
+            backup_file_task_id,
+            conflict_strategy,
+            None,
+            owner_uid,
+        )
+        .await
+    }
+
+    /// 创建备份上传任务，并直接使用扫描阶段解析好的加密映射。
+    ///
+    /// `mapping` 为空时仍支持普通/旧调用方，但不会再通过 encrypted_name
+    /// 反查 encryption_snapshots；原始信息从当前任务参数生成。自动备份主链
+    /// 应始终传入扫描阶段的映射，从而让任务重建完全不依赖数据库读查询。
+    pub async fn create_backup_task_with_mapping(
+        &self,
+        local_path: PathBuf,
+        remote_path: String,
+        backup_config_id: String,
+        encrypt_enabled: bool,
+        backup_task_id: Option<String>,
+        backup_file_task_id: Option<String>,
+        conflict_strategy: Option<crate::uploader::UploadConflictStrategy>,
+        mapping: Option<EncryptionSnapshot>,
+        owner_uid: crate::auth::Uid,
+    ) -> Result<String> {
         // 获取文件大小
         let metadata = tokio::fs::metadata(&local_path)
             .await
@@ -2777,10 +2814,22 @@ impl UploadManager {
         // 获取冲突策略（如果未指定，使用默认值 SmartDedup）
         let strategy = conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
 
-        // 🔥 如果启用加密，修改远程路径为加密文件名（与 create_task 保持一致）。
+        // 如果启用加密，修改远程路径为加密文件名（与 create_task 保持一致）。
         // 稳定文件清单重试同一个逻辑文件时会把上一次实际的 UUID.age 路径
-        // 传回来；此时复用该路径，避免每次重传都制造一个孤立密文。
-        let mut snapshot_original_path = remote_path.clone();
+        // 传回来；此时复用扫描阶段传入的映射，避免每次重传都查询数据库。
+        let local_name = local_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut snapshot_original_path = mapping
+            .as_ref()
+            .map(|snapshot| snapshot.original_path.clone())
+            .unwrap_or_else(|| remote_path.clone());
+        let mut snapshot_original_name = mapping
+            .as_ref()
+            .map(|snapshot| snapshot.original_name.clone())
+            .unwrap_or_else(|| local_name.clone());
         let (actual_remote_path, encrypted_filename) = if encrypt_enabled {
             use crate::encryption::service::EncryptionService;
 
@@ -2793,21 +2842,34 @@ impl UploadManager {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
-            let (enc_filename, path) = if EncryptionService::is_encrypted_filename(filename) {
-                // 读取已有快照只用于恢复原始显示名/路径；没有快照时仍可
-                // 复用远端位置，至少保证清单与密文位置一致。
-                if let Some(ref rm) = *self.backup_record_manager.read().await {
-                    if let Ok(Some(snapshot)) = rm.find_snapshot_by_encrypted_name(filename) {
-                        snapshot_original_path = format!(
-                            "{}/{}",
-                            snapshot.original_path.trim_end_matches('/'),
-                            snapshot.original_name
-                        );
-                    }
-                }
+            let (enc_filename, path) = if let Some(snapshot) = mapping.as_ref() {
+                // 映射由扫描阶段按 config + 本地路径解析，直接复用其中的完整
+                // 远端位置和原始逻辑键；这里绝不反查 encryption_snapshots。
+                snapshot_original_path = snapshot.original_path.clone();
+                snapshot_original_name = snapshot.original_name.clone();
+                let enc_filename = if !snapshot.remote_name.is_empty() {
+                    snapshot.remote_name.clone()
+                } else if !snapshot.encrypted_name.is_empty() {
+                    snapshot.encrypted_name.clone()
+                } else {
+                    filename.to_string()
+                };
+                let path = if snapshot.remote_path.is_empty() {
+                    remote_path.clone()
+                } else {
+                    snapshot.remote_path.clone()
+                };
+                (enc_filename, path)
+            } else if EncryptionService::is_encrypted_filename(filename) {
+                // 兼容没有映射上下文的旧调用方：直接使用任务中已有的远端
+                // 路径和本地文件名，不为恢复显示名额外查询数据库。
+                snapshot_original_path = parent.clone();
+                snapshot_original_name = local_name.clone();
                 (filename.to_string(), remote_path.clone())
             } else {
                 let enc_filename = EncryptionService::generate_encrypted_filename();
+                snapshot_original_path = parent.clone();
+                snapshot_original_name = local_name.clone();
                 let path = if parent.is_empty() || parent == "/" {
                     format!("/{}", enc_filename)
                 } else {
@@ -2839,39 +2901,49 @@ impl UploadManager {
 
         let task_id = task.id.clone();
 
-        // 🔥 如果启用加密，存储文件加密映射到 encryption_snapshots（状态为 pending）
-        // 上传完成时更新 age 映射状态并标记为 completed
+        // 如果启用加密，确保映射表保存完整的本地/远端信息。
+        // 已有且未变化的映射不重复写入；新增或状态/元数据变化时才 upsert。
         if let Some(ref enc_filename) = encrypted_filename {
-            let original_filename = std::path::Path::new(&snapshot_original_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let parent = std::path::Path::new(&snapshot_original_path)
-                .parent()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-
             let snapshot_key_version = crate::encryption::AGE_KEY_VERSION;
 
-            if let Some(ref rm) = *self.backup_record_manager.read().await {
-                use crate::autobackup::record::EncryptionSnapshot;
-                let snapshot = EncryptionSnapshot {
-                    config_id: backup_config_id.clone(),
-                    original_path: parent.clone(),
-                    original_name: original_filename.clone(),
-                    encrypted_name: enc_filename.clone(),
-                    file_size,
-                    version: 1,
-                    key_version: snapshot_key_version,
-                    remote_path: actual_remote_path.clone(),
-                    is_directory: false,
-                    status: "pending".to_string(),
-                };
-                if let Err(e) = rm.add_snapshot(&snapshot) {
-                    warn!("存储备份文件加密映射失败: {}", e);
-                } else {
-                    debug!("存储备份文件加密映射: {} -> {}", original_filename, enc_filename);
+            use crate::autobackup::record::EncryptionSnapshot;
+            let snapshot = EncryptionSnapshot {
+                config_id: backup_config_id.clone(),
+                original_path: snapshot_original_path.clone(),
+                original_name: snapshot_original_name.clone(),
+                local_path: local_path.to_string_lossy().replace('\\', "/"),
+                local_name: local_name.clone(),
+                encrypted_name: enc_filename.clone(),
+                file_size,
+                version: 1,
+                key_version: snapshot_key_version,
+                remote_path: actual_remote_path.clone(),
+                remote_name: enc_filename.clone(),
+                is_directory: false,
+                status: "pending".to_string(),
+            };
+            let should_persist = mapping
+                .as_ref()
+                .map(|old| {
+                    old.local_path != snapshot.local_path
+                        || old.local_name != snapshot.local_name
+                        || old.encrypted_name != snapshot.encrypted_name
+                        || old.file_size != snapshot.file_size
+                        || old.remote_path != snapshot.remote_path
+                        || old.remote_name != snapshot.remote_name
+                        || old.status != snapshot.status
+                })
+                .unwrap_or(true);
+            if should_persist {
+                if let Some(ref rm) = *self.backup_record_manager.read().await {
+                    if let Err(e) = rm.add_snapshot(&snapshot) {
+                        warn!("存储备份文件加密映射失败: {}", e);
+                    } else {
+                        debug!(
+                            "存储备份文件加密映射: local={} -> remote={}",
+                            snapshot.local_path, snapshot.remote_path
+                        );
+                    }
                 }
             }
 
