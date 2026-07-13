@@ -284,33 +284,21 @@ pub struct FilterConfig {
 pub struct EncryptionConfig {
     /// 是否启用加密
     pub enabled: bool,
-    /// 主密钥（Base64 编码）
-    pub master_key: Option<String>,
-    /// 加密算法
-    #[serde(default)]
-    pub algorithm: EncryptionAlgorithm,
+    /// 用户明确提供的 age 口令
+    pub passphrase: Option<String>,
     /// 密钥创建时间
     pub key_created_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// 密钥版本（用于密钥轮换）
-    #[serde(default = "default_key_version")]
-    pub key_version: u32,
     /// 最后使用时间（时间戳毫秒）
     #[serde(default)]
     pub last_used_at: Option<i64>,
-}
-
-fn default_key_version() -> u32 {
-    1
 }
 
 impl Default for EncryptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            master_key: None,
-            algorithm: EncryptionAlgorithm::default(),
+            passphrase: None,
             key_created_at: None,
-            key_version: 1,
             last_used_at: None,
         }
     }
@@ -324,7 +312,11 @@ impl EncryptionConfig {
 
     /// 检查密钥是否有效
     pub fn is_key_valid(&self) -> bool {
-        self.enabled && self.master_key.is_some()
+        self.enabled
+            && self
+                .passphrase
+                .as_deref()
+                .is_some_and(|passphrase| !passphrase.trim().is_empty())
     }
 
     /// 获取密钥年龄（天数）
@@ -333,15 +325,6 @@ impl EncryptionConfig {
             (chrono::Utc::now() - created).num_days()
         })
     }
-}
-
-/// 加密算法（固定使用 age 格式）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum EncryptionAlgorithm {
-    /// age 加密格式 (age-encryption.org/v1)
-    #[default]
-    #[serde(rename = "age")]
-    Age,
 }
 
 /// 准备阶段资源池配置

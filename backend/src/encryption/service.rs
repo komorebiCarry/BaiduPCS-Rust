@@ -6,12 +6,11 @@
 //! # 解密方式
 //!
 //! ```bash
-//! # 方法 1: 使用本项目的 decrypt-cli（自动从 encryption.json 读取密钥）
+//! # 使用本项目的 decrypt-cli
 //! decrypt-cli decrypt --key-file encryption.json --in file.age --out file.txt
 //!
-//! # 方法 2: 使用标准 age CLI（手动输入密钥作为口令）
+//! # 或使用标准 age CLI，输入用户配置的同一个口令
 //! age -d file.age
-//! # 输入口令：encryption.json 中的 master_key 字段值（Base64 编码的 32 字节密钥）
 //! ```
 
 use age::secrecy::Secret;
@@ -19,10 +18,13 @@ use anyhow::{anyhow, Result};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
-use crate::autobackup::config::EncryptionAlgorithm;
-
 /// 加密文件扩展名（使用 .age 后缀，符合 age-encryption.org/v1 规范）
 pub const ENCRYPTED_FILE_EXTENSION: &str = ".age";
+
+/// 当前唯一支持的加密格式版本。
+///
+/// 该值只用于已有任务/映射的内部元数据，不用于选择密钥或兼容其他算法。
+pub const AGE_KEY_VERSION: u32 = 1;
 
 /// age 文件头标识（用于快速识别）
 const AGE_HEADER_PREFIX: &[u8] = b"age-encryption.org/";
@@ -49,35 +51,15 @@ pub struct EncryptionService {
 }
 
 impl EncryptionService {
-    /// 创建加密服务（直接传入口令）
-    pub fn new(passphrase: impl Into<String>, _algorithm: EncryptionAlgorithm) -> Self {
-        Self { passphrase: passphrase.into() }
-    }
-
-    /// 从字符串创建（兼容旧接口，接受任意口令或 base64 密钥）
-    pub fn from_string(passphrase: &str) -> Self {
-        Self { passphrase: passphrase.to_string() }
-    }
-
-    /// 保持兼容：from_base64_key 现在接受任意口令
-    pub fn from_base64_key(passphrase: &str, _algorithm: EncryptionAlgorithm) -> Result<Self> {
-        Ok(Self { passphrase: passphrase.to_string() })
-    }
-
-    /// 生成随机口令（60 位十六进制，约 240 位熵）
-    pub fn generate_random_passphrase() -> String {
-        use rand::Rng;
-        (0..60).map(|_| format!("{:x}", rand::thread_rng().gen_range(0..16))).collect()
-    }
-
-    /// 生成新的主密钥 base64（兼容旧接口，现在就是生成随机口令）
-    pub fn generate_master_key_base64() -> String {
-        Self::generate_random_passphrase()
-    }
-
-    /// 获取口令（兼容旧接口名 get_key_base64）
-    pub fn get_key_base64(&self) -> String {
-        self.passphrase.clone()
+    /// 创建加密服务。
+    ///
+    /// 口令必须由调用方明确提供；本服务不生成、转换或猜测任何密钥。
+    pub fn new(passphrase: impl Into<String>) -> Result<Self> {
+        let passphrase = passphrase.into();
+        if passphrase.trim().is_empty() {
+            return Err(anyhow!("age 口令不能为空"));
+        }
+        Ok(Self { passphrase })
     }
 
     fn get_passphrase(&self) -> Secret<String> {
@@ -309,12 +291,12 @@ pub struct StreamingEncryptionService {
 }
 
 impl StreamingEncryptionService {
-    pub fn new(passphrase: impl Into<String>, _algorithm: EncryptionAlgorithm) -> Self {
-        Self { passphrase: passphrase.into() }
-    }
-
-    pub fn from_base64_key(passphrase: &str, _algorithm: EncryptionAlgorithm) -> Result<Self> {
-        Ok(Self { passphrase: passphrase.to_string() })
+    pub fn new(passphrase: impl Into<String>) -> Result<Self> {
+        let passphrase = passphrase.into();
+        if passphrase.trim().is_empty() {
+            return Err(anyhow!("age 口令不能为空"));
+        }
+        Ok(Self { passphrase })
     }
 
     pub async fn encrypt_file_streaming(
@@ -394,8 +376,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let key = EncryptionService::generate_random_passphrase();
-        let svc = EncryptionService::new(key, EncryptionAlgorithm::Age);
+        let svc = EncryptionService::new("user supplied passphrase").unwrap();
         let plaintext = b"Hello, age encryption!";
         let encrypted = svc.encrypt(plaintext).unwrap();
         let decrypted = svc.decrypt(&encrypted).unwrap();
@@ -404,8 +385,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_empty() {
-        let key = EncryptionService::generate_random_passphrase();
-        let svc = EncryptionService::new(key, EncryptionAlgorithm::Age);
+        let svc = EncryptionService::new("user supplied passphrase").unwrap();
         let encrypted = svc.encrypt(b"").unwrap();
         let decrypted = svc.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, b"");
@@ -413,10 +393,8 @@ mod tests {
 
     #[test]
     fn test_wrong_key_fails() {
-        let key1 = EncryptionService::generate_random_passphrase();
-        let key2 = EncryptionService::generate_random_passphrase();
-        let svc1 = EncryptionService::new(key1, EncryptionAlgorithm::Age);
-        let svc2 = EncryptionService::new(key2, EncryptionAlgorithm::Age);
+        let svc1 = EncryptionService::new("first user passphrase").unwrap();
+        let svc2 = EncryptionService::new("second user passphrase").unwrap();
         let encrypted = svc1.encrypt(b"secret data").unwrap();
         assert!(svc2.decrypt(&encrypted).is_err());
     }
@@ -425,8 +403,7 @@ mod tests {
     fn test_is_encrypted_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.age");
-        let key = EncryptionService::generate_random_passphrase();
-        let svc = EncryptionService::new(key, EncryptionAlgorithm::Age);
+        let svc = EncryptionService::new("user supplied passphrase").unwrap();
         svc.encrypt_file_chunked(Path::new("Cargo.toml"), &file_path).unwrap();
         assert!(EncryptionService::is_encrypted_file(&file_path).unwrap());
         assert!(!EncryptionService::is_encrypted_file(Path::new("Cargo.toml")).unwrap());
@@ -448,8 +425,7 @@ mod tests {
         let enc = dir.path().join("output.age");
         let dec = dir.path().join("decrypted.txt");
         std::fs::write(&input, b"Hello age file encryption!").unwrap();
-        let key = EncryptionService::generate_random_passphrase();
-        let svc = EncryptionService::new(key, EncryptionAlgorithm::Age);
+        let svc = EncryptionService::new("user supplied passphrase").unwrap();
         svc.encrypt_file_chunked(&input, &enc).unwrap();
         svc.decrypt_file(&enc, &dec).unwrap();
         assert_eq!(std::fs::read_to_string(&dec).unwrap(), "Hello age file encryption!");

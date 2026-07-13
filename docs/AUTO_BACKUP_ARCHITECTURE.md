@@ -405,8 +405,8 @@ GLOBAL_POLL_SYNC_SCHEDULED
 - **算法**：age 口令模式 — 内部使用 scrypt (`N=2^18, r=8, p=1`) 做内存硬化口令派生，安全性等同于 Argon2id
 - **文件格式**：`age-encryption.org/v1`，标准规范，**不依赖本项目即可解密**
 - **扩展名**：`.age`
-- **密钥存储**：口令持久化在 `encryption.json`（Base64 编码的 32 字节 seed，经 scrypt 派生）
-- **密钥轮换**：支持多版本历史密钥
+- **口令存储**：用户提供的口令原样持久化在 `encryption.json` 的 `passphrase` 字段
+- **密钥轮换**：不支持密钥历史；更换口令会直接替换当前口令，不兼容旧密钥配置
 
 ### 11.2 解密方式
 
@@ -416,7 +416,7 @@ decrypt-cli decrypt --key-file encryption.json --in file.age --out file.txt
 
 # 方式 2：使用标准 age CLI（不依赖本项目）
 age -d file.age
-# 输入口令：encryption.json 中的 master_key 字段值
+# 输入口令：encryption.json 中的 passphrase 字段值
 ```
 
 ### 11.3 限制

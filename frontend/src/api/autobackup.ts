@@ -197,7 +197,6 @@ export interface FileTasksResponse {
 export interface EncryptionStatus {
   enabled: boolean
   has_key: boolean
-  algorithm: string
   key_created_at?: string
 }
 
@@ -384,37 +383,28 @@ export async function getEncryptionStatus(): Promise<EncryptionStatus> {
   throw new Error(response.data.error || '获取加密状态失败')
 }
 
-/** 生成加密密钥（随机口令） */
-export async function generateEncryptionKey(): Promise<string> {
-  const response = await rawApiClient.post<ApiResponse<{ key: string }>>('/encryption/key/generate')
-  if (response.data.success && response.data.data) {
-    return response.data.data.key
-  }
-  throw new Error(response.data.error || '生成密钥失败')
-}
-
-/** 设置加密口令（age scrypt 自动处理内存硬化） */
-export async function importEncryptionKey(passphrase: string): Promise<void> {
-  const response = await rawApiClient.post<ApiResponse<void>>('/encryption/key/import', { key: passphrase })
+/** 设置用户提供的 age 口令 */
+export async function setEncryptionPassphrase(passphrase: string): Promise<void> {
+  const response = await rawApiClient.post<ApiResponse<void>>('/encryption/passphrase', { passphrase })
   if (!response.data.success) {
     throw new Error(response.data.error || '口令设置失败')
   }
 }
 
-/** 导出加密密钥 */
-export async function exportEncryptionKey(): Promise<string> {
-  const response = await rawApiClient.get<ApiResponse<{ key: string }>>('/encryption/key/export')
+/** 导出当前用户提供的 age 口令 */
+export async function exportEncryptionPassphrase(): Promise<string> {
+  const response = await rawApiClient.get<ApiResponse<{ passphrase: string }>>('/encryption/passphrase/export')
   if (response.data.success && response.data.data) {
-    return response.data.data.key
+    return response.data.data.passphrase
   }
-  throw new Error(response.data.error || '导出密钥失败')
+  throw new Error(response.data.error || '导出口令失败')
 }
 
-/** 删除加密密钥 */
-export async function deleteEncryptionKey(): Promise<void> {
-  const response = await rawApiClient.delete<ApiResponse<void>>('/encryption/key')
+/** 删除 age 口令 */
+export async function deleteEncryptionPassphrase(): Promise<void> {
+  const response = await rawApiClient.delete<ApiResponse<void>>('/encryption/passphrase')
   if (!response.data.success) {
-    throw new Error(response.data.error || '删除密钥失败')
+    throw new Error(response.data.error || '删除口令失败')
   }
 }
 
@@ -422,26 +412,19 @@ export async function deleteEncryptionKey(): Promise<void> {
 
 /** 密钥信息 */
 export interface KeyInfo {
-  /** 主密钥（Base64 编码） */
-  master_key: string
-  /** 加密算法 */
-  algorithm: string
-  /** 密钥版本 */
-  key_version: number
+  /** 用户提供的 age 口令 */
+  passphrase: string
   /** 创建时间（Unix 时间戳，毫秒） */
   created_at: number
   /** 最后使用时间 */
   last_used_at?: number
-  /** 废弃时间（仅历史密钥） */
-  deprecated_at?: number
 }
 
 /** 密钥导出响应 */
 export interface KeyExportResponse {
-  /** 当前密钥信息 */
-  current_key: KeyInfo
-  /** 历史密钥列表 */
-  key_history: KeyInfo[]
+  passphrase: string
+  created_at: number
+  last_used_at?: number
 }
 
 /** 映射记录 */
@@ -462,10 +445,6 @@ export interface MappingRecord {
   key_version: number
   /** 文件大小 */
   file_size: number
-  /** Nonce（Base64 编码） */
-  nonce: string
-  /** 加密算法 */
-  algorithm: string
   /** 远程路径（可选） */
   remote_path?: string
   /** 状态（可选） */

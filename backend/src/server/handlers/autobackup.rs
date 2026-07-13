@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::autobackup::{
     AutoBackupManager, BackupConfig, BackupDirection, BackupTask, CreateBackupConfigRequest,
-    EncryptionAlgorithm, UpdateBackupConfigRequest,
+    UpdateBackupConfigRequest,
 };
 use crate::autobackup::config::SyncConflictStrategy;
 use crate::server::{ApiError, ApiResult, AppState};
@@ -346,66 +346,40 @@ pub async fn get_encryption_status(
     Ok(Json(ApiResponse::success(EncryptionStatusResponse {
         enabled: status.enabled,
         has_key: status.has_key,
-        algorithm: "age".to_string(),
         key_created_at: status.key_created_at.map(|t| t.to_rfc3339()),
     })))
 }
 
-/// 生成随机口令（生成后自动配置为加密口令）
-pub async fn generate_encryption_key(
+/// 设置用户提供的 age 口令。
+pub async fn set_encryption_passphrase(
     State(state): State<AppState>,
-) -> ApiResult<Json<ApiResponse<GenerateKeyResponse>>> {
-    let manager = get_manager(&state).await?;
-
-    match manager.generate_encryption_key(EncryptionAlgorithm::Age) {
-        Ok(key) => Ok(Json(ApiResponse::success(GenerateKeyResponse { key }))),
-        Err(e) => Err(internal_error(&e.to_string())),
-    }
-}
-
-/// 设置加密口令（age scrypt 自动做内存硬化）
-pub async fn import_encryption_key(
-    State(state): State<AppState>,
-    Json(request): Json<ImportKeyRequest>,
+    Json(request): Json<SetPassphraseRequest>,
 ) -> ApiResult<Json<ApiResponse<()>>> {
     let manager = get_manager(&state).await?;
 
-    match manager.configure_encryption(&request.key, EncryptionAlgorithm::Age) {
+    match manager.configure_encryption(&request.passphrase) {
         Ok(()) => Ok(Json(ApiResponse::success(()))),
         Err(e) => Err(bad_request_error(&e.to_string())),
     }
 }
 
-/// 导出加密密钥
-pub async fn export_encryption_key(
+/// 导出当前用户提供的 age 口令。
+pub async fn export_encryption_passphrase(
     State(state): State<AppState>,
 ) -> ApiResult<Json<ApiResponse<ExportKeyResponse>>> {
     let manager = get_manager(&state).await?;
     match manager.export_encryption_key() {
-        Ok(key) => Ok(Json(ApiResponse::success(ExportKeyResponse { key }))),
+        Ok(passphrase) => Ok(Json(ApiResponse::success(ExportKeyResponse { passphrase }))),
         Err(e) => Err(bad_request_error(&e.to_string())),
     }
 }
 
-/// 删除加密密钥
-pub async fn delete_encryption_key(
+/// 删除 age 口令。
+pub async fn delete_encryption_passphrase(
     State(state): State<AppState>,
 ) -> ApiResult<Json<ApiResponse<()>>> {
     let manager = get_manager(&state).await?;
     match manager.delete_encryption_key() {
-        Ok(()) => Ok(Json(ApiResponse::success(()))),
-        Err(e) => Err(internal_error(&e.to_string())),
-    }
-}
-
-/// 强制删除所有加密密钥（包括历史）
-///
-/// 警告：这将导致无法解密任何已加密的文件
-pub async fn force_delete_encryption_key(
-    State(state): State<AppState>,
-) -> ApiResult<Json<ApiResponse<()>>> {
-    let manager = get_manager(&state).await?;
-    match manager.force_delete_encryption_key() {
         Ok(()) => Ok(Json(ApiResponse::success(()))),
         Err(e) => Err(internal_error(&e.to_string())),
     }
@@ -514,28 +488,17 @@ pub struct TriggerBackupResponse {
 pub struct EncryptionStatusResponse {
     pub enabled: bool,
     pub has_key: bool,
-    pub algorithm: String,
     pub key_created_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GenerateKeyRequest {
-    pub algorithm: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GenerateKeyResponse {
-    pub key: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ImportKeyRequest {
-    pub key: String,
+pub struct SetPassphraseRequest {
+    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ExportKeyResponse {
-    pub key: String,
+    pub passphrase: String,
 }
 
 #[derive(Debug, Serialize)]

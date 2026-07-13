@@ -1,4 +1,6 @@
-# 加密上传模块架构分析
+# 加密上传模块架构分析（历史设计文档）
+
+> 本文保留的是早期设计记录，其中的 AES/ChaCha 双算法、`master_key`、密钥轮换和旧文件兼容路径均已废弃。当前 `age` 分支只使用用户提供的 passphrase，通过 `age::Encryptor::with_user_passphrase` 生成 `.age` 文件；没有自动生成口令、算法选择或历史密钥回退。当前实现以 `backend/src/encryption` 和 `decrypt-cli` 为准。
 
 ---
 

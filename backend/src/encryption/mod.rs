@@ -7,7 +7,9 @@ pub mod service;
 pub mod snapshot;
 
 pub use buffer_pool::{BufferPool, PooledBuffer, BufferPoolStats};
-pub use config_store::{EncryptionConfigStore, EncryptionKeyConfig, EncryptionKeyInfo};
+pub use config_store::{EncryptionConfigStore, EncryptionKeyConfig};
 pub use export::{DecryptBundleExporter, MappingExport, MappingGenerator, MappingRecord};
-pub use service::{EncryptionService, StreamingEncryptionService, ENCRYPTED_FILE_EXTENSION};
+pub use service::{
+    EncryptionService, StreamingEncryptionService, AGE_KEY_VERSION, ENCRYPTED_FILE_EXTENSION,
+};
 pub use snapshot::SnapshotManager;

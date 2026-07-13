@@ -1688,96 +1688,12 @@ impl ChunkScheduler {
             return Ok(());
         }
 
-        // 2. 🔥 根据 key_version 选择正确的解密密钥
-        // 优先从 snapshot_manager 查询 key_version，然后从 encryption_config_store 获取对应密钥
-        let encryption_service = {
-            // 尝试从 snapshot_manager 获取 key_version
-            let key_version = if let Some(ref snapshot_mgr) = task_info.snapshot_manager {
-                match snapshot_mgr.find_by_encrypted_name(&filename) {
-                    Ok(Some(snapshot_info)) => {
-                        info!(
-                            "任务 {} 从映射表获取 key_version: {}",
-                            task_id, snapshot_info.key_version
-                        );
-                        Some(snapshot_info.key_version)
-                    }
-                    Ok(None) => {
-                        debug!("任务 {} 在映射表中未找到加密信息，使用默认密钥", task_id);
-                        None
-                    }
-                    Err(e) => {
-                        warn!("任务 {} 查询映射表失败: {}，使用默认密钥", task_id, e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            // 如果有 key_version 且有 encryption_config_store，尝试获取对应版本的密钥
-            if let (Some(version), Some(ref config_store)) = (key_version, &task_info.encryption_config_store) {
-                match config_store.get_key_by_version(version) {
-                    Ok(Some(key_info)) => {
-                        info!(
-                            "任务 {} 使用 key_version={} 的密钥进行解密",
-                            task_id, version
-                        );
-                        match EncryptionService::from_base64_key(&key_info.master_key, key_info.algorithm) {
-                            Ok(service) => Arc::new(service),
-                            Err(e) => {
-                                warn!(
-                                    "任务 {} 创建 key_version={} 的加密服务失败: {}，回退到默认密钥",
-                                    task_id, version, e
-                                );
-                                // 回退到默认的 encryption_service
-                                match &task_info.encryption_service {
-                                    Some(service) => service.clone(),
-                                    None => {
-                                        warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "任务 {} 未找到 key_version={} 的密钥，回退到默认密钥",
-                            task_id, version
-                        );
-                        // 回退到默认的 encryption_service
-                        match &task_info.encryption_service {
-                            Some(service) => service.clone(),
-                            None => {
-                                warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "任务 {} 获取 key_version={} 的密钥失败: {}，回退到默认密钥",
-                            task_id, version, e
-                        );
-                        // 回退到默认的 encryption_service
-                        match &task_info.encryption_service {
-                            Some(service) => service.clone(),
-                            None => {
-                                warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            } else {
-                // 没有 key_version 或没有 config_store，使用默认的 encryption_service
-                match &task_info.encryption_service {
-                    Some(service) => service.clone(),
-                    None => {
-                        warn!("任务 {} 是加密文件但没有配置加密服务，跳过解密", task_id);
-                        return Ok(());
-                    }
-                }
+        // 2. 只使用启动时加载的用户 age 口令。
+        // 不按 key_version 查找历史口令，也不回退到其他算法或旧格式。
+        let encryption_service = match &task_info.encryption_service {
+            Some(service) => service.clone(),
+            None => {
+                return Err(anyhow::anyhow!("检测到 age 加密文件，但用户 age 口令未配置"));
             }
         };
 

@@ -35,7 +35,7 @@ impl DecryptEngine {
             }
         }
 
-        let passphrase = Secret::new(key.master_key.clone());
+        let passphrase = Secret::new(key.passphrase.clone());
 
         let decryptor = age::Decryptor::new(BufReader::new(File::open(input)?))
             .map_err(|e| DecryptError::InvalidFormat(format!("无法读取 age 文件: {}", e)))?;
@@ -55,29 +55,6 @@ impl DecryptEngine {
             output_file.write_all(&buffer[..bytes_read])?;
         }
         Ok(())
-    }
-
-    /// 尝试使用多个密钥解密文件
-    pub fn decrypt_file_with_any_key(
-        &self, input: &Path, output: &Path, keys: &[&EncryptionKeyInfo],
-    ) -> Result<(), DecryptError> {
-        if keys.is_empty() {
-            return Err(DecryptError::KeyMismatch(0));
-        }
-        if !is_age_encrypted_file(input) {
-            return Err(DecryptError::InvalidFormat("不是 age 加密文件".to_string()));
-        }
-        let mut last_error = None;
-        for key in keys {
-            match self.decrypt_file(input, output, key) {
-                Ok(()) => return Ok(()),
-                Err(e) => match &e {
-                    DecryptError::DecryptionFailed(_) => { last_error = Some(e); continue; }
-                    _ => return Err(e),
-                },
-            }
-        }
-        Err(last_error.unwrap_or_else(|| DecryptError::KeyMismatch(0)))
     }
 
     /// 批量解密目录
@@ -133,9 +110,9 @@ impl DecryptEngine {
             None => { summary.add_skipped(input_str, "映射中找不到记录".to_string()); return; }
         };
 
-        let key = match key_loader.get_key(record.key_version) {
+        let key = match key_loader.current_key() {
             Some(k) => k,
-            None => { summary.add_failed(input_str, format!("密钥版本 {} 不存在", record.key_version)); return; }
+            None => { summary.add_failed(input_str, "用户 age 口令未配置".to_string()); return; }
         };
 
         let output_path = if mirror {

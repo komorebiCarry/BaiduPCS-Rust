@@ -3,7 +3,7 @@
 //! 实现解密数据包导出功能，用于 decrypt-cli 工具解密加密文件。
 //! 
 //! 导出内容包括：
-//! - encryption.json: 密钥配置（current_key + key_history）
+//! - encryption.json: 单一用户 age 口令配置（passphrase）
 //! - mapping.json: 加密文件映射表
 
 use anyhow::{anyhow, Result};

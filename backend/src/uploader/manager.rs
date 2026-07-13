@@ -338,18 +338,8 @@ impl UploadManager {
             }
         };
 
-        // 🔥 获取当前密钥版本号
-        let current_key_version = match self.encryption_config_store.get_current_key() {
-            Ok(Some(key_info)) => key_info.key_version,
-            Ok(None) => {
-                warn!("encrypt_folder_path_for_upload: 未找到加密密钥，使用默认版本 1");
-                1u32
-            }
-            Err(e) => {
-                warn!("encrypt_folder_path_for_upload: 获取密钥版本失败: {}，使用默认版本 1", e);
-                1u32
-            }
-        };
+        // 版本号只是固定的 age 映射元数据，不用于选择其他口令。
+        let current_key_version = crate::encryption::AGE_KEY_VERSION;
 
         let normalized_path = relative_path.replace('\\', "/");
         let path_parts: Vec<&str> = normalized_path.split('/').filter(|s| !s.is_empty()).collect();
@@ -438,7 +428,6 @@ impl UploadManager {
         encryption_config_store: &Arc<EncryptionConfigStore>,
         backup_notification_tx: Option<&tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>>,
     ) -> Result<PathBuf> {
-        use crate::autobackup::config::EncryptionAlgorithm;
         use crate::encryption::service::EncryptionService;
         use crate::server::events::BackupEvent;
 
@@ -639,72 +628,15 @@ impl UploadManager {
         };
         let encrypted_path = temp_dir.join(&encrypted_filename);
 
-        // 4. 从配置中读取加密密钥，如果不存在则生成新密钥并保存
-        // 🔥 同时获取 key_version，用于保存到任务中（支持密钥轮换后解密）
-        let (encryption_service, current_key_version) = match encryption_config_store.load() {
-            Ok(Some(key_config)) => {
-                info!("从 encryption.json 加载加密密钥成功, key_version={}", key_config.current.key_version);
-                match EncryptionService::from_base64_key(
-                    &key_config.current.master_key,
-                    key_config.current.algorithm,
-                ) {
-                    Ok(service) => {
-                        // 更新最后使用时间
-                        if let Err(e) = encryption_config_store.update_last_used() {
-                            warn!("更新加密密钥最后使用时间失败: {}", e);
-                        }
-                        (service, key_config.current.key_version)
-                    }
-                    Err(e) => {
-                        warn!("加载加密密钥失败，密钥可能已损坏: {}，将生成新密钥", e);
-                        let key_str = EncryptionService::generate_master_key_base64();
-                        let service =
-                            EncryptionService::from_string(&key_str);
-                        // 使用安全方法保存新生成的密钥（保留历史密钥）
-                        match encryption_config_store.create_new_key_safe(
-                            service.get_key_base64(),
-                            EncryptionAlgorithm::Age,
-                        ) {
-                            Ok(config) => (service, config.current.key_version),
-                            Err(e) => {
-                                warn!("保存新生成的加密密钥失败: {}", e);
-                                (service, 1u32)
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None) => {
-                info!("未找到已保存的加密密钥，生成新密钥");
-                let key_str = EncryptionService::generate_master_key_base64();
-                let service = EncryptionService::from_string(&key_str);
-                // 使用安全方法保存新生成的密钥（保留历史密钥）
-                match encryption_config_store
-                    .create_new_key_safe(service.get_key_base64(), EncryptionAlgorithm::Age)
-                {
-                    Ok(config) => (service, config.current.key_version),
-                    Err(e) => {
-                        warn!("保存新生成的加密密钥失败: {}", e);
-                        (service, 1u32)
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("读取加密配置失败: {}，将生成新密钥", e);
-                let key_str = EncryptionService::generate_master_key_base64();
-                let service = EncryptionService::from_string(&key_str);
-                // 使用安全方法保存新生成的密钥（保留历史密钥）
-                match encryption_config_store
-                    .create_new_key_safe(service.get_key_base64(), EncryptionAlgorithm::Age)
-                {
-                    Ok(config) => (service, config.current.key_version),
-                    Err(e) => {
-                        warn!("保存新生成的加密密钥失败: {}", e);
-                        (service, 1u32)
-                    }
-                }
-            }
-        };
+        // 4. 只读取用户已经配置的 age 口令；缺失或损坏时直接失败。
+        let key_config = encryption_config_store
+            .load()?
+            .ok_or_else(|| anyhow::anyhow!("未配置用户 age 口令，拒绝自动创建密钥"))?;
+        let encryption_service = EncryptionService::new(key_config.passphrase)?;
+        if let Err(e) = encryption_config_store.update_last_used() {
+            warn!("更新 age 口令最后使用时间失败: {}", e);
+        }
+        let current_key_version = crate::encryption::AGE_KEY_VERSION;
 
         // 🔥 将当前 key_version 保存到任务中（用于解密时选择正确的密钥）
         {
@@ -1286,24 +1218,13 @@ impl UploadManager {
             };
 
             // 🔥 存储文件加密映射到 encryption_snapshots（状态为 pending）
-            // 上传完成时会更新 nonce、algorithm 等字段并标记为 completed
+            // 上传完成时更新 age 映射状态并标记为 completed
             let original_filename = std::path::Path::new(&final_remote_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            // 🔥 从 encryption.json 获取正确的 key_version
-            let snapshot_key_version = match self.encryption_config_store.get_current_key() {
-                Ok(Some(key_info)) => key_info.key_version,
-                Ok(None) => {
-                    warn!("创建快照时未找到加密密钥配置，使用默认 key_version=1");
-                    1u32
-                }
-                Err(e) => {
-                    warn!("创建快照时读取加密密钥配置失败: {}，使用默认 key_version=1", e);
-                    1u32
-                }
-            };
+            let snapshot_key_version = crate::encryption::AGE_KEY_VERSION;
 
             if let Some(ref rm) = *self.backup_record_manager.read().await {
                 // 使用 add_snapshot 存储文件映射（is_directory=false）
@@ -1355,19 +1276,8 @@ impl UploadManager {
         );
 
         // 🔥 注册任务到持久化管理器（传递加密信息）
-        // 从 encryption.json 获取正确的 key_version
         let current_key_version = if encrypt {
-            match self.encryption_config_store.get_current_key() {
-                Ok(Some(key_info)) => Some(key_info.key_version),
-                Ok(None) => {
-                    warn!("加密任务但未找到加密密钥配置，使用默认 key_version=1");
-                    Some(1u32)
-                }
-                Err(e) => {
-                    warn!("读取加密密钥配置失败: {}，使用默认 key_version=1", e);
-                    Some(1u32)
-                }
-            }
+            Some(crate::encryption::AGE_KEY_VERSION)
         } else {
             None
         };
@@ -2907,7 +2817,7 @@ impl UploadManager {
         let task_id = task.id.clone();
 
         // 🔥 如果启用加密，存储文件加密映射到 encryption_snapshots（状态为 pending）
-        // 上传完成时会更新 nonce、algorithm 等字段并标记为 completed
+        // 上传完成时更新 age 映射状态并标记为 completed
         if let Some(ref enc_filename) = encrypted_filename {
             let original_filename = std::path::Path::new(&remote_path)
                 .file_name()
@@ -2919,18 +2829,7 @@ impl UploadManager {
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
 
-            // 🔥 从 encryption.json 获取正确的 key_version
-            let snapshot_key_version = match self.encryption_config_store.get_current_key() {
-                Ok(Some(key_info)) => key_info.key_version,
-                Ok(None) => {
-                    warn!("创建备份快照时未找到加密密钥配置，使用默认 key_version=1");
-                    1u32
-                }
-                Err(e) => {
-                    warn!("创建备份快照时读取加密密钥配置失败: {}，使用默认 key_version=1", e);
-                    1u32
-                }
-            };
+            let snapshot_key_version = crate::encryption::AGE_KEY_VERSION;
 
             if let Some(ref rm) = *self.backup_record_manager.read().await {
                 use crate::autobackup::record::EncryptionSnapshot;
@@ -2978,19 +2877,8 @@ impl UploadManager {
         );
 
         // 🔥 注册备份任务到持久化管理器
-        // 从 encryption.json 获取正确的 key_version
         let current_key_version = if encrypt_enabled {
-            match self.encryption_config_store.get_current_key() {
-                Ok(Some(key_info)) => Some(key_info.key_version),
-                Ok(None) => {
-                    warn!("备份加密任务但未找到加密密钥配置，使用默认 key_version=1");
-                    Some(1u32)
-                }
-                Err(e) => {
-                    warn!("读取加密密钥配置失败: {}，使用默认 key_version=1", e);
-                    Some(1u32)
-                }
-            }
+            Some(crate::encryption::AGE_KEY_VERSION)
         } else {
             None
         };

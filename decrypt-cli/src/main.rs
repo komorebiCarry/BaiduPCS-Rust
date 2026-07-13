@@ -11,12 +11,7 @@
 //!
 //! ## 单文件解密模式
 //! ```bash
-//! decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt
-//! ```
-//!
-//! ## 单文件解密模式（指定密钥版本）
-//! ```bash
-//! decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --key-version 2
+//! decrypt-cli decrypt --key-file encryption.json --in file.age --out file.txt
 //! ```
 
 mod cli;
@@ -78,9 +73,9 @@ fn main() -> ExitCode {
                 DecryptMode::SingleFile {
                     input,
                     output,
-                    key_version,
+                    ..
                 } => {
-                    execute_single_file_mode(&key_loader, &input, &output, key_version)
+                    execute_single_file_mode(&key_loader, &input, &output)
                 }
             }
         }
@@ -149,18 +144,11 @@ fn execute_single_file_mode(
     key_loader: &KeyLoader,
     input: &std::path::Path,
     output: &std::path::Path,
-    key_version: Option<u32>,
 ) -> ExitCode {
     println!("单文件解密模式");
-    println!("  密钥文件: 已加载 {} 个密钥", key_loader.key_count());
+    println!("  age 口令: 已加载");
     println!("  输入文件: {}", input.display());
     println!("  输出文件: {}", output.display());
-
-    if let Some(version) = key_version {
-        println!("  密钥版本: {}", version);
-    } else {
-        println!("  密钥版本: 自动检测（遍历所有密钥）");
-    }
     println!();
 
     // 检查输入文件是否存在
@@ -181,24 +169,15 @@ fn execute_single_file_mode(
 
     let engine = DecryptEngine::new();
 
-    // 根据是否指定密钥版本选择解密方式
-    let result = if let Some(version) = key_version {
-        // 使用指定版本的密钥
-        match key_loader.get_key(version) {
-            Some(key) => {
-                println!("使用密钥版本 {} 解密...", version);
-                engine.decrypt_file(input, output, key)
-            }
-            None => {
-                eprintln!("错误: 密钥版本 {} 不存在", version);
-                return AppExitCode::KeyMismatch.to_std();
-            }
+    let result = match key_loader.current_key() {
+        Some(key) => {
+            println!("使用用户提供的 age 口令解密...");
+            engine.decrypt_file(input, output, key)
         }
-    } else {
-        // 遍历所有密钥尝试解密
-        let all_keys = key_loader.all_keys();
-        println!("尝试使用 {} 个密钥解密...", all_keys.len());
-        engine.decrypt_file_with_any_key(input, output, &all_keys)
+        None => {
+            eprintln!("错误: 用户 age 口令未配置");
+            return AppExitCode::KeyMismatch.to_std();
+        }
     };
 
     match result {

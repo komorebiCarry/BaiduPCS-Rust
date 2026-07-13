@@ -30,10 +30,7 @@ decrypt-cli 是一个独立的命令行工具，用于解密通过 BaiduPCS-Rust
   decrypt-cli decrypt --key-file encryption.json --map mapping.json --in-dir ./encrypted --out-dir ./decrypted --mirror
 
   # 单文件解密
-  decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt
-
-  # 单文件解密（指定密钥版本）
-  decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --key-version 2
+  decrypt-cli decrypt --key-file encryption.json --in file.age --out file.txt
 "#)]
 pub struct Cli {
     #[command(subcommand)]
@@ -160,8 +157,11 @@ impl DecryptArgs {
                 DecryptError::ArgumentError("单文件模式需要指定 --out 参数".to_string())
             })?;
 
-            // --map 在单文件模式下是可选的（可以用于查找密钥版本）
-            // 但如果没有 --map 且没有 --key-version，则需要遍历所有密钥
+            if self.key_version.is_some() {
+                return Err(DecryptError::ArgumentError(
+                    "当前 age 模式只使用用户提供的单一口令，不支持 --key-version".to_string(),
+                ));
+            }
 
             return Ok(DecryptMode::SingleFile {
                 input,
@@ -306,13 +306,7 @@ mod tests {
             Commands::Decrypt(args) => {
                 assert_eq!(args.key_version, Some(2));
 
-                let mode = args.validate().unwrap();
-                match mode {
-                    DecryptMode::SingleFile { key_version, .. } => {
-                        assert_eq!(key_version, Some(2));
-                    }
-                    _ => panic!("Expected SingleFile mode"),
-                }
+                assert!(args.validate().is_err());
             }
         }
     }
@@ -507,7 +501,7 @@ mod tests {
             out_dir: None,
             input: Some(PathBuf::from("file.dat")),
             out: Some(PathBuf::from("file.txt")),
-            key_version: Some(3),
+            key_version: None,
             mirror: false,
         };
 
@@ -520,7 +514,7 @@ mod tests {
             } => {
                 assert_eq!(input, PathBuf::from("file.dat"));
                 assert_eq!(output, PathBuf::from("file.txt"));
-                assert_eq!(key_version, Some(3));
+                assert!(key_version.is_none());
             }
             _ => panic!("Expected SingleFile mode"),
         }
@@ -659,11 +653,6 @@ mod proptests {
         prop_oneof![Just(None), arb_path().prop_map(Some)]
     }
 
-    /// 生成可选的密钥版本
-    fn arb_optional_key_version() -> impl Strategy<Value = Option<u32>> {
-        prop_oneof![Just(None), (1u32..100).prop_map(Some)]
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(100))]
 
@@ -681,7 +670,6 @@ mod proptests {
             out_dir in arb_optional_path(),
             input in arb_optional_path(),
             out in arb_optional_path(),
-            key_version in arb_optional_key_version(),
         ) {
             let args = DecryptArgs {
                 key_file,
@@ -690,7 +678,7 @@ mod proptests {
                 out_dir: out_dir.clone(),
                 input: input.clone(),
                 out: out.clone(),
-                key_version,
+                key_version: None,
                 mirror: false,
             };
 
@@ -775,7 +763,6 @@ mod proptests {
             key_file in arb_path(),
             has_input in any::<bool>(),
             has_out in any::<bool>(),
-            key_version in arb_optional_key_version(),
         ) {
             // 至少有一个单文件参数
             prop_assume!(has_input || has_out);
@@ -787,7 +774,7 @@ mod proptests {
                 out_dir: None,
                 input: if has_input { Some(PathBuf::from("file.dat")) } else { None },
                 out: if has_out { Some(PathBuf::from("file.txt")) } else { None },
-                key_version,
+                key_version: None,
                 mirror: false,
             };
 
@@ -814,10 +801,9 @@ mod proptests {
             }
         }
 
-        /// **Property 10 补充: --key-version 仅在单文件模式可用**
+        /// **Property 10 补充: --key-version 已被 age 单口令模式移除**
         ///
-        /// --key-version 参数仅在单文件模式下可用，
-        /// 在批量模式下使用应返回参数错误。
+        /// 新实现不支持按版本选择密钥，任何模式下都应返回参数错误。
         ///
         /// **Validates: Requirements 5.6, 6.3**
         #[test]
@@ -849,7 +835,7 @@ mod proptests {
                 );
             }
 
-            // 单文件模式 + key_version 应该成功
+            // 单文件模式 + key_version 也应该失败
             let single_args = DecryptArgs {
                 key_file,
                 map: None,
@@ -863,13 +849,10 @@ mod proptests {
 
             let single_result = single_args.validate();
             prop_assert!(
-                single_result.is_ok(),
-                "单文件模式下使用 --key-version 应成功: {:?}",
+                single_result.is_err(),
+                "单文件模式下使用 --key-version 应返回错误: {:?}",
                 single_result
             );
-            if let Ok(DecryptMode::SingleFile { key_version: kv, .. }) = single_result {
-                prop_assert_eq!(kv, Some(key_version));
-            }
         }
 
         /// **Property 10 补充: 无模式参数时返回错误**
@@ -882,7 +865,6 @@ mod proptests {
         fn prop_no_mode_params_returns_error(
             key_file in arb_path(),
             map in arb_optional_path(),
-            key_version in arb_optional_key_version(),
         ) {
             let args = DecryptArgs {
                 key_file,
@@ -891,7 +873,7 @@ mod proptests {
                 out_dir: None,
                 input: None,
                 out: None,
-                key_version,
+                key_version: None,
                 mirror: false,
             };
 

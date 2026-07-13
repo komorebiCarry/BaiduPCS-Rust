@@ -7,7 +7,7 @@ authors = ["BaiduPCS-Rust Team"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/example/BaiduPCS-Rust"
-keywords = ["decrypt", "cli", "encryption", "aes", "chacha20"]
+keywords = ["decrypt", "cli", "encryption", "age", "passphrase"]
 categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]

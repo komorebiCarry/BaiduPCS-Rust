@@ -8,75 +8,30 @@ use std::process::ExitCode as StdExitCode;
 use thiserror::Error;
 
 // ============================================================================
-// 加密算法枚举
+// age 口令配置结构
 // ============================================================================
 
-/// 支持的加密算法（仅 age 格式）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum EncryptionAlgorithm {
-    /// age 加密格式 (age-encryption.org/v1)
-    #[default]
-    #[serde(rename = "age")]
-    Age,
-}
-
-impl fmt::Display for EncryptionAlgorithm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EncryptionAlgorithm::Age => write!(f, "age"),
-        }
-    }
-}
-
-// ============================================================================
-// 密钥配置结构
-// ============================================================================
-
-/// 单个密钥信息
-///
-/// 与后端 `EncryptionKeyInfo` 保持一致
+/// decrypt-cli 内部使用的单一用户 age 口令。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptionKeyInfo {
-    /// 主密钥（Base64 编码的 32 字节）
-    pub master_key: String,
-    /// 加密算法
-    #[serde(default)]
-    pub algorithm: EncryptionAlgorithm,
-    /// 密钥版本（用于密钥轮换）
-    #[serde(default = "default_key_version")]
-    pub key_version: u32,
-    /// 密钥创建时间（Unix 时间戳，毫秒）
-    pub created_at: i64,
-    /// 密钥最后使用时间（Unix 时间戳，毫秒）
-    pub last_used_at: Option<i64>,
-    /// 密钥废弃时间（Unix 时间戳，毫秒，仅历史密钥有此字段）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated_at: Option<i64>,
-}
-
-fn default_key_version() -> u32 {
-    1
+    pub passphrase: String,
 }
 
 impl EncryptionKeyInfo {
-    /// 检查密钥是否有效（非空）
+    /// 检查口令是否有效。
     pub fn is_valid(&self) -> bool {
-        !self.master_key.is_empty() && self.key_version > 0
+        !self.passphrase.trim().is_empty()
     }
 }
 
-/// 加密密钥配置（存储在 encryption.json）
-///
-/// 与后端 `EncryptionKeyConfig` 保持一致
+/// 与后端严格一致的 encryption.json 结构。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptionConfig {
-    /// 当前使用的密钥
-    #[serde(rename = "current_key")]
-    pub current: EncryptionKeyInfo,
-
-    /// 历史密钥（已废弃但保留用于解密旧文件）
-    #[serde(rename = "key_history", default)]
-    pub history: Vec<EncryptionKeyInfo>,
+    pub passphrase: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
 }
 
 // ============================================================================
@@ -367,79 +322,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encryption_algorithm_display() {
-        assert_eq!(format!("{}", EncryptionAlgorithm::Age), "age");
-    }
-
-    #[test]
-    fn test_encryption_algorithm_serde() {
-        let algo = EncryptionAlgorithm::Age;
-        let json = serde_json::to_string(&algo).unwrap();
-        assert_eq!(json, "\"age\"");
-        let parsed: EncryptionAlgorithm = serde_json::from_str("\"age\"").unwrap();
-        assert_eq!(parsed, EncryptionAlgorithm::Age);
-    }
-
-    #[test]
     fn test_encryption_key_info_is_valid() {
         let valid_key = EncryptionKeyInfo {
-            master_key: "dGVzdGtleQ==".to_string(),
-            algorithm: EncryptionAlgorithm::Age,
-            key_version: 1,
-            created_at: 1702454400000,
-            last_used_at: None,
-            deprecated_at: None,
+            passphrase: "user supplied passphrase".to_string(),
         };
         assert!(valid_key.is_valid());
 
         let empty_key = EncryptionKeyInfo {
-            master_key: "".to_string(),
-            algorithm: EncryptionAlgorithm::Age,
-            key_version: 1,
-            created_at: 1702454400000,
-            last_used_at: None,
-            deprecated_at: None,
+            passphrase: "".to_string(),
         };
         assert!(!empty_key.is_valid());
-
-        let zero_version_key = EncryptionKeyInfo {
-            master_key: "dGVzdGtleQ==".to_string(),
-            algorithm: EncryptionAlgorithm::Age,
-            key_version: 0,
-            created_at: 1702454400000,
-            last_used_at: None,
-            deprecated_at: None,
-        };
-        assert!(!zero_version_key.is_valid());
     }
 
     #[test]
     fn test_encryption_config_serde() {
         let config = EncryptionConfig {
-            current: EncryptionKeyInfo {
-                master_key: "dGVzdGtleXRlc3RrZXl0ZXN0a2V5dGVzdGtleTE=".to_string(),
-                algorithm: EncryptionAlgorithm::Age,
-                key_version: 2,
-                created_at: 1702454400000,
-                last_used_at: Some(1702454500000),
-                deprecated_at: None,
-            },
-            history: vec![EncryptionKeyInfo {
-                master_key: "b2xka2V5b2xka2V5b2xka2V5b2xka2V5MQ==".to_string(),
-                algorithm: EncryptionAlgorithm::Age,
-                key_version: 1,
-                created_at: 1700000000000,
-                last_used_at: Some(1702454399000),
-                deprecated_at: Some(1702454400000),
-            }],
+            passphrase: "user supplied passphrase".to_string(),
+            created_at: 1702454400000,
+            last_used_at: Some(1702454500000),
         };
 
         let json = serde_json::to_string_pretty(&config).unwrap();
         let parsed: EncryptionConfig = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.current.key_version, 2);
-        assert_eq!(parsed.history.len(), 1);
-        assert_eq!(parsed.history[0].key_version, 1);
+        assert_eq!(parsed.passphrase, "user supplied passphrase");
+        assert!(!json.contains("algorithm"));
+        assert!(!json.contains("history"));
     }
 
     #[test]

@@ -45,30 +45,15 @@ impl<T> ApiResponse<T> {
     }
 }
 
-/// 密钥导出响应
+/// age 口令导出响应
 #[derive(Debug, Serialize)]
 pub struct KeyExportResponse {
-    /// 当前密钥信息
-    pub current_key: KeyInfo,
-    /// 历史密钥列表
-    pub key_history: Vec<KeyInfo>,
-}
-
-/// 密钥信息
-#[derive(Debug, Serialize)]
-pub struct KeyInfo {
-    /// 主密钥（Base64 编码）
-    pub master_key: String,
-    /// 加密算法
-    pub algorithm: String,
-    /// 密钥版本
-    pub key_version: u32,
+    /// 用户提供的 age 口令
+    pub passphrase: String,
     /// 创建时间（Unix 时间戳，毫秒）
     pub created_at: i64,
     /// 最后使用时间
     pub last_used_at: Option<i64>,
-    /// 废弃时间（仅历史密钥）
-    pub deprecated_at: Option<i64>,
 }
 
 /// POST /api/v1/encryption/export-bundle
@@ -142,22 +127,9 @@ pub async fn export_keys(
 
     // 转换为响应格式
     let response = KeyExportResponse {
-        current_key: KeyInfo {
-            master_key: config.current.master_key,
-            algorithm: format!("{:?}", config.current.algorithm).to_lowercase(),
-            key_version: config.current.key_version,
-            created_at: config.current.created_at,
-            last_used_at: config.current.last_used_at,
-            deprecated_at: config.current.deprecated_at,
-        },
-        key_history: config.history.into_iter().map(|k| KeyInfo {
-            master_key: k.master_key,
-            algorithm: format!("{:?}", k.algorithm).to_lowercase(),
-            key_version: k.key_version,
-            created_at: k.created_at,
-            last_used_at: k.last_used_at,
-            deprecated_at: k.deprecated_at,
-        }).collect(),
+        passphrase: config.passphrase,
+        created_at: config.created_at,
+        last_used_at: config.last_used_at,
     };
 
     Ok(Json(ApiResponse::success(response)))
@@ -195,17 +167,14 @@ mod tests {
 
     #[test]
     fn test_key_info_serialization() {
-        let key_info = KeyInfo {
-            master_key: "base64key".to_string(),
-            algorithm: "age".to_string(),
-            key_version: 1,
+        let key_info = KeyExportResponse {
+            passphrase: "user supplied passphrase".to_string(),
             created_at: 1702454400000,
             last_used_at: Some(1702454500000),
-            deprecated_at: None,
         };
 
         let json = serde_json::to_string(&key_info).unwrap();
-        assert!(json.contains("base64key"));
-        assert!(json.contains("age"));
+        assert!(json.contains("user supplied passphrase"));
+        assert!(!json.contains("algorithm"));
     }
 }

@@ -433,11 +433,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/autobackup/cleanup", post(handlers::autobackup::cleanup_records))
         // 🔥 加密API
         .route("/encryption/status", get(handlers::autobackup::get_encryption_status))
-        .route("/encryption/key/generate", post(handlers::autobackup::generate_encryption_key))
-        .route("/encryption/key/import", post(handlers::autobackup::import_encryption_key))
-        .route("/encryption/key/export", get(handlers::autobackup::export_encryption_key))
-        .route("/encryption/key", delete(handlers::autobackup::delete_encryption_key))
-        .route("/encryption/key/force", delete(handlers::autobackup::force_delete_encryption_key))
+        .route(
+            "/encryption/passphrase",
+            post(handlers::autobackup::set_encryption_passphrase)
+                .delete(handlers::autobackup::delete_encryption_passphrase),
+        )
+        .route("/encryption/passphrase/export", get(handlers::autobackup::export_encryption_passphrase))
         // 🔥 分享同步 API
         .route("/share-sync/subscriptions", get(handlers::list_subscriptions))
         .route("/share-sync/subscriptions", post(handlers::create_subscription))

@@ -486,11 +486,6 @@
                         可直接输入一句**你能记住的口令**，age 会自动加盐并加密到文件中。别忘了备份 encryption.json。
                       </template>
                     </el-alert>
-                    <el-button type="primary" style="width: 100%" @click="handleGenerateKey">
-                      <el-icon><Key /></el-icon>
-                      生成随机口令
-                    </el-button>
-                    <el-divider>或</el-divider>
                     <el-form-item label="设置口令">
                       <el-input v-model="encryptionKey" type="password" show-password placeholder="输入你记住的口令（任意长度）" />
                     </el-form-item>
@@ -987,10 +982,9 @@ import {
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
 import {
   getEncryptionStatus,
-  generateEncryptionKey,
-  importEncryptionKey,
-  exportEncryptionKey,
-  deleteEncryptionKey,
+  setEncryptionPassphrase,
+  exportEncryptionPassphrase,
+  deleteEncryptionPassphrase,
   getWatchCapability,
   getTriggerConfig,
   updateTriggerConfig,
@@ -1471,19 +1465,6 @@ function handleDownloadScheduledTimeChange(time: Date | null) {
   }
 }
 
-// 生成随机口令
-async function handleGenerateKey() {
-  try {
-    const key = await generateEncryptionKey()
-    encryptionKey.value = key
-    showKeyDialog.value = true
-    await loadEncryptionStatus()
-    ElMessage.success('随机口令生成成功，请妥善保管')
-  } catch (error: any) {
-    ElMessage.error('生成口令失败: ' + (error.message || '未知错误'))
-  }
-}
-
 // 设置口令
 async function handleImportKey() {
   if (!encryptionKey.value) {
@@ -1491,7 +1472,7 @@ async function handleImportKey() {
     return
   }
   try {
-    await importEncryptionKey(encryptionKey.value)
+    await setEncryptionPassphrase(encryptionKey.value)
     encryptionKey.value = ''
     await loadEncryptionStatus()
     ElMessage.success('口令设置成功（age scrypt 自动加盐硬化）')
@@ -1503,7 +1484,7 @@ async function handleImportKey() {
 // 导出密钥
 async function handleExportKey() {
   try {
-    const key = await exportEncryptionKey()
+    const key = await exportEncryptionPassphrase()
     encryptionKey.value = key
     showKeyDialog.value = true
   } catch (error: any) {
@@ -1523,7 +1504,7 @@ async function handleDeleteKey() {
           type: 'error',
         }
     )
-    await deleteEncryptionKey()
+    await deleteEncryptionPassphrase()
     await loadEncryptionStatus()
     ElMessage.success('密钥已删除')
   } catch (error: any) {

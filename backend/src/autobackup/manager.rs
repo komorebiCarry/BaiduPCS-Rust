@@ -164,30 +164,26 @@ impl AutoBackupManager {
         let config_dir = config_path.parent().unwrap_or(Path::new("."));
         let encryption_config_store = Arc::new(EncryptionConfigStore::new(config_dir));
 
-        // 尝试从 encryption.json 加载已保存的密钥
+        // 只从 encryption.json 加载用户明确配置的 age 口令。
+        // 缺失、损坏或旧格式配置都不会触发任何自动生成或兼容回退。
         let (encryption_service, encryption_config) = match encryption_config_store.load() {
             Ok(Some(key_config)) => {
                 tracing::info!(
-                    "从 encryption.json 加载加密密钥成功, key_version={}, algorithm={:?}, history_count={}",
-                    key_config.current.key_version,
-                    key_config.current.algorithm,
-                    key_config.history.len()
+                    "从 encryption.json 加载用户 age 口令成功"
                 );
-                match EncryptionService::from_base64_key(&key_config.current.master_key, key_config.current.algorithm) {
+                match EncryptionService::new(key_config.passphrase.clone()) {
                     Ok(service) => {
                         let config = EncryptionConfig {
                             enabled: true,
-                            master_key: Some(key_config.current.master_key),
-                            algorithm: key_config.current.algorithm,
-                            key_created_at: Some(chrono::DateTime::from_timestamp_millis(key_config.current.created_at)
+                            passphrase: Some(key_config.passphrase),
+                            key_created_at: Some(chrono::DateTime::from_timestamp_millis(key_config.created_at)
                                 .unwrap_or_else(chrono::Utc::now)),
-                            key_version: key_config.current.key_version,
-                            last_used_at: None,
+                            last_used_at: key_config.last_used_at,
                         };
                         (Some(service), config)
                     }
                     Err(e) => {
-                        tracing::warn!("加载加密密钥失败，密钥可能已损坏: {}", e);
+                        tracing::warn!("加载用户 age 口令失败，不启用加密: {}", e);
                         (None, EncryptionConfig::default())
                     }
                 }
@@ -645,8 +641,8 @@ impl AutoBackupManager {
         // 验证加密选项
         if request.encrypt_enabled {
             let encryption_config = self.encryption_config.read();
-            if !encryption_config.enabled || encryption_config.master_key.is_none() {
-                return Err(anyhow!("加密功能未启用或密钥未配置"));
+            if !encryption_config.is_key_valid() {
+                return Err(anyhow!("加密功能未启用或用户 age 口令未配置"));
             }
         }
 
@@ -1443,24 +1439,14 @@ impl AutoBackupManager {
         ws_manager: Arc<RwLock<Option<Weak<WebSocketManager>>>>,
         record_manager: Arc<BackupRecordManager>,
         _configs: Arc<DashMap<String, BackupConfig>>,
-        encryption_config_store: Arc<EncryptionConfigStore>,
+        _encryption_config_store: Arc<EncryptionConfigStore>,
     ) -> Result<()> {
         use crate::uploader::{BatchedScanIterator, ScanOptions, SCAN_BATCH_SIZE};
 
         tracing::info!("开始执行备份任务: task={}, config={}", task_id, config.id);
 
-        // 🔥 获取当前密钥版本号（用于文件夹加密映射）
-        let current_key_version = match encryption_config_store.get_current_key() {
-            Ok(Some(key_info)) => key_info.key_version,
-            Ok(None) => {
-                tracing::warn!("execute_backup_task_internal: 未找到加密密钥，使用默认版本 1");
-                1u32
-            }
-            Err(e) => {
-                tracing::warn!("execute_backup_task_internal: 获取密钥版本失败: {}，使用默认版本 1", e);
-                1u32
-            }
-        };
+        // age 只使用当前用户口令；版本号仅作为固定的映射元数据。
+        let current_key_version = crate::encryption::AGE_KEY_VERSION;
 
         // 更新任务状态为准备中
         if let Some(mut task) = tasks.get_mut(&task_id) {
@@ -3900,46 +3886,26 @@ impl AutoBackupManager {
 
     // ==================== 加密管理 ====================
 
-    /// 配置加密密钥
+    /// 配置用户提供的 age 口令。
     ///
-    /// 配置后会自动持久化到 encryption.json 文件
-    /// 如果已有密钥配置，会将当前密钥移到历史，保留历史密钥用于解密旧文件
-    pub fn configure_encryption(&self, key_base64: &str, algorithm: EncryptionAlgorithm) -> Result<()> {
-        let service = EncryptionService::from_base64_key(key_base64, algorithm)?;
+    /// 新口令会替换旧口令，不保存历史口令，也不接受算法参数。
+    pub fn configure_encryption(&self, passphrase: &str) -> Result<()> {
+        let service = EncryptionService::new(passphrase.to_string())?;
+        let key_config = self
+            .encryption_config_store
+            .set_passphrase(passphrase.to_string())?;
 
         let mut encryption_service = self.encryption_service.write();
         *encryption_service = Some(service);
 
-        // 使用安全方法持久化密钥到 encryption.json（保留历史密钥）
-        let key_config = self.encryption_config_store.create_new_key_safe(
-            key_base64.to_string(),
-            algorithm,
-        )?;
-
         let mut encryption_config = self.encryption_config.write();
         encryption_config.enabled = true;
-        encryption_config.master_key = Some(key_base64.to_string());
-        encryption_config.algorithm = algorithm;
-        encryption_config.key_created_at = Some(Utc::now());
-        // 同步 key_version 到内存配置，确保与持久化配置一致
-        encryption_config.key_version = key_config.current.key_version;
+        encryption_config.passphrase = Some(passphrase.to_string());
+        encryption_config.key_created_at = chrono::DateTime::from_timestamp_millis(key_config.created_at);
+        encryption_config.last_used_at = key_config.last_used_at;
 
-        tracing::info!(
-            "Encryption configured with algorithm: {:?}, key_version: {}, history_count: {}",
-            algorithm,
-            key_config.current.key_version,
-            key_config.history.len()
-        );
+        tracing::info!("已配置用户提供的 age 口令，不保留历史口令");
         Ok(())
-    }
-
-    /// 生成新密钥
-    ///
-    /// 生成后会自动持久化到 encryption.json 文件
-    pub fn generate_encryption_key(&self, algorithm: EncryptionAlgorithm) -> Result<String> {
-        let key_base64 = EncryptionService::generate_master_key_base64();
-        self.configure_encryption(&key_base64, algorithm)?;
-        Ok(key_base64)
     }
 
     /// 删除加密密钥
@@ -3954,38 +3920,12 @@ impl AutoBackupManager {
 
         let mut encryption_config = self.encryption_config.write();
         encryption_config.enabled = false;
-        encryption_config.master_key = None;
+        encryption_config.passphrase = None;
         encryption_config.key_created_at = None;
-        encryption_config.key_version = 0;
 
-        // age 格式无需历史密钥，直接全部清除
-        self.encryption_config_store.force_delete()?;
+        self.encryption_config_store.delete()?;
 
-        tracing::info!("Encryption key deleted (age format - no history needed)");
-        Ok(())
-    }
-
-    /// 强制删除所有加密密钥（包括历史）
-    ///
-    /// 警告：这将导致无法解密任何已加密的文件。
-    /// 仅在用户明确要求完全清除所有密钥时使用。
-    ///
-    /// # Requirements
-    /// - 17.3: 提供完全删除所有密钥（包括历史）的选项
-    pub fn force_delete_encryption_key(&self) -> Result<()> {
-        let mut encryption_service = self.encryption_service.write();
-        *encryption_service = None;
-
-        let mut encryption_config = self.encryption_config.write();
-        encryption_config.enabled = false;
-        encryption_config.master_key = None;
-        encryption_config.key_created_at = None;
-        encryption_config.key_version = 0;
-
-        // 完全删除配置文件（包括历史密钥）
-        self.encryption_config_store.force_delete()?;
-
-        tracing::warn!("All encryption keys deleted including history - encrypted files cannot be decrypted");
+        tracing::info!("用户 age 口令已删除");
         Ok(())
     }
 
@@ -3994,8 +3934,7 @@ impl AutoBackupManager {
         let config = self.encryption_config.read();
         EncryptionStatus {
             enabled: config.enabled,
-            has_key: config.master_key.is_some(),
-            algorithm: config.algorithm,
+            has_key: config.is_key_valid(),
             key_created_at: config.key_created_at,
         }
     }
@@ -4005,14 +3944,12 @@ impl AutoBackupManager {
         match self.encryption_config.try_read() {
             Some(config) => EncryptionStatus {
                 enabled: config.enabled,
-                has_key: config.master_key.is_some(),
-                algorithm: config.algorithm,
+                has_key: config.is_key_valid(),
                 key_created_at: config.key_created_at,
             },
             None => EncryptionStatus {
                 enabled: false,
                 has_key: false,
-                algorithm: super::config::EncryptionAlgorithm::Age,
                 key_created_at: None,
             },
         }
@@ -4021,8 +3958,10 @@ impl AutoBackupManager {
     /// 导出加密密钥
     pub fn export_encryption_key(&self) -> Result<String> {
         let config = self.encryption_config.read();
-        config.master_key.clone()
-            .ok_or_else(|| anyhow!("加密密钥未配置"))
+        config
+            .passphrase
+            .clone()
+            .ok_or_else(|| anyhow!("用户 age 口令未配置"))
     }
 
     // ==================== 去重服务 ====================
@@ -4486,7 +4425,7 @@ impl AutoBackupManager {
 
         // 检查加密密钥状态 - 使用 try_read 避免阻塞
         let encryption_key_ok = self.encryption_config.try_read()
-            .map(|config| !config.enabled || config.master_key.is_some())
+            .map(|config| !config.enabled || config.is_key_valid())
             .unwrap_or(true);
 
         // 检查文件监听状态 - 使用 try_read 避免阻塞
@@ -7242,15 +7181,11 @@ impl AutoBackupManager {
         };
 
         // 阶段 3：创建快照记录
-        let encryption_config = self.encryption_config.read();
-        // 标记加密算法为 age 格式（age-encryption.org/v1），供解密参考
-        let algorithm_str = "age";
-        let key_version = encryption_config.key_version;
-        drop(encryption_config);
+        let key_version = crate::encryption::AGE_KEY_VERSION;
 
         tracing::info!(
-            "自动备份加密上传: file={}, encrypted_name={}, key_version={}, algorithm={}",
-            file_name, encrypted_name, key_version, algorithm_str
+            "自动备份 age 加密上传: file={}, encrypted_name={}, key_version={}",
+            file_name, encrypted_name, key_version
         );
 
         // 计算加密后的远程路径
@@ -10129,18 +10064,8 @@ impl AutoBackupManager {
         base_remote_path: &str,
         relative_path: &str,
     ) -> Result<String> {
-        // 🔥 获取当前密钥版本号
-        let current_key_version = match self.encryption_config_store.get_current_key() {
-            Ok(Some(key_info)) => key_info.key_version,
-            Ok(None) => {
-                tracing::warn!("encrypt_folder_path: 未找到加密密钥，使用默认版本 1");
-                1u32
-            }
-            Err(e) => {
-                tracing::warn!("encrypt_folder_path: 获取密钥版本失败: {}，使用默认版本 1", e);
-                1u32
-            }
-        };
+        // 版本号只是固定的 age 映射元数据，不用于选择其他口令。
+        let current_key_version = crate::encryption::AGE_KEY_VERSION;
 
         // 将相对路径分割为各个部分
         let normalized_path = relative_path.replace('\\', "/");
@@ -10267,7 +10192,6 @@ impl AutoBackupManager {
 pub struct EncryptionStatus {
     pub enabled: bool,
     pub has_key: bool,
-    pub algorithm: EncryptionAlgorithm,
     pub key_created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
