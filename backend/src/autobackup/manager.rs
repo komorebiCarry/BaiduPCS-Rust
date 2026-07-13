@@ -5,7 +5,8 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use crate::common::{ProxyConfig, ProxyFallbackManager};
@@ -22,12 +23,74 @@ use super::config::*;
 use crate::encryption::{EncryptionConfigStore, EncryptionService, SnapshotManager};
 use super::persistence::BackupPersistenceManager;
 use super::priority::{PrepareResourcePool, PriorityManager};
-use super::record::{BackupRecordManager, calculate_head_md5};
+use super::record::{
+    BackupRecordManager, EncryptionSnapshot, calculate_full_md5, calculate_head_md5,
+};
 use super::scheduler::{ChangeAggregator, ChangeEvent, PollScheduler, PollScheduleConfig, ScheduledTime, TaskController, TriggerSource, task_loop};
 use super::task::*;
 use super::validation::{validate_for_create, validate_for_update, validate_for_execute};
 use super::scan_cache::ScanCacheManager;
 use super::watcher::{FileChangeEvent, FileWatcher};
+
+/// 同一个主任务的执行认领凭证。
+///
+/// 任务状态本身用于持久化恢复和配置级唯一约束；这张进程内表负责保护
+/// “同一条 Queued 记录被两个恢复流程同时拿到”这一瞬间。凭证用 RAII
+/// 生命周期管理，执行函数无论正常返回还是报错都会释放。
+struct BackupExecutionClaim {
+    claims: Arc<ParkingMutex<HashMap<String, String>>>,
+    config_id: String,
+    task_id: String,
+}
+
+impl Drop for BackupExecutionClaim {
+    fn drop(&mut self) {
+        let mut claims = self.claims.lock();
+        if matches!(claims.get(&self.config_id), Some(owner) if owner == &self.task_id) {
+            claims.remove(&self.config_id);
+        }
+    }
+}
+
+/// 配置级稳定父记录。它代表一个被维护的文件夹，而不是一次触发。
+fn folder_task_id(config_id: &str) -> String {
+    format!("folder:{}", config_id)
+}
+
+fn is_folder_task_id(task_id: &str) -> bool {
+    task_id.starts_with("folder:")
+}
+
+fn remote_path_is_under_root(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return path.starts_with('/');
+    }
+    path == root
+        || path
+            .strip_prefix(root)
+            .map(|suffix| suffix.starts_with('/'))
+            .unwrap_or(false)
+}
+
+fn normalize_snapshot_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
+#[derive(Debug, Clone)]
+struct LocalFolderFile {
+    task: BackupFileTask,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteFolderFile {
+    fs_id: u64,
+    size: u64,
+    mtime: i64,
+    md5: Option<String>,
+}
 
 /// 自动备份管理器
 pub struct AutoBackupManager {
@@ -35,6 +98,17 @@ pub struct AutoBackupManager {
     configs: Arc<DashMap<String, BackupConfig>>,
     /// 备份任务存储
     tasks: Arc<DashMap<String, BackupTask>>,
+    /// 配置和主任务登记的串行化闸门。
+    ///
+    /// DashMap 只能保证单次 get/insert 的线程安全，不能保证“检查冲突 →
+    /// 生成状态 → 持久化 → 发布到内存”这一整段复合操作的原子性。手动、
+    /// Watch、Poll 以及配置变更统一经过此闸门；SQLite 的部分唯一索引再作为
+    /// 跨管理器/跨进程的最终约束。
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 文件夹清单扫描与用户暂停/恢复之间的串行化锁。
+    folder_operation_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 同一主任务的进程内执行认领表，防止恢复流程重复执行同一 task_id。
+    execution_claims: Arc<ParkingMutex<HashMap<String, String>>>,
     /// 记录管理器
     record_manager: Arc<BackupRecordManager>,
     /// 快照管理器
@@ -212,6 +286,9 @@ impl AutoBackupManager {
         let manager = Self {
             configs: Arc::new(DashMap::new()),
             tasks: Arc::new(DashMap::new()),
+            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            folder_operation_locks: Arc::new(DashMap::new()),
+            execution_claims: Arc::new(ParkingMutex::new(HashMap::new())),
             record_manager,
             snapshot_manager,
             encryption_service: Arc::new(RwLock::new(encryption_service)),
@@ -245,6 +322,10 @@ impl AutoBackupManager {
         // 加载已保存的配置
         manager.load_configs().await?;
 
+        // Upload 只使用配置级稳定文件夹清单。旧版按触发创建的 UUID
+        // 任务没有恢复价值，启动时直接删除主任务及其文件行。
+        manager.discard_legacy_upload_tasks()?;
+
         // 恢复未完成的任务
         manager.restore_incomplete_tasks()?;
 
@@ -253,19 +334,10 @@ impl AutoBackupManager {
         // 且加密速度远快于上传，直接删除最安全。
         manager.cleanup_stale_temp_files()?;
 
-        // 🔥 执行兜底同步：同步历史归档中已完成的备份任务到 backup_file_tasks 表
-        manager.sync_completed_backup_tasks_from_history()?;
-
         Ok(manager)
     }
 
-    /// 🔥 兜底同步：从历史归档表同步已完成的备份任务到 backup_file_tasks 表
-    ///
-    /// 防止服务重启时数据库和 WAL、元数据不一致的情况：
-    /// - 当上传/下载任务已归档到 task_history 表（is_backup=1, status='completed'）
-    /// - 但对应的 backup_file_tasks 表中的状态可能还未更新
-    /// - 此方法会根据 related_task_id 找到对应的备份文件任务并更新状态
-    /// 启动时清理孤立的临时加密文件
+    /// 启动时清理孤立的临时加密文件。
     ///
     /// 服务重启后 temp_dir 中的 .age / .age.tmp 文件均为孤儿：
     /// - encrypted_temp_path 不持久化到数据库，无法追溯归属
@@ -320,62 +392,29 @@ impl AutoBackupManager {
         Ok(())
     }
 
-    fn sync_completed_backup_tasks_from_history(&self) -> anyhow::Result<()> {
-        use crate::persistence::HistoryDbManager;
+    /// 丢弃旧版 Upload 任务状态。
+    ///
+    /// 稳定清单只保留 `folder:<config_id>` 主记录；所有旧版按触发创建的
+    /// UUID 主任务及其文件行都不再迁移、恢复或从历史表补偿。
+    fn discard_legacy_upload_tasks(&self) -> anyhow::Result<()> {
+        let upload_config_ids: Vec<String> = self
+            .configs
+            .iter()
+            .filter(|config| config.direction == BackupDirection::Upload)
+            .map(|config| config.id.clone())
+            .collect();
 
-        // 创建历史数据库管理器（只读查询）
-        let history_db = match HistoryDbManager::new(&self.db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!("兜底同步: 无法连接历史数据库，跳过同步: {}", e);
-                return Ok(());
-            }
-        };
-
-        // 查询所有已完成的备份任务
-        let completed_backup_tasks = match history_db.load_completed_backup_tasks() {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::warn!("兜底同步: 查询已完成备份任务失败，跳过同步: {}", e);
-                return Ok(());
-            }
-        };
-
-        if completed_backup_tasks.is_empty() {
-            tracing::debug!("兜底同步: 没有需要同步的已完成备份任务");
-            return Ok(());
-        }
-
-        tracing::info!(
-            "兜底同步: 发现 {} 个已完成的备份任务，开始同步到 backup_file_tasks 表",
-            completed_backup_tasks.len()
-        );
-
-        // 批量更新备份文件任务状态
-        // task_id 在 task_history 中是上传/下载任务的 ID，对应 backup_file_tasks 中的 related_task_id
-        let affected_backup_task_ids = match self.persistence_manager.complete_file_tasks_by_related_task_ids(&completed_backup_tasks) {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!("兜底同步: 批量更新备份文件任务失败: {}", e);
-                return Ok(());
-            }
-        };
-
-        // 重新计算受影响的主任务进度
-        for backup_task_id in &affected_backup_task_ids {
-            if let Err(e) = self.persistence_manager.recalculate_task_progress(backup_task_id) {
-                tracing::warn!(
-                    "兜底同步: 重新计算主任务进度失败: backup_task_id={}, error={}",
-                    backup_task_id, e
+        for config_id in upload_config_ids {
+            let discarded = self
+                .persistence_manager
+                .discard_legacy_tasks_for_config(&config_id)?;
+            if discarded > 0 {
+                tracing::info!(
+                    "已丢弃旧版 Upload 备份任务: config={}, tasks={}",
+                    config_id,
+                    discarded
                 );
             }
-        }
-
-        if !affected_backup_task_ids.is_empty() {
-            tracing::info!(
-                "兜底同步完成: 更新了 {} 个主任务的进度",
-                affected_backup_task_ids.len()
-            );
         }
 
         Ok(())
@@ -399,6 +438,21 @@ impl AutoBackupManager {
         tracing::info!("恢复 {} 个未完成的备份任务", tasks.len());
 
         for mut task in tasks {
+            if self
+                .configs
+                .get(&task.config_id)
+                .map(|config| {
+                    config.direction == BackupDirection::Upload
+                        && !is_folder_task_id(&task.id)
+                })
+                .unwrap_or(false)
+            {
+                // 防御性处理：启动清理已覆盖正常路径；若任务在两次恢复调用
+                // 之间写入，也不能让旧 Upload 状态机重新进入内存。
+                self.persistence_manager.delete_task(&task.id)?;
+                continue;
+            }
+
             let task_id = task.id.clone();
             let old_status = task.status;
 
@@ -622,6 +676,9 @@ impl AutoBackupManager {
 
     /// 创建备份配置
     pub async fn create_config(&self, request: CreateBackupConfigRequest) -> Result<BackupConfig> {
+        // 冲突检查和落盘必须在同一个临界区内完成；否则两个并发请求会同时
+        // 看到同一份旧快照并各自通过校验。
+        let _mutation_guard = self.mutation_lock.lock().await;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
 
@@ -677,14 +734,34 @@ impl AutoBackupManager {
             owner_uid: request.uid,
         };
 
-        // 保存配置
+        // 先更新内存，再以原子替换方式落盘；落盘失败时回滚内存，不能留下
+        // “接口报错但配置已经生效”的半状态。
         self.configs.insert(id.clone(), config.clone());
-        self.save_configs().await?;
+        if let Err(e) = self.save_configs().await {
+            self.configs.remove(&id);
+            return Err(e);
+        }
 
         // 启动监听和轮询
         if config.enabled {
-            self.start_config_services(&config).await?;
+            if let Err(e) = self.start_config_services(&config).await {
+                self.configs.remove(&id);
+                let _ = self.save_configs().await;
+                return Err(e);
+            }
         }
+
+        // Upload 配置创建时就建立稳定的文件夹父记录；之后所有触发只会唤醒
+        // 这个记录对应的扫描器，不再新建一次性主任务。
+        if config.direction == BackupDirection::Upload {
+            if let Err(e) = self.ensure_folder_task_locked(&config, TriggerType::Poll) {
+                self.configs.remove(&id);
+                let _ = self.save_configs().await;
+                return Err(e);
+            }
+        }
+
+        drop(_mutation_guard);
 
         tracing::info!("Created backup config: {} ({})", config.name, config.id);
 
@@ -714,7 +791,9 @@ impl AutoBackupManager {
 
     /// 更新备份配置
     pub async fn update_config(&self, id: &str, request: UpdateBackupConfigRequest) -> Result<BackupConfig> {
-        let mut config = self.configs.get_mut(id)
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let old_config = self.configs.get(id)
+            .map(|config| config.clone())
             .ok_or_else(|| anyhow!("配置不存在: {}", id))?;
 
         // 验证：encrypt_enabled 创建后不可修改（硬性约束 1.5.3）
@@ -725,10 +804,10 @@ impl AutoBackupManager {
         // 构建更新后的路径用于校验
         let updated_local_path = request.local_path.as_ref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| config.local_path.clone());
+            .unwrap_or_else(|| old_config.local_path.clone());
         let updated_remote_path = request.remote_path.as_ref()
             .cloned()
-            .unwrap_or_else(|| config.remote_path.clone());
+            .unwrap_or_else(|| old_config.remote_path.clone());
 
         // 获取所有现存配置用于校验
         let existing_configs: Vec<BackupConfig> = self.configs.iter().map(|c| c.clone()).collect();
@@ -736,69 +815,82 @@ impl AutoBackupManager {
             id,
             &updated_local_path,
             &updated_remote_path,
-            config.direction, // direction 不可更新，使用原值
+            old_config.direction, // direction 不可更新，使用原值
             &existing_configs,
         );
         if conflict_result.has_conflict {
             return Err(anyhow!(conflict_result.error_message.unwrap_or_else(|| "配置冲突".to_string())));
         }
 
-        // 停止旧的服务
-        self.stop_config_services(id).await?;
-
-        // 更新字段
+        // 在临时副本上完成所有字段变更，任何校验失败都不会破坏旧配置。
+        let mut updated_config = old_config.clone();
         if let Some(name) = request.name {
-            config.name = name;
+            updated_config.name = name;
         }
         if let Some(local_path) = request.local_path {
-            config.local_path = PathBuf::from(local_path);
+            updated_config.local_path = PathBuf::from(local_path);
         }
         if let Some(remote_path) = request.remote_path {
-            config.remote_path = remote_path;
+            updated_config.remote_path = remote_path;
         }
         if let Some(watch_config) = request.watch_config {
             // 验证下载备份不能启用监听
-            if config.direction == BackupDirection::Download && watch_config.enabled {
+            if updated_config.direction == BackupDirection::Download && watch_config.enabled {
                 return Err(anyhow!("下载备份不支持文件监听"));
             }
-            config.watch_config = watch_config;
+            updated_config.watch_config = watch_config;
         }
         if let Some(poll_config) = request.poll_config {
-            config.poll_config = poll_config;
+            updated_config.poll_config = poll_config;
         }
         if let Some(filter_config) = request.filter_config {
-            config.filter_config = filter_config;
+            updated_config.filter_config = filter_config;
         }
         if let Some(enabled) = request.enabled {
-            config.enabled = enabled;
+            updated_config.enabled = enabled;
         }
 
         // 更新冲突策略字段
         if let Some(upload_strategy) = request.upload_conflict_strategy {
-            config.upload_conflict_strategy = Some(upload_strategy);
+            updated_config.upload_conflict_strategy = Some(upload_strategy);
         }
         if let Some(download_strategy) = request.download_conflict_strategy {
-            config.download_conflict_strategy = Some(download_strategy);
+            updated_config.download_conflict_strategy = Some(download_strategy);
         }
         if let Some(sync_strategy) = request.sync_conflict_strategy {
-            config.sync_conflict_strategy = Some(sync_strategy);
+            updated_config.sync_conflict_strategy = Some(sync_strategy);
         }
         if let Some(sync_init) = request.sync_init_mode {
-            config.sync_init_mode = Some(sync_init);
+            updated_config.sync_init_mode = Some(sync_init);
         }
 
-        config.updated_at = Utc::now();
+        updated_config.updated_at = Utc::now();
 
-        let updated_config = config.clone();
-        drop(config);
-
-        // 保存配置
-        self.save_configs().await?;
+        // 停止旧服务、替换内存配置、原子落盘，全部受同一把锁保护。
+        self.stop_config_services(id).await?;
+        self.configs.insert(id.to_string(), updated_config.clone());
+        if let Err(e) = self.save_configs().await {
+            self.configs.insert(id.to_string(), old_config.clone());
+            let _ = self.save_configs().await;
+            if old_config.enabled {
+                let _ = self.start_config_services(&old_config).await;
+            }
+            return Err(e);
+        }
 
         // 重新启动服务
         if updated_config.enabled {
-            self.start_config_services(&updated_config).await?;
+            if let Err(e) = self.start_config_services(&updated_config).await {
+                self.configs.insert(id.to_string(), old_config.clone());
+                let _ = self.save_configs().await;
+                if old_config.enabled {
+                    let _ = self.start_config_services(&old_config).await;
+                }
+                return Err(e);
+            }
         }
+
+        drop(_mutation_guard);
 
         tracing::info!("Updated backup config: {} ({})", updated_config.name, updated_config.id);
         Ok(updated_config)
@@ -806,6 +898,14 @@ impl AutoBackupManager {
 
     /// 删除备份配置
     pub async fn delete_config(&self, id: &str) -> Result<()> {
+        // 删除期间禁止新的手动/自动触发完成主任务登记，避免配置删除和
+        // 任务创建交错后又把孤儿任务写回数据库。
+        let _mutation_guard = self.mutation_lock.lock().await;
+
+        if !self.configs.contains_key(id) {
+            return Err(anyhow!("配置不存在: {}", id));
+        }
+
         // 停止服务
         self.stop_config_services(id).await?;
 
@@ -865,6 +965,15 @@ impl AutoBackupManager {
             }
         }
 
+        // 稳定文件夹父记录在空闲时是 Completed，服务重启后不会进入
+        // self.tasks；删除配置时仍必须显式删除它及其文件清单，避免留下
+        // 指向已不存在配置的 folder:<config_id> 孤儿表。
+        let stable_task_id = folder_task_id(id);
+        self.tasks.remove(&stable_task_id);
+        if let Err(e) = self.persistence_manager.delete_task(&stable_task_id) {
+            tracing::warn!("删除稳定文件夹任务 {} 失败: {}", stable_task_id, e);
+        }
+
         // 🔥 内存优化：删除配置对应的任务控制器
         if self.task_controllers.remove(id).is_some() {
             tracing::info!("已删除配置 {} 的任务控制器", id);
@@ -887,8 +996,15 @@ impl AutoBackupManager {
 
         // 🔥 移除旧的快照删除逻辑 —— 加密映射表由加密模块独立管理生命周期
 
-        // 保存配置
-        self.save_configs().await?;
+        // 保存配置；失败时恢复内存中的配置，避免出现“配置文件仍存在但内存
+        // 已删除”的分裂状态。
+        if let Err(e) = self.save_configs().await {
+            self.configs.insert(id.to_string(), config.1.clone());
+            if config.1.enabled {
+                let _ = self.start_config_services(&config.1).await;
+            }
+            return Err(e);
+        }
 
         tracing::info!("Deleted backup config: {} ({})", config.1.name, id);
 
@@ -906,6 +1022,8 @@ impl AutoBackupManager {
 
         // 如果没有配置了，停止全局监听器和调度器
         self.cleanup_idle_services().await;
+
+        drop(_mutation_guard);
 
         Ok(())
     }
@@ -966,13 +1084,7 @@ impl AutoBackupManager {
             .iter()
             .filter(|t| {
                 t.owner_uid == Some(owner_uid)
-                    && matches!(
-                        t.status,
-                        BackupTaskStatus::Queued
-                            | BackupTaskStatus::Preparing
-                            | BackupTaskStatus::Transferring
-                            | BackupTaskStatus::Paused
-                    )
+                    && t.status.is_active()
             })
             .count()
     }
@@ -1053,13 +1165,10 @@ impl AutoBackupManager {
         &self.record_manager
     }
 
-    /// 检查配置是否有正在运行的任务（Preparing 或 Transferring）
+    /// 检查配置是否有占用唯一槽位的活跃任务。
     pub fn has_active_tasks(&self, config_id: &str) -> bool {
         self.tasks.iter().any(|t| {
-            t.config_id == config_id && matches!(
-                t.status,
-                BackupTaskStatus::Preparing | BackupTaskStatus::Transferring
-            )
+            t.config_id == config_id && t.status.is_active()
         })
     }
 
@@ -1078,6 +1187,7 @@ impl AutoBackupManager {
 
     /// 重置 Sync 配置的同步状态并标记需要全量同步
     pub async fn reset_sync_state(&self, config_id: &str) -> Result<usize> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         use super::sync::state_manager::SyncStateManager;
 
         let sync_db_path = self.db_path.parent()
@@ -1213,34 +1323,203 @@ impl AutoBackupManager {
 
     // ==================== 任务管理 ====================
 
+    fn folder_operation_lock(&self, config_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.folder_operation_locks
+            .entry(config_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// 获取或创建配置级稳定父记录。
+    ///
+    /// Upload 备份不再为每次手动/自动触发创建新的 BackupTask；这个记录的
+    /// 生命周期与文件夹配置一致，下面的 `backup_file_tasks` 行才是实际的
+    /// 待上传队列。旧版按触发创建的 UUID Upload 任务不会被恢复。
+    async fn ensure_folder_task(&self, config: &BackupConfig, trigger_type: TriggerType) -> Result<String> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        self.ensure_folder_task_locked(config, trigger_type)
+    }
+
+    /// 调用方已持有 `mutation_lock` 时使用的稳定父记录初始化路径。
+    fn ensure_folder_task_locked(&self, config: &BackupConfig, trigger_type: TriggerType) -> Result<String> {
+        let task_id = folder_task_id(&config.id);
+        if self.tasks.contains_key(&task_id) {
+            return Ok(task_id);
+        }
+
+        let mut task = if let Some(task) = self.persistence_manager.load_task(&task_id)? {
+            task
+        } else {
+            let now = Utc::now();
+            BackupTask {
+                id: task_id.clone(),
+                config_id: config.id.clone(),
+                // 空闲的文件夹父记录使用 Completed 表示“当前清单已收敛”；
+                // 下一次扫描会原子地切到 Preparing/Transferring。
+                status: BackupTaskStatus::Completed,
+                sub_phase: None,
+                trigger_type,
+                pending_files: Vec::new(),
+                completed_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                total_count: 0,
+                transferred_bytes: 0,
+                total_bytes: 0,
+                scan_progress: None,
+                created_at: now,
+                started_at: None,
+                completed_at: Some(now),
+                error_message: None,
+                pending_upload_task_ids: std::collections::HashSet::new(),
+                pending_download_task_ids: std::collections::HashSet::new(),
+                transfer_task_map: std::collections::HashMap::new(),
+                owner_uid: config.owner_uid,
+            }
+        };
+
+        // 配置归属是运行时唯一可信来源；旧数据库行不保存 owner_uid。
+        task.config_id = config.id.clone();
+        task.owner_uid = config.owner_uid;
+        task.trigger_type = trigger_type;
+
+        // 服务刚启动或稳定记录之前处于活动状态时，恢复仍在传输的清单行，
+        // 让完成通知能够继续命中同一个稳定父记录。
+        if task.pending_files.is_empty() {
+            if let Ok(file_tasks) = self.persistence_manager.load_folder_file_tasks(&task_id) {
+                for file_task in file_tasks.into_iter().filter(|file_task| {
+                    !matches!(
+                        file_task.status,
+                        BackupFileStatus::Completed
+                            | BackupFileStatus::Skipped
+                            | BackupFileStatus::Failed
+                    )
+                }) {
+                    if let Some(related_id) = file_task.related_task_id.clone() {
+                        match file_task.backup_operation_type {
+                            Some(BackupOperationType::Download) => {
+                                task.pending_download_task_ids.insert(related_id.clone());
+                            }
+                            _ => {
+                                task.pending_upload_task_ids.insert(related_id.clone());
+                            }
+                        }
+                        task.transfer_task_map.insert(related_id, file_task.id.clone());
+                    }
+                    task.pending_files.push(file_task);
+                }
+            }
+        }
+
+        self.persistence_manager.save_task(&task)?;
+        self.tasks.insert(task_id.clone(), task.clone());
+        self.publish_task_created(&task, config);
+        Ok(task_id)
+    }
+
+    /// 查找配置当前唯一的活跃主任务。
+    ///
+    /// 内存命中用于低延迟，SQLite 查询用于覆盖重启恢复、跨管理器以及
+    /// “已落盘但尚未插入 DashMap”的极短窗口。
+    fn active_task_id(&self, config_id: &str) -> Result<Option<String>> {
+        if let Some(task) = self.tasks.iter().find(|task| {
+            task.config_id == config_id && task.status.is_active()
+        }) {
+            return Ok(Some(task.id.clone()));
+        }
+
+        // 执行凭证可能比终态任务从 DashMap 清理晚一个极短窗口；这时仍要
+        // 把配置视为占用中，避免新任务抢先创建后又无法获得执行权。
+        if let Some(task_id) = self.execution_claims.lock().get(config_id).cloned() {
+            return Ok(Some(task_id));
+        }
+
+        self.persistence_manager.find_active_task_id(config_id)
+    }
+
+    /// 检查主任务唯一性。调用方必须已经持有 `mutation_lock`。
+    fn ensure_no_active_task_locked(&self, config: &BackupConfig) -> Result<()> {
+        if let Some(task_id) = self.active_task_id(&config.id)? {
+            return Err(anyhow!(
+                "配置 {} 已有活跃备份任务 {}，拒绝创建第二个任务",
+                config.name,
+                task_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// 原子认领一个主任务的执行权。
+    fn claim_execution_static(
+        claims: &Arc<ParkingMutex<HashMap<String, String>>>,
+        config_id: &str,
+        task_id: &str,
+    ) -> Result<BackupExecutionClaim> {
+        let mut active_claims = claims.lock();
+        if let Some(existing_task_id) = active_claims.get(config_id) {
+            return Err(anyhow!(
+                "配置 {} 的备份任务 {} 已被执行，拒绝重复执行任务 {}",
+                config_id,
+                existing_task_id,
+                task_id
+            ));
+        }
+
+        active_claims.insert(config_id.to_string(), task_id.to_string());
+        drop(active_claims);
+
+        Ok(BackupExecutionClaim {
+            claims: Arc::clone(claims),
+            config_id: config_id.to_string(),
+            task_id: task_id.to_string(),
+        })
+    }
+
     /// 手动触发备份
     pub async fn trigger_backup(&self, config_id: &str) -> Result<String> {
         let config = self.get_config(config_id)
             .ok_or_else(|| anyhow!("配置不存在: {}", config_id))?;
 
-        // 🔥 冲突检测：检查是否有正在扫描中的任务（Preparing 状态）
-        // 无论是手动触发还是自动触发的扫描，都不允许重复触发
-        let is_scanning = self.tasks.iter()
-            .any(|t| t.config_id == config_id && t.status == BackupTaskStatus::Preparing);
-
-        if is_scanning {
+        // Upload 备份采用配置级稳定文件夹记录。手动触发只是提交一次扫描
+        // 信号；TaskController 会把它和 Watch/Poll 信号合并成一个执行循环。
+        if config.direction == BackupDirection::Upload {
+            let task_id = self
+                .ensure_folder_task(&config, TriggerType::Manual)
+                .await?;
+            self.event_tx
+                .send(ChangeEvent::PollEvent {
+                    config_id: config.id.clone(),
+                })
+                .map_err(|e| anyhow!("提交文件夹扫描请求失败: {}", e))?;
             tracing::info!(
-                "手动备份被拒绝：配置 {} 正在扫描中，请等待扫描完成后再试",
-                config_id
+                "手动触发文件夹扫描: config={}, folder_task={}",
+                config.id, task_id
             );
-            return Err(anyhow!("该配置正在扫描中，请等待扫描完成后再试"));
+            return Ok(task_id);
         }
 
-        // 🔥 冲突检测：检查是否有正在传输中的任务（Transferring 状态）
-        let is_transferring = self.tasks.iter()
-            .any(|t| t.config_id == config_id && t.status == BackupTaskStatus::Transferring);
+        // 手动触发和自动触发共享同一个配置槽位。Sync 的重复手动触发只
+        // 合并意图，不重新执行同一个主任务；其它方向直接返回冲突。
+        if let Some(active_task_id) = self.active_task_id(config_id)? {
+            if config.direction == BackupDirection::Sync {
+                let intent = self.sync_intents
+                    .entry(config_id.to_string())
+                    .or_insert_with(|| Arc::new(super::sync::intent::SyncIntent::new()))
+                    .clone();
+                intent.merge_full_sync();
+                tracing::info!(
+                    "手动触发(Sync)已合并到活跃任务: config={}, task={}",
+                    config_id,
+                    active_task_id
+                );
+                return Ok(active_task_id);
+            }
 
-        if is_transferring {
-            tracing::info!(
-                "手动备份被拒绝：配置 {} 正在传输中，请等待传输完成或暂停后再试",
-                config_id
-            );
-            return Err(anyhow!("该配置正在传输中，请等待传输完成或暂停后再试"));
+            return Err(anyhow!(
+                "配置 {} 已有活跃任务 {}，请等待任务完成后再试",
+                config.name,
+                active_task_id
+            ));
         }
 
         // 🔥 冲突校验：执行前再次校验，防止配置在创建后被其他配置覆盖
@@ -1259,11 +1538,15 @@ impl AutoBackupManager {
             if let Err(e) = self.execute_sync_backup(&config, &task_id_clone, true).await {
                 tracing::error!("手动触发同步备份失败: config={}, task={}, error={}",
                     config.id, task_id_clone, e);
-                if let Some(mut task) = self.tasks.get_mut(&task_id_clone) {
-                    task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some(format!("{}", e));
-                    task.completed_at = Some(Utc::now());
-                }
+                let error_message = format!("{}", e);
+                Self::mark_task_failed_static(
+                    &self.tasks,
+                    &self.persistence_manager,
+                    &self.ws_manager,
+                    &task_id_clone,
+                    &error_message,
+                    config.owner_uid,
+                );
             }
             return Ok(task_id);
         }
@@ -1278,23 +1561,9 @@ impl AutoBackupManager {
     async fn create_backup_task(&self, config: &BackupConfig, trigger_type: TriggerType) -> Result<String> {
         use super::priority::{Priority, PriorityContext};
 
-        // 步骤8: 同一配置仅允许一个活跃任务
-        // 检查是否已有同 config_id 且状态为活跃的任务
-        let has_active_task = self.tasks.iter().any(|t| {
-            t.config_id == config.id && matches!(
-                t.status,
-                BackupTaskStatus::Queued | BackupTaskStatus::Preparing |
-                BackupTaskStatus::Transferring | BackupTaskStatus::Paused
-            )
-        });
-
-        if has_active_task {
-            tracing::info!(
-                "配置 {} 已有活跃任务在运行，跳过创建新任务 (trigger: {:?})",
-                config.id, trigger_type
-            );
-            return Err(anyhow!("配置 {} 已有任务在运行", config.name));
-        }
+        // 检查、构造、落盘和发布到内存必须是一个不可交错的登记步骤。
+        let _mutation_guard = self.mutation_lock.lock().await;
+        self.ensure_no_active_task_locked(config)?;
 
         let task_id = Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -1321,7 +1590,14 @@ impl AutoBackupManager {
         let task = BackupTask {
             id: task_id.clone(),
             config_id: config.id.clone(),
-            status: BackupTaskStatus::Queued,
+            // 任务能够立即执行时，创建记录就同时占用 Preparing 槽位。
+            // 不能在这里保留 Queued，否则落库/插入内存与 tokio::spawn
+            // 之间的窗口会被自动扫描误认为可以启动第二次执行。
+            status: if can_start {
+                BackupTaskStatus::Preparing
+            } else {
+                BackupTaskStatus::Queued
+            },
             sub_phase: if can_start { None } else { Some(BackupSubPhase::WaitingSlot) },
             trigger_type,
             pending_files: Vec::new(),
@@ -1333,7 +1609,7 @@ impl AutoBackupManager {
             total_bytes: 0,
             scan_progress: None,
             created_at: now,
-            started_at: None,
+            started_at: if can_start { Some(now) } else { None },
             completed_at: None,
             error_message: None,
             pending_upload_task_ids: std::collections::HashSet::new(),
@@ -1343,13 +1619,19 @@ impl AutoBackupManager {
             owner_uid: config.owner_uid,
         };
 
-        // 保存到内存
-        self.tasks.insert(task_id.clone(), task.clone());
-
-        // 持久化到数据库
+        // 先落盘，成功后再发布到内存。SQLite 的部分唯一索引负责处理
+        // 其它管理器/进程恰好同时登记同一配置的情况。
         if let Err(e) = self.persistence_manager.save_task(&task) {
-            tracing::warn!("持久化备份任务失败: {}", e);
+            if let Some(existing_task_id) = self.persistence_manager.find_active_task_id(&config.id)? {
+                return Err(anyhow!(
+                    "配置 {} 已有活跃备份任务 {}，拒绝创建第二个任务",
+                    config.name,
+                    existing_task_id
+                ));
+            }
+            return Err(anyhow!("持久化备份任务失败: {}", e));
         }
+        self.tasks.insert(task_id.clone(), task.clone());
 
         // 发送任务创建事件
         self.publish_task_created(&task, config);
@@ -1364,6 +1646,7 @@ impl AutoBackupManager {
             let task_id_clone = task_id.clone();
             let config_clone = config.clone();
             let self_tasks = self.tasks.clone();
+            let self_execution_claims = self.execution_claims.clone();
             let self_upload_manager = self.upload_manager.clone();
             let self_download_manager = self.download_manager.clone();
             // 🔥 clone per-uid 池，静态方法按 config.owner_uid 解析 manager
@@ -1387,6 +1670,7 @@ impl AutoBackupManager {
                             task_id_clone.clone(),
                             config_clone,
                             self_tasks,
+                            self_execution_claims,
                             self_upload_manager,
                             self_upload_manager_pool,
                             self_persistence_manager,
@@ -1401,6 +1685,7 @@ impl AutoBackupManager {
                             task_id_clone.clone(),
                             config_clone,
                             self_tasks,
+                            self_execution_claims,
                             self_download_manager,
                             self_download_manager_pool,
                             self_persistence_manager,
@@ -1424,7 +1709,93 @@ impl AutoBackupManager {
             });
         }
 
+        // 保持登记闸门直到执行协程已经提交。这样自动扫描无法在
+        // “任务已登记但尚未 spawn”窗口中抢先启动同一个主任务。
+        drop(_mutation_guard);
         Ok(task_id)
+    }
+
+    /// 将一个主任务原子地声明为 Preparing，并返回声明前的状态。
+    ///
+    /// DashMap 的单条目写锁保证状态读取和更新不会被同一进程中的另一个
+    ///执行者插入；创建路径另外用 `mutation_lock` 保证跨入口的登记唯一性。
+    fn claim_task_preparing_static(
+        tasks: &Arc<DashMap<String, BackupTask>>,
+        task_id: &str,
+        sub_phase: Option<BackupSubPhase>,
+    ) -> Option<BackupTaskStatus> {
+        let mut task = tasks.get_mut(task_id)?;
+        let old_status = task.status;
+        task.status = BackupTaskStatus::Preparing;
+        task.started_at.get_or_insert_with(Utc::now);
+        if let Some(sub_phase) = sub_phase {
+            task.sub_phase = Some(sub_phase);
+        }
+        Some(old_status)
+    }
+
+    /// 只在状态确实发生变化时发送 Preparing 状态事件。
+    fn publish_preparing_transition_static(
+        ws_manager: &Arc<RwLock<Option<Weak<WebSocketManager>>>>,
+        task_id: &str,
+        old_status: Option<BackupTaskStatus>,
+        owner_uid: Option<u64>,
+    ) {
+        if let Some(old_status) = old_status.filter(|status| *status != BackupTaskStatus::Preparing) {
+            let old_status = format!("{:?}", old_status).to_lowercase();
+            Self::publish_status_changed_static(
+                ws_manager,
+                task_id,
+                &old_status,
+                "preparing",
+                owner_uid,
+            );
+        }
+    }
+
+    /// 原子地结算失败状态并持久化，避免错误路径留下 Queued/Preparing
+    /// 活跃记录，导致后续所有手动和自动触发都被唯一约束挡住。
+    fn mark_task_failed_static(
+        tasks: &Arc<DashMap<String, BackupTask>>,
+        persistence_manager: &BackupPersistenceManager,
+        ws_manager: &Arc<RwLock<Option<Weak<WebSocketManager>>>>,
+        task_id: &str,
+        error: &str,
+        owner_uid: Option<u64>,
+    ) {
+        let status_change = if let Some(mut task) = tasks.get_mut(task_id) {
+            if task.status == BackupTaskStatus::Failed {
+                None
+            } else {
+                let old_status = format!("{:?}", task.status).to_lowercase();
+                task.status = BackupTaskStatus::Failed;
+                task.error_message = Some(error.to_string());
+                task.completed_at = Some(Utc::now());
+                Some((old_status, task.clone()))
+            }
+        } else {
+            None
+        };
+
+        if let Some((old_status, task)) = status_change {
+            if let Err(e) = persistence_manager.save_task(&task) {
+                tracing::warn!("持久化失败备份任务失败: task={}, error={}", task_id, e);
+            }
+            let owner_uid = task.owner_uid.or(owner_uid);
+            Self::publish_status_changed_static(
+                ws_manager,
+                task_id,
+                &old_status,
+                "failed",
+                owner_uid,
+            );
+            Self::publish_task_failed_static(
+                ws_manager,
+                task_id,
+                error,
+                owner_uid,
+            );
+        }
     }
 
     /// 执行备份任务（内部静态方法）
@@ -1432,6 +1803,7 @@ impl AutoBackupManager {
         task_id: String,
         config: BackupConfig,
         tasks: Arc<DashMap<String, BackupTask>>,
+        execution_claims: Arc<ParkingMutex<HashMap<String, String>>>,
         upload_manager: Arc<RwLock<Option<Weak<UploadManager>>>>,
         // 🔥 per-uid 池，按 config.owner_uid 解析目标账号 manager
         upload_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<UploadManager>>>>>>,
@@ -1443,19 +1815,25 @@ impl AutoBackupManager {
     ) -> Result<()> {
         use crate::uploader::{BatchedScanIterator, ScanOptions, SCAN_BATCH_SIZE};
 
+        let _execution_claim = Self::claim_execution_static(
+            &execution_claims,
+            &config.id,
+            &task_id,
+        )?;
         tracing::info!("开始执行备份任务: task={}, config={}", task_id, config.id);
 
         // age 只使用当前用户口令；版本号仅作为固定的映射元数据。
         let current_key_version = crate::encryption::AGE_KEY_VERSION;
 
-        // 更新任务状态为准备中
-        if let Some(mut task) = tasks.get_mut(&task_id) {
-            task.status = BackupTaskStatus::Preparing;
-            task.started_at = Some(Utc::now());
-        }
-
-        // 发送状态变更事件
-        Self::publish_status_changed_static(&ws_manager, &task_id, "queued", "preparing", config.owner_uid);
+        // 创建路径已经可能提前占用 Preparing；恢复的 Queued 任务则在这里
+        // 完成唯一的状态认领，避免重复执行者各自发送一次 queued→preparing。
+        let old_status = Self::claim_task_preparing_static(&tasks, &task_id, None);
+        Self::publish_preparing_transition_static(
+            &ws_manager,
+            &task_id,
+            old_status,
+            config.owner_uid,
+        );
 
         // 🔥 优先复用已恢复的文件任务（重启续传关键：不要覆盖 related_task_id）
         // 注意：这里的 clone 是必要的，因为我们需要在循环中消费 file_tasks
@@ -1495,11 +1873,15 @@ impl AutoBackupManager {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("创建分批扫描器失败: task={}, error={}", task_id, e);
-                    if let Some(mut task) = tasks.get_mut(&task_id) {
-                        task.status = BackupTaskStatus::Failed;
-                        task.error_message = Some(format!("扫描目录失败: {}", e));
-                        task.completed_at = Some(Utc::now());
-                    }
+                    let error_message = format!("扫描目录失败: {}", e);
+                    Self::mark_task_failed_static(
+                        &tasks,
+                        &persistence_manager,
+                        &ws_manager,
+                        &task_id,
+                        &error_message,
+                        config.owner_uid,
+                    );
                     return Err(anyhow!("扫描目录失败: {}", e));
                 }
             };
@@ -1716,11 +2098,14 @@ impl AutoBackupManager {
             Some(mgr) => mgr,
             None => {
                 tracing::error!("上传管理器未设置: task={}", task_id);
-                if let Some(mut task) = tasks.get_mut(&task_id) {
-                    task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some("上传管理器未设置".to_string());
-                    task.completed_at = Some(Utc::now());
-                }
+                Self::mark_task_failed_static(
+                    &tasks,
+                    &persistence_manager,
+                    &ws_manager,
+                    &task_id,
+                    "上传管理器未设置",
+                    config.owner_uid,
+                );
                 return Err(anyhow!("上传管理器未设置"));
             }
         };
@@ -1971,6 +2356,7 @@ impl AutoBackupManager {
         task_id: String,
         config: BackupConfig,
         tasks: Arc<DashMap<String, BackupTask>>,
+        execution_claims: Arc<ParkingMutex<HashMap<String, String>>>,
         download_manager: Arc<RwLock<Option<Weak<DownloadManager>>>>,
         // 🔥 per-uid 池，按 config.owner_uid 解析目标账号 manager
         download_manager_pool: Arc<RwLock<Option<Arc<DashMap<crate::auth::Uid, Arc<DownloadManager>>>>>>,
@@ -1982,16 +2368,20 @@ impl AutoBackupManager {
         // 按 owner_uid 严格路由 client，禁止 legacy session.json fallback
         client_pool: Arc<RwLock<Option<Weak<tokio::sync::RwLock<crate::netdisk::ClientPool>>>>>,
     ) -> Result<()> {
+        let _execution_claim = Self::claim_execution_static(
+            &execution_claims,
+            &config.id,
+            &task_id,
+        )?;
         tracing::info!("开始执行下载备份任务: task={}, config={}", task_id, config.id);
 
-        // 更新任务状态为准备中
-        if let Some(mut task) = tasks.get_mut(&task_id) {
-            task.status = BackupTaskStatus::Preparing;
-            task.started_at = Some(Utc::now());
-        }
-
-        // 发送状态变更事件
-        Self::publish_status_changed_static(&ws_manager, &task_id, "queued", "preparing", config.owner_uid);
+        let old_status = Self::claim_task_preparing_static(&tasks, &task_id, None);
+        Self::publish_preparing_transition_static(
+            &ws_manager,
+            &task_id,
+            old_status,
+            config.owner_uid,
+        );
 
         // 获取下载管理器
         // 🔥 按 config.owner_uid 从 per-uid 池解析目标账号 manager
@@ -2006,11 +2396,14 @@ impl AutoBackupManager {
             Some(mgr) => mgr,
             None => {
                 tracing::error!("下载管理器未设置: task={}", task_id);
-                if let Some(mut task) = tasks.get_mut(&task_id) {
-                    task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some("下载管理器未设置".to_string());
-                    task.completed_at = Some(Utc::now());
-                }
+                Self::mark_task_failed_static(
+                    &tasks,
+                    &persistence_manager,
+                    &ws_manager,
+                    &task_id,
+                    "下载管理器未设置",
+                    config.owner_uid,
+                );
                 return Err(anyhow!("下载管理器未设置"));
             }
         };
@@ -2412,11 +2805,15 @@ impl AutoBackupManager {
                     "下载备份任务无法解析目标账号 client: task={}, config={}, owner_uid={:?}, error={}",
                     task_id, config.id, config.owner_uid, e
                 );
-                if let Some(mut task) = tasks.get_mut(&task_id) {
-                    task.status = BackupTaskStatus::Failed;
-                    task.error_message = Some(format!("无法解析目标账号客户端: {}", e));
-                    task.completed_at = Some(Utc::now());
-                }
+                let error_message = format!("无法解析目标账号客户端: {}", e);
+                Self::mark_task_failed_static(
+                    &tasks,
+                    &persistence_manager,
+                    &ws_manager,
+                    &task_id,
+                    &error_message,
+                    config.owner_uid,
+                );
                 return Err(anyhow!("无法解析目标账号客户端: {}", e));
             }
         };
@@ -3673,6 +4070,15 @@ impl AutoBackupManager {
     ///
     /// 暂停备份任务时，会同时暂停所有关联的底层上传/下载任务
     pub async fn pause_task(&self, task_id: &str) -> Result<()> {
+        if let Some(config_id) = task_id.strip_prefix("folder:") {
+            let operation_lock = self.folder_operation_lock(config_id);
+            let _operation_guard = operation_lock.lock().await;
+            return self.pause_task_inner(task_id).await;
+        }
+        self.pause_task_inner(task_id).await
+    }
+
+    async fn pause_task_inner(&self, task_id: &str) -> Result<()> {
         // 步骤7: 操作接口限制为活跃任务
         // 先收集需要暂停的底层任务ID，避免持有 DashMap 锁时调用 async 方法
         let (pending_uploads, pending_downloads, config_id) = {
@@ -3786,6 +4192,15 @@ impl AutoBackupManager {
     ///
     /// 恢复备份任务时，会同时恢复所有关联的底层上传/下载任务
     pub async fn resume_task(&self, task_id: &str) -> Result<()> {
+        if let Some(config_id) = task_id.strip_prefix("folder:") {
+            let operation_lock = self.folder_operation_lock(config_id);
+            let _operation_guard = operation_lock.lock().await;
+            return self.resume_task_inner(task_id).await;
+        }
+        self.resume_task_inner(task_id).await
+    }
+
+    async fn resume_task_inner(&self, task_id: &str) -> Result<()> {
         // 步骤7: 操作接口限制为活跃任务
         // 先收集需要恢复的底层任务ID，避免持有 DashMap 锁时调用 async 方法
         let (pending_uploads, pending_downloads, config_id) = {
@@ -3872,6 +4287,16 @@ impl AutoBackupManager {
         // 发送状态变更事件（已释放 get_mut guard）
         if let Some((old_status, new_status, owner_uid)) = status_change {
             self.publish_status_changed_with_owner(task_id, &old_status, &new_status, owner_uid);
+        }
+
+        // 稳定文件夹没有底层子任务时，恢复动作本身必须重新唤醒扫描器；
+        // 否则 Paused -> Queued 只改变状态，文件表会一直停在旧快照。
+        if is_folder_task_id(task_id) && pending_uploads.is_empty() && pending_downloads.is_empty() {
+            if let Err(e) = self.event_tx.send(ChangeEvent::PollEvent {
+                config_id: config_id.clone(),
+            }) {
+                tracing::warn!("恢复文件夹任务后提交扫描信号失败: task={}, error={}", task_id, e);
+            }
         }
 
         // 发送恢复事件
@@ -4033,6 +4458,7 @@ impl AutoBackupManager {
         uid: u64,
         account_count: usize,
     ) -> Result<usize> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         // ── Step 1: 回填 config.owner_uid（落盘 autobackup_configs.json） ──
         let mut updated_config_ids: Vec<String> = Vec::new();
         for mut entry in self.configs.iter_mut() {
@@ -4104,7 +4530,20 @@ impl AutoBackupManager {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(&self.config_path, json)?;
+        // 通过同目录临时文件 + rename 提交配置快照，避免进程中断时留下
+        // 半截 JSON。调用方负责用 mutation_lock 串行化多个快照提交。
+        let temp_path = PathBuf::from(format!("{}.tmp", self.config_path.display()));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp_path, &self.config_path)?;
         Ok(())
     }
 
@@ -4790,9 +5229,22 @@ impl AutoBackupManager {
                             }
                         };
 
-                        // Watch 事件由本地文件变更触发，统一走上传快速路径
-                        // Sync 配置的完整双向同步仅由 Poll 事件触发，避免 Watch 时
-                        // 扫描远端导致 RemoteWins/NewerWins 覆盖用户刚编辑的文件
+                        // 非 Sync Watch 只表示配置可能需要重新扫描；不再直接
+                        // 构造一批旧式文件任务，统一转成 Poll 信号。
+                        if config.direction != BackupDirection::Sync {
+                            if let Err(e) = self_clone.event_tx.send(ChangeEvent::PollEvent {
+                                config_id: config_id.clone(),
+                            }) {
+                                tracing::warn!(
+                                    "Watch 扫描信号提交失败: config={}, error={}",
+                                    config_id, e
+                                );
+                            }
+                            continue;
+                        }
+
+                        // Sync 配置的完整双向同步仅由 Poll 事件触发，Watch
+                        // 只合并本地变更意图，避免扫描远端覆盖用户刚编辑的文件。
                         if let Err(e) = self_clone.execute_watch_event(&config, &paths).await {
                             tracing::error!("处理Watch事件失败: config={}, error={}", config_id, e);
                         }
@@ -5028,18 +5480,19 @@ impl AutoBackupManager {
         });
     }
 
-    /// 执行指定配置的备份任务（仅用于 Poll 事件触发的全量扫描）
+    /// 执行指定配置的轮询。
     ///
-    /// 🔥 注意：此方法只被 Poll 事件调用，会执行全量扫描
-    /// Watch 事件走 execute_watch_event，只处理变化的文件，不会调用此方法
-    ///
-    /// 时序：
-    /// 1. 扫描阶段检查：如果任务正在扫描（Preparing），丢弃新触发
-    /// 2. 执行全量扫描
-    /// 3. 如果有增量，判断是否有传输任务（Transferring）
-    /// 4. 如果有传输任务，进行增量合并
-    /// 5. 如果没有传输任务，创建新任务
+    /// Upload 走稳定文件夹清单；Download/Sync 保留各自的传输流程。
     async fn execute_backup_for_config(&self, config: &BackupConfig) -> anyhow::Result<()> {
+        // Upload 备份是配置级文件夹清单模型：这里不创建新的 UUID 主任务，
+        // 每次执行只重新核对本地/远端并消费稳定父记录下的 pending 文件。
+        if config.direction == BackupDirection::Upload {
+            let task_id = self
+                .ensure_folder_task(config, TriggerType::Poll)
+                .await?;
+            return self.execute_upload_folder_reconciliation(config, &task_id).await;
+        }
+
         // 🔥 扫描阶段优化：如果任务正在扫描（Preparing），丢弃新触发，等待旧扫描完成
         if let Some(scanning_task) = self.tasks.iter()
             .find(|t| t.config_id == config.id && t.status == BackupTaskStatus::Preparing)
@@ -5106,16 +5559,6 @@ impl AutoBackupManager {
                 task_id, config.id, restored_files.len(), restored_count
             );
 
-            // 更新任务状态为 Preparing（execute_*_backup_with_files 内部会改为 Transferring）
-            tracing::info!("尝试更新任务状态: task={}", task_id);
-            if let Some(mut task) = self.tasks.get_mut(&task_id) {
-                tracing::info!("成功获取任务，更新状态为 Preparing: task={}", task_id);
-                task.status = BackupTaskStatus::Preparing;
-                task.started_at = Some(Utc::now());
-            } else {
-                tracing::error!("无法获取任务: task={}", task_id);
-            }
-
             tracing::info!(
                 "准备调用 execute_*_backup_with_files: task={}, direction={:?}",
                 task_id, config.direction
@@ -5123,11 +5566,7 @@ impl AutoBackupManager {
 
             match config.direction {
                 BackupDirection::Upload => {
-                    tracing::info!("调用 execute_upload_backup_with_files: task={}", task_id);
-                    self.execute_upload_backup_with_files(
-                        task_id.clone(), config.clone(), restored_files,
-                    ).await?;
-                    tracing::info!("execute_upload_backup_with_files 完成: task={}", task_id);
+                    unreachable!("Upload 已经由稳定文件夹清单路径处理");
                 }
                 BackupDirection::Download => {
                     tracing::info!("调用 execute_download_backup_with_files: task={}", task_id);
@@ -5137,6 +5576,23 @@ impl AutoBackupManager {
                     tracing::info!("execute_download_backup_with_files 完成: task={}", task_id);
                 }
                 BackupDirection::Sync => {
+                    let _execution_claim = Self::claim_execution_static(
+                        &self.execution_claims,
+                        &config.id,
+                        &task_id,
+                    )?;
+                    let old_status = Self::claim_task_preparing_static(
+                        &self.tasks,
+                        &task_id,
+                        None,
+                    );
+                    let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
+                    Self::publish_preparing_transition_static(
+                        &self.ws_manager,
+                        &task_id,
+                        old_status,
+                        owner_uid_for_event,
+                    );
                     // Sync 断点续传：复用已恢复的文件子任务，直接进入传输阶段
                     // 过滤出仍需传输的文件（pending / checking / waitingtransfer / encrypting 等非终态）
                     let pending_files: Vec<BackupFileTask> = restored_files.into_iter()
@@ -5240,31 +5696,13 @@ impl AutoBackupManager {
             return Ok(());
         }
 
-        // 🔥 关键修复：清理同配置下已失效的 Queued 任务（没有可续传文件的空壳任务）
-        // 场景：重启恢复的任务 files_loaded=0，无法续传，走到此分支创建新任务，
-        // 但旧的 Queued 任务残留在 DashMap 中，导致 Watch 事件永远被"合并"而不执行。
-        // DB 端已由 persistence 兜底同步更新为 completed，但 DashMap 未同步。
-        let stale_queued_ids: Vec<String> = self.tasks.iter()
-            .filter(|t| t.config_id == config.id && matches!(t.status, BackupTaskStatus::Queued))
-            .map(|t| t.id.clone())
-            .collect();
-        for stale_id in &stale_queued_ids {
-            tracing::info!(
-                "清理无法续传的残留 Queued 任务: task={}, config={}",
-                stale_id, config.id
-            );
-            self.tasks.remove(stale_id);
-            // DB 端通常已被兜底同步更新，这里再保险删除一次
-            if let Err(e) = self.persistence_manager.delete_task(stale_id) {
-                tracing::warn!("删除残留任务失败: task={}, error={}", stale_id, e);
-            }
-        }
+        // Queued 是 Download/Sync 配置唯一槽位的一部分，空文件列表交给
+        // 后续扫描流程处理。
 
-        // 🔥 正确时序：先扫描，扫描完成后再判断是否有传输任务
-        // 根据配置方向执行扫描
+        // 根据配置方向执行扫描。Upload 已在函数开头进入稳定清单路径。
         let new_files = match config.direction {
             BackupDirection::Upload => {
-                self.scan_local_directory_for_backup(config).await?
+                unreachable!("Upload 已经由稳定文件夹清单路径处理");
             }
             BackupDirection::Download => {
                 self.scan_remote_directory_for_backup(config).await?
@@ -5292,7 +5730,18 @@ impl AutoBackupManager {
                     true // 没有 intent 记录，默认完整同步
                 };
 
-                let sync_task_id = self.create_backup_task_record(config, trigger_type).await?;
+                // 重启恢复的空 Queued 任务仍然是该配置的唯一槽位，复用它而
+                // 不是创建第二个 Sync 主任务。
+                let queued_task_id = self.tasks.iter()
+                    .find(|task| {
+                        task.config_id == config.id
+                            && task.status == BackupTaskStatus::Queued
+                    })
+                    .map(|task| task.id.clone());
+                let sync_task_id = match queued_task_id {
+                    Some(task_id) => task_id,
+                    None => self.create_backup_task_record(config, trigger_type).await?,
+                };
                 if let Err(e) = self.execute_sync_backup(config, &sync_task_id, scan_remote).await {
                     tracing::error!("自动触发同步备份失败: config={}, task={}, error={}",
                         config.id, sync_task_id, e);
@@ -5327,13 +5776,8 @@ impl AutoBackupManager {
             config.id, new_files.len()
         );
 
-        // 传输阶段优化：检查是否有正在传输的任务（Transferring 状态）
-        // 如果有，进行增量合并；如果没有，创建新任务
-        //
-        // 注意：必须先把 task_id 克隆出来再结束 iter()，使 DashMap shard guard 在
-        // 语句结束时立即释放。否则 guard 会跨越下方的 merge_new_files_to_task().await
-        // 持有，而该函数内部又对同一 task 调用 self.tasks.get_mut()（同 shard 写锁），
-        // 造成永久自死锁——表现为 tasks.iter()/len() 全量遍历卡死。
+        // 传输阶段优化：检查是否有正在传输的任务（Transferring 状态）。
+        // 注意：先克隆 task_id 再结束 DashMap 迭代 guard，避免跨 await 持锁。
         let transferring_task_id = self.tasks.iter()
             .find(|t| t.config_id == config.id && t.status == BackupTaskStatus::Transferring)
             .map(|t| t.id.clone());
@@ -5343,10 +5787,10 @@ impl AutoBackupManager {
                 config.id, task_id, new_files.len()
             );
             // 增量合并新文件到现有任务
-            return self.merge_new_files_to_task(&task_id, config, new_files).await;
+            return self.merge_new_download_files_to_task(&task_id, config, new_files).await;
         }
 
-        // 没有传输任务，按原有逻辑创建新任务或复用 Queued 任务
+        // 没有传输任务，复用排队任务或创建新的 Download/Sync 任务。
         let reusable_task_id = self
             .tasks
             .iter()
@@ -5389,14 +5833,10 @@ impl AutoBackupManager {
             self.create_backup_task_record(config, trigger_type).await?
         };
 
-        // 执行传输任务（使用已扫描的文件列表）
+        // 执行 Download 传输任务（Sync 已在扫描阶段提前返回）。
         match config.direction {
             BackupDirection::Upload => {
-                self.execute_upload_backup_with_files(
-                    task_id.clone(),
-                    config.clone(),
-                    new_files,
-                ).await?;
+                unreachable!("Upload 已经由稳定文件夹清单路径处理");
             }
             BackupDirection::Download => {
                 self.execute_download_backup_with_files(
@@ -5419,17 +5859,74 @@ impl AutoBackupManager {
         Ok(())
     }
 
-    /// 创建备份任务记录（仅创建，不执行）
+    /// 将新增的远端文件并入 Download 传输任务。
     ///
-    /// 用于 TaskController 调用场景，任务执行由调用方控制
+    /// Upload 不再使用增量文件任务合并；它只通过稳定文件夹清单完成
+    /// “扫描—比较—重传”。
+    async fn merge_new_download_files_to_task(
+        &self,
+        task_id: &str,
+        config: &BackupConfig,
+        mut new_files: Vec<BackupFileTask>,
+    ) -> Result<()> {
+        if new_files.is_empty() {
+            return Ok(());
+        }
+
+        let existing_file_keys: std::collections::HashSet<String> = self
+            .tasks
+            .get(task_id)
+            .map(|task| {
+                task.pending_files
+                    .iter()
+                    .map(|file| format!("{}|{}", file.local_path.display(), file.remote_path))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        new_files.retain(|file| {
+            let key = format!("{}|{}", file.local_path.display(), file.remote_path);
+            !existing_file_keys.contains(&key)
+        });
+        if new_files.is_empty() {
+            return Ok(());
+        }
+
+        for file in &mut new_files {
+            file.parent_task_id = task_id.to_string();
+        }
+        let transfer_files = new_files.clone();
+        self.persistence_manager
+            .save_file_tasks_batch(&new_files, &config.id)?;
+
+        if let Some(mut task) = self.tasks.get_mut(task_id) {
+            task.total_count += new_files.len();
+            task.total_bytes += new_files.iter().map(|file| file.file_size).sum::<u64>();
+            task.pending_files.extend(new_files);
+            self.persistence_manager.save_task(&task)?;
+            Self::publish_progress_static(&self.ws_manager, &task);
+        }
+
+        self.create_download_tasks_for_files(task_id, config, transfer_files, None)
+            .await?;
+        Ok(())
+    }
+
+    /// 创建并预留一个立即执行的备份任务记录。
+    ///
+    /// 该方法的调用方会在返回后直接执行扫描/同步，因此记录必须从创建
+    /// 起就处于 Preparing，而不能先落成 Queued 再等待调用方切换状态。
     async fn create_backup_task_record(&self, config: &BackupConfig, trigger_type: TriggerType) -> Result<String> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        self.ensure_no_active_task_locked(config)?;
+
         let task_id = Uuid::new_v4().to_string();
         let now = Utc::now();
 
         let task = BackupTask {
             id: task_id.clone(),
             config_id: config.id.clone(),
-            status: BackupTaskStatus::Queued,
+            status: BackupTaskStatus::Preparing,
             sub_phase: None,
             trigger_type,
             pending_files: Vec::new(),
@@ -5441,7 +5938,7 @@ impl AutoBackupManager {
             total_bytes: 0,
             scan_progress: None,
             created_at: now,
-            started_at: None,
+            started_at: Some(now),
             completed_at: None,
             error_message: None,
             pending_upload_task_ids: std::collections::HashSet::new(),
@@ -5451,13 +5948,19 @@ impl AutoBackupManager {
             owner_uid: config.owner_uid,
         };
 
-        // 保存到内存
-        self.tasks.insert(task_id.clone(), task.clone());
-
-        // 持久化到数据库
+        // 先落盘再发布到内存，避免出现内存里有任务但数据库没有任务的
+        // 半状态；部分唯一索引会拒绝跨请求/跨管理器的第二个活跃任务。
         if let Err(e) = self.persistence_manager.save_task(&task) {
-            tracing::warn!("持久化备份任务失败: {}", e);
+            if let Some(existing_task_id) = self.persistence_manager.find_active_task_id(&config.id)? {
+                return Err(anyhow!(
+                    "配置 {} 已有活跃备份任务 {}，拒绝创建第二个任务",
+                    config.name,
+                    existing_task_id
+                ));
+            }
+            return Err(anyhow!("持久化备份任务失败: {}", e));
         }
+        self.tasks.insert(task_id.clone(), task.clone());
 
         // 发送任务创建事件
         self.publish_task_created(&task, config);
@@ -5473,77 +5976,6 @@ impl AutoBackupManager {
     /// 手动触发备份（通过 TaskController）
     ///
     /// 与自动触发使用相同的并发控制逻辑
-    pub fn trigger_backup_manual(&self, config_id: &str) -> Result<bool> {
-        let config = self.get_config(config_id)
-            .ok_or_else(|| anyhow!("配置不存在: {}", config_id))?;
-
-        if !config.enabled {
-            return Err(anyhow!("配置已禁用: {}", config_id));
-        }
-
-        // 🔥 冲突检测：检查是否有正在扫描中或传输中的任务
-        let is_scanning = self.tasks.iter()
-            .any(|t| t.config_id == config_id && t.status == BackupTaskStatus::Preparing);
-        let is_transferring = self.tasks.iter()
-            .any(|t| t.config_id == config_id && t.status == BackupTaskStatus::Transferring);
-
-        if is_scanning || is_transferring {
-            // Sync 配置：合并 full_sync 意图，任务完成后自动重新触发
-            if config.direction == super::config::BackupDirection::Sync {
-                let intent = self.sync_intents
-                    .entry(config_id.to_string())
-                    .or_insert_with(|| Arc::new(super::sync::intent::SyncIntent::new()))
-                    .clone();
-                intent.merge_full_sync();
-                tracing::info!(
-                    "手动备份(Sync): 配置 {} 有活跃任务，已合并 full_sync 意图",
-                    config_id
-                );
-                return Ok(true);
-            }
-
-            // 非 Sync 配置：保持原有拒绝逻辑
-            if is_scanning {
-                tracing::info!(
-                    "手动备份被拒绝：配置 {} 正在扫描中，请等待扫描完成后再试",
-                    config_id
-                );
-                return Err(anyhow!("该配置正在扫描中，请等待扫描完成后再试"));
-            }
-            tracing::info!(
-                "手动备份被拒绝：配置 {} 正在传输中，请等待传输完成或暂停后再试",
-                config_id
-            );
-            return Err(anyhow!("该配置正在传输中，请等待传输完成或暂停后再试"));
-        }
-
-        // 获取或创建 TaskController
-        let controller = self.task_controllers
-            .entry(config_id.to_string())
-            .or_insert_with(|| {
-                let ctrl = Arc::new(TaskController::new(config_id.to_string()));
-                // 注意：这里只创建控制器，不启动任务循环
-                // 任务循环会在 start_event_consumer 中启动
-                tracing::warn!(
-                    "手动触发时创建了新的 TaskController，建议先调用 start_event_consumer: {}",
-                    config_id
-                );
-                ctrl
-            })
-            .clone();
-
-        let triggered = controller.trigger(TriggerSource::Manual);
-
-        if triggered {
-            tracing::info!(
-                "手动触发配置 {} 成功（running: {}, pending: {}）",
-                config_id, controller.is_running(), controller.has_pending()
-            );
-        }
-
-        Ok(triggered)
-    }
-
     /// 获取配置的控制器状态
     pub fn get_controller_status(&self, config_id: &str) -> Option<super::scheduler::ControllerStatus> {
         self.task_controllers.get(config_id).map(|ctrl| ctrl.status())
@@ -5906,6 +6338,32 @@ impl AutoBackupManager {
     ///
     /// 当上传或下载任务完成时，更新对应的备份任务状态
     async fn handle_transfer_completed(&self, transfer_task_id: &str, success: bool, is_upload: bool, upload_meta: Option<super::events::UploadCompletionMeta>) {
+        // 稳定文件夹的扫描/登记与完成结算必须共用同一把锁。否则扫描可能
+        // 在完成通知从 pending 集合移除之后、文件行写回之前读到半状态，
+        // 再把旧快照或新快照互相覆盖。
+        let folder_config_id = self
+            .tasks
+            .iter()
+            .find(|task| {
+                is_upload
+                    && is_folder_task_id(&task.id)
+                    && task.pending_upload_task_ids.contains(transfer_task_id)
+            })
+            .map(|task| task.config_id.clone());
+
+        if let Some(config_id) = folder_config_id {
+            let operation_lock = self.folder_operation_lock(&config_id);
+            let _operation_guard = operation_lock.lock().await;
+            self.handle_transfer_completed_inner(transfer_task_id, success, is_upload, upload_meta)
+                .await;
+            return;
+        }
+
+        self.handle_transfer_completed_inner(transfer_task_id, success, is_upload, upload_meta)
+            .await;
+    }
+
+    async fn handle_transfer_completed_inner(&self, transfer_task_id: &str, success: bool, is_upload: bool, upload_meta: Option<super::events::UploadCompletionMeta>) {
         use super::record::{UploadRecord, DownloadRecord};
 
         let task_type = if is_upload { "上传" } else { "下载" };
@@ -6207,6 +6665,17 @@ impl AutoBackupManager {
                             }
                         }
                     }
+
+                    // 稳定文件夹任务完成一批上传后重新扫描一次。这样在上传
+                    // 期间发生的文件变化不会被丢掉；失败批次不自动无限重试，
+                    // 交给下一次手动/轮询触发，避免网络故障形成忙循环。
+                    if cfg.direction == BackupDirection::Upload
+                        && update.final_status == BackupTaskStatus::Completed
+                    {
+                        let _ = self.event_tx.send(ChangeEvent::PollEvent {
+                            config_id: cfg.id.clone(),
+                        });
+                    }
                 }
             }
 
@@ -6239,6 +6708,7 @@ impl AutoBackupManager {
                 if matches!(update.final_status, BackupTaskStatus::Completed) {
                     if let Some(ref cfg) = config {
                         if cfg.direction == super::config::BackupDirection::Sync && cfg.needs_full_sync {
+                            let _mutation_guard = self.mutation_lock.lock().await;
                             if let Some(mut live_cfg) = self.configs.get_mut(&cfg.id) {
                                 live_cfg.needs_full_sync = false;
                                 tracing::info!("Sync 所有传输完成，清除 needs_full_sync: config={}", cfg.id);
@@ -6351,8 +6821,10 @@ impl AutoBackupManager {
                 self.publish_task_failed(task_id, &msg);
             }
 
-            // 任务进入终态后从 DashMap 移除（与 handle_transfer_completed 一致）
-            self.cleanup_completed_task(task_id);
+            // 稳定文件夹父记录不能清出内存；它还要接收后续扫描和完成通知。
+            if !is_folder_task_id(task_id) {
+                self.cleanup_completed_task(task_id);
+            }
         }
     }
 
@@ -6699,6 +7171,8 @@ impl AutoBackupManager {
     pub async fn restore_incomplete_tasks_with_transfer_check(&self) -> Result<usize> {
         tracing::info!("开始恢复未完成的备份任务...");
 
+        self.discard_legacy_upload_tasks()?;
+
         // 从数据库加载未完成的任务
         let incomplete_tasks = self.persistence_manager.load_incomplete_tasks()?;
         let task_count = incomplete_tasks.len();
@@ -7028,6 +7502,11 @@ impl AutoBackupManager {
     /// - 3.1: 任务进入终态后从 DashMap 移除
     /// - 3.2: 移除前确保任务已持久化
     fn cleanup_completed_task(&self, task_id: &str) {
+        if is_folder_task_id(task_id) {
+            tracing::debug!("稳定文件夹父记录保留在内存: task_id={}", task_id);
+            return;
+        }
+
         // 步骤 1: 持久化任务到数据库
         // 先获取任务数据进行持久化，确保数据不丢失
         if let Some(task) = self.tasks.get(task_id) {
@@ -7762,6 +8241,7 @@ impl AutoBackupManager {
 
         // 6. 保存配置
         tracing::info!("保存配置...");
+        let _mutation_guard = self.mutation_lock.lock().await;
         if let Err(e) = self.save_configs().await {
             result.errors.push(format!("保存配置失败: {}", e));
             result.success = false;
@@ -7801,14 +8281,451 @@ impl AutoBackupManager {
 
     // ==================== 扫描与增量合并方法 ====================
 
-    /// 扫描本地目录获取需要备份的文件列表
+    /// 用本地原始文件名查询加密混淆表，解析出远端真实 `.age` 路径。
     ///
-    /// 应用过滤规则和去重检查，返回需要上传的文件任务列表
-    async fn scan_local_directory_for_backup(&self, config: &BackupConfig) -> Result<Vec<BackupFileTask>> {
+    /// 加密文件的远端名称不是本地文件名，不能拿本地期望路径直接和 ls
+    /// 结果比较。历史记录中 original_path 既可能是本地相对目录，也可能是
+    /// 创建上传任务时保存的明文远端父目录；如果已有清单行，则优先用它的
+    /// remote_path 与映射表精确关联。
+    fn find_encrypted_snapshot_for_file(
+        &self,
+        config: &BackupConfig,
+        file_task: &BackupFileTask,
+        previous: Option<&BackupFileTask>,
+    ) -> Result<Option<EncryptionSnapshot>> {
+        let file_name = file_task
+            .local_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("无效的本地文件名: {:?}", file_task.local_path))?;
+        let local_relative_dir = file_task
+            .local_path
+            .strip_prefix(&config.local_path)
+            .ok()
+            .and_then(|relative| relative.parent())
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let expected_remote_parent = std::path::Path::new(&file_task.remote_path)
+            .parent()
+            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let previous_remote_path = previous.map(|file| file.remote_path.as_str());
+
+        let snapshots = self
+            .record_manager
+            .find_file_snapshots_by_config_original_name(&config.id, file_name)?;
+        let matched = snapshots.into_iter().find(|snapshot| {
+            remote_path_is_under_root(&snapshot.remote_path, &config.remote_path)
+                && (previous_remote_path
+                    .map(|path| snapshot.remote_path == path)
+                    .unwrap_or(false)
+                    || normalize_snapshot_path(&snapshot.original_path)
+                        == normalize_snapshot_path(&local_relative_dir)
+                    || normalize_snapshot_path(&snapshot.original_path)
+                        == normalize_snapshot_path(&expected_remote_parent))
+        });
+
+        if let Some(ref snapshot) = matched {
+            tracing::debug!(
+                "通过加密映射表解析远端文件: config={}, local_name={}, original_path={}, encrypted_name={}, remote_path={}",
+                config.id,
+                file_name,
+                snapshot.original_path,
+                snapshot.encrypted_name,
+                snapshot.remote_path
+            );
+        }
+
+        Ok(matched)
+    }
+
+    /// 执行一个配置级文件夹扫描。
+    ///
+    /// 这条路径不会创建新的主任务：稳定父记录只负责暴露当前状态，真正的
+    /// 队列是 `backup_file_tasks` 中按远端位置唯一的文件行。扫描、清单 upsert
+    /// 和限量投递上传子任务按固定顺序执行；重复触发由外层 TaskController 合并。
+    async fn execute_upload_folder_reconciliation(
+        &self,
+        config: &BackupConfig,
+        folder_task_id: &str,
+    ) -> Result<()> {
+        // 扫描清单、登记上传批次与暂停/恢复必须以文件夹为粒度串行化。
+        // 触发信号仍可并发到达，但不会在状态转换中间插入第二个操作。
+        let operation_lock = self.folder_operation_lock(&config.id);
+        let _operation_guard = operation_lock.lock().await;
+
+        let has_active_uploads = self
+            .tasks
+            .get(folder_task_id)
+            .map(|task| !task.pending_upload_task_ids.is_empty())
+            .unwrap_or(false);
+
+        if let Some(task) = self.tasks.get(folder_task_id) {
+            if task.status == BackupTaskStatus::Paused {
+                tracing::info!(
+                    "文件夹任务处于暂停状态，跳过扫描: config={}, task={}",
+                    config.id, folder_task_id
+                );
+                return Ok(());
+            }
+        }
+
+        // 当前仍有上传子任务时，不重新覆盖正在传输的文件行。完成通知会
+        // 再次提交一次 PollEvent，届时扫描会消费本轮触发期间积累的变化。
+        if has_active_uploads {
+            tracing::debug!(
+                "文件夹仍有上传子任务，合并扫描请求并等待完成: config={}, task={}",
+                config.id, folder_task_id
+            );
+            return Ok(());
+        }
+
+        self.update_folder_task_state(
+            folder_task_id,
+            BackupTaskStatus::Preparing,
+            Some(BackupSubPhase::DedupChecking),
+            None,
+        )
+        .await?;
+
+        let local_files = match self.scan_local_folder_inventory(config, folder_task_id).await {
+            Ok(files) => files,
+            Err(e) => {
+                let message = format!("扫描本地文件夹失败: {}", e);
+                self.update_folder_task_state(
+                    folder_task_id,
+                    BackupTaskStatus::Failed,
+                    None,
+                    Some(message.clone()),
+                )
+                .await?;
+                return Err(anyhow!(message));
+            }
+        };
+
+        let remote_files = match self.scan_remote_folder_inventory(config).await {
+            Ok(files) => files,
+            Err(e) => {
+                let message = format!("扫描远端文件夹失败: {}", e);
+                self.update_folder_task_state(
+                    folder_task_id,
+                    BackupTaskStatus::Failed,
+                    None,
+                    Some(message.clone()),
+                )
+                .await?;
+                return Err(anyhow!(message));
+            }
+        };
+
+        let existing_files = self
+            .persistence_manager
+            .load_folder_file_tasks(folder_task_id)?;
+        let existing_by_local: HashMap<String, BackupFileTask> = existing_files
+            .iter()
+            .map(|file_task| {
+                (
+                    file_task.local_path.to_string_lossy().to_string(),
+                    file_task.clone(),
+                )
+            })
+            .collect();
+        let existing_by_remote: HashMap<String, BackupFileTask> = existing_files
+            .iter()
+            .map(|file_task| (file_task.remote_path.clone(), file_task.clone()))
+            .collect();
+
+        let mut manifest = Vec::with_capacity(local_files.len());
+        let mut seen_remote_paths = std::collections::HashSet::new();
+
+        for local_file in local_files {
+            let local_path_key = local_file.task.local_path.to_string_lossy().to_string();
+            let previous = existing_by_local
+                .get(&local_path_key)
+                .filter(|file_task| {
+                    remote_path_is_under_root(&file_task.remote_path, &config.remote_path)
+                })
+                .or_else(|| existing_by_remote.get(&local_file.task.remote_path));
+
+            // 远端匹配策略只由当前配置决定。即使旧清单行曾经使用过加密，
+            // 用户关闭当前配置的加密后，也必须回到本地文件对应的明文路径。
+            let encrypted_remote = config.encrypt_enabled;
+            let encrypted_snapshot = if encrypted_remote {
+                self.find_encrypted_snapshot_for_file(config, &local_file.task, previous)?
+            } else {
+                None
+            };
+
+            // 加密远端路径必须先由“本地文件名 -> encryption_snapshots”解析；
+            // 没有映射时按不存在处理，不能退回拿明文路径直接和 ls 结果比较。
+            let remote_path = if encrypted_remote {
+                encrypted_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.remote_path.clone())
+                    .unwrap_or_else(|| local_file.task.remote_path.clone())
+            } else {
+                previous
+                    .filter(|file_task| !file_task.encrypted)
+                    .map(|file_task| file_task.remote_path.clone())
+                    .unwrap_or_else(|| local_file.task.remote_path.clone())
+            };
+            let remote = if encrypted_remote {
+                encrypted_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| remote_files.get(&snapshot.remote_path))
+            } else {
+                remote_files.get(&remote_path)
+            };
+
+            let previous_fingerprint_matches = previous
+                .filter(|file_task| {
+                    matches!(
+                        file_task.status,
+                        BackupFileStatus::Completed | BackupFileStatus::Skipped
+                    )
+                })
+                .map(|file_task| {
+                    file_task.file_size == local_file.task.file_size
+                        && file_task
+                            .head_md5
+                            .as_deref()
+                            .filter(|md5| !md5.is_empty())
+                            == local_file
+                                .task
+                                .head_md5
+                                .as_deref()
+                                .filter(|md5| !md5.is_empty())
+                })
+                .unwrap_or(false);
+
+            let remote_matches = if let Some(remote) = remote {
+                // age 密文带有头部和认证开销，远端尺寸/MD5 不可能与明文相同。
+                // 对已经完成过的加密清单，使用本地文件尺寸 + head_md5 作为
+                // 明文指纹，再以映射表解析出的随机 .age 路径确认密文仍存在。
+                // 若本地内容发生变化，指纹失配，流程会创建新的 age 上传。
+                if encrypted_remote {
+                    previous_fingerprint_matches
+                        || (previous.is_none()
+                            && encrypted_snapshot
+                                .as_ref()
+                                .map(|snapshot| snapshot.file_size == local_file.task.file_size)
+                                .unwrap_or(false))
+                } else if remote.size != local_file.task.file_size {
+                    false
+                } else if let Some(remote_md5) = remote.md5.as_deref() {
+                    let md5_path = local_file.task.local_path.clone();
+                    match tokio::task::spawn_blocking(move || calculate_full_md5(&md5_path)).await {
+                        Ok(Ok(local_md5)) => local_md5.eq_ignore_ascii_case(remote_md5),
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "计算完整 MD5 失败，按缺失处理: path={:?}, error={}",
+                                local_file.task.local_path, e
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "计算完整 MD5 线程失败，按缺失处理: path={:?}, error={}",
+                                local_file.task.local_path, e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    // 百度列表接口有时不返回 md5；没有远端校验值时，只有
+                    // 稳定清单中已经确认过且本地指纹未变，才认为文件存在。
+                    previous_fingerprint_matches
+                }
+            } else {
+                false
+            };
+
+            let mut file_task = local_file.task;
+            file_task.parent_task_id = folder_task_id.to_string();
+            file_task.remote_path = remote_path.clone();
+            file_task.status = if remote_matches {
+                BackupFileStatus::Completed
+            } else {
+                BackupFileStatus::Pending
+            };
+            file_task.fs_id = remote.map(|item| item.fs_id);
+            file_task.sync_remote_mtime = remote.map(|item| item.mtime);
+            file_task.sync_remote_size = remote.map(|item| item.size);
+            file_task.sync_remote_fs_id = remote.map(|item| item.fs_id);
+
+            if let Some(previous) = previous {
+                file_task.id = previous.id.clone();
+            }
+
+            seen_remote_paths.insert(remote_path);
+            manifest.push(file_task);
+        }
+
+        self.persistence_manager
+            .upsert_folder_file_tasks(&manifest, &config.id, folder_task_id)?;
+
+        // 本地删除不等于删除远端文件。把清单行标为 skipped，保留它用于审计，
+        // 也避免下次扫描把一条已删除的本地文件误判成待上传。
+        self.persistence_manager
+            .mark_folder_files_not_seen(folder_task_id, &seen_remote_paths)?;
+
+        let max_concurrent = self
+            .resolve_upload_manager(config.owner_uid.map(crate::auth::Uid::new))
+            .map(|manager| manager.max_concurrent_tasks().max(1))
+            .unwrap_or(1);
+        let pending_files = self
+            .persistence_manager
+            .get_next_pending_files(folder_task_id, max_concurrent)?;
+
+        if pending_files.is_empty() {
+            self.update_folder_task_state(
+                folder_task_id,
+                BackupTaskStatus::Completed,
+                None,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        {
+            let mut task = self
+                .tasks
+                .get_mut(folder_task_id)
+                .ok_or_else(|| anyhow!("稳定文件夹任务不存在: {}", folder_task_id))?;
+            task.pending_files = pending_files.clone();
+            task.total_count = pending_files.len();
+            task.total_bytes = pending_files.iter().map(|file_task| file_task.file_size).sum();
+            task.completed_count = 0;
+            task.failed_count = 0;
+            task.skipped_count = 0;
+            task.error_message = None;
+            task.status = BackupTaskStatus::Transferring;
+            task.sub_phase = Some(BackupSubPhase::Uploading);
+            self.persistence_manager.save_task(&task)?;
+        }
+        Self::publish_status_changed_static(
+            &self.ws_manager,
+            folder_task_id,
+            "preparing",
+            "transferring",
+            config.owner_uid,
+        );
+
+        let processed_files = match self
+            .create_upload_tasks_for_files(folder_task_id, config, pending_files, None)
+            .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                let message = format!("创建上传子任务失败: {}", e);
+                self.update_folder_task_state(
+                    folder_task_id,
+                    BackupTaskStatus::Failed,
+                    None,
+                    Some(message.clone()),
+                )
+                .await?;
+                return Err(anyhow!(message));
+            }
+        };
+
+        // `create_upload_tasks_for_files` 已经在启动每个子任务前持久化了
+        // related_task_id 和实际远端路径。这里合并回内存时不能再用整批覆盖：
+        // 某个秒传/小文件可能已经在本调用返回前收到完成通知，覆盖会把它
+        // 从 Completed 回写成 WaitingTransfer，形成永久悬挂。
+        self.merge_processed_file_tasks_into_parent(folder_task_id, &processed_files)?;
+
+        // 子任务数可能小于并发上限（例如部分文件在创建时失败）；如果没有
+        // 任何子任务在飞行中，立即结算，避免稳定父记录卡在 Transferring。
+        self.finalize_backup_task_if_no_pending(folder_task_id);
+        Ok(())
+    }
+
+    /// 更新稳定文件夹父记录。状态更新和 SQLite 写入在同一条状态转换中完成。
+    async fn update_folder_task_state(
+        &self,
+        task_id: &str,
+        status: BackupTaskStatus,
+        sub_phase: Option<BackupSubPhase>,
+        error_message: Option<String>,
+    ) -> Result<()> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let status_change = if let Some(mut task) = self.tasks.get_mut(task_id) {
+            let old_status = format!("{:?}", task.status).to_lowercase();
+            task.status = status;
+            task.sub_phase = sub_phase;
+            task.error_message = error_message;
+            task.trigger_type = TriggerType::Poll;
+            if matches!(status, BackupTaskStatus::Preparing | BackupTaskStatus::Transferring) {
+                task.started_at.get_or_insert_with(Utc::now);
+                task.completed_at = None;
+            } else if status.is_terminal() {
+                task.completed_at = Some(Utc::now());
+            }
+            self.persistence_manager.save_task(&task)?;
+            Some((old_status, task.owner_uid, task.clone()))
+        } else {
+            None
+        };
+        drop(_mutation_guard);
+
+        if let Some((old_status, owner_uid, task)) = status_change {
+            let new_status = format!("{:?}", task.status).to_lowercase();
+            if old_status != new_status {
+                Self::publish_status_changed_static(
+                    &self.ws_manager,
+                    task_id,
+                    &old_status,
+                    &new_status,
+                    owner_uid,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 将创建阶段的文件快照合并回稳定父记录。
+    ///
+    /// 上传子任务可能在 `start_task` 返回前就完成，因此不能把调用方拿到的
+    /// 旧向量整体赋回 `pending_files`。已经被完成/失败通知结算的行必须保留
+    /// 终态，其余行才接受创建阶段补齐的 related_task_id、远端路径和状态。
+    fn merge_processed_file_tasks_into_parent(
+        &self,
+        task_id: &str,
+        processed_files: &[BackupFileTask],
+    ) -> Result<()> {
+        let mut task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| anyhow!("稳定文件夹任务不存在: {}", task_id))?;
+
+        for processed in processed_files {
+            if let Some(current) = task.pending_files.iter_mut().find(|file| file.id == processed.id) {
+                if !matches!(
+                    current.status,
+                    BackupFileStatus::Completed | BackupFileStatus::Failed
+                ) {
+                    *current = processed.clone();
+                }
+            } else {
+                task.pending_files.push(processed.clone());
+            }
+        }
+
+        self.persistence_manager.save_task(&task)?;
+        Ok(())
+    }
+
+    /// 扫描本地文件夹的完整文件清单，不依赖上传记录去重。
+    async fn scan_local_folder_inventory(
+        &self,
+        config: &BackupConfig,
+        folder_task_id: &str,
+    ) -> Result<Vec<LocalFolderFile>> {
         use crate::uploader::{BatchedScanIterator, ScanOptions};
 
-        tracing::info!("扫描本地目录: config={}, path={:?}", config.id, config.local_path);
-
+        let local_path = config.local_path.clone();
         let scan_options = ScanOptions {
             follow_symlinks: false,
             max_file_size: if config.filter_config.max_file_size > 0 {
@@ -7821,174 +8738,68 @@ impl AutoBackupManager {
             allowed_paths: vec![],
         };
 
-        // 使用 BatchedScanIterator 分批扫描（通过 channel + spawn_blocking）
-        let local_path = config.local_path.clone();
-        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel(4);
-
-        let opts_clone = scan_options.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut iterator = match BatchedScanIterator::new(&local_path, opts_clone) {
-                Ok(it) => it,
-                Err(e) => {
-                    tracing::error!("创建备份扫描迭代器失败: {}", e);
-                    return;
-                }
-            };
-            loop {
-                match iterator.next_batch() {
-                    Ok(Some(batch)) => {
-                        if batch_tx.blocking_send(batch).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::error!("备份扫描批次失败: {}", e);
-                        break;
-                    }
-                }
+        let scanned_files = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
+            let mut iterator = BatchedScanIterator::new(&local_path, scan_options)?;
+            let mut files = Vec::new();
+            while let Some(batch) = iterator.next_batch()? {
+                files.extend(batch);
             }
-        });
+            Ok(files)
+        })
+        .await
+        .map_err(|e| anyhow!("本地文件夹扫描线程失败: {}", e))??;
 
-        let include_exts = &config.filter_config.include_extensions;
-        let exclude_exts = &config.filter_config.exclude_extensions;
-        let exclude_dirs = &config.filter_config.exclude_directories;
-        let min_file_size = config.filter_config.min_file_size;
+        let mut result = Vec::with_capacity(scanned_files.len());
+        for scanned_file in scanned_files {
+            let file_ext = scanned_file
+                .local_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            let relative = scanned_file.relative_path.to_string_lossy();
 
-        let mut file_tasks = Vec::new();
-        let scan_cache = Arc::clone(&self.scan_cache_manager);
-        let config_id_for_cache = config.id.clone();
-
-        while let Some(batch) = batch_rx.recv().await {
-            // 第一步：按扩展名/目录/大小过滤，同时收集 mtime
-            let mut filtered: Vec<(crate::uploader::folder::ScannedFile, i64)> = Vec::new();
-            for scanned_file in batch {
-                let file_ext = scanned_file.local_path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_lowercase())
-                    .unwrap_or_default();
-
-                if !include_exts.is_empty() && !include_exts.iter().any(|e| e.to_lowercase() == file_ext) {
-                    continue;
-                }
-                if exclude_exts.iter().any(|e| e.to_lowercase() == file_ext) {
-                    continue;
-                }
-                let relative_str = scanned_file.relative_path.to_string_lossy();
-                if exclude_dirs.iter().any(|d| relative_str.contains(d)) {
-                    continue;
-                }
-                if scanned_file.size < min_file_size {
-                    continue;
-                }
-
-                // 读取 mtime 用于增量缓存比对
-                let mtime = std::fs::metadata(&scanned_file.local_path)
-                    .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
-                    .unwrap_or(0);
-                filtered.push((scanned_file, mtime));
+            if (!config.filter_config.include_extensions.is_empty()
+                && !config
+                    .filter_config
+                    .include_extensions
+                    .iter()
+                    .any(|ext| ext.to_lowercase() == file_ext))
+                || config
+                    .filter_config
+                    .exclude_extensions
+                    .iter()
+                    .any(|ext| ext.to_lowercase() == file_ext)
+                || config
+                    .filter_config
+                    .exclude_directories
+                    .iter()
+                    .any(|directory| relative.contains(directory))
+                || scanned_file.size < config.filter_config.min_file_size
+                || (config.filter_config.max_file_size > 0
+                    && scanned_file.size > config.filter_config.max_file_size)
+            {
+                continue;
             }
 
-            // 第二步：增量缓存比对（仅处理变化/新增文件）
-            let scan_metas: Vec<super::scan_cache::ScannedFileMeta> = filtered.iter()
-                .map(|(f, mtime)| super::scan_cache::ScannedFileMeta {
-                    file_path: f.local_path.to_string_lossy().to_string(),
-                    mtime: *mtime,
-                    size: f.size as i64,
-                })
-                .collect();
-
-            let cache_ref = Arc::clone(&scan_cache);
-            let cfg_id = config_id_for_cache.clone();
-            let changed_set = tokio::task::spawn_blocking(move || {
-                cache_ref.find_changed_files(&cfg_id, &scan_metas)
-            }).await.unwrap_or_else(|_| Ok(Vec::new())).unwrap_or_default();
-
-            let changed_paths: std::collections::HashSet<String> = changed_set.iter()
-                .map(|m| m.file_path.clone())
-                .collect();
-
-            // 第三步：仅对变化文件执行 head_md5 + 去重检查
-            let mut cache_entries = Vec::new();
-            for (scanned_file, mtime) in &filtered {
-                let file_path_str = scanned_file.local_path.to_string_lossy().to_string();
-                if !changed_paths.contains(&file_path_str) {
-                    continue;
-                }
-
-                // 文件稳定性检测：比较扫描时的大小与当前大小
-                // 如果不一致，说明文件仍在写入（复制/移动/下载），跳过本轮
-                let current_size = std::fs::metadata(&scanned_file.local_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if current_size != scanned_file.size {
-                    tracing::info!(
-                        "文件大小仍在变化，跳过: {} (扫描时={}, 当前={} bytes)",
-                        scanned_file.local_path.display(), scanned_file.size, current_size
-                    );
-                    continue;
-                }
-
-                let file_name = scanned_file.local_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let relative_path = scanned_file.local_path.strip_prefix(&config.local_path)
-                    .map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                let head_md5 = match calculate_head_md5(&scanned_file.local_path) {
-                    Ok(md5) => md5,
-                    Err(e) => {
-                        tracing::warn!("计算文件头MD5失败，跳过去重检查: {:?}, error={}", scanned_file.local_path, e);
-                        "unknown".to_string()
-                    }
-                };
-
-                let (exists, _) = match self.record_manager.check_upload_record_preliminary(
-                    &config.id,
-                    &relative_path,
-                    &file_name,
-                    scanned_file.size,
-                    &head_md5,
-                ) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::warn!("查询去重记录失败: {:?}, error={}", scanned_file.local_path, e);
-                        (false, None)
-                    }
-                };
-
-                // 更新缓存条目（无论是否去重命中）
-                cache_entries.push(super::scan_cache::CachedFileEntry {
-                    config_id: config_id_for_cache.clone(),
-                    file_path: file_path_str.clone(),
-                    relative_path: scanned_file.relative_path.to_string_lossy().to_string(),
-                    mtime: *mtime,
-                    size: scanned_file.size as i64,
-                    head_md5: Some(head_md5.clone()),
-                    last_scan_at: chrono::Utc::now().timestamp(),
-                });
-
-                if exists {
-                    tracing::debug!("文件已备份，跳过: {} (size={}, md5={})", file_name, scanned_file.size, head_md5);
-                    continue;
-                }
-
-                // 计算远程路径
-                let remote_path = format!("{}/{}",
-                                          config.remote_path.trim_end_matches('/'),
-                                          scanned_file.relative_path.to_string_lossy().replace('\\', "/"));
-
-                let file_task = BackupFileTask {
+            match std::fs::metadata(&scanned_file.local_path) {
+                Ok(metadata) if metadata.len() == scanned_file.size => {}
+                _ => continue,
+            }
+            let head_md5 = calculate_head_md5(&scanned_file.local_path).ok();
+            let remote_path = format!(
+                "{}/{}",
+                config.remote_path.trim_end_matches('/'),
+                relative.replace('\\', "/")
+            );
+            result.push(LocalFolderFile {
+                task: BackupFileTask {
                     id: Uuid::new_v4().to_string(),
-                    parent_task_id: String::new(), // 稍后设置
-                    local_path: scanned_file.local_path.clone(),
+                    parent_task_id: folder_task_id.to_string(),
+                    local_path: scanned_file.local_path,
                     remote_path,
                     file_size: scanned_file.size,
-                    head_md5: Some(head_md5),
+                    head_md5,
                     fs_id: None,
                     status: BackupFileStatus::Pending,
                     sub_phase: None,
@@ -8007,26 +8818,70 @@ impl AutoBackupManager {
                     sync_remote_fs_id: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
-                };
-
-                file_tasks.push(file_task);
-            }
-
-            // 第四步：批量更新扫描缓存
-            if !cache_entries.is_empty() {
-                let cache_ref = Arc::clone(&scan_cache);
-                let entries = cache_entries;
-                let _ = tokio::task::spawn_blocking(move || {
-                    cache_ref.batch_upsert(entries)
-                }).await;
-            }
-
-            // 让出执行权，避免长时间阻塞
-            tokio::task::yield_now().await;
+                },
+            });
         }
 
-        tracing::info!("本地目录扫描完成: config={}, 发现 {} 个新文件", config.id, file_tasks.len());
-        Ok(file_tasks)
+        Ok(result)
+    }
+
+    /// 递归读取远端文件夹，建立“远端位置 -> 元数据”索引。
+    async fn scan_remote_folder_inventory(
+        &self,
+        config: &BackupConfig,
+    ) -> Result<HashMap<String, RemoteFolderFile>> {
+        let proxy = self.proxy_config.read().clone();
+        let fallback = self.fallback_mgr.read().clone();
+        let client = self
+            .resolve_netdisk_client_for_config(config, proxy.as_ref(), fallback)
+            .await?;
+        let mut directories = vec![config.remote_path.clone()];
+        let mut files = HashMap::new();
+
+        while let Some(directory) = directories.pop() {
+            let mut page = 1;
+            loop {
+                let response = client.get_file_list(&directory, page, 1000).await?;
+                if response.errno != 0 {
+                    return Err(anyhow!(
+                        "远端目录列表 API 错误: dir={}, errno={}, message={}",
+                        directory, response.errno, response.errmsg
+                    ));
+                }
+                if response.list.is_empty() {
+                    break;
+                }
+
+                let page_len = response.list.len();
+                for item in response.list {
+                    if item.is_directory() {
+                        directories.push(item.path.clone());
+                        continue;
+                    }
+
+                    // 这里建立的是远端全量存在性索引，不能套用本地文件过滤：
+                    // 加密上传的真实文件名是随机 UUID.age，按本地扩展名过滤
+                    // 会把它排除，导致每次扫描都重复上传。过滤只用于生成
+                    // 本地期望清单，远端多出来的文件不会被删除。
+                    files.insert(
+                        item.path.clone(),
+                        RemoteFolderFile {
+                            fs_id: item.fs_id,
+                            size: item.size,
+                            mtime: item.server_mtime,
+                            md5: item.md5.clone(),
+                        },
+                    );
+                }
+
+                if page_len < 1000 {
+                    break;
+                }
+                page += 1;
+            }
+        }
+
+        Ok(files)
     }
 
     /// 扫描远程目录获取需要下载的文件列表
@@ -8171,199 +9026,6 @@ impl AutoBackupManager {
         Ok(file_tasks)
     }
 
-    /// 增量合并新文件到现有传输任务
-    ///
-    /// 当任务正在传输时，将新扫描到的文件合并到现有任务中
-    ///
-    /// 🔥 关键：过滤掉当前任务已有的文件，避免重复加入和统计错误
-    async fn merge_new_files_to_task(
-        &self,
-        task_id: &str,
-        config: &BackupConfig,
-        mut new_files: Vec<BackupFileTask>,
-    ) -> Result<()> {
-        if new_files.is_empty() {
-            return Ok(());
-        }
-
-        // 🔥 问题1和2修复：过滤掉当前任务已有的文件
-        // 收集当前任务中已有文件的唯一标识（local_path + remote_path）
-        let existing_file_keys: std::collections::HashSet<String> = {
-            if let Some(task) = self.tasks.get(task_id) {
-                task.pending_files.iter()
-                    .map(|f| format!("{}|{}", f.local_path.display(), f.remote_path))
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            }
-        };
-
-        // 过滤掉已存在的文件
-        let original_count = new_files.len();
-        new_files.retain(|f| {
-            let key = format!("{}|{}", f.local_path.display(), f.remote_path);
-            !existing_file_keys.contains(&key)
-        });
-
-        let filtered_count = original_count - new_files.len();
-        if filtered_count > 0 {
-            tracing::info!(
-                "增量合并去重: task={}, 原始 {} 个文件, 过滤掉 {} 个已存在文件, 剩余 {} 个新文件",
-                task_id, original_count, filtered_count, new_files.len()
-            );
-        }
-
-        // 过滤后如果没有新文件，直接返回
-        if new_files.is_empty() {
-            tracing::info!("增量合并: task={}, 没有新文件需要合并", task_id);
-            return Ok(());
-        }
-
-        let new_file_count = new_files.len();
-        let new_total_bytes: u64 = new_files.iter().map(|f| f.file_size).sum();
-
-        // 设置 parent_task_id
-        for file_task in &mut new_files {
-            file_task.parent_task_id = task_id.to_string();
-        }
-
-        // 批量保存新文件任务到数据库
-        if let Err(e) = self.persistence_manager.save_file_tasks_batch(&new_files, &config.id) {
-            tracing::warn!("批量保存增量文件任务到DB失败: {}", e);
-        }
-
-        // 更新任务统计
-        if let Some(mut task) = self.tasks.get_mut(task_id) {
-            task.pending_files.extend(new_files.clone());
-            task.total_count += new_file_count;
-            task.total_bytes += new_total_bytes;
-
-            tracing::info!(
-                "增量合并完成: task={}, 新增 {} 个文件 ({} bytes), 总计 {} 个文件 ({} bytes)",
-                task_id, new_file_count, new_total_bytes, task.total_count, task.total_bytes
-            );
-
-            // 持久化任务
-            if let Err(e) = self.persistence_manager.save_task(&task) {
-                tracing::warn!("持久化增量合并后的任务失败: {}", e);
-            }
-
-            // 发送进度事件
-            Self::publish_progress_static(&self.ws_manager, &task);
-        }
-
-        // 为新文件创建传输任务
-        match config.direction {
-            BackupDirection::Upload => {
-                self.create_upload_tasks_for_files(task_id, config, new_files, None).await?;
-            }
-            BackupDirection::Download => {
-                self.create_download_tasks_for_files(task_id, config, new_files, None).await?;
-            }
-            BackupDirection::Sync => {
-                // Sync 模式的传输由 sync 模块独立管理，不走此路径
-                unreachable!("Sync 模式不使用 common_execute_backup_with_files");
-            }
-        }
-
-        Ok(())
-    }
-
-    /// 使用已扫描的文件列表执行上传备份
-    async fn execute_upload_backup_with_files(
-        &self,
-        task_id: String,
-        config: BackupConfig,
-        mut file_tasks: Vec<BackupFileTask>,
-    ) -> Result<()> {
-        tracing::info!(
-            "🔥 execute_upload_backup_with_files 开始: task={}, files={}",
-            task_id, file_tasks.len()
-        );
-
-        let file_count = file_tasks.len();
-        let total_bytes: u64 = file_tasks.iter().map(|f| f.file_size).sum();
-
-        // 设置 parent_task_id
-        for file_task in &mut file_tasks {
-            file_task.parent_task_id = task_id.clone();
-        }
-
-        // 更新任务状态为准备中
-        if let Some(mut task) = self.tasks.get_mut(&task_id) {
-            task.status = BackupTaskStatus::Preparing;
-            task.started_at = Some(Utc::now());
-        }
-        let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "queued", "preparing", owner_uid_for_event);
-
-        // 批量保存文件任务到数据库
-        if !file_tasks.is_empty() {
-            if let Err(e) = self.persistence_manager.save_file_tasks_batch(&file_tasks, &config.id) {
-                tracing::warn!("批量保存文件任务到DB失败: {}", e);
-            }
-        }
-
-        // 🔥 优化：直接移动 file_tasks 到 task.pending_files，避免不必要的 clone
-        let is_empty = file_tasks.is_empty();
-
-        // 更新任务
-        if let Some(mut task) = self.tasks.get_mut(&task_id) {
-            task.pending_files = file_tasks; // 直接移动，不再 clone
-            task.total_count = file_count;
-            task.total_bytes = total_bytes;
-            task.status = BackupTaskStatus::Transferring;
-        }
-
-        // 持久化任务
-        if let Some(task) = self.tasks.get(&task_id) {
-            if let Err(e) = self.persistence_manager.save_task(&task) {
-                tracing::warn!("持久化备份任务失败: {}", e);
-            }
-        }
-
-        // 如果没有文件需要备份，直接完成
-        if is_empty {
-            if let Some(mut task) = self.tasks.get_mut(&task_id) {
-                task.status = BackupTaskStatus::Completed;
-                task.completed_at = Some(Utc::now());
-            }
-            Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "completed", config.owner_uid);
-            // 发送任务完成事件
-            if let Some(task) = self.tasks.get(&task_id) {
-                Self::publish_task_completed_static(&self.ws_manager, &task);
-            }
-            return Ok(());
-        }
-
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "preparing", "transferring", config.owner_uid);
-
-        // 🔥 优化：克隆 pending_files 用于创建上传任务，保留原始数据供 API 查询
-        let pending_files_clone = if let Some(task) = self.tasks.get(&task_id) {
-            task.pending_files.clone()
-        } else {
-            Vec::new()
-        };
-
-        // 创建上传任务，返回处理后的文件任务列表
-        let processed_files = self.create_upload_tasks_for_files(&task_id, &config, pending_files_clone, None).await?;
-
-        // 🔥 修复：把处理后的文件任务放回 task.pending_files，更新状态
-        if let Some(mut task) = self.tasks.get_mut(&task_id) {
-            task.pending_files = processed_files;
-        }
-
-        // 🔥 兜底结算：若所有文件都在创建/启动阶段被处理掉（全部跳过/创建失败/start 失败/
-        // owner_uid 缺失），父任务可能无任何 pending 子任务，不会再有 transfer 通知触发结算。
-        // 此处主动按计数结算，避免父任务永久卡 Transferring。
-        self.finalize_backup_task_if_no_pending(&task_id);
-
-        Ok(())
-    }
-
-    /// 为文件列表创建上传任务
-    /// 返回处理后的文件任务列表，调用方需要将其放回 task.pending_files
-    /// `override_upload_strategy`: Sync 模式传 Some(Overwrite) 强制覆盖语义
     async fn create_upload_tasks_for_files(
         &self,
         task_id: &str,
@@ -8516,6 +9178,9 @@ impl AutoBackupManager {
                     file_task.error_message =
                         Some("owner_uid 缺失，无法创建子任务".to_string());
                     file_task.updated_at = Utc::now();
+                    if let Err(e) = self.persistence_manager.save_file_task(file_task, &config.id) {
+                        tracing::warn!("owner_uid 缺失后持久化 file_task 失败: {}", e);
+                    }
                     continue;
                 }
             };
@@ -8530,29 +9195,51 @@ impl AutoBackupManager {
                 task_owner_uid,
             ).await {
                 Ok(upload_task_id) => {
-                    if let Err(e) = upload_mgr.start_task(&upload_task_id).await {
-                        tracing::error!("启动上传任务失败: {}", e);
-                        if let Some(mut task) = self.tasks.get_mut(task_id) {
-                            task.failed_count += 1;
-                        }
-                        // 直接在 file_task 上更新状态
-                        file_task.status = BackupFileStatus::Failed;
-                        file_task.error_message = Some(format!("启动上传任务失败: {}", e));
-                        continue;
+                    // 先登记父任务映射，再启动底层任务。否则秒传/小文件可能
+                    // 在 start_task 内立刻发出完成通知，而父任务尚未知道该
+                    // upload_task_id，完成通知会被当成无关事件丢弃。
+                    file_task.related_task_id = Some(upload_task_id.clone());
+                    // 加密上传会由 UploadManager 为文件生成最终的随机 .age
+                    // 路径；稳定文件清单必须保存这个实际位置，下一轮扫描
+                    // 才能按远端真实路径确认文件是否存在。
+                    if let Some(upload_task) = upload_mgr.get_task(&upload_task_id).await {
+                        file_task.remote_path = upload_task.remote_path;
                     }
+                    file_task.updated_at = Utc::now();
 
-                    // 更新 task 的映射关系
                     if let Some(mut task) = self.tasks.get_mut(task_id) {
                         task.pending_upload_task_ids.insert(upload_task_id.clone());
                         task.transfer_task_map.insert(upload_task_id.clone(), file_task_id.clone());
+                        if let Some(parent_file) = task.pending_files.iter_mut().find(|file| file.id == file_task_id) {
+                            *parent_file = file_task.clone();
+                        }
                     }
-
-                    // 直接在 file_task 上更新 related_task_id
-                    file_task.related_task_id = Some(upload_task_id.clone());
-                    file_task.updated_at = Utc::now();
 
                     if let Err(e) = self.persistence_manager.save_file_task(file_task, &config.id) {
                         tracing::warn!("持久化文件任务失败: {}", e);
+                    }
+
+                    if let Err(e) = upload_mgr.start_task(&upload_task_id).await {
+                        tracing::error!("启动上传任务失败: {}", e);
+                        if let Some(mut task) = self.tasks.get_mut(task_id) {
+                            task.pending_upload_task_ids.remove(&upload_task_id);
+                            task.transfer_task_map.remove(&upload_task_id);
+                            task.failed_count += 1;
+                            if let Some(parent_file) = task.pending_files.iter_mut().find(|file| file.id == file_task_id) {
+                                parent_file.status = BackupFileStatus::Failed;
+                                parent_file.related_task_id = None;
+                                parent_file.error_message = Some(format!("启动上传任务失败: {}", e));
+                                parent_file.updated_at = Utc::now();
+                            }
+                        }
+                        file_task.status = BackupFileStatus::Failed;
+                        file_task.related_task_id = None;
+                        file_task.error_message = Some(format!("启动上传任务失败: {}", e));
+                        file_task.updated_at = Utc::now();
+                        if let Err(save_error) = self.persistence_manager.save_file_task(file_task, &config.id) {
+                            tracing::warn!("启动上传任务失败后持久化 file_task 失败: {}", save_error);
+                        }
+                        continue;
                     }
 
                     created_count += 1;
@@ -8565,6 +9252,9 @@ impl AutoBackupManager {
                     // 直接在 file_task 上更新状态
                     file_task.status = BackupFileStatus::Failed;
                     file_task.error_message = Some(format!("创建上传任务失败: {}", e));
+                    if let Err(save_error) = self.persistence_manager.save_file_task(file_task, &config.id) {
+                        tracing::warn!("创建上传任务失败后持久化 file_task 失败: {}", save_error);
+                    }
                 }
             }
         }
@@ -8583,6 +9273,11 @@ impl AutoBackupManager {
         config: BackupConfig,
         mut file_tasks: Vec<BackupFileTask>,
     ) -> Result<()> {
+        let _execution_claim = Self::claim_execution_static(
+            &self.execution_claims,
+            &config.id,
+            &task_id,
+        )?;
         let file_count = file_tasks.len();
         let total_bytes: u64 = file_tasks.iter().map(|f| f.file_size).sum();
 
@@ -8591,13 +9286,14 @@ impl AutoBackupManager {
             file_task.parent_task_id = task_id.clone();
         }
 
-        // 更新任务状态
-        if let Some(mut task) = self.tasks.get_mut(&task_id) {
-            task.status = BackupTaskStatus::Preparing;
-            task.started_at = Some(Utc::now());
-        }
+        let old_status = Self::claim_task_preparing_static(&self.tasks, &task_id, None);
         let owner_uid_for_event = self.tasks.get(&task_id).and_then(|t| t.owner_uid);
-        Self::publish_status_changed_static(&self.ws_manager, &task_id, "queued", "preparing", owner_uid_for_event);
+        Self::publish_preparing_transition_static(
+            &self.ws_manager,
+            &task_id,
+            old_status,
+            owner_uid_for_event,
+        );
 
         // 批量保存文件任务
         if !file_tasks.is_empty() {
@@ -8675,19 +9371,29 @@ impl AutoBackupManager {
         use super::sync::state_manager::SyncStateManager;
         use super::sync::plan::generate_sync_plan;
 
+        let _execution_claim = Self::claim_execution_static(
+            &self.execution_claims,
+            &config.id,
+            task_id,
+        )?;
         tracing::info!(
             "开始执行同步备份: config={}, task={}, scan_remote={}",
             config.id, task_id, scan_remote
         );
 
-        // 更新任务状态为 Preparing + SyncScanning
-        if let Some(mut task) = self.tasks.get_mut(task_id) {
-            task.status = BackupTaskStatus::Preparing;
-            task.sub_phase = Some(BackupSubPhase::SyncScanning);
-            task.started_at = Some(Utc::now());
-        }
+        // 新建记录已经预留 Preparing；恢复的 Queued 记录在这里完成唯一认领。
+        let old_status = Self::claim_task_preparing_static(
+            &self.tasks,
+            task_id,
+            Some(BackupSubPhase::SyncScanning),
+        );
         let owner_uid_for_event = self.tasks.get(task_id).and_then(|t| t.owner_uid);
-        Self::publish_status_changed_static(&self.ws_manager, task_id, "queued", "preparing", owner_uid_for_event);
+        Self::publish_preparing_transition_static(
+            &self.ws_manager,
+            task_id,
+            old_status,
+            owner_uid_for_event,
+        );
 
         // ════════════════════════════════════════════════════════
         // Stage 1: Snapshot — 扫描本地和远端
@@ -8806,6 +9512,7 @@ impl AutoBackupManager {
             }
             // needs_full_sync 仅在没有传输时立即清除（无传输风险）
             if config.needs_full_sync {
+                let _mutation_guard = self.mutation_lock.lock().await;
                 if let Some(mut cfg) = self.configs.get_mut(&config.id) {
                     cfg.needs_full_sync = false;
                     tracing::info!("同步无传输任务，清除 needs_full_sync: config={}", config.id);
@@ -8907,7 +9614,7 @@ impl AutoBackupManager {
         let owner_uid_for_event = self.tasks.get(task_id).and_then(|t| t.owner_uid);
         Self::publish_status_changed_static(&self.ws_manager, task_id, "preparing", "transferring", owner_uid_for_event);
 
-        // Step 1: 创建上传传输任务（直接调用低层方法，不经过 execute_upload_backup_with_files）
+        // Step 1: 创建上传传输任务（直接调用低层方法）。
         if total_upload_count > 0 {
             if let Some(mut task) = self.tasks.get_mut(task_id) {
                 task.sub_phase = Some(BackupSubPhase::SyncUploading);
@@ -9081,7 +9788,7 @@ impl AutoBackupManager {
 
     /// 扫描本地目录生成 Sync 快照（LocalScannedFile 列表）
     ///
-    /// 与 scan_local_directory_for_backup 不同：不做去重检查，只收集文件元数据。
+    /// 只收集文件元数据，不做上传去重检查。
     async fn scan_local_for_sync(&self, config: &BackupConfig) -> Result<Vec<super::sync::types::LocalScannedFile>> {
         use crate::uploader::{BatchedScanIterator, ScanOptions};
 
@@ -9520,8 +10227,7 @@ impl AutoBackupManager {
     /// 执行 Watch 事件的完整处理流程
     ///
     /// 🔥 Watch 事件不需要全量扫描，直接处理变化的文件路径
-    /// 1. Sync 配置走 SyncPlanner（仅本地快照，不扫描远端）
-    /// 2. Upload 配置走旧链路：增量合并或创建新上传任务
+    /// Sync 配置走 SyncPlanner（仅本地快照，不扫描远端）。
     async fn execute_watch_event(
         &self,
         config: &BackupConfig,
@@ -9538,12 +10244,9 @@ impl AutoBackupManager {
 
         // Sync 配置走 SyncPlanner（Watch 快路径：仅本地快照 + Sync planner，不扫描远端）
         if config.direction == BackupDirection::Sync {
-            // 检查是否有正在运行的 Sync 任务（Preparing / Transferring / Queued）
+            // 检查是否有占用配置唯一槽位的 Sync 任务。
             let has_active = self.tasks.iter()
-                .any(|t| t.config_id == config.id && matches!(
-                    t.status,
-                    BackupTaskStatus::Preparing | BackupTaskStatus::Transferring | BackupTaskStatus::Queued
-                ));
+                .any(|t| t.config_id == config.id && t.status.is_active());
 
             if has_active {
                 // 有活跃任务，合并 Watch 意图，任务完成后会重新触发
@@ -9587,346 +10290,8 @@ impl AutoBackupManager {
             return Ok(());
         }
 
-        // 检查是否有正在传输的任务
-        let transferring_task_id = self.tasks.iter()
-            .find(|t| t.config_id == config.id && t.status == BackupTaskStatus::Transferring)
-            .map(|t| t.id.clone());
-
-        if let Some(task_id) = transferring_task_id {
-            // 有传输任务，直接处理变化的文件并合并
-            tracing::info!(
-                "Watch事件: 配置 {} 有传输任务 {}，增量合并 {} 个变化文件",
-                config.id, task_id, paths.len()
-            );
-            return self.process_watch_event_files(&task_id, config, paths).await;
-        }
-
-        // 没有传输任务，需要创建新任务
-        // 先处理文件，生成文件任务列表
-        let new_files = self.build_file_tasks_from_paths(config, paths).await?;
-
-        if new_files.is_empty() {
-            tracing::info!("Watch事件: config={}, 没有新文件需要备份", config.id);
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Watch事件: config={}, 发现 {} 个新文件，创建新任务",
-            config.id, new_files.len()
-        );
-
-        // 创建新任务
-        let task_id = self.create_backup_task_record(config, TriggerType::Watch).await?;
-
-        // 执行上传（Watch 事件只用于上传备份）
-        self.execute_upload_backup_with_files(task_id, config.clone(), new_files).await
-    }
-
-    /// 从文件路径列表构建文件任务列表
-    ///
-    /// 应用过滤规则和去重检查
-    async fn build_file_tasks_from_paths(
-        &self,
-        config: &BackupConfig,
-        paths: &[PathBuf],
-    ) -> Result<Vec<BackupFileTask>> {
-        let mut file_tasks = Vec::new();
-
-        for path in paths {
-            // 检查文件是否存在
-            if !path.exists() || !path.is_file() {
-                // 文件已删除，清理扫描缓存
-                let _ = self.scan_cache_manager.delete_by_path(&config.id, &path.to_string_lossy());
-                continue;
-            }
-
-            // 检查文件是否在配置的本地路径下
-            if !path.starts_with(&config.local_path) {
-                continue;
-            }
-
-            // 获取文件元数据
-            let metadata = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let file_size = metadata.len();
-
-            // 文件稳定性检测：等待 1 秒后再次检查大小
-            // 防止正在复制/移动/写入的文件被提前上传
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            let size_after = std::fs::metadata(path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if size_after != file_size {
-                tracing::info!(
-                    "文件大小仍在变化，跳过: {} ({} -> {} bytes)",
-                    path.display(), file_size, size_after
-                );
-                continue;
-            }
-
-            // 应用过滤规则
-            let file_ext = path.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                .unwrap_or_default();
-
-            if !config.filter_config.include_extensions.is_empty()
-                && !config.filter_config.include_extensions.iter().any(|e| e.to_lowercase() == file_ext)
-            {
-                continue;
-            }
-
-            if config.filter_config.exclude_extensions.iter().any(|e| e.to_lowercase() == file_ext) {
-                continue;
-            }
-
-            let relative_str = path.strip_prefix(&config.local_path)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if config.filter_config.exclude_directories.iter().any(|d| relative_str.contains(d)) {
-                continue;
-            }
-
-            if file_size < config.filter_config.min_file_size {
-                continue;
-            }
-            if config.filter_config.max_file_size > 0 && file_size > config.filter_config.max_file_size {
-                continue;
-            }
-
-            // 去重检查
-            let file_name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let relative_path = path.strip_prefix(&config.local_path)
-                .map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let head_md5 = calculate_head_md5(path).unwrap_or_else(|_| "unknown".to_string());
-
-            let (exists, _) = self.record_manager.check_upload_record_preliminary(
-                &config.id,
-                &relative_path,
-                &file_name,
-                file_size,
-                &head_md5,
-            ).unwrap_or((false, None));
-
-            if exists {
-                continue;
-            }
-
-            // 计算远程路径
-            let remote_path = format!("{}/{}",
-                                      config.remote_path.trim_end_matches('/'),
-                                      path.strip_prefix(&config.local_path)
-                                          .map(|p| p.to_string_lossy().replace('\\', "/"))
-                                          .unwrap_or_else(|_| file_name.clone()));
-
-            let file_task = BackupFileTask {
-                id: Uuid::new_v4().to_string(),
-                parent_task_id: String::new(),
-                local_path: path.clone(),
-                remote_path,
-                file_size,
-                head_md5: Some(head_md5),
-                fs_id: None,
-                status: BackupFileStatus::Pending,
-                sub_phase: None,
-                skip_reason: None,
-                encrypted: config.encrypt_enabled,
-                encrypted_name: None,
-                temp_encrypted_path: None,
-                transferred_bytes: 0,
-                decrypt_progress: None,
-                error_message: None,
-                retry_count: 0,
-                related_task_id: None,
-                backup_operation_type: Some(BackupOperationType::Upload),
-                sync_remote_mtime: None,
-                sync_remote_size: None,
-                sync_remote_fs_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-
-            file_tasks.push(file_task);
-        }
-
-        Ok(file_tasks)
-    }
-
-    /// 处理 Watch 事件中的文件变化（合并到现有任务）
-    ///
-    /// 只处理变化的文件，根据备份方向复用对应的去重逻辑
-    async fn process_watch_event_files(
-        &self,
-        task_id: &str,
-        config: &BackupConfig,
-        paths: &[PathBuf],
-    ) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-
-        tracing::info!(
-            "处理Watch事件文件: task={}, config={}, paths={}",
-            task_id, config.id, paths.len()
-        );
-
-        let mut new_files = Vec::new();
-
-        for path in paths {
-            // 检查文件是否存在（可能已被删除）
-            if !path.exists() || !path.is_file() {
-                // 文件已删除，清理扫描缓存
-                let _ = self.scan_cache_manager.delete_by_path(&config.id, &path.to_string_lossy());
-                tracing::debug!("Watch文件不存在或不是文件，跳过: {:?}", path);
-                continue;
-            }
-
-            // 检查文件是否在配置的本地路径下
-            if !path.starts_with(&config.local_path) {
-                tracing::debug!("Watch文件不在配置路径下，跳过: {:?}", path);
-                continue;
-            }
-
-            // 获取文件元数据
-            let metadata = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("获取文件元数据失败: {:?}, error={}", path, e);
-                    continue;
-                }
-            };
-
-            let file_size = metadata.len();
-
-            // 应用过滤规则
-            let file_ext = path.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                .unwrap_or_default();
-
-            // 检查包含扩展名
-            if !config.filter_config.include_extensions.is_empty()
-                && !config.filter_config.include_extensions.iter().any(|e| e.to_lowercase() == file_ext)
-            {
-                continue;
-            }
-
-            // 检查排除扩展名
-            if config.filter_config.exclude_extensions.iter().any(|e| e.to_lowercase() == file_ext) {
-                continue;
-            }
-
-            // 检查排除目录
-            let relative_str = path.strip_prefix(&config.local_path)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if config.filter_config.exclude_directories.iter().any(|d| relative_str.contains(d)) {
-                continue;
-            }
-
-            // 检查文件大小
-            if file_size < config.filter_config.min_file_size {
-                continue;
-            }
-            if config.filter_config.max_file_size > 0 && file_size > config.filter_config.max_file_size {
-                continue;
-            }
-
-            // 去重检查
-            let file_name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let relative_path = path.strip_prefix(&config.local_path)
-                .map(|p| p.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let head_md5 = match calculate_head_md5(path) {
-                Ok(md5) => md5,
-                Err(e) => {
-                    tracing::warn!("计算文件头MD5失败: {:?}, error={}", path, e);
-                    "unknown".to_string()
-                }
-            };
-
-            let (exists, _) = match self.record_manager.check_upload_record_preliminary(
-                &config.id,
-                &relative_path,
-                &file_name,
-                file_size,
-                &head_md5,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::warn!("查询去重记录失败: {:?}, error={}", path, e);
-                    (false, None)
-                }
-            };
-
-            if exists {
-                tracing::debug!("Watch文件已备份，跳过: {} (size={}, md5={})", file_name, file_size, head_md5);
-                continue;
-            }
-
-            // 计算远程路径
-            let remote_path = format!("{}/{}",
-                                      config.remote_path.trim_end_matches('/'),
-                                      path.strip_prefix(&config.local_path)
-                                          .map(|p| p.to_string_lossy().replace('\\', "/"))
-                                          .unwrap_or_else(|_| file_name.clone()));
-
-            let file_task = BackupFileTask {
-                id: Uuid::new_v4().to_string(),
-                parent_task_id: task_id.to_string(),
-                local_path: path.clone(),
-                remote_path,
-                file_size,
-                head_md5: Some(head_md5),
-                fs_id: None,
-                status: BackupFileStatus::Pending,
-                sub_phase: None,
-                skip_reason: None,
-                encrypted: config.encrypt_enabled,
-                encrypted_name: None,
-                temp_encrypted_path: None,
-                transferred_bytes: 0,
-                decrypt_progress: None,
-                error_message: None,
-                retry_count: 0,
-                related_task_id: None,
-                backup_operation_type: Some(BackupOperationType::Upload),
-                sync_remote_mtime: None,
-                sync_remote_size: None,
-                sync_remote_fs_id: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-
-            new_files.push(file_task);
-        }
-
-        if new_files.is_empty() {
-            tracing::info!("Watch事件处理完成: task={}, 没有新文件需要备份", task_id);
-            return Ok(());
-        }
-
-        tracing::info!(
-            "Watch事件处理: task={}, 发现 {} 个新文件需要备份",
-            task_id, new_files.len()
-        );
-
-        // 使用增量合并方法（会自动过滤当前任务已有的文件）
-        self.merge_new_files_to_task(task_id, config, new_files).await
+        // 非 Sync 配置已在事件分发层转为 Poll；这里保留一个防御性返回。
+        Ok(())
     }
 
     /// 加密路径中的文件夹名（静态版本，用于静态方法中）
@@ -10308,4 +10673,305 @@ pub struct ShutdownResult {
     pub cleaned_temp_files: usize,
     /// 错误信息（如果有）
     pub errors: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Notify;
+
+    fn race_test_config(root: &Path) -> BackupConfig {
+        let now = Utc::now();
+        let mut watch_config = WatchConfig::default();
+        watch_config.enabled = false;
+        let mut poll_config = PollConfig::default();
+        poll_config.enabled = false;
+
+        BackupConfig {
+            id: "race-config".to_string(),
+            name: "race-config".to_string(),
+            local_path: root.join("upload"),
+            remote_path: "/race".to_string(),
+            direction: BackupDirection::Upload,
+            watch_config,
+            poll_config,
+            filter_config: FilterConfig::default(),
+            encrypt_enabled: false,
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+            owner_uid: None,
+        }
+    }
+
+    fn assert_one_active_task(manager: &AutoBackupManager, config_id: &str, task_id: &str) {
+        let active_tasks: Vec<_> = manager
+            .get_tasks_by_config(config_id)
+            .into_iter()
+            .filter(|task| task.status.is_active())
+            .collect();
+
+        assert_eq!(active_tasks.len(), 1, "配置不应同时存在多个活跃主任务");
+        assert_eq!(active_tasks[0].id, task_id);
+        assert_eq!(
+            manager.persistence_manager.find_active_task_id(config_id).unwrap(),
+            Some(task_id.to_string())
+        );
+    }
+
+    fn encrypted_file_task(config: &BackupConfig, local_path: PathBuf) -> BackupFileTask {
+        BackupFileTask {
+            id: "file-task".to_string(),
+            parent_task_id: folder_task_id(&config.id),
+            remote_path: format!(
+                "{}/{}",
+                config.remote_path.trim_end_matches('/'),
+                local_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+            ),
+            file_size: 4,
+            local_path,
+            head_md5: None,
+            fs_id: None,
+            status: BackupFileStatus::Pending,
+            sub_phase: None,
+            skip_reason: None,
+            encrypted: true,
+            encrypted_name: None,
+            temp_encrypted_path: None,
+            transferred_bytes: 0,
+            decrypt_progress: None,
+            error_message: None,
+            retry_count: 0,
+            related_task_id: None,
+            backup_operation_type: Some(BackupOperationType::Upload),
+            sync_remote_mtime: None,
+            sync_remote_size: None,
+            sync_remote_fs_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_reconciliation_resolves_remote_path_from_snapshot() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let local_root = root.join("upload");
+        std::fs::create_dir_all(&local_root).unwrap();
+        let local_path = local_root.join("same-name.txt");
+        std::fs::write(&local_path, b"data").unwrap();
+
+        let record_manager = Arc::new(
+            BackupRecordManager::new(&root.join("records.db")).unwrap(),
+        );
+        let snapshot_manager = Arc::new(SnapshotManager::new(Arc::clone(&record_manager)));
+        let manager = AutoBackupManager::new(
+            root.join("configs.json"),
+            root.join("tasks.db"),
+            root.join("temp"),
+            Arc::clone(&record_manager),
+            snapshot_manager,
+        )
+        .await
+        .unwrap();
+
+        let mut config = race_test_config(root);
+        config.encrypt_enabled = true;
+        manager.configs.insert(config.id.clone(), config.clone());
+
+        record_manager
+            .add_snapshot(&EncryptionSnapshot {
+                config_id: config.id.clone(),
+                original_path: "/race".to_string(),
+                original_name: "same-name.txt".to_string(),
+                encrypted_name: "random-name.age".to_string(),
+                file_size: 4,
+                version: 1,
+                key_version: 1,
+                remote_path: "/race/random-name.age".to_string(),
+                is_directory: false,
+                status: "completed".to_string(),
+            })
+            .unwrap();
+        // 同名文件在另一个配置下的映射不能被当前配置误用。
+        record_manager
+            .add_snapshot(&EncryptionSnapshot {
+                config_id: "other-config".to_string(),
+                original_path: "/race".to_string(),
+                original_name: "same-name.txt".to_string(),
+                encrypted_name: "other-name.age".to_string(),
+                file_size: 4,
+                version: 1,
+                key_version: 1,
+                remote_path: "/race/other-name.age".to_string(),
+                is_directory: false,
+                status: "completed".to_string(),
+            })
+            .unwrap();
+
+        let file_task = encrypted_file_task(&config, local_path);
+        let snapshot = manager
+            .find_encrypted_snapshot_for_file(&config, &file_task, None)
+            .unwrap()
+            .expect("应通过本地文件名和配置解析加密映射");
+        assert_eq!(snapshot.remote_path, "/race/random-name.age");
+        assert_ne!(snapshot.remote_path, file_task.remote_path);
+
+        let invalid_snapshot = EncryptionSnapshot {
+            config_id: config.id.clone(),
+            original_path: String::new(),
+            original_name: "same-name.txt".to_string(),
+            encrypted_name: "outside.age".to_string(),
+            file_size: 4,
+            version: 1,
+            key_version: 1,
+            remote_path: "/outside/outside.age".to_string(),
+            is_directory: false,
+            status: "completed".to_string(),
+        };
+        record_manager.add_snapshot(&invalid_snapshot).unwrap();
+        let snapshot = manager
+            .find_encrypted_snapshot_for_file(&config, &file_task, None)
+            .unwrap()
+            .expect("根目录内的有效映射仍应可用");
+        assert_eq!(snapshot.remote_path, "/race/random-name.age");
+
+        let shutdown = manager.shutdown().await;
+        assert!(shutdown.success, "测试管理器应能正常关闭: {:?}", shutdown.errors);
+    }
+
+    #[tokio::test]
+    async fn test_manual_trigger_during_upload_initialization_then_pause_resume_keeps_one_task() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let record_manager = Arc::new(
+            BackupRecordManager::new(&root.join("records.db")).unwrap(),
+        );
+        let snapshot_manager = Arc::new(SnapshotManager::new(Arc::clone(&record_manager)));
+        let manager = Arc::new(
+            AutoBackupManager::new(
+                root.join("configs.json"),
+                root.join("tasks.db"),
+                root.join("temp"),
+                record_manager,
+                snapshot_manager,
+            )
+            .await
+            .unwrap(),
+        );
+        let config = race_test_config(root);
+        manager.configs.insert(config.id.clone(), config.clone());
+
+        // 这是配置创建时建立的稳定文件夹父记录。任务已经占用 Preparing
+        // 槽位，但下面的初始化协程故意在真正开始前停住。
+        let task_id = manager
+            .ensure_folder_task(&config, TriggerType::Watch)
+            .await
+            .unwrap();
+        manager
+            .update_folder_task_state(
+                &task_id,
+                BackupTaskStatus::Preparing,
+                Some(BackupSubPhase::DedupChecking),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_task(&task_id).unwrap().status,
+            BackupTaskStatus::Preparing
+        );
+        assert_one_active_task(&manager, &config.id, &task_id);
+
+        let initialization_entered = Arc::new(Notify::new());
+        let initialization_release = Arc::new(Notify::new());
+        let initializer = {
+            let manager = Arc::clone(&manager);
+            let entered = Arc::clone(&initialization_entered);
+            let release = Arc::clone(&initialization_release);
+            let config_id = config.id.clone();
+            let task_id = task_id.clone();
+
+            tokio::spawn(async move {
+                let _execution_claim = AutoBackupManager::claim_execution_static(
+                    &manager.execution_claims,
+                    &config_id,
+                    &task_id,
+                )
+                .unwrap();
+
+                entered.notify_one();
+                release.notified().await;
+
+                // 模拟上传初始化完成并开始创建底层上传子任务。
+                let task_snapshot = {
+                    let mut task = manager.tasks.get_mut(&task_id).unwrap();
+                    assert_eq!(task.status, BackupTaskStatus::Preparing);
+                    task.status = BackupTaskStatus::Transferring;
+                    task.sub_phase = Some(BackupSubPhase::Uploading);
+                    task.pending_upload_task_ids
+                        .insert("upload-subtask-initialized".to_string());
+                    task.clone()
+                };
+                manager
+                    .persistence_manager
+                    .save_task(&task_snapshot)
+                    .unwrap();
+            })
+        };
+
+        // 确认自动任务确实卡在初始化阶段，再模拟用户点击手动备份。
+        initialization_entered.notified().await;
+        let (manual_result, concurrent_manual_result) = tokio::join!(
+            manager.trigger_backup(&config.id),
+            manager.trigger_backup(&config.id),
+        );
+        let manual_result = manual_result.unwrap();
+        let concurrent_manual_result = concurrent_manual_result.unwrap();
+        assert_eq!(manual_result, task_id, "手动触发必须复用稳定文件夹记录");
+        assert_eq!(concurrent_manual_result, task_id, "并发手动触发必须复用同一稳定记录");
+        assert_one_active_task(&manager, &config.id, &task_id);
+
+        // 放行自动任务进入上传中，然后验证暂停/恢复只改变同一条主任务的状态。
+        initialization_release.notify_one();
+        initializer.await.unwrap();
+        assert_eq!(
+            manager.get_task(&task_id).unwrap().status,
+            BackupTaskStatus::Transferring
+        );
+        assert_one_active_task(&manager, &config.id, &task_id);
+
+        manager.pause_task(&task_id).await.unwrap();
+        assert_eq!(
+            manager.get_task(&task_id).unwrap().status,
+            BackupTaskStatus::Paused
+        );
+        assert_one_active_task(&manager, &config.id, &task_id);
+
+        let manual_while_paused = manager.trigger_backup(&config.id).await.unwrap();
+        assert_eq!(
+            manual_while_paused, task_id,
+            "暂停时手动触发也只能复用稳定文件夹记录"
+        );
+
+        manager.resume_task(&task_id).await.unwrap();
+        assert_eq!(
+            manager.get_task(&task_id).unwrap().status,
+            BackupTaskStatus::Transferring
+        );
+        assert_one_active_task(&manager, &config.id, &task_id);
+
+        let shutdown = manager.shutdown().await;
+        assert!(shutdown.success, "测试管理器应能正常关闭: {:?}", shutdown.errors);
+    }
 }

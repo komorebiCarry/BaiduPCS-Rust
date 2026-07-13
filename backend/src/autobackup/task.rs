@@ -27,6 +27,24 @@ pub enum BackupTaskStatus {
     Paused,
 }
 
+impl BackupTaskStatus {
+    /// 是否仍然占用该配置的唯一执行槽位。
+    ///
+    /// 同一配置的手动、监听和轮询触发必须共享这个槽位；因此 Queued
+    /// 和 Paused 也属于活跃状态，不能在它们存在时再创建第二个主任务。
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Preparing | Self::Transferring | Self::Paused
+        )
+    }
+
+    /// 是否已经进入终态。
+    pub fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
+}
+
 /// 备份子阶段（用于更细粒度的状态追踪）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

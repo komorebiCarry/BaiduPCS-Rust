@@ -484,6 +484,43 @@ impl BackupRecordManager {
         Ok(result)
     }
 
+    /// 根据配置和本地原始文件名查询所有文件加密映射。
+    ///
+    /// 同名文件可能位于不同目录，调用方还需要结合 original_path 或
+    /// remote_path 做目录级消歧；不能只用全局 encrypted_name/文件名猜测。
+    pub fn find_file_snapshots_by_config_original_name(
+        &self,
+        config_id: &str,
+        original_name: &str,
+    ) -> Result<Vec<EncryptionSnapshot>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT config_id, original_path, original_name, encrypted_name,
+                    file_size, version, key_version, remote_path, is_directory, status
+             FROM encryption_snapshots
+             WHERE config_id = ?1 AND original_name = ?2 AND is_directory = 0
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+
+        let rows = stmt.query_map(params![config_id, original_name], |row| {
+            Ok(EncryptionSnapshot {
+                config_id: row.get(0)?,
+                original_path: row.get(1)?,
+                original_name: row.get(2)?,
+                encrypted_name: row.get(3)?,
+                file_size: row.get::<_, i64>(4)? as u64,
+                version: row.get(5)?,
+                key_version: row.get::<_, i64>(6)? as u32,
+                remote_path: row.get(7)?,
+                is_directory: row.get::<_, i32>(8)? == 1,
+                status: row.get(9)?,
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// 更新快照状态
     pub fn update_snapshot_status(&self, encrypted_name: &str, status: &str) -> Result<bool> {
         let conn = self.get_conn()?;

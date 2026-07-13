@@ -118,6 +118,53 @@ impl BackupPersistenceManager {
             [],
         )?;
 
+        // 迁移旧数据库时先收敛历史竞态产生的重复活跃任务，再建立最终的
+        // 部分唯一索引。保留最早创建的任务，其余任务标记为失败而不是删除，
+        // 这样历史仍可审计，同时从此以后数据库层面不可能再出现同一配置的
+        // Queued/Preparing/Transferring/Paused 双任务。
+        let duplicate_count = conn.execute(
+            r#"
+            UPDATE backup_tasks
+            SET status = 'failed',
+                error_message = COALESCE(error_message, '启动时清理重复活跃备份任务'),
+                completed_at = COALESCE(completed_at, ?1)
+            WHERE id IN (
+                SELECT duplicate.id
+                FROM backup_tasks AS duplicate
+                WHERE duplicate.status IN ('queued', 'preparing', 'transferring', 'paused')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM backup_tasks AS winner
+                      WHERE winner.config_id = duplicate.config_id
+                        AND winner.status IN ('queued', 'preparing', 'transferring', 'paused')
+                        AND (
+                            winner.created_at < duplicate.created_at
+                            OR (
+                                winner.created_at = duplicate.created_at
+                                AND winner.id < duplicate.id
+                            )
+                        )
+                  )
+            )
+            "#,
+            params![chrono::Utc::now().timestamp()],
+        )?;
+        if duplicate_count > 0 {
+            tracing::warn!(
+                "备份任务数据库启动迁移：已将 {} 个重复活跃任务标记为失败",
+                duplicate_count
+            );
+        }
+
+        conn.execute(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_tasks_one_active_per_config
+            ON backup_tasks(config_id)
+            WHERE status IN ('queued', 'preparing', 'transferring', 'paused')
+            "#,
+            [],
+        )?;
+
         // 创建子任务表
         conn.execute(
             r#"
@@ -196,6 +243,31 @@ impl BackupPersistenceManager {
             [],
         )?;
 
+        // 新模型下 `folder:<config_id>` 是配置级稳定父记录，文件清单不能因为
+        // 手动/监听/轮询触发而重复插入。同一文件的远端位置在一个文件夹内唯一；
+        // 旧版本按每次主任务保存的历史行不参与这个约束，避免破坏已有历史数据。
+        conn.execute(
+            r#"
+            DELETE FROM backup_file_tasks
+            WHERE backup_task_id LIKE 'folder:%'
+              AND rowid NOT IN (
+                  SELECT MAX(rowid)
+                  FROM backup_file_tasks
+                  WHERE backup_task_id LIKE 'folder:%'
+                  GROUP BY config_id, remote_path
+              )
+            "#,
+            [],
+        )?;
+        conn.execute(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_folder_file_manifest_unique
+            ON backup_file_tasks(config_id, remote_path)
+            WHERE backup_task_id LIKE 'folder:%'
+            "#,
+            [],
+        )?;
+
         // 迁移：为已有数据库添加 sync_remote_* 列（ALTER TABLE ADD COLUMN 如果列已存在会报错，忽略即可）
         for col in &[
             "sync_remote_mtime INTEGER",
@@ -228,12 +300,27 @@ impl BackupPersistenceManager {
 
         conn.execute(
             r#"
-            INSERT OR REPLACE INTO backup_tasks (
+            INSERT INTO backup_tasks (
                 id, config_id, status, sub_phase, trigger_type,
                 completed_count, failed_count, skipped_count, total_count,
                 transferred_bytes, total_bytes, error_message,
                 created_at, started_at, completed_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ON CONFLICT(id) DO UPDATE SET
+                config_id = excluded.config_id,
+                status = excluded.status,
+                sub_phase = excluded.sub_phase,
+                trigger_type = excluded.trigger_type,
+                completed_count = excluded.completed_count,
+                failed_count = excluded.failed_count,
+                skipped_count = excluded.skipped_count,
+                total_count = excluded.total_count,
+                transferred_bytes = excluded.transferred_bytes,
+                total_bytes = excluded.total_bytes,
+                error_message = excluded.error_message,
+                created_at = excluded.created_at,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at
             "#,
             params![
                 task.id,
@@ -299,6 +386,29 @@ impl BackupPersistenceManager {
         }
     }
 
+    /// 查找指定配置当前唯一的活跃主任务。
+    ///
+    /// 该查询与 `idx_backup_tasks_one_active_per_config` 配套使用：查询用于
+    /// 友好地返回已有任务 ID，唯一索引负责处理跨管理器/跨请求的最终竞态。
+    pub fn find_active_task_id(&self, config_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        conn.query_row(
+            r#"
+            SELECT id
+            FROM backup_tasks
+            WHERE config_id = ?1
+              AND status IN ('queued', 'preparing', 'transferring', 'paused')
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            "#,
+            params![config_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// 更新任务状态
     pub fn update_task_status(
         &self,
@@ -359,7 +469,7 @@ impl BackupPersistenceManager {
                    transferred_bytes, total_bytes, error_message,
                    created_at, started_at, completed_at
             FROM backup_tasks
-            WHERE status NOT IN ('completed', 'cancelled', 'failed')
+            WHERE status NOT IN ('completed', 'partiallycompleted', 'partially_completed', 'cancelled', 'failed')
             ORDER BY created_at ASC
             "#,
         )?;
@@ -412,6 +522,42 @@ impl BackupPersistenceManager {
         conn.execute("DELETE FROM backup_tasks WHERE id = ?1", params![task_id])?;
 
         Ok(())
+    }
+
+    /// 丢弃旧版按触发创建的主任务及其文件行。
+    ///
+    /// 稳定文件夹模型使用 `folder:<config_id>` 作为唯一主记录，因此这里只
+    /// 删除同一配置下所有非稳定记录，不尝试迁移或恢复旧状态机的数据。
+    pub fn discard_legacy_tasks_for_config(&self, config_id: &str) -> Result<usize> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let tx = conn.transaction()?;
+
+        let task_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM backup_tasks WHERE config_id = ?1 AND id NOT LIKE 'folder:%'",
+            params![config_id],
+            |row| row.get(0),
+        )?;
+
+        tx.execute(
+            r#"
+            DELETE FROM backup_file_tasks
+            WHERE backup_task_id IN (
+                SELECT id
+                FROM backup_tasks
+                WHERE config_id = ?1
+                  AND id NOT LIKE 'folder:%'
+            )
+               OR (config_id = ?1 AND backup_task_id NOT LIKE 'folder:%')
+            "#,
+            params![config_id],
+        )?;
+        tx.execute(
+            "DELETE FROM backup_tasks WHERE config_id = ?1 AND id NOT LIKE 'folder:%'",
+            params![config_id],
+        )?;
+
+        tx.commit()?;
+        Ok(task_count as usize)
     }
 
     // ==================== 子任务操作 ====================
@@ -550,6 +696,231 @@ impl BackupPersistenceManager {
         }
 
         tx.commit()?;
+        Ok(())
+    }
+
+    /// 原子维护一个配置对应的稳定文件清单。
+    ///
+    /// 与旧的“每次主任务插入一批文件”路径不同，这里按
+    /// `(config_id, remote_path)` 更新同一行。正在上传的行不会被扫描覆盖，
+    /// 等上传完成后下一次扫描会重新比较本地文件和远端状态，避免旧上传的
+    /// 完成通知把新版本文件错误地标记为已完成。
+    pub fn upsert_folder_file_tasks(
+        &self,
+        file_tasks: &[BackupFileTask],
+        config_id: &str,
+        folder_task_id: &str,
+    ) -> Result<()> {
+        if file_tasks.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let tx = conn.transaction()?;
+
+        for file_task in file_tasks {
+            let status = format!("{:?}", file_task.status).to_lowercase();
+            let sub_phase = file_task.sub_phase.map(|p| format!("{:?}", p).to_lowercase());
+            let skip_reason = file_task
+                .skip_reason
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap_or_default());
+            let file_name = file_task
+                .local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let now = chrono::Utc::now().timestamp();
+
+            let existing: Option<(String, String, Option<String>)> = tx
+                .query_row(
+                    r#"
+                    SELECT id, status, related_task_id
+                    FROM backup_file_tasks
+                    WHERE config_id = ?1
+                      AND remote_path = ?2
+                      AND backup_task_id LIKE 'folder:%'
+                    LIMIT 1
+                    "#,
+                    params![config_id, file_task.remote_path],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+
+            if let Some((existing_id, existing_status, existing_related_task_id)) = existing {
+                let active = matches!(
+                    existing_status.as_str(),
+                    "checking" | "encrypting" | "waitingtransfer" | "transferring"
+                );
+
+                if active {
+                    // 不改写正在执行的文件快照；否则完成通知可能结算到新版本。
+                    tx.execute(
+                        "UPDATE backup_file_tasks SET updated_at = ?1 WHERE id = ?2",
+                        params![now, existing_id],
+                    )?;
+                    continue;
+                }
+
+                tx.execute(
+                    r#"
+                    UPDATE backup_file_tasks SET
+                        backup_task_id = ?1,
+                        relative_path = ?2,
+                        file_name = ?3,
+                        local_path = ?4,
+                        file_size = ?5,
+                        head_md5 = ?6,
+                        fs_id = ?7,
+                        status = ?8,
+                        sub_phase = ?9,
+                        skip_reason = ?10,
+                        encrypted = ?11,
+                        encrypted_name = ?12,
+                        temp_encrypted_path = ?13,
+                        transferred_bytes = ?14,
+                        error_message = ?15,
+                        retry_count = ?16,
+                        related_task_id = ?17,
+                        backup_operation_type = ?18,
+                        sync_remote_mtime = ?19,
+                        sync_remote_size = ?20,
+                        sync_remote_fs_id = ?21,
+                        updated_at = ?22
+                    WHERE id = ?23
+                    "#,
+                    params![
+                        folder_task_id,
+                        "",
+                        file_name,
+                        file_task.local_path.to_string_lossy().to_string(),
+                        file_task.file_size as i64,
+                        file_task.head_md5.as_deref().unwrap_or(""),
+                        file_task.fs_id.map(|id| id as i64),
+                        status,
+                        sub_phase,
+                        skip_reason,
+                        file_task.encrypted,
+                        file_task.encrypted_name,
+                        file_task.temp_encrypted_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        file_task.transferred_bytes as i64,
+                        file_task.error_message,
+                        file_task.retry_count as i64,
+                        file_task.related_task_id.clone().or(existing_related_task_id),
+                        file_task.backup_operation_type.map(|t| format!("{:?}", t).to_lowercase()),
+                        file_task.sync_remote_mtime,
+                        file_task.sync_remote_size.map(|s| s as i64),
+                        file_task.sync_remote_fs_id.map(|id| id as i64),
+                        now,
+                        existing_id,
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    r#"
+                    INSERT INTO backup_file_tasks (
+                        id, backup_task_id, config_id, relative_path, file_name,
+                        local_path, remote_path, file_size, head_md5, fs_id,
+                        status, sub_phase, skip_reason, encrypted, encrypted_name, temp_encrypted_path,
+                        transferred_bytes, error_message, retry_count,
+                        related_task_id, backup_operation_type,
+                        sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
+                        created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                              ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                              ?21, ?22, ?23, ?24, ?25, ?26)
+                    "#,
+                    params![
+                        file_task.id,
+                        folder_task_id,
+                        config_id,
+                        "",
+                        file_name,
+                        file_task.local_path.to_string_lossy().to_string(),
+                        file_task.remote_path,
+                        file_task.file_size as i64,
+                        file_task.head_md5.as_deref().unwrap_or(""),
+                        file_task.fs_id.map(|id| id as i64),
+                        status,
+                        sub_phase,
+                        skip_reason,
+                        file_task.encrypted,
+                        file_task.encrypted_name,
+                        file_task.temp_encrypted_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                        file_task.transferred_bytes as i64,
+                        file_task.error_message,
+                        file_task.retry_count as i64,
+                        file_task.related_task_id,
+                        file_task.backup_operation_type.map(|t| format!("{:?}", t).to_lowercase()),
+                        file_task.sync_remote_mtime,
+                        file_task.sync_remote_size.map(|s| s as i64),
+                        file_task.sync_remote_fs_id.map(|id| id as i64),
+                        file_task.created_at.timestamp(),
+                        now,
+                    ],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 加载配置级稳定文件清单。
+    pub fn load_folder_file_tasks(&self, folder_task_id: &str) -> Result<Vec<BackupFileTask>> {
+        let (tasks, _) = self.load_file_tasks(folder_task_id, 1, 10_000)?;
+        Ok(tasks)
+    }
+
+    /// 将本轮扫描中已经不存在的本地文件标为 skipped，但不删除远端文件。
+    pub fn mark_folder_files_not_seen(
+        &self,
+        folder_task_id: &str,
+        seen_remote_paths: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let now = chrono::Utc::now().timestamp();
+
+        if seen_remote_paths.is_empty() {
+            conn.execute(
+                r#"
+                UPDATE backup_file_tasks
+                SET status = 'skipped',
+                    error_message = '本地文件已不存在',
+                    updated_at = ?1
+                WHERE backup_task_id = ?2
+                  AND status NOT IN ('checking', 'encrypting', 'waitingtransfer', 'transferring')
+                "#,
+                params![now, folder_task_id],
+            )?;
+            return Ok(());
+        }
+
+        let placeholders: Vec<String> = (0..seen_remote_paths.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect();
+        let sql = format!(
+            r#"
+            UPDATE backup_file_tasks
+            SET status = 'skipped',
+                error_message = '本地文件已不存在',
+                updated_at = ?1
+            WHERE backup_task_id = ?2
+              AND status NOT IN ('checking', 'encrypting', 'waitingtransfer', 'transferring')
+              AND remote_path NOT IN ({})
+            "#,
+            placeholders.join(", ")
+        );
+
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(seen_remote_paths.len() + 2);
+        values.push(Box::new(now));
+        values.push(Box::new(folder_task_id.to_string()));
+        for path in seen_remote_paths {
+            values.push(Box::new(path.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|value| value.as_ref()).collect();
+        conn.execute(&sql, refs.as_slice())?;
         Ok(())
     }
 
@@ -1070,232 +1441,6 @@ impl BackupPersistenceManager {
         Ok(count as usize)
     }
 
-    // ==================== 服务重启兜底同步方法 ====================
-
-    /// 根据关联的上传/下载任务ID查找备份文件任务
-    ///
-    /// 用于服务重启时，根据已归档的上传/下载任务ID找到对应的备份文件任务
-    pub fn find_file_task_by_related_task_id(&self, related_task_id: &str) -> Result<Option<(String, String)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
-
-        let result = conn
-            .query_row(
-                "SELECT id, backup_task_id FROM backup_file_tasks WHERE related_task_id = ?1",
-                params![related_task_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-
-        Ok(result)
-    }
-
-    /// 根据关联任务ID更新备份文件任务状态为已完成
-    ///
-    /// 用于服务重启时的兜底同步：当上传/下载任务已归档到历史表时，
-    /// 同步更新对应的备份文件任务状态
-    pub fn complete_file_task_by_related_task_id(
-        &self,
-        related_task_id: &str,
-        transferred_bytes: u64,
-    ) -> Result<Option<String>> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
-
-        let now = chrono::Utc::now().timestamp();
-
-        // 先查找对应的文件任务和主任务ID
-        let task_info: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, backup_task_id FROM backup_file_tasks WHERE related_task_id = ?1",
-                params![related_task_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-
-        if let Some((file_task_id, backup_task_id)) = task_info {
-            // 更新文件任务状态为已完成
-            conn.execute(
-                r#"
-                UPDATE backup_file_tasks
-                SET status = 'completed',
-                    transferred_bytes = ?1,
-                    updated_at = ?2
-                WHERE id = ?3
-                "#,
-                params![transferred_bytes as i64, now, file_task_id],
-            )?;
-
-            tracing::info!(
-                "兜底同步: 已更新备份文件任务状态为完成, file_task_id={}, related_task_id={}",
-                file_task_id,
-                related_task_id
-            );
-
-            Ok(Some(backup_task_id))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// 批量根据关联任务ID更新备份文件任务状态
-    ///
-    /// 用于服务重启时批量同步已完成的上传/下载任务到备份文件任务
-    pub fn complete_file_tasks_by_related_task_ids(
-        &self,
-        task_completions: &[(String, u64)], // (related_task_id, transferred_bytes)
-    ) -> Result<Vec<String>> {
-        if task_completions.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
-        let tx = conn.transaction()?;
-
-        let now = chrono::Utc::now().timestamp();
-        let mut affected_backup_task_ids = Vec::new();
-
-        for (related_task_id, transferred_bytes) in task_completions {
-            // 查找对应的文件任务
-            let task_info: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT id, backup_task_id FROM backup_file_tasks WHERE related_task_id = ?1",
-                    params![related_task_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?;
-
-            if let Some((file_task_id, backup_task_id)) = task_info {
-                // 更新文件任务状态
-                tx.execute(
-                    r#"
-                    UPDATE backup_file_tasks
-                    SET status = 'completed',
-                        transferred_bytes = ?1,
-                        updated_at = ?2
-                    WHERE id = ?3
-                    "#,
-                    params![*transferred_bytes as i64, now, file_task_id],
-                )?;
-
-                if !affected_backup_task_ids.contains(&backup_task_id) {
-                    affected_backup_task_ids.push(backup_task_id);
-                }
-
-                tracing::debug!(
-                    "兜底同步: 更新备份文件任务, file_task_id={}, related_task_id={}",
-                    file_task_id,
-                    related_task_id
-                );
-            }
-        }
-
-        tx.commit()?;
-
-        if !affected_backup_task_ids.is_empty() {
-            tracing::info!(
-                "兜底同步: 批量更新了 {} 个备份文件任务，涉及 {} 个主任务",
-                task_completions.len(),
-                affected_backup_task_ids.len()
-            );
-        }
-
-        Ok(affected_backup_task_ids)
-    }
-
-    /// 重新计算并更新主任务的进度统计
-    ///
-    /// 根据文件任务的实际状态重新计算主任务的 completed_count, failed_count 等
-    /// 同时计算 total_bytes（排除 skipped）和 transferred_bytes（已完成文件用 file_size，其他用 transferred_bytes）
-    pub fn recalculate_task_progress(&self, backup_task_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
-
-        // 统计各状态的文件数量和字节数
-        // total_bytes: 排除 skipped 状态的文件大小总和
-        // transferred_bytes: 已完成文件用 file_size，其他用 transferred_bytes
-        let stats: (i64, i64, i64, i64, i64, i64) = conn.query_row(
-            r#"
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-                SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped,
-                COALESCE(SUM(CASE WHEN status != 'skipped' THEN file_size ELSE 0 END), 0) as total_bytes,
-                COALESCE(SUM(
-                    CASE
-                        WHEN status = 'completed' THEN file_size
-                        WHEN status != 'skipped' THEN transferred_bytes
-                        ELSE 0
-                    END
-                ), 0) as transferred_bytes
-            FROM backup_file_tasks
-            WHERE backup_task_id = ?1
-            "#,
-            params![backup_task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        )?;
-
-        let (total, completed, failed, skipped, total_bytes, transferred_bytes) = stats;
-
-        // 更新主任务进度（同时更新 total_bytes 字段）
-        conn.execute(
-            r#"
-            UPDATE backup_tasks
-            SET completed_count = ?1,
-                failed_count = ?2,
-                skipped_count = ?3,
-                total_count = ?4,
-                total_bytes = ?5,
-                transferred_bytes = ?6
-            WHERE id = ?7
-            "#,
-            params![completed, failed, skipped, total, total_bytes, transferred_bytes, backup_task_id],
-        )?;
-
-        // 检查是否所有文件都已处理完成（终态）
-        let pending_count: i64 = conn.query_row(
-            r#"
-            SELECT COUNT(*) FROM backup_file_tasks
-            WHERE backup_task_id = ?1
-              AND status NOT IN ('completed', 'failed', 'skipped', 'cancelled')
-            "#,
-            params![backup_task_id],
-            |row| row.get(0),
-        )?;
-
-        // 如果没有待处理的文件，更新主任务状态
-        if pending_count == 0 && total > 0 {
-            let new_status = if failed > 0 && completed > 0 {
-                "partiallycompleted"
-            } else if failed > 0 {
-                "failed"
-            } else {
-                "completed"
-            };
-
-            let now = chrono::Utc::now().timestamp();
-            conn.execute(
-                "UPDATE backup_tasks SET status = ?1, completed_at = ?2 WHERE id = ?3",
-                params![new_status, now, backup_task_id],
-            )?;
-
-            tracing::info!(
-                "兜底同步: 主任务状态更新为 {}, backup_task_id={}, completed={}, failed={}, skipped={}",
-                new_status,
-                backup_task_id,
-                completed,
-                failed,
-                skipped
-            );
-        }
-
-        Ok(())
-    }
-
-    // ==================== 扫描与传输阶段优化方法 ====================
-
-    /// 获取任务的所有文件本地路径（用于增量对比）
-    ///
-    /// 返回当前任务中所有文件的本地路径集合（包括已完成、失败、跳过的）
-    /// 用于增量合并时判断文件是否已在当前任务中
     pub fn get_task_file_local_paths(&self, task_id: &str) -> Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
@@ -1731,6 +1876,109 @@ mod tests {
         assert_eq!(loaded.total_count, task.total_count);
     }
 
+    #[test]
+    fn test_only_one_active_task_per_config() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("unique_active.db");
+        let manager = BackupPersistenceManager::new(&db_path).unwrap();
+        let now = chrono::Utc::now();
+
+        let make_task = |id: &str, status: BackupTaskStatus| BackupTask {
+            owner_uid: None,
+            id: id.to_string(),
+            config_id: "same-config".to_string(),
+            status,
+            sub_phase: None,
+            trigger_type: TriggerType::Manual,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 0,
+            transferred_bytes: 0,
+            total_bytes: 0,
+            scan_progress: None,
+            created_at: now,
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+
+        let first = make_task("first", BackupTaskStatus::Queued);
+        manager.save_task(&first).unwrap();
+        assert_eq!(manager.find_active_task_id("same-config").unwrap(), Some("first".to_string()));
+
+        let second = make_task("second", BackupTaskStatus::Preparing);
+        assert!(manager.save_task(&second).is_err());
+
+        let mut finished = first.clone();
+        finished.status = BackupTaskStatus::Completed;
+        finished.completed_at = Some(now);
+        manager.save_task(&finished).unwrap();
+
+        manager.save_task(&second).unwrap();
+        assert_eq!(manager.find_active_task_id("same-config").unwrap(), Some("second".to_string()));
+    }
+
+    #[test]
+    fn test_concurrent_active_task_inserts_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("concurrent_unique_active.db");
+        let manager = Arc::new(BackupPersistenceManager::new(&db_path).unwrap());
+        let barrier = Arc::new(Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let now = chrono::Utc::now();
+                    let task = BackupTask {
+                        owner_uid: None,
+                        id: format!("concurrent-{index}"),
+                        config_id: "same-config".to_string(),
+                        status: BackupTaskStatus::Preparing,
+                        sub_phase: None,
+                        trigger_type: TriggerType::Manual,
+                        pending_files: Vec::new(),
+                        completed_count: 0,
+                        failed_count: 0,
+                        skipped_count: 0,
+                        total_count: 0,
+                        transferred_bytes: 0,
+                        total_bytes: 0,
+                        scan_progress: None,
+                        created_at: now,
+                        started_at: Some(now),
+                        completed_at: None,
+                        error_message: None,
+                        pending_upload_task_ids: std::collections::HashSet::new(),
+                        pending_download_task_ids: std::collections::HashSet::new(),
+                        transfer_task_map: std::collections::HashMap::new(),
+                    };
+
+                    barrier.wait();
+                    manager.save_task(&task).is_ok()
+                })
+            })
+            .collect();
+
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+
+        assert_eq!(winners, 1);
+        assert!(manager.find_active_task_id("same-config").unwrap().is_some());
+    }
+
     /// 构造一个用于测试的 BackupFileTask
     fn make_test_file_task(id: &str, parent_task_id: &str) -> BackupFileTask {
         BackupFileTask {
@@ -1759,6 +2007,135 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn test_discard_legacy_tasks_keeps_folder_manifest() {
+        let dir = tempdir().unwrap();
+        let manager = BackupPersistenceManager::new(&dir.path().join("discard-legacy.db")).unwrap();
+        let now = chrono::Utc::now();
+        let make_task = |id: &str| BackupTask {
+            owner_uid: None,
+            id: id.to_string(),
+            config_id: "manifest-config".to_string(),
+            status: BackupTaskStatus::Completed,
+            sub_phase: None,
+            trigger_type: TriggerType::Poll,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 0,
+            transferred_bytes: 0,
+            total_bytes: 0,
+            scan_progress: None,
+            created_at: now,
+            started_at: None,
+            completed_at: Some(now),
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+
+        manager.save_task(&make_task("legacy-task")).unwrap();
+        manager.save_task(&make_task("folder:manifest-config")).unwrap();
+        manager
+            .save_file_task(&make_test_file_task("legacy-file", "legacy-task"), "manifest-config")
+            .unwrap();
+        manager
+            .save_file_task(
+                &make_test_file_task("manifest-file", "folder:manifest-config"),
+                "manifest-config",
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .discard_legacy_tasks_for_config("manifest-config")
+                .unwrap(),
+            1
+        );
+        assert!(manager.load_task("legacy-task").unwrap().is_none());
+        assert!(manager.load_task("folder:manifest-config").unwrap().is_some());
+        assert!(manager.load_file_tasks("legacy-task", 100, 0).unwrap().0.is_empty());
+        assert_eq!(manager.load_folder_file_tasks("folder:manifest-config").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_folder_manifest_upsert_is_idempotent_and_does_not_clobber_active_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("folder_manifest.db");
+        let manager = BackupPersistenceManager::new(&db_path).unwrap();
+        let now = chrono::Utc::now();
+        let folder_task_id = "folder:cfg-folder";
+
+        let parent = BackupTask {
+            owner_uid: None,
+            id: folder_task_id.to_string(),
+            config_id: "cfg-folder".to_string(),
+            status: BackupTaskStatus::Completed,
+            sub_phase: None,
+            trigger_type: TriggerType::Poll,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 0,
+            transferred_bytes: 0,
+            total_bytes: 0,
+            scan_progress: None,
+            created_at: now,
+            started_at: None,
+            completed_at: Some(now),
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+        manager.save_task(&parent).unwrap();
+
+        let first = make_test_file_task("manifest-first", folder_task_id);
+        manager
+            .upsert_folder_file_tasks(&[first.clone()], "cfg-folder", folder_task_id)
+            .unwrap();
+
+        // 同一远端位置的下一次扫描应更新同一行，而不是再插入一条文件任务。
+        let mut refreshed = first.clone();
+        refreshed.id = "manifest-second-generated-id".to_string();
+        refreshed.file_size = 54321;
+        refreshed.status = BackupFileStatus::Completed;
+        manager
+            .upsert_folder_file_tasks(&[refreshed], "cfg-folder", folder_task_id)
+            .unwrap();
+
+        let loaded = manager.load_folder_file_tasks(folder_task_id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, first.id, "清单更新必须保留稳定文件行 ID");
+        assert_eq!(loaded[0].file_size, 54321);
+        assert_eq!(loaded[0].status, BackupFileStatus::Completed);
+
+        // 扫描与上传完成通知交错时，新的扫描不能覆盖正在传输的快照。
+        let mut active = loaded[0].clone();
+        active.status = BackupFileStatus::Transferring;
+        active.related_task_id = Some("upload-child".to_string());
+        manager
+            .upsert_folder_file_tasks(&[active.clone()], "cfg-folder", folder_task_id)
+            .unwrap();
+
+        let mut stale_scan = active.clone();
+        stale_scan.file_size = 99999;
+        stale_scan.status = BackupFileStatus::Pending;
+        stale_scan.related_task_id = None;
+        manager
+            .upsert_folder_file_tasks(&[stale_scan], "cfg-folder", folder_task_id)
+            .unwrap();
+
+        let loaded_active = manager.load_folder_file_tasks(folder_task_id).unwrap();
+        assert_eq!(loaded_active.len(), 1);
+        assert_eq!(loaded_active[0].status, BackupFileStatus::Transferring);
+        assert_eq!(loaded_active[0].file_size, 54321);
+        assert_eq!(loaded_active[0].related_task_id.as_deref(), Some("upload-child"));
     }
 
     /// Round-trip: save_file_task → load_file_tasks 应保留 sync_remote_* 字段

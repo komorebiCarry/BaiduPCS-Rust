@@ -1365,43 +1365,6 @@ impl HistoryDbManager {
     }
 
     // ========================================================================
-    // 备份任务兜底同步方法
-    // ========================================================================
-
-    /// 查询已完成的备份任务（用于服务重启时的兜底同步）
-    ///
-    /// 返回所有 is_backup = 1 且 status = 'completed' 的任务
-    /// 包含 task_id 和 file_size（用于更新 backup_file_tasks 的 transferred_bytes）
-    pub fn load_completed_backup_tasks(&self) -> Result<Vec<(String, u64)>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
-
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT task_id, COALESCE(file_size, 0) as file_size
-            FROM task_history
-            WHERE is_backup = 1 AND status = 'completed'
-            "#,
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-        })?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            match row {
-                Ok(r) => results.push(r),
-                Err(e) => warn!("读取已完成备份任务失败: {}", e),
-            }
-        }
-
-        Ok(results)
-    }
-
-    // ========================================================================
     // 辅助方法
     // ========================================================================
 

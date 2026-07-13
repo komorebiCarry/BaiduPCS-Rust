@@ -4,5 +4,5 @@ pub mod record_manager;
 
 pub use record_manager::{
     BackupRecordManager, UploadRecord, DownloadRecord, EncryptionSnapshot,
-    RecordStats, calculate_head_md5,
+    RecordStats, calculate_full_md5, calculate_head_md5,
 };

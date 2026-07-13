@@ -2777,7 +2777,10 @@ impl UploadManager {
         // 获取冲突策略（如果未指定，使用默认值 SmartDedup）
         let strategy = conflict_strategy.unwrap_or(crate::uploader::UploadConflictStrategy::SmartDedup);
 
-        // 🔥 如果启用加密，修改远程路径为加密文件名（与 create_task 保持一致）
+        // 🔥 如果启用加密，修改远程路径为加密文件名（与 create_task 保持一致）。
+        // 稳定文件清单重试同一个逻辑文件时会把上一次实际的 UUID.age 路径
+        // 传回来；此时复用该路径，避免每次重传都制造一个孤立密文。
+        let mut snapshot_original_path = remote_path.clone();
         let (actual_remote_path, encrypted_filename) = if encrypt_enabled {
             use crate::encryption::service::EncryptionService;
 
@@ -2786,13 +2789,33 @@ impl UploadManager {
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
 
-            let enc_filename = EncryptionService::generate_encrypted_filename();
-
-            let path = if parent.is_empty() || parent == "/" {
-                format!("/{}", enc_filename)
+            let filename = std::path::Path::new(&remote_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let (enc_filename, path) = if EncryptionService::is_encrypted_filename(filename) {
+                // 读取已有快照只用于恢复原始显示名/路径；没有快照时仍可
+                // 复用远端位置，至少保证清单与密文位置一致。
+                if let Some(ref rm) = *self.backup_record_manager.read().await {
+                    if let Ok(Some(snapshot)) = rm.find_snapshot_by_encrypted_name(filename) {
+                        snapshot_original_path = format!(
+                            "{}/{}",
+                            snapshot.original_path.trim_end_matches('/'),
+                            snapshot.original_name
+                        );
+                    }
+                }
+                (filename.to_string(), remote_path.clone())
             } else {
-                format!("{}/{}", parent, enc_filename)
+                let enc_filename = EncryptionService::generate_encrypted_filename();
+                let path = if parent.is_empty() || parent == "/" {
+                    format!("/{}", enc_filename)
+                } else {
+                    format!("{}/{}", parent, enc_filename)
+                };
+                (enc_filename, path)
             };
+
             (path, Some(enc_filename))
         } else {
             (remote_path.clone(), None)
@@ -2819,12 +2842,12 @@ impl UploadManager {
         // 🔥 如果启用加密，存储文件加密映射到 encryption_snapshots（状态为 pending）
         // 上传完成时更新 age 映射状态并标记为 completed
         if let Some(ref enc_filename) = encrypted_filename {
-            let original_filename = std::path::Path::new(&remote_path)
+            let original_filename = std::path::Path::new(&snapshot_original_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
-            let parent = std::path::Path::new(&actual_remote_path)
+            let parent = std::path::Path::new(&snapshot_original_path)
                 .parent()
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
