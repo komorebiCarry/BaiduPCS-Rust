@@ -312,7 +312,15 @@ pub async fn list_file_tasks(
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(20);
 
-    match manager.get_file_tasks_async(&task_id, page, page_size).await {
+    let result = if params.active_only.unwrap_or(false) {
+        manager
+            .get_active_file_tasks_async(&task_id, page, page_size)
+            .await
+    } else {
+        manager.get_file_tasks_async(&task_id, page, page_size).await
+    };
+
+    match result {
         Some((file_tasks, total)) => Ok(Json(ApiResponse::success(FileTasksResponse {
             file_tasks,
             total,
@@ -552,6 +560,8 @@ pub struct BackupTasksResponse {
 pub struct FileTasksQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
+    /// 只返回当前传输窗口中的非终态文件，供活跃预览使用。
+    pub active_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

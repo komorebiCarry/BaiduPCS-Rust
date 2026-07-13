@@ -26,7 +26,7 @@ import BackupTaskDetail from '@/components/BackupTaskDetail.vue'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { useIsMobile } from '@/utils/responsive'
 import { createAdaptivePoller } from '@/utils/backendHealth'
-import type { BackupEvent } from '@/types/events'
+import type { BackupEvent, BackupEventScanProgress } from '@/types/events'
 // 多账号集成
 import { useAuthStore } from '@/stores/auth'
 import AccountFilter from '@/components/AccountFilter.vue'
@@ -60,7 +60,7 @@ const ownerFilterCounts = computed(() => {
 })
 // 每个配置的活跃任务（正在进行的备份任务）
 const activeTaskByConfig = ref<Map<string, BackupTask | null>>(new Map())
-// 每个配置的活跃文件任务（前5个正在传输的文件）
+// 每个配置的活跃文件任务（当前非终态文件预览）
 const activeFileTasks = ref<Map<string, BackupFileTask[]>>(new Map())
 const encryptionStatus = ref<EncryptionStatus | null>(null)
 const managerStatus = ref<ManagerStatus | null>(null)
@@ -150,7 +150,7 @@ async function loadActiveTaskForConfig(configId: string) {
 
     activeTaskByConfig.value.set(configId, activeTask)
 
-    // 如果有活跃任务，加载前5个文件任务
+    // 如果有活跃任务，只加载当前仍在传输窗口中的文件
     if (activeTask) {
       await loadFileTasksForActiveTask(activeTask.id, configId)
     } else {
@@ -161,11 +161,22 @@ async function loadActiveTaskForConfig(configId: string) {
   }
 }
 
-// 加载活跃任务的前5个文件任务
-async function loadFileTasksForActiveTask(taskId: string, configId: string) {
+// 加载活跃任务的当前传输文件预览
+async function loadFileTasksForActiveTask(
+  taskId: string,
+  configId: string,
+  excludeFileTaskId?: string,
+) {
   try {
-    const response = await listFileTasks(taskId, 1, 5)
-    activeFileTasks.value.set(configId, response.file_tasks)
+    const response = await listFileTasks(taskId, 1, 5, true)
+    // 完成事件先于后端持久化事件到达时，查询可能短暂读到旧状态；
+    // 本次刚完成的文件即使出现在旧快照里也不能重新回到预览。
+    const fileTasks = excludeFileTaskId
+      ? response.file_tasks.filter(fileTask => fileTask.id !== excludeFileTaskId)
+      : response.file_tasks
+    const next = new Map(activeFileTasks.value)
+    next.set(configId, fileTasks)
+    activeFileTasks.value = next
   } catch (e: any) {
     console.error('加载文件任务失败:', e)
   }
@@ -439,6 +450,21 @@ function getStatusText(status: string) {
   }
 }
 
+function getTaskCountText(config: BackupConfig, task: BackupTask): string {
+  const verb = config.direction === 'upload'
+    ? '已上传'
+    : config.direction === 'download'
+      ? '已下载'
+      : '已完成'
+  return `${verb} ${task.completed_count}/${task.total_count} 个文件`
+}
+
+function getScanProgressText(task: BackupTask): string {
+  const progress = task.scan_progress
+  if (!progress) return '正在建立文件清单…'
+  return `正在扫描本地文件：已扫描 ${progress.scanned_files} 个文件、${progress.scanned_dirs} 个目录`
+}
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
   const k = 1024
@@ -523,27 +549,25 @@ function handleBackupEvent(event: BackupEvent) {
       updateTaskProgress(event)
       break
 
+    case 'scan_progress':
+      // 稳定文件夹任务准备阶段的本地扫描进度
+      updateScanProgress(event as BackupEventScanProgress)
+      break
+
+    case 'scan_completed':
+      // 扫描完成后重新读取任务，获取完整文件总数和去重结果
+      refreshTaskFromEvent(event.task_id)
+      break
+
     case 'status_changed':
       // 状态变更，刷新活跃任务
-      findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-        if (foundConfigId) {
-          loadActiveTaskForConfig(foundConfigId)
-          // 如果是当前查看的任务详情，也刷新任务列表
-          if (selectedTasks.value.some(t => t.id === event.task_id)) {
-            refreshSelectedTasks(foundConfigId)
-          }
-        }
-      })
+      refreshTaskFromEvent(event.task_id, true)
       break
 
     case 'completed':
     case 'failed':
       // 任务完成或失败，刷新活跃任务和管理器状态
-      findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-        if (foundConfigId) {
-          loadActiveTaskForConfig(foundConfigId)
-        }
-      })
+      refreshTaskFromEvent(event.task_id)
       loadData() // 刷新整体状态
       break
 
@@ -561,11 +585,7 @@ function handleBackupEvent(event: BackupEvent) {
     case 'resumed':
     case 'cancelled':
       // 任务状态变更
-      findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-        if (foundConfigId) {
-          loadActiveTaskForConfig(foundConfigId)
-        }
-      })
+      refreshTaskFromEvent(event.task_id)
       break
 
     case 'file_encrypting':
@@ -600,8 +620,22 @@ function handleBackupEvent(event: BackupEvent) {
   }
 }
 
+// 稳定文件夹任务使用 folder:<config_id> 作为唯一任务 ID。
+// 这条映射不依赖当前页面是否已经缓存了活跃任务，避免首次触发时
+// 收到状态事件却无法找到对应配置。
+function configIdFromTaskId(taskId: string): string | null {
+  const prefix = 'folder:'
+  if (!taskId.startsWith(prefix)) return null
+
+  const configId = taskId.slice(prefix.length)
+  return configId || null
+}
+
 // 根据任务ID查找配置ID
 async function findConfigIdByTaskId(taskId: string): Promise<string | null> {
+  const stableConfigId = configIdFromTaskId(taskId)
+  if (stableConfigId) return stableConfigId
+
   // 先从活跃任务中查找
   for (const [configId, task] of activeTaskByConfig.value) {
     if (task?.id === taskId) {
@@ -616,10 +650,56 @@ async function findConfigIdByTaskId(taskId: string): Promise<string | null> {
   return null
 }
 
+// 事件可能早于前端第一次加载任务列表到达；此时直接按稳定任务 ID
+// 找到配置并重新拉取，不能只依赖内存中的 activeTaskByConfig。
+function refreshTaskFromEvent(taskId: string, refreshHistory = false) {
+  findConfigIdByTaskId(taskId).then(foundConfigId => {
+    if (!foundConfigId) return
+
+    loadActiveTaskForConfig(foundConfigId)
+    if (refreshHistory && selectedTasks.value.some(t => t.id === taskId)) {
+      refreshSelectedTasks(foundConfigId)
+    }
+  })
+}
+
+function updateScanProgress(event: BackupEventScanProgress) {
+  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
+    if (!foundConfigId) return
+
+    const task = activeTaskByConfig.value.get(foundConfigId)
+    if (!task || task.id !== event.task_id) {
+      loadActiveTaskForConfig(foundConfigId)
+      return
+    }
+
+    const updatedTask: BackupTask = {
+      ...task,
+      status: 'preparing',
+      sub_phase: 'dedup_checking',
+      scan_progress: {
+        scanned_files: event.scanned_files,
+        scanned_dirs: event.scanned_dirs,
+        last_scan_at: new Date().toISOString(),
+      },
+    }
+    activeTaskByConfig.value.set(foundConfigId, updatedTask)
+    activeTaskByConfig.value = new Map(activeTaskByConfig.value)
+
+    const selectedIndex = selectedTasks.value.findIndex(t => t.id === event.task_id)
+    if (selectedIndex !== -1) {
+      selectedTasks.value[selectedIndex] = updatedTask
+      selectedTasks.value = [...selectedTasks.value]
+    }
+  })
+}
+
 function updateTaskProgress(event: BackupEvent & { event_type: 'progress' }) {
   // 遍历所有配置的活跃任务查找匹配的任务
+  let matched = false
   for (const [configId, task] of activeTaskByConfig.value) {
     if (task?.id === event.task_id) {
+      matched = true
       // 更新任务进度
       const updatedTask = {
         ...task,
@@ -644,6 +724,10 @@ function updateTaskProgress(event: BackupEvent & { event_type: 'progress' }) {
       break
     }
   }
+
+  // 稳定父任务首次从空闲转为运行时，前端缓存中还没有 task，
+  // 进度事件本身也必须能触发一次任务加载。
+  if (!matched) refreshTaskFromEvent(event.task_id)
 }
 
 // 更新文件任务进度（直接更新内存，避免频繁 API 请求）
@@ -666,23 +750,33 @@ function updateFileTaskProgress(event: BackupEvent & { event_type: 'file_progres
     }
   }
 
-  // 如果在当前列表中没找到（可能是新开始传输的文件），则重新加载文件列表
-  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-    if (foundConfigId) {
-      const activeTask = activeTaskByConfig.value.get(foundConfigId)
-      if (activeTask) {
-        loadFileTasksForActiveTask(activeTask.id, foundConfigId)
-      }
-    }
-  })
+  // 如果在当前列表中没找到（可能是新开始传输的文件），重新加载稳定任务
+  // 及其文件清单；不能要求 activeTaskByConfig 事先已经有缓存。
+  refreshTaskFromEvent(event.task_id)
 }
 
 // 更新文件任务状态（仅状态变更，不更新进度）
 function updateFileTaskStatus(event: BackupEvent & { event_type: 'file_status_changed' }) {
   // 遍历所有配置的文件任务列表查找匹配的文件任务
-  for (const [_configId, fileTasks] of activeFileTasks.value) {
-    const fileTask = fileTasks.find(f => f.id === event.file_task_id)
-    if (fileTask) {
+  for (const [configId, fileTasks] of activeFileTasks.value) {
+    const fileTaskIndex = fileTasks.findIndex(f => f.id === event.file_task_id)
+    if (fileTaskIndex !== -1) {
+      const fileTask = fileTasks[fileTaskIndex]
+
+      // 预览只表示当前传输窗口。文件完成/失败/跳过后立即移除，
+      // 再从后端活动清单补入刚刚释放槽位的新文件；完整文件列表仍保留
+      // 这些终态记录供任务详情查询。
+      if (['completed', 'failed', 'skipped'].includes(event.new_status)) {
+        activeFileTasks.value.set(
+          configId,
+          fileTasks.filter(f => f.id !== event.file_task_id),
+        )
+        activeFileTasks.value = new Map(activeFileTasks.value)
+        void loadFileTasksForActiveTask(event.task_id, configId, event.file_task_id)
+        console.log(`[AutoBackup] 文件从当前传输预览移除: ${event.file_name} -> ${event.new_status}`)
+        return
+      }
+
       // 更新状态
       fileTask.status = event.new_status as BackupFileTask['status']
       // 🔥 修复：当状态变为 completed 时，确保进度显示为 100%
@@ -696,15 +790,8 @@ function updateFileTaskStatus(event: BackupEvent & { event_type: 'file_status_ch
     }
   }
 
-  // 如果在当前列表中没找到，则重新加载文件列表
-  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-    if (foundConfigId) {
-      const activeTask = activeTaskByConfig.value.get(foundConfigId)
-      if (activeTask) {
-        loadFileTasksForActiveTask(activeTask.id, foundConfigId)
-      }
-    }
-  })
+  // 如果在当前列表中没找到，则重新加载稳定任务及其文件清单。
+  refreshTaskFromEvent(event.task_id)
 }
 
 // 更新文件任务加密状态
@@ -725,15 +812,8 @@ function updateFileTaskEncryptStatus(
     }
   }
 
-  // 如果在当前列表中没找到，则重新加载文件列表
-  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-    if (foundConfigId) {
-      const activeTask = activeTaskByConfig.value.get(foundConfigId)
-      if (activeTask) {
-        loadFileTasksForActiveTask(activeTask.id, foundConfigId)
-      }
-    }
-  })
+  // 如果在当前列表中没找到，则重新加载稳定任务及其文件清单。
+  refreshTaskFromEvent(event.task_id)
 }
 
 // 更新文件任务解密状态
@@ -754,15 +834,8 @@ function updateFileTaskDecryptStatus(
     }
   }
 
-  // 如果在当前列表中没找到，则重新加载文件列表
-  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-    if (foundConfigId) {
-      const activeTask = activeTaskByConfig.value.get(foundConfigId)
-      if (activeTask) {
-        loadFileTasksForActiveTask(activeTask.id, foundConfigId)
-      }
-    }
-  })
+  // 如果在当前列表中没找到，则重新加载稳定任务及其文件清单。
+  refreshTaskFromEvent(event.task_id)
 }
 
 // 更新文件任务加密进度
@@ -783,15 +856,8 @@ function updateFileTaskEncryptProgress(
     }
   }
 
-  // 如果在当前列表中没找到，则重新加载文件列表
-  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-    if (foundConfigId) {
-      const activeTask = activeTaskByConfig.value.get(foundConfigId)
-      if (activeTask) {
-        loadFileTasksForActiveTask(activeTask.id, foundConfigId)
-      }
-    }
-  })
+  // 如果在当前列表中没找到，则重新加载稳定任务及其文件清单。
+  refreshTaskFromEvent(event.task_id)
 }
 
 // 更新文件任务解密进度
@@ -812,15 +878,8 @@ function updateFileTaskDecryptProgress(
     }
   }
 
-  // 如果在当前列表中没找到，则重新加载文件列表
-  findConfigIdByTaskId(event.task_id).then(foundConfigId => {
-    if (foundConfigId) {
-      const activeTask = activeTaskByConfig.value.get(foundConfigId)
-      if (activeTask) {
-        loadFileTasksForActiveTask(activeTask.id, foundConfigId)
-      }
-    }
-  })
+  // 如果在当前列表中没找到，则重新加载稳定任务及其文件清单。
+  refreshTaskFromEvent(event.task_id)
 }
 
 function setupWebSocket() {
@@ -1047,7 +1106,7 @@ watch(hasActiveTask, () => {
                   />
                 </div>
                 <div class="task-progress-stats">
-                  <span class="task-files">{{ activeTaskByConfig.get(config.id)!.completed_count }}/{{ activeTaskByConfig.get(config.id)!.total_count }} 文件</span>
+                  <span class="task-files">{{ getTaskCountText(config, activeTaskByConfig.get(config.id)!) }}</span>
                   <span class="task-size">{{ formatBytes(activeTaskByConfig.get(config.id)!.transferred_bytes) }} / {{ formatBytes(activeTaskByConfig.get(config.id)!.total_bytes) }}</span>
                 </div>
                 <div class="task-actions" @click.stop>
@@ -1077,18 +1136,29 @@ watch(hasActiveTask, () => {
                 </div>
               </div>
 
+              <!-- 准备阶段显示本地文件清单扫描进度；总数在扫描完成后由稳定清单确定。 -->
+              <div
+                  v-if="activeTaskByConfig.get(config.id)!.status === 'preparing'"
+                  class="scan-progress-text"
+              >
+                <el-icon class="is-loading"><Loading /></el-icon>
+                {{ getScanProgressText(activeTaskByConfig.get(config.id)!) }}
+              </div>
+
               <!-- 进度条 -->
               <div class="task-progress-bar">
                 <el-progress
-                    :percentage="calcBackupPercent(activeTaskByConfig.get(config.id)!)"
+                    :percentage="activeTaskByConfig.get(config.id)!.status === 'preparing' ? 100 : calcBackupPercent(activeTaskByConfig.get(config.id)!)"
+                    :indeterminate="activeTaskByConfig.get(config.id)!.status === 'preparing'"
                     :stroke-width="6"
                     :show-text="false"
                     :status="activeTaskByConfig.get(config.id)!.status === 'paused' ? 'warning' : undefined"
                 />
               </div>
 
-              <!-- 文件任务列表（前5个） -->
+              <!-- 文件任务列表仅作为当前传输预览；主进度始终使用完整文件清单。 -->
               <div v-if="activeFileTasks.get(config.id)?.length" class="file-tasks-preview">
+                <div class="file-tasks-preview-title">当前传输文件（预览）</div>
                 <div
                     v-for="fileTask in activeFileTasks.get(config.id)"
                     :key="fileTask.id"
@@ -1118,9 +1188,6 @@ watch(hasActiveTask, () => {
                   <el-tag :type="getFileStatusColor(fileTask.status)" size="small">
                     {{ getFileStatusText(fileTask.status) }}
                   </el-tag>
-                </div>
-                <div v-if="activeTaskByConfig.get(config.id)!.total_count > 5" class="more-files">
-                  还有 {{ activeTaskByConfig.get(config.id)!.total_count - 5 }} 个文件...
                 </div>
               </div>
             </div>
@@ -1708,6 +1775,15 @@ watch(hasActiveTask, () => {
   padding: 0 12px 8px;
 }
 
+.scan-progress-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 8px;
+  color: #409eff;
+  font-size: 12px;
+}
+
 .task-skipped {
   color: #e6a23c;
   font-size: 12px;
@@ -1719,6 +1795,12 @@ watch(hasActiveTask, () => {
   padding: 0 12px 12px;
   border-top: 1px dashed #dcdfe6;
   margin-top: 4px;
+}
+
+.file-tasks-preview-title {
+  padding: 8px 0 2px;
+  color: #909399;
+  font-size: 12px;
 }
 
 .file-task-item {

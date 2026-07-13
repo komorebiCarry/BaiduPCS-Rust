@@ -48,6 +48,14 @@ export interface FilterConfig {
   min_file_size?: number
 }
 
+/** 稳定文件夹任务的本地扫描进度 */
+export interface ScanProgress {
+  scanned_dirs: number
+  scanned_files: number
+  current_dir?: string
+  last_scan_at: string
+}
+
 /** 备份配置 */
 export interface BackupConfig {
   id: string
@@ -126,6 +134,8 @@ export interface BackupTask {
   total_count: number
   transferred_bytes: number
   total_bytes: number
+  /** 准备阶段扫描本地文件夹的进度 */
+  scan_progress?: ScanProgress
   created_at: string
   started_at?: string
   completed_at?: string
@@ -354,9 +364,14 @@ export async function resumeBackupTask(taskId: string): Promise<void> {
 }
 
 /** 获取任务的文件任务列表（分页） */
-export async function listFileTasks(taskId: string, page = 1, pageSize = 20): Promise<FileTasksResponse> {
+export async function listFileTasks(
+  taskId: string,
+  page = 1,
+  pageSize = 20,
+  activeOnly = false,
+): Promise<FileTasksResponse> {
   const response = await rawApiClient.get<ApiResponse<FileTasksResponse>>(`/autobackup/tasks/${taskId}/files`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, active_only: activeOnly || undefined }
   })
   if (response.data.success && response.data.data) {
     return response.data.data

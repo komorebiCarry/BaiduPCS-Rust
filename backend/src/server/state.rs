@@ -1352,11 +1352,13 @@ impl AppState {
                 // 🔥 初始化全局轮询（使用配置文件中的触发配置）
                 manager_arc.update_trigger_config(upload_trigger, download_trigger).await;
 
+                // 🔥 启动传输完成监听器（监听上传/下载任务完成，更新备份任务状态）
+                // 必须先绑定完成监听，再放行自动备份的启动扫描；否则扫描很快结束时，
+                // 新建的第一个上传子任务可能在 listener 注册前完成，父任务会漏掉通知。
+                manager_arc.start_transfer_listeners().await;
+
                 // 启动事件消费循环（监听文件变更和定时轮询事件）
                 manager_arc.start_event_consumer().await;
-
-                // 🔥 启动传输完成监听器（监听上传/下载任务完成，更新备份任务状态）
-                manager_arc.start_transfer_listeners().await;
 
                 // 🔥 多账号 per-uid 池注入
                 if let Some(uid) = *self.active_uid.read().await {

@@ -158,6 +158,12 @@ function getSubPhaseText(phase: BackupSubPhase | undefined): string {
   return phaseMap[phase] || phase
 }
 
+function getScanProgressText(task: BackupTask): string {
+  const progress = task.scan_progress
+  if (!progress) return '正在建立文件清单…'
+  return `正在扫描本地文件：已扫描 ${progress.scanned_files} 个文件、${progress.scanned_dirs} 个目录`
+}
+
 // 操作
 function handlePause() {
   if (task.value) {
@@ -491,7 +497,15 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
               <span>文件进度</span>
               <span>{{ task.completed_count }} / {{ task.total_count }} 文件</span>
             </div>
-            <el-progress :percentage="progress" :status="task.status === 'completed' ? 'success' : undefined" />
+            <div v-if="task.status === 'preparing'" class="scan-progress-text">
+              <el-icon class="is-loading"><Loading /></el-icon>
+              {{ getScanProgressText(task) }}
+            </div>
+            <el-progress
+                :percentage="task.status === 'preparing' ? 100 : progress"
+                :indeterminate="task.status === 'preparing'"
+                :status="task.status === 'completed' ? 'success' : undefined"
+            />
 
             <div class="progress-label mt-3">
               <span>数据进度</span>
@@ -733,6 +747,15 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
   font-size: 13px;
   color: var(--el-text-color-secondary);
   margin-bottom: 8px;
+}
+
+.scan-progress-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--el-color-primary);
+  font-size: 12px;
 }
 
 .mt-3 {

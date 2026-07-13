@@ -560,6 +560,41 @@ impl BackupPersistenceManager {
         Ok(task_count as usize)
     }
 
+    /// 清除稳定上传文件夹在进程重启前留下的执行上下文。
+    ///
+    /// 稳定文件清单是事实来源，重启后必须重新确认本地/远端状态，不能把旧
+    /// upload_task_id 当作当前传输窗口继续恢复。终态行仍保留用于历史展示；
+    /// 只有非终态且带有旧子任务引用，或处于执行中的行，才被重置为 pending。
+    pub fn reset_folder_upload_execution_state(&self, folder_task_id: &str) -> Result<usize> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+
+        let reset_count = tx.execute(
+            r#"
+            UPDATE backup_file_tasks
+            SET status = 'pending',
+                sub_phase = NULL,
+                skip_reason = NULL,
+                temp_encrypted_path = NULL,
+                transferred_bytes = 0,
+                error_message = NULL,
+                related_task_id = NULL,
+                updated_at = ?1
+            WHERE backup_task_id = ?2
+              AND status NOT IN ('completed', 'failed', 'skipped', 'cancelled')
+              AND (
+                    related_task_id IS NOT NULL
+                    OR status IN ('checking', 'encrypting', 'waitingtransfer', 'transferring')
+              )
+            "#,
+            params![now, folder_task_id],
+        )?;
+
+        tx.commit()?;
+        Ok(reset_count)
+    }
+
     // ==================== 子任务操作 ====================
 
     /// 保存文件任务
@@ -935,21 +970,54 @@ impl BackupPersistenceManager {
         page: usize,
         page_size: usize,
     ) -> Result<(Vec<BackupFileTask>, usize)> {
+        self.load_file_tasks_filtered(task_id, page, page_size, false)
+    }
+
+    /// 加载当前仍在传输窗口中的文件任务。
+    ///
+    /// 稳定文件夹任务的完整文件表必须保留 completed/skipped/failed 行供
+    /// 历史查询；“当前传输文件”预览则只应读取非终态行，避免完成文件占住
+    /// 预览窗口。
+    pub fn load_active_file_tasks(
+        &self,
+        task_id: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(Vec<BackupFileTask>, usize)> {
+        self.load_file_tasks_filtered(task_id, page, page_size, true)
+    }
+
+    fn load_file_tasks_filtered(
+        &self,
+        task_id: &str,
+        page: usize,
+        page_size: usize,
+        active_only: bool,
+    ) -> Result<(Vec<BackupFileTask>, usize)> {
         let conn = self.conn.lock().map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         // 规范化分页参数
         let normalized_page_size = normalize_pagination(page_size);
+        let status_filter = if active_only {
+            " AND status IN ('pending', 'checking', 'encrypting', 'waitingtransfer', 'transferring')"
+        } else {
+            ""
+        };
 
         // 获取总数
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM backup_file_tasks WHERE backup_task_id = ?1{}",
+            status_filter
+        );
         let total: usize = conn.query_row(
-            "SELECT COUNT(*) FROM backup_file_tasks WHERE backup_task_id = ?1",
+            &count_sql,
             params![task_id],
             |row| row.get(0),
         )?;
 
         // 分页查询
         let offset = (page.saturating_sub(1)) * normalized_page_size;
-        let mut stmt = conn.prepare(
+        let query = format!(
             r#"
             SELECT id, backup_task_id, config_id, relative_path, file_name,
                    local_path, remote_path, file_size, head_md5, fs_id,
@@ -959,11 +1027,21 @@ impl BackupPersistenceManager {
                    sync_remote_mtime, sync_remote_size, sync_remote_fs_id,
                    created_at, updated_at
             FROM backup_file_tasks
-            WHERE backup_task_id = ?1
-            ORDER BY created_at ASC
+            WHERE backup_task_id = ?1{}
+            ORDER BY {}created_at ASC
             LIMIT ?2 OFFSET ?3
             "#,
-        )?;
+            status_filter,
+            if active_only {
+                "CASE status WHEN 'transferring' THEN 0 WHEN 'encrypting' THEN 1 "
+                    .to_string()
+                    + "WHEN 'checking' THEN 2 WHEN 'waitingtransfer' THEN 3 "
+                    + "WHEN 'pending' THEN 4 ELSE 5 END, updated_at DESC, "
+            } else {
+                String::new()
+            }
+        );
+        let mut stmt = conn.prepare(&query)?;
 
         let rows = stmt.query_map(params![task_id, normalized_page_size as i64, offset as i64], |row| {
             Ok(BackupFileTaskRow {
@@ -2136,6 +2214,143 @@ mod tests {
         assert_eq!(loaded_active[0].status, BackupFileStatus::Transferring);
         assert_eq!(loaded_active[0].file_size, 54321);
         assert_eq!(loaded_active[0].related_task_id.as_deref(), Some("upload-child"));
+    }
+
+    #[test]
+    fn test_load_active_file_tasks_excludes_terminal_rows() {
+        let dir = tempdir().unwrap();
+        let manager = BackupPersistenceManager::new(&dir.path().join("active-preview.db")).unwrap();
+        let now = chrono::Utc::now();
+        let task_id = "folder:active-preview";
+        let config_id = "active-preview";
+
+        let parent = BackupTask {
+            owner_uid: None,
+            id: task_id.to_string(),
+            config_id: config_id.to_string(),
+            status: BackupTaskStatus::Transferring,
+            sub_phase: None,
+            trigger_type: TriggerType::Poll,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 5,
+            transferred_bytes: 0,
+            total_bytes: 500,
+            scan_progress: None,
+            created_at: now,
+            started_at: Some(now),
+            completed_at: None,
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+        manager.save_task(&parent).unwrap();
+
+        let statuses = [
+            ("active-pending", BackupFileStatus::Pending),
+            ("active-checking", BackupFileStatus::Checking),
+            ("active-encrypting", BackupFileStatus::Encrypting),
+            ("active-waiting", BackupFileStatus::WaitingTransfer),
+            ("active-transferring", BackupFileStatus::Transferring),
+            ("done", BackupFileStatus::Completed),
+            ("skipped", BackupFileStatus::Skipped),
+            ("failed", BackupFileStatus::Failed),
+        ];
+        for (id, status) in statuses {
+            let mut file_task = make_test_file_task(id, task_id);
+            file_task.remote_path = format!("/remote/{id}");
+            file_task.status = status;
+            file_task.created_at = now;
+            file_task.updated_at = now;
+            manager.save_file_task(&file_task, config_id).unwrap();
+        }
+
+        let (active, total) = manager.load_active_file_tasks(task_id, 1, 20).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(active.len(), 5);
+        assert!(active.iter().all(|file_task| {
+            matches!(
+                file_task.status,
+                BackupFileStatus::Pending
+                    | BackupFileStatus::Checking
+                    | BackupFileStatus::Encrypting
+                    | BackupFileStatus::WaitingTransfer
+                    | BackupFileStatus::Transferring
+            )
+        }));
+        assert!(!active.iter().any(|file_task| {
+            matches!(
+                file_task.status,
+                BackupFileStatus::Completed | BackupFileStatus::Skipped | BackupFileStatus::Failed
+            )
+        }));
+    }
+
+    #[test]
+    fn test_reset_folder_upload_execution_state_keeps_terminal_rows() {
+        let dir = tempdir().unwrap();
+        let manager = BackupPersistenceManager::new(&dir.path().join("reset-folder.db")).unwrap();
+        let now = chrono::Utc::now();
+        let task_id = "folder:reset-folder";
+        let config_id = "reset-folder";
+
+        let parent = BackupTask {
+            owner_uid: None,
+            id: task_id.to_string(),
+            config_id: config_id.to_string(),
+            status: BackupTaskStatus::Transferring,
+            sub_phase: None,
+            trigger_type: TriggerType::Poll,
+            pending_files: Vec::new(),
+            completed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 2,
+            transferred_bytes: 12345,
+            total_bytes: 24690,
+            scan_progress: None,
+            created_at: now,
+            started_at: Some(now),
+            completed_at: None,
+            error_message: None,
+            pending_upload_task_ids: std::collections::HashSet::new(),
+            pending_download_task_ids: std::collections::HashSet::new(),
+            transfer_task_map: std::collections::HashMap::new(),
+        };
+        manager.save_task(&parent).unwrap();
+
+        let mut active = make_test_file_task("reset-active", task_id);
+        active.remote_path = "/remote/reset-active".to_string();
+        active.status = BackupFileStatus::Transferring;
+        active.related_task_id = Some("stale-upload-task".to_string());
+        active.transferred_bytes = 99;
+        active.error_message = Some("stale".to_string());
+        manager.save_file_task(&active, config_id).unwrap();
+
+        let mut completed = make_test_file_task("reset-completed", task_id);
+        completed.remote_path = "/remote/reset-completed".to_string();
+        completed.status = BackupFileStatus::Completed;
+        completed.related_task_id = Some("completed-upload-task".to_string());
+        manager.save_file_task(&completed, config_id).unwrap();
+
+        assert_eq!(manager.reset_folder_upload_execution_state(task_id).unwrap(), 1);
+
+        let rows = manager.load_folder_file_tasks(task_id).unwrap();
+        let active = rows.iter().find(|row| row.id == "reset-active").unwrap();
+        assert_eq!(active.status, BackupFileStatus::Pending);
+        assert_eq!(active.related_task_id, None);
+        assert_eq!(active.transferred_bytes, 0);
+        assert_eq!(active.error_message, None);
+
+        let completed = rows.iter().find(|row| row.id == "reset-completed").unwrap();
+        assert_eq!(completed.status, BackupFileStatus::Completed);
+        assert_eq!(
+            completed.related_task_id.as_deref(),
+            Some("completed-upload-task")
+        );
     }
 
     /// Round-trip: save_file_task → load_file_tasks 应保留 sync_remote_* 字段
