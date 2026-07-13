@@ -3488,7 +3488,7 @@ impl AutoBackupManager {
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
         // 步骤7: 操作接口限制为活跃任务
         // 先收集需要取消的底层任务ID，避免持有 DashMap 锁时调用 async 方法
-        let (pending_uploads, pending_downloads) = {
+        let (pending_uploads, pending_downloads, config_id) = {
             let task = self.tasks.get(task_id)
                 .ok_or_else(|| anyhow!("任务已完成或不存在，无法操作: {}", task_id))?;
 
@@ -3497,6 +3497,7 @@ impl AutoBackupManager {
                     (
                         task.pending_upload_task_ids.iter().cloned().collect::<Vec<_>>(),
                         task.pending_download_task_ids.iter().cloned().collect::<Vec<_>>(),
+                        task.config_id.clone(),
                     )
                 }
                 BackupTaskStatus::Completed | BackupTaskStatus::PartiallyCompleted | BackupTaskStatus::Cancelled | BackupTaskStatus::Failed => {
