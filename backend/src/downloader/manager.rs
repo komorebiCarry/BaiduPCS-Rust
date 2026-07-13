@@ -100,7 +100,7 @@ pub struct DownloadManager {
     folder_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
     /// 🔥 加密快照管理器（用于查询加密文件映射，获取原始文件名）
     snapshot_manager: Arc<RwLock<Option<Arc<crate::encryption::snapshot::SnapshotManager>>>>,
-    /// 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+    /// 🔥 加密配置存储（用于创建下载任务的 age 解密服务）
     encryption_config_store: Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
     /// 🔥 链接级重试次数（从配置读取，传递给 TaskScheduleInfo）
     max_retries: u32,
@@ -395,9 +395,35 @@ impl DownloadManager {
         guard.clone()
     }
 
+    /// 为下载任务创建 age 解密服务。
+    ///
+    /// 解密服务必须在构造 `TaskScheduleInfo` 时注入，调度器只负责使用已经
+    /// 注入的服务，不在下载完成阶段再读取配置或临时创建服务。
+    fn create_encryption_service(
+        config_store: Option<&Arc<crate::encryption::EncryptionConfigStore>>,
+        task_id: &str,
+    ) -> Option<Arc<crate::encryption::EncryptionService>> {
+        let config_store = config_store?;
+        let key_config = match config_store.load() {
+            Ok(key_config) => key_config?,
+            Err(e) => {
+                warn!("任务 {} 读取 age 口令配置失败: {}", task_id, e);
+                return None;
+            }
+        };
+
+        match crate::encryption::EncryptionService::new(key_config.passphrase) {
+            Ok(service) => Some(Arc::new(service)),
+            Err(e) => {
+                warn!("任务 {} 创建 age 解密服务失败: {}", task_id, e);
+                None
+            }
+        }
+    }
+
     /// 🔥 设置加密配置存储
     ///
-    /// 由 AppState 在初始化时调用，注入加密配置存储用于根据 key_version 选择正确的解密密钥
+    /// 由 AppState 在初始化时调用，供新下载任务创建 age 解密服务
     pub async fn set_encryption_config_store(&self, config_store: Arc<crate::encryption::EncryptionConfigStore>) {
         let mut guard = self.encryption_config_store.write().await;
         *guard = Some(config_store);
@@ -1478,7 +1504,7 @@ impl DownloadManager {
         let task_slot_pool_clone = self.task_slot_pool.clone();
         let tasks_clone = self.tasks.clone(); // 🔥 用于 handle_task_failure 的优先级队列插入
         let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
-        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
+        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于创建任务级 age 解密服务
         let max_retries = self.max_retries;
         // 🔥 auto_requeue 发送端（scheduler 回调时用）
         let requeue_tx_clone = self.requeue_tx.clone();
@@ -1495,6 +1521,10 @@ impl DownloadManager {
             let backup_notification_tx = backup_notification_tx_arc.read().await.clone();
             let snapshot_manager = snapshot_manager_arc.read().await.clone(); // 🔥 获取快照管理器
             let encryption_config_store = encryption_config_store_arc.read().await.clone(); // 🔥 获取加密配置存储
+            let encryption_service = Self::create_encryption_service(
+                encryption_config_store.as_ref(),
+                &task_id_clone,
+            );
             // 🔥 文件夹管理器（scheduler 调度时需要）
             let folder_manager_clone_for_schedule = folder_manager_arc_clone.read().await.clone();
             // 准备任务
@@ -1775,12 +1805,10 @@ impl DownloadManager {
                         slot_id,
                         is_borrowed_slot,
                         task_slot_pool: Some(task_slot_pool_clone.clone()),
-                        // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
-                        encryption_service: None,
+                        // 🔥 加密服务（在任务创建时从全局 age 口令构造并注入）
+                        encryption_service,
                         // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
                         snapshot_manager: snapshot_manager.clone(),
-                        // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
-                        encryption_config_store: encryption_config_store.clone(),
                         // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
                         manager_tasks: Some(tasks_clone.clone()),
                         // 🔥 链接级重试次数（从配置读取）
@@ -2141,7 +2169,7 @@ impl DownloadManager {
         let folder_progress_tx_arc = self.folder_progress_tx.clone();
         let backup_notification_tx_arc = self.backup_notification_tx.clone();
         let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
-        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
+        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于创建任务级 age 解密服务
         let max_retries = self.max_retries;
         // 🔥 auto_requeue 发送端和文件夹管理器引用
         let requeue_tx_for_monitor = self.requeue_tx.clone();
@@ -2337,7 +2365,7 @@ impl DownloadManager {
                                 let task_slot_pool_clone = task_slot_pool.clone();
                                 let tasks_clone = tasks.clone(); // 🔥 用于 handle_task_failure 的优先级队列插入
                                 let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
-                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
+                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于创建任务级 age 解密服务
                                 // 🔥 auto_requeue 发送端和文件夹管理器引用
                                 let requeue_tx_cloned_monitor = requeue_tx_for_monitor.clone();
                                 let folder_manager_arc_clone = folder_manager_arc_for_monitor.clone();
@@ -2351,6 +2379,10 @@ impl DownloadManager {
                                         backup_notification_tx_arc_clone.read().await.clone();
                                     let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
                                     let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
+                                    let encryption_service = Self::create_encryption_service(
+                                        encryption_config_store.as_ref(),
+                                        &id_clone,
+                                    );
                                     // 🔥 文件夹管理器（构造 TaskScheduleInfo 时使用）
                                     let folder_manager_for_task = folder_manager_arc_clone.read().await.clone();
                                     let prepare_result = engine_clone
@@ -2635,12 +2667,10 @@ impl DownloadManager {
                                                 slot_id,
                                                 is_borrowed_slot,
                                                 task_slot_pool: Some(task_slot_pool_clone.clone()),
-                                                // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
-                                                encryption_service: None,
+                                                // 🔥 加密服务（在任务创建时从全局 age 口令构造并注入）
+                                                encryption_service,
                                                 // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
                                                 snapshot_manager: snapshot_manager.clone(),
-                                                // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
-                                                encryption_config_store: encryption_config_store.clone(),
                                                 // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
                                                 manager_tasks: Some(tasks_clone.clone()),
                                                 // 🔥 链接级重试次数（从配置读取）
@@ -2909,7 +2939,7 @@ impl DownloadManager {
         let folder_progress_tx_arc = self.folder_progress_tx.clone();
         let backup_notification_tx_arc = self.backup_notification_tx.clone();
         let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
-        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
+        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于创建任务级 age 解密服务
         let max_retries = self.max_retries;
         // 🔥 auto_requeue 发送端和文件夹管理器引用
         let requeue_tx_for_trigger = self.requeue_tx.clone();
@@ -3100,7 +3130,7 @@ impl DownloadManager {
                                 let backup_notification_tx_arc_clone = backup_notification_tx_arc.clone();
                                 let task_slot_pool_clone = task_slot_pool.clone();
                                 let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
-                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
+                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于创建任务级 age 解密服务
                                 let tasks_clone = tasks.clone(); // 🔥 用于任务完成时立即清理
                                 let waiting_queue_clone = waiting_queue.clone(); // 🔥 用于备份任务失败重试
                                 // 🔥 auto_requeue 发送端和文件夹管理器引用
@@ -3116,6 +3146,10 @@ impl DownloadManager {
                                         backup_notification_tx_arc_clone.read().await.clone();
                                     let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
                                     let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
+                                    let encryption_service = Self::create_encryption_service(
+                                        encryption_config_store.as_ref(),
+                                        &id_clone,
+                                    );
                                     // 🔥 文件夹管理器（构造 TaskScheduleInfo 时使用）
                                     let folder_manager_for_task = folder_manager_arc_clone_trig.read().await.clone();
 
@@ -3399,12 +3433,10 @@ impl DownloadManager {
                                                 slot_id,
                                                 is_borrowed_slot,
                                                 task_slot_pool: Some(task_slot_pool_clone.clone()),
-                                                // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
-                                                encryption_service: None,
+                                                // 🔥 加密服务（在任务创建时从全局 age 口令构造并注入）
+                                                encryption_service,
                                                 // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
                                                 snapshot_manager: snapshot_manager.clone(),
-                                                // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
-                                                encryption_config_store: encryption_config_store.clone(),
                                                 // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
                                                 manager_tasks: Some(tasks_clone.clone()),
                                                 // 🔥 链接级重试次数（从配置读取）
@@ -6968,6 +7000,25 @@ mod tests {
             last_warmup_at: None,
             custom_config: Default::default(),
         }
+    }
+
+    #[test]
+    fn creates_task_encryption_service_from_global_passphrase() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(crate::encryption::EncryptionConfigStore::new(temp_dir.path()));
+        store
+            .set_passphrase("global download passphrase".to_string())
+            .unwrap();
+
+        let service = DownloadManager::create_encryption_service(Some(&store), "task-1")
+            .expect("应从全局口令创建任务解密服务");
+        let encrypted = service.encrypt(b"download payload").unwrap();
+        assert_eq!(service.decrypt(&encrypted).unwrap(), b"download payload");
+    }
+
+    #[test]
+    fn no_global_passphrase_keeps_task_encryption_service_unset() {
+        assert!(DownloadManager::create_encryption_service(None, "task-1").is_none());
     }
 
     #[tokio::test]

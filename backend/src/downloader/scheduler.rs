@@ -218,17 +218,13 @@ pub struct TaskScheduleInfo {
     /// 任务位池引用（用于释放槽位）
     pub task_slot_pool: Option<Arc<crate::task_slot_pool::TaskSlotPool>>,
 
-    // 🔥 加密服务（用于下载完成后解密加密文件）
-    /// 加密服务引用（可选，仅当需要解密时使用）
+    // 🔥 加密服务（由 DownloadManager 在任务创建时注入）
+    /// 加密服务引用（可选；未配置时加密任务会报告口令未配置）
     pub encryption_service: Option<Arc<EncryptionService>>,
 
     // 🔥 加密快照管理器（用于查询加密文件映射，获取原始文件名）
     /// 快照管理器引用（可选，用于解密后重命名）
     pub snapshot_manager: Option<Arc<crate::encryption::snapshot::SnapshotManager>>,
-
-    // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
-    /// 加密配置存储引用（可选，用于密钥轮换后解密旧文件）
-    pub encryption_config_store: Option<Arc<crate::encryption::EncryptionConfigStore>>,
 
     // 🔥 Manager 任务列表引用（用于任务完成时立即清理，避免内存泄漏）
     /// DownloadManager.tasks 的引用，任务完成后从中移除
@@ -1688,7 +1684,7 @@ impl ChunkScheduler {
             return Ok(());
         }
 
-        // 2. 只使用启动时加载的用户 age 口令。
+        // 2. 只使用任务创建时注入的用户 age 口令服务。
         // 不按 key_version 查找历史口令，也不回退到其他算法或旧格式。
         let encryption_service = match &task_info.encryption_service {
             Some(service) => service.clone(),
