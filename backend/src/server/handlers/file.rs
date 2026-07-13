@@ -231,7 +231,7 @@ fn query_encryption_mappings(
             info!("查询到 {} 条加密映射记录", snapshots.len());
             snapshots
                 .into_iter()
-                .map(|s| (s.encrypted_name, (s.original_name, s.file_size)))
+                .map(|s| (s.encrypted_name, (s.local_name, s.file_size)))
                 .collect()
         }
         Err(e) => {
@@ -260,9 +260,9 @@ fn query_folder_mappings(
         // 查询所有配置的映射（返回 EncryptionSnapshot）
         if let Ok(snapshots) = state.backup_record_manager.get_all_folder_mappings_by_encrypted_name(encrypted_name) {
             for snapshot in snapshots {
-                // original_path 存储的是父路径
-                if snapshot.original_path == parent_path {
-                    result.insert(encrypted_name.clone(), snapshot.original_name);
+                // 文件夹映射的 local_path 存储父路径
+                if snapshot.local_path == parent_path {
+                    result.insert(encrypted_name.clone(), snapshot.local_name);
                     break;
                 }
             }

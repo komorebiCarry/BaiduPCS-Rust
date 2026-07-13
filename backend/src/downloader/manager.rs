@@ -664,8 +664,8 @@ impl DownloadManager {
         if let Some(ref mgr) = *snapshot_manager {
             match mgr.find_by_encrypted_name(encrypted_filename) {
                 Ok(Some(info)) => {
-                    debug!("找到加密文件映射: {} -> {}", encrypted_filename, info.original_name);
-                    return Some(info.original_name);
+                    debug!("找到加密文件映射: {} -> {}", encrypted_filename, info.local_name);
+                    return Some(info.local_name);
                 }
                 Ok(None) => {
                     debug!("未找到加密文件映射: {}", encrypted_filename);

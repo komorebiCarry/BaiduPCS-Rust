@@ -191,15 +191,15 @@ impl FolderDownloadManager {
             if let Ok(snapshots) = record_manager.get_all_folder_mappings_by_encrypted_name(encrypted_name) {
                 // 优先匹配 parent_path
                 for snapshot in &snapshots {
-                    if snapshot.original_path == parent_path {
-                        info!("还原文件夹名（精确匹配）: {} -> {}", encrypted_name, snapshot.original_name);
-                        return Some(snapshot.original_name.clone());
+                    if snapshot.local_path == parent_path {
+                        info!("还原文件夹名（精确匹配）: {} -> {}", encrypted_name, snapshot.local_name);
+                        return Some(snapshot.local_name.clone());
                     }
                 }
                 // 如果没有精确匹配，返回第一个结果（加密名是 UUID，理论上只有一条记录）
                 if let Some(snapshot) = snapshots.first() {
-                    info!("还原文件夹名（首条记录）: {} -> {}", encrypted_name, snapshot.original_name);
-                    return Some(snapshot.original_name.clone());
+                    info!("还原文件夹名（首条记录）: {} -> {}", encrypted_name, snapshot.local_name);
+                    return Some(snapshot.local_name.clone());
                 }
             }
         } else {

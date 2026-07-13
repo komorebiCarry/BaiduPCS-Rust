@@ -11,7 +11,6 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Row};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
@@ -21,35 +20,23 @@ use std::sync::Arc;
 /// 映射表是加密文件恢复的唯一事实来源，因此本地/远端路径和文件名都
 /// 作为显式列读取，不能在上传热路径中临时从其它表或路径字符串猜测。
 const SNAPSHOT_SELECT_COLUMNS: &str =
-    "config_id, original_path, original_name, local_path, local_name, encrypted_name, \
+    "config_id, local_path, local_name, encrypted_name, \
      file_size, version, key_version, remote_path, remote_name, is_directory, status";
 
 fn snapshot_from_row(row: &Row<'_>) -> rusqlite::Result<EncryptionSnapshot> {
     Ok(EncryptionSnapshot {
         config_id: row.get(0)?,
-        // original_path/original_name 保留为兼容旧版本的逻辑键。
-        original_path: row.get(1)?,
-        original_name: row.get(2)?,
-        local_path: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-        local_name: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-        encrypted_name: row.get(5)?,
-        file_size: row.get::<_, i64>(6)? as u64,
-        version: row.get(7)?,
-        key_version: row.get::<_, i64>(8)? as u32,
-        remote_path: row.get(9)?,
-        remote_name: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
-        is_directory: row.get::<_, i32>(11)? == 1,
-        status: row.get(12)?,
+        local_path: row.get(1)?,
+        local_name: row.get(2)?,
+        encrypted_name: row.get(3)?,
+        file_size: row.get::<_, i64>(4)? as u64,
+        version: row.get(5)?,
+        key_version: row.get::<_, i64>(6)? as u32,
+        remote_path: row.get(7)?,
+        remote_name: row.get(8)?,
+        is_directory: row.get::<_, i32>(9)? == 1,
+        status: row.get(10)?,
     })
-}
-
-fn path_file_name(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// 数据库连接池类型
@@ -106,7 +93,7 @@ impl BackupRecordManager {
 
     /// 初始化数据库表
     fn init_database(&self) -> Result<()> {
-        let mut conn = self.get_conn()?;
+        let conn = self.get_conn()?;
 
         // 启用 WAL 模式提升并发性能
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -186,40 +173,33 @@ impl BackupRecordManager {
             CREATE TABLE IF NOT EXISTS encryption_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,   -- 自增主键
                 config_id TEXT NOT NULL,                -- 备份配置ID
-                original_path TEXT NOT NULL,            -- 原始文件相对路径（文件夹时为父路径）
-                original_name TEXT NOT NULL,            -- 原始文件名/文件夹名
-                local_path TEXT NOT NULL DEFAULT '',    -- 本地文件完整路径
-                local_name TEXT NOT NULL DEFAULT '',    -- 本地文件名
+                local_path TEXT NOT NULL,               -- 本地文件完整路径（文件夹时为父路径）
+                local_name TEXT NOT NULL,               -- 本地文件名/文件夹名
                 encrypted_name TEXT NOT NULL,           -- 加密后的文件名/文件夹名 (随机生成)
                 file_size INTEGER NOT NULL DEFAULT 0,   -- 原始文件大小 (字节，文件夹为0)
                 version INTEGER NOT NULL DEFAULT 1,     -- 加密格式版本号
                 key_version INTEGER NOT NULL DEFAULT 1, -- 密钥版本号（关联加密时使用的密钥）
                 remote_path TEXT NOT NULL,              -- 远程存储路径 (百度网盘路径)
-                remote_name TEXT NOT NULL DEFAULT '',   -- 远程文件名/文件夹名
+                remote_name TEXT NOT NULL,              -- 远程文件名/文件夹名
                 is_directory INTEGER NOT NULL DEFAULT 0,-- 是否为文件夹: 0=文件, 1=文件夹
                 status TEXT NOT NULL DEFAULT 'pending', -- 状态: pending/uploading/completed/failed
                 created_at TEXT NOT NULL,               -- 创建时间 (RFC3339格式)
                 updated_at TEXT NOT NULL,               -- 更新时间 (RFC3339格式)
-                UNIQUE(config_id, original_path, original_name)  -- 唯一约束: 同一配置下原始路径+文件名唯一
+                UNIQUE(config_id, local_path, local_name, is_directory)  -- 同一配置下本地映射唯一
             )",
             [],
         )?;
 
-        // 旧版本已经创建过 encryption_snapshots 时，CREATE TABLE 不会补列。
-        // 这里显式执行轻量迁移，保证升级后每一条映射都具备完整的本地/远端
-        // 路径和名称字段。
-        Self::ensure_snapshot_columns(&mut conn)?;
-
         // 创建快照索引
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_snapshots_lookup
-             ON encryption_snapshots(config_id, original_path, original_name)",
+             ON encryption_snapshots(config_id, local_path, local_name, is_directory)",
             [],
         )?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_snapshots_config_name
-             ON encryption_snapshots(config_id, original_name, is_directory, updated_at DESC)",
+             ON encryption_snapshots(config_id, local_name, is_directory, updated_at DESC)",
             [],
         )?;
 
@@ -248,78 +228,6 @@ impl BackupRecordManager {
              ON encryption_snapshots(is_directory, encrypted_name)",
             [],
         )?;
-
-        Ok(())
-    }
-
-    /// 为已有数据库补齐完整映射字段，并把旧字段迁移到新字段。
-    fn ensure_snapshot_columns(conn: &mut DbConnection) -> Result<()> {
-        let existing_columns: HashSet<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(encryption_snapshots)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<rusqlite::Result<HashSet<_>>>()?
-        };
-
-        for (name, definition) in [
-            ("local_path", "TEXT NOT NULL DEFAULT ''"),
-            ("local_name", "TEXT NOT NULL DEFAULT ''"),
-            ("remote_name", "TEXT NOT NULL DEFAULT ''"),
-        ] {
-            if !existing_columns.contains(name) {
-                conn.execute(
-                    &format!("ALTER TABLE encryption_snapshots ADD COLUMN {name} {definition}"),
-                    [],
-                )?;
-            }
-        }
-
-        // 收集后再更新，避免持有 SELECT statement 时修改同一张表。
-        let rows: Vec<(i64, String, String, String, Option<String>, Option<String>, Option<String>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, original_path, original_name, remote_path,
-                        local_path, local_name, remote_name
-                 FROM encryption_snapshots",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
-        let tx = conn.transaction()?;
-        for (id, original_path, original_name, remote_path, local_path, local_name, remote_name) in rows {
-            let local_path = if local_path.as_deref().unwrap_or_default().is_empty() {
-                original_path
-            } else {
-                local_path.unwrap_or_default()
-            };
-            let local_name = if local_name.as_deref().unwrap_or_default().is_empty() {
-                original_name
-            } else {
-                local_name.unwrap_or_default()
-            };
-            let remote_name = if remote_name.as_deref().unwrap_or_default().is_empty() {
-                path_file_name(&remote_path)
-            } else {
-                remote_name.unwrap_or_default()
-            };
-
-            tx.execute(
-                "UPDATE encryption_snapshots
-                 SET local_path = ?1, local_name = ?2, remote_name = ?3
-                 WHERE id = ?4",
-                params![local_path, local_name, remote_name, id],
-            )?;
-        }
-        tx.commit()?;
 
         Ok(())
     }
@@ -527,13 +435,11 @@ impl BackupRecordManager {
 
         conn.execute(
             "INSERT INTO encryption_snapshots
-             (config_id, original_path, original_name, local_path, local_name,
+             (config_id, local_path, local_name,
               encrypted_name, file_size, version, key_version, remote_path,
               remote_name, is_directory, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
-             ON CONFLICT(config_id, original_path, original_name) DO UPDATE SET
-                local_path = excluded.local_path,
-                local_name = excluded.local_name,
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+             ON CONFLICT(config_id, local_path, local_name, is_directory) DO UPDATE SET
                 encrypted_name = excluded.encrypted_name,
                 file_size = excluded.file_size,
                 version = excluded.version,
@@ -545,8 +451,6 @@ impl BackupRecordManager {
                 updated_at = excluded.updated_at",
             params![
                 snapshot.config_id,
-                snapshot.original_path,
-                snapshot.original_name,
                 snapshot.local_path,
                 snapshot.local_name,
                 snapshot.encrypted_name,
@@ -563,8 +467,14 @@ impl BackupRecordManager {
 
         let id: i64 = conn.query_row(
             "SELECT id FROM encryption_snapshots
-             WHERE config_id = ?1 AND original_path = ?2 AND original_name = ?3",
-            params![snapshot.config_id, snapshot.original_path, snapshot.original_name],
+             WHERE config_id = ?1 AND local_path = ?2 AND local_name = ?3
+               AND is_directory = ?4",
+            params![
+                snapshot.config_id,
+                snapshot.local_path,
+                snapshot.local_name,
+                snapshot.is_directory as i32,
+            ],
             |row| row.get(0),
         )?;
 
@@ -587,13 +497,11 @@ impl BackupRecordManager {
         for snapshot in snapshots {
             tx.execute(
                 "INSERT INTO encryption_snapshots
-                 (config_id, original_path, original_name, local_path, local_name,
+                 (config_id, local_path, local_name,
                   encrypted_name, file_size, version, key_version, remote_path,
                   remote_name, is_directory, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
-                 ON CONFLICT(config_id, original_path, original_name) DO UPDATE SET
-                    local_path = excluded.local_path,
-                    local_name = excluded.local_name,
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+                 ON CONFLICT(config_id, local_path, local_name, is_directory) DO UPDATE SET
                     encrypted_name = excluded.encrypted_name,
                     file_size = excluded.file_size,
                     version = excluded.version,
@@ -605,8 +513,6 @@ impl BackupRecordManager {
                     updated_at = excluded.updated_at",
                 params![
                     snapshot.config_id,
-                    snapshot.original_path,
-                    snapshot.original_name,
                     snapshot.local_path,
                     snapshot.local_name,
                     snapshot.encrypted_name,
@@ -642,81 +548,6 @@ impl BackupRecordManager {
             .optional()?;
 
         Ok(result)
-    }
-
-    /// 根据原始路径查找快照
-    pub fn find_snapshot_by_original(
-        &self,
-        original_path: &str,
-        original_name: &str,
-    ) -> Result<Option<EncryptionSnapshot>> {
-        let conn = self.get_conn()?;
-
-        let result = conn
-            .query_row(
-                &format!("SELECT {SNAPSHOT_SELECT_COLUMNS}
-                 FROM encryption_snapshots
-                 WHERE original_path = ?1 AND original_name = ?2
-                   AND is_directory = 0
-                 ORDER BY updated_at DESC, id DESC",
-                ),
-                params![original_path, original_name],
-                snapshot_from_row,
-            )
-            .optional()?;
-
-        Ok(result)
-    }
-
-    /// 根据配置和原始路径查找文件快照。
-    ///
-    /// 新上传链路必须带 config_id，避免不同备份配置拥有同名文件时拿到
-    /// 错误的加密名称。旧的无配置方法仅保留给兼容调用方。
-    pub fn find_snapshot_by_config_original(
-        &self,
-        config_id: &str,
-        original_path: &str,
-        original_name: &str,
-    ) -> Result<Option<EncryptionSnapshot>> {
-        let conn = self.get_conn()?;
-
-        let result = conn
-            .query_row(
-                &format!("SELECT {SNAPSHOT_SELECT_COLUMNS}
-                 FROM encryption_snapshots
-                 WHERE config_id = ?1 AND original_path = ?2 AND original_name = ?3
-                   AND is_directory = 0",
-                ),
-                params![config_id, original_path, original_name],
-                snapshot_from_row,
-            )
-            .optional()?;
-
-        Ok(result)
-    }
-
-    /// 根据配置和本地原始文件名查询所有文件加密映射。
-    ///
-    /// 同名文件可能位于不同目录，调用方还需要结合 original_path 或
-    /// remote_path 做目录级消歧；不能只用全局 encrypted_name/文件名猜测。
-    pub fn find_file_snapshots_by_config_original_name(
-        &self,
-        config_id: &str,
-        original_name: &str,
-    ) -> Result<Vec<EncryptionSnapshot>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
-            &format!("SELECT {SNAPSHOT_SELECT_COLUMNS}
-             FROM encryption_snapshots
-             WHERE config_id = ?1 AND original_name = ?2 AND is_directory = 0
-             ORDER BY updated_at DESC, id DESC",
-            ),
-        )?;
-
-        let rows = stmt.query_map(params![config_id, original_name], snapshot_from_row)?;
-
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
     }
 
     /// 一次加载指定配置下的全部文件映射。
@@ -837,36 +668,6 @@ impl BackupRecordManager {
         Ok((upload_deleted, download_deleted, 0))
     }
 
-    /// 删除指定配置的所有加密快照记录
-    ///
-    // ==================== 以下删除函数已废弃 ====================
-    //
-    // encryption_snapshots 表是 uuid.age 与原始文件名的唯一关联线索，
-    // UUID v4 几乎不可能碰撞，因此禁止任何删除操作。
-    // 之前存在的删除函数（按 config_id、按状态、按 encrypted_name）均已移除。
-    // ==========================================================
-
-    /// 删除指定配置的加密快照记录
-    /// 此函数已弃用，保留仅用于编译兼容，不做任何操作。
-    pub fn delete_snapshots_by_config(&self, _config_id: &str) -> Result<usize> {
-        tracing::warn!("delete_snapshots_by_config 已弃用，encryption_snapshots 表禁止删除");
-        Ok(0)
-    }
-
-    /// 删除指定配置下未完成的加密快照记录
-    /// 此函数已弃用，保留仅用于编译兼容，不做任何操作。
-    pub fn delete_incomplete_snapshots_by_config(&self, _config_id: &str) -> Result<usize> {
-        tracing::warn!("delete_incomplete_snapshots_by_config 已弃用，encryption_snapshots 表禁止删除");
-        Ok(0)
-    }
-
-    /// 批量删除指定加密文件名的快照记录
-    /// 此函数已弃用，保留仅用于编译兼容，不做任何操作。
-    pub fn delete_snapshots_by_encrypted_names(&self, _encrypted_names: &[String]) -> Result<usize> {
-        tracing::warn!("delete_snapshots_by_encrypted_names 已弃用，encryption_snapshots 表禁止删除");
-        Ok(0)
-    }
-
     /// 获取数据库统计信息
     pub fn get_stats(&self) -> Result<RecordStats> {
         let conn = self.get_conn()?;
@@ -901,62 +702,61 @@ impl BackupRecordManager {
     /// 添加文件夹映射（存储到 encryption_snapshots 表，is_directory=1）
     ///
     /// # 参数
-    /// - `parent_path`: 父路径
-    /// - `original_name`: 原始文件夹名
+    /// - `local_parent_path`: 本地父路径
+    /// - `local_name`: 本地文件夹名
     /// - `encrypted_name`: 加密后的文件夹名
     /// - `key_version`: 当前加密密钥版本号
     pub fn add_folder_mapping(
         &self,
-        parent_path: &str,
-        original_name: &str,
+        local_parent_path: &str,
+        local_name: &str,
         encrypted_name: &str,
         key_version: u32,
     ) -> Result<i64> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
-        let remote_path = format!("{}/{}", parent_path.trim_end_matches('/'), encrypted_name);
+        let remote_path = format!("{}/{}", local_parent_path.trim_end_matches('/'), encrypted_name);
 
         conn.execute(
             "INSERT INTO encryption_snapshots
-             (config_id, original_path, original_name, local_path, local_name,
+             (config_id, local_path, local_name,
               encrypted_name, file_size, version, key_version, remote_path,
               remote_name, is_directory, status, created_at, updated_at)
-             VALUES ('', ?1, ?2, ?1, ?2, ?3, 0, 1, ?4, ?5, ?3, 1, 'completed', ?6, ?6)
-             ON CONFLICT(config_id, original_path, original_name) DO UPDATE SET
-                local_path = excluded.local_path,
-                local_name = excluded.local_name,
+             VALUES ('', ?1, ?2, ?3, 0, 1, ?4, ?5, ?3, 1, 'completed', ?6, ?6)
+             ON CONFLICT(config_id, local_path, local_name, is_directory) DO UPDATE SET
                 encrypted_name = excluded.encrypted_name,
                 remote_path = excluded.remote_path,
                 remote_name = excluded.remote_name,
                 key_version = excluded.key_version,
                 status = excluded.status,
                 updated_at = excluded.updated_at",
-            params![parent_path, original_name, encrypted_name, key_version as i64, remote_path, now],
+            params![local_parent_path, local_name, encrypted_name, key_version as i64, remote_path, now],
         )?;
 
         let id: i64 = conn.query_row(
             "SELECT id FROM encryption_snapshots
-             WHERE config_id = '' AND original_path = ?1 AND original_name = ?2",
-            params![parent_path, original_name],
+             WHERE config_id = '' AND local_path = ?1 AND local_name = ?2
+               AND is_directory = 1",
+            params![local_parent_path, local_name],
             |row| row.get(0),
         )?;
 
         Ok(id)
     }
 
-    /// 根据原始文件夹名查找加密名
+    /// 根据本地文件夹名查找加密名
     pub fn find_encrypted_folder_name(
         &self,
-        parent_path: &str,
-        original_folder_name: &str,
+        local_parent_path: &str,
+        local_name: &str,
     ) -> Result<Option<String>> {
         let conn = self.get_conn()?;
 
         let result: Option<String> = conn
             .query_row(
                 "SELECT encrypted_name FROM encryption_snapshots
-                 WHERE original_path = ?1 AND original_name = ?2 AND is_directory = 1",
-                params![parent_path, original_folder_name],
+                 WHERE local_path = ?1 AND local_name = ?2 AND is_directory = 1",
+                params![local_parent_path, local_name],
                 |row| row.get(0),
             )
             .optional()?;
@@ -964,8 +764,8 @@ impl BackupRecordManager {
         Ok(result)
     }
 
-    /// 根据加密文件夹名查找原始名
-    pub fn find_original_folder_name(
+    /// 根据加密文件夹名查找本地名
+    pub fn find_local_folder_name(
         &self,
         encrypted_folder_name: &str,
     ) -> Result<Option<String>> {
@@ -973,7 +773,7 @@ impl BackupRecordManager {
 
         let result: Option<String> = conn
             .query_row(
-                "SELECT original_name FROM encryption_snapshots
+                "SELECT local_name FROM encryption_snapshots
                  WHERE encrypted_name = ?1 AND is_directory = 1",
                 params![encrypted_folder_name],
                 |row| row.get(0),
@@ -1036,15 +836,9 @@ pub struct DownloadRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptionSnapshot {
     pub config_id: String,
-    /// 兼容旧版本的逻辑源路径键（文件夹时为父路径）。
-    pub original_path: String,
-    /// 兼容旧版本的逻辑源名称键。
-    pub original_name: String,
     /// 本地文件完整路径；文件夹映射存储本地父路径。
-    #[serde(default)]
     pub local_path: String,
     /// 本地文件名/文件夹名。
-    #[serde(default)]
     pub local_name: String,
     /// 远端文件名/文件夹名（加密文件通常为 UUID.age）。
     pub encrypted_name: String,
@@ -1053,7 +847,6 @@ pub struct EncryptionSnapshot {
     pub version: i32,
     pub key_version: u32,
     pub remote_path: String,        // 远程完整路径
-    #[serde(default)]
     pub remote_name: String,        // 远程文件名/文件夹名
     pub is_directory: bool,         // 是否为文件夹
     pub status: String,
@@ -1152,61 +945,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_snapshot_schema_migrates_legacy_rows() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("legacy.db");
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE encryption_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    config_id TEXT NOT NULL,
-                    original_path TEXT NOT NULL,
-                    original_name TEXT NOT NULL,
-                    encrypted_name TEXT NOT NULL,
-                    file_size INTEGER NOT NULL DEFAULT 0,
-                    version INTEGER NOT NULL DEFAULT 1,
-                    key_version INTEGER NOT NULL DEFAULT 1,
-                    remote_path TEXT NOT NULL,
-                    is_directory INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(config_id, original_path, original_name)
-                );
-                INSERT INTO encryption_snapshots (
-                    config_id, original_path, original_name, encrypted_name,
-                    file_size, remote_path, status, created_at, updated_at
-                ) VALUES (
-                    'config-1', '/docs', 'report.txt', 'uuid.age',
-                    42, '/backup/uuid.age', 'completed',
-                    '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'
-                );",
-            )
-            .unwrap();
-        }
-
-        let record_manager = BackupRecordManager::new(&db_path).unwrap();
-        let snapshot = record_manager
-            .find_snapshot_by_encrypted_name("uuid.age")
-            .unwrap()
-            .expect("旧记录应可读");
-        assert_eq!(snapshot.local_path, "/docs");
-        assert_eq!(snapshot.local_name, "report.txt");
-        assert_eq!(snapshot.remote_path, "/backup/uuid.age");
-        assert_eq!(snapshot.remote_name, "uuid.age");
-        assert_eq!(snapshot.file_size, 42);
-    }
-
-    #[test]
     fn test_add_snapshots_batch_persists_complete_mapping() {
         let temp = tempdir().unwrap();
         let record_manager = BackupRecordManager::new(&temp.path().join("records.db")).unwrap();
         let snapshots = vec![
             EncryptionSnapshot {
                 config_id: "config-1".to_string(),
-                original_path: "/backup/docs".to_string(),
-                original_name: "one.txt".to_string(),
                 local_path: "/home/user/docs/one.txt".to_string(),
                 local_name: "one.txt".to_string(),
                 encrypted_name: "one.age".to_string(),
@@ -1220,8 +964,6 @@ mod tests {
             },
             EncryptionSnapshot {
                 config_id: "config-1".to_string(),
-                original_path: "/backup/docs".to_string(),
-                original_name: "two.txt".to_string(),
                 local_path: "/home/user/docs/two.txt".to_string(),
                 local_name: "two.txt".to_string(),
                 encrypted_name: "two.age".to_string(),

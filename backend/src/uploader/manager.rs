@@ -1231,8 +1231,6 @@ impl UploadManager {
                 use crate::autobackup::record::EncryptionSnapshot;
                 let snapshot = EncryptionSnapshot {
                     config_id: "manual_upload".to_string(),
-                    original_path: encrypted_parent.clone(),
-                    original_name: original_filename.clone(),
                     local_path: local_path.to_string_lossy().replace('\\', "/"),
                     local_name: local_path
                         .file_name()
@@ -2822,14 +2820,6 @@ impl UploadManager {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
-        let mut snapshot_original_path = mapping
-            .as_ref()
-            .map(|snapshot| snapshot.original_path.clone())
-            .unwrap_or_else(|| remote_path.clone());
-        let mut snapshot_original_name = mapping
-            .as_ref()
-            .map(|snapshot| snapshot.original_name.clone())
-            .unwrap_or_else(|| local_name.clone());
         let (actual_remote_path, encrypted_filename) = if encrypt_enabled {
             use crate::encryption::service::EncryptionService;
 
@@ -2844,9 +2834,7 @@ impl UploadManager {
                 .unwrap_or_default();
             let (enc_filename, path) = if let Some(snapshot) = mapping.as_ref() {
                 // 映射由扫描阶段按 config + 本地路径解析，直接复用其中的完整
-                // 远端位置和原始逻辑键；这里绝不反查 encryption_snapshots。
-                snapshot_original_path = snapshot.original_path.clone();
-                snapshot_original_name = snapshot.original_name.clone();
+                // 远端位置；这里绝不反查 encryption_snapshots。
                 let enc_filename = if !snapshot.remote_name.is_empty() {
                     snapshot.remote_name.clone()
                 } else if !snapshot.encrypted_name.is_empty() {
@@ -2861,15 +2849,9 @@ impl UploadManager {
                 };
                 (enc_filename, path)
             } else if EncryptionService::is_encrypted_filename(filename) {
-                // 兼容没有映射上下文的旧调用方：直接使用任务中已有的远端
-                // 路径和本地文件名，不为恢复显示名额外查询数据库。
-                snapshot_original_path = parent.clone();
-                snapshot_original_name = local_name.clone();
                 (filename.to_string(), remote_path.clone())
             } else {
                 let enc_filename = EncryptionService::generate_encrypted_filename();
-                snapshot_original_path = parent.clone();
-                snapshot_original_name = local_name.clone();
                 let path = if parent.is_empty() || parent == "/" {
                     format!("/{}", enc_filename)
                 } else {
@@ -2909,8 +2891,6 @@ impl UploadManager {
             use crate::autobackup::record::EncryptionSnapshot;
             let snapshot = EncryptionSnapshot {
                 config_id: backup_config_id.clone(),
-                original_path: snapshot_original_path.clone(),
-                original_name: snapshot_original_name.clone(),
                 local_path: local_path.to_string_lossy().replace('\\', "/"),
                 local_name: local_name.clone(),
                 encrypted_name: enc_filename.clone(),

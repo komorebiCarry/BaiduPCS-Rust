@@ -66,40 +66,10 @@ impl SnapshotManager {
         Self { record_manager }
     }
 
-    /// 创建快照
+    /// 创建包含完整本地/远端映射信息的快照。
     pub fn create_snapshot(
         &self,
         config_id: &str,
-        original_path: &str,
-        original_name: &str,
-        encrypted_name: &str,
-        file_size: u64,
-        version: i32,
-        key_version: u32,
-        remote_path: &str,
-    ) -> Result<i64> {
-        // 旧调用方只提供逻辑原始路径，保留原有兼容语义；拥有真实本地路径
-        // 的上传链路应调用 create_snapshot_with_local_path。
-        self.create_snapshot_with_mapping(
-            config_id,
-            original_path,
-            original_name,
-            original_path,
-            original_name,
-            encrypted_name,
-            file_size,
-            version,
-            key_version,
-            remote_path,
-        )
-    }
-
-    /// 创建带完整本地路径的文件快照。
-    pub fn create_snapshot_with_local_path(
-        &self,
-        config_id: &str,
-        original_path: &str,
-        original_name: &str,
         local_path: &str,
         encrypted_name: &str,
         file_size: u64,
@@ -111,34 +81,7 @@ impl SnapshotManager {
             .file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
-            .unwrap_or(original_name);
-        self.create_snapshot_with_mapping(
-            config_id,
-            original_path,
-            original_name,
-            local_path,
-            local_name,
-            encrypted_name,
-            file_size,
-            version,
-            key_version,
-            remote_path,
-        )
-    }
-
-    fn create_snapshot_with_mapping(
-        &self,
-        config_id: &str,
-        original_path: &str,
-        original_name: &str,
-        local_path: &str,
-        local_name: &str,
-        encrypted_name: &str,
-        file_size: u64,
-        version: i32,
-        key_version: u32,
-        remote_path: &str,
-    ) -> Result<i64> {
+            .ok_or_else(|| anyhow::anyhow!("本地路径没有文件名: {local_path}"))?;
         let remote_name = remote_path
             .replace('\\', "/")
             .trim_end_matches('/')
@@ -148,8 +91,6 @@ impl SnapshotManager {
             .to_string();
         let snapshot = EncryptionSnapshot {
             config_id: config_id.to_string(),
-            original_path: original_path.to_string(),
-            original_name: original_name.to_string(),
             local_path: local_path.to_string(),
             local_name: local_name.to_string(),
             encrypted_name: encrypted_name.to_string(),
@@ -173,29 +114,6 @@ impl SnapshotManager {
     /// 根据加密文件名查找快照
     pub fn find_by_encrypted_name(&self, encrypted_name: &str) -> Result<Option<SnapshotInfo>> {
         let snapshot = self.record_manager.find_snapshot_by_encrypted_name(encrypted_name)?;
-        Ok(snapshot.map(SnapshotInfo::from))
-    }
-
-    /// 根据原始文件路径查找快照
-    pub fn find_by_original(
-        &self,
-        original_path: &str,
-        original_name: &str,
-    ) -> Result<Option<SnapshotInfo>> {
-        let snapshot = self.record_manager.find_snapshot_by_original(original_path, original_name)?;
-        Ok(snapshot.map(SnapshotInfo::from))
-    }
-
-    /// 根据配置和原始路径查找快照，避免跨配置同名文件串用映射。
-    pub fn find_by_config_original(
-        &self,
-        config_id: &str,
-        original_path: &str,
-        original_name: &str,
-    ) -> Result<Option<SnapshotInfo>> {
-        let snapshot = self
-            .record_manager
-            .find_snapshot_by_config_original(config_id, original_path, original_name)?;
         Ok(snapshot.map(SnapshotInfo::from))
     }
 
@@ -242,18 +160,13 @@ impl SnapshotManager {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotInfo {
     pub config_id: String,
-    pub original_path: String,
-    pub original_name: String,
-    #[serde(default)]
     pub local_path: String,
-    #[serde(default)]
     pub local_name: String,
     pub encrypted_name: String,
     pub file_size: u64,
     pub version: i32,
     pub key_version: u32,
     pub remote_path: String,
-    #[serde(default)]
     pub remote_name: String,
     pub status: SnapshotStatus,
 }
@@ -262,8 +175,6 @@ impl From<EncryptionSnapshot> for SnapshotInfo {
     fn from(s: EncryptionSnapshot) -> Self {
         Self {
             config_id: s.config_id,
-            original_path: s.original_path,
-            original_name: s.original_name,
             local_path: s.local_path,
             local_name: s.local_name,
             encrypted_name: s.encrypted_name,
@@ -283,9 +194,13 @@ pub fn get_file_display_info(
     encrypted_name: &str,
 ) -> Result<FileDisplayInfo> {
     if let Some(snapshot) = snapshot_manager.find_by_encrypted_name(encrypted_name)? {
+        let display_path = Path::new(&snapshot.local_path)
+            .parent()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
         Ok(FileDisplayInfo {
-            display_name: snapshot.original_name.clone(),
-            display_path: snapshot.original_path.clone(),
+            display_name: snapshot.local_name.clone(),
+            display_path,
             is_encrypted: true,
             encrypted_name: Some(encrypted_name.to_string()),
             original_size: Some(snapshot.file_size),
@@ -336,8 +251,7 @@ mod tests {
         // 创建快照
         let id = snapshot_manager.create_snapshot(
             "config_1",
-            "/path/to/file",
-            "test.txt",
+            "/path/to/file/test.txt",
             "uuid-1234.age",
             1024,
             1,
@@ -358,8 +272,7 @@ mod tests {
         // 创建快照
         snapshot_manager.create_snapshot(
             "config_1",
-            "/path/to/file",
-            "original.txt",
+            "/path/to/file/original.txt",
             encrypted_name,
             2048,
             1,
@@ -373,37 +286,11 @@ mod tests {
 
         let snapshot = found.unwrap();
         assert_eq!(snapshot.config_id, "config_1");
-        assert_eq!(snapshot.original_name, "original.txt");
+        assert_eq!(snapshot.local_name, "original.txt");
         assert_eq!(snapshot.encrypted_name, encrypted_name);
         assert_eq!(snapshot.file_size, 2048);
         assert_eq!(snapshot.key_version, 1);
         assert_eq!(snapshot.status, SnapshotStatus::Pending);
-    }
-
-    #[test]
-    fn test_snapshot_manager_find_by_original() {
-        let record_manager = create_test_record_manager();
-        let snapshot_manager = SnapshotManager::new(record_manager);
-
-        // 创建快照
-        snapshot_manager.create_snapshot(
-            "config_2",
-            "/documents",
-            "report.pdf",
-            "report-uuid.age",
-            4096,
-            2,
-            1,  // key_version
-            "/backup/documents",
-        ).unwrap();
-
-        // 通过原始路径查找
-        let found = snapshot_manager.find_by_original("/documents", "report.pdf").unwrap();
-        assert!(found.is_some());
-
-        let snapshot = found.unwrap();
-        assert_eq!(snapshot.encrypted_name, "report-uuid.age");
-        assert_eq!(snapshot.version, 2);
     }
 
     #[test]
@@ -416,8 +303,7 @@ mod tests {
         // 创建快照
         snapshot_manager.create_snapshot(
             "config_3",
-            "/path",
-            "file.txt",
+            "/path/file.txt",
             encrypted_name,
             512,
             1,
@@ -454,8 +340,7 @@ mod tests {
 
         snapshot_manager.create_snapshot(
             "config_4",
-            "/path",
-            "file.txt",
+            "/path/file.txt",
             encrypted_name,
             256,
             1,
@@ -478,7 +363,7 @@ mod tests {
         let result = snapshot_manager.find_by_encrypted_name("nonexistent.age").unwrap();
         assert!(result.is_none());
 
-        let result = snapshot_manager.find_by_original("config", "/path").unwrap();
+        let result = snapshot_manager.find_by_encrypted_name("config").unwrap();
         assert!(result.is_none());
     }
 
@@ -507,8 +392,7 @@ mod tests {
 
         snapshot_manager.create_snapshot(
             "config_5",
-            "/documents/work",
-            "important.docx",
+            "/documents/work/important.docx",
             encrypted_name,
             8192,
             1,
@@ -543,8 +427,6 @@ mod tests {
     fn test_snapshot_info_from_encryption_snapshot() {
         let encryption_snapshot = EncryptionSnapshot {
             config_id: "config".to_string(),
-            original_path: "/path".to_string(),
-            original_name: "file.txt".to_string(),
             local_path: "/local/path/file.txt".to_string(),
             local_name: "file.txt".to_string(),
             encrypted_name: "encrypted.age".to_string(),
@@ -560,7 +442,7 @@ mod tests {
         let snapshot_info = SnapshotInfo::from(encryption_snapshot);
 
         assert_eq!(snapshot_info.config_id, "config");
-        assert_eq!(snapshot_info.original_name, "file.txt");
+        assert_eq!(snapshot_info.local_name, "file.txt");
         assert_eq!(snapshot_info.key_version, 1);
         assert_eq!(snapshot_info.status, SnapshotStatus::Completed);
     }

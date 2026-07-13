@@ -25,15 +25,9 @@ pub struct MappingRecord {
     pub config_id: String,
     /// 加密后的文件名（UUID.age 格式）
     pub encrypted_name: String,
-    /// 原始文件相对路径
-    pub original_path: String,
-    /// 原始文件名
-    pub original_name: String,
     /// 本地文件完整路径
-    #[serde(default)]
     pub local_path: String,
     /// 本地文件名
-    #[serde(default)]
     pub local_name: String,
     /// 是否为文件夹
     pub is_directory: bool,
@@ -43,15 +37,12 @@ pub struct MappingRecord {
     pub key_version: u32,
     /// 原始文件大小（字节）
     pub file_size: u64,
-    /// 网盘路径（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_path: Option<String>,
-    /// 网盘文件名（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_name: Option<String>,
-    /// 状态（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    /// 网盘完整路径
+    pub remote_path: String,
+    /// 网盘文件名
+    pub remote_name: String,
+    /// 状态
+    pub status: String,
 }
 
 /// 映射导出数据
@@ -85,29 +76,27 @@ impl MappingGenerator {
         let conn = self.record_manager.get_conn_for_export()?;
         
         let mut stmt = conn.prepare(
-            "SELECT config_id, encrypted_name, original_path, original_name,
-                    local_path, local_name, is_directory, version, key_version, file_size,
+            "SELECT config_id, encrypted_name, local_path, local_name,
+                    is_directory, version, key_version, file_size,
                     remote_path, remote_name, status
              FROM encryption_snapshots
              WHERE status = 'completed'
-             ORDER BY config_id, original_path, original_name"
+             ORDER BY config_id, local_path, local_name"
         )?;
 
         let rows = stmt.query_map([], |row| {
             Ok(MappingRecord {
                 config_id: row.get(0)?,
                 encrypted_name: row.get(1)?,
-                original_path: row.get(2)?,
-                original_name: row.get(3)?,
-                local_path: row.get(4)?,
-                local_name: row.get(5)?,
-                is_directory: row.get::<_, i32>(6)? == 1,
-                version: row.get(7)?,
-                key_version: row.get::<_, i64>(8)? as u32,
-                file_size: row.get::<_, i64>(9)? as u64,
-                remote_path: row.get::<_, Option<String>>(10)?,
-                remote_name: row.get::<_, Option<String>>(11)?,
-                status: row.get::<_, Option<String>>(12)?,
+                local_path: row.get(2)?,
+                local_name: row.get(3)?,
+                is_directory: row.get::<_, i32>(4)? == 1,
+                version: row.get(5)?,
+                key_version: row.get::<_, i64>(6)? as u32,
+                file_size: row.get::<_, i64>(7)? as u64,
+                remote_path: row.get(8)?,
+                remote_name: row.get(9)?,
+                status: row.get(10)?,
             })
         })?;
 
@@ -128,29 +117,27 @@ impl MappingGenerator {
         let conn = self.record_manager.get_conn_for_export()?;
         
         let mut stmt = conn.prepare(
-            "SELECT config_id, encrypted_name, original_path, original_name,
-                    local_path, local_name, is_directory, version, key_version, file_size,
+            "SELECT config_id, encrypted_name, local_path, local_name,
+                    is_directory, version, key_version, file_size,
                     remote_path, remote_name, status
              FROM encryption_snapshots
              WHERE config_id = ?1 AND status = 'completed'
-             ORDER BY original_path, original_name"
+             ORDER BY local_path, local_name"
         )?;
 
         let rows = stmt.query_map([config_id], |row| {
             Ok(MappingRecord {
                 config_id: row.get(0)?,
                 encrypted_name: row.get(1)?,
-                original_path: row.get(2)?,
-                original_name: row.get(3)?,
-                local_path: row.get(4)?,
-                local_name: row.get(5)?,
-                is_directory: row.get::<_, i32>(6)? == 1,
-                version: row.get(7)?,
-                key_version: row.get::<_, i64>(8)? as u32,
-                file_size: row.get::<_, i64>(9)? as u64,
-                remote_path: row.get::<_, Option<String>>(10)?,
-                remote_name: row.get::<_, Option<String>>(11)?,
-                status: row.get::<_, Option<String>>(12)?,
+                local_path: row.get(2)?,
+                local_name: row.get(3)?,
+                is_directory: row.get::<_, i32>(4)? == 1,
+                version: row.get(5)?,
+                key_version: row.get::<_, i64>(6)? as u32,
+                file_size: row.get::<_, i64>(7)? as u64,
+                remote_path: row.get(8)?,
+                remote_name: row.get(9)?,
+                status: row.get(10)?,
             })
         })?;
 
@@ -263,8 +250,6 @@ mod tests {
         // 添加测试快照
         let snapshot = EncryptionSnapshot {
             config_id: "test-config".to_string(),
-            original_path: "/documents".to_string(),
-            original_name: "test.txt".to_string(),
             local_path: "/local/documents/test.txt".to_string(),
             local_name: "test.txt".to_string(),
             encrypted_name: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age".to_string(),
@@ -284,7 +269,7 @@ mod tests {
         assert_eq!(mapping.records.len(), 1);
         let record = &mapping.records[0];
         assert_eq!(record.config_id, "test-config");
-        assert_eq!(record.original_name, "test.txt");
+        assert_eq!(record.local_name, "test.txt");
         assert_eq!(record.encrypted_name, "a1b2c3d4-e5f6-7890-abcd-ef1234567890.age");
         assert_eq!(record.key_version, 1);
         assert!(!record.is_directory);
@@ -295,17 +280,15 @@ mod tests {
         let record = MappingRecord {
             config_id: "config-1".to_string(),
             encrypted_name: "uuid.age".to_string(),
-            original_path: "/path".to_string(),
-            original_name: "file.txt".to_string(),
             local_path: "/local/path/file.txt".to_string(),
             local_name: "file.txt".to_string(),
             is_directory: false,
             version: 1,
             key_version: 1,
             file_size: 1024,
-            remote_path: Some("/remote/path".to_string()),
-            remote_name: Some("uuid.age".to_string()),
-            status: Some("completed".to_string()),
+            remote_path: "/remote/path".to_string(),
+            remote_name: "uuid.age".to_string(),
+            status: "completed".to_string(),
         };
 
         let json = serde_json::to_string(&record).unwrap();

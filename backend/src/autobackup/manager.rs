@@ -83,7 +83,7 @@ fn normalize_snapshot_path(path: &str) -> String {
 /// 扫描阶段一次加载的加密映射索引。
 ///
 /// 映射表中的同名文件可能位于不同目录，因此索引先按本地文件名收窄
-/// 候选集合，再用原始目录/远端路径做最终消歧。索引只保存快照下标，避免
+/// 候选集合，再用完整本地路径/远端路径做最终消歧。索引只保存快照下标，避免
 /// 为每个文件再次复制完整的映射对象。
 struct EncryptionSnapshotIndex<'a> {
     by_name: HashMap<&'a str, Vec<usize>>,
@@ -97,12 +97,6 @@ impl<'a> EncryptionSnapshotIndex<'a> {
                 .entry(snapshot.local_name.as_str())
                 .or_default()
                 .push(index);
-            if snapshot.original_name != snapshot.local_name {
-                by_name
-                    .entry(snapshot.original_name.as_str())
-                    .or_default()
-                    .push(index);
-            }
         }
         Self { by_name }
     }
@@ -119,17 +113,7 @@ impl<'a> EncryptionSnapshotIndex<'a> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let local_relative_dir = file_task
-            .local_path
-            .strip_prefix(&config.local_path)
-            .ok()
-            .and_then(|relative| relative.parent())
-            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        let expected_remote_parent = std::path::Path::new(&file_task.remote_path)
-            .parent()
-            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
+        let local_path = file_task.local_path.to_string_lossy();
         let previous_remote_path = previous.map(|file| file.remote_path.as_str());
 
         let candidates = self.by_name.get(file_name)?;
@@ -141,84 +125,11 @@ impl<'a> EncryptionSnapshotIndex<'a> {
                     && (previous_remote_path
                         .map(|path| snapshot.remote_path == path)
                         .unwrap_or(false)
-                        || normalize_snapshot_path(&snapshot.original_path)
-                            == normalize_snapshot_path(&local_relative_dir)
-                        || normalize_snapshot_path(&snapshot.original_path)
-                            == normalize_snapshot_path(&expected_remote_parent))
+                        || normalize_snapshot_path(&snapshot.local_path)
+                            == normalize_snapshot_path(&local_path))
             })
             .cloned()
     }
-}
-
-/// 用当前备份配置把旧快照中的逻辑路径补齐为完整本地路径。
-///
-/// 旧表没有 local_path/local_name，迁移只能先把 original_path 复制进去；
-/// 对文件快照而言，远端路径和配置根目录足以恢复相对目录，因此第一次
-/// 全量扫描时把这些历史行也升级成完整映射，后续重启即可直接复用。
-fn hydrate_snapshot_local_metadata(
-    config: &BackupConfig,
-    snapshots: &mut [EncryptionSnapshot],
-) -> Vec<EncryptionSnapshot> {
-    let remote_root = config.remote_path.trim_end_matches('/');
-    let mut updates = Vec::new();
-
-    for snapshot in snapshots {
-        let old_local_path = snapshot.local_path.clone();
-        let old_local_name = snapshot.local_name.clone();
-        let old_remote_name = snapshot.remote_name.clone();
-
-        if snapshot.local_name.is_empty() {
-            snapshot.local_name = snapshot.original_name.clone();
-        }
-        if snapshot.remote_name.is_empty() {
-            snapshot.remote_name = snapshot
-                .remote_path
-                .replace('\\', "/")
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(&snapshot.encrypted_name)
-                .to_string();
-        }
-
-        // 迁移后的 local_path == original_path 是旧记录的标记；这时可用
-        // remote_path 相对当前 config.remote_path 的目录恢复本地完整路径。
-        if snapshot.local_path.is_empty() || snapshot.local_path == snapshot.original_path {
-            let normalized_remote = snapshot.remote_path.replace('\\', "/");
-            let remote_parent = normalized_remote
-                .rsplit_once('/')
-                .map(|(parent, _)| parent)
-                .unwrap_or("");
-            let relative_parent = if remote_path_is_under_root(remote_parent, remote_root) {
-                remote_parent
-                    .strip_prefix(remote_root)
-                    .unwrap_or("")
-                    .trim_start_matches('/')
-                    .to_string()
-            } else if let Ok(relative) = Path::new(&snapshot.original_path)
-                .strip_prefix(&config.local_path)
-            {
-                relative.to_string_lossy().replace('\\', "/")
-            } else {
-                normalize_snapshot_path(&snapshot.original_path)
-            };
-
-            let local_path = config
-                .local_path
-                .join(relative_parent)
-                .join(&snapshot.local_name);
-            snapshot.local_path = local_path.to_string_lossy().replace('\\', "/");
-        }
-
-        if snapshot.local_path != old_local_path
-            || snapshot.local_name != old_local_name
-            || snapshot.remote_name != old_remote_name
-        {
-            updates.push(snapshot.clone());
-        }
-    }
-
-    updates
 }
 
 #[derive(Debug, Clone)]
@@ -8143,10 +8054,8 @@ impl AutoBackupManager {
 
         // 创建快照（状态为 pending，上传完成后标记 completed）
         let local_path = file_task.local_path.to_string_lossy().replace('\\', "/");
-        self.snapshot_manager.create_snapshot_with_local_path(
+        self.snapshot_manager.create_snapshot(
             &config.id,
-            &relative_path,
-            file_name,
             &local_path,
             &encrypted_name,
             file_task.file_size,
@@ -8396,12 +8305,12 @@ impl AutoBackupManager {
         match snapshot_info {
             Some(info) => {
                 // 有快照信息，可以恢复原始文件名和路径
-                let original_path = local_save_dir.join(&info.original_name);
+                let original_path = local_save_dir.join(&info.local_name);
                 let temp_download_path = self.temp_dir.join(remote_file_name);
 
                 Ok(PrepareDecryptedDownloadResult {
                     is_encrypted: true,
-                    original_name: Some(info.original_name.clone()),
+                    original_name: Some(info.local_name.clone()),
                     original_path: Some(original_path),
                     temp_download_path: Some(temp_download_path),
                     snapshot_info: Some(info),
@@ -8751,33 +8660,7 @@ impl AutoBackupManager {
 
     // ==================== 扫描与增量合并方法 ====================
 
-    /// 用本地原始文件名查询加密混淆表，解析出远端真实 `.age` 路径。
-    ///
-    /// 加密文件的远端名称不是本地文件名，不能拿本地期望路径直接和 ls
-    /// 结果比较。历史记录中 original_path 既可能是本地相对目录，也可能是
-    /// 创建上传任务时保存的明文远端父目录；如果已有清单行，则优先用它的
-    /// remote_path 与映射表精确关联。
-    #[allow(dead_code)]
-    fn find_encrypted_snapshot_for_file(
-        &self,
-        config: &BackupConfig,
-        file_task: &BackupFileTask,
-        previous: Option<&BackupFileTask>,
-    ) -> Result<Option<EncryptionSnapshot>> {
-        let snapshots = self.record_manager.find_file_snapshots_by_config(&config.id)?;
-        let index = EncryptionSnapshotIndex::new(&snapshots);
-        Ok(self.match_encrypted_snapshot_for_file_index(
-            config,
-            file_task,
-            previous,
-            &index,
-            &snapshots,
-        ))
-    }
-
     /// 在已经批量加载的映射集合中完成本地文件到远端密文的消歧。
-    ///
-    /// 这是兼容调用方的入口；文件夹扫描主链会复用同一个索引。
     fn match_encrypted_snapshot_for_file_index(
         &self,
         config: &BackupConfig,
@@ -8794,10 +8677,10 @@ impl AutoBackupManager {
         let matched = index.find(config, file_task, previous, snapshots);
         if let Some(ref snapshot) = matched {
             tracing::debug!(
-                "通过加密映射表解析远端文件: config={}, local_name={}, original_path={}, encrypted_name={}, remote_path={}",
+                "通过加密映射表解析远端文件: config={}, local_path={}, local_name={}, encrypted_name={}, remote_path={}",
                 config.id,
+                file_task.local_path.display(),
                 file_name,
-                snapshot.original_path,
                 snapshot.encrypted_name,
                 snapshot.remote_path
             );
@@ -8834,16 +8717,8 @@ impl AutoBackupManager {
                 crate::encryption::EncryptionService::is_encrypted_filename(name)
                     .then(|| name.to_string())
             })?;
-        let original_path = std::path::Path::new(&file_task.remote_path)
-            .parent()
-            .map(|parent| parent.to_string_lossy().replace('\\', "/"))
-            .filter(|parent| !parent.is_empty())
-            .unwrap_or_else(|| config.remote_path.trim_end_matches('/').to_string());
-
         Some(EncryptionSnapshot {
             config_id: config.id.clone(),
-            original_path,
-            original_name: local_name.clone(),
             local_path: file_task.local_path.to_string_lossy().replace('\\', "/"),
             local_name,
             encrypted_name: remote_name.clone(),
@@ -8990,25 +8865,11 @@ impl AutoBackupManager {
         // 上传窗口补槽位时直接复用 backup_file_tasks 中已经保存的 encrypted_name
         // 和 remote_path，不再触碰 encryption_snapshots。
         let snapshot_load_started = Instant::now();
-        let mut encrypted_snapshots = if config.encrypt_enabled {
+        let encrypted_snapshots = if config.encrypt_enabled {
             self.record_manager.find_file_snapshots_by_config(&config.id)?
         } else {
             Vec::new()
         };
-        let hydrated_snapshot_updates = if config.encrypt_enabled {
-            hydrate_snapshot_local_metadata(config, &mut encrypted_snapshots)
-        } else {
-            Vec::new()
-        };
-        if !hydrated_snapshot_updates.is_empty() {
-            let hydrated_count = hydrated_snapshot_updates.len();
-            self.record_manager.add_snapshots_batch(&hydrated_snapshot_updates)?;
-            tracing::info!(
-                config_id = %config.id,
-                mapping_hydrated_count = hydrated_count,
-                "自动备份历史加密映射已补齐本地路径"
-            );
-        }
         let snapshot_index = EncryptionSnapshotIndex::new(&encrypted_snapshots);
         tracing::info!(
             config_id = %config.id,
@@ -9249,10 +9110,6 @@ impl AutoBackupManager {
 
                     snapshot_updates.push(EncryptionSnapshot {
                         config_id: config.id.clone(),
-                        // 保持与历史上传记录兼容：original_path 使用远端父路径，
-                        // 同时 local_path 保存真实本地完整路径。
-                        original_path: remote_parent,
-                        original_name: local_name.clone(),
                         local_path: file_task.local_path.to_string_lossy().replace('\\', "/"),
                         local_name,
                         encrypted_name: encrypted_name.clone(),
@@ -11303,7 +11160,7 @@ impl AutoBackupManager {
 
         for part in &path_parts {
             if EncryptionService::is_encrypted_folder_name(part) {
-                match record_manager.find_original_folder_name(part)? {
+                match record_manager.find_local_folder_name(part)? {
                     Some(original_name) => {
                         original_parts.push(original_name.clone());
                         current_parent = format!("{}/{}", current_parent, part);
@@ -11439,7 +11296,7 @@ impl AutoBackupManager {
         for part in &path_parts {
             if EncryptionService::is_encrypted_folder_name(part) {
                 // 查找原始文件夹名
-                match self.record_manager.find_original_folder_name(part)? {
+                match self.record_manager.find_local_folder_name(part)? {
                     Some(original_name) => {
                         original_parts.push(original_name.clone());
                         current_parent = format!("{}/{}", current_parent, part);
@@ -11674,39 +11531,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_hydrate_legacy_snapshot_local_path() {
-        let temp = tempdir().unwrap();
-        let config = race_test_config(temp.path());
-        let mut snapshots = vec![EncryptionSnapshot {
-            config_id: config.id.clone(),
-            original_path: "/race/docs".to_string(),
-            original_name: "report.txt".to_string(),
-            local_path: "/race/docs".to_string(),
-            local_name: "report.txt".to_string(),
-            encrypted_name: "report.age".to_string(),
-            file_size: 12,
-            version: 1,
-            key_version: 1,
-            remote_path: "/race/docs/report.age".to_string(),
-            remote_name: "report.age".to_string(),
-            is_directory: false,
-            status: "completed".to_string(),
-        }];
-
-        let updates = hydrate_snapshot_local_metadata(&config, &mut snapshots);
-        assert_eq!(updates.len(), 1);
-        assert_eq!(
-            snapshots[0].local_path,
-            config
-                .local_path
-                .join("docs/report.txt")
-                .to_string_lossy()
-                .replace('\\', "/")
-        );
-        assert_eq!(updates[0].remote_name, "report.age");
-    }
-
     #[tokio::test]
     async fn test_encrypted_reconciliation_resolves_remote_path_from_snapshot() {
         let temp = tempdir().unwrap();
@@ -11737,8 +11561,6 @@ mod tests {
         record_manager
             .add_snapshot(&EncryptionSnapshot {
                 config_id: config.id.clone(),
-                original_path: "/race".to_string(),
-                original_name: "same-name.txt".to_string(),
                 local_path: local_path.to_string_lossy().to_string(),
                 local_name: "same-name.txt".to_string(),
                 encrypted_name: "random-name.age".to_string(),
@@ -11755,8 +11577,6 @@ mod tests {
         record_manager
             .add_snapshot(&EncryptionSnapshot {
                 config_id: "other-config".to_string(),
-                original_path: "/race".to_string(),
-                original_name: "same-name.txt".to_string(),
                 local_path: local_path.to_string_lossy().to_string(),
                 local_name: "same-name.txt".to_string(),
                 encrypted_name: "other-name.age".to_string(),
@@ -11771,18 +11591,28 @@ mod tests {
             .unwrap();
 
         let file_task = encrypted_file_task(&config, local_path.clone());
+        let snapshots = record_manager
+            .find_file_snapshots_by_config(&config.id)
+            .unwrap();
+        let snapshot_index = EncryptionSnapshotIndex::new(&snapshots);
         let snapshot = manager
-            .find_encrypted_snapshot_for_file(&config, &file_task, None)
-            .unwrap()
+            .match_encrypted_snapshot_for_file_index(
+                &config,
+                &file_task,
+                None,
+                &snapshot_index,
+                &snapshots,
+            )
             .expect("应通过本地文件名和配置解析加密映射");
         assert_eq!(snapshot.remote_path, "/race/random-name.age");
         assert_ne!(snapshot.remote_path, file_task.remote_path);
 
         let invalid_snapshot = EncryptionSnapshot {
             config_id: config.id.clone(),
-            original_path: String::new(),
-            original_name: "same-name.txt".to_string(),
-            local_path: local_path.to_string_lossy().to_string(),
+            local_path: root
+                .join("other/same-name.txt")
+                .to_string_lossy()
+                .to_string(),
             local_name: "same-name.txt".to_string(),
             encrypted_name: "outside.age".to_string(),
             file_size: 4,
@@ -11794,9 +11624,18 @@ mod tests {
             status: "completed".to_string(),
         };
         record_manager.add_snapshot(&invalid_snapshot).unwrap();
+        let snapshots = record_manager
+            .find_file_snapshots_by_config(&config.id)
+            .unwrap();
+        let snapshot_index = EncryptionSnapshotIndex::new(&snapshots);
         let snapshot = manager
-            .find_encrypted_snapshot_for_file(&config, &file_task, None)
-            .unwrap()
+            .match_encrypted_snapshot_for_file_index(
+                &config,
+                &file_task,
+                None,
+                &snapshot_index,
+                &snapshots,
+            )
             .expect("根目录内的有效映射仍应可用");
         assert_eq!(snapshot.remote_path, "/race/random-name.age");
 

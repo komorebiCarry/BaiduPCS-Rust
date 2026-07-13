@@ -2183,9 +2183,9 @@ impl ChunkScheduler {
             if let Ok(Some(snapshot_info)) = snapshot_mgr.find_by_encrypted_name(filename) {
                 info!(
                     "找到加密文件映射: {} -> {}",
-                    filename, snapshot_info.original_name
+                    filename, snapshot_info.local_name
                 );
-                return parent.join(&snapshot_info.original_name);
+                return parent.join(&snapshot_info.local_name);
             }
         }
 
