@@ -5,7 +5,7 @@ use crate::downloader::{
     SpeedCalculator, UrlHealthManager,
 };
 use crate::persistence::PersistenceManager;
-use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
+use crate::server::events::{DownloadEvent, TaskEvent};
 use crate::server::websocket::WebSocketManager;
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -198,10 +198,6 @@ pub struct TaskScheduleInfo {
     /// WebSocket 管理器引用
     pub ws_manager: Option<Arc<WebSocketManager>>,
 
-    // 🔥 进度事件节流器（200ms 间隔，避免事件风暴）
-    /// 任务级进度节流器，多个分片共享
-    pub progress_throttler: Arc<ProgressThrottler>,
-
     // 🔥 文件夹进度通知发送器（由子任务进度变化触发）
     /// 可选，仅文件夹子任务需要
     pub folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
@@ -384,6 +380,7 @@ impl ChunkScheduler {
 
         // 启动全局调度循环
         scheduler.start_scheduling();
+        scheduler.start_speed_refresh_loop();
 
         scheduler
     }
@@ -470,6 +467,9 @@ impl ChunkScheduler {
     pub async fn register_task(&self, mut task_info: TaskScheduleInfo) -> Result<()> {
         let task_id = task_info.task_id.clone();
 
+        // 在任何分片开始写入前建立累计字节基线，避免首批数据造成速度尖峰。
+        task_info.speed_calc.lock().await.refresh();
+
         // 🔥 如果是备份任务，注入调度器的 backup_notification_tx
         {
             let t = task_info.task.lock().await;
@@ -495,6 +495,106 @@ impl ChunkScheduler {
             active_count
         );
         Ok(())
+    }
+
+    /// 每 500ms 统一刷新活跃任务的速度和进度事件。
+    ///
+    /// 数据接收路径只负责累计字节；固定频率采样避免高吞吐时产生事件风暴，
+    /// 也确保无新数据时空闲时间仍会进入速度窗口。
+    fn start_speed_refresh_loop(&self) {
+        const REFRESH_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+
+        let active_tasks = self.active_tasks.clone();
+        let scheduler_running = self.scheduler_running.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            while scheduler_running.load(Ordering::SeqCst) {
+                interval.tick().await;
+                let mut folder_notifications = HashMap::new();
+
+                let tasks: Vec<TaskScheduleInfo> = {
+                    let tasks = active_tasks.read().await;
+                    tasks.values().cloned().collect()
+                };
+
+                for task_info in tasks {
+                    let progress_snapshot = {
+                        let mut task = task_info.task.lock().await;
+                        if task.status != crate::downloader::TaskStatus::Downloading {
+                            task.speed = 0;
+                            None
+                        } else {
+                            // 与下载回调保持 task -> speed_calc 的加锁顺序。
+                            let speed = task_info.speed_calc.lock().await.refresh();
+                            task.speed = speed;
+                            Some((
+                                task.downloaded_size,
+                                task.total_size,
+                                speed,
+                                task.group_id.clone(),
+                                task.is_backup,
+                                task.owner_uid.raw(),
+                            ))
+                        }
+                    };
+
+                    let Some((downloaded_size, total_size, speed, group_id, is_backup, owner_uid)) =
+                        progress_snapshot
+                    else {
+                        continue;
+                    };
+
+                    if !is_backup {
+                        if let Some(ws) = task_info.ws_manager.as_ref() {
+                            let progress = if total_size > 0 {
+                                (downloaded_size as f64 / total_size as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            ws.send_if_subscribed(
+                                TaskEvent::Download(DownloadEvent::Progress {
+                                    task_id: task_info.task_id.clone(),
+                                    downloaded_size,
+                                    total_size,
+                                    speed,
+                                    progress,
+                                    group_id: group_id.clone(),
+                                    is_backup,
+                                    owner_uid: Some(owner_uid),
+                                }),
+                                group_id.clone(),
+                            );
+                        }
+                    }
+
+                    if let Some(group_id) = group_id {
+                        if let Some(tx) = task_info.folder_progress_tx.as_ref() {
+                            folder_notifications
+                                .entry(group_id)
+                                .or_insert_with(|| tx.clone());
+                        }
+                    }
+
+                    if is_backup {
+                        if let Some(tx) = task_info.backup_notification_tx.as_ref() {
+                            let _ = tx.send(BackupTransferNotification::Progress {
+                                task_id: task_info.task_id.clone(),
+                                task_type: TransferTaskType::Download,
+                                transferred_bytes: downloaded_size,
+                                total_bytes: total_size,
+                            });
+                        }
+                    }
+                }
+
+                for (group_id, tx) in folder_notifications {
+                    let _ = tx.send(group_id);
+                }
+            }
+        });
     }
 
     /// 取消任务
@@ -1054,7 +1154,7 @@ impl ChunkScheduler {
             // 每次调度时从共享引用读取最新客户端（代理热更新后自动生效）
             let client = task_info.client.read().unwrap().clone();
 
-            // 调用 DownloadEngine 的下载方法（传入事件总线和节流器）
+            // 调用 DownloadEngine 的下载方法；进度事件由任务级定时采样循环统一发布。
             let result = DownloadEngine::download_chunk_with_retry(
                 chunk_index,
                 client,
@@ -1066,14 +1166,8 @@ impl ChunkScheduler {
                 task_info.speed_calc.clone(),
                 task_info.task.clone(),
                 task_info.chunk_size,
-                task_info.total_size,
                 task_info.cancellation_token.clone(),
                 slot_id, // 传递槽位ID
-                task_info.ws_manager.clone(),
-                Some(task_info.progress_throttler.clone()),
-                task_id.clone(),
-                task_info.folder_progress_tx.clone(), // 🔥 文件夹进度通知发送器
-                task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
                 Some(task_info.slot_touch_throttler.clone()), // 🔥 任务级共享槽位刷新节流器
                 task_info.max_retries, // 🔥 链接级重试次数（从配置读取）
                 task_info.fallback_mgr.clone(), // 🔥 代理故障回退管理器

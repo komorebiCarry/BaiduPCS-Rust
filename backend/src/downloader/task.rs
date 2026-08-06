@@ -326,16 +326,23 @@ impl DownloadTask {
 
     /// 估算剩余时间 (秒)
     pub fn eta(&self) -> Option<u64> {
-        if self.speed == 0 || self.downloaded_size >= self.total_size {
+        if self.total_size == 0 {
+            return None;
+        }
+        if self.downloaded_size >= self.total_size {
+            return Some(0);
+        }
+        if self.speed == 0 {
             return None;
         }
         let remaining = self.total_size - self.downloaded_size;
-        Some(remaining / self.speed)
+        Some(remaining.div_ceil(self.speed))
     }
 
     /// 标记为下载中
     pub fn mark_downloading(&mut self) {
         self.status = TaskStatus::Downloading;
+        self.speed = 0;
         if self.started_at.is_none() {
             self.started_at = Some(chrono::Utc::now().timestamp());
         }
@@ -344,6 +351,7 @@ impl DownloadTask {
     /// 标记为解密中
     pub fn mark_decrypting(&mut self) {
         self.status = TaskStatus::Decrypting;
+        self.speed = 0;
     }
 
     /// 🔥 失效正在进行的解密协程
@@ -384,17 +392,20 @@ impl DownloadTask {
         self.status = TaskStatus::Completed;
         self.completed_at = Some(chrono::Utc::now().timestamp());
         self.downloaded_size = self.total_size;
+        self.speed = 0;
     }
 
     /// 标记为失败
     pub fn mark_failed(&mut self, error: String) {
         self.status = TaskStatus::Failed;
+        self.speed = 0;
         self.error = Some(error);
     }
 
     /// 标记为暂停
     pub fn mark_paused(&mut self) {
         self.status = TaskStatus::Paused;
+        self.speed = 0;
     }
 }
 
@@ -468,6 +479,14 @@ mod tests {
 
         task.speed = 0;
         assert_eq!(task.eta(), None); // 速度为0，无法估算
+
+        task.downloaded_size = 999;
+        task.speed = 100;
+        assert_eq!(task.eta(), Some(1)); // 不足 1 秒时向上取整
+
+        task.downloaded_size = 1000;
+        task.speed = 0;
+        assert_eq!(task.eta(), Some(0));
     }
 
     #[test]
@@ -483,16 +502,23 @@ mod tests {
         task.mark_downloading();
         assert_eq!(task.status, TaskStatus::Downloading);
         assert!(task.started_at.is_some());
+        assert_eq!(task.speed, 0);
 
+        task.speed = 100;
         task.mark_paused();
         assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.speed, 0);
 
+        task.speed = 100;
         task.mark_failed("Network error".to_string());
         assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.speed, 0);
         assert_eq!(task.error, Some("Network error".to_string()));
 
+        task.speed = 100;
         task.mark_completed();
         assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.speed, 0);
         assert_eq!(task.downloaded_size, task.total_size);
         assert!(task.completed_at.is_some());
     }

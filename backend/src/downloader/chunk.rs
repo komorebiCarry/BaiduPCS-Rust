@@ -236,6 +236,9 @@ impl Chunk {
         let mut total_bytes_downloaded = 0u64;
         let mut pending_progress = 0u64; // 累积的待更新字节数
         const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
+        const PROGRESS_UPDATE_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(500);
+        let mut last_progress_update = std::time::Instant::now();
         // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
         // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
         // 需要对每次stream.next()单独设置超时
@@ -321,12 +324,14 @@ impl Chunk {
             total_bytes_downloaded += chunk_len;
             pending_progress += chunk_len;
 
-            // 🔥 批量更新进度：累积到阈值或下载完成时才回调（大幅减少锁竞争）
+            // 批量更新进度：高速下载按字节阈值刷新，低速下载至少每 500ms 刷新一次。
             if pending_progress >= PROGRESS_UPDATE_THRESHOLD
+                || last_progress_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
                 || total_bytes_downloaded >= remaining
             {
                 progress_callback(pending_progress);
                 pending_progress = 0;
+                last_progress_update = std::time::Instant::now();
             }
         }
 

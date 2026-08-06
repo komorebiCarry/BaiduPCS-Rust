@@ -185,16 +185,20 @@ export function calculateProgress(task: DownloadTask): number {
  * 计算剩余时间（秒）
  */
 export function calculateETA(task: DownloadTask): number | null {
+  if (!Number.isFinite(task.total_size) || task.total_size <= 0 ||
+      !Number.isFinite(task.downloaded_size) || task.downloaded_size < 0) {
+    return null
+  }
   // 已传输完成：remaining=0 → 返回 0（"即将完成"）
   if (task.downloaded_size >= task.total_size) {
     return 0
   }
   // 速度未知（0 B/s）：无法估算 → 返回 null（"计算中"）
-  if (task.speed === 0) {
+  if (!Number.isFinite(task.speed) || task.speed <= 0) {
     return null
   }
   const remaining = task.total_size - task.downloaded_size
-  return Math.floor(remaining / task.speed)
+  return Math.ceil(remaining / task.speed)
 }
 
 

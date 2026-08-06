@@ -1,11 +1,8 @@
 use crate::auth::UserAuth;
-use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
 use crate::common::{ProxyConfig, RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
 use crate::netdisk::NetdiskClient;
-use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
-use crate::server::websocket::WebSocketManager;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::future::join_all;
@@ -16,7 +13,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -1939,8 +1936,32 @@ impl DownloadEngine {
             });
         }
 
+        // 独立下载模式不经过 ChunkScheduler，需要单独刷新空闲时间和任务速度。
+        let speed_refresh_handle = {
+            let task = task.clone();
+            let speed_calc = speed_calc.clone();
+            let cancellation_token = cancellation_token.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => break,
+                        _ = interval.tick() => {
+                            let mut task = task.lock().await;
+                            if task.status != crate::downloader::TaskStatus::Downloading {
+                                task.speed = 0;
+                                continue;
+                            }
+                            task.speed = speed_calc.lock().await.refresh();
+                        }
+                    }
+                }
+            })
+        };
+
         // 10. 并发下载分片（使用全局 Semaphore 和复用的 download_client，使用 URL 健康管理器）
-        self.download_chunks(
+        let download_result = self.download_chunks(
             task.clone(),
             chunk_manager.clone(),
             speed_calc.clone(),
@@ -1949,12 +1970,12 @@ impl DownloadEngine {
             url_health,       // 传递 URL 健康管理器
             &temp_path,       // 使用临时路径
             chunk_size,         // 传递分片大小用于计算超时
-            total_size,         // 传递文件总大小用于计算延迟
             referer.as_deref(), // 传递 Referer 头（如果存在）
             cancellation_token, // 传递取消令牌
         )
-            .await
-            .context("下载分片失败")?;
+            .await;
+        speed_refresh_handle.abort();
+        download_result.context("下载分片失败")?;
 
         // 11. 校验临时文件大小
         self.verify_file_size(&temp_path, total_size)
@@ -2834,7 +2855,6 @@ impl DownloadEngine {
     /// # 参数
     /// * `client` - 复用的 HTTP 客户端（确保所有分片使用同一个 client）
     /// * `chunk_size` - 分片大小（用于计算超时）
-    /// * `total_size` - 文件总大小（用于判断是否大文件，调整延迟）
     /// * `referer` - Referer 头（如果存在），用于 Range 请求避免 403 Forbidden
     /// * `cancellation_token` - 取消令牌（用于中断下载）
     async fn download_chunks(
@@ -2847,7 +2867,6 @@ impl DownloadEngine {
         url_health: Arc<Mutex<UrlHealthManager>>,
         output_path: &Path,
         chunk_size: u64,
-        total_size: u64,
         referer: Option<&str>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
@@ -2951,14 +2970,8 @@ impl DownloadEngine {
                     speed_calc.clone(),
                     task.clone(),
                     timeout_secs,
-                    total_size,
                     cancellation_token,
                     "usize".parse()?,
-                    None, // ws_manager（独立模式不需要）
-                    None, // progress_throttler（独立模式不需要）
-                    String::new(), // task_id（独立模式不需要）
-                    None, // folder_progress_tx（独立模式不需要）
-                    None, // backup_notification_tx（独立模式不需要）
                     None, // slot_touch_throttler（独立模式不需要）
                     3,    // max_retries（独立模式使用默认值）
                     None, // fallback_mgr（独立模式不需要）
@@ -3057,14 +3070,8 @@ impl DownloadEngine {
     /// * `speed_calc` - 速度计算器
     /// * `task` - 下载任务
     /// * `chunk_size` - 分片大小（用于动态计算超时）
-    /// * `total_size` - 文件总大小（用于探测恢复链接）
     /// * `cancellation_token` - 取消令牌（用于中断下载）
     /// * `chunk_thread_id` - 分片线程ID（用于日志）
-    /// * `ws_manager` - WebSocket 管理器（可选，用于发布进度事件）
-    /// * `progress_throttler` - 进度节流器（可选，200ms 间隔）
-    /// * `task_id` - 任务 ID（用于进度事件）
-    /// * `folder_progress_tx` - 文件夹进度通知发送器（可选，仅文件夹子任务需要）
-    /// * `backup_notification_tx` - 备份任务统一通知发送器（可选，仅备份任务需要）
     #[allow(clippy::too_many_arguments)]
     pub async fn download_chunk_with_retry(
         chunk_index: usize,
@@ -3077,14 +3084,8 @@ impl DownloadEngine {
         speed_calc: Arc<Mutex<SpeedCalculator>>,
         task: Arc<Mutex<DownloadTask>>,
         chunk_size: u64,
-        total_size: u64,
         cancellation_token: CancellationToken,
         chunk_thread_id: usize,
-        ws_manager: Option<Arc<WebSocketManager>>,
-        progress_throttler: Option<Arc<ProgressThrottler>>,
-        task_id: String,
-        folder_progress_tx: Option<mpsc::UnboundedSender<String>>,
-        backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
         slot_touch_throttler: Option<Arc<crate::task_slot_pool::SlotTouchThrottler>>,
         max_retries: u32,
         fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
@@ -3202,97 +3203,36 @@ impl DownloadEngine {
             };
             let bytes_before = chunk.bytes_downloaded;
 
-            // 创建进度回调闭包（实时更新任务进度和速度，发布带节流的进度事件）
+            // 创建进度回调闭包（累计任务进度和速度样本）。
+            // 速度计算与事件推送由 ChunkScheduler 的 500ms 定时循环统一执行。
             let task_clone = task.clone();
             let speed_calc_clone = speed_calc.clone();
-            let ws_manager_clone = ws_manager.clone();
-            let throttler_clone = progress_throttler.clone();
-            let task_id_clone = task_id.clone();
-            let total_size_clone = total_size;
-            let folder_progress_tx_clone = folder_progress_tx.clone();
-            let backup_notification_tx_clone = backup_notification_tx.clone();
             // 🔥 使用任务级共享槽位刷新节流器（由调用方传入，所有分片共享同一实例）
             let slot_touch_throttler_clone = slot_touch_throttler.clone();
             let progress_callback = move |bytes: u64| {
                 // 使用 tokio::task::block_in_place 在同步闭包中执行异步操作
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        // 更新任务已下载大小，并获取 group_id 和 is_backup
-                        // 🔥 同时取出 owner_uid
-                        let (downloaded_size, speed, group_id, is_backup, owner_uid_raw) = {
+                        // 更新任务已下载大小和速度累计值。
+                        {
                             let mut t = task_clone.lock().await;
                             // 🔥 修复：限制 downloaded_size 不超过 total_size，防止断点续传时重复累加
                             let new_size = t.downloaded_size.saturating_add(bytes);
                             t.downloaded_size = std::cmp::min(new_size, t.total_size);
-                            let downloaded = t.downloaded_size;
-
-                            // 更新速度计算器
+                            // 只累计字节；固定频率快照由调度器统一记录。
                             let mut calc = speed_calc_clone.lock().await;
                             calc.add_sample(bytes);
-                            t.speed = calc.speed();
-
-                            (downloaded, t.speed, t.group_id.clone(), t.is_backup, t.owner_uid.raw())
-                        };
-
-                        // 🔧 克隆一个临时变量用于 send
-                        let group_id_for_ws = group_id.clone();
+                            // 独立下载模式没有调度器刷新循环，保留按数据更新的兜底值。
+                            if t.status == crate::downloader::TaskStatus::Downloading {
+                                t.speed = calc.speed();
+                            } else {
+                                t.speed = 0;
+                            }
+                        }
 
                         // 🔥 刷新槽位时间戳（带节流，防止槽位超时释放）
                         if let Some(ref throttler) = slot_touch_throttler_clone {
                             throttler.try_touch().await;
-                        }
-                        // 🔥 发布带节流的进度事件（每 200ms 最多发布一次）
-                        if let Some(ref ws) = ws_manager_clone {
-                            let should_emit = throttler_clone
-                                .as_ref()
-                                .map(|t| t.should_emit())
-                                .unwrap_or(true);
-
-                            if should_emit {
-                                let progress = if total_size_clone > 0 {
-                                    (downloaded_size as f64 / total_size_clone as f64) * 100.0
-                                } else {
-                                    0.0
-                                };
-
-                                // 🔥 如果是文件夹子任务（有 group_id），发送到 download:folder:{group_id} 订阅
-                                if !is_backup {
-                                    ws.send_if_subscribed(
-                                        TaskEvent::Download(DownloadEvent::Progress {
-                                            task_id: task_id_clone.clone(),
-                                            downloaded_size,
-                                            total_size: total_size_clone,
-                                            speed,
-                                            progress,
-                                            group_id: group_id.clone(),
-                                            is_backup,
-
-                                            owner_uid: Some(owner_uid_raw),
-                                        }),
-                                        group_id_for_ws,
-                                    );
-                                }
-
-                                // 🔥 如果是文件夹子任务，通知文件夹管理器发送聚合进度
-                                if let Some(ref group_id) = group_id {
-                                    if let Some(ref tx) = folder_progress_tx_clone {
-                                        let _ = tx.send(group_id.clone());
-                                    }
-                                }
-
-                                // 🔥 如果是备份任务，发送进度通知到 AutoBackupManager
-                                if is_backup {
-                                    if let Some(ref tx) = backup_notification_tx_clone {
-                                        let notification = BackupTransferNotification::Progress {
-                                            task_id: task_id_clone.clone(),
-                                            task_type: TransferTaskType::Download,
-                                            transferred_bytes: downloaded_size,
-                                            total_bytes: total_size_clone,
-                                        };
-                                        let _ = tx.send(notification);
-                                    }
-                                }
-                            }
                         }
                     })
                 });
