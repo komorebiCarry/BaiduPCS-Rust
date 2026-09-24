@@ -494,20 +494,8 @@ async fn main() -> anyhow::Result<()> {
             web_auth::web_auth_middleware,
         ));
 
-    // 🔥 Web 访问认证 API 路由（使用独立的 WebAuthState）
-    let web_auth_routes = Router::new()
-        .route("/login", post(web_auth::login))
-        .route("/refresh", post(web_auth::refresh))
-        .route("/logout", post(web_auth::logout))
-        .route("/status", get(web_auth::status))
-        .route("/config", get(web_auth::get_config))
-        .route("/config", put(web_auth::update_config))
-        .route("/password/set", post(web_auth::set_password))
-        .route("/totp/setup", post(web_auth::totp_setup))
-        .route("/totp/verify", post(web_auth::totp_verify))
-        .route("/totp/disable", post(web_auth::totp_disable))
-        .route("/recovery-codes/regenerate", post(web_auth::regenerate_recovery_codes))
-        .with_state(web_auth_state.clone());
+    // 🔥 Web 访问认证 API 路由（使用独立的 WebAuthState；配置类接口需登录，见 web_auth::routes）
+    let web_auth_routes = web_auth::web_auth_routes(web_auth_state.clone());
 
     // 自动检测前端资源目录
     let frontend_dir = detect_frontend_dir();

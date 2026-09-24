@@ -53,7 +53,7 @@ let refreshSubscribers: Array<(token: string) => void> = []
 /**
  * 获取 Web 认证访问令牌
  */
-function getWebAuthAccessToken(): string | null {
+export function getWebAuthAccessToken(): string | null {
     return localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
 }
 
