@@ -30,12 +30,24 @@
 
         <el-menu-item index="/downloads">
           <el-icon><Download /></el-icon>
-          <template #title>下载管理</template>
+          <span v-if="isCollapse && downloadIndicator" class="menu-icon-badge" :class="{ 'has-failed': downloadIndicator.failed > 0 }">
+            {{ formatBadge(downloadIndicator.remaining) }}
+          </span>
+          <template #title>
+            <span>下载管理</span>
+            <MenuTransferProgress v-if="!isCollapse" :indicator="downloadIndicator" mode="sidebar" />
+          </template>
         </el-menu-item>
 
         <el-menu-item index="/uploads">
           <el-icon><Upload /></el-icon>
-          <template #title>上传管理</template>
+          <span v-if="isCollapse && uploadIndicator" class="menu-icon-badge" :class="{ 'has-failed': uploadIndicator.failed > 0 }">
+            {{ formatBadge(uploadIndicator.remaining) }}
+          </span>
+          <template #title>
+            <span>上传管理</span>
+            <MenuTransferProgress v-if="!isCollapse" :indicator="uploadIndicator" mode="sidebar" />
+          </template>
         </el-menu-item>
 
         <el-menu-item index="/transfers">
@@ -115,11 +127,13 @@
           <el-menu-item index="/downloads">
             <el-icon><Download /></el-icon>
             <span>下载管理</span>
+            <MenuTransferProgress :indicator="downloadIndicator" mode="drawer" />
           </el-menu-item>
 
           <el-menu-item index="/uploads">
             <el-icon><Upload /></el-icon>
             <span>上传管理</span>
+            <MenuTransferProgress :indicator="uploadIndicator" mode="drawer" />
           </el-menu-item>
 
           <el-menu-item index="/transfers">
@@ -226,9 +240,18 @@
           :class="{ active: activeMenu === item.path }"
           @click="navigateTo(item.path)"
       >
-        <el-icon :size="22">
-          <component :is="item.icon" />
-        </el-icon>
+        <span class="tabbar-icon">
+          <el-icon :size="22">
+            <component :is="item.icon" />
+          </el-icon>
+          <span
+              v-if="tabbarIndicator(item.path)"
+              class="tabbar-badge"
+              :class="{ 'has-failed': tabbarIndicator(item.path)!.failed > 0 }"
+          >
+            {{ formatBadge(tabbarIndicator(item.path)!.remaining) }}
+          </span>
+        </span>
         <span class="tabbar-label">{{ item.label }}</span>
       </div>
     </div>
@@ -239,7 +262,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, markRaw } from 'vue'
+import { ref, computed, watch, markRaw, onMounted, onUnmounted } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -247,6 +271,8 @@ import { useWebAuthStore } from '@/stores/webAuth'
 import { useIsMobile } from '@/utils/responsive'
 import UserProfileDialog from '@/components/UserProfileDialog.vue'
 import AccountSwitcher from '@/components/AccountSwitcher.vue'
+import MenuTransferProgress from '@/components/MenuTransferProgress.vue'
+import { useTaskSummaryStore, type TransferIndicator } from '@/stores/taskSummary'
 import {
   FolderOpened,
   Folder,
@@ -270,6 +296,22 @@ const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const webAuthStore = useWebAuthStore()
+const taskSummaryStore = useTaskSummaryStore()
+const { downloadIndicator, uploadIndicator } = storeToRefs(taskSummaryStore)
+
+// 菜单上的上传/下载进度：布局挂载期间持续轮询
+onMounted(() => taskSummaryStore.start())
+onUnmounted(() => taskSummaryStore.stop())
+
+function tabbarIndicator(path: string): TransferIndicator | null {
+  if (path === '/downloads') return downloadIndicator.value
+  if (path === '/uploads') return uploadIndicator.value
+  return null
+}
+
+function formatBadge(n: number): string {
+  return n > 99 ? '99+' : String(n)
+}
 
 // 响应式检测
 const isMobile = useIsMobile()
@@ -445,6 +487,7 @@ watch(
     background: transparent;
 
     :deep(.el-menu-item) {
+      position: relative; // 承载底部进度条 / 折叠态角标
       color: rgba(255, 255, 255, 0.7);
 
       &:hover {
@@ -545,6 +588,7 @@ watch(
     background: transparent;
 
     :deep(.el-menu-item) {
+      position: relative; // 承载底部进度条
       height: 56px;
       line-height: 56px;
       color: rgba(255, 255, 255, 0.7);
@@ -651,7 +695,48 @@ watch(
       font-size: 11px;
       margin-top: 2px;
     }
+
+    .tabbar-icon {
+      position: relative;
+      display: inline-flex;
+    }
   }
+}
+
+// 上传/下载未完成数角标（折叠侧边栏图标 / 移动端底部导航图标）
+.menu-icon-badge,
+.tabbar-badge {
+  position: absolute;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: #409eff;
+  color: white;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-sizing: border-box;
+  pointer-events: none;
+
+  &.has-failed {
+    background: #f56c6c;
+  }
+}
+
+.menu-icon-badge {
+  top: 8px;
+  left: 34px;
+  // 蓝色选中背景上用描边区分
+  box-shadow: 0 0 0 1.5px #304156;
+}
+
+.tabbar-badge {
+  top: -6px;
+  left: 14px;
+  box-shadow: 0 0 0 1.5px white;
 }
 
 // 移动端内容区底部留白（为底部导航栏留空间）

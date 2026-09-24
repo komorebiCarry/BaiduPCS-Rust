@@ -906,16 +906,6 @@ impl FolderDownloadManager {
                     .pending_files
                     .retain(|f| !existing_fs_ids.contains(&f.fs_id));
 
-                // 🔥 issue #156 续：已下完的文件也必须剔除，否则 #156 之前写脏的快照
-                //    恢复后会把它们原样重下一遍（说明见 prune_completed_from_pending）。
-                let pruned = folder.prune_completed_from_pending();
-                if pruned > 0 {
-                    warn!(
-                        "文件夹 {} 恢复时剪掉 {} 个已下完却仍留在 pending 队列的文件（脏快照自愈）",
-                        folder_id, pruned
-                    );
-                }
-
                 // 🔥 只挑选文件，**不从 pending_files 摘除**
                 //
                 // 子任务在真正启动之前是不落盘的（`add_task` / `add_task_paused` 都只往
@@ -2941,6 +2931,17 @@ impl FolderDownloadManager {
         folders.values().cloned().collect()
     }
 
+    /// 只读遍历内存中的全部文件夹下载
+    ///
+    /// 与 `get_all_folders` 不同，不克隆 `FolderDownload`（其 `pending_files`
+    /// 可能有上万条），供菜单进度摘要这类高频轮询使用。
+    pub async fn visit_folders<F: FnMut(&FolderDownload)>(&self, mut f: F) {
+        let folders = self.folders.read().await;
+        for folder in folders.values() {
+            f(folder);
+        }
+    }
+
     /// 🔥 获取归属指定 `backup_config_id`（如 `share-sync:{订阅id}`）的内存文件夹下载
     ///
     /// 供分享同步收集 tree 模式整目录下载产生的文件夹子任务进度。
@@ -3975,10 +3976,10 @@ impl FolderDownloadManager {
     ///
     /// 只在恢复/继续这类低频路径调用（O(pending) 一次），不进补任务热路径。
     async fn reconcile_pending_files(&self, folder_id: &str) {
-        let (owner_uid, pending_before) = {
+        let (owner_uid, pending_before, has_counted) = {
             let folders = self.folders.read().await;
             match folders.get(folder_id) {
-                Some(f) => (f.owner_uid, f.pending_files.len()),
+                Some(f) => (f.owner_uid, f.pending_files.len(), !f.counted_fs_ids.is_empty()),
                 None => return,
             }
         };
@@ -4016,7 +4017,10 @@ impl FolderDownloadManager {
             }
         }
 
-        if covered.is_empty() {
+        // 🔥 covered 为空不代表没事可做：counted_fs_ids 非空时仍要按 fs_id 剪一遍
+        //    （历史库被清理过、或查询失败退化时，covered 会是空的）。
+        //    全新文件夹两者都为空，仍然立即返回，保持"无额外开销"。
+        if covered.is_empty() && !has_counted {
             return;
         }
 
@@ -4031,6 +4035,13 @@ impl FolderDownloadManager {
             folder
                 .pending_files
                 .retain(|pf| !covered.contains(&pf.relative_path));
+
+            // 🔥 issue #156 续：再按 fs_id 剪一遍已下完的文件。
+            //    上面那道按 relative_path 剪，依赖历史库里有该子任务的归档记录；
+            //    历史被清理、或查询失败退化成"只按活跃任务对账"时就兜不住，而
+            //    #156 之前写脏的快照恰恰是 pending 里留着已下完的文件。
+            //    counted_fs_ids 是持久化的、按网盘侧文件身份记的账，正好补这个口子。
+            folder.prune_completed_from_pending();
 
             let pending_after = folder.pending_files.len();
             let removed = pending_before.saturating_sub(pending_after);

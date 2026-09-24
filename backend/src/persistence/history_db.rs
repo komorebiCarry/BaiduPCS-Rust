@@ -766,6 +766,49 @@ impl HistoryDbManager {
         Ok((tasks, total))
     }
 
+    /// 最近已完成的非备份任务：只取 `(task_id, 是否属于文件夹)` 两列
+    ///
+    /// 供菜单进度轮询统计「列表里的已完成任务」：排序和条数与
+    /// `get_task_history_by_type_status_exclude_backup` 取列表时一致，但不读整行。
+    pub fn list_recent_completed_task_ids(
+        &self,
+        task_type: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, bool)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT task_id, group_id IS NOT NULL
+            FROM task_history
+            WHERE task_type = ?1 AND status = 'completed' AND is_backup = 0
+            ORDER BY completed_at DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![task_type, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// 全部文件夹历史的 `(folder_id, status)`
+    ///
+    /// 供菜单进度轮询统计，不读 `pending_files_json` 等大字段。
+    pub fn list_folder_history_statuses(&self) -> Result<Vec<(String, String)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let mut stmt = conn.prepare("SELECT folder_id, status FROM folder_history")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// 按任务类型和状态获取任务历史（排除备份任务）
     ///
     /// # Arguments
@@ -1998,6 +2041,58 @@ mod tests {
         assert_eq!(f.skipped_size, 3_307_595, "跳过字节数必须还原");
         assert_eq!(f.skipped_entries.len(), 2, "跳过明细必须还原");
         assert_eq!(f.skipped_entries[1].relative_path, "子目录/b.doc");
+    }
+
+    /// 菜单进度统计用的轻量查询：已完成、非备份，按类型区分，并标出是否属于文件夹
+    #[test]
+    fn test_list_recent_completed_task_ids() {
+        let dir = TempDir::new().unwrap();
+        let db = HistoryDbManager::new(&dir.path().join("h.db")).unwrap();
+
+        let download = |id: &str| {
+            let mut m = TaskMetadata::new_download(
+                id.into(), 1, "/r".into(), "/l".into(), 10, 10, 1, None, None,
+            );
+            m.mark_completed();
+            m
+        };
+        let mut grouped = download("d-grouped");
+        grouped.group_id = Some("f-1".into());
+        let mut backup = download("d-backup");
+        backup.is_backup = true;
+        let mut failed = download("d-failed");
+        failed.mark_failed();
+        let mut upload = TaskMetadata::new_upload(
+            "u-1".into(), "/l".into(), "/r".into(), 10, 10, 1, None, None,
+        );
+        upload.mark_completed();
+        for m in [download("d-1"), grouped, backup, failed, upload] {
+            db.add_task_to_history(&m).unwrap();
+        }
+
+        let mut ids = db.list_recent_completed_task_ids("download", 500).unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![("d-1".to_string(), false), ("d-grouped".to_string(), true)]
+        );
+        assert_eq!(
+            db.list_recent_completed_task_ids("upload", 500).unwrap(),
+            vec![("u-1".to_string(), false)]
+        );
+        assert_eq!(db.list_recent_completed_task_ids("download", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_folder_history_statuses() {
+        let dir = TempDir::new().unwrap();
+        let db = HistoryDbManager::new(&dir.path().join("h.db")).unwrap();
+        db.add_folder_to_history(&sample_folder()).unwrap();
+
+        assert_eq!(
+            db.list_folder_history_statuses().unwrap(),
+            vec![("f-1".to_string(), "completed".to_string())]
+        );
     }
 
     /// 批量归档路径与单条走的是两段独立 SQL，参数个数同样要守住。

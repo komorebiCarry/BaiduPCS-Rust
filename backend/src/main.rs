@@ -343,6 +343,8 @@ async fn main() -> anyhow::Result<()> {
             "/downloads/folder/:id",
             delete(handlers::cancel_folder_download),
         )
+        // 上传/下载进度摘要（菜单进度轮询）
+        .route("/tasks/summary", get(handlers::get_tasks_summary))
         // 上传API
         .route("/uploads", post(handlers::create_upload))
         .route("/uploads", get(handlers::get_all_uploads))

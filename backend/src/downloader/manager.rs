@@ -5346,6 +5346,17 @@ impl DownloadManager {
         result
     }
 
+    /// 只读遍历内存中的全部任务（含备份任务，由调用方自行过滤）
+    ///
+    /// 供菜单进度摘要这类高频轮询使用：不克隆任务、不查历史库、不排序，
+    /// 回调里只读取需要的字段。
+    pub async fn visit_tasks<F: FnMut(&DownloadTask)>(&self, mut f: F) {
+        let tasks = self.tasks.read().await;
+        for task in tasks.values() {
+            f(&*task.lock().await);
+        }
+    }
+
     /// 获取所有备份任务
     pub async fn get_backup_tasks(&self) -> Vec<DownloadTask> {
         let tasks = self.tasks.read().await;

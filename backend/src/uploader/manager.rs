@@ -2787,6 +2787,17 @@ impl UploadManager {
         tasks
     }
 
+    /// 只读遍历内存中的全部任务（含备份任务，由调用方自行过滤）
+    ///
+    /// 供菜单进度摘要这类高频轮询使用：不克隆任务、不查历史库、不排序。
+    pub async fn visit_tasks<F: FnMut(&UploadTask)>(&self, mut f: F) {
+        // 🔥 先收集 task 的 Arc 快照再释放 DashMap 迭代 guard，避免跨 await 持 shard 锁
+        let task_arcs: Vec<_> = self.tasks.iter().map(|e| e.task.clone()).collect();
+        for task_arc in task_arcs {
+            f(&*task_arc.lock().await);
+        }
+    }
+
     /// 获取所有备份任务
     pub async fn get_backup_tasks(&self) -> Vec<UploadTask> {
         let mut tasks = Vec::new();
