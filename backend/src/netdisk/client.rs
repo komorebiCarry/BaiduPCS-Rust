@@ -1115,6 +1115,82 @@ impl NetdiskClient {
         Ok(search_result)
     }
 
+    /// 搜索「群聊中分享过的文件」。
+    ///
+    /// 官方 PC 客户端把这项能力封装在 `browserengine.dll` 里（Electron 主进程经 FFI 调用），
+    /// 但其内部实际只是发起一个未公开的 HTTP GET 请求：
+    ///
+    /// ```text
+    /// GET https://pan.baidu.com/basembox/group/multisearch
+    ///     ?key_word=<关键词>&type=2&sign=<签名>
+    /// ```
+    ///
+    /// 因此可以脱离 DLL 直接调用，跨平台可用（详见
+    /// `docs/research/netdisk-chat-file-search.md`）。签名算法见
+    /// [`crate::sign::chat_search_sign`]：`base64(hex_md5(SALT + "_" + uk + key_word))`。
+    ///
+    /// # 参数
+    /// * `key_word` - 搜索关键词
+    ///
+    /// # 返回
+    /// 群聊文件搜索结果。注意 `errno`：`2156` 为未搜到结果、`2157` 为签名校验失败，
+    /// 两种情况都会在此处按错误返回（保留原始 errno 于错误信息中）。
+    ///
+    /// 检索范围为**当前账号加入的全部群**（跨群合并、无法限定单群）；结果**一次性返回、
+    /// 无分页**，服务端上限 500 条。命中数请取 `response.result.len()`，
+    /// 而非 `all_num`（后者并非命中数，详见 `ChatSearchResponse` 的字段说明）。
+    pub async fn search_chat_files(
+        &self,
+        key_word: &str,
+    ) -> Result<crate::netdisk::ChatSearchResponse> {
+        info!("搜索群聊文件: key_word={}", key_word);
+
+        let sign = crate::sign::chat_search_sign(self.uid(), key_word);
+        let url = "https://pan.baidu.com/basembox/group/multisearch";
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("key_word", key_word),
+                ("type", "2"),
+                ("sign", sign.as_str()),
+                ("clienttype", "8"),
+            ])
+            .header("Cookie", self.bduss_cookie_header())
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("Failed to search chat files");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let result: crate::netdisk::ChatSearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse chat search response")?;
+
+        if result.errno != 0 {
+            anyhow::bail!("Chat search API error errno={}", result.errno);
+        }
+
+        debug!(
+            "群聊文件搜索返回 {} 个结果（服务端 all_num={}，非命中数）",
+            result.result.len(),
+            result.all_num
+        );
+        Ok(result)
+    }
+
     /// 按完整路径获取文件元信息（fs_id / size / server_mtime / md5 等）。
     ///
     /// 说明：百度开放接口 `xpan/multimedia?method=filemetas` 只支持按 `fsids` 查询，

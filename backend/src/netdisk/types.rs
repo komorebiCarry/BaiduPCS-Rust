@@ -1073,3 +1073,91 @@ pub enum FileOperationOutcome {
         payload: FileOperationErrorPayload,
     },
 }
+
+/// 「群聊文件搜索」响应（`/basembox/group/multisearch`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatSearchResponse {
+    /// 错误码（0 表示成功；2156 未搜到结果；2157 签名校验失败）
+    pub errno: i32,
+
+    /// 服务端返回的 `all_num` 字段。
+    ///
+    /// 注意：该值**不是命中文件数**——实测对任意关键词（含不存在的词）都返回同一数值，
+    /// 疑为「参与检索的群/会话数量」，**请勿用它做计数**，真正的命中数应取 `result.len()`。
+    #[serde(default)]
+    pub all_num: i64,
+
+    /// 结果列表。
+    ///
+    /// 接口**一次性返回全部命中**（跨所有群合并），**无分页**；但服务端**上限 500 条**，
+    /// 因此 `result.len() == 500` 时可能已被截断。
+    #[serde(default)]
+    pub result: Vec<ChatFileItem>,
+}
+
+/// 「群聊文件搜索」命中的单个文件（对应某条群消息里分享的文件）。
+///
+/// 字段名与官方接口返回的 JSON 一致（部分为驼峰），故使用 `rename` 适配。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatFileItem {
+    /// 文件 ID（字符串形式的 fs_id）
+    #[serde(default)]
+    pub fsid: String,
+
+    /// 文件名
+    #[serde(default)]
+    pub server_filename: String,
+
+    /// 文件大小（字节）
+    #[serde(default)]
+    pub size: i64,
+
+    /// 文件 MD5（小写 16 进制字符串）
+    #[serde(default)]
+    pub md5: String,
+
+    /// 是否为目录（0=文件，1=目录）
+    #[serde(default)]
+    pub is_dir: i64,
+
+    /// 文件分类
+    #[serde(default)]
+    pub category: i64,
+
+    /// 文件在分享者网盘中的完整路径（URL 编码）
+    #[serde(default)]
+    pub path: String,
+
+    /// 文件在分享者网盘中的父目录路径（URL 编码）
+    #[serde(default)]
+    pub parent_path: String,
+
+    /// 所在群聊名称
+    #[serde(default)]
+    pub chat_name: String,
+
+    /// 群 ID
+    #[serde(default, rename = "groupId")]
+    pub group_id: String,
+
+    /// 分享该文件的消息 ID（可配合 `shareInfo` 接口使用）
+    #[serde(default, rename = "msgId")]
+    pub msg_id: String,
+
+    /// 分享者（文件所有者）的 uk
+    #[serde(default)]
+    pub uk: String,
+
+    /// 分享者昵称
+    #[serde(default, rename = "displayName")]
+    pub display_name: String,
+
+    /// 带签名的直链（约 8 小时有效）。
+    ///
+    /// 注意下载时的 UA 规则（实测，与直觉相反）：**小文件**用浏览器/客户端 UA 均可，
+    /// 但**大文件（约 ≥60MB）**用浏览器 UA 会在第一跳被 403 拒绝、用客户端 UA 会在 CDN 跳被拒。
+    /// **最稳的组合是「不带 User-Agent」**（仅 Cookie + Referer），且重定向的两跳须使用**同一** UA
+    /// （中途更换会 `sign error`）。详见 `docs/research/netdisk-chat-file-search.md`。
+    #[serde(default)]
+    pub dlink: String,
+}
