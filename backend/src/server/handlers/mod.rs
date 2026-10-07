@@ -15,6 +15,7 @@ pub mod local_files;
 pub mod folder_download;
 pub mod share;
 pub mod share_sync;
+pub mod task_summary;
 pub mod transfer;
 pub mod upload;
 
@@ -34,5 +35,6 @@ pub use share_sync::{
     list_run_items, list_subtasks, preview_tree, resume_subscription, trigger_subscription,
     update_subscription,
 };
+pub use task_summary::get_tasks_summary;
 pub use transfer::*;
 pub use upload::*;

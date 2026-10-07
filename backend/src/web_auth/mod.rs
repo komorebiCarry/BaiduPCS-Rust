@@ -8,6 +8,7 @@ pub mod middleware;
 pub mod password;
 pub mod rate_limiter;
 pub mod recovery;
+pub mod routes;
 pub mod state;
 pub mod store;
 pub mod token;
@@ -27,6 +28,7 @@ pub use rate_limiter::{
     MAX_FAILED_ATTEMPTS, MAX_RECORDS,
 };
 pub use recovery::{RecoveryCodeManager, RECOVERY_CODE_COUNT};
+pub use routes::web_auth_routes;
 pub use state::WebAuthState;
 pub use store::{create_auth_store, create_auth_store_with_path, AuthStore, DEFAULT_AUTH_STORE_PATH};
 pub use token::{

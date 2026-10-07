@@ -3,17 +3,17 @@
 //! 实现 Axum 中间件，用于保护需要认证的 API 端点。
 //!
 //! ## 功能
-//! - 从 Header 或 Cookie 提取 Access Token
+//! - 从 Header、Cookie 或（仅 WebSocket 握手）查询参数提取 Access Token
 //! - 验证令牌有效性
-//! - 认证绕过逻辑（auth 端点、静态资源、健康检查）
 //! - 将认证状态注入请求上下文
 //!
-//! ## 重要说明
-//! 此中间件仅作用于 Web 访问认证，不影响：
-//! - 百度二维码登录轮询
-//! - 下载/上传进度轮询
-//! - WebSocket 实时推送
-//! - 所有其他现有功能
+//! ## 默认拒绝
+//! 中间件只挂在需要保护的路由上（`/api/v1` 下全部业务接口，以及
+//! `/api/v1/web-auth` 下的配置类接口），挂上即要求认证，**没有路径白名单**。
+//! 需要公开的端点（Web 登录/刷新/状态、健康检查、前端静态资源）不挂本中间件。
+//!
+//! 以前用「受保护路径白名单」判断，名单外的路径一律当静态资源放行，
+//! 导致新增的 `/accounts`、`/shares`、`/cloud-dl` 等接口在开启认证后仍可匿名访问。
 
 use crate::web_auth::state::WebAuthState;
 use crate::web_auth::types::{AuthMode, TokenClaims};
@@ -58,68 +58,10 @@ impl AuthErrorResponse {
     }
 }
 
-/// 需要绕过认证的路径前缀
-/// 注意：由于中间件应用在嵌套路由上，路径是相对于 /api/v1 的
-const AUTH_BYPASS_PREFIXES: &[&str] = &[
-    "/web-auth/",  // Web 认证相关端点（相对路径）
-    "/auth/",      // 百度认证相关端点（二维码登录等）
-    "/ws",         // WebSocket 端点
-    // 完整路径（用于非嵌套路由）
-    "/api/v1/web-auth/",
-    "/api/v1/auth/",
-    "/api/v1/ws",
-    "/health",
-];
-
-/// 需要绕过认证的精确路径
-const AUTH_BYPASS_EXACT: &[&str] = &[
-    // 相对路径（用于嵌套路由）
-    "/web-auth/status",
-    "/web-auth/login",
-    "/web-auth/refresh",
-    // 完整路径（用于非嵌套路由）
-    "/api/v1/web-auth/status",
-    "/api/v1/web-auth/login",
-    "/api/v1/web-auth/refresh",
-];
-
-/// 检查路径是否需要绕过认证
-fn should_bypass_auth(path: &str) -> bool {
-    // 检查精确匹配
-    if AUTH_BYPASS_EXACT.contains(&path) {
-        return true;
-    }
-
-    // 检查前缀匹配
-    for prefix in AUTH_BYPASS_PREFIXES {
-        if path.starts_with(prefix) {
-            return true;
-        }
-    }
-
-    // 静态资源（非 API 路径，且不是相对 API 路径）
-    // 相对路径以 / 开头但不以 /api/ 开头
-    if !path.starts_with("/api/") {
-        // 检查是否是嵌套路由的相对路径（以 / 开头的 API 端点）
-        // 这些路径应该需要认证
-        let api_relative_paths = [
-            "/files", "/downloads", "/uploads", "/transfers",
-            "/fs/", "/config", "/autobackup/", "/encryption/",
-            "/system/",
-        ];
-        
-        for api_path in api_relative_paths {
-            if path.starts_with(api_path) {
-                return false;
-            }
-        }
-        
-        // 其他非 API 路径（静态资源）
-        return true;
-    }
-
-    false
-}
+/// WebSocket 握手时携带令牌的查询参数名
+///
+/// 浏览器的 `WebSocket` 构造函数无法设置 Authorization 头，令牌只能放在 URL 里。
+const WS_TOKEN_QUERY_PARAM: &str = "access_token";
 
 /// 从请求中提取 Access Token
 ///
@@ -154,7 +96,29 @@ fn extract_access_token(request: &Request<Body>) -> Option<String> {
         }
     }
 
+    // 3. WebSocket 握手：从查询参数提取
+    //    只对 Upgrade: websocket 请求生效，普通请求不接受 URL 里的令牌（避免进访问日志 / 浏览器历史）
+    if is_websocket_upgrade(request) {
+        if let Some(query) = request.uri().query() {
+            for pair in query.split('&') {
+                if let Some(value) = pair.strip_prefix(&format!("{}=", WS_TOKEN_QUERY_PARAM)) {
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     None
+}
+
+fn is_websocket_upgrade(request: &Request<Body>) -> bool {
+    request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 /// Web 认证中间件
@@ -172,12 +136,6 @@ pub async fn web_auth_middleware(
 ) -> Response {
     let path = request.uri().path();
     let method = request.method().clone();
-
-    // 检查是否需要绕过认证
-    if should_bypass_auth(path) {
-        debug!("Auth bypass for path: {} {}", method, path);
-        return next.run(request).await;
-    }
 
     // 获取当前认证模式
     let auth_mode = state.get_auth_mode().await;
@@ -318,53 +276,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_bypass_auth_exact_paths() {
-        // 相对路径（嵌套路由）
-        assert!(should_bypass_auth("/web-auth/status"));
-        assert!(should_bypass_auth("/web-auth/login"));
-        assert!(should_bypass_auth("/web-auth/refresh"));
-        // 完整路径
-        assert!(should_bypass_auth("/api/v1/web-auth/status"));
-        assert!(should_bypass_auth("/api/v1/web-auth/login"));
-        assert!(should_bypass_auth("/api/v1/web-auth/refresh"));
+    fn test_extract_access_token_from_ws_query() {
+        let request = Request::builder()
+            .uri("/ws?foo=1&access_token=ws_token_789")
+            .header(header::UPGRADE, "websocket")
+            .body(Body::empty())
+            .unwrap();
+
+        assert_eq!(extract_access_token(&request), Some("ws_token_789".to_string()));
     }
 
     #[test]
-    fn test_should_bypass_auth_prefixes() {
-        // 相对路径（嵌套路由）
-        assert!(should_bypass_auth("/web-auth/config"));
-        assert!(should_bypass_auth("/auth/qrcode/generate"));
-        assert!(should_bypass_auth("/auth/qrcode/status"));
-        assert!(should_bypass_auth("/ws"));
-        // 完整路径
-        assert!(should_bypass_auth("/api/v1/web-auth/config"));
-        assert!(should_bypass_auth("/api/v1/auth/qrcode/generate"));
-        assert!(should_bypass_auth("/health"));
-        assert!(should_bypass_auth("/api/v1/ws"));
-    }
+    fn test_query_token_ignored_without_ws_upgrade() {
+        // 普通请求不接受 URL 里的令牌
+        let request = Request::builder()
+            .uri("/accounts/list?access_token=ws_token_789")
+            .body(Body::empty())
+            .unwrap();
 
-    #[test]
-    fn test_should_bypass_auth_static_resources() {
-        assert!(should_bypass_auth("/"));
-        assert!(should_bypass_auth("/index.html"));
-        assert!(should_bypass_auth("/assets/main.js"));
-        assert!(should_bypass_auth("/favicon.ico"));
-    }
-
-    #[test]
-    fn test_should_not_bypass_auth_protected_paths() {
-        // 相对路径（嵌套路由）
-        assert!(!should_bypass_auth("/files"));
-        assert!(!should_bypass_auth("/downloads"));
-        assert!(!should_bypass_auth("/uploads"));
-        assert!(!should_bypass_auth("/config"));
-        assert!(!should_bypass_auth("/autobackup/configs"));
-        // 完整路径
-        assert!(!should_bypass_auth("/api/v1/files"));
-        assert!(!should_bypass_auth("/api/v1/downloads"));
-        assert!(!should_bypass_auth("/api/v1/uploads"));
-        assert!(!should_bypass_auth("/api/v1/config"));
-        assert!(!should_bypass_auth("/api/v1/autobackup/configs"));
+        assert!(extract_access_token(&request).is_none());
     }
 
     #[test]

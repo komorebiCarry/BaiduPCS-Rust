@@ -3,6 +3,7 @@
  * 单例模式管理 WebSocket 连接，提供事件订阅机制
  */
 
+import { getWebAuthAccessToken } from '@/api/client'
 import type {
   WsClientMessage,
   WsServerMessage,
@@ -89,7 +90,11 @@ class WebSocketClient {
     const host = window.location.host
     // 开发环境走 Vite 代理 /ws -> 8080；生产环境同域直连
     const path = isDev ? '/ws/api/v1/ws' : '/api/v1/ws'
-    return `${protocol}//${host}${path}`
+    // 浏览器 WebSocket 无法设置 Authorization 头，Web 认证令牌放在查询参数里；
+    // 每次连接/重连都重新读取，拿到 HTTP 请求刷新后的最新令牌
+    const token = getWebAuthAccessToken()
+    const query = token ? `?access_token=${encodeURIComponent(token)}` : ''
+    return `${protocol}//${host}${path}${query}`
   }
 
   /**
@@ -103,7 +108,8 @@ class WebSocketClient {
 
     this.setConnectionState('connecting')
     const url = this.getWsUrl()
-    console.log('[WS] 正在连接:', url)
+    // 日志里不打印令牌
+    console.log('[WS] 正在连接:', url.split('?')[0])
 
     try {
       this.ws = new WebSocket(url)
