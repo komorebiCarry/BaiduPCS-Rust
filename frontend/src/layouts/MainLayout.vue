@@ -170,9 +170,12 @@
         <!-- 抽屉底部用户信息 -->
         <div class="drawer-footer">
           <div class="drawer-user" @click="handleUserClick">
-            <el-avatar :size="36" :src="userAvatar">
-              <el-icon><User /></el-icon>
-            </el-avatar>
+            <VipAvatar
+                :size="36"
+                :src="userAvatar"
+                :vip-type="authStore.activeAccount?.vip_type"
+                :vip-level="authStore.activeAccount?.vip_level"
+            />
             <span class="drawer-username">{{ username }}</span>
           </div>
           <div class="drawer-logout-buttons">
@@ -271,6 +274,7 @@ import { useWebAuthStore } from '@/stores/webAuth'
 import { useIsMobile } from '@/utils/responsive'
 import UserProfileDialog from '@/components/UserProfileDialog.vue'
 import AccountSwitcher from '@/components/AccountSwitcher.vue'
+import VipAvatar from '@/components/VipAvatar.vue'
 import MenuTransferProgress from '@/components/MenuTransferProgress.vue'
 import { useTaskSummaryStore, type TransferIndicator } from '@/stores/taskSummary'
 import {
@@ -280,7 +284,6 @@ import {
   Download,
   Upload,
   Setting,
-  User,
   SwitchButton,
   Expand,
   Fold,

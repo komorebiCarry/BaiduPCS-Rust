@@ -821,6 +821,12 @@ pub async fn add_account_and_activate(state: &AppState, user: UserAuth) -> anyho
     // Step 5: 推送 BudgetRecomputed（让前端 BudgetPanel 立即看到新账号配额）
     state.broadcast_budget_recomputed().await;
 
+    // Step 6: 后台补齐会员成长等级（登录接口不返回）
+    {
+        let state = state.clone();
+        tokio::spawn(async move { state.refresh_vip_levels().await });
+    }
+
     info!("add_account_and_activate: uid={} 已激活", uid.raw());
     Ok(())
 }

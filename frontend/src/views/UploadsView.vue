@@ -291,11 +291,11 @@ const activeCount = computed(() => {
 })
 
 const completedCount = computed(() => {
-  return uploadItems.value.filter(item => item.status === 'completed').length
+  return displayedItems.value.filter(item => item.status === 'completed').length
 })
 
 const failedCount = computed(() => {
-  return uploadItems.value.filter(item => item.status === 'failed').length
+  return displayedItems.value.filter(item => item.status === 'failed').length
 })
 
 const pausedCount = computed(() => {
@@ -414,6 +414,32 @@ async function handleDelete(item: UploadTask) {
   }
 }
 
+// 按列表中实际出现的归属账号逐个清除（后端 clear 接口按 owner_uid 严格过滤，
+// 不带 uid 时只清活跃账号，跨账号聚合列表下会漏清其他账号的任务）
+async function clearByOwners(status: 'completed' | 'failed', clearFn: (uid?: number) => Promise<number>) {
+  const uids = new Set<number | undefined>()
+  for (const item of displayedItems.value) {
+    if (item.status !== status) continue
+    // 归属缺失的任务交给后端按活跃账号兜底
+    uids.add(typeof item.owner_uid === 'number' && item.owner_uid > 0 ? item.owner_uid : undefined)
+  }
+  let count = 0
+  let failed = 0
+  for (const uid of uids) {
+    try {
+      count += await clearFn(uid)
+    } catch (error) {
+      failed++
+      console.error(`清除任务失败 (uid=${uid ?? 'active'}):`, error)
+    }
+  }
+  if (failed > 0) {
+    ElMessage.warning(`已清除 ${count} 个任务，${failed} 个账号清除失败`)
+  } else {
+    ElMessage.success(`已清除 ${count} 个任务`)
+  }
+}
+
 // 清除已完成
 async function handleClearCompleted() {
   try {
@@ -426,8 +452,7 @@ async function handleClearCompleted() {
           type: 'warning',
         }
     )
-    const count = await clearCompleted()
-    ElMessage.success(`已清除 ${count} 个任务`)
+    await clearByOwners('completed', clearCompleted)
     refreshTasks()
   } catch (error: any) {
     if (error !== 'cancel') {
@@ -448,8 +473,7 @@ async function handleClearFailed() {
           type: 'warning',
         }
     )
-    const count = await clearFailed()
-    ElMessage.success(`已清除 ${count} 个任务`)
+    await clearByOwners('failed', clearFailed)
     refreshTasks()
   } catch (error: any) {
     if (error !== 'cancel') {

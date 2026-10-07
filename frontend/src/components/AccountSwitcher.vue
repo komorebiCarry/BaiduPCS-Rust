@@ -8,13 +8,13 @@
       @command="onCommand"
   >
     <span class="account-switcher__trigger">
-      <el-avatar
+      <VipAvatar
           :src="activeAvatar"
           :size="28"
+          :vip-type="authStore.activeAccount?.vip_type"
+          :vip-level="authStore.activeAccount?.vip_level"
           class="account-switcher__avatar"
-      >
-        <el-icon><UserFilled /></el-icon>
-      </el-avatar>
+      />
       <span class="account-switcher__name">{{ activeName }}</span>
       <el-icon class="account-switcher__caret"><ArrowDown /></el-icon>
     </span>
@@ -36,21 +36,18 @@
             :disabled="acc.uid === authStore.activeUid || switching"
             class="account-switcher__item"
         >
-          <el-avatar
-              :src="acc.avatar_url || ''"
+          <VipAvatar
+              :src="acc.avatar_url"
               :size="24"
+              :vip-type="acc.vip_type"
+              :vip-level="acc.vip_level"
               class="account-switcher__item-avatar"
-          >
-            <el-icon><UserFilled /></el-icon>
-          </el-avatar>
+          />
           <span class="account-switcher__item-name">
             {{ acc.nickname || acc.username }}
           </span>
           <el-tag v-if="acc.uid === authStore.activeUid" size="small" type="primary" effect="plain">
             当前
-          </el-tag>
-          <el-tag v-else-if="acc.vip_type" size="small" type="warning" effect="plain">
-            VIP{{ acc.vip_type }}
           </el-tag>
         </el-dropdown-item>
 
@@ -106,6 +103,7 @@ import {
   Lock,
 } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
+import VipAvatar from '@/components/VipAvatar.vue'
 
 /**
  * Props

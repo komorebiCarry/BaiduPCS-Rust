@@ -9,9 +9,14 @@
     <div class="profile-content">
       <!-- 头像和基本信息 -->
       <div class="profile-header">
-        <el-avatar :size="80" :src="user?.avatar_url">
+        <VipAvatar
+            :size="80"
+            :src="user?.avatar_url"
+            :vip-type="user?.vip_type"
+            :vip-level="vipLevel"
+        >
           <el-icon :size="40"><User /></el-icon>
-        </el-avatar>
+        </VipAvatar>
         <div class="profile-name">
           <h3>{{ user?.nickname || user?.username || '未知用户' }}</h3>
           <el-tag v-if="vipLabel" :type="vipTagType" size="small">
@@ -55,6 +60,8 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useAuthStore } from '@/stores/auth'
+import VipAvatar from '@/components/VipAvatar.vue'
 import { User } from '@element-plus/icons-vue'
 import type { UserAuth } from '@/api/auth'
 
@@ -71,6 +78,12 @@ const visible = computed({
   get: () => props.modelValue,
   set: (val) => emit('update:modelValue', val)
 })
+
+// 会员成长等级只在账号摘要里有（UserAuth 不带）
+const authStore = useAuthStore()
+const vipLevel = computed(() =>
+  authStore.accounts.find((a) => a.uid === props.user?.uid)?.vip_level ?? null
+)
 
 // VIP 标签
 const vipLabel = computed(() => {

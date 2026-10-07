@@ -3955,6 +3955,7 @@ mod tests {
             nickname: Some("测试用户".to_string()),
             avatar_url: Some("https://example.com/avatar.jpg".to_string()),
             vip_type: Some(2),                                // SVIP
+            vip_level: None,
             total_space: Some(2 * 1024 * 1024 * 1024 * 1024), // 2TB
             used_space: Some(500 * 1024 * 1024 * 1024),       // 500GB
             bduss: "mock_bduss".to_string(),

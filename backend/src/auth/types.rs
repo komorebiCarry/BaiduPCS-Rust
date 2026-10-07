@@ -60,6 +60,8 @@ pub struct AccountSummary {
     pub nickname: Option<String>,
     pub avatar_url: Option<String>,
     pub vip_type: Option<u32>,
+    /// 会员成长等级（如 SVIP5 的 5）；未获取到时为 `None`
+    pub vip_level: Option<u32>,
     pub is_active: bool,
     /// 持久化的账号自定义配置
     ///
@@ -82,6 +84,7 @@ impl AccountSummary {
             nickname: user.nickname.clone(),
             avatar_url: user.avatar_url.clone(),
             vip_type: user.vip_type,
+            vip_level: user.vip_level,
             is_active: active_uid == Some(user.uid),
             custom_config: user.custom_config.clone(),
         }
@@ -203,6 +206,12 @@ pub struct UserAuth {
     pub avatar_url: Option<String>,
     /// VIP类型（0=普通用户，1=普通会员，2=超级会员）
     pub vip_type: Option<u32>,
+    /// 会员成长等级（如 SVIP5 的 5）
+    ///
+    /// 登录接口不返回，由 `AppState::refresh_vip_levels` 后台刷新；
+    /// 旧 `accounts.json` 无此字段 → `None`。
+    #[serde(default)]
+    pub vip_level: Option<u32>,
     /// 网盘容量（字节）
     pub total_space: Option<u64>,
     /// 已使用空间（字节）
@@ -246,6 +255,7 @@ impl UserAuth {
             nickname: None,
             avatar_url: None,
             vip_type: None,
+            vip_level: None,
             total_space: None,
             used_space: None,
             bduss,
@@ -280,6 +290,7 @@ impl UserAuth {
             nickname,
             avatar_url,
             vip_type,
+            vip_level: None,
             total_space,
             used_space,
             bduss,

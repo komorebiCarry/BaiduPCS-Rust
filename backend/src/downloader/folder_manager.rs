@@ -5822,6 +5822,7 @@ mod tests {
             nickname: None,
             avatar_url: None,
             vip_type: Some(2),
+            vip_level: None,
             total_space: None,
             used_space: None,
             bduss: "mock_bduss".to_string(),
