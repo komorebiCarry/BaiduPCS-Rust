@@ -111,16 +111,20 @@ export async function deleteDownload(taskId: string, deleteFile: boolean = false
 
 /**
  * 清除已完成的任务
+ *
+ * @param uid 指定归属账号；缺省时后端回退到当前活跃账号
  */
-export async function clearCompleted(): Promise<number> {
-  return apiClient.delete('/downloads/clear/completed')
+export async function clearCompleted(uid?: number): Promise<number> {
+  return apiClient.delete('/downloads/clear/completed', { params: { uid } })
 }
 
 /**
  * 清除失败的任务
+ *
+ * @param uid 指定归属账号；缺省时后端回退到当前活跃账号
  */
-export async function clearFailed(): Promise<number> {
-  return apiClient.delete('/downloads/clear/failed')
+export async function clearFailed(uid?: number): Promise<number> {
+  return apiClient.delete('/downloads/clear/failed', { params: { uid } })
 }
 
 // ============================================
