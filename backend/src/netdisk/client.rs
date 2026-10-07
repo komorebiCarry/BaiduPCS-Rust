@@ -1,7 +1,7 @@
 // 网盘客户端实现
 
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
-use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
+use crate::auth::constants::{API_USER_GETINFO, API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
 use crate::common::ProxyConfig;
 use crate::netdisk::{
@@ -925,6 +925,57 @@ impl NetdiskClient {
                 true
             }
         }
+    }
+
+    /// 获取会员成长等级（如 SVIP5 的 5）
+    ///
+    /// `membership/user/info` 不含等级，这里走 `/api/user/getinfo`（仅需 BDUSS）。
+    pub async fn fetch_vip_level(&self) -> Result<u32> {
+        let user_list = format!("[{}]", self.user_auth.uid);
+        let client_type = CLIENT_TYPE.to_string();
+        let app_id = BAIDU_APP_ID.to_string();
+        let response = self
+            .client
+            .get(API_USER_GETINFO)
+            .query(&[
+                ("user_list", user_list.as_str()),
+                ("need_relation", "0"),
+                ("need_secret_info", "1"),
+                ("clienttype", client_type.as_str()),
+                ("app_id", app_id.as_str()),
+                ("web", "1"),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.user_auth.bduss))
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("Failed to fetch vip level");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let json: Value = response
+            .json()
+            .await
+            .context("Failed to parse vip level response")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(0);
+        if errno != 0 {
+            anyhow::bail!("API error {}: {}", errno, json["errmsg"].as_str().unwrap_or(""));
+        }
+
+        json["records"][0]["vip_level"]
+            .as_u64()
+            .map(|l| l as u32)
+            .context("vip_level missing in getinfo response")
     }
 
     /// 获取用户UID

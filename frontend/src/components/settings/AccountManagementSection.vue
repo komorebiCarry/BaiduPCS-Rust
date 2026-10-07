@@ -30,9 +30,12 @@
       <el-table-column label="账号" min-width="220">
         <template #default="{ row }">
           <div class="account-cell">
-            <el-avatar :src="row.avatar_url || ''" :size="32">
-              <el-icon><UserFilled /></el-icon>
-            </el-avatar>
+            <VipAvatar
+                :src="row.avatar_url"
+                :size="32"
+                :vip-type="row.vip_type"
+                :vip-level="row.vip_level"
+            />
             <div class="account-cell__info">
               <span class="account-cell__name">
                 {{ row.nickname || row.username }}
@@ -47,8 +50,8 @@
 
       <el-table-column label="会员" width="120">
         <template #default="{ row }">
-          <el-tag v-if="row.vip_type" type="warning" effect="plain" size="small">
-            VIP{{ row.vip_type }}
+          <el-tag v-if="row.vip_type" :type="row.vip_type === 2 ? 'primary' : 'warning'" effect="plain" size="small">
+            {{ vipLabel(row.vip_type, row.vip_level) }}
           </el-tag>
           <span v-else class="account-cell__sub">普通用户</span>
         </template>
@@ -124,6 +127,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, UserFilled, Refresh } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import type { AccountSummary } from '@/api/accounts'
+import VipAvatar from '@/components/VipAvatar.vue'
+import { vipLabel } from '@/utils/vip'
 
 const router = useRouter()
 const authStore = useAuthStore()

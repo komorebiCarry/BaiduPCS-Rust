@@ -542,6 +542,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("ClientPool 预热出现非致命错误: {}", e);
     }
 
+    // 会员成长等级刷新：启动后一次，之后每 6 小时一次
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                ticker.tick().await;
+                state.refresh_vip_levels().await;
+            }
+        });
+    }
+
     // 构建完整应用
     let app = Router::new()
         .nest("/api/v1", api_routes)

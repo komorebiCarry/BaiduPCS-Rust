@@ -69,6 +69,8 @@ export interface AccountSummary {
   nickname: string | null
   avatar_url: string | null
   vip_type: number | null
+  /** 会员成长等级（如 SVIP5 的 5）；后端后台刷新，旧后端 / 未刷新到时缺失 */
+  vip_level?: number | null
   is_active: boolean
   /**
    * 持久化的账号自定义配置。

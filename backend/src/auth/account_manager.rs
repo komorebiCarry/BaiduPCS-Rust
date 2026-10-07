@@ -202,6 +202,11 @@ impl AccountManager {
     pub async fn add_user(&mut self, user: UserAuth) -> Result<()> {
         let uid = user.uid;
         if let Some(existing) = self.data.users.iter_mut().find(|u| u.uid == uid) {
+            // 登录接口不返回 vip_level；重新登录 / 用旧快照回写时保留已刷新到的等级
+            let mut user = user;
+            if user.vip_level.is_none() {
+                user.vip_level = existing.vip_level;
+            }
             *existing = user;
             info!("AccountManager: 更新已有账号 uid={uid}");
         } else {
@@ -248,6 +253,22 @@ impl AccountManager {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+
+    /// 更新指定用户的会员成长等级。
+    ///
+    /// 返回 `Ok(true)` 表示等级有变化并已持久化；`uid` 不存在或等级未变返回 `Ok(false)`。
+    pub async fn update_user_vip_level(&mut self, uid: Uid, vip_level: u32) -> Result<bool> {
+        let raw = uid.raw();
+        match self.data.users.iter_mut().find(|u| u.uid == raw) {
+            Some(user) if user.vip_level != Some(vip_level) => {
+                user.vip_level = Some(vip_level);
+                info!("AccountManager: 更新 vip_level uid={raw} level={vip_level}");
+                self.save().await?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 

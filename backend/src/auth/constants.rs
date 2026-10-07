@@ -32,6 +32,9 @@ pub const API_QRCODE_LOGIN: &str = "https://passport.baidu.com/v3/login/main/qrb
 /// 网盘用户信息接口
 pub const API_USER_INFO: &str = "https://pan.baidu.com/rest/2.0/membership/user/info";
 
+/// 网盘用户资料接口（records[].vip_level 为会员成长等级，仅需 BDUSS）
+pub const API_USER_GETINFO: &str = "https://pan.baidu.com/api/user/getinfo";
+
 /// 网盘配额接口（获取空间使用情况）
 pub const API_QUOTA: &str = "https://pan.baidu.com/api/quota";
 

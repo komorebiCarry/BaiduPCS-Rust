@@ -36,6 +36,7 @@ import {
 import { getConfig } from '@/api/config'
 import { getWebSocketClient } from '@/utils/websocket'
 import type { AccountSummary } from '@/api/accounts'
+import VipAvatar from '@/components/VipAvatar.vue'
 import type { BudgetEvent } from '@/types/events'
 
 const budgetStore = useBudgetStore()
@@ -888,9 +889,14 @@ defineExpose({ refresh: refreshSnapshot })
         >
           <!-- 账号头部 -->
           <div class="account-header">
-            <el-avatar :src="ui.account.avatar_url ?? undefined" :size="32">
+            <VipAvatar
+                :src="ui.account.avatar_url"
+                :size="32"
+                :vip-type="ui.account.vip_type"
+                :vip-level="ui.account.vip_level"
+            >
               {{ (ui.account.nickname || ui.account.username || '?').charAt(0) }}
-            </el-avatar>
+            </VipAvatar>
             <div class="account-id">
               <span class="account-name">
                 {{ ui.account.nickname || ui.account.username }}

@@ -2718,6 +2718,45 @@ impl AppState {
         self.ws_manager.broadcast(WsServerMessage::budget(event));
     }
 
+    /// 刷新所有账号的会员成长等级（`vip_level`）。
+    ///
+    /// 登录接口只给会员类型不给等级，这里逐账号查 `/api/user/getinfo` 回写
+    /// `accounts.json`；有变化时广播 `ListChanged` 让前端头像角标即时更新。
+    /// 单账号失败仅记 warn，不影响其它账号。
+    pub async fn refresh_vip_levels(&self) {
+        let uids: Vec<Uid> = {
+            let mgr = self.account_manager.lock().await;
+            mgr.list_users().iter().map(|u| Uid::new(u.uid)).collect()
+        };
+
+        let mut changed = false;
+        for uid in uids {
+            // 刚登录的账号可能尚未注入池，懒加载兜底
+            if let Err(e) = self.ensure_client_for_uid(uid).await {
+                warn!("获取 vip_level 跳过: uid={}, err={}", uid.raw(), e);
+                continue;
+            }
+            let client = match self.client_pool.read().await.get_client(uid) {
+                Some(c) => c,
+                None => continue,
+            };
+            match client.fetch_vip_level().await {
+                Ok(level) => {
+                    let mut mgr = self.account_manager.lock().await;
+                    match mgr.update_user_vip_level(uid, level).await {
+                        Ok(c) => changed |= c,
+                        Err(e) => warn!("保存 vip_level 失败: uid={}, err={}", uid.raw(), e),
+                    }
+                }
+                Err(e) => warn!("获取 vip_level 失败: uid={}, err={}", uid.raw(), e),
+            }
+        }
+
+        if changed {
+            crate::server::broadcast_account_list_changed(self).await;
+        }
+    }
+
     /// 多账号 ClientPool 预热
     ///
     /// **职责**：为所有"非活跃"账号构造 `NetdiskClient` 并注入 `ClientPool`。
