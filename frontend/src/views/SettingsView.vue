@@ -433,6 +433,16 @@
                       选择"转存后自动下载"时，会根据下载配置决定是否弹出文件选择器
                     </div>
                   </el-form-item>
+
+                  <el-form-item label="网盘临时目录">
+                    <el-button :loading="cleaningTempDirs" @click="openTempCleanupDialog">
+                      清理残留临时目录
+                    </el-button>
+                    <div class="form-tip">
+                      分享直下 / 分享同步（仅同步到本地）会先把文件转存到网盘临时目录再下载，任务中断时可能留下残留、占用网盘空间。
+                      只清理当前账号网盘中没有任务在用的目录。
+                    </div>
+                  </el-form-item>
                 </el-card>
 
                 <!-- 分享同步 -->
@@ -968,6 +978,39 @@
         @confirm="handleDirConfirm"
     />
 
+    <!-- 清理残留临时目录对话框 -->
+    <el-dialog
+        v-model="tempCleanupDialogVisible"
+        title="清理残留临时目录"
+        :width="isMobile ? '92%' : '480px'"
+        :close-on-click-modal="!cleaningTempDirs"
+        :show-close="!cleaningTempDirs"
+    >
+      <p class="temp-cleanup-desc">
+        将删除当前账号网盘临时目录中、已经没有任何转存或下载任务在用的残留目录。删除的文件会进入网盘回收站，清空回收站后才会释放空间。
+      </p>
+      <el-checkbox v-model="tempCleanupIncludeForeign" :disabled="cleaningTempDirs">
+        同时清理其他实例留下的目录
+      </el-checkbox>
+      <el-alert
+          v-if="tempCleanupIncludeForeign"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-top: 12px"
+      >
+        <template #title>
+          同一个百度账号同时登录在多个实例上时，会删掉其他实例正在使用的目录。仅在确认没有其他实例在运行时勾选（例如容器重建前遗留的目录）。
+        </template>
+      </el-alert>
+      <template #footer>
+        <el-button :disabled="cleaningTempDirs" @click="tempCleanupDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="cleaningTempDirs" @click="handleCleanupTempDirs">
+          开始清理
+        </el-button>
+      </template>
+    </el-dialog>
+
     <!-- 密钥显示对话框 -->
     <el-dialog v-model="showKeyDialog" title="加密密钥" width="450px" :close-on-click-modal="false">
       <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 16px">
@@ -1040,6 +1083,7 @@ import {
   QuestionFilled,
 } from '@element-plus/icons-vue'
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
+import { cleanupOrphanedTempDirs } from '@/api/transfer'
 import {
   getEncryptionStatus,
   generateEncryptionKey,
@@ -1293,6 +1337,51 @@ async function loadConfig() {
   } finally {
     loading.value = false
     nextTick(() => initSectionObserver())
+  }
+}
+
+// ==================== 清理残留临时目录 ====================
+const tempCleanupDialogVisible = ref(false)
+const tempCleanupIncludeForeign = ref(false)
+const cleaningTempDirs = ref(false)
+
+function openTempCleanupDialog() {
+  tempCleanupIncludeForeign.value = false
+  tempCleanupDialogVisible.value = true
+}
+
+async function handleCleanupTempDirs() {
+  cleaningTempDirs.value = true
+  try {
+    const result = await cleanupOrphanedTempDirs(tempCleanupIncludeForeign.value)
+    const parts = [`已清理 ${result.deleted_count} 个残留目录`]
+    if (result.failed_paths.length > 0) {
+      parts.push(`${result.failed_paths.length} 个清理失败，可稍后重试`)
+    }
+    if (result.foreign_namespace_skipped > 0) {
+      parts.push(`另有 ${result.foreign_namespace_skipped} 组其他实例的目录未清理，如确认不再使用可勾选"同时清理其他实例留下的目录"`)
+    }
+    const message = parts.join('；')
+    if (result.failed_paths.length > 0 || result.foreign_namespace_skipped > 0) {
+      ElMessage.warning({ message, duration: 8000 })
+    } else {
+      ElMessage.success(message)
+    }
+    tempCleanupDialogVisible.value = false
+  } catch (error: any) {
+    if (error && typeof error.code === 'number') {
+      // 业务错误（code≠0）拦截器不弹提示，这里统一提示
+      ElMessage.error('清理失败: ' + (error.message || '未知错误'))
+    } else {
+      // 网络错误 / 超时：拦截器已提示过错误本身。残留很多时清理可能超过请求超时，
+      // 但后端仍会在后台继续完成，提示用户稍后再看，避免反复点击
+      ElMessage.info({
+        message: '若残留目录较多，清理可能仍在后台进行，请过几分钟再点一次确认是否已清理完',
+        duration: 8000,
+      })
+    }
+  } finally {
+    cleaningTempDirs.value = false
   }
 }
 
@@ -1766,6 +1855,12 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+.temp-cleanup-desc {
+  margin: 0 0 12px;
+  color: var(--el-text-color-regular);
+  line-height: 1.6;
+}
+
 .settings-container {
   width: 100%;
   height: 100%;

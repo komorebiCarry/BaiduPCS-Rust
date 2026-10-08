@@ -201,6 +201,9 @@ impl AppState {
         // 加载配置
         let config = AppConfig::load_or_default("config/app.toml").await;
 
+        // 分享直下临时目录按实例分命名空间（issue #162），必须在任何转存任务创建前确定
+        crate::transfer::temp_cleanup::init_instance_id(std::path::Path::new("config"));
+
         // ───── 迁移前完整备份（P0）─────
         // 必须在**任何会写 DB / 改名 / 回写的初始化之前**完成。否则：
         //   - `PersistenceManager::new()` → `HistoryDbManager::init_tables()` 会先跑
@@ -848,8 +851,17 @@ impl AppState {
             )
                 .await;
 
+            // 恢复完成后才允许孤儿临时目录清理：之前任务表不全，白名单会漏
+            crate::transfer::temp_cleanup::mark_recovery_done();
+
             // 🔥 启动时清理孤立临时目录（如果配置启用）
             transfer_manager_arc.cleanup_orphaned_on_startup_if_enabled().await;
+
+            // 分享直下孤儿临时目录周期清理（只动本实例命名空间）
+            self.start_orphan_temp_sweep_loop();
+
+            // 分享同步 / 分享直下已结束任务的内存回收
+            self.start_finished_task_reclaim_loop();
         }
 
         // 🔥 启动 WebSocket 批量发送器
@@ -891,6 +903,153 @@ impl AppState {
         self.init_share_sync_manager().await;
 
         Ok(())
+    }
+
+    /// 启动分享直下孤儿临时目录周期清理（进程内只启动一次）
+    ///
+    /// 每 10 分钟检查一次是否到期，周期取 `share_direct_download.orphan_sweep_interval_hours`
+    /// （0 = 关闭），改配置无需重启。对每个已注册账号的 TransferManager 各跑一遍，
+    /// 每个账号只列自己网盘、只删本实例命名空间里的孤立目录。
+    fn start_orphan_temp_sweep_loop(&self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let transfer_managers = Arc::clone(&self.transfer_managers);
+        let config = Arc::clone(&self.config);
+        tokio::spawn(async move {
+            const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+            let mut last_run = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+
+                let hours = config
+                    .read()
+                    .await
+                    .share_direct_download
+                    .orphan_sweep_interval_hours;
+                if hours == 0 {
+                    continue;
+                }
+                let interval = std::time::Duration::from_secs(hours.saturating_mul(3600));
+                if last_run.elapsed() < interval {
+                    continue;
+                }
+                last_run = tokio::time::Instant::now();
+
+                let managers: Vec<(Uid, Arc<TransferManager>)> = transfer_managers
+                    .iter()
+                    .map(|e| (*e.key(), Arc::clone(e.value())))
+                    .collect();
+                for (uid, tm) in managers {
+                    let Some(result) = tm.sweep_own_namespace_orphans().await else {
+                        continue;
+                    };
+                    if result.deleted_count > 0 || result.error.is_some() {
+                        info!(
+                            "孤儿临时目录周期清理: uid={}, 删除={}, 失败={}, error={:?}",
+                            uid.raw(),
+                            result.deleted_count,
+                            result.failed_paths.len(),
+                            result.error
+                        );
+                    }
+                    if result.foreign_namespace_skipped > 0 {
+                        warn!(
+                            "孤儿临时目录周期清理: uid={} 发现 {} 组其他实例的临时目录，自动清理不会处理。                             如果是容器重建前遗留的，可在「设置 → 转存配置 → 清理残留临时目录」勾选                             「同时清理其他实例留下的目录」手动清理；并建议挂载 /app/config，                             避免重建容器后实例 id 变化",
+                            uid.raw(),
+                            result.foreign_namespace_skipped
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// 启动已结束内部任务的内存回收（进程内只启动一次）
+    ///
+    /// 以下对象用户在界面上看不到、也删不掉，结束后除了失败重试 / 删除订阅之外没有
+    /// 任何移除点，会一直留在内存里：
+    /// - 分享同步的内部转存任务（`TransferManager`）；
+    /// - 分享同步的文件夹下载（`FolderDownloadManager`，backup_config_id=`share-sync:*`）；
+    /// - 转存监听已不在时的已完成分享直下下载任务（`DownloadManager`）。
+    ///
+    /// 每 10 分钟扫一次，候选**持续可回收满 1 小时**才移出内存（见 `ReclaimTracker`）：
+    /// 留给仍在轮询它们的调用方足够时间，也不短于孤儿临时目录清理对已结束任务的
+    /// 1 小时保护期（移出内存后那层保护就没了）。只移出内存，不动持久化 / 历史记录。
+    fn start_finished_task_reclaim_loop(&self) {
+        use crate::common::reclaim_tracker::ReclaimTracker;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+        const TTL: std::time::Duration = std::time::Duration::from_secs(
+            crate::transfer::temp_cleanup::TERMINAL_GRACE_SECS as u64,
+        );
+
+        let transfer_managers = Arc::clone(&self.transfer_managers);
+        let download_managers = Arc::clone(&self.download_managers);
+        let folder_download_manager = Arc::clone(&self.folder_download_manager);
+        tokio::spawn(async move {
+            let mut transfer_trackers: HashMap<Uid, ReclaimTracker> = HashMap::new();
+            let mut download_trackers: HashMap<Uid, ReclaimTracker> = HashMap::new();
+            let mut folder_tracker = ReclaimTracker::new();
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+                let now = std::time::Instant::now();
+
+                let tms: Vec<(Uid, Arc<TransferManager>)> = transfer_managers
+                    .iter()
+                    .map(|e| (*e.key(), Arc::clone(e.value())))
+                    .collect();
+                transfer_trackers.retain(|uid, _| tms.iter().any(|(u, _)| u == uid));
+                for (uid, tm) in tms {
+                    let candidates = tm.finished_internal_task_candidates().await;
+                    let due = transfer_trackers.entry(uid).or_default().due(candidates, now, TTL);
+                    let removed = tm.evict_finished_internal_tasks(&due).await;
+                    if removed > 0 {
+                        info!(
+                            "内存回收: uid={} 移出已结束的分享同步内部转存任务 {} 个",
+                            uid.raw(),
+                            removed
+                        );
+                    }
+                }
+
+                let dms: Vec<(Uid, Arc<DownloadManager>)> = download_managers
+                    .iter()
+                    .map(|e| (*e.key(), Arc::clone(e.value())))
+                    .collect();
+                download_trackers.retain(|uid, _| dms.iter().any(|(u, _)| u == uid));
+                for (uid, dm) in dms {
+                    let candidates = dm.completed_share_direct_task_candidates().await;
+                    let due = download_trackers.entry(uid).or_default().due(candidates, now, TTL);
+                    let removed = dm.evict_completed_share_direct_tasks(&due).await;
+                    if removed > 0 {
+                        info!(
+                            "内存回收: uid={} 移出已完成的分享直下下载任务 {} 个",
+                            uid.raw(),
+                            removed
+                        );
+                    }
+                }
+
+                let candidates = folder_download_manager.completed_share_sync_folder_candidates().await;
+                let due = folder_tracker.due(candidates, now, TTL);
+                let removed = folder_download_manager
+                    .evict_completed_share_sync_folders(&due)
+                    .await;
+                if removed > 0 {
+                    info!("内存回收: 移出已完成的分享同步文件夹下载 {} 个", removed);
+                }
+            }
+        });
     }
 
     /// 🔥 恢复持久化的任务

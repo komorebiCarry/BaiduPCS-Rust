@@ -1640,17 +1640,35 @@ impl ShareSyncManager {
         // 转存段一起看：卡在 `checkingshare` / `transferring` 的孤儿转存同样该收。
         // （前提是 `is_terminal_subtask_status` 认得 `transferred` —— 那是纯网盘腿的
         // 正常终点，漏判的话每轮都会被误认成有残留。）
-        let residual: Vec<String> = collect_share_sync_subtasks(&transfer, id, owner_uid)
+        let cfg_id = share_sync_backup_config_id(id);
+        let mut residual: Vec<String> = collect_share_sync_subtasks(&transfer, id, owner_uid)
             .await
             .into_iter()
             .filter(|s| !is_terminal_subtask_status(&s.status))
             .map(|s| format!("{}:{}({})", s.kind, s.name, s.status))
             .collect();
+        // `collect_share_sync_subtasks` 的转存段走 `get_all_tasks`，而它为「转存管理」
+        // 列表隐藏了内部任务 —— 转存段在那里永远是空的。展示链路沿用现状，这里单独
+        // 直接查内存里的内部转存任务，否则卡在转存阶段的孤儿任务（连同它的临时目录）
+        // 永远收不走。
+        residual.extend(
+            transfer
+                .get_internal_tasks_by_backup_config(&cfg_id)
+                .await
+                .into_iter()
+                .filter(|t| !t.status.is_terminal())
+                .map(|t| {
+                    format!(
+                        "transfer:{}({:?})",
+                        t.file_name.unwrap_or_else(|| basename_of(&t.save_path)),
+                        t.status
+                    )
+                }),
+        );
         if residual.is_empty() {
             return;
         }
 
-        let cfg_id = share_sync_backup_config_id(id);
         let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
         warn!(
             "share-sync: 订阅 {} 本轮开始前清理上一轮残留子任务 {} 个（转存内存={}, 历史={}）: {}",

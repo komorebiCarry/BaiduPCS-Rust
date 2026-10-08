@@ -4,6 +4,7 @@
 
 pub mod manager;
 pub mod task;
+pub mod temp_cleanup;
 pub mod types;
 
 pub use manager::TransferManager;

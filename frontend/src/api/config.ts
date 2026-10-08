@@ -152,6 +152,8 @@ export interface ShareDirectDownloadConfig {
   auto_cleanup?: boolean
   cleanup_on_failure?: boolean
   cleanup_orphaned_on_startup?: boolean
+  /// 自动清理孤立临时目录的周期（小时），0 表示关闭
+  orphan_sweep_interval_hours?: number
 }
 
 /// CDN 刷新配置

@@ -475,6 +475,16 @@ pub struct ShareDirectDownloadConfig {
     /// 默认: false（避免误删用户数据）
     #[serde(default = "default_share_direct_cleanup_orphaned_on_startup")]
     pub cleanup_orphaned_on_startup: bool,
+
+    /// 自动清理孤立临时目录的周期（小时），0 表示关闭
+    ///
+    /// 只清理本实例命名空间（`{temp_dir}/inst-{实例id}/`）下、创建超过 6 小时、
+    /// 且不被任何未结束的转存 / 下载任务引用的目录；旧版本平铺的目录和其他实例的
+    /// 目录不会被自动清理。`auto_cleanup` 或 `cleanup_on_failure` 关闭时（想保留
+    /// 临时文件）自动清理不执行。
+    /// 默认: 6
+    #[serde(default = "default_share_direct_orphan_sweep_interval_hours")]
+    pub orphan_sweep_interval_hours: u64,
 }
 
 // 分享直下配置默认值函数
@@ -492,6 +502,10 @@ fn default_share_direct_cleanup_on_failure() -> bool {
 
 fn default_share_direct_cleanup_orphaned_on_startup() -> bool {
     false
+}
+
+fn default_share_direct_orphan_sweep_interval_hours() -> u64 {
+    6
 }
 
 impl ShareDirectDownloadConfig {
@@ -530,6 +544,7 @@ impl Default for ShareDirectDownloadConfig {
             auto_cleanup: default_share_direct_auto_cleanup(),
             cleanup_on_failure: default_share_direct_cleanup_on_failure(),
             cleanup_orphaned_on_startup: default_share_direct_cleanup_orphaned_on_startup(),
+            orphan_sweep_interval_hours: default_share_direct_orphan_sweep_interval_hours(),
         }
     }
 }
@@ -1846,6 +1861,16 @@ mod tests {
         assert!(config.auto_cleanup);
         assert!(config.cleanup_on_failure);
         assert!(!config.cleanup_orphaned_on_startup);
+        assert_eq!(config.orphan_sweep_interval_hours, 6);
+    }
+
+    #[test]
+    fn test_share_direct_download_config_missing_sweep_interval_defaults() {
+        // 旧配置文件没有 orphan_sweep_interval_hours 字段时取默认值
+        let config: ShareDirectDownloadConfig =
+            toml::from_str("temp_dir = \"/.bpr_share_temp/\"
+").unwrap();
+        assert_eq!(config.orphan_sweep_interval_hours, 6);
     }
 
     #[test]
@@ -1856,6 +1881,7 @@ mod tests {
             auto_cleanup: false,
             cleanup_on_failure: false,
             cleanup_orphaned_on_startup: true,
+            orphan_sweep_interval_hours: 0,
         };
 
         // 序列化为 TOML
@@ -1868,6 +1894,7 @@ mod tests {
         assert!(!deserialized.auto_cleanup);
         assert!(!deserialized.cleanup_on_failure);
         assert!(deserialized.cleanup_orphaned_on_startup);
+        assert_eq!(deserialized.orphan_sweep_interval_hours, 0);
     }
 
     #[test]

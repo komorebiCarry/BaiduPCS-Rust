@@ -9,6 +9,7 @@ use crate::persistence::{
 use crate::server::events::{TaskEvent, TransferEvent};
 use crate::server::websocket::WebSocketManager;
 use crate::transfer::task::{TransferStatus, TransferTask};
+use crate::transfer::temp_cleanup;
 use crate::transfer::types::{BatchGroupInfo, CleanupResult, CleanupStatus, ShareLink, SharePageInfo, SharedFileInfo, TransferResult};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -49,6 +50,9 @@ pub struct TransferManager {
     /// per-uid manager 创建后由 setter 注入或在 `new` 时传入。
     /// 所有 TransferTask 创建点都会链调 .with_owner_uid(self.owner_uid)。
     owner_uid: crate::auth::Uid,
+    /// 孤儿临时目录清理互斥锁：手动清理可能跑很久（前端超时后用户再点一次）、
+    /// 还会与周期清理撞上，并发跑只会成倍发删除请求、更容易触发 errno=132 风控
+    orphan_sweep_lock: Arc<Mutex<()>>,
 }
 
 /// 创建转存任务请求
@@ -159,6 +163,7 @@ impl TransferManager {
             ws_manager: Arc::new(RwLock::new(None)),
             // 多账号：初始为 Uid(0)、由 set_owner_uid 注入
             owner_uid: crate::auth::Uid::default(),
+            orphan_sweep_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -425,8 +430,11 @@ impl TransferManager {
             let task_uuid = uuid::Uuid::new_v4().to_string();
             let app_cfg = self.app_config.read().await;
             let temp_dir_base = &app_cfg.share_direct_download.temp_dir;
-            // 确保临时目录路径格式正确：{config.temp_dir}{uuid}/
-            let temp_dir = format!("{}/{}/", temp_dir_base.trim_end_matches('/'), task_uuid);
+            // 临时目录：{config.temp_dir}/inst-{实例id}/{uuid}/（实例 id 不可用时退回
+            // {config.temp_dir}/{uuid}/）。按实例分命名空间，自动孤儿清理只动自己的目录。
+            let namespace = temp_cleanup::own_namespace();
+            let temp_dir =
+                temp_cleanup::build_task_temp_dir(temp_dir_base, namespace.as_deref(), &task_uuid);
             info!("分享直下模式: 临时目录={}", temp_dir);
 
             // 分享直下强制自动下载
@@ -2256,12 +2264,43 @@ impl TransferManager {
         // 检查是否有任何下载任务创建成功
         if download_task_ids.is_empty() && folder_download_ids.is_empty() {
             warn!("没有下载任务创建成功");
-            let mut t = task.write().await;
-            t.mark_transferred(); // 标记为已转存，虽然没有文件需要下载
+            let temp_dir = {
+                let mut t = task.write().await;
+                t.mark_transferred(); // 标记为已转存，虽然没有文件需要下载
+                t.temp_dir.clone()
+            };
+
+            // 分享直下：文件已转存进临时目录，但不会再有下载任务去读它（全部因本地已存在
+            // 被跳过，或下载任务创建失败）。此时不清理，这个目录就再也没人管了（issue #162）。
+            let mut cleanup_status = None;
+            if is_share_direct_download {
+                let (auto_cleanup, configured_root) = {
+                    let cfg = app_config.read().await;
+                    (
+                        cfg.share_direct_download.auto_cleanup,
+                        cfg.share_direct_download.temp_dir.clone(),
+                    )
+                };
+                if auto_cleanup {
+                    if let Some(ref temp_dir) = temp_dir {
+                        info!("无下载任务，清理临时目录: task_id={}, temp_dir={}", task_id, temp_dir);
+                        let client = _client.read().unwrap().clone();
+                        let cleanup = Self::cleanup_temp_dir_internal(&client, temp_dir, &configured_root).await;
+                        info!("无下载任务清理结果: task_id={}, status={:?}", task_id, cleanup.status);
+                        cleanup_status = Some(cleanup.status);
+                    }
+                }
+            }
 
             // 无下载任务也要将转存状态标记为完成（持久化）
             if let Some(ref pm_arc) = persistence_manager {
                 let pm = pm_arc.lock().await;
+
+                if let Some(cs) = cleanup_status {
+                    if let Err(e) = pm.update_cleanup_status(task_id, cs) {
+                        warn!("持久化清理状态失败: task_id={}, error={}", task_id, e);
+                    }
+                }
 
                 if let Err(e) = pm.update_transfer_status(task_id, "completed") {
                     warn!("更新转存任务状态为完成失败: {}", e);
@@ -2673,19 +2712,6 @@ impl TransferManager {
                                         );
                                     }
 
-                                    // 🔥 清理完成后，移除分享直下的下载任务
-                                    let dm_lock = download_manager.read().await;
-                                    if let Some(ref dm) = *dm_lock {
-                                        for download_task_id in &download_task_ids {
-                                            // 跳过文件夹下载任务（以 folder: 开头）
-                                            if download_task_id.starts_with("folder:") {
-                                                continue;
-                                            }
-                                            if let Err(e) = dm.remove_share_direct_download_task(download_task_id).await {
-                                                warn!("移除分享直下下载任务失败: {}, error={}", download_task_id, e);
-                                            }
-                                        }
-                                    }
                                 } else {
                                     // 不自动清理，直接标记为完成
                                     let old_status;
@@ -2717,6 +2743,23 @@ impl TransferManager {
                                             }),
                                             None,
                                         );
+                                    }
+                                }
+
+                                // 🔥 移除分享直下的下载任务（已在完成时归档到历史库）。
+                                // 调度器完成时特意把它们留在内存里等这里移除；无论是否自动清理
+                                // 临时目录都要移除，否则关掉 auto_cleanup 时它们会永远留在内存里
+                                // （「清除已完成」也会跳过分享直下任务）。
+                                let dm_lock = download_manager.read().await;
+                                if let Some(ref dm) = *dm_lock {
+                                    for download_task_id in &download_task_ids {
+                                        // 跳过文件夹下载任务（以 folder: 开头）
+                                        if download_task_id.starts_with("folder:") {
+                                            continue;
+                                        }
+                                        if let Err(e) = dm.remove_share_direct_download_task(download_task_id).await {
+                                            warn!("移除分享直下下载任务失败: {}, error={}", download_task_id, e);
+                                        }
                                     }
                                 }
                             }
@@ -2789,6 +2832,33 @@ impl TransferManager {
                                         }),
                                         None,
                                     );
+                                }
+
+                                // 下载子任务全部被取消（回退到 Transferred）：没有任何下载会再
+                                // 读这个临时目录，与「取消转存任务」同口径按 cleanup_on_failure
+                                // 清理（issue #162）。
+                                //
+                                // 持久化状态刻意不改成 transferred：那样重启后会按「已转存待下载」
+                                // 恢复并对已删除的临时目录重新建下载；保持原状重启后只会再走一遍
+                                // 这里（删除幂等，errno=12 视为成功）。
+                                if new_status == TransferStatus::Transferred {
+                                    let cleanup_on_failure = app_config
+                                        .read()
+                                        .await
+                                        .share_direct_download
+                                        .cleanup_on_failure;
+                                    if cleanup_on_failure {
+                                        if let Some(ref temp_dir) = temp_dir {
+                                            info!("下载全部取消，清理临时目录: task_id={}, temp_dir={}", task_id, temp_dir);
+                                            let cleanup = Self::cleanup_temp_dir_internal(&client, temp_dir, &configured_root).await;
+                                            info!("下载取消清理结果: task_id={}, status={:?}", task_id, cleanup.status);
+                                            if let Some(ref pm_arc) = persistence_manager {
+                                                if let Err(e) = pm_arc.lock().await.update_cleanup_status(&task_id, cleanup.status) {
+                                                    warn!("持久化清理状态失败: task_id={}, error={}", task_id, e);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3009,55 +3079,17 @@ impl TransferManager {
 
         info!("开始清理临时目录: {}", temp_dir);
 
-        // 安全检查：确保路径在配置的临时目录根下，且不是根目录本身
-        // temp_dir 格式应为 /<temp_root>/{uuid}/ ，例如 /.bpr_share_temp/{uuid}/
-        let temp_dir_trimmed = temp_dir.trim_end_matches('/');
-        let root_trimmed = configured_temp_root.trim_end_matches('/');
-
-        // 检查 0：configured_temp_root 本身必须安全（不能是 /、空、或过短）
-        // trim 后至少 2 字符（如 /.x），防止 / 退化导致 starts_with("") 恒真
-        if root_trimmed.len() < 2 || !root_trimmed.starts_with('/') {
+        // 安全检查：路径必须是 {根}/{uuid} 或 {根}/inst-{id}/{uuid}，根本身必须安全。
+        // 末级必须是 UUID，防止畸形路径把整个临时根 / 命名空间删掉。
+        if let Err(reason) = temp_cleanup::validate_task_temp_dir(temp_dir, configured_temp_root) {
             error!(
-                "配置的临时目录根不安全，跳过清理: configured_root={}",
-                configured_temp_root
+                "临时目录路径不安全，跳过清理: path={}, configured_root={}, reason={}",
+                temp_dir, configured_temp_root, reason
             );
             return CleanupResult {
                 success: false,
                 status: CleanupStatus::NotAttempted,
-                error: Some(format!(
-                    "配置的临时目录根不安全（过短或非绝对路径）: {}",
-                    configured_temp_root
-                )),
-                errno: None,
-            };
-        }
-
-        let parts: Vec<&str> = temp_dir_trimmed.split('/').filter(|s| !s.is_empty()).collect();
-
-        // 检查 1：至少两级目录（temp_root + uuid）
-        if parts.len() < 2 {
-            error!("临时目录路径层级不足，跳过清理: {}", temp_dir);
-            return CleanupResult {
-                success: false,
-                status: CleanupStatus::NotAttempted,
-                error: Some("路径格式不正确：层级不足".to_string()),
-                errno: None,
-            };
-        }
-
-        // 检查 2：路径必须以配置的临时根目录开头，且根后紧跟 '/'（防止前缀碰撞）
-        let is_under_root = temp_dir_trimmed.starts_with(root_trimmed)
-            && temp_dir_trimmed.len() > root_trimmed.len()
-            && temp_dir_trimmed.as_bytes()[root_trimmed.len()] == b'/';
-        if !is_under_root {
-            error!(
-                "临时目录路径不在配置的临时根目录下，跳过清理: path={}, configured_root={}",
-                temp_dir, configured_temp_root
-            );
-            return CleanupResult {
-                success: false,
-                status: CleanupStatus::NotAttempted,
-                error: Some("路径不在配置的临时目录根下".to_string()),
+                error: Some(reason),
                 errno: None,
             };
         }
@@ -3971,6 +4003,68 @@ impl TransferManager {
         }
     }
 
+    /// 内存中归属指定同步配置的分享同步内部转存任务
+    ///
+    /// `get_all_tasks` 为了「转存管理」列表隐藏内部任务会把它们过滤掉，分享同步收集
+    /// 子任务进度 / 残留时必须走这里，否则转存段永远是空的。
+    pub async fn get_internal_tasks_by_backup_config(&self, backup_config_id: &str) -> Vec<TransferTask> {
+        let task_arcs: Vec<Arc<RwLock<TransferTask>>> =
+            self.tasks.iter().map(|e| e.value().task.clone()).collect();
+        let mut result = Vec::new();
+        for task_arc in task_arcs {
+            let task = task_arc.read().await;
+            if task.is_internal && task.backup_config_id.as_deref() == Some(backup_config_id) {
+                result.push(task.clone());
+            }
+        }
+        result
+    }
+
+    /// 内存中已到终态的分享同步内部转存任务（内存回收候选），附 `updated_at` 作版本标记
+    ///
+    /// 内部任务在「转存管理」里不可见，用户没法删除；除了失败重试时被丢弃、订阅被删
+    /// 之外没有任何移除点，成功完成的会一直留在内存里。
+    pub async fn finished_internal_task_candidates(&self) -> Vec<(String, i64)> {
+        let task_arcs: Vec<(String, Arc<RwLock<TransferTask>>)> = self
+            .tasks
+            .iter()
+            .map(|e| (e.key().clone(), e.value().task.clone()))
+            .collect();
+        let mut ids = Vec::new();
+        for (id, task_arc) in task_arcs {
+            let task = task_arc.read().await;
+            if task.is_internal && task.status.is_terminal() {
+                ids.push((id, task.updated_at));
+            }
+        }
+        ids
+    }
+
+    /// 把已到终态的分享同步内部转存任务移出内存
+    ///
+    /// 只移出内存：完成的已归档到历史库，不删持久化、不发删除事件（前端看不到内部任务）。
+    /// 逐个复查状态，候选收集之后状态若有变化不会误删。
+    pub async fn evict_finished_internal_tasks(&self, task_ids: &[String]) -> usize {
+        let mut removed = 0usize;
+        for id in task_ids {
+            let task_arc = self.tasks.get(id).map(|e| e.value().task.clone());
+            let Some(task_arc) = task_arc else {
+                continue;
+            };
+            let evictable = {
+                let task = task_arc.read().await;
+                task.is_internal && task.status.is_terminal()
+            };
+            if evictable {
+                if let Some((_, info)) = self.tasks.remove(id) {
+                    info.cancellation_token.cancel();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// 任务是否存在于**内存**中（不查历史库）。
     ///
     /// 用于跨账号路由的"内存优先"判定：内存命中即可确定归属为本 manager 的
@@ -4350,10 +4444,13 @@ impl TransferManager {
             .collect();
 
         let mut target_ids: Vec<String> = Vec::new();
+        // 移除前先记下需要善后的分享直下临时目录（移除后任务就查不到了）
+        let mut abandoned_temp_dirs: Vec<String> = Vec::new();
         for (id, task_arc) in task_arcs {
             let task = task_arc.read().await;
             if task.backup_config_id.as_deref() == Some(cfg_id) {
                 target_ids.push(id);
+                abandoned_temp_dirs.extend(Self::abandoned_temp_dir(&task));
             }
         }
 
@@ -4411,6 +4508,10 @@ impl TransferManager {
             );
         }
 
+        // 5) 下载段收完后再删分享直下临时目录：先删目录的话，仍在跑的下载 worker
+        //    会对已消失的文件刷满屏 31066。
+        self.cleanup_abandoned_temp_dirs(&abandoned_temp_dirs).await;
+
         info!(
             "delete_tasks_for_backup_config: cfg={} 完成（转存内存={}, 转存历史={}）",
             cfg_id, memory_count, history_count
@@ -4436,6 +4537,16 @@ impl TransferManager {
         //
         // 生产者观察到取消需要一点时间，因此仍有极小的漏网窗口；兜底是每轮 run 开始
         // 前的 `sweep_residual_subtasks`（见 share_sync/manager.rs），下一轮会收干净。
+        //
+        // 分享直下临时目录（issue #162）：移除后监听循环随取消令牌退出、不再走任何清理
+        // 分支，`.meta` 也被删掉，重启恢复同样找不到它 —— 必须在这里善后，否则每次
+        // 重试 / 回退 / 判终态都会在网盘上留下一个装满文件的 {uuid} 目录。
+        let task_arc = self.tasks.get(task_id).map(|e| e.value().task.clone());
+        let abandoned_temp_dir = match task_arc {
+            Some(arc) => Self::abandoned_temp_dir(&*arc.read().await),
+            None => None,
+        };
+
         if let Err(e) = self.remove_task(task_id).await {
             warn!("discard_task: 移除转存任务 {} 失败: {}", task_id, e);
         }
@@ -4449,6 +4560,11 @@ impl TransferManager {
             None => 0,
         };
 
+        // 下载段收完后再删临时目录（顺序原因同 delete_tasks_for_backup_config）
+        if let Some(temp_dir) = abandoned_temp_dir {
+            self.cleanup_abandoned_temp_dirs(&[temp_dir]).await;
+        }
+
         if dl_count > 0 || folder_count > 0 {
             info!(
                 "discard_task: task={} 已丢弃（下载子任务={}, 文件夹子任务={}）",
@@ -4456,6 +4572,59 @@ impl TransferManager {
             );
         }
         (dl_count, folder_count)
+    }
+
+    /// 被丢弃的转存任务需要善后删除的分享直下临时目录
+    ///
+    /// 只看**未到终态**的分享直下任务。到了终态（完成 / 转存失败 / 下载失败 / 已转存）
+    /// 的任务在各自分支里已经按配置清理过，清理失败的交给孤儿清理兜底；这里再删一遍
+    /// 只会对每个残留终态任务多发一次删除请求 —— 分享同步的内部任务会在内存里累积，
+    /// 一轮 sweep 可能是几百次删除，容易触发 errno=132 风控。
+    fn abandoned_temp_dir(task: &TransferTask) -> Option<String> {
+        if !task.is_share_direct_download || task.status.is_terminal() {
+            return None;
+        }
+        task.temp_dir.clone().filter(|s| !s.trim().is_empty())
+    }
+
+    /// 删除被丢弃任务遗留的分享直下临时目录
+    ///
+    /// 丢弃即放弃这次提交，与「取消转存任务」同口径受 `cleanup_on_failure` 控制。
+    /// 逐个走 `cleanup_temp_dir_internal`（含路径安全校验、errno=12 幂等）。命中
+    /// errno=132 风控时停止，剩下的交给孤儿清理，避免连续触发风控。
+    async fn cleanup_abandoned_temp_dirs(&self, temp_dirs: &[String]) {
+        if temp_dirs.is_empty() {
+            return;
+        }
+        let (cleanup_on_failure, configured_root) = {
+            let cfg = self.app_config.read().await;
+            (
+                cfg.share_direct_download.cleanup_on_failure,
+                cfg.share_direct_download.temp_dir.clone(),
+            )
+        };
+        if !cleanup_on_failure {
+            info!(
+                "cleanup_on_failure 已关闭，保留被丢弃任务的 {} 个临时目录",
+                temp_dirs.len()
+            );
+            return;
+        }
+        let client = self.client.read().unwrap().clone();
+        for (idx, temp_dir) in temp_dirs.iter().enumerate() {
+            let cleanup = Self::cleanup_temp_dir_internal(&client, temp_dir, &configured_root).await;
+            info!(
+                "丢弃转存任务，清理临时目录: temp_dir={}, status={:?}",
+                temp_dir, cleanup.status
+            );
+            if cleanup.status == CleanupStatus::RiskControlBlocked {
+                warn!(
+                    "清理临时目录被风控拦截，剩余 {} 个留给孤儿清理",
+                    temp_dirs.len() - idx - 1
+                );
+                break;
+            }
+        }
     }
 
     /// 获取配置
@@ -4696,180 +4865,341 @@ impl TransferManager {
     // 🔥 孤立目录清理
     // ========================================================================
 
-    /// 清理孤立的临时目录
+    /// 清理孤立的临时目录（手动 / 启动清理口径）
     ///
-    /// 扫描临时目录下的所有子目录，找出不属于任何活跃任务的目录（孤立目录），
-    /// 然后删除这些孤立目录。
-    ///
-    /// # Returns
-    /// 清理结果，包含删除的目录数和失败的目录列表
+    /// 范围：旧版本平铺的 `{根}/{uuid}` 目录 + 本实例命名空间；其他实例的命名空间
+    /// 不动（见 `cleanup_orphaned_temp_dirs_with`）。
     pub async fn cleanup_orphaned_temp_dirs(&self) -> CleanupOrphanedResult {
+        self.cleanup_orphaned_temp_dirs_with(temp_cleanup::OrphanSweepOptions::manual(false))
+            .await
+    }
+
+    /// 周期自动清理：只动本实例命名空间。
+    ///
+    /// 以下情况不执行，返回 None：
+    /// - 实例 id 不可用（平铺布局，分不清哪些目录是本实例的）；
+    /// - 用户关了 `auto_cleanup` 或 `cleanup_on_failure`：说明想保留临时目录里的文件，
+    ///   自动清理不能替用户做主（手动 / 启动清理是用户显式操作，不受此限）。
+    pub async fn sweep_own_namespace_orphans(&self) -> Option<CleanupOrphanedResult> {
+        temp_cleanup::own_namespace()?;
+        let keeps_files = {
+            let cfg = self.app_config.read().await;
+            !cfg.share_direct_download.auto_cleanup || !cfg.share_direct_download.cleanup_on_failure
+        };
+        if keeps_files {
+            debug!("已关闭 auto_cleanup / cleanup_on_failure，跳过孤儿临时目录周期清理");
+            return None;
+        }
+        Some(
+            self.cleanup_orphaned_temp_dirs_with(temp_cleanup::OrphanSweepOptions::periodic())
+                .await,
+        )
+    }
+
+    /// 按指定范围清理孤立的分享直下临时目录（issue #162）
+    ///
+    /// 一个目录必须同时满足以下条件才会被删（见 `temp_cleanup` 模块说明）：
+    /// 1. 本进程任务恢复已完成；
+    /// 2. 目录名是 UUID，且位于本次清理范围内；
+    /// 3. 创建时间超过 `opts.min_dir_age_secs`；
+    /// 4. 不被任何仍在用的转存 / 下载 / 文件夹下载引用（内存 + 磁盘持久化）。
+    ///
+    /// 「先列目录、后收集白名单」：清理过程中新建的任务目录不会出现在候选里。
+    /// 白名单任一来源读取失败都会中止清理 —— 宁可不删，也不在名单不全时误删。
+    pub async fn cleanup_orphaned_temp_dirs_with(
+        &self,
+        opts: temp_cleanup::OrphanSweepOptions,
+    ) -> CleanupOrphanedResult {
+        let fail = |msg: String| CleanupOrphanedResult {
+            error: Some(msg),
+            ..Default::default()
+        };
+
+        if !temp_cleanup::recovery_done() {
+            return fail("任务恢复尚未完成，请稍后再试".to_string());
+        }
+        let Ok(_sweep_guard) = self.orphan_sweep_lock.try_lock() else {
+            info!("已有孤儿临时目录清理在进行中，跳过本次");
+            return fail("已有清理任务在进行中，请稍后再试".to_string());
+        };
+
         let temp_dir_base = {
             let cfg = self.app_config.read().await;
             cfg.share_direct_download.temp_dir.clone()
         };
+        let root = match temp_cleanup::validate_temp_root(&temp_dir_base) {
+            Ok(r) => r.to_string(),
+            Err(e) => {
+                error!("拒绝执行孤立目录清理: {}", e);
+                return fail(e);
+            }
+        };
+        let own_ns = temp_cleanup::own_namespace();
+        info!(
+            "开始清理孤立临时目录: root={}, own_namespace={:?}, opts={:?}",
+            root, own_ns, opts
+        );
 
-        info!("开始清理孤立临时目录: base={}", temp_dir_base);
+        let client = self.client.read().unwrap().clone();
 
-        // 安全守卫：配置的临时根目录不能是 /、空、或过短
-        let root_trimmed = temp_dir_base.trim_end_matches('/');
-        if root_trimmed.len() < 2 || !root_trimmed.starts_with('/') {
-            error!(
-                "配置的临时目录根不安全，拒绝执行孤立目录清理: configured_root={}",
-                temp_dir_base
-            );
-            return CleanupOrphanedResult {
-                deleted_count: 0,
-                failed_paths: vec![],
-                error: Some(format!(
-                    "配置的临时目录根不安全（过短或非绝对路径）: {}",
-                    temp_dir_base
-                )),
-            };
-        }
-
-        // 1. 获取临时目录下的所有子目录
-        let client_snapshot = self.client.read().unwrap().clone();
-        let list_result = client_snapshot.get_file_list(&temp_dir_base, 1, 1000).await;
-        let subdirs = match list_result {
-            Ok(response) => {
-                if response.errno != 0 {
-                    // API 返回错误
-                    let err_msg = if response.errmsg.is_empty() {
-                        format!("API 错误码: {}", response.errno)
-                    } else {
-                        response.errmsg
-                    };
-                    // 如果目录不存在，说明没有临时文件需要清理
-                    if response.errno == -9 {
-                        info!("临时目录不存在，无需清理: {}", temp_dir_base);
-                        return CleanupOrphanedResult {
-                            deleted_count: 0,
-                            failed_paths: vec![],
-                            error: None,
-                        };
-                    }
-                    warn!("列出临时目录失败: {}", err_msg);
-                    return CleanupOrphanedResult {
-                        deleted_count: 0,
-                        failed_paths: vec![],
-                        error: Some(err_msg),
-                    };
-                }
-                response.list
-                    .into_iter()
-                    .filter(|f| f.isdir == 1)
-                    .map(|f| f.path)
-                    .collect::<Vec<_>>()
+        // 1. 列出候选目录
+        let root_entries = match list_all_dir_entries(&client, &root).await {
+            Ok(Some(entries)) => entries,
+            Ok(None) => {
+                info!("临时目录不存在，无需清理: {}", root);
+                return CleanupOrphanedResult::default();
             }
             Err(e) => {
-                let err_msg = e.to_string();
-                // 如果目录不存在，说明没有临时文件需要清理
-                if err_msg.contains("不存在") || err_msg.contains("not found") || err_msg.contains("-9") {
-                    info!("临时目录不存在，无需清理: {}", temp_dir_base);
-                    return CleanupOrphanedResult {
-                        deleted_count: 0,
-                        failed_paths: vec![],
-                        error: None,
-                    };
-                }
-                warn!("列出临时目录失败: {}", err_msg);
-                return CleanupOrphanedResult {
-                    deleted_count: 0,
-                    failed_paths: vec![],
-                    error: Some(err_msg),
-                };
+                warn!("列出临时目录失败: {}", e);
+                return fail(e);
             }
         };
 
-        if subdirs.is_empty() {
-            info!("临时目录为空，无需清理");
-            return CleanupOrphanedResult {
-                deleted_count: 0,
-                failed_paths: vec![],
-                error: None,
+        let mut candidates: Vec<(String, i64)> = Vec::new();
+        let mut foreign_namespace_skipped = 0usize;
+        for entry in root_entries.into_iter().filter(|e| e.isdir == 1) {
+            use temp_cleanup::RootEntry;
+            let scan_children = match temp_cleanup::classify_root_entry(
+                &entry.server_filename,
+                own_ns.as_deref(),
+            ) {
+                RootEntry::LegacyTask => {
+                    if opts.include_legacy {
+                        candidates.push((entry.path.clone(), entry.server_ctime));
+                    }
+                    false
+                }
+                RootEntry::OwnNamespace => opts.include_own_namespace,
+                RootEntry::ForeignNamespace => {
+                    if !opts.include_foreign_namespaces {
+                        foreign_namespace_skipped += 1;
+                    }
+                    opts.include_foreign_namespaces
+                }
+                RootEntry::Other => false,
             };
-        }
-
-        // 2. 获取当前所有活跃任务的 temp_dir 集合
-        //
-        // 此前用 `try_read()`，活跃任务正在
-        // 状态流转持有写锁时其 temp_dir 不会进入集合 → 后续被当作孤立目录删除，
-        // 可能误删活跃任务的临时目录。改为先收集 Arc 再依次 `read().await`，
-        // 确保所有活跃任务的 temp_dir 都被纳入"白名单"。
-        let active_task_arcs: Vec<Arc<RwLock<TransferTask>>> = self
-            .tasks
-            .iter()
-            .map(|e| e.value().task.clone())
-            .collect();
-
-        let mut active_temp_dirs: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(active_task_arcs.len());
-        for task_arc in active_task_arcs {
-            let task = task_arc.read().await;
-            if let Some(ref temp_dir) = task.temp_dir {
-                active_temp_dirs.insert(temp_dir.clone());
+            if !scan_children {
+                continue;
+            }
+            match list_all_dir_entries(&client, &entry.path).await {
+                Ok(Some(children)) => {
+                    candidates.extend(
+                        children
+                            .into_iter()
+                            .filter(|c| {
+                                c.isdir == 1 && temp_cleanup::is_uuid_segment(&c.server_filename)
+                            })
+                            .map(|c| (c.path, c.server_ctime)),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("列出命名空间目录失败: {}, error={}", entry.path, e);
+                    return fail(e);
+                }
             }
         }
 
-        // 3. 找出孤立目录（不属于任何活跃任务的目录）
-        let orphaned_dirs: Vec<String> = subdirs
+        if candidates.is_empty() {
+            info!("没有候选临时目录需要清理");
+            return CleanupOrphanedResult {
+                foreign_namespace_skipped,
+                ..Default::default()
+            };
+        }
+
+        // 2. 收集仍在用的路径（列目录之后再收集，见函数说明）
+        let now = chrono::Utc::now().timestamp();
+        let protected = match self.collect_protected_temp_paths(&root, now).await {
+            Ok(set) => set,
+            Err(e) => {
+                warn!("收集在用任务失败，为避免误删已中止孤立目录清理: {}", e);
+                return fail(format!("收集在用任务失败，已中止清理: {}", e));
+            }
+        };
+
+        // 3. 过滤出孤立目录
+        let orphans: Vec<String> = candidates
             .into_iter()
-            .filter(|path| {
-                // 规范化路径格式进行比较
-                let normalized = if path.ends_with('/') {
-                    path.clone()
-                } else {
-                    format!("{}/", path)
-                };
-                !active_temp_dirs.contains(&normalized) && !active_temp_dirs.contains(path)
+            .filter_map(|(path, ctime)| {
+                let path = temp_cleanup::normalize_dir(&path).to_string();
+                let deletable = !protected.contains(&path)
+                    && temp_cleanup::old_enough(ctime, now, opts.min_dir_age_secs)
+                    && temp_cleanup::validate_task_temp_dir(&path, &root).is_ok();
+                deletable.then_some(path)
             })
             .collect();
 
-        if orphaned_dirs.is_empty() {
+        if orphans.is_empty() {
             info!("没有孤立目录需要清理");
             return CleanupOrphanedResult {
-                deleted_count: 0,
-                failed_paths: vec![],
-                error: None,
+                foreign_namespace_skipped,
+                ..Default::default()
             };
         }
 
-        info!("发现 {} 个孤立目录，开始清理", orphaned_dirs.len());
+        info!("发现 {} 个孤立目录，开始清理", orphans.len());
 
-        // 4. 删除孤立目录
-        let delete_result = client_snapshot.delete_files(&orphaned_dirs).await;
-        match delete_result {
-            Ok(result) => {
-                if result.success {
-                    info!("成功清理 {} 个孤立目录", result.deleted_count);
-                } else {
-                    warn!(
-                        "部分孤立目录清理失败: 成功={}, 失败={:?}",
-                        result.deleted_count, result.failed_paths
-                    );
+        // 4. 分批删除；命中风控即停，剩余留到下次
+        const ORPHAN_DELETE_BATCH: usize = 100;
+        let mut deleted_count = 0usize;
+        let mut failed_paths: Vec<String> = Vec::new();
+        let mut last_error: Option<String> = None;
+        let batches: Vec<&[String]> = orphans.chunks(ORPHAN_DELETE_BATCH).collect();
+        for (idx, batch) in batches.iter().enumerate() {
+            match client.delete_files_chunked(batch).await {
+                Ok(r) if r.success => deleted_count += batch.len(),
+                Ok(r) => {
+                    if r.failed_paths.is_empty() {
+                        failed_paths.extend(batch.iter().cloned());
+                    } else {
+                        deleted_count += batch.len().saturating_sub(r.failed_paths.len());
+                        failed_paths.extend(r.failed_paths);
+                    }
+                    if r.errno == Some(132) {
+                        warn!("孤立目录清理被风控拦截（errno=132），剩余目录留到下次清理");
+                        last_error =
+                            Some("删除被百度风控拦截（errno=132），请稍后重试".to_string());
+                        for rest in &batches[idx + 1..] {
+                            failed_paths.extend(rest.iter().cloned());
+                        }
+                        break;
+                    }
+                    last_error = r.error.or(last_error);
                 }
-                CleanupOrphanedResult {
-                    deleted_count: result.deleted_count,
-                    failed_paths: result.failed_paths,
-                    error: result.error,
-                }
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                error!("清理孤立目录失败: {}", err_msg);
-                CleanupOrphanedResult {
-                    deleted_count: 0,
-                    failed_paths: orphaned_dirs,
-                    error: Some(err_msg),
+                Err(e) => {
+                    error!("清理孤立目录失败: {}", e);
+                    failed_paths.extend(batch.iter().cloned());
+                    last_error = Some(e.to_string());
                 }
             }
         }
+
+        info!(
+            "孤立目录清理完成: 删除={}, 失败={}",
+            deleted_count,
+            failed_paths.len()
+        );
+        CleanupOrphanedResult {
+            deleted_count,
+            failed_paths,
+            error: last_error,
+            foreign_namespace_skipped,
+        }
+    }
+
+    /// 收集临时根目录下仍在用的路径（含每一级上级目录）
+    ///
+    /// 来源（任一读取失败都返回 Err，由调用方中止清理）：
+    /// - 内存中的转存任务：未结束（`Transferred` 也算未结束，重启恢复会据此重建下载），
+    ///   或结束未满 `TERMINAL_GRACE_SECS`；
+    /// - 内存中未完成的下载任务（含分享同步的备份下载）与文件夹下载；
+    /// - 磁盘上的 `.meta` 与文件夹持久化记录 —— 覆盖恢复失败 / 被跳过、或所属账号
+    ///   manager 尚未构造的任务，它们不在内存里，但用户之后仍可继续。
+    async fn collect_protected_temp_paths(
+        &self,
+        root: &str,
+        now: i64,
+    ) -> std::result::Result<HashSet<String>, String> {
+        use crate::persistence::{TaskPersistenceStatus, TaskType};
+
+        let mut protected: HashSet<String> = HashSet::new();
+
+        // a) 内存中的转存任务
+        let task_arcs: Vec<Arc<RwLock<TransferTask>>> =
+            self.tasks.iter().map(|e| e.value().task.clone()).collect();
+        for task_arc in task_arcs {
+            let t = task_arc.read().await;
+            let finished =
+                temp_cleanup::is_finished_transfer_status(&format!("{:?}", t.status));
+            if !temp_cleanup::transfer_protects_temp_dir(finished, t.updated_at, now) {
+                continue;
+            }
+            if let Some(ref temp_dir) = t.temp_dir {
+                temp_cleanup::protect_path(&mut protected, root, temp_dir);
+            }
+            temp_cleanup::protect_path(&mut protected, root, &t.save_path);
+        }
+
+        // b) 内存中的下载任务 / 文件夹下载
+        if let Some(dm) = self.download_manager_handle().await {
+            for path in dm.unfinished_remote_paths_under(root).await {
+                temp_cleanup::protect_path(&mut protected, root, &path);
+            }
+        }
+        if let Some(fdm) = self.folder_download_manager_handle().await {
+            fdm.visit_folders(|f| {
+                if !matches!(f.status, FolderStatus::Completed | FolderStatus::Cancelled) {
+                    temp_cleanup::protect_path(&mut protected, root, &f.remote_root);
+                }
+            })
+                .await;
+        }
+
+        // c) 磁盘持久化记录
+        let pm_arc = self
+            .persistence_manager
+            .lock()
+            .await
+            .as_ref()
+            .map(|pm| pm.clone())
+            .ok_or_else(|| "持久化管理器未初始化".to_string())?;
+        let wal_dir = pm_arc.lock().await.wal_dir().clone();
+        let (metas, folders) = tokio::task::spawn_blocking(move || {
+            let metas = crate::persistence::metadata::scan_all_metadata(&wal_dir)
+                .map_err(|e| format!("扫描任务元数据失败: {}", e))?;
+            let folders = crate::persistence::folder::load_all_folders(&wal_dir)
+                .map_err(|e| format!("读取文件夹下载记录失败: {}", e))?;
+            Ok::<_, String>((metas, folders))
+        })
+            .await
+            .map_err(|e| format!("扫描持久化记录任务异常: {}", e))??;
+
+        for meta in metas {
+            match meta.task_type {
+                TaskType::Transfer => {
+                    let finished = meta
+                        .transfer_status
+                        .as_deref()
+                        .map(temp_cleanup::is_finished_transfer_status)
+                        .unwrap_or(false);
+                    if !temp_cleanup::transfer_protects_temp_dir(
+                        finished,
+                        meta.updated_at.timestamp(),
+                        now,
+                    ) {
+                        continue;
+                    }
+                    for path in [&meta.temp_dir, &meta.transfer_target_path]
+                        .into_iter()
+                        .flatten()
+                    {
+                        temp_cleanup::protect_path(&mut protected, root, path);
+                    }
+                }
+                TaskType::Download => {
+                    if meta.status == Some(TaskPersistenceStatus::Completed) {
+                        continue;
+                    }
+                    if let Some(ref path) = meta.remote_path {
+                        temp_cleanup::protect_path(&mut protected, root, path);
+                    }
+                }
+                TaskType::Upload => {}
+            }
+        }
+        for folder in folders {
+            if !matches!(folder.status, FolderStatus::Completed | FolderStatus::Cancelled) {
+                temp_cleanup::protect_path(&mut protected, root, &folder.remote_root);
+            }
+        }
+
+        Ok(protected)
     }
 }
 
 /// 清理孤立目录的结果
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CleanupOrphanedResult {
     /// 成功删除的目录数
     pub deleted_count: usize,
@@ -4877,6 +5207,53 @@ pub struct CleanupOrphanedResult {
     pub failed_paths: Vec<String>,
     /// 错误信息（如果有）
     pub error: Option<String>,
+    /// 因属于其他实例而未清理的命名空间数（手动清理带 include_foreign=true 才会处理）
+    pub foreign_namespace_skipped: usize,
+}
+
+/// 列出网盘目录下的全部条目（自动翻页）
+///
+/// 目录不存在时返回 `Ok(None)`。
+async fn list_all_dir_entries(
+    client: &NetdiskClient,
+    dir: &str,
+) -> std::result::Result<Option<Vec<crate::netdisk::FileItem>>, String> {
+    const PAGE_SIZE: u32 = 1000;
+    const MAX_PAGES: u32 = 200;
+
+    let is_not_found_msg =
+        |m: &str| m.contains("不存在") || m.contains("not found") || m.contains("-9");
+
+    let mut all = Vec::new();
+    for page in 1..=MAX_PAGES {
+        match client.get_file_list(dir, page, PAGE_SIZE).await {
+            Ok(resp) => {
+                if resp.errno != 0 {
+                    if resp.errno == -9 && page == 1 {
+                        return Ok(None);
+                    }
+                    return Err(if resp.errmsg.is_empty() {
+                        format!("API 错误码: {}", resp.errno)
+                    } else {
+                        resp.errmsg
+                    });
+                }
+                let n = resp.list.len();
+                all.extend(resp.list);
+                if n < PAGE_SIZE as usize {
+                    return Ok(Some(all));
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if page == 1 && is_not_found_msg(&msg) {
+                    return Ok(None);
+                }
+                return Err(msg);
+            }
+        }
+    }
+    Err(format!("目录条目过多（超过 {} 页），已中止: {}", MAX_PAGES, dir))
 }
 
 impl TransferManager {
@@ -6695,5 +7072,156 @@ mod tests {
         assert!(merged.error.is_none());
         // empty group_id means root level, remote_dir should be temp_dir itself
         assert_eq!(groups_info[0].remote_dir, "/tmp");
+    }
+
+    // ========== issue #162：丢弃任务时的临时目录善后 ==========
+
+    fn share_direct_task(status: TransferStatus) -> TransferTask {
+        let temp_dir = "/.bpr_share_temp/00aaf329-43bd-49d5-9c3f-8648c6ff4e43/".to_string();
+        let mut task = TransferTask::new(
+            "https://pan.baidu.com/s/1abc".to_string(),
+            None,
+            temp_dir.clone(),
+            0,
+            true,
+            None,
+        );
+        task.is_share_direct_download = true;
+        task.temp_dir = Some(temp_dir);
+        task.status = status;
+        task
+    }
+
+    #[test]
+    fn test_abandoned_temp_dir_for_unfinished_share_direct_task() {
+        for status in [
+            TransferStatus::Queued,
+            TransferStatus::CheckingShare,
+            TransferStatus::Transferring,
+            TransferStatus::Downloading,
+            TransferStatus::Cleaning,
+        ] {
+            let task = share_direct_task(status.clone());
+            assert_eq!(
+                TransferManager::abandoned_temp_dir(&task).as_deref(),
+                Some("/.bpr_share_temp/00aaf329-43bd-49d5-9c3f-8648c6ff4e43/"),
+                "{:?}",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn test_abandoned_temp_dir_skips_terminal_and_normal_tasks() {
+        // 终态：各自分支已按配置清理过，不重复发删除请求
+        for status in [
+            TransferStatus::Completed,
+            TransferStatus::Transferred,
+            TransferStatus::TransferFailed,
+            TransferStatus::DownloadFailed,
+        ] {
+            let task = share_direct_task(status.clone());
+            assert!(TransferManager::abandoned_temp_dir(&task).is_none(), "{:?}", status);
+        }
+
+        // 普通转存：save_path 是用户目录，绝不能删
+        let mut task = share_direct_task(TransferStatus::Downloading);
+        task.is_share_direct_download = false;
+        assert!(TransferManager::abandoned_temp_dir(&task).is_none());
+
+        // temp_dir 为空
+        let mut task = share_direct_task(TransferStatus::Downloading);
+        task.temp_dir = Some("  ".to_string());
+        assert!(TransferManager::abandoned_temp_dir(&task).is_none());
+    }
+
+    // ========== 已结束内部任务的内存回收 ==========
+
+    fn test_manager() -> TransferManager {
+        let user = crate::auth::UserAuth::new(1, "user_1".to_string(), "bduss_1".to_string());
+        let client = NetdiskClient::new(user).expect("create test client");
+        TransferManager::new(
+            Arc::new(StdRwLock::new(client)),
+            TransferConfig::default(),
+            Arc::new(RwLock::new(AppConfig::default())),
+        )
+    }
+
+    fn insert_task(
+        tm: &TransferManager,
+        is_internal: bool,
+        cfg: Option<&str>,
+        status: TransferStatus,
+    ) -> String {
+        let mut task = share_direct_task(status);
+        task.is_internal = is_internal;
+        task.backup_config_id = cfg.map(|c| c.to_string());
+        let id = task.id.clone();
+        tm.tasks.insert(
+            id.clone(),
+            TransferTaskInfo {
+                task: Arc::new(RwLock::new(task)),
+                cancellation_token: CancellationToken::new(),
+            },
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn test_get_internal_tasks_by_backup_config() {
+        let tm = test_manager();
+        let a = insert_task(&tm, true, Some("share-sync:a"), TransferStatus::Transferring);
+        insert_task(&tm, true, Some("share-sync:b"), TransferStatus::Transferring);
+        // 非内部任务即使带同名归属也不算
+        insert_task(&tm, false, Some("share-sync:a"), TransferStatus::Transferring);
+
+        let got: Vec<String> = tm
+            .get_internal_tasks_by_backup_config("share-sync:a")
+            .await
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(got, vec![a]);
+    }
+
+    #[tokio::test]
+    async fn test_evict_only_finished_internal_tasks() {
+        let tm = test_manager();
+        let done = insert_task(&tm, true, Some("share-sync:a"), TransferStatus::Completed);
+        let running = insert_task(&tm, true, Some("share-sync:a"), TransferStatus::Downloading);
+        let visible = insert_task(&tm, false, None, TransferStatus::Completed);
+
+        let candidates: Vec<String> = tm
+            .finished_internal_task_candidates()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(candidates, vec![done.clone()]);
+
+        // 传入不该回收的 id 也只会移走真正可回收的
+        let removed = tm
+            .evict_finished_internal_tasks(&[done.clone(), running.clone(), visible.clone()])
+            .await;
+        assert_eq!(removed, 1);
+        assert!(!tm.has_task_in_memory(&done));
+        assert!(tm.has_task_in_memory(&running));
+        assert!(tm.has_task_in_memory(&visible));
+    }
+
+    #[tokio::test]
+    async fn test_evict_rechecks_status() {
+        let tm = test_manager();
+        let id = insert_task(&tm, true, Some("share-sync:a"), TransferStatus::Transferred);
+        let candidates = tm.finished_internal_task_candidates().await;
+        assert_eq!(candidates.len(), 1);
+
+        // 收集候选之后状态变回非终态（如恢复后重新开始下载）
+        {
+            let arc = tm.tasks.get(&id).map(|e| e.value().task.clone()).unwrap();
+            arc.write().await.status = TransferStatus::Downloading;
+        }
+        assert_eq!(tm.evict_finished_internal_tasks(&[id.clone()]).await, 0);
+        assert!(tm.has_task_in_memory(&id));
     }
 }

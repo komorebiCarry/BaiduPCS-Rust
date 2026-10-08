@@ -2987,6 +2987,51 @@ impl FolderDownloadManager {
     /// 清除内存中已完成的文件夹
     ///
     /// 返回清除的数量
+    /// 内存中已完成的分享同步文件夹下载 id（内存回收候选）
+    ///
+    /// 分享同步的文件夹下载（backup_config_id 为 `share-sync:{订阅id}`）在「下载管理」
+    /// 里不可见、用户没法手动清除，完成后会一直留在内存里。
+    ///
+    /// 附 `completed_at` 作版本标记（见 `ReclaimTracker`）。
+    pub async fn completed_share_sync_folder_candidates(&self) -> Vec<(String, i64)> {
+        let folders = self.folders.read().await;
+        folders
+            .values()
+            .filter(|f| Self::is_completed_share_sync_folder(f))
+            .map(|f| (f.id.clone(), f.completed_at.unwrap_or(0)))
+            .collect()
+    }
+
+    /// 把已完成的分享同步文件夹下载移出内存（不动持久化 / 历史，与 `clear_completed_folders` 同口径）
+    ///
+    /// 逐个复查状态，调用方拿到候选后若状态有变化不会误删。
+    pub async fn evict_completed_share_sync_folders(&self, folder_ids: &[String]) -> usize {
+        if folder_ids.is_empty() {
+            return 0;
+        }
+        let mut folders = self.folders.write().await;
+        let mut removed = 0usize;
+        for id in folder_ids {
+            if folders.get(id).is_some_and(Self::is_completed_share_sync_folder) {
+                folders.remove(id);
+                removed += 1;
+            }
+        }
+        drop(folders);
+        if removed > 0 {
+            self.prune_persist_state().await;
+        }
+        removed
+    }
+
+    fn is_completed_share_sync_folder(folder: &FolderDownload) -> bool {
+        folder.status == FolderStatus::Completed
+            && folder
+            .backup_config_id
+            .as_deref()
+            .is_some_and(|c| c.starts_with("share-sync:"))
+    }
+
     pub async fn clear_completed_folders(&self) -> usize {
         let mut folders = self.folders.write().await;
         let before_count = folders.len();

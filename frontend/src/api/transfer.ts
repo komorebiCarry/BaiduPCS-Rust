@@ -185,6 +185,8 @@ export interface CleanupOrphanedResponse {
   deleted_count: number
   /** 删除失败的目录路径列表 */
   failed_paths: string[]
+  /** 因属于其他实例而未清理的命名空间数 */
+  foreign_namespace_skipped: number
 }
 
 /// 转存 API 错误
@@ -256,9 +258,16 @@ export async function cancelTransfer(taskId: string): Promise<string> {
  *
  * 扫描临时目录下的所有子目录，找出不属于任何活跃任务的目录（孤立目录），
  * 然后删除这些孤立目录。
+ *
+ * @param includeForeign 是否连同其他实例命名空间下的目录一起清理。同一百度账号
+ *   挂在多个实例上时会删掉其他实例正在用的目录，只在用户明确确认后传 true。
  */
-export async function cleanupOrphanedTempDirs(): Promise<CleanupOrphanedResponse> {
-  return apiClient.post('/transfers/cleanup')
+export async function cleanupOrphanedTempDirs(includeForeign = false): Promise<CleanupOrphanedResponse> {
+  return apiClient.post('/transfers/cleanup', null, {
+    params: includeForeign ? { include_foreign: true } : undefined,
+    // 残留多时要分批删除，命中风控还会退避重试，远超默认 30 秒
+    timeout: 10 * 60 * 1000,
+  })
 }
 
 // ============================================

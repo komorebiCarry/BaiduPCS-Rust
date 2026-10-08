@@ -429,6 +429,19 @@ pub struct CleanupOrphanedResponse {
     pub deleted_count: usize,
     /// 删除失败的目录路径列表
     pub failed_paths: Vec<String>,
+    /// 因属于其他实例而未清理的命名空间数（带 include_foreign=true 才会清理）
+    pub foreign_namespace_skipped: usize,
+}
+
+/// 手动清理孤立临时目录的查询参数
+#[derive(Debug, Default, Deserialize)]
+pub struct CleanupOrphanedQuery {
+    /// 是否连同其他实例命名空间下的目录一起清理
+    ///
+    /// 同一百度账号挂在多个实例上时，其他实例正在用的目录也会被删，只在用户明确
+    /// 确认后传 true。
+    #[serde(default)]
+    pub include_foreign: bool,
 }
 
 /// 预览分享文件请求
@@ -612,8 +625,9 @@ pub async fn preview_share_dir(
 /// 然后删除这些孤立目录。
 pub async fn cleanup_orphaned_temp_dirs(
     State(app_state): State<AppState>,
+    Query(query): Query<CleanupOrphanedQuery>,
 ) -> Json<TransferApiResponse<CleanupOrphanedResponse>> {
-    info!("手动清理孤立临时目录");
+    info!("手动清理孤立临时目录: include_foreign={}", query.include_foreign);
 
     let transfer_manager = match app_state.transfer_manager_for_active().await {
         Some(tm) => tm,
@@ -625,7 +639,11 @@ pub async fn cleanup_orphaned_temp_dirs(
         }
     };
 
-    let result = transfer_manager.cleanup_orphaned_temp_dirs().await;
+    let result = transfer_manager
+        .cleanup_orphaned_temp_dirs_with(crate::transfer::temp_cleanup::OrphanSweepOptions::manual(
+            query.include_foreign,
+        ))
+        .await;
 
     if let Some(ref err) = result.error {
         if result.deleted_count == 0 {
@@ -645,5 +663,6 @@ pub async fn cleanup_orphaned_temp_dirs(
     Json(TransferApiResponse::success(CleanupOrphanedResponse {
         deleted_count: result.deleted_count,
         failed_paths: result.failed_paths,
+        foreign_namespace_skipped: result.foreign_namespace_skipped,
     }))
 }

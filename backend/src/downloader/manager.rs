@@ -5265,6 +5265,48 @@ impl DownloadManager {
         }
     }
 
+    /// 内存中已完成的分享直下下载任务 id（内存回收候选）
+    ///
+    /// 分享直下任务完成后不随调度器移出内存（等转存管理器清理临时目录后再移除，见
+    /// `remove_share_direct_download_task`）。转存任务监听不在了（用户删了转存记录、
+    /// 或重启后转存任务未恢复）时就再没人移除它们，「清除已完成」也会跳过它们。
+    ///
+    /// 附 `completed_at` 作版本标记（见 `ReclaimTracker`）。
+    pub async fn completed_share_direct_task_candidates(&self) -> Vec<(String, i64)> {
+        let tasks = self.tasks.read().await;
+        let mut ids = Vec::new();
+        for (id, task) in tasks.iter() {
+            let t = task.lock().await;
+            if t.is_share_direct_download && t.status == TaskStatus::Completed {
+                ids.push((id.clone(), t.completed_at.unwrap_or(0)));
+            }
+        }
+        ids
+    }
+
+    /// 把已完成的分享直下下载任务移出内存（已在完成时归档到历史库，不动持久化）
+    pub async fn evict_completed_share_direct_tasks(&self, task_ids: &[String]) -> usize {
+        if task_ids.is_empty() {
+            return 0;
+        }
+        let mut tasks = self.tasks.write().await;
+        let mut removed = 0usize;
+        for id in task_ids {
+            let evictable = match tasks.get(id) {
+                Some(task) => {
+                    let t = task.lock().await;
+                    t.is_share_direct_download && t.status == TaskStatus::Completed
+                }
+                None => false,
+            };
+            if evictable {
+                tasks.remove(id);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// 清除指定的分享直下任务（由转存管理器调用）
     ///
     /// 用于转存管理器在清理临时文件后移除已完成的分享直下下载任务
@@ -5302,6 +5344,32 @@ impl DownloadManager {
         if prev == 0 {
             self.active_count.store(0, Ordering::SeqCst);
         }
+    }
+
+    /// 内存中未完成下载任务（**含备份任务**）里，远端路径位于 `prefix` 之下的路径
+    ///
+    /// 供分享直下孤儿临时目录清理建白名单（issue #162）：分享同步的下载子任务走
+    /// `create_backup_task`（is_backup=true），`get_all_tasks` 会把它们排除。
+    /// 暂停 / 失败的任务仍算「在用」—— 用户随时可能继续或重试。
+    pub async fn unfinished_remote_paths_under(&self, prefix: &str) -> Vec<String> {
+        let prefix = prefix.trim_end_matches('/');
+        let tasks = self.tasks.read().await;
+        let mut result = Vec::new();
+        for task in tasks.values() {
+            let t = task.lock().await;
+            if t.status == TaskStatus::Completed {
+                continue;
+            }
+            let under = t
+                .remote_path
+                .strip_prefix(prefix)
+                .map(|rest| rest.starts_with('/'))
+                .unwrap_or(false);
+            if under {
+                result.push(t.remote_path.clone());
+            }
+        }
+        result
     }
 
     /// 获取所有任务（包括当前任务和历史任务，排除备份任务）
