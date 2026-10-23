@@ -11,6 +11,7 @@ pub mod cron;
 pub mod diff;
 pub mod error;
 pub mod events;
+pub mod exclusion;
 pub mod executor;
 pub mod manager;
 pub mod persistence;
@@ -30,6 +31,11 @@ pub use cron::CronSchedule;
 pub use diff::{diff_snapshots, DiffSummaryView, ShareDiff, ShareModifiedItem};
 pub use error::{ErrorCategory, ShareSyncError};
 pub use events::{ShareSyncEvent, ShareSyncEventPublisher};
+pub use exclusion::{
+    normalize_test_path, validate_globs, validate_regexes, validate_rules, CompiledRules,
+    RuleError, RuleKind, MAX_REGEX_RULES, MAX_REGEX_RULE_BYTES, MAX_REGEX_TOTAL_BYTES,
+    MAX_TEST_PATH_BYTES,
+};
 pub use executor::{timestamped_name, ApplyOutcome, ExecutorHooks, ShareSyncExecutor};
 pub use manager::{
     collect_share_sync_subtasks, share_sync_backup_config_id, ManagerConfig, ShareSyncManager,

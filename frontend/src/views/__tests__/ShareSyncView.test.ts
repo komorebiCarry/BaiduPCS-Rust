@@ -18,6 +18,10 @@ const api = vi.hoisted(() => ({
   listSubtasks: vi.fn(),
 }))
 
+const editorStub = vi.hoisted(() => ({
+  validateRules: vi.fn<() => Promise<{ ok: boolean; message?: string }>>(async () => ({ ok: true })),
+}))
+
 vi.mock('@/api/shareSync', () => ({
   listSubscriptions: api.listSubscriptions,
   updateSubscription: api.updateSubscription,
@@ -30,6 +34,11 @@ vi.mock('@/api/shareSync', () => ({
   getRun: api.getRun,
   listRunItems: api.listRunItems,
   listSubtasks: api.listSubtasks,
+  getExcludeRuleCapabilities: vi.fn(async () => ({
+    supports_regex: true,
+    regex_limits: { max_rules: 64, max_rule_bytes: 1024, max_total_bytes: 32768, max_test_path_bytes: 4096 },
+  })),
+  validateExcludeRules: editorStub.validateRules,
 }))
 
 const ws = vi.hoisted(() => ({
@@ -98,7 +107,18 @@ function mountView() {
         AccountFilter: true,
         AccountBadge: true,
         TransferDialog: true,
-        ShareIncludeExcludeEditor: true,
+        ShareIncludeExcludeEditor: {
+          name: 'ShareIncludeExcludeEditor',
+          props: [
+            'shareUrl', 'password', 'includePaths', 'excludePatterns',
+            'excludeRegexPatterns', 'excludePaths', 'ownerUid', 'ownerLoggedIn',
+          ],
+          emits: ['update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns', 'update:excludePaths'],
+          template: '<div class="include-exclude-editor-stub" />',
+          setup(_props: unknown, { expose }: { expose: (e: Record<string, unknown>) => void }) {
+            expose({ validateRules: editorStub.validateRules })
+          },
+        },
         CronExprEditor: true,
         FilePickerModal: {
           name: 'FilePickerModal',
@@ -113,6 +133,10 @@ function mountView() {
 /** 扫描进度卡片里的取消按钮 */
 function cancelButton(): HTMLElement | null {
   return document.body.querySelector<HTMLElement>('.scan-cancel-btn')
+}
+
+function scanCurrent(): HTMLElement | null {
+  return document.body.querySelector<HTMLElement>('.scan-current')
 }
 
 /** 触发一次 WS 事件 */
@@ -444,6 +468,247 @@ describe('ShareSyncView 取消扫描', () => {
     await flushPromises()
 
     expect(cancelButton()).toBeNull()
+    wrapper.unmount()
+  })
+})
+
+describe('ShareSyncView 扫描当前路径展示', () => {
+  function scanCurrentPath(): HTMLElement | null {
+    return document.body.querySelector<HTMLElement>('.scan-current-path')
+  }
+
+  function scanCurrentLabel(): HTMLElement | null {
+    return document.body.querySelector<HTMLElement>('.scan-current-label')
+  }
+
+  it('完整多级路径存于单行路径节点与 title，省略只交给 CSS', async () => {
+    const full = '/剧集/第一季/高清 1080P/第 01 集'
+    const wrapper = mountView()
+    await flushPromises()
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: full })
+    await flushPromises()
+
+    const el = scanCurrent()
+    expect(el, '应显示当前扫描目录').toBeTruthy()
+    expect(el!.getAttribute('title'), 'title 始终是完整路径').toBe(full)
+    expect(el!.textContent, '路径正文应完整呈现，而不是只挂在 title 上').toContain(full)
+    expect(el!.textContent).not.toContain('…')
+    expect(scanCurrentLabel()!.textContent, '「当前」标签独立且不进入省略容器').toBe('当前：')
+    expect(scanCurrentPath()!.querySelector('bdi'), '路径内容需 LTR 隔离').toBeTruthy()
+    expect(scanCurrentPath()!.textContent).toBe(full)
+    wrapper.unmount()
+  })
+
+  it('混合中文、拉丁、空格、数字与标点的顺序原样保留', async () => {
+    const full = '/我的 资源/Season 01/第1集 1080P (2026) [HEVC]'
+    const wrapper = mountView()
+    await flushPromises()
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: full })
+    await flushPromises()
+
+    expect(scanCurrentPath()!.textContent, '不得改写或重排路径字符').toBe(full)
+    expect(scanCurrent()!.getAttribute('title')).toBe(full)
+    wrapper.unmount()
+  })
+
+  it('路径行位于可滚动的 .ss-content 内，末行才能滚出底部标签栏', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: '/剧集/第一季/第 01 集' })
+    await flushPromises()
+
+    const el = scanCurrent()
+    expect(el!.closest('.ss-content'), '路径行必须在可滚动容器内，末行才不会被底部标签栏盖住').toBeTruthy()
+    wrapper.unmount()
+  })
+
+  it('根路径与短路径原样展示', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: '/' })
+    await flushPromises()
+    expect(scanCurrent()!.textContent).toContain('/')
+    expect(scanCurrent()!.textContent).not.toContain('…')
+    expect(scanCurrentPath()!.textContent).toBe('/')
+    expect(scanCurrent()!.getAttribute('title')).toBe('/')
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: '/剧集' })
+    await flushPromises()
+    expect(scanCurrent()!.textContent).toContain('/剧集')
+    expect(scanCurrentPath()!.textContent).toBe('/剧集')
+    expect(scanCurrent()!.getAttribute('title')).toBe('/剧集')
+    wrapper.unmount()
+  })
+
+  it('新的扫描帧替换旧路径', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: '/剧集/第一季' })
+    await flushPromises()
+    expect(scanCurrentPath()!.textContent).toBe('/剧集/第一季')
+
+    const next = '/剧集/第二季/第 02 集'
+    emitWs({ ...SCAN_PROGRESS, current_dir: next })
+    await flushPromises()
+    expect(scanCurrentPath()!.textContent).toBe(next)
+    expect(scanCurrent()!.getAttribute('title')).toBe(next)
+    expect(scanCurrent()!.textContent).not.toContain('/剧集/第一季')
+    wrapper.unmount()
+  })
+
+  it('超长无分隔片段完整保留，结尾名称不被 JS 截断', async () => {
+    const long = '/资料库/' + 'A'.repeat(120)
+    const wrapper = mountView()
+    await flushPromises()
+
+    emitWs({ ...SCAN_PROGRESS, current_dir: long })
+    await flushPromises()
+
+    expect(scanCurrentPath()!.textContent).toBe(long)
+    expect(scanCurrent()!.getAttribute('title')).toBe(long)
+    expect(scanCurrent()!.textContent).not.toContain('…')
+    wrapper.unmount()
+  })
+})
+
+describe('ShareSyncView 正则排除规则', () => {
+  const WITH_REGEX = {
+    ...SUB,
+    exclude_patterns: ['*.tmp'],
+    exclude_regex_patterns: ['^/股票/按月归档/2025.*$'],
+  }
+
+  function editButton(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    const btn = Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')
+    expect(btn, `「${name}」应有编辑按钮`).toBeTruthy()
+    return btn!
+  }
+
+  it('卡片摘要分别统计通配符与正则条数', async () => {
+    api.listSubscriptions.mockResolvedValue([WITH_REGEX])
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    const text = card.textContent ?? ''
+    expect(text).toContain('排除通配符 1 条')
+    expect(text).toContain('排除正则 1 条')
+    wrapper.unmount()
+  })
+
+  it('详情弹窗为正则标签加标记，与通配符区分', async () => {
+    api.listSubscriptions.mockResolvedValue([WITH_REGEX])
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    card.click()
+    await flushPromises()
+
+    const tags = Array.from(document.body.querySelectorAll<HTMLElement>('.path-tags .el-tag'))
+    const regexTag = tags.find((t) => t.textContent?.includes('^/股票/按月归档/2025.*$'))
+    expect(regexTag, '详情应展示正则规则').toBeTruthy()
+    expect(regexTag!.textContent).toContain('正则')
+    const globTag = tags.find((t) => t.textContent?.includes('*.tmp'))
+    expect(globTag?.textContent, '通配符标签不加正则标记').not.toContain('正则')
+    wrapper.unmount()
+  })
+
+  it('保存时提交正则字段并保持类型独立', async () => {
+    api.listSubscriptions.mockResolvedValue([WITH_REGEX])
+    api.updateSubscription.mockResolvedValue(WITH_REGEX)
+    const wrapper = mountView()
+    await flushPromises()
+
+    editButton(WITH_REGEX.name).click()
+    await flushPromises()
+    const save = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')!
+    save.click()
+    await flushPromises()
+
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      exclude_patterns: string[]
+      exclude_regex_patterns: string[]
+    }
+    expect(req.exclude_patterns).toEqual(['*.tmp'])
+    expect(req.exclude_regex_patterns).toEqual(['^/股票/按月归档/2025.*$'])
+    wrapper.unmount()
+  })
+
+  it('正则校验未通过时不提交保存', async () => {
+    api.listSubscriptions.mockResolvedValue([WITH_REGEX])
+    editorStub.validateRules.mockResolvedValueOnce({
+      ok: false,
+      message: '正则第 1 条：无法编译正则',
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    editButton(WITH_REGEX.name).click()
+    await flushPromises()
+    const save = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')!
+    save.click()
+    await flushPromises()
+
+    expect(editorStub.validateRules).toHaveBeenCalled()
+    expect(api.updateSubscription, '校验失败不得写接口').not.toHaveBeenCalled()
+    expect(document.body.textContent).toContain('无法编译正则')
+    wrapper.unmount()
+  })
+
+  it('提交前归一化正则列表（去空白、去重、保序）', async () => {
+    const messy = {
+      ...SUB,
+      exclude_regex_patterns: ['  ^/a$  ', '^/a$', '', '^/b$'],
+    }
+    api.listSubscriptions.mockResolvedValue([messy])
+    api.updateSubscription.mockResolvedValue(messy)
+    const wrapper = mountView()
+    await flushPromises()
+
+    editButton(messy.name).click()
+    await flushPromises()
+    const save = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')!
+    save.click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { exclude_regex_patterns: string[] }
+    expect(req.exclude_regex_patterns).toEqual(['^/a$', '^/b$'])
+    wrapper.unmount()
+  })
+
+  it('旧响应缺少正则字段时按空处理，不报错', async () => {
+    const legacy = { ...SUB }
+    delete (legacy as { exclude_regex_patterns?: string[] }).exclude_regex_patterns
+    api.listSubscriptions.mockResolvedValue([legacy])
+    api.updateSubscription.mockResolvedValue(legacy)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.textContent).not.toContain('排除正则')
+
+    editButton(legacy.name).click()
+    await flushPromises()
+    const save = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')!
+    save.click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { exclude_regex_patterns: string[] }
+    expect(req.exclude_regex_patterns).toEqual([])
     wrapper.unmount()
   })
 })

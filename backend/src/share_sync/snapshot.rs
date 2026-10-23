@@ -133,9 +133,9 @@ use std::sync::Arc;
 
 use crate::netdisk::client::NetdiskClient;
 use crate::share_sync::error::ShareSyncError;
+use crate::share_sync::exclusion::CompiledRules;
 use crate::share_sync::rate_limit::QuotaLimiter;
 use crate::transfer::types::{ShareFileListResult, SharedFileInfo};
-use regex::RegexSet;
 use tokio_util::sync::CancellationToken;
 
 /// 抓取结果（含访问元数据，便于后续转存/下载使用）
@@ -293,15 +293,23 @@ impl<'a> SnapshotCollector<'a> {
     }
 
     /// 从 URL + 密码构造一个 collector（先访问分享页取 bdstoken）
+    ///
+    /// 排除规则在**任何网络访问之前**编译：非法规则直接以 `ConfigError` 失败，
+    /// 不会静默退化成「不做任何排除」。
     pub async fn from_url(
         client: &'a NetdiskClient,
         share_url: &str,
         password: Option<String>,
         include_paths: Vec<String>,
         exclude_patterns: Vec<String>,
+        exclude_regex_patterns: Vec<String>,
         exclude_paths: Vec<String>,
         rate_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self, ShareSyncError> {
+        let compiled_exclusions =
+            ExclusionRules::compile(exclude_paths, &exclude_patterns, &exclude_regex_patterns)
+                .map_err(|e| ShareSyncError::ConfigError(e.to_string()))?;
+
         let mut share_link = client
             .parse_share_link(share_url)
             // 用 `{:#}` 保留完整 anyhow 错误链（含底层超时/百度 errno+errmsg），
@@ -346,12 +354,7 @@ impl<'a> SnapshotCollector<'a> {
             .filter_map(normalize_snapshot_path)
             .collect();
         let include_index = build_include_index(&include_paths);
-        let exclude_paths: BTreeSet<String> = exclude_paths
-            .into_iter()
-            .filter_map(normalize_snapshot_path)
-            .collect();
-        let exclusions =
-            ExclusionRules::new(exclude_paths, compile_exclude_patterns(&exclude_patterns));
+        let exclusions = compiled_exclusions;
         Ok(Self {
             client,
             short_key: page.short_key,
@@ -795,22 +798,6 @@ fn build_include_index_impl(include_paths: &BTreeSet<String>) -> BTreeSet<String
     idx
 }
 
-/// 把 glob 模式（仅 `*` / `?`）编译为 `RegexSet`，对每条路径做 O(L) 匹配。
-///
-/// 旧实现是手写递归 + 回溯，复杂度 O(2^L)，对万级条目 × 多个 pattern 会很慢。
-/// 编译失败时回退到"无 exclude"（不阻塞主流程）。
-fn compile_exclude_patterns(patterns: &[String]) -> Option<RegexSet> {
-    if patterns.is_empty() {
-        return None;
-    }
-    let regexes: Vec<String> = patterns
-        .iter()
-        .map(|p| glob_to_regex(p).map(|r| format!("^{}$", r)))
-        .collect::<Result<_, _>>()
-        .ok()?;
-    RegexSet::new(&regexes).ok()
-}
-
 /// 取消检查：令牌已触发时返回「扫描已取消」。
 ///
 /// 自由函数形式便于脱离 collector 直接测试。
@@ -821,32 +808,45 @@ pub fn cancelled_error(cancel: Option<&CancellationToken>) -> Result<(), ShareSy
     Ok(())
 }
 
-/// 排除规则集合：精确目录路径（`exclude_paths`）+ glob 模式（`exclude_patterns`）。
+/// 排除规则集合：精确目录路径（`exclude_paths`）+ glob / 正则模式。
 ///
-/// 两条规则的语义：
+/// 三类规则的语义：
 /// - **精确路径**：命中的目录连同其中全部内容一起排除，且扫描时不再列举该目录。
-/// - **glob 模式**：路径命中即排除；**目录**命中时其整棵子树一起排除。
+/// - **glob / 正则**：路径命中即排除；**目录**命中时其整棵子树一起排除。
 ///
 /// 精确路径的匹配是**边界感知**的：`/a/b` 不会误伤同层的 `/a/bc`。
 #[derive(Debug, Default, Clone)]
 pub struct ExclusionRules {
     /// 精确排除的目录路径（相对分享根）
     exact_paths: BTreeSet<String>,
-    /// 预编译的 exclude glob → RegexSet
-    pattern: Option<RegexSet>,
+    /// 预编译的 glob + 正则规则
+    rules: CompiledRules,
 }
 
 impl ExclusionRules {
-    fn new(exact_paths: BTreeSet<String>, pattern: Option<RegexSet>) -> Self {
-        Self {
-            exact_paths,
-            pattern,
-        }
+    /// 编译排除规则（精确目录 + glob + 正则）。
+    ///
+    /// `Err` 表示规则非法：调用方必须显式失败，**不得**退化成「不做任何排除」。
+    pub fn compile(
+        exclude_paths: Vec<String>,
+        exclude_patterns: &[String],
+        exclude_regex_patterns: &[String],
+    ) -> Result<Self, crate::share_sync::exclusion::RuleError> {
+        let exact_paths: BTreeSet<String> = exclude_paths
+            .into_iter()
+            .filter_map(normalize_snapshot_path)
+            .collect();
+        let rules = CompiledRules::compile(exclude_patterns, exclude_regex_patterns)?;
+        Ok(Self::new(exact_paths, rules))
+    }
+
+    fn new(exact_paths: BTreeSet<String>, rules: CompiledRules) -> Self {
+        Self { exact_paths, rules }
     }
 
     /// 没有任何排除规则
     pub fn is_empty(&self) -> bool {
-        self.exact_paths.is_empty() && self.pattern.is_none()
+        self.exact_paths.is_empty() && self.rules.is_empty()
     }
 
     /// 精确路径是否覆盖 `path`（`path` 自身或其后代）
@@ -856,12 +856,9 @@ impl ExclusionRules {
             .any(|p| is_path_ancestor_or_self(path, p))
     }
 
-    /// glob 模式是否命中 `path`
+    /// glob / 正则是否命中 `path` 自身或其祖先目录
     fn pattern_hit(&self, path: &str) -> bool {
-        self.pattern
-            .as_ref()
-            .map(|set| set.is_match(path))
-            .unwrap_or(false)
+        self.rules.matches_path(path)
     }
 
     /// 该目录是否应被整棵剪掉（不再列举，其内容不出现在快照里）
@@ -891,24 +888,6 @@ impl ExclusionRules {
             .map(|p| remap_include_to_share_root(p, share_root))
             .collect();
     }
-}
-
-/// 简单 glob → regex 转换（仅 `*` 和 `?`，其余元字符转义）。
-fn glob_to_regex(pattern: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(pattern.len() * 2);
-    for ch in pattern.chars() {
-        match ch {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
-            // regex 元字符需要转义
-            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    Ok(out)
 }
 
 pub fn infer_share_root(files: &[SharedFileInfo]) -> String {
@@ -1253,6 +1232,8 @@ impl ShareFileListResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::share_sync::exclusion::glob_to_regex;
+    use regex::RegexSet;
 
     #[test]
     fn test_ancestor_dirs() {
@@ -1281,16 +1262,12 @@ mod tests {
         ExclusionRules::default()
     }
 
-    /// 精确目录排除 + glob 排除的组合
+    /// 精确目录排除 + glob / 正则排除的组合
     fn exclusions(exact: &[&str], patterns: &[&str]) -> ExclusionRules {
         let exact_paths: BTreeSet<String> = exact.iter().map(|p| p.to_string()).collect();
-        let pattern = compile_exclude_patterns(
-            &patterns
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<String>>(),
-        );
-        ExclusionRules::new(exact_paths, pattern)
+        let globs: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        let rules = CompiledRules::compile(&globs, &[]).expect("测试 glob 应可编译");
+        ExclusionRules::new(exact_paths, rules)
     }
 
     /// ScanCache 的读写与计数。整轮重试靠它续爬，命中即意味着少发一批请求。
@@ -1736,7 +1713,7 @@ mod tests {
         // 模拟 compile_exclude_patterns 的 "^...$" 锚定
         let regexes: Vec<String> = patterns
             .iter()
-            .map(|p| format!("^{}$", glob_to_regex(p).unwrap()))
+            .map(|p| format!("^{}$", glob_to_regex(p)))
             .collect();
         RegexSet::new(&regexes).unwrap()
     }
@@ -1789,9 +1766,9 @@ mod tests {
     #[test]
     fn test_glob_to_regex_escapes_metachars() {
         // 扩展名 dot、字符类、管道等需要转义
-        assert_eq!(glob_to_regex("a.b").unwrap(), "a\\.b");
-        assert_eq!(glob_to_regex("a+b").unwrap(), "a\\+b");
-        assert_eq!(glob_to_regex("a(b)c").unwrap(), "a\\(b\\)c");
+        assert_eq!(glob_to_regex("a.b"), "a\\.b");
+        assert_eq!(glob_to_regex("a+b"), "a\\+b");
+        assert_eq!(glob_to_regex("a(b)c"), "a\\(b\\)c");
     }
 
     #[test]
@@ -1811,22 +1788,160 @@ mod tests {
         assert!(!idx.contains("/a/b/other.csv"));
     }
 
-    #[test]
-    fn test_compile_exclude_empty_returns_none() {
-        let set = compile_exclude_patterns(&[]);
-        assert!(set.is_none());
+    /// 精确目录 + glob + 正则的组合（正则单独成列，便于覆盖扫描侧语义）
+    fn exclusions_with_regex(globs: &[&str], regexes: &[&str]) -> ExclusionRules {
+        let to_vec = |items: &[&str]| items.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        ExclusionRules::compile(Vec::new(), &to_vec(globs), &to_vec(regexes))
+            .expect("测试规则应可编译")
     }
 
     #[test]
-    fn test_compile_exclude_invalid_falls_back() {
-        // `compile_exclude_patterns` 在 `RegexSet::new` 返回 Err 时回退到 None。
-        // 现代 regex crate 非常宽松，常规 glob 都能编译——这里用 Pattern::new 直接
-        // 验证 glob_to_regex 不 panic + compile_exclude_patterns 接受空 patterns。
-        assert!(glob_to_regex("[abc]").is_ok());
-        assert!(compile_exclude_patterns(&[]).is_none());
-        // 正常一组 pattern 编译成功
-        let set = compile_exclude_patterns(&["*.tmp".to_string(), "*.bak".to_string()]);
-        assert!(set.is_some());
+    fn test_regex_dir_admission_prunes_whole_subtree() {
+        let includes: BTreeSet<String> = BTreeSet::new();
+        let index: BTreeSet<String> = BTreeSet::new();
+        let rules = exclusions_with_regex(&[], &["^/股票/按月归档/临时文件$"]);
+
+        // 命中的目录整棵剪掉（既不列举，也不入队）
+        assert!(!dir_allowed_with(
+            &includes,
+            &index,
+            &rules,
+            "/股票/按月归档/临时文件"
+        ));
+        // 兄弟月份与其它父目录不受影响
+        assert!(dir_allowed_with(
+            &includes,
+            &index,
+            &rules,
+            "/股票/按月归档/2026-10"
+        ));
+        assert!(dir_allowed_with(
+            &includes,
+            &index,
+            &rules,
+            "/指数/按月归档/2026-10"
+        ));
+        // 后代路径因祖先命中同样被剪
+        assert!(!dir_allowed_with(
+            &includes,
+            &index,
+            &rules,
+            "/股票/按月归档/临时文件/深层"
+        ));
+    }
+
+    #[test]
+    fn test_absorb_entries_skips_regex_excluded_dirs_and_keeps_new_months() {
+        let includes: BTreeSet<String> = BTreeSet::new();
+        let index: BTreeSet<String> = BTreeSet::new();
+        let rules = exclusions_with_regex(&[], &["^/股票/按月归档/2025.*$"]);
+        let mut all_items = Vec::new();
+        let mut seen = HashSet::new();
+        let mut queued_dirs = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut found = BTreeSet::new();
+        let mut files_seen = 0usize;
+
+        // 列 /股票/按月归档 得到的一批：一个被正则命中的旧月份 + 一个新的月份
+        let batch = vec![
+            shared_file("/股票/按月归档/2025-01", "2025-01", 1, true),
+            shared_file("/股票/按月归档/2026-10", "2026-10", 2, true),
+            shared_file("/股票/按月归档/2026-10/说明.txt", "说明.txt", 3, false),
+        ];
+        absorb_entries(
+            batch,
+            "",
+            &includes,
+            &index,
+            &rules,
+            &mut all_items,
+            &mut seen,
+            &mut queued_dirs,
+            &mut queue,
+            &mut found,
+            &mut files_seen,
+        );
+
+        assert!(
+            !queued_dirs.contains("/股票/按月归档/2025-01"),
+            "命中正则的目录不得入队"
+        );
+        assert!(
+            queued_dirs.contains("/股票/按月归档/2026-10"),
+            "新月份必须继续跟进"
+        );
+        // 该吸收函数同时服务网络与缓存两条路径，因此两种来源都受同一套剪枝约束
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_and_mark_pruned_regex_subtree() {
+        let includes: BTreeSet<String> = BTreeSet::new();
+        let index: BTreeSet<String> = BTreeSet::new();
+        let rules = exclusions_with_regex(&[], &["^/股票/按月归档/临时文件$"]);
+        let all_items = vec![
+            dir_item("/股票/按月归档", 1),
+            dir_item("/股票/按月归档/临时文件", 2),
+            item("/股票/按月归档/临时文件/缓存.bin", 3, 100),
+            item("/股票/按月归档/2026-10/月报.csv", 4, 100),
+        ];
+
+        let out = filter_and_mark_pruned(all_items, &includes, &index, &rules);
+        let by_path: BTreeMap<&str, &ShareSnapshotItem> =
+            out.iter().map(|i| (i.path.as_str(), i)).collect();
+
+        assert!(!by_path.contains_key("/股票/按月归档/临时文件"));
+        assert!(!by_path.contains_key("/股票/按月归档/临时文件/缓存.bin"));
+        assert!(by_path.contains_key("/股票/按月归档/2026-10/月报.csv"));
+        // 被排除的子树会让存活祖先进入「禁止整目录直传」状态
+        assert!(by_path["/股票/按月归档"].subtree_pruned);
+    }
+
+    #[test]
+    fn test_regex_does_not_touch_sibling_or_other_parent() {
+        let rules = exclusions_with_regex(&[], &["^/基金/按月归档/重复数据$"]);
+        assert!(rules.excludes_dir("/基金/按月归档/重复数据"));
+        assert!(
+            !rules.excludes_dir("/基金/按月归档/2026-10"),
+            "兄弟月份不受影响"
+        );
+        assert!(
+            !rules.excludes_dir("/债券/按月归档/重复数据"),
+            "其它父目录不受影响"
+        );
+        assert!(rules.excludes_item("/基金/按月归档/重复数据/a.csv", false));
+    }
+
+    #[test]
+    fn test_invalid_regex_fails_compile_instead_of_disabling_excludes() {
+        let err = ExclusionRules::compile(Vec::new(), &[], &["(".to_string()])
+            .expect_err("非法正则必须显式失败");
+        assert_eq!(err.index, Some(0));
+        let mapped = ShareSyncError::ConfigError(err.to_string());
+        assert!(mapped.to_string().contains("正则"));
+    }
+
+    #[test]
+    fn test_compiled_rules_empty_is_empty() {
+        let rules = CompiledRules::compile(&[], &[]).unwrap();
+        assert!(rules.is_empty());
+        assert!(!rules.matches_path("/a"));
+    }
+
+    #[test]
+    fn test_compiled_rules_invalid_regex_is_error() {
+        // 非法规则必须显式失败：不能静默退化成「不做任何排除」。
+        let err = CompiledRules::compile(&[], &["(".to_string()]).unwrap_err();
+        assert_eq!(err.kind, crate::share_sync::exclusion::RuleKind::Regex);
+        assert_eq!(err.index, Some(0));
+    }
+
+    #[test]
+    fn test_compiled_rules_glob_literals_compile() {
+        assert!(CompiledRules::compile(&["[abc]".to_string()], &[]).is_ok());
+        let rules =
+            CompiledRules::compile(&["*.tmp".to_string(), "*.bak".to_string()], &[]).unwrap();
+        assert!(!rules.is_empty());
     }
 
     #[test]

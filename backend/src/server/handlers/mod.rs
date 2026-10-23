@@ -32,10 +32,10 @@ pub use folder_download::*;
 pub use share::*;
 // 显式列出 share_sync 里的 handler 函数，避免导入 ApiResponse（避免与 auth/autobackup 冲突）
 pub use share_sync::{
-    create_subscription, delete_subscription, disable_subscription, enable_subscription, get_run,
-    get_subscription, latest_snapshot, list_run_items, list_runs, list_subscriptions,
-    list_subtasks, preview_cron, preview_tree, resume_subscription, trigger_subscription,
-    update_subscription,
+    create_subscription, delete_subscription, disable_subscription, enable_subscription,
+    exclude_rule_capabilities, get_run, get_subscription, latest_snapshot, list_run_items,
+    list_runs, list_subscriptions, list_subtasks, preview_cron, preview_tree, resume_subscription,
+    trigger_subscription, update_subscription, validate_exclude_rules,
 };
 pub use task_summary::get_tasks_summary;
 pub use transfer::*;

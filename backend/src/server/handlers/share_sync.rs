@@ -186,6 +186,9 @@ pub async fn update_subscription(
     if let Some(v) = req.exclude_patterns {
         new_sub.exclude_patterns = v;
     }
+    if let Some(v) = req.exclude_regex_patterns {
+        new_sub.exclude_regex_patterns = v;
+    }
     if let Some(v) = req.exclude_paths {
         new_sub.exclude_paths = v;
     }
@@ -770,11 +773,141 @@ where
     }
 }
 
+// =====================================================
+// 排除规则能力与试匹配
+// =====================================================
+
+/// 正则规则限制（与 `share_sync::exclusion` 的实际编译边界一致）。
+#[derive(Debug, Serialize)]
+pub struct RegexRuleLimits {
+    pub max_rules: usize,
+    pub max_rule_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_test_path_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExcludeRuleCapabilities {
+    pub supports_regex: bool,
+    pub regex_limits: RegexRuleLimits,
+}
+
+/// GET /api/v1/share-sync/exclude-rules/capabilities
+///
+/// 前端据此决定是否提供「正则表达式」选项；不支持时保持纯 glob 编辑。
+pub async fn exclude_rule_capabilities() -> ApiResult<Json<ApiResponse<ExcludeRuleCapabilities>>> {
+    use crate::share_sync::exclusion::{
+        MAX_REGEX_RULES, MAX_REGEX_RULE_BYTES, MAX_REGEX_TOTAL_BYTES, MAX_TEST_PATH_BYTES,
+    };
+    Ok(Json(ApiResponse::success(ExcludeRuleCapabilities {
+        supports_regex: true,
+        regex_limits: RegexRuleLimits {
+            max_rules: MAX_REGEX_RULES,
+            max_rule_bytes: MAX_REGEX_RULE_BYTES,
+            max_total_bytes: MAX_REGEX_TOTAL_BYTES,
+            max_test_path_bytes: MAX_TEST_PATH_BYTES,
+        },
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ValidateExcludeRulesRequest {
+    /// 通配符规则（历史字段）
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
+    /// 正则规则
+    #[serde(default)]
+    pub exclude_regex_patterns: Vec<String>,
+    /// 可选试匹配路径（相对分享根）
+    #[serde(default)]
+    pub test_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuleValidationError {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidateExcludeRulesResponse {
+    pub valid: bool,
+    pub errors: Vec<RuleValidationError>,
+    /// 仅在规则全部合法且提供了 `test_path` 时返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<bool>,
+}
+
+fn rule_validation_error(err: crate::share_sync::exclusion::RuleError) -> RuleValidationError {
+    RuleValidationError {
+        kind: err.kind.as_str(),
+        index: err.index,
+        message: err.message,
+    }
+}
+
+/// POST /api/v1/share-sync/exclude-rules/validate
+///
+/// 只校验/试匹配请求里的两份规则列表（不涉及 include 路径、精确目录排除、分享链接）。
+/// 规则非法时返回 `valid:false` 且不执行任何匹配。
+pub async fn validate_exclude_rules(
+    Json(req): Json<ValidateExcludeRulesRequest>,
+) -> ApiResult<Json<ApiResponse<ValidateExcludeRulesResponse>>> {
+    use crate::share_sync::exclusion;
+
+    if let Err(e) = exclusion::validate_rules(&req.exclude_patterns, &req.exclude_regex_patterns) {
+        return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+            valid: false,
+            errors: vec![rule_validation_error(e)],
+            excluded: None,
+        })));
+    }
+
+    let Some(raw_path) = req.test_path else {
+        return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+            valid: true,
+            errors: Vec::new(),
+            excluded: None,
+        })));
+    };
+
+    let path = match exclusion::normalize_test_path(&raw_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+                valid: false,
+                errors: vec![rule_validation_error(e)],
+                excluded: None,
+            })))
+        }
+    };
+
+    let compiled =
+        match exclusion::CompiledRules::compile(&req.exclude_patterns, &req.exclude_regex_patterns)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+                    valid: false,
+                    errors: vec![rule_validation_error(e)],
+                    excluded: None,
+                })))
+            }
+        };
+
+    Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+        valid: true,
+        errors: Vec::new(),
+        excluded: Some(compiled.matches_path(&path)),
+    })))
+}
+
 #[cfg(test)]
 mod cron_preview_tests {
     use super::*;
     use chrono::{FixedOffset, TimeZone};
-
     #[test]
     fn preview_valid_expression() {
         let tz = FixedOffset::east_opt(8 * 3600).unwrap();
@@ -812,4 +945,133 @@ mod cron_preview_tests {
 #[allow(dead_code)]
 fn _suppress_unused_status() -> StatusCode {
     StatusCode::OK
+}
+
+#[cfg(test)]
+mod exclude_rule_endpoint_tests {
+    use super::*;
+
+    async fn validate(
+        patterns: &[&str],
+        regexes: &[&str],
+        path: Option<&str>,
+    ) -> ValidateExcludeRulesResponse {
+        let req = ValidateExcludeRulesRequest {
+            exclude_patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            exclude_regex_patterns: regexes.iter().map(|p| p.to_string()).collect(),
+            test_path: path.map(|p| p.to_string()),
+        };
+        let Json(resp) = validate_exclude_rules(Json(req))
+            .await
+            .expect("不应返回传输错误");
+        resp.data
+    }
+
+    #[tokio::test]
+    async fn capabilities_advertise_regex_and_limits() {
+        let Json(resp) = exclude_rule_capabilities().await.unwrap();
+        assert!(resp.data.supports_regex);
+        assert_eq!(resp.data.regex_limits.max_rules, 64);
+        assert_eq!(resp.data.regex_limits.max_rule_bytes, 1024);
+        assert_eq!(resp.data.regex_limits.max_total_bytes, 32768);
+        assert_eq!(resp.data.regex_limits.max_test_path_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn valid_rules_without_path_have_no_result() {
+        let r = validate(&["*.tmp"], &["^/股票/按月归档/2025.*$"], None).await;
+        assert!(r.valid);
+        assert!(r.errors.is_empty());
+        assert!(r.excluded.is_none());
+    }
+
+    #[tokio::test]
+    async fn glob_and_regex_both_participate() {
+        let glob = validate(&["*.tmp"], &[], Some("/a/b.tmp")).await;
+        assert_eq!(glob.excluded, Some(true));
+        let regex = validate(
+            &[],
+            &["^/股票/按月归档/2025.*$"],
+            Some("/股票/按月归档/2025-03/x.mp4"),
+        )
+        .await;
+        assert_eq!(regex.excluded, Some(true));
+        let neither = validate(&["*.tmp"], &["^/股票/.*$"], Some("/基金/2026-01/a.bin")).await;
+        assert_eq!(neither.excluded, Some(false));
+    }
+
+    #[tokio::test]
+    async fn regex_ancestor_prunes_descendants() {
+        let r = validate(
+            &[],
+            &["^/股票/按月归档/临时文件$"],
+            Some("/股票/按月归档/临时文件/深层/a.bin"),
+        )
+        .await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(true));
+    }
+
+    #[tokio::test]
+    async fn invalid_regex_reports_kind_and_index_without_matching() {
+        let r = validate(&["*.tmp"], &["^/ok$", "("], Some("/a.tmp")).await;
+        assert!(!r.valid);
+        assert!(r.excluded.is_none(), "非法规则不得执行匹配");
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].kind, "regex");
+        assert_eq!(r.errors[0].index, Some(1));
+        assert!(!r.errors[0].message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_regex_is_rejected() {
+        let r = validate(&[], &["  "], None).await;
+        assert!(!r.valid);
+        assert_eq!(r.errors[0].kind, "regex");
+        assert_eq!(r.errors[0].index, Some(0));
+    }
+
+    #[tokio::test]
+    async fn too_many_regex_rules_is_list_level_error() {
+        let many: Vec<String> = (0..65).map(|i| format!("^/{i}$")).collect();
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let r = validate(&[], &refs, None).await;
+        assert!(!r.valid);
+        assert_eq!(r.errors[0].kind, "rules");
+        assert!(r.errors[0].index.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_test_path_is_path_error() {
+        let long = format!("/{}", "a".repeat(5000));
+        let r = validate(&["*.tmp"], &[], Some(&long)).await;
+        assert!(!r.valid);
+        assert_eq!(r.errors[0].kind, "path");
+        assert!(r.errors[0].message.contains("4096"));
+    }
+
+    #[tokio::test]
+    async fn test_path_is_normalized_like_snapshot_paths() {
+        let r = validate(&[], &["^/a/b$"], Some("//a//b/")).await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(true));
+        // 空路径归一为虚拟根：只有能匹配 `/` 的规则才命中
+        let root = validate(&[], &["^/a$"], Some("  ")).await;
+        assert_eq!(root.excluded, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_matches_only_rule_lists_not_exact_dirs() {
+        // 精确目录排除不在本接口内，试匹配只反映两份规则列表
+        let r = validate(&[], &[], Some("/股票/按月归档/临时文件")).await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(false));
+    }
+
+    #[tokio::test]
+    async fn match_all_regex_is_legal() {
+        let r = validate(&[], &[".*"], Some("/任何/路径")).await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(true));
+    }
 }
