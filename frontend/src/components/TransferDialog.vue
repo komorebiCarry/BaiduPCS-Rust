@@ -114,12 +114,14 @@
           </el-form-item>
           <el-form-item label="同步范围">
             <ShareIncludeExcludeEditor
+                ref="excludeEditorRef"
                 :share-url="form.shareUrl"
                 :password="form.password || null"
                 :owner-uid="authStore.activeUid ?? null"
                 :owner-logged-in="true"
                 v-model:include-paths="form.includePaths"
                 v-model:exclude-patterns="form.excludePatterns"
+                v-model:exclude-regex-patterns="form.excludeRegexPatterns"
                 v-model:exclude-paths="form.excludePaths"
             />
           </el-form-item>
@@ -330,6 +332,7 @@ const form = reactive({
   syncCronExpr: '',
   includePaths: [] as string[],
   excludePatterns: [] as string[],
+  excludeRegexPatterns: [] as string[],
   excludePaths: [] as string[],
   // 订阅目标开关（至少开一个）：转存到网盘 / 同步到本地
   syncToNetdisk: true,
@@ -433,6 +436,7 @@ async function handleOpen() {
   form.syncCronExpr = ''
   form.includePaths = []
   form.excludePatterns = []
+  form.excludeRegexPatterns = []
   form.excludePaths = []
 
   try {
@@ -487,6 +491,7 @@ function handleClose() {
   form.syncCronExpr = ''
   form.includePaths = []
   form.excludePatterns = []
+  form.excludeRegexPatterns = []
   form.excludePaths = []
   form.syncToNetdisk = true
   form.syncToLocal = false
@@ -593,6 +598,8 @@ function handlePreviewError(error: any) {
 
 // cron 编辑器（提交前用其预览结果拦截已知无效的表达式）
 const cronEditorRef = ref<InstanceType<typeof CronExprEditor> | null>(null)
+// 排除规则编辑器：创建订阅前由它做后端正则校验
+const excludeEditorRef = ref<InstanceType<typeof ShareIncludeExcludeEditor> | null>(null)
 
 // 按所选轮询方式构造 poll_config；校验失败时提示并返回 null
 function buildSyncPollConfig(): PollConfig | null {
@@ -657,6 +664,12 @@ async function createSyncSubscription() {
     ElMessage.error('已开启“同步到本地”，请选择本地目录')
     return
   }
+  // 存在正则规则时必须经后端校验通过才创建（老后端不会被静默忽略）
+  const ruleCheck = await excludeEditorRef.value?.validateRules?.()
+  if (ruleCheck && !ruleCheck.ok) {
+    ElMessage.error(ruleCheck.message || '排除规则校验失败')
+    return
+  }
 
   submitting.value = true
   errorMessage.value = ''
@@ -667,6 +680,7 @@ async function createSyncSubscription() {
       password: form.password || null,
       include_paths: form.includePaths,
       exclude_patterns: form.excludePatterns,
+      exclude_regex_patterns: form.excludeRegexPatterns,
       exclude_paths: form.excludePaths,
       targets: buildSyncTargets(),
       poll_config: pollConfig,

@@ -186,9 +186,12 @@ pub struct ShareSubscription {
     /// 限定订阅的子路径列表（空 = 整个分享）
     #[serde(default)]
     pub include_paths: Vec<String>,
-    /// 排除 glob 模式列表
+    /// 排除 glob 模式列表（历史字段，始终按通配符解释）
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
+    /// 排除正则列表（Rust 语法，整条路径匹配）；旧配置缺省为空。
+    #[serde(default)]
+    pub exclude_regex_patterns: Vec<String>,
     /// 精确排除的目录路径（相对分享根）：连同全部内容排除，且不再递归列举。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
@@ -241,6 +244,7 @@ impl ShareSubscription {
             password: None,
             include_paths: Vec::new(),
             exclude_patterns: Vec::new(),
+            exclude_regex_patterns: Vec::new(),
             exclude_paths: Vec::new(),
             targets,
             conflict_strategy: ConflictStrategy::default(),
@@ -270,6 +274,11 @@ impl ShareSubscription {
             return Err("分享链接不能为空".into());
         }
         validate_share_url(&self.share_url)?;
+        crate::share_sync::exclusion::validate_rules(
+            &self.exclude_patterns,
+            &self.exclude_regex_patterns,
+        )
+        .map_err(|e| e.to_string())?;
         if self.targets.is_empty() {
             return Err("至少需要配置一个同步目标".into());
         }
@@ -452,6 +461,9 @@ pub struct CreateShareSubscriptionRequest {
     pub include_paths: Vec<String>,
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
+    /// 排除正则列表（Rust 语法，整条路径匹配）；缺省为空。
+    #[serde(default)]
+    pub exclude_regex_patterns: Vec<String>,
     /// 精确排除的目录路径（相对分享根）；缺省为空 = 不排除。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
@@ -475,6 +487,7 @@ impl CreateShareSubscriptionRequest {
         sub.password = self.password;
         sub.include_paths = self.include_paths;
         sub.exclude_patterns = self.exclude_patterns;
+        sub.exclude_regex_patterns = self.exclude_regex_patterns;
         sub.exclude_paths = self.exclude_paths;
         if let Some(s) = self.conflict_strategy {
             sub.conflict_strategy = s;
@@ -502,6 +515,9 @@ pub struct UpdateShareSubscriptionRequest {
     pub include_paths: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_patterns: Option<Vec<String>>,
+    /// 缺省（字段缺失）= 保留已有正则规则；显式 `[]` = 清空。
+    #[serde(default)]
+    pub exclude_regex_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_paths: Option<Vec<String>>,
     #[serde(default)]
@@ -910,6 +926,7 @@ mod tests {
             password: Some("1234".into()),
             include_paths: vec!["/a".into()],
             exclude_patterns: vec![],
+            exclude_regex_patterns: vec!["^/股票/2025.*$".into()],
             exclude_paths: vec!["/a/tmp".into()],
             targets: vec![SyncTarget::Netdisk(NetdiskTarget {
                 remote_path: "/y".into(),
@@ -956,6 +973,100 @@ mod tests {
         assert!(sub.exclude_paths.is_empty());
         assert_eq!(sub.include_paths, vec!["/a".to_string()]);
         assert_eq!(sub.exclude_patterns, vec!["*.tmp".to_string()]);
+    }
+
+    /// 老订阅没有 exclude_regex_patterns 字段：默认空，且旧 glob（含字面量括号 /
+    /// 括号 / `re:` 前缀）语义不变。
+    #[test]
+    fn test_subscription_without_regex_field_keeps_glob_semantics() {
+        let json = r#"{
+            "id": "s1",
+            "name": "t",
+            "share_url": "https://pan.baidu.com/s/1y7CluAbCdEfGh",
+            "include_paths": [],
+            "exclude_patterns": ["*.tmp", "/a(1)", "/b[2]", "re:x"],
+            "targets": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let sub: ShareSubscription = serde_json::from_str(json).unwrap();
+        assert!(sub.exclude_regex_patterns.is_empty());
+        assert_eq!(
+            sub.exclude_patterns,
+            vec![
+                "*.tmp".to_string(),
+                "/a(1)".to_string(),
+                "/b[2]".to_string(),
+                "re:x".to_string()
+            ]
+        );
+        // 全部仍按通配符解释：字面量括号 / 括号 / `re:` 前缀都不做正则解析
+        let rules = crate::share_sync::exclusion::CompiledRules::compile(
+            &sub.exclude_patterns,
+            &sub.exclude_regex_patterns,
+        )
+        .unwrap();
+        assert!(rules.matches_self("/a(1)"));
+        assert!(!rules.matches_self("/a1"));
+        assert!(rules.matches_self("/b[2]"));
+        assert!(rules.matches_self("re:x"));
+        // 规则校验（订阅保存入口使用同一套）对这份历史配置保持放行
+        assert!(crate::share_sync::exclusion::validate_rules(
+            &sub.exclude_patterns,
+            &sub.exclude_regex_patterns
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_regex_patterns_roundtrip() {
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        sub.exclude_regex_patterns = vec!["^/股票/按月归档/20(25|26)-.*$".into()];
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: ShareSubscription = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.exclude_regex_patterns,
+            vec!["^/股票/按月归档/20(25|26)-.*$".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_regex() {
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })],
+        );
+        sub.exclude_regex_patterns = vec!["^/ok$".into(), "(".into()];
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("第 2 条"), "{err}");
+
+        sub.exclude_regex_patterns = vec!["  ".into()];
+        assert!(sub.validate().unwrap_err().contains("不能为空"));
+    }
+
+    #[test]
+    fn test_update_request_missing_vs_empty_regex_list() {
+        // 字段缺失 = 保留（Option None）
+        let missing: UpdateShareSubscriptionRequest =
+            serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert!(missing.exclude_regex_patterns.is_none());
+        // 显式 [] = 清空（Option Some(vec![])）
+        let cleared: UpdateShareSubscriptionRequest =
+            serde_json::from_str(r#"{"exclude_regex_patterns":[]}"#).unwrap();
+        assert_eq!(cleared.exclude_regex_patterns, Some(Vec::new()));
     }
 
     /// 精确目录排除随订阅序列化往返，编辑后不丢失。

@@ -61,7 +61,10 @@
                   <span class="dot">·</span><span>范围 {{ s.include_paths.length }} 条</span>
                 </template>
                 <template v-if="s.exclude_patterns.length">
-                  <span class="dot">·</span><span>排除 {{ s.exclude_patterns.length }} 条</span>
+                  <span class="dot">·</span><span>排除通配符 {{ s.exclude_patterns.length }} 条</span>
+                </template>
+                <template v-if="(s.exclude_regex_patterns?.length ?? 0) > 0">
+                  <span class="dot">·</span><span>排除正则 {{ s.exclude_regex_patterns!.length }} 条</span>
                 </template>
                 <template v-if="s.exclude_paths?.length">
                   <span class="dot">·</span><span>排除目录 {{ s.exclude_paths.length }} 个</span>
@@ -153,8 +156,9 @@
                     :indeterminate="true"
                     :duration="1"
                 />
-                <div class="scan-current" :title="scanOf(s.id)!.current_dir">
-                  当前：{{ scanTail(scanOf(s.id)!.current_dir) }}
+                <div class="scan-current" :title="scanOf(s.id)!.current_dir || '/'">
+                  <span class="scan-current-label">当前：</span>
+                  <span class="scan-current-path"><bdi>{{ scanOf(s.id)!.current_dir || '/' }}</bdi></span>
                 </div>
                 <div v-if="scanOf(s.id)!.attempt > 1" class="scan-retry">
                   网络异常，正在第 {{ scanOf(s.id)!.attempt }} 次重试<span
@@ -294,7 +298,10 @@
             <span v-else>同步整个分享</span>
           </el-descriptions-item>
           <el-descriptions-item label="排除规则">
-            <div v-if="selected.exclude_patterns.length > 0" class="path-tags">
+            <div
+                v-if="selected.exclude_patterns.length > 0 || (selected.exclude_regex_patterns?.length ?? 0) > 0"
+                class="path-tags"
+            >
               <el-tag
                   v-for="(p, i) in selected.exclude_patterns"
                   :key="`ex-${i}`"
@@ -302,6 +309,14 @@
                   type="info"
               >
                 {{ p }}
+              </el-tag>
+              <el-tag
+                  v-for="(p, i) in (selected.exclude_regex_patterns ?? [])"
+                  :key="`exr-${i}`"
+                  size="small"
+                  type="warning"
+              >
+                <span class="rule-kind">正则</span>{{ p }}
               </el-tag>
             </div>
             <span v-else>无</span>
@@ -354,12 +369,14 @@
         </el-form-item>
         <el-form-item label="同步范围">
           <ShareIncludeExcludeEditor
+              ref="excludeEditorRef"
               :share-url="form.share_url"
               :password="form.password || null"
               :owner-uid="selected?.owner_uid ?? null"
               :owner-logged-in="selectedOwnerLoggedIn"
               v-model:include-paths="form.include_paths"
               v-model:exclude-patterns="form.exclude_patterns"
+              v-model:exclude-regex-patterns="form.exclude_regex_patterns"
               v-model:exclude-paths="form.exclude_paths"
           />
         </el-form-item>
@@ -776,14 +793,6 @@ function scanSummary(p: ScanProgressState): string {
   return parts.join(' · ')
 }
 
-/** 深目录路径只留末两级，避免把卡片撑爆；完整路径挂在 title 上。 */
-function scanTail(dir: string): string {
-  if (!dir) return '/'
-  const segs = dir.split('/').filter(Boolean)
-  if (segs.length <= 2) return '/' + segs.join('/')
-  return '…/' + segs.slice(-2).join('/')
-}
-
 // 子任务列表默认折叠（几千文件时不铺满卡片）；按订阅记忆展开态。
 const expandedSubtasks = ref<Set<string>>(new Set())
 function subtasksExpanded(id: string): boolean {
@@ -857,6 +866,7 @@ const scheduledTime = ref<string>('03:00')
 
 // cron 编辑器（保存前用其预览结果拦截已知无效的表达式）
 const cronEditorRef = ref<InstanceType<typeof CronExprEditor> | null>(null)
+const excludeEditorRef = ref<InstanceType<typeof ShareIncludeExcludeEditor> | null>(null)
 
 // 路径编辑
 function createDefaultTarget(): SyncTarget {
@@ -964,6 +974,7 @@ const defaultForm = (): {
   password: string
   include_paths: string[]
   exclude_patterns: string[]
+  exclude_regex_patterns: string[]
   exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
@@ -975,6 +986,7 @@ const defaultForm = (): {
   password: '',
   include_paths: [],
   exclude_patterns: [],
+  exclude_regex_patterns: [],
   exclude_paths: [],
   targets: [createDefaultTarget()],
   conflict_strategy: 'overwrite',
@@ -1134,6 +1146,7 @@ function openEdit(s?: ShareSubscription) {
     password: selected.value.password || '',
     include_paths: [...selected.value.include_paths],
     exclude_patterns: [...selected.value.exclude_patterns],
+    exclude_regex_patterns: [...(selected.value.exclude_regex_patterns ?? [])],
     exclude_paths: [...(selected.value.exclude_paths ?? [])],
     targets: selected.value.targets.map(t => ({ ...t })) as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
@@ -1175,6 +1188,12 @@ async function saveForm() {
     return
   }
   syncScheduledTimeFromPicker()
+  // 存在正则规则时，必须由后端确认整份配置合法后才提交（旧后端不会被静默忽略）
+  const ruleCheck = await excludeEditorRef.value?.validateRules?.()
+  if (ruleCheck && !ruleCheck.ok) {
+    ElMessage.error(ruleCheck.message || '排除规则校验失败')
+    return
+  }
   buildSanitizedPayload()
   if (!validateForm()) {
     return
@@ -1188,6 +1207,7 @@ async function saveForm() {
         password: form.value.password || null,
         include_paths: form.value.include_paths,
         exclude_patterns: form.value.exclude_patterns,
+        exclude_regex_patterns: form.value.exclude_regex_patterns,
         exclude_paths: form.value.exclude_paths,
         targets: form.value.targets,
         conflict_strategy: form.value.conflict_strategy,
@@ -1315,6 +1335,13 @@ function buildSanitizedPayload() {
       excludeSet.add(n)
     }
   }
+  const regexSet = new Set<string>()
+  for (const p of form.value.exclude_regex_patterns) {
+    const n = p.trim()
+    if (n && !regexSet.has(n)) {
+      regexSet.add(n)
+    }
+  }
   const excludePathSet = new Set<string>()
   for (const p of form.value.exclude_paths) {
     const n = normalizePath(p)
@@ -1324,6 +1351,7 @@ function buildSanitizedPayload() {
   }
   form.value.include_paths = Array.from(includeSet)
   form.value.exclude_patterns = Array.from(excludeSet)
+  form.value.exclude_regex_patterns = Array.from(regexSet)
   form.value.exclude_paths = Array.from(excludePathSet)
 
   const nextTargets: SyncTarget[] = []
@@ -2047,8 +2075,18 @@ onUnmounted(() => {
 
 .ss-content {
   flex: 1;
+  // 允许收缩并内部滚动，避免内容撑高后被外层 overflow:hidden 裁掉
+  min-height: 0;
   overflow: auto;
   padding: 16px 20px;
+}
+
+// 移动端底部为 fixed 标签栏（56px + 安全区）：限制本页高度，余下由 .ss-content 内部滚动
+.main-layout.is-mobile .share-sync-view {
+  max-height: calc(100vh - 60px - 56px - env(safe-area-inset-bottom, 0px));
+}
+.main-layout.is-mobile .ss-content {
+  padding-bottom: 12px;
 }
 
 // ==================== 订阅卡片列表（自动备份风格） ====================
@@ -2212,9 +2250,26 @@ onUnmounted(() => {
   margin-top: 6px;
   font-size: 12px;
   color: #909399;
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+}
+.scan-current-label {
+  flex: none;
+}
+// rtl 让省略号出现在行首（保留结尾子目录），bdi 保持路径 LTR 顺序
+.scan-current-path {
+  flex: 1 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.scan-current-path > bdi {
+  direction: ltr;
+  unicode-bidi: isolate;
 }
 // 重试提示用告警色：让用户一眼看出是网络在抖，而不是程序卡死
 .scan-retry {
@@ -2325,7 +2380,14 @@ onUnmounted(() => {
   color: #909399;
   font-size: 12px;
 }
-.path-tags { display: flex; flex-wrap: wrap; align-items: center; }
+.path-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.rule-kind {
+  margin-right: 4px;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.06);
+  font-size: 11px;
+}
 .path-actions { display: flex; align-items: center; }
 
 .tree-picker-toolbar {

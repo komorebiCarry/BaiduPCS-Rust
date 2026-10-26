@@ -63,6 +63,8 @@ export interface ShareSubscription {
   password?: string | null
   include_paths: string[]
   exclude_patterns: string[]
+  /** 排除正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
+  exclude_regex_patterns?: string[]
   /** 精确排除的目录路径（相对分享根）；命中的目录连同其中全部内容一起排除 */
   exclude_paths: string[]
   targets: SyncTarget[]
@@ -88,6 +90,8 @@ export interface CreateShareSubscriptionRequest {
   password?: string | null
   include_paths?: string[]
   exclude_patterns?: string[]
+  /** 排除正则（Rust 语法，整条路径匹配） */
+  exclude_regex_patterns?: string[]
   /** 精确排除的目录路径（相对分享根） */
   exclude_paths?: string[]
   targets: SyncTarget[]
@@ -104,6 +108,8 @@ export interface UpdateShareSubscriptionRequest {
   password?: string | null
   include_paths?: string[]
   exclude_patterns?: string[]
+  /** 缺省 = 保留已存正则；显式 [] = 清空 */
+  exclude_regex_patterns?: string[]
   /** 精确排除的目录路径（相对分享根） */
   exclude_paths?: string[]
   targets?: SyncTarget[]
@@ -447,6 +453,76 @@ export async function previewTree(
         depth,
         // 按订阅所属账号路由网盘 client（编辑非当前账号订阅时必需）；不传则后端回退 active 账号
         owner_uid: ownerUid ?? undefined,
+      }
+  )
+  return r.data.data
+}
+
+// ==================== 排除规则能力与试匹配 ====================
+
+/** 规则错误类型，与后端 `kind` 取值一致 */
+export type ExcludeRuleKind = 'glob' | 'regex' | 'path' | 'rules'
+
+export interface ExcludeRuleError {
+  kind: ExcludeRuleKind
+  /** 0 起的列表下标；列表级错误没有 */
+  index?: number
+  message: string
+}
+
+export interface ExcludeRegexLimits {
+  max_rules: number
+  max_rule_bytes: number
+  max_total_bytes: number
+  max_test_path_bytes: number
+}
+
+export interface ExcludeRuleCapabilities {
+  supports_regex: boolean
+  regex_limits: ExcludeRegexLimits
+}
+
+export interface ValidateExcludeRulesRequest {
+  exclude_patterns?: string[]
+  exclude_regex_patterns?: string[]
+  /** 可选试匹配路径（相对分享根） */
+  test_path?: string
+}
+
+export interface ValidateExcludeRulesResponse {
+  valid: boolean
+  errors: ExcludeRuleError[]
+  /** 仅规则合法且提供了 test_path 时返回 */
+  excluded?: boolean
+}
+
+/**
+ * 服务端是否支持正则排除规则及其限制。
+ *
+ * 失败（404 / 网络不可用）时调用方必须保持纯 glob 编辑，不能把异常当成「支持」。
+ */
+export async function getExcludeRuleCapabilities(): Promise<ExcludeRuleCapabilities> {
+  const r = await rawApiClient.get<{ success: boolean; data: ExcludeRuleCapabilities }>(
+      `${BASE}/exclude-rules/capabilities`
+  )
+  return r.data.data
+}
+
+/**
+ * 校验排除规则，可选对一条相对分享根路径试匹配。
+ *
+ * 只覆盖请求里的两份规则列表（不含同步范围与精确排除目录）；规则非法时
+ * `valid:false` 且后端不会执行匹配。
+ */
+export async function validateExcludeRules(
+    req: ValidateExcludeRulesRequest
+): Promise<ValidateExcludeRulesResponse> {
+  const r = await rawApiClient.post<{ success: boolean; data: ValidateExcludeRulesResponse }>(
+      `${BASE}/exclude-rules/validate`,
+      {
+        exclude_patterns: req.exclude_patterns ?? [],
+        exclude_regex_patterns: req.exclude_regex_patterns ?? [],
+        ...(req.test_path === undefined ? {} : { test_path: req.test_path }),
       }
   )
   return r.data.data

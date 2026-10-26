@@ -197,8 +197,10 @@ export interface ConflictStrategyConfig {
 
 /// 分享同步配置
 export interface ShareSyncConfig {
-  /** 排除规则常用词表：创建/编辑订阅时点选快速添加；在系统设置页维护 */
+  /** 排除规则常用词表（通配符）：创建/编辑订阅时点选快速添加；在系统设置页维护 */
   exclude_preset_rules: string[]
+  /** 正则排除规则常用词表；旧后端不返回该字段（按空处理），与 glob 词表相互独立 */
+  exclude_regex_preset_rules?: string[]
 }
 
 /// 界面偏好配置

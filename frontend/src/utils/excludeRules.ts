@@ -12,6 +12,9 @@
  * - 不按空格切分 —— 规则常含空格（如 `*S02 连载中*`）。
  */
 
+/** 规则类型：历史字段按通配符解释，正则需显式选择 */
+export type ExcludeRuleKind = 'glob' | 'regex'
+
 /** 把输入文本解析成规则列表：按行拆分，行内内容（含逗号等标点）原样保留。 */
 export function parseRuleInput(text: string): string[] {
   return text
@@ -28,4 +31,57 @@ export function mergeRules(existing: readonly string[], incoming: readonly strin
     if (t && !next.includes(t)) next.push(t)
   }
   return next
+}
+
+/** 旧响应可能缺字段：统一归一为数组（去空白、去重、保序） */
+export function normalizeRuleList(list: readonly string[] | null | undefined): string[] {
+  return mergeRules([], list ?? [])
+}
+
+/** 两份规则列表内容是否完全一致（用于丢弃过期的异步结果） */
+export function sameRuleList(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false
+  return a.every((v, i) => v === b[i])
+}
+
+/** 规则类型的展示名 */
+export function ruleKindLabel(kind: ExcludeRuleKind): string {
+  return kind === 'regex' ? '正则表达式' : '通配符'
+}
+
+/**
+ * 新增批次的错误文案：落在本次新增范围内的下标换算成「本次新增第 N 条」，
+ * 让多行一次添加时能对应回输入框里的那一行；其余错误仍用整份列表下标。
+ */
+export function describeRuleErrorFrom(
+  err: { kind: string; index?: number; message: string },
+  addedKind: ExcludeRuleKind,
+  baseLength: number,
+): string {
+  if (err.kind === addedKind && typeof err.index === 'number' && err.index >= baseLength) {
+    const label = err.kind === 'regex' ? '正则' : '通配符'
+    return `${label}本次新增第 ${err.index - baseLength + 1} 条：${err.message}`
+  }
+  return describeRuleError(err)
+}
+
+/**
+ * 规则错误转成一行可读文案。
+ *
+ * 下标是 0 起的列表位置，展示时 +1；与后端 `kind/index/message` 契约一致。
+ */
+export function describeRuleError(err: {
+  kind: string
+  index?: number
+  message: string
+}): string {
+  const label = err.kind === 'regex'
+    ? '正则'
+    : err.kind === 'glob'
+      ? '通配符'
+      : err.kind === 'path'
+        ? '测试路径'
+        : '规则'
+  const where = typeof err.index === 'number' ? `第 ${err.index + 1} 条：` : ''
+  return `${label}${where}${err.message}`
 }

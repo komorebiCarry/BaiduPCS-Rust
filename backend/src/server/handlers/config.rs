@@ -1,7 +1,8 @@
 // 配置管理 API
 
 use crate::config::{
-    AppConfig, DownloadConfig, PathValidationResult, VipRecommendedConfig, VipType, APP_CONFIG_PATH,
+    AppConfig, DownloadConfig, PathValidationResult, ShareSyncConfig, VipRecommendedConfig,
+    VipType, APP_CONFIG_PATH,
 };
 use crate::server::error::{ApiError, ApiResult};
 use axum::{extract::State, response::Json};
@@ -190,9 +191,12 @@ pub async fn reset_to_recommended(
 /// 更新配置
 pub async fn update_config(
     State(app_state): State<crate::server::AppState>,
-    Json(mut new_config): Json<AppConfig>,
+    Json(raw): Json<serde_json::Value>,
 ) -> ApiResult<Json<ApiResponse<ConfigUpdateResponse>>> {
     info!("更新应用配置");
+
+    let mut new_config: AppConfig = serde_json::from_value(raw.clone())
+        .map_err(|e| ApiError::BadRequest(format!("配置格式不合法: {}", e)))?;
 
     // 基本验证
     if new_config.download.max_global_threads == 0 {
@@ -257,6 +261,14 @@ pub async fn update_config(
         // 设置页会把 GET /config 拿到的整份配置原样提交回来，这里一律以服务端
         // 当前值为准，防止旧值或伪造值关闭认证（issue #177）
         new_config.web_auth = guard.web_auth.clone();
+
+        preserve_missing_regex_presets(&raw, &mut new_config, &guard.share_sync);
+        if let Err(e) = new_config.share_sync.validate() {
+            return Err(ApiError::BadRequest(format!(
+                "分享同步排除规则校验失败: {}",
+                e
+            )));
+        }
 
         // 保存到文件（包含完整的路径验证）
         let validation_result = new_config
@@ -1017,5 +1029,105 @@ mod tests {
         // 默认配置应该有效
         assert!(config.download.max_global_threads > 0);
         assert!(config.download.chunk_size_mb > 0);
+    }
+}
+
+/// 检查原始 JSON 以区分「字段缺失」与「显式空列表」（字段默认值为空），缺失时保留已存词表。
+fn preserve_missing_regex_presets(
+    raw: &serde_json::Value,
+    incoming: &mut AppConfig,
+    stored: &ShareSyncConfig,
+) {
+    let present = raw
+        .get("share_sync")
+        .and_then(|v| v.get("exclude_regex_preset_rules"))
+        .is_some();
+    if !present {
+        incoming.share_sync.exclude_regex_preset_rules = stored.exclude_regex_preset_rules.clone();
+    }
+}
+
+#[cfg(test)]
+mod regex_preset_update_tests {
+    use super::*;
+
+    fn stored() -> ShareSyncConfig {
+        ShareSyncConfig {
+            exclude_preset_rules: vec!["*.nfo".into()],
+            exclude_regex_preset_rules: vec!["^/股票/按月归档/2025.*$".into()],
+        }
+    }
+
+    /// 按旧客户端的方式构造请求：完整配置 JSON 但删掉新字段。
+    fn raw_without_regex_field() -> serde_json::Value {
+        let mut raw = serde_json::to_value(AppConfig::default()).unwrap();
+        raw.get_mut("share_sync")
+            .and_then(|v| v.as_object_mut())
+            .expect("share_sync 必须存在")
+            .remove("exclude_regex_preset_rules");
+        raw
+    }
+
+    fn set_regex_presets(raw: &mut serde_json::Value, value: serde_json::Value) {
+        raw["share_sync"]["exclude_regex_preset_rules"] = value;
+    }
+
+    fn parse(raw: &serde_json::Value) -> AppConfig {
+        serde_json::from_value(raw.clone()).unwrap()
+    }
+
+    #[test]
+    fn missing_field_preserves_stored_regex_presets() {
+        let raw = raw_without_regex_field();
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert_eq!(
+            cfg.share_sync.exclude_regex_preset_rules,
+            vec!["^/股票/按月归档/2025.*$".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_field_keeps_glob_presets_from_request() {
+        let mut raw = raw_without_regex_field();
+        raw["share_sync"]["exclude_preset_rules"] = serde_json::json!(["*.tmp"]);
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert_eq!(
+            cfg.share_sync.exclude_preset_rules,
+            vec!["*.tmp".to_string()]
+        );
+        assert_eq!(cfg.share_sync.exclude_regex_preset_rules.len(), 1);
+    }
+
+    #[test]
+    fn explicit_empty_list_clears_regex_presets() {
+        let mut raw = raw_without_regex_field();
+        set_regex_presets(&mut raw, serde_json::json!([]));
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert!(cfg.share_sync.exclude_regex_preset_rules.is_empty());
+    }
+
+    #[test]
+    fn explicit_list_replaces_regex_presets() {
+        let mut raw = raw_without_regex_field();
+        set_regex_presets(&mut raw, serde_json::json!(["^/基金/.*$"]));
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert_eq!(
+            cfg.share_sync.exclude_regex_preset_rules,
+            vec!["^/基金/.*$".to_string()]
+        );
+    }
+
+    #[test]
+    fn invalid_regex_presets_are_rejected_before_save() {
+        let mut raw = raw_without_regex_field();
+        set_regex_presets(&mut raw, serde_json::json!(["("]));
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        let err = cfg.share_sync.validate().unwrap_err();
+        assert!(err.contains("正则"), "{err}");
     }
 }

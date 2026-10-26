@@ -681,6 +681,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/share-sync/preview-tree", post(handlers::preview_tree))
         .route("/share-sync/cron/preview", post(handlers::preview_cron))
+        .route(
+            "/share-sync/exclude-rules/capabilities",
+            get(handlers::exclude_rule_capabilities),
+        )
+        .route(
+            "/share-sync/exclude-rules/validate",
+            post(handlers::validate_exclude_rules),
+        )
         // 🔥 加密数据导出 API
         .route("/encryption/export-bundle", post(handlers::export_bundle))
         .route("/encryption/export-mapping", get(handlers::export_mapping))

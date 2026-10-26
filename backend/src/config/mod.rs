@@ -112,6 +112,18 @@ pub struct ShareSyncConfig {
     /// 在系统设置页维护（增删）；默认为空，完全由用户自行配置，不做任何预置。
     #[serde(default)]
     pub exclude_preset_rules: Vec<String>,
+    /// 正则排除规则「常用词表」。与 glob 词表相互独立，不会被注入 glob 字段；
+    /// 旧配置缺省为空。
+    #[serde(default)]
+    pub exclude_regex_preset_rules: Vec<String>,
+}
+
+impl ShareSyncConfig {
+    /// 校验正则词表：与订阅保存、实际扫描使用同一套边界与限制。
+    pub fn validate(&self) -> Result<(), String> {
+        crate::share_sync::exclusion::validate_regexes(&self.exclude_regex_preset_rules)
+            .map_err(|e| e.to_string())
+    }
 }
 
 // ============================================================================
@@ -1711,13 +1723,52 @@ port = 1"
             .share_sync
             .exclude_preset_rules
             .is_empty());
+        assert!(AppConfig::default()
+            .share_sync
+            .exclude_regex_preset_rules
+            .is_empty());
         let legacy: ShareSyncConfig = toml::from_str("").unwrap();
         assert!(legacy.exclude_preset_rules.is_empty());
+        assert!(
+            legacy.exclude_regex_preset_rules.is_empty(),
+            "老配置没有正则词表字段时必须默认为空"
+        );
 
         // 用户配置的词表反序列化读回
         let saved: ShareSyncConfig =
             toml::from_str(r#"exclude_preset_rules = ["*样片*", "*.nfo"]"#).unwrap();
         assert_eq!(saved.exclude_preset_rules, ["*样片*", "*.nfo"]);
+        assert!(saved.exclude_regex_preset_rules.is_empty());
+
+        // 两类词表相互独立
+        let both: ShareSyncConfig = toml::from_str(
+            r#"
+            exclude_preset_rules = ["*.nfo"]
+            exclude_regex_preset_rules = ["^/股票/按月归档/2025.*$"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(both.exclude_preset_rules, ["*.nfo"]);
+        assert_eq!(both.exclude_regex_preset_rules, ["^/股票/按月归档/2025.*$"]);
+        assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    fn test_share_sync_config_rejects_invalid_regex_presets() {
+        let mut cfg = ShareSyncConfig::default();
+        cfg.exclude_regex_preset_rules = vec!["(".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("第 1 条"), "{err}");
+
+        cfg.exclude_regex_preset_rules = vec!["   ".into()];
+        assert!(cfg.validate().is_err());
+
+        // glob 词表不参与正则校验（历史词表可能是任意字面量）
+        let glob_only = ShareSyncConfig {
+            exclude_preset_rules: vec!["[样片]".into(), "re:x".into()],
+            exclude_regex_preset_rules: Vec::new(),
+        };
+        assert!(glob_only.validate().is_ok());
     }
 
     /// 界面偏好：老配置文件缺失该段 / 缺字段时取默认值（记忆目录开、快捷条关）
