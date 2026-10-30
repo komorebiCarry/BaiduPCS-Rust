@@ -103,7 +103,7 @@
           />
           <div class="form-tip">
             可用占位符：<code v-for="p in placeholders" :key="p" class="ph">{{ wrap(p) }}</code>。
-            Content-Type 含 json 时，占位符的值会按 JSON 字符串规则转义，请写在引号内。
+            Content-Type 含 json 时，占位符的值会按 JSON 字符串规则转义，请写在引号内；为 application/x-www-form-urlencoded 时按 URL 编码。请求头中的占位符会把换行折叠为空格。
             <el-link type="primary" :underline="false" @click="resetTemplate">恢复默认模板</el-link>
           </div>
         </el-form-item>

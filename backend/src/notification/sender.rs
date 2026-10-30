@@ -67,7 +67,7 @@ pub async fn send_webhook(
         }
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| format!("请求头名称不合法: {}", name))?;
-        let value = render(&h.value, n, Escape::None);
+        let value = render(&h.value, n, Escape::Header);
         // 值可能含敏感信息，错误里只报头名
         let value = HeaderValue::from_str(&value)
             .map_err(|_| format!("请求头 {} 的值不合法", name.as_str()))?;
@@ -80,8 +80,11 @@ pub async fn send_webhook(
         } else {
             cfg.content_type.trim()
         };
-        let mode = if content_type.to_ascii_lowercase().contains("json") {
+        let ct = content_type.to_ascii_lowercase();
+        let mode = if ct.contains("json") {
             Escape::Json
+        } else if ct.contains("x-www-form-urlencoded") {
+            Escape::Url
         } else {
             Escape::None
         };
@@ -234,6 +237,44 @@ mod tests {
         assert!(req.starts_with("PUT /hook?e=download_failed "), "{}", req);
         assert!(req.to_ascii_lowercase().contains("x-custom: v-error"));
         assert!(req.contains(r#"{"m":"a\"b"}"#));
+    }
+
+    /// 多行正文用在请求头里：换行折叠为空格，不能让整条 Webhook 因非法头值失败；
+    /// form 请求体按 URL 编码
+    #[tokio::test]
+    async fn test_webhook_multiline_header_and_form_body() {
+        let (base, handle) = one_shot_server("HTTP/1.1 200 OK").await;
+        let cfg = WebhookChannelConfig {
+            enabled: true,
+            url: format!("{}/hook", base),
+            method: "POST".into(),
+            headers: vec![crate::notification::WebhookHeader {
+                name: "X-Message".into(),
+                value: "{{message}}".into(),
+            }],
+            content_type: "application/x-www-form-urlencoded".into(),
+            body_template: "title={{name}}&message={{message}}".into(),
+            timeout_secs: 5,
+        };
+        let n = Notification::new(
+            NotificationKind::DownloadFailed,
+            Some("a&b=c".into()),
+            "line1\nline2",
+        );
+        send_webhook(&reqwest::Client::new(), &cfg, &n)
+            .await
+            .unwrap();
+        let req = handle.await.unwrap();
+        assert!(
+            req.to_ascii_lowercase().contains("x-message: line1 line2"),
+            "{}",
+            req
+        );
+        assert!(
+            req.ends_with("title=a%26b%3Dc&message=line1%0Aline2"),
+            "{}",
+            req
+        );
     }
 
     #[tokio::test]

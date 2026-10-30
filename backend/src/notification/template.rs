@@ -13,8 +13,11 @@ pub enum Escape {
     None,
     /// JSON 字符串内容转义（不含两侧引号）
     Json,
-    /// URL 百分号编码
+    /// URL 百分号编码（URL 与 `application/x-www-form-urlencoded` 请求体）
     Url,
+    /// HTTP 请求头值：换行等控制字符折叠为空格（`HeaderValue` 不接受 CR / LF，
+    /// 而正文 `{{message}}` 是多行的）
+    Header,
 }
 
 fn lookup(n: &Notification, key: &str) -> Option<String> {
@@ -51,6 +54,10 @@ fn escape(value: &str, mode: Escape) -> String {
             }
             out
         }
+        Escape::Header => value
+            .chars()
+            .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+            .collect(),
     }
 }
 
@@ -119,6 +126,13 @@ mod tests {
             Escape::None,
         );
         assert_eq!(s, "t-1|{{nope}}|{{unterminated");
+    }
+
+    #[test]
+    fn test_header_escape_folds_newlines() {
+        let s = render("X {{message}}", &sample(), Escape::Header);
+        assert_eq!(s, "X line1 line2");
+        assert!(reqwest::header::HeaderValue::from_str(&s).is_ok());
     }
 
     #[test]

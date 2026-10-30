@@ -61,10 +61,11 @@ pub struct WebhookChannelConfig {
     /// 请求方法：`POST`（默认）/ `PUT` / `GET`。GET 不发送请求体。
     #[serde(default = "default_webhook_method")]
     pub method: String,
-    /// 自定义请求头（值支持占位符，原样替换）
+    /// 自定义请求头（值支持占位符，换行等控制字符折叠为空格）
     #[serde(default)]
     pub headers: Vec<WebhookHeader>,
-    /// 请求体 Content-Type；含 `json` 时占位符按 JSON 字符串规则转义
+    /// 请求体 Content-Type；含 `json` 时占位符按 JSON 字符串规则转义，
+    /// 含 `x-www-form-urlencoded` 时按 URL 编码
     #[serde(default = "default_webhook_content_type")]
     pub content_type: String,
     /// 请求体模板

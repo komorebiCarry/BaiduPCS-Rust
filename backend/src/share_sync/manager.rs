@@ -145,6 +145,9 @@ pub struct ShareSyncManager {
     pending_resume: DashMap<String, ()>,
     /// 订阅 ID → 本轮扫描的可取消句柄；run 结束即按 `run_id` 比对移除。
     scan_handles: DashMap<String, ScanHandle>,
+    /// 订阅 ID → 最近一次已推送的失败通知指纹（见 [`Self::claim_failure_notification`]）。
+    /// 同一故障跨轮次只推一次；干净成功后清除。仅在内存，重启后至多重推一次。
+    failure_notified: DashMap<String, String>,
     /// 持久化层
     persistence: Arc<ShareSyncPersistence>,
     /// 配置文件路径（JSON）
@@ -337,6 +340,7 @@ impl ShareSyncManager {
             resuming: DashMap::new(),
             pending_resume: DashMap::new(),
             scan_handles: DashMap::new(),
+            failure_notified: DashMap::new(),
             persistence,
             config_path: cfg.config_path,
             publisher: cfg
@@ -884,7 +888,8 @@ impl ShareSyncManager {
             failed,
             ..Default::default()
         };
-        self.notify_run_finished(sub_id, run_id, status, &notify_summary, None);
+        // 续跑收尾拿不到 resource_skipped，只按 status 判断（与上面推进基线的判据一致）
+        self.notify_run_finished(sub_id, run_id, status, &notify_summary, None, false);
         self.publisher.publish(ShareSyncEvent::RunCompleted {
             run_id: run_id.into(),
             subscription_id: sub_id.into(),
@@ -1339,6 +1344,7 @@ impl ShareSyncManager {
                     format!("分享链接：{}", sub_clone.share_url),
                 ],
                 false,
+                None,
             );
             self.publisher.publish(ShareSyncEvent::StatusChanged {
                 subscription_id: id.into(),
@@ -1411,6 +1417,7 @@ impl ShareSyncManager {
             None => return Err(ShareSyncError::SubscriptionNotFound(id.into())),
         };
         self.stop_scheduler_for(id);
+        self.clear_failure_notification(id);
         // DB 删除（级联清理 snapshots/runs）
         let _ = self.persistence.delete_subscription(id);
         // 清理该订阅名下的内部转存/下载任务（带 share-sync:{id} 归属），
@@ -1852,7 +1859,14 @@ impl ShareSyncManager {
                                 snapshot_attempt += 1;
                             }
                             Err((stage, e)) => {
-                                self.fail_run(&run_id, id, owner_uid, &format!("{}: {}", stage, e));
+                                let msg = format!("{}: {}", stage, e);
+                                // 链接确定性失效：不推普通「同步失败」，累计到阈值时
+                                // 由 note_link_failure 推一条「链接失效，已暂停」
+                                if e.is_link_invalid() {
+                                    self.fail_run_quiet(&run_id, id, owner_uid, &msg);
+                                } else {
+                                    self.fail_run(&run_id, id, owner_uid, &msg);
+                                }
                                 self.maybe_note_link_failure(id, &e);
                                 break Err(e);
                             }
@@ -2044,6 +2058,7 @@ impl ShareSyncManager {
                     outcome.status,
                     &outcome.diff_summary,
                     outcome.error.as_deref(),
+                    outcome.resource_skipped,
                 );
                 self.publisher.publish(ShareSyncEvent::RunCompleted {
                     run_id: outcome.run_id.clone(),
@@ -2340,6 +2355,9 @@ impl ShareSyncManager {
     // ===================================================
 
     /// 推送一条分享同步通知（异步、失败只记日志，见 `crate::notification`）。
+    ///
+    /// `failure_fingerprint` 为 `Some` 时按订阅做跨轮次去重：与上次已推送的失败指纹相同
+    /// 则不推（每轮 run_id 都不同，单靠 `dedup` 挡不住同一故障逐轮重复推送）。
     fn notify_share_sync(
         &self,
         kind: crate::notification::NotificationKind,
@@ -2347,9 +2365,20 @@ impl ShareSyncManager {
         run_id: Option<&str>,
         mut lines: Vec<String>,
         dedup: bool,
+        failure_fingerprint: Option<String>,
     ) {
         if !crate::notification::is_kind_enabled(kind) {
             return;
+        }
+        if let Some(fp) = failure_fingerprint {
+            if !self.claim_failure_notification(&sub.id, fp) {
+                debug!(
+                    "share-sync: 订阅 {} 同一故障已通知过，恢复前不再重复推送",
+                    sub.id
+                );
+                return;
+            }
+            lines.push("该问题恢复前不再重复提醒".to_string());
         }
         let targets = describe_targets_for_notification(sub);
         if !targets.is_empty() {
@@ -2369,7 +2398,28 @@ impl ShareSyncManager {
         crate::notification::notify(n);
     }
 
-    /// run 正常收尾：有新增 / 修改 → 「发现更新」；部分失败 → 「同步失败」。无变化不通知。
+    /// 记录本次要推送的失败指纹；与该订阅上次已推送的相同则返回 false（不推）。
+    fn claim_failure_notification(&self, sub_id: &str, fingerprint: String) -> bool {
+        let mut last = self
+            .failure_notified
+            .entry(sub_id.to_string())
+            .or_default();
+        if *last == fingerprint {
+            return false;
+        }
+        *last = fingerprint;
+        true
+    }
+
+    /// 订阅干净成功：清掉失败指纹，下次再出故障重新提醒
+    fn clear_failure_notification(&self, sub_id: &str) {
+        self.failure_notified.remove(sub_id);
+    }
+
+    /// run 正常收尾：
+    /// - 干净成功：清失败指纹；有新增 / 修改 → 「发现更新」，无变化不通知；
+    /// - 部分失败，或因网盘空间 / 本地磁盘不足跳过了子项（`resource_skipped`，此时 run
+    ///   状态仍是 `Completed`，但文件并未落地、基线也不推进）→ 「同步失败」，同一故障只推一次。
     fn notify_run_finished(
         &self,
         sub_id: &str,
@@ -2377,32 +2427,72 @@ impl ShareSyncManager {
         status: crate::share_sync::types::RunStatus,
         summary: &DiffSummary,
         error: Option<&str>,
+        resource_skipped: bool,
     ) {
         use crate::notification::NotificationKind;
         use crate::share_sync::types::RunStatus;
-        let (added, modified, failed) = (summary.added, summary.modified, summary.failed);
+        let (added, modified) = (summary.added, summary.modified);
+        let clean = status == RunStatus::Completed && !resource_skipped;
+        if clean {
+            self.clear_failure_notification(sub_id);
+        }
         let Some(sub) = self.get_subscription(sub_id) else {
             return;
         };
-        let kind = match status {
-            RunStatus::CompletedWithErrors => NotificationKind::ShareSyncFailed,
-            RunStatus::Completed if added + modified > 0 => NotificationKind::ShareSyncUpdated,
-            _ => return,
-        };
-        let mut lines = vec![format!(
-            "新增 {} 个，更新 {} 个，失败 {} 个",
-            added, modified, failed
-        )];
-        if kind == NotificationKind::ShareSyncFailed {
-            lines.insert(0, "同步完成但有部分文件失败，下一轮会自动重试".to_string());
+        let error = error.filter(|e| !e.is_empty());
+        if clean {
+            if added + modified == 0 {
+                return;
+            }
+            let mut lines = vec![format!(
+                "新增 {} 个，更新 {} 个，失败 {} 个",
+                added, modified, summary.failed
+            )];
+            if let Some(e) = error {
+                lines.push(format!("错误：{}", e));
+            }
+            self.notify_share_sync(
+                NotificationKind::ShareSyncUpdated,
+                &sub,
+                Some(run_id),
+                lines,
+                true,
+                None,
+            );
+            return;
         }
-        if let Some(e) = error.filter(|e| !e.is_empty()) {
+        if !matches!(status, RunStatus::Completed | RunStatus::CompletedWithErrors) {
+            return;
+        }
+        let (headline, fp_kind) = if status == RunStatus::CompletedWithErrors {
+            ("同步完成但有部分文件失败，下一轮会自动重试", "partial")
+        } else {
+            (
+                "网盘空间或本地磁盘不足，部分文件已跳过，腾出空间后下一轮会自动补齐",
+                "resource",
+            )
+        };
+        let mut lines = vec![
+            headline.to_string(),
+            format!(
+                "本轮变更：新增 {} 个，更新 {} 个；失败 {} 个，跳过 {} 个",
+                added, modified, summary.failed, summary.skipped
+            ),
+        ];
+        if let Some(e) = error {
             lines.push(format!("错误：{}", e));
         }
-        self.notify_share_sync(kind, &sub, Some(run_id), lines, true);
+        self.notify_share_sync(
+            NotificationKind::ShareSyncFailed,
+            &sub,
+            Some(run_id),
+            lines,
+            true,
+            Some(format!("{}:{}", fp_kind, error.unwrap_or(""))),
+        );
     }
 
-    /// run 失败
+    /// run 失败（同一错误跨轮次只推一次）
     fn notify_run_failed(&self, sub_id: &str, run_id: &str, err: &str) {
         let Some(sub) = self.get_subscription(sub_id) else {
             return;
@@ -2413,6 +2503,7 @@ impl ShareSyncManager {
             Some(run_id),
             vec![format!("错误：{}", err)],
             true,
+            Some(format!("failed:{}", err)),
         );
     }
 
@@ -3725,6 +3816,8 @@ impl ExecutorHooks for ProductionHooks {
             // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
             is_internal: true,
             backup_config_id: Some(self.share_sync_backup_config_id()),
+            // 分享同步内部转存：不改「最近保存目录」
+            remember_recent_dir: false,
         };
         let resp = tm
             .create_task(req)
@@ -3888,6 +3981,8 @@ impl ExecutorHooks for ProductionHooks {
             // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
             is_internal: true,
             backup_config_id: Some(self.share_sync_backup_config_id()),
+            // 分享同步内部转存：不改「最近保存目录」
+            remember_recent_dir: false,
         };
 
         let resp = tm
@@ -4240,6 +4335,8 @@ impl ExecutorHooks for ProductionHooks {
             // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
             is_internal: true,
             backup_config_id: Some(self.share_sync_backup_config_id()),
+            // 分享同步内部转存：不改「最近保存目录」
+            remember_recent_dir: false,
         };
         let resp = tm
             .create_task(req)
@@ -4335,6 +4432,8 @@ impl ExecutorHooks for ProductionHooks {
             // （下载段据此走自动备份同款 create_backup_task：隐藏 + 优先级 + 归属）。
             is_internal: true,
             backup_config_id: Some(self.share_sync_backup_config_id()),
+            // 分享同步内部转存：不改「最近保存目录」
+            remember_recent_dir: false,
         };
 
         let resp = tm
@@ -5556,6 +5655,64 @@ mod tests {
         let r = m.trigger_one(&s.id).await;
         m.running.remove(&s.id);
         assert!(matches!(r, Err(ShareSyncError::AlreadyRunning(_))));
+    }
+
+    /// 同一故障跨轮次只通知一次：指纹相同不再推；配额类跳过不算恢复；干净成功才清除
+    #[tokio::test]
+    async fn test_failure_notification_fingerprint_dedups_until_clean_success() {
+        let dir = tempdir().unwrap();
+        let m = ShareSyncManager::new(ManagerConfig {
+            config_path: dir.path().join("subs.json"),
+            db_path: dir.path().join("s.db"),
+            resolver: Arc::new(StaticAccountResolver::none()),
+            publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
+        })
+        .await
+        .unwrap();
+        let mut s = sub("a");
+        s.owner_uid = 1;
+        let s = m.create_subscription(s).unwrap();
+
+        let fp = "partial:账号(uid=2)未登录".to_string();
+        assert!(m.claim_failure_notification(&s.id, fp.clone()));
+        assert!(!m.claim_failure_notification(&s.id, fp.clone()), "同一故障不再推");
+        assert!(
+            m.claim_failure_notification(&s.id, "failed:网络错误".into()),
+            "原因变化要推"
+        );
+        assert!(m.claim_failure_notification(&s.id, fp.clone()));
+
+        let summary = DiffSummary {
+            added: 3,
+            ..DiffSummary::default()
+        };
+        // 配额满：run 状态是 Completed 但文件没落地，不算恢复
+        m.notify_run_finished(
+            &s.id,
+            "run-1",
+            RunStatus::Completed,
+            &summary,
+            Some("网盘空间不足,部分子项已跳过"),
+            true,
+        );
+        assert!(!m.claim_failure_notification(&s.id, fp.clone()));
+        // 部分失败也不算恢复
+        m.notify_run_finished(
+            &s.id,
+            "run-2",
+            RunStatus::CompletedWithErrors,
+            &summary,
+            None,
+            false,
+        );
+        assert!(!m.claim_failure_notification(&s.id, fp.clone()));
+        // 干净成功：清除，下次再出同样的故障重新提醒
+        m.notify_run_finished(&s.id, "run-3", RunStatus::Completed, &summary, None, false);
+        assert!(m.claim_failure_notification(&s.id, fp.clone()));
+
+        // 删除订阅一并清掉
+        m.delete_subscription(&s.id).await.unwrap();
+        assert!(m.failure_notified.get(&s.id).is_none());
     }
 
     /// 离线构造某账号的转存管理器（共享同一个全局 FolderDownloadManager）
