@@ -54,9 +54,7 @@
         <!-- 目标账号（多账号时显示）：转存 / 订阅归属该账号，目录选择也浏览该账号的网盘 -->
         <el-form-item v-if="showAccountSelect" label="目标账号">
           <AccountSelect v-model="form.targetUid" placeholder="请选择保存到哪个账号" />
-          <div v-if="isCrossAccount" class="form-tip">
-            将保存到非当前活跃账号的网盘{{ form.keepSync ? '，订阅也归属该账号' : '' }}
-          </div>
+          <div v-if="isCrossAccount" class="form-tip">{{ crossAccountTip }}</div>
         </el-form-item>
 
         <!-- 保存位置（开启“保持同步”且关闭“转存到网盘”时隐藏，仅本地/分享直下订阅无需网盘目录） -->
@@ -359,6 +357,13 @@ const showAccountSelect = computed(() => !!authStore.hasMultipleAccounts)
 const isCrossAccount = computed(
     () => form.targetUid != null && authStore.activeUid != null && form.targetUid !== authStore.activeUid,
 )
+
+// 跨账号提示：只开「下载到本地」的同步订阅不在网盘留存（分享直下），文案不能说「保存到网盘」
+const crossAccountTip = computed(() => {
+  if (!form.keepSync) return '将保存到非当前活跃账号的网盘'
+  if (!form.syncToNetdisk) return '将由非当前活跃账号以分享直下方式下载到本地，订阅也归属该账号'
+  return '将保存到非当前活跃账号的网盘，订阅也归属该账号'
+})
 
 // 对话框步骤状态
 const step = ref<'input' | 'select'>('input')

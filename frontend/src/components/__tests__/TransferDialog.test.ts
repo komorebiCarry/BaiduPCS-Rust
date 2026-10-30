@@ -311,4 +311,24 @@ describe('TransferDialog 跨账号保存', () => {
     expect(req.save_path).toBe('/')
     wrapper.unmount()
   })
+  it('跨账号提示随「转存到网盘」开关变化：只下载到本地时不说「保存到网盘」', async () => {
+    authState.hasMultipleAccounts = true
+    const wrapper = await mountDialog()
+    document.body.querySelector<HTMLElement>('.pick-account-2')!.click()
+    await flushPromises()
+    const tip = () => Array.from(document.body.querySelectorAll<HTMLElement>('.form-tip'))
+        .map((el) => el.textContent?.trim() ?? '')
+        .find((t) => t.includes('非当前活跃账号')) ?? ''
+    expect(tip()).toBe('将保存到非当前活跃账号的网盘，订阅也归属该账号')
+
+    const switchIn = (label: string) => Array.from(document.body.querySelectorAll<HTMLElement>('.el-form-item'))
+        .find((el) => el.querySelector('.el-form-item__label')?.textContent?.trim() === label)!
+        .querySelector<HTMLElement>('.el-switch')!
+    switchIn('同步到本地').click()
+    await flushPromises()
+    switchIn('转存到网盘').click()
+    await flushPromises()
+    expect(tip()).toBe('将由非当前活跃账号以分享直下方式下载到本地，订阅也归属该账号')
+    wrapper.unmount()
+  })
 })

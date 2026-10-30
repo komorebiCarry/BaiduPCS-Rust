@@ -830,4 +830,154 @@ describe('ShareSyncView 跨账号目标（#179）', () => {
     ])
     wrapper.unmount()
   })
+  const dialogSwitches = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog .el-switch'))
+  const hints = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog .sync-mode-hint'))
+      .map((el) => el.textContent?.trim() ?? '')
+
+  it('关闭「转存到网盘」后归集目标隐藏且不提交；重开对话框开关保持关闭', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download' },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    const addBtn = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog button'))
+        .find((b) => b.textContent?.includes('同时转存到其他账号的网盘'))
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(1)
+    expect(addBtn()).toBeTruthy()
+
+    dialogSwitches()[0].click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length, '归集行随开关隐藏').toBe(0)
+    expect(addBtn(), '新增按钮随开关隐藏').toBeUndefined()
+
+    let saved: typeof sub | null = null
+    api.updateSubscription.mockImplementation(async (_id: string, req: { targets: typeof sub.targets }) => {
+      saved = { ...sub, targets: req.targets }
+      return saved
+    })
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([{ kind: 'local', local_path: '/tmp', mode: 'share_direct' }])
+
+    // 往返稳定：用保存后的目标重新打开，网盘开关仍关闭、没有 UID 2 的目标被提升为主网盘
+    api.listSubscriptions.mockResolvedValue([saved!])
+    wrapper.unmount()
+    const wrapper2 = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    expect(dialogSwitches()[0].classList.contains('is-checked')).toBe(false)
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(0)
+    wrapper2.unmount()
+  })
+
+  it('关闭后再开启「转存到网盘」恢复本次会话里的归集目标', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download' },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    dialogSwitches()[0].click()
+    await flushPromises()
+    dialogSwitches()[0].click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(1)
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual(sub.targets)
+    wrapper.unmount()
+  })
+
+  it('A 账号存网盘 + B 账号下载到本地：提示不再矛盾，本地按分享直下保存', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', download_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    const text = hints().join('\n')
+    expect(text).not.toContain('从网盘副本下载到本地')
+    expect(text).toContain('UID: 2')
+    expect(text).toContain('分享直下')
+    expect(text).toContain('网盘目标照常转存并保留')
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'local', local_path: '/tmp', mode: 'share_direct', download_uid: 2 },
+    ])
+    wrapper.unmount()
+  })
+
+  it('下载账号同时有归集网盘目标时，提示从该账号网盘副本下载', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'share_direct', download_uid: 2 },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+    const text = hints().join('\n')
+    expect(text).toContain('从下载账号（UID: 2）的网盘副本下载到本地，网盘保留。')
+    expect(text).not.toContain('分享直下')
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets[1]).toEqual({ kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', download_uid: 2 })
+    wrapper.unmount()
+  })
 })

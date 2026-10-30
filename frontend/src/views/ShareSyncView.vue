@@ -414,8 +414,9 @@
             </div>
 
             <!-- 多账号归集：同一订阅额外转存到其他账号的网盘（每个账号最多 1 个网盘目标） -->
+            <!-- 归集目标是「额外」的网盘目标：跟随「转存到网盘」开关，关闭时隐藏且不提交 -->
             <div
-                v-for="(et, idx) in extraNetdiskTargets"
+                v-for="(et, idx) in visibleExtraNetdiskTargets"
                 :key="`extra-${idx}`"
                 class="target-row extra-netdisk-row"
             >
@@ -445,7 +446,7 @@
                 </el-input>
               </div>
             </div>
-            <div v-if="authStore.hasMultipleAccounts" class="target-account-row">
+            <div v-if="authStore.hasMultipleAccounts && netdiskEnabled" class="target-account-row">
               <el-button size="small" text type="primary" :icon="Plus" @click="addExtraNetdiskTarget">
                 同时转存到其他账号的网盘
               </el-button>
@@ -958,6 +959,8 @@ function targetKindCounts(): { netdisk: number; local: number } {
 //   网盘+本地     = Netdisk + Local{ mode: transfer_and_download }（后端合并成一条腿：转存一次→从副本下载）
 //   仅本地        = 仅 Local{ mode: share_direct }（分享直下：转临时目录→下载→清理，网盘不留存）
 // 约束：至少开启一个。
+// 跨账号（#179）时后端按账号分腿推导：本地下载账号上没有网盘目标时，该账号的本地腿
+// 走分享直下（见 syncModeHint / submitTargets）。
 
 function findNetdiskTarget(): NetdiskTarget | undefined {
   return form.value.targets.find((t): t is NetdiskTarget => t.kind === 'netdisk')
@@ -1010,18 +1013,62 @@ const localEnabled = computed<boolean>({
   set(on: boolean) { rebuildTargets(!!findNetdiskTarget(), on) },
 })
 
+// 本地目标的实际下载方式按「下载账号」决定（与后端按账号分腿一致）：
+// 下载账号同时有网盘目标 → 从该网盘副本下载；否则 → 分享直下（转临时目录→下载→清理）。
 const syncModeHint = computed(() => {
   const nd = netdiskEnabled.value
   const lo = localEnabled.value
-  if (nd && lo) return '从网盘副本下载到本地，网盘保留。'
-  if (nd) return ''
-  return '下载后清理网盘临时文件。'
+  if (!lo) return ''
+  const downloadUid = localDownloadUid()
+  const crossAccount = downloadUid !== null && downloadUid !== editingOwnerUid()
+  const who = crossAccount ? `下载账号（UID: ${downloadUid}）` : ''
+  if (localUsesNetdiskCopy()) {
+    return crossAccount ? `从${who}的网盘副本下载到本地，网盘保留。` : '从网盘副本下载到本地，网盘保留。'
+  }
+  if (nd) {
+    // 有网盘目标但不在下载账号上：网盘目标照常转存保留，本地由下载账号分享直下
+    return `网盘目标照常转存并保留；${who || '下载账号'}没有网盘目标，本地将以分享直下方式下载（下载后清理该账号的网盘临时文件）。`
+  }
+  return crossAccount ? `由${who}分享直下，下载后清理其网盘临时文件。` : '下载后清理网盘临时文件。'
 })
 
 // ==================== 跨账号目标（#179） ====================
 // 网盘目标可指定账号（缺省=订阅所属账号）；额外的网盘目标用于「多账号归集」，
 // 每个账号最多 1 个（与后端 validate 一致）。本地目标可指定下载账号或跟随全局默认下载账号。
 const extraNetdiskTargets = ref<NetdiskTarget[]>([])
+
+/** 实际生效的归集目标：「转存到网盘」关闭时不生效（列表保留为本次会话草稿，重新开启时恢复） */
+const visibleExtraNetdiskTargets = computed<NetdiskTarget[]>(() =>
+  netdiskEnabled.value ? extraNetdiskTargets.value : [],
+)
+
+/** 网盘目标落在的账号（null = 所属账号未知，按所属账号算） */
+function netdiskTargetAccounts(): Set<number | null> {
+  const owner = editingOwnerUid()
+  const set = new Set<number | null>()
+  const nd = findNetdiskTarget()
+  if (nd) set.add(explicitTargetUid(nd.account_uid) ?? owner)
+  for (const t of visibleExtraNetdiskTargets.value) set.add(explicitTargetUid(t.account_uid) ?? owner)
+  return set
+}
+
+/** 本地目标的下载账号：跟随所属 / 默认下载账号（未设置回退所属）/ 指定账号 */
+function localDownloadUid(): number | null {
+  const owner = editingOwnerUid()
+  const lo = findLocalTarget()
+  if (!lo) return null
+  if (lo.use_default_download_account) {
+    const d = downloadConfig.value?.default_download_account_uid
+    return typeof d === 'number' && d > 0 ? d : owner
+  }
+  return explicitTargetUid(lo.download_uid) ?? owner
+}
+
+/** 下载账号上是否有网盘目标（有 = 从网盘副本下载；无 = 分享直下） */
+function localUsesNetdiskCopy(): boolean {
+  if (!findLocalTarget()) return false
+  return netdiskTargetAccounts().has(localDownloadUid())
+}
 
 function editingOwnerUid(): number | null {
   return selected.value?.owner_uid ?? null
@@ -1038,7 +1085,7 @@ const showTargetAccountControls = computed<boolean>(() => {
   // 单账号时若订阅已带跨账号配置，仍展示以便查看/改回
   const nd = findNetdiskTarget()
   const lo = findLocalTarget()
-  return extraNetdiskTargets.value.length > 0
+  return visibleExtraNetdiskTargets.value.length > 0
       || explicitTargetUid(nd?.account_uid) !== null
       || explicitTargetUid(lo?.download_uid) !== null
       || !!lo?.use_default_download_account
@@ -1092,8 +1139,8 @@ const crossAccountHint = computed(() => {
   const lo = findLocalTarget()
   const ndUid = nd ? explicitTargetUid(nd.account_uid) : null
   const loUid = lo ? (lo.use_default_download_account ? 'default' : explicitTargetUid(lo.download_uid)) : null
-  if (extraNetdiskTargets.value.length === 0 && ndUid === null && loUid === null) return ''
-  return '跨账号目标按账号分别执行：各账号需保持登录；下载账号若没有同账号的网盘目标，将以分享直下方式下载（不在该账号网盘留存）。'
+  if (visibleExtraNetdiskTargets.value.length === 0 && ndUid === null && loUid === null) return ''
+  return '跨账号目标按账号分别执行，涉及的各账号都需保持登录。'
 })
 
 function addExtraNetdiskTarget() {
@@ -1566,7 +1613,10 @@ function buildSanitizedPayload() {
 
 /** 提交给后端的完整目标列表：主网盘/本地 + 额外归集网盘目标 */
 function submitTargets(): SyncTarget[] {
-  return [...form.value.targets, ...extraNetdiskTargets.value]
+  // 本地目标的 mode 与实际执行方式对齐（后端按账号分腿推导，这里只让存档自洽）
+  const mode: LocalTarget['mode'] = localUsesNetdiskCopy() ? 'transfer_and_download' : 'share_direct'
+  const main = form.value.targets.map(t => (t.kind === 'local' ? { ...t, mode } : t))
+  return [...main, ...visibleExtraNetdiskTargets.value]
 }
 
 function sanitizeTargets(targets: SyncTarget[]): SyncTarget[] {
