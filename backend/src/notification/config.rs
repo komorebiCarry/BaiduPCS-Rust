@@ -42,16 +42,16 @@ pub struct NotificationConfig {
     pub events: NotificationEventToggles,
 }
 
-/// 自定义请求头
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 自定义请求头（`Debug` 输出会隐去值，避免鉴权头进日志）
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookHeader {
     pub name: String,
     #[serde(default)]
     pub value: String,
 }
 
-/// 通用 Webhook 渠道配置
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 通用 Webhook 渠道配置（`Debug` 输出隐去 URL 与请求头值：URL 里常带推送 Key）
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookChannelConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -75,6 +75,49 @@ pub struct WebhookChannelConfig {
     pub timeout_secs: u64,
 }
 
+/// 日志里替代敏感值的占位
+fn redacted(v: &str) -> &'static str {
+    if v.is_empty() {
+        ""
+    } else {
+        "<redacted>"
+    }
+}
+
+impl std::fmt::Debug for WebhookHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookHeader")
+            .field("name", &self.name)
+            .field("value", &redacted(&self.value))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WebhookChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &redacted(&self.url))
+            .field("method", &self.method)
+            .field("headers", &self.headers)
+            .field("content_type", &self.content_type)
+            .field("body_template_len", &self.body_template.len())
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for GotifyChannelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GotifyChannelConfig")
+            .field("enabled", &self.enabled)
+            .field("server_url", &self.server_url)
+            .field("app_token", &redacted(&self.app_token))
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
 impl Default for WebhookChannelConfig {
     fn default() -> Self {
         Self {
@@ -89,8 +132,8 @@ impl Default for WebhookChannelConfig {
     }
 }
 
-/// Gotify 渠道配置
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Gotify 渠道配置（`Debug` 输出隐去 App Token）
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GotifyChannelConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -333,5 +376,20 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.gotify.priority = 11;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_debug_output_redacts_secrets() {
+        let mut cfg = NotificationConfig::default();
+        cfg.gotify.app_token = "SECRET-TOKEN".into();
+        cfg.webhook.url = "https://api.day.app/SECRET-KEY/{title}".into();
+        cfg.webhook.headers = vec![WebhookHeader {
+            name: "Authorization".into(),
+            value: "Bearer SECRET-BEARER".into(),
+        }];
+        let dbg = format!("{:?}", cfg);
+        assert!(!dbg.contains("SECRET"), "Debug 输出泄露了敏感值: {}", dbg);
+        assert!(dbg.contains("Authorization"));
+        assert!(dbg.contains("<redacted>"));
     }
 }
