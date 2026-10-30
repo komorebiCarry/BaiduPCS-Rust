@@ -51,6 +51,14 @@
           <div v-if="passwordError" class="error-tip">{{ passwordError }}</div>
         </el-form-item>
 
+        <!-- 目标账号（多账号时显示）：转存 / 订阅归属该账号，目录选择也浏览该账号的网盘 -->
+        <el-form-item v-if="showAccountSelect" label="目标账号">
+          <AccountSelect v-model="form.targetUid" placeholder="请选择保存到哪个账号" />
+          <div v-if="isCrossAccount" class="form-tip">
+            将保存到非当前活跃账号的网盘{{ form.keepSync ? '，订阅也归属该账号' : '' }}
+          </div>
+        </el-form-item>
+
         <!-- 保存位置（开启“保持同步”且关闭“转存到网盘”时隐藏，仅本地/分享直下订阅无需网盘目录） -->
         <el-form-item
             v-if="!form.keepSync || form.syncToNetdisk"
@@ -58,8 +66,10 @@
             prop="savePath"
         >
           <NetdiskPathSelector
+              :key="form.targetUid ?? 'active'"
               v-model="form.savePath"
               v-model:fs-id="form.saveFsId"
+              :uid="form.targetUid"
           />
         </el-form-item>
 
@@ -117,7 +127,7 @@
                 ref="excludeEditorRef"
                 :share-url="form.shareUrl"
                 :password="form.password || null"
-                :owner-uid="authStore.activeUid ?? null"
+                :owner-uid="form.targetUid ?? authStore.activeUid ?? null"
                 :owner-logged-in="true"
                 v-model:include-paths="form.includePaths"
                 v-model:exclude-patterns="form.excludePatterns"
@@ -262,6 +272,7 @@ import NetdiskPathSelector from './NetdiskPathSelector.vue'
 import ShareFileSelector from './ShareFileSelector.vue'
 import ShareIncludeExcludeEditor from './ShareIncludeExcludeEditor.vue'
 import CronExprEditor from './CronExprEditor.vue'
+import AccountSelect from './AccountSelect.vue'
 import { FilePickerModal } from '@/components/FilePicker'
 
 // 响应式检测
@@ -317,6 +328,8 @@ const formRef = ref<FormInstance>()
 
 // 表单数据
 const form = reactive({
+  // 目标账号（转存 / 订阅归属）；打开时默认当前活跃账号
+  targetUid: null as number | null,
   shareUrl: '',
   password: '',
   savePath: '/',
@@ -339,6 +352,13 @@ const form = reactive({
   syncToLocal: false,
   syncLocalPath: '',
 })
+
+// 多账号时才显示目标账号选择
+const showAccountSelect = computed(() => !!authStore.hasMultipleAccounts)
+// 目标账号不是当前活跃账号
+const isCrossAccount = computed(
+    () => form.targetUid != null && authStore.activeUid != null && form.targetUid !== authStore.activeUid,
+)
 
 // 对话框步骤状态
 const step = ref<'input' | 'select'>('input')
@@ -428,6 +448,7 @@ async function handleOpen() {
   passwordError.value = ''
 
   // 不依赖配置请求的默认值先设好（保证锁定/默认“保持同步”即使配置加载失败也生效）
+  form.targetUid = authStore.activeUid ?? null
   form.keepSync = props.lockKeepSync ? true : (props.defaultKeepSync ?? false)
   form.syncName = ''
   form.syncIntervalSecs = 1800
@@ -457,6 +478,12 @@ async function handleOpen() {
 }
 
 async function setDefaultSavePath() {
+  // 最近保存目录 / 当前浏览目录都属于活跃账号；跨账号时从目标账号根目录开始选
+  if (isCrossAccount.value) {
+    form.savePath = '/'
+    form.saveFsId = 0
+    return
+  }
   if (transferConfig.value?.recent_save_fs_id && transferConfig.value?.recent_save_path) {
     form.saveFsId = transferConfig.value.recent_save_fs_id
     form.savePath = transferConfig.value.recent_save_path
@@ -478,6 +505,7 @@ function setCurrentDirAsDefault() {
 // 对话框关闭时重置所有状态
 function handleClose() {
   visible.value = false
+  form.targetUid = null
   form.shareUrl = ''
   form.password = ''
   form.savePath = '/'
@@ -684,8 +712,8 @@ async function createSyncSubscription() {
       exclude_paths: form.excludePaths,
       targets: buildSyncTargets(),
       poll_config: pollConfig,
-      // 显式归属当前活跃账号（缺省由后端回退）
-      owner_uid: authStore.activeUid ?? undefined,
+      // 显式归属所选目标账号（默认当前活跃账号；缺省由后端回退）
+      owner_uid: form.targetUid ?? authStore.activeUid ?? undefined,
     }
     const sub = await createSubscription(req)
     ElMessage.success('已创建同步订阅，可在「分享同步」页管理')
@@ -745,6 +773,8 @@ async function executeTransfer(localDownloadPath?: string, transferAll: boolean 
       local_download_path: localDownloadPath,
       selected_fs_ids: transferAll ? undefined : (selectedFsIds.value.length > 0 ? selectedFsIds.value : undefined),
       selected_files: transferAll ? undefined : (selectedFiles.value.length > 0 ? selectedFiles.value : undefined),
+      // 跨账号保存：任务在目标账号下创建（缺省由后端回退到活跃账号）
+      owner_uid: form.targetUid ?? undefined,
     }
 
     const response = await createTransfer(request)
@@ -859,6 +889,14 @@ function handleTransferError(error: any) {
       errorMessage.value = message || '转存失败，请稍后重试'
   }
 }
+
+// 切换目标账号：原目录属于旧账号，重置保存位置
+watch(() => form.targetUid, (uid, prev) => {
+  if (prev === undefined || uid === prev || !visible.value) return
+  // 打开 / 关闭对话框时的赋值不算切换
+  if (prev === null || uid === null) return
+  void setDefaultSavePath()
+})
 
 // 监听 savePath 变化，清除错误
 watch(() => form.savePath, () => {

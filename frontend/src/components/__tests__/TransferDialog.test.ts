@@ -52,8 +52,11 @@ vi.mock('@/api/shareSync', () => ({
   validateExcludeRules: shareSync.validateRules,
 }))
 
+// 可变的 auth 桩：跨账号用例打开多账号
+const authState = vi.hoisted(() => ({ activeUid: 1, hasMultipleAccounts: false }))
+
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({ activeUid: 1 }),
+  useAuthStore: () => authState,
 }))
 
 vi.mock('@/utils/responsive', () => ({
@@ -62,10 +65,10 @@ vi.mock('@/utils/responsive', () => ({
 
 const TARGET_ITEM = { fs_id: 1, is_dir: false, path: '/a.txt', size: 10, name: 'a.txt' }
 
-async function mountDialog() {
+async function mountDialog(lockKeepSync = true) {
   // 先关闭再打开，触发 el-dialog 的 open 钩子（handleOpen 初始化表单与 keepSync）
   const wrapper = mount(TransferDialog, {
-    props: { modelValue: false, lockKeepSync: true },
+    props: { modelValue: false, lockKeepSync },
     attachTo: document.body,
     global: {
       plugins: [ElementPlus],
@@ -74,6 +77,13 @@ async function mountDialog() {
         ShareFileSelector: true,
         CronExprEditor: true,
         FilePickerModal: true,
+        // 账号选择桩：点击切到 uid=2
+        AccountSelect: {
+          name: 'AccountSelect',
+          props: ['modelValue'],
+          emits: ['update:modelValue'],
+          template: `<button class="pick-account-2" @click="$emit('update:modelValue', 2)">acc-{{ modelValue }}</button>`,
+        },
         // 编辑器桩：暴露 validateRules，并提供按钮触发正则模型更新
         ShareIncludeExcludeEditor: {
           name: 'ShareIncludeExcludeEditor',
@@ -115,6 +125,9 @@ function createButton(): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  authState.activeUid = 1
+  authState.hasMultipleAccounts = false
+  transfer.createTransfer.mockReset().mockResolvedValue({ task_id: 'task-1' })
   config.getTransferConfig.mockReset().mockResolvedValue({
     recent_save_path: '/我的资源',
     recent_save_fs_id: 0,
@@ -222,6 +235,80 @@ describe('TransferDialog 订阅创建与正则排除', () => {
       exclude_regex_patterns: string[]
     }
     expect(req.exclude_regex_patterns, '重开不得残留上次的正则').toEqual([])
+    wrapper.unmount()
+  })
+})
+
+describe('TransferDialog 跨账号保存', () => {
+  function findButton(text: string): HTMLButtonElement {
+    const btn = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find((b) => b.textContent?.trim() === text)
+    expect(btn, `应有「${text}」按钮`).toBeTruthy()
+    return btn!
+  }
+
+  it('单账号时不显示目标账号选择，订阅归属活跃账号', async () => {
+    const wrapper = await mountDialog()
+    expect(document.body.querySelector('.pick-account-2')).toBeNull()
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+    createButton().click()
+    await flushPromises()
+    const req = shareSync.createSubscription.mock.calls[0][0] as { owner_uid?: number }
+    expect(req.owner_uid).toBe(1)
+    wrapper.unmount()
+  })
+
+  it('选择其他账号后订阅归属该账号，目录选择器浏览该账号且保存位置重置为根目录', async () => {
+    authState.hasMultipleAccounts = true
+    config.getTransferConfig.mockResolvedValue({
+      recent_save_path: '/我的资源',
+      recent_save_fs_id: 42,
+      default_behavior: 'transfer_only',
+    })
+    const wrapper = await mountDialog()
+    const selector = wrapper.findComponent({ name: 'NetdiskPathSelector' })
+    expect(selector.props('modelValue')).toBe('/我的资源')
+
+    document.body.querySelector<HTMLElement>('.pick-account-2')!.click()
+    await flushPromises()
+
+    const selectorAfter = wrapper.findComponent({ name: 'NetdiskPathSelector' })
+    expect(selectorAfter.props('uid')).toBe(2)
+    expect(selectorAfter.props('modelValue'), '最近目录属于活跃账号，跨账号应回到根目录').toBe('/')
+    expect(wrapper.findComponent({ name: 'ShareIncludeExcludeEditor' }).props('ownerUid')).toBe(2)
+
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+    createButton().click()
+    await flushPromises()
+    const req = shareSync.createSubscription.mock.calls[0][0] as {
+      owner_uid?: number
+      targets: { kind: string; remote_path?: string }[]
+    }
+    expect(req.owner_uid).toBe(2)
+    expect(req.targets[0]).toMatchObject({ kind: 'netdisk', remote_path: '/' })
+    wrapper.unmount()
+  })
+
+  it('一次性转存带上目标账号 owner_uid', async () => {
+    authState.hasMultipleAccounts = true
+    const wrapper = await mountDialog(false)
+    document.body.querySelector<HTMLElement>('.pick-account-2')!.click()
+    await flushPromises()
+
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+    findButton('转存全部').click()
+    await flushPromises()
+
+    expect(transfer.createTransfer).toHaveBeenCalledTimes(1)
+    const req = transfer.createTransfer.mock.calls[0][0] as { owner_uid?: number; save_path?: string }
+    expect(req.owner_uid).toBe(2)
+    expect(req.save_path).toBe('/')
     wrapper.unmount()
   })
 })

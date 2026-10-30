@@ -9,11 +9,11 @@
 
     <!-- 目录选择对话框 -->
     <el-dialog
-        v-model="dialogVisible"
-        title="选择保存位置"
-        width="600px"
-        :close-on-click-modal="false"
-        @open="handleDialogOpen"
+      v-model="dialogVisible"
+      title="选择保存位置"
+      width="600px"
+      :close-on-click-modal="false"
+      @open="handleDialogOpen"
     >
       <!-- 面包屑导航 -->
       <div class="breadcrumb-nav">
@@ -23,10 +23,10 @@
             根目录
           </el-breadcrumb-item>
           <el-breadcrumb-item
-              v-for="(part, index) in pathParts"
-              :key="getPathUpTo(index)"
-              :class="{ 'is-last': index === pathParts.length - 1 }"
-              @click="navigateTo(getPathUpTo(index))"
+            v-for="(part, index) in pathParts"
+            :key="getPathUpTo(index)"
+            :class="{ 'is-last': index === pathParts.length - 1 }"
+            @click="navigateTo(getPathUpTo(index))"
           >
             {{ part }}
           </el-breadcrumb-item>
@@ -41,12 +41,12 @@
 
           <!-- 目录列表 -->
           <div
-              v-for="folder in folders"
-              :key="folder.fs_id"
-              class="folder-item"
-              :class="{ selected: selectedFsId === folder.fs_id }"
-              @click="selectFolder(folder)"
-              @dblclick="enterFolder(folder)"
+            v-for="folder in folders"
+            :key="folder.fs_id"
+            class="folder-item"
+            :class="{ selected: selectedFsId === folder.fs_id }"
+            @click="selectFolder(folder)"
+            @dblclick="enterFolder(folder)"
           >
             <el-icon class="folder-icon"><Folder /></el-icon>
             <span class="folder-name">{{ folder.server_filename }}</span>
@@ -66,10 +66,10 @@
       <!-- 新建文件夹 -->
       <div class="create-folder">
         <el-input
-            v-model="newFolderName"
-            placeholder="新建文件夹"
-            size="small"
-            @keyup.enter="createNewFolder"
+          v-model="newFolderName"
+          placeholder="新建文件夹"
+          size="small"
+          @keyup.enter="createNewFolder"
         >
           <template #append>
             <el-button @click="createNewFolder" :loading="creating">
@@ -103,6 +103,8 @@ import { getFileList, createFolder, type FileItem } from '@/api/file'
 const props = defineProps<{
   modelValue: string  // 路径
   fsId: number        // 目录 fs_id
+  /** 浏览 / 新建目录所用的账号；缺省为当前活跃账号（跨账号转存时由父组件传入目标账号） */
+  uid?: number | null
 }>()
 
 const emit = defineEmits<{
@@ -175,7 +177,7 @@ async function loadFolders(path: string, append: boolean = false) {
 
   try {
     const page = append ? currentPage.value : 1
-    const data = await getFileList(path, page, pageSize)
+    const data = await getFileList(path, page, pageSize, 'name', false, props.uid)
     // 只显示文件夹
     const newFolders = data.list.filter(item => item.isdir === 1)
 
@@ -267,10 +269,10 @@ async function createNewFolder() {
 
   try {
     const fullPath = currentPath.value === '/'
-        ? `/${name}`
-        : `${currentPath.value}/${name}`
+      ? `/${name}`
+      : `${currentPath.value}/${name}`
 
-    await createFolder(fullPath)
+    await createFolder(fullPath, props.uid)
     ElMessage.success('文件夹创建成功')
     newFolderName.value = ''
 
