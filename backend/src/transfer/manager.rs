@@ -4294,6 +4294,14 @@ impl TransferManager {
         })
     }
 
+    /// 同步取任务句柄（不等锁）。
+    ///
+    /// 消息通知在发布终态事件的调用栈内用它抓住任务：之后任务即使被移出内存
+    /// （放弃重提 / 内存回收 / 删除），仍能读到名称与内部任务标记。
+    pub fn task_handle(&self, id: &str) -> Option<Arc<RwLock<TransferTask>>> {
+        self.tasks.get(id).map(|e| Arc::clone(&e.value().task))
+    }
+
     /// 获取单个任务
     pub async fn get_task(&self, id: &str) -> Option<TransferTask> {
         if let Some(task_info) = self.tasks.get(id) {

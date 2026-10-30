@@ -6,7 +6,9 @@
 //! - 事件来源：
 //!   - 转存 / 下载 / 文件夹下载 / 自动备份：在 `WebSocketManager::send_if_subscribed`
 //!     处统一旁路观察终态事件（[`observe_task_event`]），任务名称等上下文由
-//!     [`TaskEventInspector`]（`AppState` 注册）异步补齐；
+//!     [`TaskEventInspector`]（`AppState` 注册）在发布事件的调用栈内同步抓取任务句柄、
+//!     再在后台补齐；发布后会立即把任务移出内存的路径（单文件下载完成）由发布方用
+//!     [`remember_download_context`] 预先登记上下文；
 //!   - 分享同步：在 `share_sync::manager` 中直接调用 [`notify`]（需要订阅名 / 变更统计）。
 //! - 安全：Gotify Token、Webhook URL / 请求头都不写日志；reqwest 错误会去掉 URL 再输出。
 
@@ -24,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
+use futures::future::BoxFuture;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -186,11 +188,24 @@ impl EventContext {
     }
 }
 
+/// 后台补全事件上下文的 future（见 [`TaskEventInspector::capture`]）
+pub type ContextFuture = BoxFuture<'static, EventContext>;
+
 /// 由应用层注册，用于按事件反查任务名称、过滤内部任务
-#[async_trait]
 pub trait TaskEventInspector: Send + Sync {
-    async fn inspect(&self, kind: NotificationKind, event: &TaskEvent) -> EventContext;
+    /// **在发布事件的调用栈内同步执行**：发布方发完终态事件后可能马上把任务移出内存
+    /// （归档 / 回收 / 放弃重提），后台任务再去按 id 查就查不到了 —— 名称丢失，更糟的是
+    /// 内部任务（分享同步 / 备份）的「跳过」判定也随之丢失。所以实现必须在这里同步抓住
+    /// 任务句柄（`Arc`）或快照，返回的 future 在后台读取并补全上下文。
+    ///
+    /// 实现不得阻塞、不得等待异步锁（只能用 `DashMap` 读 / `try_read` 这类非阻塞操作）。
+    fn capture(&self, kind: NotificationKind, event: &TaskEvent) -> ContextFuture;
 }
+
+/// 发布方预先登记的上下文保留时长（正常情况下几乎立即被取走）
+const PENDING_CONTEXT_TTL: Duration = Duration::from_secs(60);
+/// 预登记表容量上限，超过时清理过期项
+const PENDING_CONTEXT_MAX_ENTRIES: usize = 256;
 
 struct Notifier {
     config: RwLock<Arc<NotificationConfig>>,
@@ -199,6 +214,8 @@ struct Notifier {
     client: reqwest::Client,
     inspector: RwLock<Option<Arc<dyn TaskEventInspector>>>,
     recent: Mutex<HashMap<String, Instant>>,
+    /// 发布方在终态事件发出前同步登记的上下文（key 见 [`pending_context_key`]）
+    pending: Mutex<HashMap<String, (Instant, EventContext)>>,
 }
 
 static NOTIFIER: LazyLock<Notifier> = LazyLock::new(|| Notifier {
@@ -211,6 +228,7 @@ static NOTIFIER: LazyLock<Notifier> = LazyLock::new(|| Notifier {
         .unwrap_or_default(),
     inspector: RwLock::new(None),
     recent: Mutex::new(HashMap::new()),
+    pending: Mutex::new(HashMap::new()),
 });
 
 /// 应用（热更新）通知配置；启动时与每次保存配置后调用
@@ -229,6 +247,98 @@ pub fn current_config() -> Arc<NotificationConfig> {
 /// 注册事件上下文补充器
 pub fn set_task_event_inspector(inspector: Arc<dyn TaskEventInspector>) {
     *NOTIFIER.inspector.write() = Some(inspector);
+}
+
+/// 通知是否整体生效（总开关 + 至少一个渠道）；发布方据此决定要不要准备上下文
+pub fn is_active() -> bool {
+    NOTIFIER.active.load(Ordering::Acquire)
+}
+
+/// 单文件下载任务的通知上下文（名称 / 本地路径 / 内部任务跳过判定）
+pub fn download_task_context(task: &crate::downloader::DownloadTask) -> EventContext {
+    if task.is_backup || task.backup_config_id.is_some() {
+        return EventContext::skip();
+    }
+    let name = task
+        .original_filename
+        .clone()
+        .or_else(|| task.remote_path.rsplit('/').next().map(|s| s.to_string()))
+        .filter(|n| !n.is_empty());
+    EventContext {
+        skip: false,
+        name,
+        details: vec![format!("本地路径：{}", task.local_path.display())],
+    }
+}
+
+/// 发布方在发出下载终态事件**之前**登记上下文。
+///
+/// 单文件下载完成后调度器会立即归档并把任务移出 `DownloadManager.tasks`，后台再查必然
+/// 落空；在仍持有任务时登记一份，[`observe_task_event`] 会同步取走使用。通知未启用时
+/// 直接忽略（零开销）。
+pub fn remember_download_context(task_id: &str, ctx: EventContext) {
+    if !is_active() {
+        return;
+    }
+    remember_context(format!("download:{}", task_id), ctx);
+}
+
+fn remember_context(key: String, ctx: EventContext) {
+    let mut pending = NOTIFIER.pending.lock();
+    let now = Instant::now();
+    if pending.len() >= PENDING_CONTEXT_MAX_ENTRIES {
+        pending.retain(|_, (t, _)| now.duration_since(*t) < PENDING_CONTEXT_TTL);
+        // 仍满（短时间内大量未被取走的登记，理论上不会发生）：淘汰最旧的一项，保证有界
+        if pending.len() >= PENDING_CONTEXT_MAX_ENTRIES {
+            if let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                pending.remove(&oldest);
+            }
+        }
+    }
+    pending.insert(key, (now, ctx));
+}
+
+/// 事件对应的预登记 key（只有下载终态事件会预登记）
+fn pending_context_key(event: &TaskEvent) -> Option<String> {
+    match event {
+        TaskEvent::Download(
+            DownloadEvent::Completed { task_id, .. } | DownloadEvent::Failed { task_id, .. },
+        ) => Some(format!("download:{}", task_id)),
+        _ => None,
+    }
+}
+
+/// 取走事件对应的预登记上下文（过期的不用）
+fn take_pending_context(event: &TaskEvent) -> Option<EventContext> {
+    let key = pending_context_key(event)?;
+    let mut pending = NOTIFIER.pending.lock();
+    if pending.is_empty() {
+        return None;
+    }
+    pending
+        .remove(&key)
+        .filter(|(t, _)| t.elapsed() < PENDING_CONTEXT_TTL)
+        .map(|(_, ctx)| ctx)
+}
+
+/// 同步阶段确定上下文来源：预登记优先，否则交给 inspector 同步抓取句柄
+fn prepare_context(
+    remembered: Option<EventContext>,
+    inspector: Option<Arc<dyn TaskEventInspector>>,
+    kind: NotificationKind,
+    event: &TaskEvent,
+) -> ContextFuture {
+    if let Some(ctx) = remembered {
+        return Box::pin(futures::future::ready(ctx));
+    }
+    match inspector {
+        Some(i) => i.capture(kind, event),
+        None => Box::pin(futures::future::ready(EventContext::default())),
+    }
 }
 
 /// 是否会推送该类事件（总开关 + 渠道 + 事件开关）
@@ -471,8 +581,11 @@ fn classify_task_event(
 
 /// 旁路观察 WebSocket 任务事件（由 `WebSocketManager::send_if_subscribed` 调用）。
 ///
-/// 同步部分只做廉价判断；名称反查与网络请求都在后台任务中完成。
+/// 同步部分只做廉价判断并抓取任务句柄（发布方随后可能把任务移出内存）；
+/// 读取任务详情与网络请求都在后台任务中完成。
 pub fn observe_task_event(event: &TaskEvent) {
+    // 预登记的上下文无论推不推都要取走，避免残留
+    let remembered = take_pending_context(event);
     if !NOTIFIER.active.load(Ordering::Acquire) {
         return;
     }
@@ -488,12 +601,9 @@ pub fn observe_task_event(event: &TaskEvent) {
     }
     let cfg = current_config();
     let inspector = NOTIFIER.inspector.read().clone();
-    let event = event.clone();
+    let ctx_future = prepare_context(remembered, inspector, kind, event);
     spawn_background(async move {
-        let ctx = match inspector {
-            Some(i) => i.inspect(kind, &event).await,
-            None => EventContext::default(),
-        };
+        let ctx = ctx_future.await;
         if ctx.skip {
             debug!("notification: 内部任务跳过 {}:{}", kind.as_str(), task_id);
             return;
@@ -514,6 +624,121 @@ pub fn observe_task_event(event: &TaskEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn download_completed(task_id: &str) -> TaskEvent {
+        TaskEvent::Download(DownloadEvent::Completed {
+            task_id: task_id.into(),
+            completed_at: 0,
+            group_id: None,
+            is_backup: false,
+            downloaded_size: 1,
+            total_size: 1,
+            owner_uid: Some(1),
+        })
+    }
+
+    /// 回归：单文件下载完成后调度器立即把任务移出内存，后台再按 id 查会丢名称 / 路径。
+    /// 调度器在发事件前登记的上下文必须在发布时被同步取走、且只取一次。
+    #[tokio::test]
+    async fn test_remembered_download_context_survives_task_removal() {
+        let task = crate::downloader::DownloadTask::new(
+            1,
+            "/remote/movie.mkv".into(),
+            std::path::PathBuf::from("/data/movie.mkv"),
+            1,
+            crate::auth::Uid::new(1),
+        );
+        let ctx = download_task_context(&task);
+        assert!(!ctx.skip);
+        assert_eq!(ctx.name.as_deref(), Some("movie.mkv"));
+        remember_context("download:t-remembered".into(), ctx);
+        drop(task); // 模拟任务已被移出内存
+
+        let ev = download_completed("t-remembered");
+        let remembered = take_pending_context(&ev);
+        assert!(remembered.is_some(), "发布时应取到预登记的上下文");
+        assert!(take_pending_context(&ev).is_none(), "预登记只能取一次");
+
+        // 预登记优先于 inspector
+        struct Panicking;
+        impl TaskEventInspector for Panicking {
+            fn capture(&self, _: NotificationKind, _: &TaskEvent) -> ContextFuture {
+                panic!("有预登记时不应再反查")
+            }
+        }
+        let ctx = prepare_context(
+            remembered,
+            Some(Arc::new(Panicking)),
+            NotificationKind::DownloadCompleted,
+            &ev,
+        )
+        .await;
+        assert_eq!(ctx.name.as_deref(), Some("movie.mkv"));
+        assert!(ctx.details.iter().any(|l| l.contains("/data/movie.mkv")));
+        // 下载失败事件同样走预登记表
+        assert!(
+            pending_context_key(&TaskEvent::Download(DownloadEvent::Failed {
+                task_id: "x".into(),
+                error: "e".into(),
+                group_id: None,
+                is_backup: false,
+                owner_uid: None,
+            }))
+            .is_some()
+        );
+    }
+
+    /// 内部（分享同步）下载任务即使出表也要保持「跳过」判定
+    #[test]
+    fn test_download_task_context_skips_internal_tasks() {
+        let mut task = crate::downloader::DownloadTask::new(
+            1,
+            "/r/a.txt".into(),
+            std::path::PathBuf::from("/l/a.txt"),
+            1,
+            crate::auth::Uid::new(1),
+        );
+        task.backup_config_id = Some("share-sync:s".into());
+        assert!(download_task_context(&task).skip);
+    }
+
+    /// inspector 在同步阶段抓住任务句柄：后台读取前任务被移出内存也不影响上下文
+    #[tokio::test]
+    async fn test_inspector_capture_holds_handle_across_removal() {
+        use dashmap::DashMap;
+        struct MapInspector(Arc<DashMap<String, Arc<tokio::sync::RwLock<String>>>>);
+        impl TaskEventInspector for MapInspector {
+            fn capture(&self, _: NotificationKind, event: &TaskEvent) -> ContextFuture {
+                let TaskEvent::Download(DownloadEvent::Completed { task_id, .. }) = event else {
+                    return Box::pin(futures::future::ready(EventContext::default()));
+                };
+                let handle = self.0.get(task_id).map(|e| Arc::clone(e.value()));
+                Box::pin(async move {
+                    match handle {
+                        Some(h) => EventContext {
+                            skip: false,
+                            name: Some(h.read().await.clone()),
+                            details: vec![],
+                        },
+                        None => EventContext::default(),
+                    }
+                })
+            }
+        }
+        let map = Arc::new(DashMap::new());
+        map.insert(
+            "t-handle".to_string(),
+            Arc::new(tokio::sync::RwLock::new("a.bin".to_string())),
+        );
+        let fut = prepare_context(
+            None,
+            Some(Arc::new(MapInspector(Arc::clone(&map)))),
+            NotificationKind::DownloadCompleted,
+            &download_completed("t-handle"),
+        );
+        map.remove("t-handle"); // 发布方紧接着把任务移出内存
+        assert_eq!(fut.await.name.as_deref(), Some("a.bin"));
+    }
 
     #[test]
     fn test_classify_skips_group_and_backup_downloads() {
