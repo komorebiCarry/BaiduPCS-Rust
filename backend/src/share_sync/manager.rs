@@ -2870,8 +2870,15 @@ async fn collect_subtasks_impl(
     // 下载段(文件夹):tree 模式整目录转存 + 自动下载会产生文件夹下载任务
     // (backup_config_id==cfg)。其子文件任务带 group_id 不会单独出现在下载管理,
     // 也不走 is_backup 的 get_tasks_by_backup_config,因此在此按文件夹级聚合进度。
+    //
+    // FolderDownloadManager 是全进程单例：只取**本账号**（= `transfer` 所属账号）的
+    // 文件夹，子任务也只在本账号的 DownloadManager 上（跨账号订阅按账号逐个收集时，
+    // 不过滤会把别的账号的文件夹再算一遍，得到速度为 0 的重复假记录）。
     if let Some(fdm) = transfer.folder_download_manager_handle().await {
-        for f in fdm.get_folders_by_backup_config(&cfg).await {
+        for f in fdm
+            .get_folders_by_backup_config_for_owner(&cfg, transfer.owner_uid())
+            .await
+        {
             // 文件夹本身不持有速度，按其子文件任务(group_id==folder.id)的瞬时速度求和。
             //
             // **只统计 `Downloading`**，与 `folder_manager` / `folder_download` handler
@@ -3628,8 +3635,12 @@ async fn is_waiting_for_download_slot(tm: &TransferManager, subscription_id: &st
 
     // 文件夹下载段：子任务带 group_id、is_backup=false，不会出现在上面按
     // backup_config 的查询里（见 `DownloadTask::new_with_group`），要单独取
+    // （只看本账号的文件夹：fdm 是全局单例，见 `collect_subtasks_impl`）
     if let Some(fdm) = tm.folder_download_manager_handle().await {
-        for f in fdm.get_folders_by_backup_config(&cfg).await {
+        for f in fdm
+            .get_folders_by_backup_config_for_owner(&cfg, tm.owner_uid())
+            .await
+        {
             statuses.extend(
                 dm.get_tasks_by_group(&f.id)
                     .await
@@ -5545,6 +5556,60 @@ mod tests {
         let r = m.trigger_one(&s.id).await;
         m.running.remove(&s.id);
         assert!(matches!(r, Err(ShareSyncError::AlreadyRunning(_))));
+    }
+
+    /// 离线构造某账号的转存管理器（共享同一个全局 FolderDownloadManager）
+    async fn offline_tm_for(
+        uid: u64,
+        fdm: &Arc<crate::downloader::FolderDownloadManager>,
+    ) -> Arc<TransferManager> {
+        let user =
+            crate::auth::UserAuth::new(uid, format!("user_{}", uid), format!("bduss_{}", uid));
+        let client = NetdiskClient::new(user).expect("create test client");
+        let mut tm = TransferManager::new(
+            Arc::new(std::sync::RwLock::new(client)),
+            crate::config::TransferConfig::default(),
+            Arc::new(tokio::sync::RwLock::new(crate::config::AppConfig::default())),
+        );
+        tm.set_owner_uid(crate::auth::Uid::new(uid));
+        tm.set_folder_download_manager(Arc::clone(fdm)).await;
+        Arc::new(tm)
+    }
+
+    /// 跨账号订阅：FolderDownloadManager 是全局单例，按账号收集子任务时每个账号
+    /// 只能看到自己的文件夹（不重复、不出现拿错 DownloadManager 的假记录）
+    #[tokio::test]
+    async fn test_collect_subtasks_only_sees_own_account_folders() {
+        use crate::downloader::{FolderDownload, FolderDownloadManager, FolderStatus};
+        let dir = tempdir().unwrap();
+        let fdm = Arc::new(FolderDownloadManager::new(dir.path().to_path_buf()));
+        let cfg = share_sync_backup_config_id("sub-x");
+        let mut f2 = FolderDownload::new("/share/dir".into(), dir.path().join("dir"));
+        f2.owner_uid = crate::auth::Uid::new(2);
+        f2.backup_config_id = Some(cfg.clone());
+        f2.status = FolderStatus::Downloading;
+        let f2_row = format!("folder:{}", f2.id);
+        fdm.insert_folder_for_test(f2).await;
+
+        let tm1 = offline_tm_for(1, &fdm).await;
+        let tm2 = offline_tm_for(2, &fdm).await;
+
+        let rows1 = collect_share_sync_subtasks_with_children(&tm1, "sub-x", 1).await;
+        assert!(
+            rows1.is_empty(),
+            "账号 1 不应看到账号 2 的文件夹: {:?}",
+            rows1
+        );
+        let rows2 = collect_share_sync_subtasks_with_children(&tm2, "sub-x", 2).await;
+        assert_eq!(
+            rows2.iter().map(|r| r.task_id.clone()).collect::<Vec<_>>(),
+            vec![f2_row]
+        );
+        // 残留探测同口径：账号 1 没有残留，不会被账号 2 的未完成文件夹误触发清理
+        assert!(collect_share_sync_subtasks(&tm1, "sub-x", 1)
+            .await
+            .is_empty());
+        assert!(!is_waiting_for_download_slot(&tm1, "sub-x").await);
     }
 
     /// 已登录（离线构造的客户端 / 转存管理器，不发网络请求）的解析器
