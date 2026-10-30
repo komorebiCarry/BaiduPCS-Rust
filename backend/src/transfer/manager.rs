@@ -105,6 +105,10 @@ pub struct CreateTransferRequest {
     /// `access_share_page`，直接复用此 `SharePageInfo`（密码分享仍会重新校验提取码
     /// 以刷新本次转存所需的 cookie）。其它调用方传 `None`，行为不变。
     pub prefetched_share: Option<SharePageInfo>,
+
+    /// 转存成功后记为全局「最近保存目录」（见 [`TransferTask::remember_recent_dir`]）。
+    /// 仅「用户手动转存到当前活跃账号」的入口置 `true`，其余调用方一律 `false`。
+    pub remember_recent_dir: bool,
 }
 
 /// 创建转存任务响应
@@ -493,6 +497,9 @@ impl TransferManager {
         // 分享同步内部任务标记 + 同步配置 id（决定衍生下载是否走 create_backup_task）
         task.is_internal = request.is_internal;
         task.backup_config_id = request.backup_config_id.clone();
+        task.remember_recent_dir = request.remember_recent_dir
+            && !request.is_internal
+            && !request.is_share_direct_download;
 
         let task_id = task.id.clone();
 
@@ -1047,12 +1054,13 @@ impl TransferManager {
         }
 
         // 执行转存
-        let (save_path, save_fs_id, is_share_direct_download) = {
+        let (save_path, save_fs_id, is_share_direct_download, remember_recent_dir) = {
             let t = task.read().await;
             (
                 t.save_path.clone(),
                 t.save_fs_id,
                 t.is_share_direct_download,
+                t.remember_recent_dir,
             )
         };
 
@@ -1623,9 +1631,10 @@ impl TransferManager {
 
                 info!("转存成功: {} 个文件", result.transferred_paths.len());
 
-                // 更新最近使用的目录（同时保存 fs_id 和 path）并持久化
-                // 分享直下模式下 save_path 是临时目录，不应写入 recent_save_path
-                if !is_share_direct_download {
+                // 更新最近使用的目录（同时保存 fs_id 和 path）并持久化。
+                // 只记用户手动转存到当前活跃账号的目录：分享直下的 save_path 是临时目录，
+                // 跨账号保存 / 内部转存的目录不属于活跃账号（见 `remember_recent_dir`）
+                if remember_recent_dir && !is_share_direct_download {
                     let mut cfg = config.write().await;
                     cfg.recent_save_fs_id = Some(save_fs_id);
                     cfg.recent_save_path = Some(save_path.clone());
@@ -4291,6 +4300,8 @@ impl TransferManager {
                 .is_some_and(is_internal_config_id),
             backup_config_id: metadata.backup_config_id.clone(),
             randsk: None,
+            // 恢复的任务不知道当初的请求来源：不更新「最近保存目录」
+            remember_recent_dir: false,
         })
     }
 

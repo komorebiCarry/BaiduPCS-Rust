@@ -161,6 +161,14 @@ pub struct TransferTask {
     /// 将 randsk 存入 task，`execute_task` 可显式传入 API 调用而非依赖 CookieJar。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub randsk: Option<String>,
+
+    /// 转存成功后是否把保存目录记为全局「最近保存目录」。
+    ///
+    /// 「最近保存目录」是活跃账号转存对话框的默认位置，只有用户手动转存到**当前活跃
+    /// 账号**时才记；跨账号保存、分享同步 / 跨账号复制等内部转存、重启恢复的任务都不记，
+    /// 否则会把别的账号的目录写成活跃账号的默认目录。仅运行态，不持久化。
+    #[serde(skip)]
+    pub remember_recent_dir: bool,
 }
 
 impl TransferTask {
@@ -214,6 +222,7 @@ impl TransferTask {
             is_internal: false,
             backup_config_id: None,
             randsk: None,
+            remember_recent_dir: false,
         }
     }
 
