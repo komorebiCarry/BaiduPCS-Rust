@@ -33,6 +33,23 @@ pub trait ShareSyncAccountResolver: Send + Sync {
     async fn active_uid(&self) -> Option<u64> {
         None
     }
+
+    /// 全局「默认下载账号」（`download.default_download_account_uid`）。
+    ///
+    /// 本地目标勾选「跟随默认下载账号」时每次执行实时解析；未设置返回 None
+    /// （调用方回退到订阅所属账号）。默认实现返回 None。
+    async fn default_download_uid(&self) -> Option<u64> {
+        None
+    }
+
+    /// 当前已注册（已登录）的全部账号 uid。
+    ///
+    /// 跨账号订阅的子任务可能落在任意账号的转存管理器里：清理残留 / 列出子任务时
+    /// 要遍历所有账号，而不只看当前配置（目标改过账号后，旧账号上的残留也要收走）。
+    /// 默认实现返回空（静态解析器只有一个实例，调用方总会额外带上 owner_uid）。
+    async fn known_uids(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// 固定解析器：忽略 `owner_uid`，始终返回构造时给定的实例。

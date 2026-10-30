@@ -22,6 +22,10 @@ pub struct NetdiskTarget {
     /// 仅本目标生效的冲突策略；None 时继承订阅级
     #[serde(default)]
     pub conflict_strategy: Option<ConflictStrategy>,
+    /// 转存到哪个账号的网盘（跨账号保存 / 多账号归集）。
+    /// `None`（老订阅缺省）或 0 = 订阅所属账号 `owner_uid`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uid: Option<u64>,
 }
 
 /// 本地同步模式：决定「同步到本地」时网盘侧如何留存。
@@ -48,6 +52,15 @@ pub struct LocalTarget {
     /// 本地同步模式（默认 `ShareDirect`，老订阅反序列化不报错）。
     #[serde(default)]
     pub mode: LocalSyncMode,
+    /// 用哪个账号下载到本地（如「小号转存留底 + VIP 大号下载」）。
+    /// `None`（老订阅缺省）或 0 = 订阅所属账号 `owner_uid`。
+    /// `use_default_download_account=true` 时忽略本字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_uid: Option<u64>,
+    /// 跟随全局「默认下载账号」（`download.default_download_account_uid`），
+    /// 每次执行时实时解析；未设置默认下载账号时回退到 `owner_uid`。
+    #[serde(default)]
+    pub use_default_download_account: bool,
 }
 
 /// 同步目标（一份订阅可同时配多个）
@@ -58,7 +71,40 @@ pub enum SyncTarget {
     Local(LocalTarget),
 }
 
+/// 非 0 的显式账号；`None` / 0 视为「跟随订阅所属账号」
+fn explicit_uid(uid: Option<u64>) -> Option<u64> {
+    uid.filter(|u| *u != 0)
+}
+
 impl SyncTarget {
+    /// 该目标实际使用的账号 uid。
+    ///
+    /// - 网盘目标：`account_uid`，缺省为 `owner_uid`
+    /// - 本地目标：`use_default_download_account` 时取全局默认下载账号，
+    ///   否则取 `download_uid`；均缺省时为 `owner_uid`
+    pub fn effective_uid(&self, owner_uid: u64, default_download_uid: Option<u64>) -> u64 {
+        match self {
+            SyncTarget::Netdisk(t) => explicit_uid(t.account_uid).unwrap_or(owner_uid),
+            SyncTarget::Local(t) => {
+                let picked = if t.use_default_download_account {
+                    explicit_uid(default_download_uid)
+                } else {
+                    explicit_uid(t.download_uid)
+                };
+                picked.unwrap_or(owner_uid)
+            }
+        }
+    }
+
+    /// 用户显式指定的账号（不含「跟随默认下载账号」）；用于保存时校验账号存在
+    pub fn explicit_account_uid(&self) -> Option<u64> {
+        match self {
+            SyncTarget::Netdisk(t) => explicit_uid(t.account_uid),
+            SyncTarget::Local(t) if !t.use_default_download_account => explicit_uid(t.download_uid),
+            SyncTarget::Local(_) => None,
+        }
+    }
+
     /// 获取此目标的冲突策略（优先自身，回退到订阅级）
     pub fn effective_conflict_strategy(&self, fallback: ConflictStrategy) -> ConflictStrategy {
         match self {
@@ -260,6 +306,31 @@ impl ShareSubscription {
         }
     }
 
+    /// 按账号把目标分组为执行腿：`(账号 uid, 该账号上的目标)`。
+    ///
+    /// 订阅所属账号的腿排在最前，其余按 uid 升序；腿内保持目标原有顺序。
+    /// 所有目标都落在 `owner_uid` 上时只有一条腿，与跨账号功能之前的行为一致。
+    pub fn account_legs(&self, default_download_uid: Option<u64>) -> Vec<(u64, Vec<SyncTarget>)> {
+        let mut legs: Vec<(u64, Vec<SyncTarget>)> = Vec::new();
+        for t in &self.targets {
+            let uid = t.effective_uid(self.owner_uid, default_download_uid);
+            match legs.iter_mut().find(|(u, _)| *u == uid) {
+                Some((_, ts)) => ts.push(t.clone()),
+                None => legs.push((uid, vec![t.clone()])),
+            }
+        }
+        let owner = self.owner_uid;
+        legs.sort_by_key(|(u, _)| (*u != owner, *u));
+        legs
+    }
+
+    /// 是否有目标落在订阅所属账号之外（跨账号订阅）
+    pub fn is_cross_account(&self, default_download_uid: Option<u64>) -> bool {
+        self.targets
+            .iter()
+            .any(|t| t.effective_uid(self.owner_uid, default_download_uid) != self.owner_uid)
+    }
+
     /// 触摸 updated_at
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
@@ -282,21 +353,28 @@ impl ShareSubscription {
         if self.targets.is_empty() {
             return Err("至少需要配置一个同步目标".into());
         }
-        // 目标模型收窄：最多 1 个网盘目标 + 1 个本地目标（可共存=转存直下）。
-        // 多个本地目标会让同一文件重复下载到多个目录、浪费带宽；多个网盘目标也无清晰需求。
-        let netdisk_count = self
-            .targets
-            .iter()
-            .filter(|t| matches!(t, SyncTarget::Netdisk(_)))
-            .count();
+        // 目标模型收窄：每个账号最多 1 个网盘目标 + 整条订阅最多 1 个本地目标。
+        // 多个本地目标会让同一文件重复下载到多个目录、浪费带宽；
+        // 多个网盘目标仅用于「多账号归集」——同一订阅转存到不同账号的网盘。
+        let mut netdisk_accounts: Vec<Option<u64>> = Vec::new();
+        for t in &self.targets {
+            if let SyncTarget::Netdisk(n) = t {
+                // 显式填 owner_uid 与缺省等价
+                let key = explicit_uid(n.account_uid).filter(|u| *u != self.owner_uid);
+                if netdisk_accounts.contains(&key) {
+                    return Err(match key {
+                        Some(uid) => format!("同一账号最多只能配置 1 个网盘目标（uid={}）", uid),
+                        None => "最多只能配置 1 个网盘目标（多个网盘目标需分属不同账号）".into(),
+                    });
+                }
+                netdisk_accounts.push(key);
+            }
+        }
         let local_count = self
             .targets
             .iter()
             .filter(|t| matches!(t, SyncTarget::Local(_)))
             .count();
-        if netdisk_count > 1 {
-            return Err("最多只能配置 1 个网盘目标".into());
-        }
         if local_count > 1 {
             return Err("最多只能配置 1 个本地目标".into());
         }
@@ -545,6 +623,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         assert_eq!(sub.name, "test");
@@ -562,6 +641,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         assert!(sub.validate().is_err());
@@ -576,6 +656,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         assert!(sub.validate().is_err());
@@ -591,6 +672,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -607,6 +689,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -623,6 +706,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -639,6 +723,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         assert!(sub.validate().is_ok());
@@ -665,11 +750,13 @@ mod tests {
                     remote_path: "/a".into(),
                     save_fs_id: 0,
                     conflict_strategy: None,
+                    account_uid: None,
                 }),
                 SyncTarget::Netdisk(NetdiskTarget {
                     remote_path: "/b".into(),
                     save_fs_id: 0,
                     conflict_strategy: None,
+                    account_uid: None,
                 }),
             ],
         );
@@ -692,11 +779,15 @@ mod tests {
                     local_path: tmp.clone(),
                     conflict_strategy: None,
                     mode: Default::default(),
+                    download_uid: None,
+                    use_default_download_account: false,
                 }),
                 SyncTarget::Local(LocalTarget {
                     local_path: tmp,
                     conflict_strategy: None,
                     mode: Default::default(),
+                    download_uid: None,
+                    use_default_download_account: false,
                 }),
             ],
         );
@@ -720,11 +811,14 @@ mod tests {
                     remote_path: "/a".into(),
                     save_fs_id: 0,
                     conflict_strategy: None,
+                    account_uid: None,
                 }),
                 SyncTarget::Local(LocalTarget {
                     local_path: tmp,
                     conflict_strategy: None,
                     mode: Default::default(),
+                    download_uid: None,
+                    use_default_download_account: false,
                 }),
             ],
         );
@@ -741,6 +835,8 @@ mod tests {
                 local_path: tmp,
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         );
         sub.poll_config.interval_secs = 60;
@@ -757,6 +853,8 @@ mod tests {
                 local_path: PathBuf::from("relative/path"),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -775,6 +873,8 @@ mod tests {
                 local_path: tmp,
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         );
         let err = sub.validate().unwrap_err();
@@ -850,6 +950,8 @@ mod tests {
                 local_path: tmp,
                 conflict_strategy: None,
                 mode: LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         );
         sub.poll_config.mode = PollMode::Cron;
@@ -880,6 +982,7 @@ mod tests {
             remote_path: "/x".into(),
             save_fs_id: 0,
             conflict_strategy: None,
+            account_uid: None,
         });
         assert_eq!(
             t.effective_conflict_strategy(ConflictStrategy::Versioned),
@@ -893,6 +996,8 @@ mod tests {
             local_path: PathBuf::from("/x"),
             conflict_strategy: Some(ConflictStrategy::Skip),
             mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            download_uid: None,
+            use_default_download_account: false,
         });
         assert_eq!(
             t.effective_conflict_strategy(ConflictStrategy::Overwrite),
@@ -909,6 +1014,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         let json = serde_json::to_string(&sub).unwrap();
@@ -932,6 +1038,7 @@ mod tests {
                 remote_path: "/y".into(),
                 save_fs_id: 0,
                 conflict_strategy: Some(ConflictStrategy::Versioned),
+                account_uid: None,
             })],
             conflict_strategy: Some(ConflictStrategy::Skip),
             delete_missing: Some(true),
@@ -1027,6 +1134,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         sub.exclude_regex_patterns = vec!["^/股票/按月归档/20(25|26)-.*$".into()];
@@ -1047,6 +1155,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         sub.exclude_regex_patterns = vec!["^/ok$".into(), "(".into()];
@@ -1079,11 +1188,125 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         sub.exclude_paths = vec!["/剧集/S01".into()];
         let json = serde_json::to_string(&sub).unwrap();
         let back: ShareSubscription = serde_json::from_str(&json).unwrap();
         assert_eq!(back.exclude_paths, vec!["/剧集/S01".to_string()]);
+    }
+
+    fn netdisk(path: &str, account_uid: Option<u64>) -> SyncTarget {
+        SyncTarget::Netdisk(NetdiskTarget {
+            remote_path: path.into(),
+            save_fs_id: 0,
+            conflict_strategy: None,
+            account_uid,
+        })
+    }
+
+    fn local(download_uid: Option<u64>, use_default: bool) -> SyncTarget {
+        SyncTarget::Local(LocalTarget {
+            local_path: std::env::temp_dir(),
+            conflict_strategy: None,
+            mode: LocalSyncMode::ShareDirect,
+            download_uid,
+            use_default_download_account: use_default,
+        })
+    }
+
+    fn cross_sub(targets: Vec<SyncTarget>) -> ShareSubscription {
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            targets,
+        );
+        sub.owner_uid = 100;
+        sub
+    }
+
+    #[test]
+    fn test_legacy_targets_deserialize_to_owner_account() {
+        // 跨账号字段之前的持久化数据：不含 account_uid / download_uid / use_default_download_account
+        let json = r#"[
+            {"kind":"netdisk","remote_path":"/a","save_fs_id":0},
+            {"kind":"local","local_path":"/tmp","mode":"transfer_and_download"}
+        ]"#;
+        let targets: Vec<SyncTarget> = serde_json::from_str(json).unwrap();
+        match &targets[0] {
+            SyncTarget::Netdisk(n) => assert_eq!(n.account_uid, None),
+            _ => panic!("应为网盘目标"),
+        }
+        match &targets[1] {
+            SyncTarget::Local(l) => {
+                assert_eq!(l.download_uid, None);
+                assert!(!l.use_default_download_account);
+            }
+            _ => panic!("应为本地目标"),
+        }
+        for t in &targets {
+            assert_eq!(t.effective_uid(100, Some(200)), 100);
+        }
+        // 缺省账号不写出字段，老版本读回不受影响
+        let back = serde_json::to_string(&targets[0]).unwrap();
+        assert!(!back.contains("account_uid"), "实际: {}", back);
+    }
+
+    #[test]
+    fn test_effective_uid_rules() {
+        assert_eq!(netdisk("/a", Some(200)).effective_uid(100, None), 200);
+        assert_eq!(netdisk("/a", Some(0)).effective_uid(100, None), 100);
+        assert_eq!(local(Some(300), false).effective_uid(100, Some(200)), 300);
+        // 跟随默认下载账号：忽略 download_uid
+        assert_eq!(local(Some(300), true).effective_uid(100, Some(200)), 200);
+        // 未设置默认下载账号 → 回退所属账号
+        assert_eq!(local(None, true).effective_uid(100, None), 100);
+        assert_eq!(local(None, true).explicit_account_uid(), None);
+        assert_eq!(local(Some(300), false).explicit_account_uid(), Some(300));
+        assert_eq!(netdisk("/a", Some(200)).explicit_account_uid(), Some(200));
+    }
+
+    #[test]
+    fn test_account_legs_group_by_account_owner_first() {
+        let sub = cross_sub(vec![
+            netdisk("/b", Some(300)),
+            local(Some(300), false),
+            netdisk("/a", None),
+            netdisk("/c", Some(200)),
+        ]);
+        let legs = sub.account_legs(None);
+        let uids: Vec<u64> = legs.iter().map(|(u, _)| *u).collect();
+        assert_eq!(uids, vec![100, 200, 300]);
+        assert_eq!(legs[2].1.len(), 2, "同账号的网盘 + 本地目标在同一条腿");
+        assert!(sub.is_cross_account(None));
+
+        let single = cross_sub(vec![netdisk("/a", None), local(Some(100), false)]);
+        assert_eq!(single.account_legs(None).len(), 1);
+        assert!(!single.is_cross_account(None));
+        // 默认下载账号指向其他账号时才算跨账号
+        let follow = cross_sub(vec![netdisk("/a", None), local(None, true)]);
+        assert!(!follow.is_cross_account(None));
+        assert!(follow.is_cross_account(Some(200)));
+    }
+
+    #[test]
+    fn test_validate_multiple_netdisk_targets_need_distinct_accounts() {
+        // 不同账号：允许（多账号归集）
+        let ok = cross_sub(vec![netdisk("/a", None), netdisk("/b", Some(200))]);
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+
+        // 显式写所属账号与缺省等价 → 视为同一账号
+        let dup_owner = cross_sub(vec![netdisk("/a", None), netdisk("/b", Some(100))]);
+        let err = dup_owner.validate().unwrap_err();
+        assert!(
+            err.contains("最多只能配置 1 个网盘目标"),
+            "实际错误: {}",
+            err
+        );
+
+        let dup_other = cross_sub(vec![netdisk("/a", Some(200)), netdisk("/b", Some(200))]);
+        let err = dup_other.validate().unwrap_err();
+        assert!(err.contains("uid=200"), "实际错误: {}", err);
     }
 }

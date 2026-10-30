@@ -153,6 +153,7 @@ pub async fn create_subscription(
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
     let owner_uid = resolve_owner_uid_for_create(&state, req.uid).await?;
     ensure_client_available(&state, owner_uid).await?;
+    ensure_target_accounts_available(&state, &req.targets, &[]).await?;
     let m = get_manager(&state).await?;
     let mut sub = req.into_subscription();
     sub.owner_uid = owner_uid.raw();
@@ -160,6 +161,36 @@ pub async fn create_subscription(
         Ok(s) => Ok(Json(ApiResponse::success(s))),
         Err(e) => Err(map_share_err(e)),
     }
+}
+
+/// 校验同步目标里显式指定的账号（跨账号保存）都已登录。
+///
+/// 只校验本次新引入的账号：沿用原配置里的账号即使暂时掉线也允许保存其他修改，
+/// 执行时该账号的目标会单独报错。「跟随默认下载账号」在执行时实时解析，不在此校验。
+async fn ensure_target_accounts_available(
+    state: &AppState,
+    targets: &[crate::share_sync::SyncTarget],
+    previous: &[crate::share_sync::SyncTarget],
+) -> Result<(), ApiError> {
+    let known: Vec<u64> = previous
+        .iter()
+        .filter_map(|t| t.explicit_account_uid())
+        .collect();
+    for uid in targets.iter().filter_map(|t| t.explicit_account_uid()) {
+        if known.contains(&uid) {
+            continue;
+        }
+        if ensure_client_available(state, crate::auth::Uid::new(uid))
+            .await
+            .is_err()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "同步目标指定的账号(uid={})未登录或不存在",
+                uid
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// PUT /api/v1/share-sync/subscriptions/:id
@@ -193,6 +224,7 @@ pub async fn update_subscription(
         new_sub.exclude_paths = v;
     }
     if let Some(v) = req.targets {
+        ensure_target_accounts_available(&state, &v, &existing.targets).await?;
         new_sub.targets = v;
     }
     if let Some(v) = req.conflict_strategy {

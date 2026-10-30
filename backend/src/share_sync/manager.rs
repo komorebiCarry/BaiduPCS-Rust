@@ -23,7 +23,7 @@ use crate::share_sync::events::{
     NoopShareSyncEventPublisher, ShareSyncEvent, ShareSyncEventPublisher,
 };
 use crate::share_sync::executor::{
-    ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
+    seed_diff_summary, ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
 };
 use crate::share_sync::persistence::{
     ShareSyncPersistence, RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
@@ -602,11 +602,11 @@ impl ShareSyncManager {
         // 只能靠切页面触发 REST 兜底拉取 —— 表现就是"速度不动，切菜单回来才刷新"。
         let progress_handle = {
             let publisher = Arc::clone(&self.publisher);
-            let transfer = Arc::clone(&tm);
+            let accounts = vec![(owner_uid, Arc::clone(&tm))];
             let rid = run_id.clone();
             let sid = sub_id.clone();
             tokio::spawn(async move {
-                broadcast_subtask_progress(publisher, transfer, rid, sid, owner_uid).await;
+                broadcast_subtask_progress(publisher, accounts, rid, sid, owner_uid).await;
             })
         };
         // 无论从哪条分支退出（跑完 / 硬上限）都要停掉广播器，避免留下永不退出的后台任务。
@@ -938,8 +938,11 @@ impl ShareSyncManager {
                 pending: &self.pending_resume,
                 ids: vec![id.clone()],
             };
-            let owner_uid = match self.get_subscription(&id) {
-                Some(s) => s.owner_uid,
+            let (owner_uid, cross_account) = match self.get_subscription(&id) {
+                Some(s) => {
+                    let default_download_uid = self.resolver.default_download_uid().await;
+                    (s.owner_uid, s.is_cross_account(default_download_uid))
+                }
                 None => continue, // 订阅启动后被删,跳过
             };
             // 同账号已确认未就绪：不再逐个订阅干等（期间门禁一直挂着），交给轮询调度兜底。
@@ -988,8 +991,15 @@ impl ShareSyncManager {
             //
             // fresh 排在 stale 前面：本次刚收编的那条才是进程被杀时真正在飞的活儿，
             // 历史 interrupted 只是它的前身。
+            //
+            // 跨账号订阅不做原地接管（接管只盯所属账号的子任务），直接走下面的清理 + 重跑。
             let mut taken_over = false;
-            for run_id in target.fresh.iter().chain(target.stale.iter()) {
+            let resumable_runs: Vec<&String> = if cross_account {
+                Vec::new()
+            } else {
+                target.fresh.iter().chain(target.stale.iter()).collect()
+            };
+            for run_id in resumable_runs {
                 if let Some(task_ids) = self.probe_resumable_run(&id, run_id, owner_uid).await {
                     let mgr = Arc::clone(&self);
                     let sub = id.clone();
@@ -1031,12 +1041,12 @@ impl ShareSyncManager {
                 }
             }
             let cfg_id = share_sync_backup_config_id(&id);
-            if let Some(transfer) = self.resolver.transfer_manager(owner_uid).await {
+            for (uid, transfer) in self.all_transfer_managers(owner_uid).await {
                 let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
                 if mem > 0 || hist > 0 {
                     info!(
-                        "share_sync 启动续跑: 订阅 {} 已清理上一轮残留（转存内存={}, 历史={}，连带下载/文件夹子任务）",
-                        id, mem, hist
+                        "share_sync 启动续跑: 订阅 {} 已清理上一轮残留（uid={}, 转存内存={}, 历史={}，连带下载/文件夹子任务）",
+                        id, uid, mem, hist
                     );
                 }
             }
@@ -1170,23 +1180,22 @@ impl ShareSyncManager {
         let sub = self
             .get_subscription(id)
             .ok_or_else(|| ShareSyncError::SubscriptionNotFound(id.into()))?;
-        let owner_uid = sub.owner_uid;
-        match self.resolver.transfer_manager(owner_uid).await {
-            Some(tm) => {
-                // 这是「进行中子任务」轮询兜底接口：必须只返回**未到终态**的子任务。
-                // 文件夹下载任务带 backup_config_id 归属后会**持久保留**(完成也不删),
-                // 若不过滤,切换页面后重新拉取会把已完成的文件夹当成「进行中」显示
-                // (前端 REST 路径直接信任后端,不像 WS upsert 那样剔除终态)。
-                // 与前端 SUBTASK_TERMINAL 口径一致,在源头过滤掉终态子任务。
-                let subs = collect_share_sync_subtasks_with_children(&tm, id, owner_uid)
+        // 跨账号订阅：子任务分布在各目标账号上，逐个账号收集后合并。
+        let mut subs: Vec<ShareSyncSubtask> = Vec::new();
+        for (uid, tm) in self.subscription_transfer_managers(&sub).await {
+            // 这是「进行中子任务」轮询兜底接口：必须只返回**未到终态**的子任务。
+            // 文件夹下载任务带 backup_config_id 归属后会**持久保留**(完成也不删),
+            // 若不过滤,切换页面后重新拉取会把已完成的文件夹当成「进行中」显示
+            // (前端 REST 路径直接信任后端,不像 WS upsert 那样剔除终态)。
+            // 与前端 SUBTASK_TERMINAL 口径一致,在源头过滤掉终态子任务。
+            subs.extend(
+                collect_share_sync_subtasks_with_children(&tm, id, uid)
                     .await
                     .into_iter()
-                    .filter(|s| !is_terminal_subtask_status(&s.status))
-                    .collect();
-                Ok(drop_orphan_children(subs))
-            }
-            None => Ok(Vec::new()),
+                    .filter(|s| !is_terminal_subtask_status(&s.status)),
+            );
         }
+        Ok(drop_orphan_children(subs))
     }
 
     pub fn create_subscription(
@@ -1407,13 +1416,14 @@ impl ShareSyncManager {
         // 清理该订阅名下的内部转存/下载任务（带 share-sync:{id} 归属），
         // 否则删订阅后这些任务会成为孤儿（重启被恢复成永远跑不完的隐藏任务 → 脏数据）。
         // 转存管理器会连带清理它持有的下载子任务。
+        // 跨账号订阅的子任务可能落在任一账号上，逐个账号清理。
         let cfg_id = share_sync_backup_config_id(id);
-        if let Some(transfer) = self.resolver.transfer_manager(removed.owner_uid).await {
+        for (uid, transfer) in self.all_transfer_managers(removed.owner_uid).await {
             let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
             if mem > 0 || hist > 0 {
                 info!(
-                    "share-sync: 删除订阅 {} 已清理内部转存任务（内存={}, 历史={}）",
-                    id, mem, hist
+                    "share-sync: 删除订阅 {} 已清理内部转存任务（uid={}, 内存={}, 历史={}）",
+                    id, uid, mem, hist
                 );
             }
         }
@@ -1928,60 +1938,56 @@ impl ShareSyncManager {
             .update_run_phase(&run_id, RUN_PHASE_EXECUTING);
         // 启动「子任务进度广播器」：run 期间约 1s 推一次 ItemProgress（走 share_sync 频道，
         // 不与自动备份 / 下载管理混淆）。run 结束后 abort。前端 WS 实时刷，REST 轮询兜底。
+        // 跨账号：按目标账号分腿（所有目标都在所属账号上时只有一条腿，走原有路径）。
+        let default_download_uid = self.resolver.default_download_uid().await;
+        let legs = sub.account_legs(default_download_uid);
+        let leg_uids: Vec<u64> = legs.iter().map(|(u, _)| *u).collect();
+        let progress_accounts = self.resolve_transfer_managers(owner_uid, &leg_uids).await;
         let progress_handle = {
             let publisher = Arc::clone(&self.publisher);
-            let transfer = Arc::clone(&transfer);
+            let accounts = progress_accounts.clone();
             let run_id = run_id.clone();
             let subscription_id = id.to_string();
             tokio::spawn(async move {
-                broadcast_subtask_progress(publisher, transfer, run_id, subscription_id, owner_uid)
+                broadcast_subtask_progress(publisher, accounts, run_id, subscription_id, owner_uid)
                     .await;
             })
         };
 
-        let hooks = ProductionHooks {
-            netdisk,
-            transfer,
-            captured: captured.clone(),
-            owner_uid,
-            rate_limiter: Arc::clone(&self.rate_limiter),
-            subscription_id: sub.id.clone(),
-        };
-        let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
-        // v2 阶段 3:默认走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
-        // 仅当显式 BAIDUPCS_DIR_TRANSFER_ENABLED=0/false 时退回老的单文件路径。
-        // 阶段 4-6 的二分/并行/限速都挂在 tree 入口下。
-        let dir_transfer_enabled = std::env::var("BAIDUPCS_DIR_TRANSFER_ENABLED")
-            .ok()
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
-        let outcome = if dir_transfer_enabled {
-            let (execution_diff, added_dir_ancestors) =
-                execution_diff_with_directory_ancestors(&diff, &curr_snapshot);
-            if added_dir_ancestors > 0 {
-                info!(
-                    "share_sync_tree_prepare: run_id={} subscription={} added_dir_ancestors={}",
-                    run_id, sub.id, added_dir_ancestors
-                );
-            }
-            info!(
-                "share_sync_route: run_id={} subscription={} mode=tree",
-                run_id, sub.id
-            );
-            executor
-                .apply_with_run_id_tree(run_id.clone(), &captured, &execution_diff)
-                .await
+        let single_owner_leg = legs.len() == 1 && legs[0].0 == owner_uid;
+        let outcome = if single_owner_leg {
+            let hooks = ProductionHooks {
+                netdisk,
+                transfer,
+                captured: captured.clone(),
+                owner_uid,
+                rate_limiter: Arc::clone(&self.rate_limiter),
+                subscription_id: sub.id.clone(),
+            };
+            let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
+            apply_diff_with_executor(&executor, &run_id, &captured, &diff, &curr_snapshot).await
         } else {
-            executor
-                .apply_with_run_id(run_id.clone(), &captured, &diff)
-                .await
+            info!(
+                "share_sync_route: run_id={} subscription={} cross_account legs={:?}",
+                run_id, sub.id, leg_uids
+            );
+            self.execute_account_legs(
+                &sub,
+                &run_id,
+                &captured,
+                &diff,
+                &curr_snapshot,
+                legs,
+                (netdisk, transfer),
+            )
+            .await
         };
 
         // run 结束，停止进度广播器（再补推一帧最终态，确保前端拿到 completed/failed）。
         progress_handle.abort();
         broadcast_subtask_progress_once(
             Arc::clone(&self.publisher),
-            self.resolver.transfer_manager(owner_uid).await,
+            progress_accounts,
             run_id.clone(),
             id.to_string(),
             owner_uid,
@@ -2078,6 +2084,166 @@ impl ShareSyncManager {
         Ok(outcome)
     }
 
+    /// 解析一组账号的转存管理器：`owner_uid` 在前，其余按给定顺序去重；未就绪的账号跳过。
+    async fn resolve_transfer_managers(
+        &self,
+        owner_uid: u64,
+        uids: &[u64],
+    ) -> Vec<(u64, Arc<TransferManager>)> {
+        let mut seen: Vec<u64> = Vec::with_capacity(uids.len() + 1);
+        let mut out = Vec::new();
+        for &uid in std::iter::once(&owner_uid).chain(uids.iter()) {
+            if seen.contains(&uid) {
+                continue;
+            }
+            seen.push(uid);
+            if let Some(tm) = self.resolver.transfer_manager(uid).await {
+                out.push((uid, tm));
+            }
+        }
+        out
+    }
+
+    /// 订阅当前配置涉及的账号（所属账号 + 各目标账号）的转存管理器
+    async fn subscription_transfer_managers(
+        &self,
+        sub: &ShareSubscription,
+    ) -> Vec<(u64, Arc<TransferManager>)> {
+        let default_download_uid = self.resolver.default_download_uid().await;
+        let uids: Vec<u64> = sub
+            .account_legs(default_download_uid)
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+        self.resolve_transfer_managers(sub.owner_uid, &uids).await
+    }
+
+    /// 所属账号 + 全部已登录账号的转存管理器。
+    ///
+    /// 清理残留时用：目标改过账号 / 默认下载账号变过后，旧账号上的子任务也要收走。
+    async fn all_transfer_managers(&self, owner_uid: u64) -> Vec<(u64, Arc<TransferManager>)> {
+        let uids = self.resolver.known_uids().await;
+        self.resolve_transfer_managers(owner_uid, &uids).await
+    }
+
+    /// 跨账号执行：每个账号一条执行腿，并发执行后合并为一个 run 结果。
+    ///
+    /// - 所属账号的腿复用扫描时的客户端与分享上下文；
+    /// - 其他账号先用**该账号**的客户端访问分享页（+ 验证提取码）拿到自己的
+    ///   `bdstoken` / `randsk`，再在该账号下转存 / 下载；
+    /// - 某账号未登录或访问分享失败只让该腿失败（run 记为部分失败），不影响其他账号；
+    /// - 本地目标所在账号没有网盘目标时，执行器自动按「分享直下」处理
+    ///   （转存到该账号临时目录 → 下载 → 清理）。
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_account_legs(
+        &self,
+        sub: &ShareSubscription,
+        run_id: &str,
+        captured: &CapturedShare,
+        diff: &ShareDiff,
+        curr_snapshot: &ShareSnapshot,
+        legs: Vec<(u64, Vec<SyncTarget>)>,
+        owner_handles: (Arc<NetdiskClient>, Arc<TransferManager>),
+    ) -> ApplyOutcome {
+        let leg_futures = legs.into_iter().map(|(uid, targets)| {
+            let owner_handles = owner_handles.clone();
+            async move {
+                let res = self
+                    .run_account_leg(
+                        sub,
+                        uid,
+                        targets,
+                        run_id,
+                        captured,
+                        diff,
+                        curr_snapshot,
+                        owner_handles,
+                    )
+                    .await;
+                if let Err(e) = &res {
+                    warn!(
+                        "share-sync: 跨账号执行腿失败 run_id={} subscription={} uid={}: {}",
+                        run_id, sub.id, uid, e
+                    );
+                }
+                (uid, res)
+            }
+        });
+        let results = futures::future::join_all(leg_futures).await;
+        let outcome = merge_account_leg_outcomes(run_id, diff, results);
+        if let Err(e) = self.persistence.finish_run(
+            run_id,
+            chrono::Utc::now().timestamp(),
+            outcome.status,
+            &outcome.diff_summary,
+            outcome.error.as_deref(),
+        ) {
+            warn!("finish_run 失败: {}", e);
+        }
+        outcome
+    }
+
+    /// 执行一条账号腿（不写 run 终态，由 [`Self::execute_account_legs`] 合并后统一写）
+    #[allow(clippy::too_many_arguments)]
+    async fn run_account_leg(
+        &self,
+        sub: &ShareSubscription,
+        uid: u64,
+        targets: Vec<SyncTarget>,
+        run_id: &str,
+        captured: &CapturedShare,
+        diff: &ShareDiff,
+        curr_snapshot: &ShareSnapshot,
+        owner_handles: (Arc<NetdiskClient>, Arc<TransferManager>),
+    ) -> Result<ApplyOutcome, String> {
+        let (netdisk, transfer, leg_captured) = if uid == sub.owner_uid {
+            (owner_handles.0, owner_handles.1, captured.clone())
+        } else {
+            let netdisk = self
+                .resolver
+                .netdisk_client(uid)
+                .await
+                .ok_or_else(|| format!("账号(uid={})未登录，跳过该账号的同步目标", uid))?;
+            let transfer = self
+                .resolver
+                .transfer_manager(uid)
+                .await
+                .ok_or_else(|| format!("账号(uid={})的转存管理器未就绪", uid))?;
+            let collector = SnapshotCollector::from_url(
+                netdisk.as_ref(),
+                &sub.share_url,
+                sub.password.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Arc::clone(&self.rate_limiter),
+            )
+            .await
+            .map_err(|e| format!("账号(uid={})访问分享失败: {}", uid, e))?;
+            let mut leg_captured = collector.captured_share();
+            drop(collector);
+            // 分享本身的标识以扫描时为准（快照里的 fs_id 都基于它）
+            leg_captured.shareid = captured.shareid.clone();
+            leg_captured.uk = captured.uk.clone();
+            (netdisk, transfer, leg_captured)
+        };
+        let mut leg_sub = sub.clone();
+        leg_sub.targets = targets;
+        let hooks = ProductionHooks {
+            netdisk,
+            transfer,
+            captured: leg_captured.clone(),
+            owner_uid: uid,
+            rate_limiter: Arc::clone(&self.rate_limiter),
+            subscription_id: sub.id.clone(),
+        };
+        let executor = ShareSyncExecutor::new(&leg_sub, &self.persistence, &hooks)
+            .without_run_finalize()
+            .with_item_account((uid != sub.owner_uid).then_some(uid));
+        Ok(apply_diff_with_executor(&executor, run_id, &leg_captured, diff, curr_snapshot).await)
+    }
+
     /// 清掉某订阅名下没人驱动的内部转存/下载任务（孤儿残留）。
     ///
     /// **调用方必须已持有该订阅的 `running` 守卫**——否则会把正在跑的 run 的子任务
@@ -2086,10 +2252,14 @@ impl ShareSyncManager {
     /// 只删任务记录，不删已下载的本地文件：本轮 diff 会把缺的重新补上，而
     /// `local_file_matches` 对已经落地的文件仍会直接标 Completed，不会白下一遍。
     async fn sweep_residual_subtasks(&self, id: &str, owner_uid: u64) {
-        let Some(transfer) = self.resolver.transfer_manager(owner_uid).await else {
-            return;
-        };
+        // 跨账号订阅的子任务可能落在任一账号上，逐个账号清理
+        for (uid, transfer) in self.all_transfer_managers(owner_uid).await {
+            Self::sweep_residual_subtasks_on(id, uid, &transfer).await;
+        }
+    }
 
+    /// [`Self::sweep_residual_subtasks`] 在单个账号上的实现
+    async fn sweep_residual_subtasks_on(id: &str, owner_uid: u64, transfer: &TransferManager) {
         // 先探测有没有「还没到终态」的残留，有才动手。
         //
         // 健康订阅每个轮询周期都会走到这里，而 `delete_tasks_for_backup_config` 是
@@ -2100,7 +2270,7 @@ impl ShareSyncManager {
         // （前提是 `is_terminal_subtask_status` 认得 `transferred` —— 那是纯网盘腿的
         // 正常终点，漏判的话每轮都会被误认成有残留。）
         let cfg_id = share_sync_backup_config_id(id);
-        let mut residual: Vec<String> = collect_share_sync_subtasks(&transfer, id, owner_uid)
+        let mut residual: Vec<String> = collect_share_sync_subtasks(transfer, id, owner_uid)
             .await
             .into_iter()
             .filter(|s| !is_terminal_subtask_status(&s.status))
@@ -2130,9 +2300,10 @@ impl ShareSyncManager {
 
         let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
         warn!(
-            "share-sync: 订阅 {} 本轮开始前清理上一轮残留子任务 {} 个（转存内存={}, 历史={}）: {}",
+            "share-sync: 订阅 {} 本轮开始前清理上一轮残留子任务 {} 个（uid={}, 转存内存={}, 历史={}）: {}",
             id,
             residual.len(),
+            owner_uid,
             mem,
             hist,
             residual.join(", ")
@@ -3188,16 +3359,21 @@ fn share_sync_stall_retry_cooldown() -> Duration {
 }
 
 /// 收集当前子任务并逐个推送 `ShareSyncEvent::ItemProgress`（一帧）。
+/// `accounts`：要收集子任务的账号（跨账号订阅有多个）；事件统一按订阅所属账号 `owner_uid` 推送。
 async fn emit_subtask_progress(
     publisher: &Arc<dyn ShareSyncEventPublisher>,
-    transfer: &TransferManager,
+    accounts: &[(u64, Arc<TransferManager>)],
     run_id: &str,
     subscription_id: &str,
     owner_uid: u64,
     reported_terminal: &mut std::collections::HashSet<String>,
 ) {
-    let subs =
-        collect_share_sync_subtasks_with_children(transfer, subscription_id, owner_uid).await;
+    let mut subs = Vec::new();
+    for (uid, transfer) in accounts {
+        subs.extend(
+            collect_share_sync_subtasks_with_children(transfer, subscription_id, *uid).await,
+        );
+    }
     for s in subs {
         // 终态只推一次（见 `broadcast_subtask_progress` 的说明）
         if is_terminal_subtask_status(&s.status) && !reported_terminal.insert(s.task_id.clone()) {
@@ -3224,7 +3400,7 @@ async fn emit_subtask_progress(
 /// 「每个 run 的子任务进度广播器」：约 1s 推一帧，直到被 abort。
 async fn broadcast_subtask_progress(
     publisher: Arc<dyn ShareSyncEventPublisher>,
-    transfer: Arc<TransferManager>,
+    accounts: Vec<(u64, Arc<TransferManager>)>,
     run_id: String,
     subscription_id: String,
     owner_uid: u64,
@@ -3241,7 +3417,7 @@ async fn broadcast_subtask_progress(
         ticker.tick().await;
         emit_subtask_progress(
             &publisher,
-            &transfer,
+            &accounts,
             &run_id,
             &subscription_id,
             owner_uid,
@@ -3254,23 +3430,122 @@ async fn broadcast_subtask_progress(
 /// 补推一帧最终态（run 结束后调用，确保前端拿到 completed/failed 终态）。
 async fn broadcast_subtask_progress_once(
     publisher: Arc<dyn ShareSyncEventPublisher>,
-    transfer: Option<Arc<TransferManager>>,
+    accounts: Vec<(u64, Arc<TransferManager>)>,
     run_id: String,
     subscription_id: String,
     owner_uid: u64,
 ) {
-    if let Some(tm) = transfer {
-        // run 结束后的最终帧：用空集合，保证终态一定会被推出去（前端据此移除）
-        let mut reported_terminal = std::collections::HashSet::new();
-        emit_subtask_progress(
-            &publisher,
-            &tm,
-            &run_id,
-            &subscription_id,
-            owner_uid,
-            &mut reported_terminal,
-        )
-        .await;
+    // run 结束后的最终帧：用空集合，保证终态一定会被推出去（前端据此移除）
+    let mut reported_terminal = std::collections::HashSet::new();
+    emit_subtask_progress(
+        &publisher,
+        &accounts,
+        &run_id,
+        &subscription_id,
+        owner_uid,
+        &mut reported_terminal,
+    )
+    .await;
+}
+
+/// 用给定执行器把 diff 应用到目标（tree 入口 / 旧单文件入口二选一）
+async fn apply_diff_with_executor(
+    executor: &ShareSyncExecutor<'_>,
+    run_id: &str,
+    captured: &CapturedShare,
+    diff: &ShareDiff,
+    curr_snapshot: &ShareSnapshot,
+) -> ApplyOutcome {
+    // v2 阶段 3:默认走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
+    // 仅当显式 BAIDUPCS_DIR_TRANSFER_ENABLED=0/false 时退回老的单文件路径。
+    // 阶段 4-6 的二分/并行/限速都挂在 tree 入口下。
+    let dir_transfer_enabled = std::env::var("BAIDUPCS_DIR_TRANSFER_ENABLED")
+        .ok()
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true);
+    if dir_transfer_enabled {
+        let (execution_diff, added_dir_ancestors) =
+            execution_diff_with_directory_ancestors(diff, curr_snapshot);
+        if added_dir_ancestors > 0 {
+            info!(
+                "share_sync_tree_prepare: run_id={} added_dir_ancestors={}",
+                run_id, added_dir_ancestors
+            );
+        }
+        info!("share_sync_route: run_id={} mode=tree", run_id);
+        executor
+            .apply_with_run_id_tree(run_id.to_string(), captured, &execution_diff)
+            .await
+    } else {
+        executor
+            .apply_with_run_id(run_id.to_string(), captured, diff)
+            .await
+    }
+}
+
+/// 合并跨账号各执行腿的结果为一个 run 结果。
+///
+/// - 新增 / 修改 / 删除 / 未变化等计数取自 diff（各腿相同，只算一次）；
+/// - 失败 / 跳过 / 覆盖数按腿累加；
+/// - 任一腿部分失败或整腿失败（账号未登录、访问分享失败）→ `CompletedWithErrors`，
+///   整腿失败时把本轮待执行的文件数计入失败数；所有腿都整体失败 → `Failed`；
+/// - 资源类跳过（配额 / 磁盘满）任一腿出现即标记，调用方据此不推进快照基线。
+fn merge_account_leg_outcomes(
+    run_id: &str,
+    diff: &ShareDiff,
+    legs: Vec<(u64, Result<ApplyOutcome, String>)>,
+) -> ApplyOutcome {
+    let mut summary = DiffSummary::default();
+    seed_diff_summary(&mut summary, diff);
+    summary.added = diff.added.iter().filter(|i| !i.is_dir).count();
+    summary.modified = diff.modified.iter().filter(|i| !i.new.is_dir).count();
+    summary.removed = diff.removed.iter().filter(|i| !i.is_dir).count();
+    let pending_files = summary.added + summary.modified;
+
+    let mut any_error = false;
+    let mut all_failed = !legs.is_empty();
+    let mut resource_skipped = false;
+    let mut errors: Vec<String> = Vec::new();
+    for (uid, res) in legs {
+        match res {
+            Ok(o) => {
+                if o.status != RunStatus::Failed {
+                    all_failed = false;
+                }
+                summary.failed += o.diff_summary.failed;
+                summary.skipped += o.diff_summary.skipped;
+                summary.overwritten += o.diff_summary.overwritten;
+                if o.status != RunStatus::Completed {
+                    any_error = true;
+                }
+                resource_skipped |= o.resource_skipped;
+                if let Some(e) = o.error {
+                    errors.push(format!("账号 {}：{}", uid, e));
+                }
+            }
+            Err(e) => {
+                any_error = true;
+                summary.failed += pending_files;
+                errors.push(e);
+            }
+        }
+    }
+    ApplyOutcome {
+        run_id: run_id.to_string(),
+        status: if all_failed {
+            RunStatus::Failed
+        } else if any_error {
+            RunStatus::CompletedWithErrors
+        } else {
+            RunStatus::Completed
+        },
+        diff_summary: summary,
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("；"))
+        },
+        resource_skipped,
     }
 }
 
@@ -3372,8 +3647,20 @@ fn describe_targets_for_notification(sub: &ShareSubscription) -> String {
     sub.targets
         .iter()
         .map(|t| match t {
-            SyncTarget::Netdisk(n) => format!("网盘 {}", n.remote_path),
-            SyncTarget::Local(l) => format!("本地 {}", l.local_path.display()),
+            SyncTarget::Netdisk(n) => {
+                match n.account_uid.filter(|u| *u != sub.owner_uid && *u != 0) {
+                    Some(uid) => format!("网盘(uid={}) {}", uid, n.remote_path),
+                    None => format!("网盘 {}", n.remote_path),
+                }
+            }
+            SyncTarget::Local(l) if l.use_default_download_account => {
+                format!("本地 {}（默认下载账号）", l.local_path.display())
+            }
+            SyncTarget::Local(l) => match l.download_uid.filter(|u| *u != sub.owner_uid && *u != 0)
+            {
+                Some(uid) => format!("本地 {}（下载账号 uid={}）", l.local_path.display(), uid),
+                None => format!("本地 {}", l.local_path.display()),
+            },
         })
         .collect::<Vec<_>>()
         .join("；")
@@ -4689,6 +4976,8 @@ mod tests {
                 local_path: std::env::temp_dir(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         )
     }
@@ -5108,6 +5397,8 @@ mod tests {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         );
         let items = vec![
@@ -5136,6 +5427,8 @@ mod tests {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         );
         let item = ShareSnapshotItem::new("/nested/a.csv", "a.csv", 1, 4, false);
@@ -5161,6 +5454,7 @@ mod tests {
                 remote_path: "/backup".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })],
         );
         let item =
@@ -5589,5 +5883,126 @@ mod tests {
         );
         // 订阅本身不受影响：仍启用、可再次触发
         assert!(m.get_subscription(&s.id).unwrap().enabled);
+    }
+
+    fn leg_outcome(
+        status: RunStatus,
+        failed: usize,
+        skipped: usize,
+        error: Option<&str>,
+    ) -> ApplyOutcome {
+        ApplyOutcome {
+            run_id: "run-x".into(),
+            status,
+            diff_summary: DiffSummary {
+                failed,
+                skipped,
+                ..DiffSummary::default()
+            },
+            error: error.map(String::from),
+            resource_skipped: false,
+        }
+    }
+
+    fn two_file_diff() -> ShareDiff {
+        ShareDiff {
+            added: vec![
+                ShareSnapshotItem::new("/a.txt", "a.txt", 1, 10, false),
+                ShareSnapshotItem::new("/d", "d", 2, 0, true),
+                ShareSnapshotItem::new("/d/b.txt", "b.txt", 3, 10, false),
+            ],
+            removed: Vec::new(),
+            modified: Vec::new(),
+            unchanged_count: 5,
+        }
+    }
+
+    #[test]
+    fn test_merge_account_legs_all_ok_counts_diff_once() {
+        let diff = two_file_diff();
+        let merged = merge_account_leg_outcomes(
+            "run-1",
+            &diff,
+            vec![
+                (100, Ok(leg_outcome(RunStatus::Completed, 0, 1, None))),
+                (200, Ok(leg_outcome(RunStatus::Completed, 0, 2, None))),
+            ],
+        );
+        assert_eq!(merged.run_id, "run-1");
+        assert_eq!(merged.status, RunStatus::Completed);
+        assert_eq!(merged.diff_summary.added, 2, "目录不计、各腿只算一次");
+        assert_eq!(merged.diff_summary.unchanged, 5);
+        assert_eq!(merged.diff_summary.total, 7);
+        assert_eq!(merged.diff_summary.skipped, 3);
+        assert!(merged.error.is_none());
+    }
+
+    #[test]
+    fn test_merge_account_legs_failed_leg_marks_partial_failure() {
+        let diff = two_file_diff();
+        let merged = merge_account_leg_outcomes(
+            "run-1",
+            &diff,
+            vec![
+                (100, Ok(leg_outcome(RunStatus::Completed, 0, 0, None))),
+                (200, Err("账号(uid=200)未登录，跳过该账号的同步目标".into())),
+            ],
+        );
+        assert_eq!(merged.status, RunStatus::CompletedWithErrors);
+        assert_eq!(
+            merged.diff_summary.failed, 2,
+            "整腿失败按待执行文件数计失败"
+        );
+        assert!(merged.error.unwrap().contains("uid=200"));
+    }
+
+    #[test]
+    fn test_merge_account_legs_propagates_partial_errors_and_resource_skip() {
+        let diff = two_file_diff();
+        let mut quota = leg_outcome(
+            RunStatus::Completed,
+            0,
+            2,
+            Some("网盘空间不足,部分子项已跳过"),
+        );
+        quota.resource_skipped = true;
+        let merged = merge_account_leg_outcomes(
+            "run-1",
+            &diff,
+            vec![
+                (100, Ok(quota)),
+                (
+                    200,
+                    Ok(leg_outcome(RunStatus::CompletedWithErrors, 1, 0, None)),
+                ),
+            ],
+        );
+        assert_eq!(merged.status, RunStatus::CompletedWithErrors);
+        assert!(merged.resource_skipped, "任一腿资源类跳过都不能推进基线");
+        assert_eq!(merged.diff_summary.failed, 1);
+        assert!(merged.error.unwrap().starts_with("账号 100："));
+    }
+
+    #[test]
+    fn test_merge_account_legs_all_failed_is_failed() {
+        let diff = two_file_diff();
+        let merged = merge_account_leg_outcomes(
+            "run-1",
+            &diff,
+            vec![
+                (
+                    100,
+                    Ok(leg_outcome(RunStatus::Failed, 0, 0, Some("启动失败"))),
+                ),
+                (200, Err("账号(uid=200)未登录，跳过该账号的同步目标".into())),
+            ],
+        );
+        assert_eq!(merged.status, RunStatus::Failed);
+        let err = merged.error.unwrap();
+        assert!(
+            err.contains("账号 100：启动失败") && err.contains("uid=200"),
+            "{}",
+            err
+        );
     }
 }

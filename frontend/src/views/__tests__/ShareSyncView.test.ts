@@ -712,3 +712,122 @@ describe('ShareSyncView 正则排除规则', () => {
     wrapper.unmount()
   })
 })
+
+describe('ShareSyncView 跨账号目标（#179）', () => {
+  const saveButton = () => Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+      .find((b) => b.textContent?.trim() === '保存')!
+
+  function editButton(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    return Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')!
+  }
+
+  afterEach(() => {
+    auth.hasMultipleAccounts = false
+    auth.accounts = [{ uid: 1, username: 'u', nickname: null }]
+  })
+
+  it('老订阅保存时不写入账号字段', async () => {
+    api.updateSubscription.mockResolvedValue({ ...SUB })
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(SUB.name).click()
+    await flushPromises()
+    expect(document.body.querySelector('.subscription-dialog .target-account-row'), '单账号老订阅不展示账号控件').toBeNull()
+    saveButton().click()
+    await flushPromises()
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([{ kind: 'local', local_path: '/tmp', mode: 'share_direct' }])
+    wrapper.unmount()
+  })
+
+  it('已有跨账号目标原样保留（归集网盘 + 默认下载账号），卡片标明账号', async () => {
+    const sub = {
+      ...SUB,
+      targets: [
+        { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+        { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', use_default_download_account: true },
+        { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+      ],
+    }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.textContent).toContain('网盘(UID 2)')
+    expect(card.textContent).toContain('本地(默认下载账号)')
+
+    editButton(sub.name).click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(1)
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'local', local_path: '/tmp', mode: 'transfer_and_download', use_default_download_account: true },
+      { kind: 'netdisk', remote_path: '/归集', save_fs_id: 0, account_uid: 2 },
+    ])
+    wrapper.unmount()
+  })
+
+  it('多账号可新增归集目标，默认选未占用账号；同账号重复时拒绝保存', async () => {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1, username: 'u', nickname: null },
+      { uid: 2, username: 'v', nickname: null },
+    ]
+    const sub = { ...SUB, targets: [{ kind: 'netdisk', remote_path: '/主', save_fs_id: 0 }] }
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue(sub)
+    const wrapper = mountView()
+    await flushPromises()
+    editButton(sub.name).click()
+    await flushPromises()
+
+    const addBtn = () => Array.from(document.body.querySelectorAll<HTMLElement>('.subscription-dialog button'))
+        .find((b) => b.textContent?.includes('同时转存到其他账号的网盘'))!
+    addBtn().click()
+    await flushPromises()
+    saveButton().click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    let req = api.updateSubscription.mock.calls[0][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0, account_uid: 2 },
+    ])
+
+    // 再次打开并新增两行：第二行已无空闲账号，回落到所属账号 → 与主网盘目标同账号，校验拦截
+    editButton(sub.name).click()
+    await flushPromises()
+    addBtn().click()
+    await flushPromises()
+    addBtn().click()
+    await flushPromises()
+    expect(document.body.querySelectorAll('.subscription-dialog .extra-netdisk-row').length).toBe(2)
+    saveButton().click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    expect(document.body.textContent).toContain('多个网盘目标需分属不同账号')
+
+    // 移除重复行后可保存
+    const removeBtn = document.body.querySelector<HTMLElement>('.subscription-dialog [aria-label="移除归集目标 #2"]')!
+    removeBtn.click()
+    await flushPromises()
+    saveButton().click()
+    await flushPromises()
+    expect(api.updateSubscription).toHaveBeenCalledTimes(2)
+    req = api.updateSubscription.mock.calls[1][1] as { targets: Array<Record<string, unknown>> }
+    expect(req.targets).toEqual([
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0 },
+      { kind: 'netdisk', remote_path: '/主', save_fs_id: 0, account_uid: 2 },
+    ])
+    wrapper.unmount()
+  })
+})

@@ -54,7 +54,7 @@
                 <el-tag :type="strategyTagType(s.conflict_strategy)" size="small">{{ describeStrategy(s.conflict_strategy) }}</el-tag>
               </div>
               <div class="config-path">
-                <span>{{ describeTargets(s.targets) }}</span>
+                <span>{{ describeTargets(s.targets, s.owner_uid) }}</span>
                 <span class="dot">·</span>
                 <span>{{ describeInterval(s.poll_config) }}</span>
                 <template v-if="s.include_paths.length">
@@ -403,6 +403,53 @@
                 />
               </div>
             </div>
+            <div v-if="showTargetAccountControls && netdiskEnabled" class="target-account-row">
+              <span class="target-account-label">网盘账号</span>
+              <AccountSelect
+                  v-model="primaryNetdiskAccount"
+                  size="small"
+                  class="target-account-select"
+                  aria-label="网盘目标账号"
+              />
+            </div>
+
+            <!-- 多账号归集：同一订阅额外转存到其他账号的网盘（每个账号最多 1 个网盘目标） -->
+            <div
+                v-for="(et, idx) in extraNetdiskTargets"
+                :key="`extra-${idx}`"
+                class="target-row extra-netdisk-row"
+            >
+              <div class="target-switch">
+                <AccountSelect
+                    :model-value="et.account_uid ?? editingOwnerUid()"
+                    @update:model-value="et.account_uid = $event"
+                    size="small"
+                    class="target-account-select"
+                    :aria-label="`归集账号 #${idx + 1}`"
+                    placeholder="选择账号"
+                />
+              </div>
+              <div class="target-path">
+                <el-input
+                    v-model="et.remote_path"
+                    :aria-label="`归集网盘目录 #${idx + 1}`"
+                    placeholder="该账号网盘路径，如 /我的资源/同步"
+                >
+                  <template #append>
+                    <el-button
+                        :icon="Close"
+                        :aria-label="`移除归集目标 #${idx + 1}`"
+                        @click="removeExtraNetdiskTarget(idx)"
+                    />
+                  </template>
+                </el-input>
+              </div>
+            </div>
+            <div v-if="authStore.hasMultipleAccounts" class="target-account-row">
+              <el-button size="small" text type="primary" :icon="Plus" @click="addExtraNetdiskTarget">
+                同时转存到其他账号的网盘
+              </el-button>
+            </div>
 
             <div class="target-row">
               <div class="target-switch">
@@ -430,6 +477,25 @@
                 </el-input>
               </div>
             </div>
+            <div v-if="showTargetAccountControls && localEnabled" class="target-account-row">
+              <span class="target-account-label">下载账号</span>
+              <el-select
+                  v-model="localDownloadAccount"
+                  size="small"
+                  class="target-account-select"
+                  aria-label="本地下载账号"
+              >
+                <el-option value="owner" label="跟随订阅所属账号" />
+                <el-option value="default" :label="defaultDownloadAccountLabel" />
+                <el-option
+                    v-for="acc in authStore.accounts"
+                    :key="acc.uid"
+                    :value="acc.uid"
+                    :label="`${acc.nickname || acc.username}（UID: ${acc.uid}）`"
+                />
+              </el-select>
+            </div>
+            <div v-if="crossAccountHint" class="sync-mode-hint">{{ crossAccountHint }}</div>
 
             <div v-if="syncModeHint" class="sync-mode-hint">{{ syncModeHint }}</div>
           </div>
@@ -496,7 +562,7 @@
         <el-table :data="currentRun.items" size="small" max-height="400" v-loading="runItemsLoading">
           <el-table-column prop="path" label="路径" />
           <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
-          <el-table-column prop="target" label="目标" width="80" :formatter="describeTarget" />
+          <el-table-column prop="target" label="目标" width="120" :formatter="describeTarget" />
           <el-table-column prop="status" label="状态" width="100" :formatter="describeItemStatus" />
           <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
@@ -570,6 +636,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/utils/responsive'
 import AccountFilter from '@/components/AccountFilter.vue'
 import AccountBadge from '@/components/AccountBadge.vue'
+import AccountSelect from '@/components/AccountSelect.vue'
 import TransferDialog from '@/components/TransferDialog.vue'
 import ShareIncludeExcludeEditor from '@/components/ShareIncludeExcludeEditor.vue'
 import CronExprEditor from '@/components/CronExprEditor.vue'
@@ -951,6 +1018,122 @@ const syncModeHint = computed(() => {
   return '下载后清理网盘临时文件。'
 })
 
+// ==================== 跨账号目标（#179） ====================
+// 网盘目标可指定账号（缺省=订阅所属账号）；额外的网盘目标用于「多账号归集」，
+// 每个账号最多 1 个（与后端 validate 一致）。本地目标可指定下载账号或跟随全局默认下载账号。
+const extraNetdiskTargets = ref<NetdiskTarget[]>([])
+
+function editingOwnerUid(): number | null {
+  return selected.value?.owner_uid ?? null
+}
+
+/** 目标的显式账号：缺省 / 0 / 等于所属账号都视为「所属账号」(null) */
+function explicitTargetUid(uid: number | null | undefined): number | null {
+  if (typeof uid !== 'number' || uid <= 0) return null
+  return uid === editingOwnerUid() ? null : uid
+}
+
+const showTargetAccountControls = computed<boolean>(() => {
+  if (authStore.hasMultipleAccounts) return true
+  // 单账号时若订阅已带跨账号配置，仍展示以便查看/改回
+  const nd = findNetdiskTarget()
+  const lo = findLocalTarget()
+  return extraNetdiskTargets.value.length > 0
+      || explicitTargetUid(nd?.account_uid) !== null
+      || explicitTargetUid(lo?.download_uid) !== null
+      || !!lo?.use_default_download_account
+})
+
+const primaryNetdiskAccount = computed<number | null>({
+  get() {
+    const nd = findNetdiskTarget() ?? netdiskDraft.value
+    return explicitTargetUid(nd.account_uid) ?? editingOwnerUid()
+  },
+  set(v: number | null) {
+    const uid = explicitTargetUid(v)
+    const apply = (t: NetdiskTarget) => {
+      // save_fs_id 是原账号的目录 id，换账号后失效
+      if (explicitTargetUid(t.account_uid) !== uid) t.save_fs_id = 0
+      t.account_uid = uid
+    }
+    const nd = findNetdiskTarget()
+    if (nd) apply(nd)
+    apply(netdiskDraft.value)
+  },
+})
+
+type LocalDownloadAccountChoice = 'owner' | 'default' | number
+const localDownloadAccount = computed<LocalDownloadAccountChoice>({
+  get() {
+    const lo = findLocalTarget() ?? localDraft.value
+    if (lo.use_default_download_account) return 'default'
+    return explicitTargetUid(lo.download_uid) ?? 'owner'
+  },
+  set(v: LocalDownloadAccountChoice) {
+    const apply = (t: LocalTarget) => {
+      t.use_default_download_account = v === 'default'
+      t.download_uid = typeof v === 'number' ? explicitTargetUid(v) : null
+    }
+    const lo = findLocalTarget()
+    if (lo) apply(lo)
+    apply(localDraft.value)
+  },
+})
+
+const defaultDownloadAccountLabel = computed(() => {
+  const uid = downloadConfig.value?.default_download_account_uid
+  if (typeof uid !== 'number' || uid <= 0) return '默认下载账号（未设置，回退所属账号）'
+  const acc = authStore.accounts.find(a => a.uid === uid)
+  return `默认下载账号（${acc ? acc.nickname || acc.username : `UID: ${uid}`}）`
+})
+
+const crossAccountHint = computed(() => {
+  const nd = findNetdiskTarget()
+  const lo = findLocalTarget()
+  const ndUid = nd ? explicitTargetUid(nd.account_uid) : null
+  const loUid = lo ? (lo.use_default_download_account ? 'default' : explicitTargetUid(lo.download_uid)) : null
+  if (extraNetdiskTargets.value.length === 0 && ndUid === null && loUid === null) return ''
+  return '跨账号目标按账号分别执行：各账号需保持登录；下载账号若没有同账号的网盘目标，将以分享直下方式下载（不在该账号网盘留存）。'
+})
+
+function addExtraNetdiskTarget() {
+  // 默认选一个还没有网盘目标的已登录账号，避免新增行直接与已有目标撞账号
+  const owner = editingOwnerUid()
+  const used = new Set<number | null>()
+  const nd = findNetdiskTarget()
+  if (nd) used.add(explicitTargetUid(nd.account_uid) ?? owner)
+  for (const t of extraNetdiskTargets.value) used.add(explicitTargetUid(t.account_uid) ?? owner)
+  const free = authStore.accounts.find(a => !used.has(a.uid))
+  extraNetdiskTargets.value.push({
+    kind: 'netdisk',
+    remote_path: netdiskRemotePath.value || '/',
+    save_fs_id: 0,
+    conflict_strategy: null,
+    account_uid: free?.uid ?? null,
+  })
+}
+
+function removeExtraNetdiskTarget(idx: number) {
+  extraNetdiskTargets.value.splice(idx, 1)
+}
+
+/** 把订阅目标拆成「主网盘 + 本地」(表单开关模型) 与「额外归集网盘目标」 */
+function splitTargetsForEdit(targets: SyncTarget[]): { main: SyncTarget[]; extras: NetdiskTarget[] } {
+  const main: SyncTarget[] = []
+  const extras: NetdiskTarget[] = []
+  let seenNetdisk = false
+  for (const t of targets) {
+    if (t.kind === 'netdisk') {
+      if (seenNetdisk) extras.push({ ...t })
+      else main.push({ ...t })
+      seenNetdisk = true
+    } else {
+      main.push({ ...t })
+    }
+  }
+  return { main, extras }
+}
+
 const netdiskRemotePath = computed<string>({
   get() { return findNetdiskTarget()?.remote_path ?? netdiskDraft.value.remote_path },
   set(v: string) {
@@ -1148,7 +1331,7 @@ function openEdit(s?: ShareSubscription) {
     exclude_patterns: [...selected.value.exclude_patterns],
     exclude_regex_patterns: [...(selected.value.exclude_regex_patterns ?? [])],
     exclude_paths: [...(selected.value.exclude_paths ?? [])],
-    targets: selected.value.targets.map(t => ({ ...t })) as SyncTarget[],
+    targets: [] as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
     delete_missing: selected.value.delete_missing,
     poll_config: normalizePollConfigForUi(selected.value.poll_config),
@@ -1162,6 +1345,13 @@ function openEdit(s?: ShareSubscription) {
     form.value.poll_config.schedule_hour = null
     form.value.poll_config.schedule_minute = null
   }
+  // 刷新「默认下载账号」（可能在设置页改过），只影响下载账号下拉的提示文案
+  getConfig()
+      .then((cfg) => { downloadConfig.value = cfg.download })
+      .catch(() => { /* 保留已加载的配置 */ })
+  const { main, extras } = splitTargetsForEdit(selected.value.targets)
+  form.value.targets = main
+  extraNetdiskTargets.value = extras
   seedTargetDrafts(form.value.targets)
   dialogVisible.value = true
 }
@@ -1179,6 +1369,7 @@ function getApiErrorMessage(e: unknown): string {
 function resetForm() {
   formRef.value?.resetFields?.()
   seedTargetDrafts(defaultForm().targets)
+  extraNetdiskTargets.value = []
 }
 
 async function saveForm() {
@@ -1209,7 +1400,7 @@ async function saveForm() {
         exclude_patterns: form.value.exclude_patterns,
         exclude_regex_patterns: form.value.exclude_regex_patterns,
         exclude_paths: form.value.exclude_paths,
-        targets: form.value.targets,
+        targets: submitTargets(),
         conflict_strategy: form.value.conflict_strategy,
         delete_missing: form.value.delete_missing,
         poll_config: form.value.poll_config,
@@ -1232,19 +1423,31 @@ function validateForm(): boolean {
     return false
   }
 
-  // 目标模型收窄：最多 1 网盘 + 1 本地（与后端 validate 一致）
-  const { netdisk, local } = targetKindCounts()
-  if (netdisk > 1) {
-    ElMessage.error('最多只能配置 1 个网盘目标')
-    return false
+  // 目标模型：每个账号最多 1 个网盘目标 + 最多 1 个本地目标（与后端 validate 一致）
+  const { local } = targetKindCounts()
+  const owner = editingOwnerUid()
+  const netdiskAccounts = new Set<number | null>()
+  for (const t of submitTargets()) {
+    if (t.kind !== 'netdisk') continue
+    const uid = explicitTargetUid(t.account_uid) ?? owner
+    if (netdiskAccounts.has(uid)) {
+      ElMessage.error(
+        uid === owner
+          ? '最多只能配置 1 个网盘目标（多个网盘目标需分属不同账号）'
+          : `同一账号最多只能配置 1 个网盘目标（UID: ${uid}）`,
+      )
+      return false
+    }
+    netdiskAccounts.add(uid)
   }
   if (local > 1) {
     ElMessage.error('最多只能配置 1 个本地目标')
     return false
   }
 
-  for (let i = 0; i < form.value.targets.length; i++) {
-    const t = form.value.targets[i] as NetdiskTarget | LocalTarget
+  const allTargets = submitTargets()
+  for (let i = 0; i < allTargets.length; i++) {
+    const t = allTargets[i] as NetdiskTarget | LocalTarget
     if (t.kind === 'netdisk') {
       if (!t.remote_path || !String(t.remote_path).trim()) {
         ElMessage.error(`目标 #${i + 1}：网盘路径不能为空`)
@@ -1354,8 +1557,21 @@ function buildSanitizedPayload() {
   form.value.exclude_regex_patterns = Array.from(regexSet)
   form.value.exclude_paths = Array.from(excludePathSet)
 
+  // 额外归集网盘目标单独归一化（保持表单模型不变，校验失败时界面状态不丢）
+  extraNetdiskTargets.value = sanitizeTargets(extraNetdiskTargets.value)
+      .filter((t): t is NetdiskTarget => t.kind === 'netdisk')
+  form.value.targets = sanitizeTargets(form.value.targets)
+  form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
+}
+
+/** 提交给后端的完整目标列表：主网盘/本地 + 额外归集网盘目标 */
+function submitTargets(): SyncTarget[] {
+  return [...form.value.targets, ...extraNetdiskTargets.value]
+}
+
+function sanitizeTargets(targets: SyncTarget[]): SyncTarget[] {
   const nextTargets: SyncTarget[] = []
-  for (const raw of form.value.targets) {
+  for (const raw of targets) {
     const t = raw as NetdiskTarget | LocalTarget
     if (!t.kind) {
       continue
@@ -1367,6 +1583,7 @@ function buildSanitizedPayload() {
         remote_path: remote,
         save_fs_id: Number.isFinite(Number(t.save_fs_id)) ? Number(t.save_fs_id) : 0,
         ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
+        ...(explicitTargetUid(t.account_uid) !== null ? { account_uid: explicitTargetUid(t.account_uid) } : {}),
       })
     } else if (t.kind === 'local') {
       // 本地路径只做 trim，不做 / 归一化（保留 Windows 的 D:\ 等平台路径原样交后端）
@@ -1376,11 +1593,15 @@ function buildSanitizedPayload() {
         local_path: local,
         mode: t.mode === 'transfer_and_download' ? 'transfer_and_download' : 'share_direct',
         ...(t.conflict_strategy ? { conflict_strategy: t.conflict_strategy } : {}),
+        ...(t.use_default_download_account
+          ? { use_default_download_account: true }
+          : explicitTargetUid(t.download_uid) !== null
+            ? { download_uid: explicitTargetUid(t.download_uid) }
+            : {}),
       })
     }
   }
-  form.value.targets = nextTargets
-  form.value.poll_config = normalizePollConfigForSubmit(form.value.poll_config)
+  return nextTargets
 }
 
 async function removeSubscription(s?: ShareSubscription) {
@@ -1593,8 +1814,19 @@ function describeInterval(p: PollConfig): string {
   return '已禁用'
 }
 
-function describeTargets(targets: SyncTarget[]): string {
-  return targets.map(t => t.kind === 'netdisk' ? '网盘' : '本地').join(' + ')
+function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
+  // 只标注落在其他账号上的目标（缺省 / 0 / 等于所属账号都是所属账号）
+  const other = (uid: number | null | undefined) =>
+    typeof uid === 'number' && uid > 0 && uid !== ownerUid ? uid : null
+  return targets.map(t => {
+    if (t.kind === 'netdisk') {
+      const uid = other(t.account_uid)
+      return uid !== null ? `网盘(UID ${uid})` : '网盘'
+    }
+    if (t.use_default_download_account) return '本地(默认下载账号)'
+    const uid = other(t.download_uid)
+    return uid !== null ? `本地(UID ${uid})` : '本地'
+  }).join(' + ')
 }
 
 function describeStrategy(s: ConflictStrategy): string {
@@ -1668,6 +1900,9 @@ function describeAction(_r: unknown, _c: unknown, v: string): string {
   return ACTION_LABELS[v] ?? v
 }
 function describeTarget(_r: unknown, _c: unknown, v: string): string {
+  // 跨账号执行腿的动作记为 `netdisk@<uid>` / `local@<uid>`（所属账号不带后缀）
+  const m = /^(.+)@(\d+)$/.exec(v || '')
+  if (m) return `${TARGET_LABELS[m[1]] ?? m[1]}(UID ${m[2]})`
   return TARGET_LABELS[v] ?? v
 }
 function describeItemStatus(_r: unknown, _c: unknown, v: string): string {
@@ -2363,6 +2598,22 @@ onUnmounted(() => {
     flex: 1 1 240px;
     min-width: 0;
   }
+
+  .target-account-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    padding-left: 48px;
+  }
+
+  .target-account-label {
+    font-size: 12px;
+    color: #909399;
+    white-space: nowrap;
+  }
+
+  .target-account-select { width: 220px; }
 }
 
 .run-item { cursor: pointer; &:hover { color: #409eff; } }

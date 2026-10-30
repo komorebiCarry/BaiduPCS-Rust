@@ -60,6 +60,8 @@ struct AppStateShareSyncResolver {
     transfer_managers: Arc<DashMap<Uid, Arc<TransferManager>>>,
     /// 进程当前活跃账号（多账号运行时真源）
     active_uid: Arc<RwLock<Option<Uid>>>,
+    /// 全局配置：读取「默认下载账号」
+    config: Arc<RwLock<AppConfig>>,
 }
 
 #[async_trait::async_trait]
@@ -79,6 +81,21 @@ impl ShareSyncAccountResolver for AppStateShareSyncResolver {
 
     async fn active_uid(&self) -> Option<u64> {
         self.active_uid.read().await.map(|u| u.raw())
+    }
+
+    async fn default_download_uid(&self) -> Option<u64> {
+        self.config
+            .read()
+            .await
+            .download
+            .default_download_account_uid
+    }
+
+    async fn known_uids(&self) -> Vec<u64> {
+        self.transfer_managers
+            .iter()
+            .map(|e| e.key().raw())
+            .collect()
     }
 }
 
@@ -1897,6 +1914,7 @@ impl AppState {
             client_pool: Arc::clone(&self.client_pool),
             transfer_managers: Arc::clone(&self.transfer_managers),
             active_uid: Arc::clone(&self.active_uid),
+            config: Arc::clone(&self.config),
         });
 
         let cfg = ManagerConfig {

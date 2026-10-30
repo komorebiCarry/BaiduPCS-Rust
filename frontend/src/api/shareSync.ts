@@ -22,6 +22,11 @@ export interface NetdiskTarget {
   remote_path: string
   save_fs_id: number
   conflict_strategy?: ConflictStrategy | null
+  /**
+   * 转存到哪个账号的网盘（跨账号保存 / 多账号归集）。
+   * 缺省或 null = 订阅所属账号（兼容老订阅）。同一订阅里每个账号最多 1 个网盘目标。
+   */
+  account_uid?: number | null
 }
 
 export interface LocalTarget {
@@ -30,6 +35,13 @@ export interface LocalTarget {
   conflict_strategy?: ConflictStrategy | null
   /** 本地同步模式；缺省时后端按 `share_direct` 反序列化（兼容老订阅） */
   mode?: LocalSyncMode
+  /**
+   * 用哪个账号下载到本地（如「小号留底 + VIP 大号下载」）。
+   * 缺省或 null = 订阅所属账号；`use_default_download_account` 为 true 时忽略本字段。
+   */
+  download_uid?: number | null
+  /** 跟随全局「默认下载账号」（运行时解析；未设置时回退订阅所属账号） */
+  use_default_download_account?: boolean
 }
 
 export type SyncTarget = NetdiskTarget | LocalTarget
