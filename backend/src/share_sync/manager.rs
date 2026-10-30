@@ -878,6 +878,13 @@ impl ShareSyncManager {
         }
 
         // 4) 广播，让前端把这条 run 从「运行中」收掉
+        // 续跑收尾的 item 都来自重启前那一轮的 diff，completed 即实际落地的变更数
+        let notify_summary = DiffSummary {
+            added: completed,
+            failed,
+            ..Default::default()
+        };
+        self.notify_run_finished(sub_id, run_id, status, &notify_summary, None);
         self.publisher.publish(ShareSyncEvent::RunCompleted {
             run_id: run_id.into(),
             subscription_id: sub_id.into(),
@@ -1313,6 +1320,17 @@ impl ShareSyncManager {
                 "share-sync: 订阅 {} 连续 {}/{} 次链接失效，自动暂停轮询: {}",
                 id, count, threshold, reason
             );
+            self.notify_share_sync(
+                crate::notification::NotificationKind::ShareSyncLinkInvalid,
+                &sub_clone,
+                None,
+                vec![
+                    format!("连续 {} 次检测到链接失效，已自动暂停轮询", count),
+                    format!("原因：{}", reason),
+                    format!("分享链接：{}", sub_clone.share_url),
+                ],
+                false,
+            );
             self.publisher.publish(ShareSyncEvent::StatusChanged {
                 subscription_id: id.into(),
                 enabled: sub_clone.enabled,
@@ -1566,7 +1584,7 @@ impl ShareSyncManager {
             debug!("share-sync: 订阅 {} 正在等待启动续跑，跳过本次触发", id);
             if let Some(rid) = given_run_id.as_deref() {
                 let owner_uid = self.get_subscription(id).map(|s| s.owner_uid).unwrap_or(0);
-                self.fail_run(
+                self.fail_run_quiet(
                     rid,
                     id,
                     owner_uid,
@@ -1585,7 +1603,7 @@ impl ShareSyncManager {
             // 不会再走到收尾，需在此 fail_run，避免留下永远 running 的孤儿 run。
             if let Some(rid) = given_run_id.as_deref() {
                 let owner_uid = self.get_subscription(id).map(|s| s.owner_uid).unwrap_or(0);
-                self.fail_run(rid, id, owner_uid, "已有同步任务在执行，已取消本次触发");
+                self.fail_run_quiet(rid, id, owner_uid, "已有同步任务在执行，已取消本次触发");
             }
             return Err(ShareSyncError::AlreadyRunning(id.into()));
         }
@@ -1623,7 +1641,7 @@ impl ShareSyncManager {
                 .unwrap_or_else(|| "分享链接已失效，已暂停轮询；请更新链接后恢复".into());
             // 同上：收尾 trigger_one 预建的 run，避免孤儿 running。
             if let Some(rid) = given_run_id.as_deref() {
-                self.fail_run(rid, id, sub.owner_uid, &reason);
+                self.fail_run_quiet(rid, id, sub.owner_uid, &reason);
             }
             return Err(ShareSyncError::ShareLinkError(reason));
         }
@@ -2014,6 +2032,13 @@ impl ShareSyncManager {
                     outcome.diff_summary.failed,
                     outcome.diff_summary.skipped,
                 );
+                self.notify_run_finished(
+                    id,
+                    &outcome.run_id,
+                    outcome.status,
+                    &outcome.diff_summary,
+                    outcome.error.as_deref(),
+                );
                 self.publisher.publish(ShareSyncEvent::RunCompleted {
                     run_id: outcome.run_id.clone(),
                     subscription_id: id.into(),
@@ -2028,6 +2053,11 @@ impl ShareSyncManager {
                 });
             }
             crate::share_sync::types::RunStatus::Failed => {
+                self.notify_run_failed(
+                    id,
+                    &outcome.run_id,
+                    outcome.error.as_deref().unwrap_or("unknown error"),
+                );
                 self.publisher.publish(ShareSyncEvent::RunFailed {
                     run_id: outcome.run_id.clone(),
                     subscription_id: id.into(),
@@ -2134,7 +2164,100 @@ impl ShareSyncManager {
         });
     }
 
+    // ===================================================
+    // 消息通知
+    // ===================================================
+
+    /// 推送一条分享同步通知（异步、失败只记日志，见 `crate::notification`）。
+    fn notify_share_sync(
+        &self,
+        kind: crate::notification::NotificationKind,
+        sub: &ShareSubscription,
+        run_id: Option<&str>,
+        mut lines: Vec<String>,
+        dedup: bool,
+    ) {
+        if !crate::notification::is_kind_enabled(kind) {
+            return;
+        }
+        let targets = describe_targets_for_notification(sub);
+        if !targets.is_empty() {
+            lines.push(format!("同步目标：{}", targets));
+        }
+        lines.push(format!("订阅 ID：{}", sub.id));
+        if let Some(rid) = run_id {
+            lines.push(format!("运行 ID：{}", rid));
+        }
+        let mut n =
+            crate::notification::Notification::new(kind, Some(sub.name.clone()), lines.join("\n"))
+                .with_task_id(sub.id.clone())
+                .with_account(Some(sub.owner_uid));
+        if dedup {
+            n = n.with_dedup_key(format!("{}:{}", kind.as_str(), run_id.unwrap_or(&sub.id)));
+        }
+        crate::notification::notify(n);
+    }
+
+    /// run 正常收尾：有新增 / 修改 → 「发现更新」；部分失败 → 「同步失败」。无变化不通知。
+    fn notify_run_finished(
+        &self,
+        sub_id: &str,
+        run_id: &str,
+        status: crate::share_sync::types::RunStatus,
+        summary: &DiffSummary,
+        error: Option<&str>,
+    ) {
+        use crate::notification::NotificationKind;
+        use crate::share_sync::types::RunStatus;
+        let (added, modified, failed) = (summary.added, summary.modified, summary.failed);
+        let Some(sub) = self.get_subscription(sub_id) else {
+            return;
+        };
+        let kind = match status {
+            RunStatus::CompletedWithErrors => NotificationKind::ShareSyncFailed,
+            RunStatus::Completed if added + modified > 0 => NotificationKind::ShareSyncUpdated,
+            _ => return,
+        };
+        let mut lines = vec![format!(
+            "新增 {} 个，更新 {} 个，失败 {} 个",
+            added, modified, failed
+        )];
+        if kind == NotificationKind::ShareSyncFailed {
+            lines.insert(0, "同步完成但有部分文件失败，下一轮会自动重试".to_string());
+        }
+        if let Some(e) = error.filter(|e| !e.is_empty()) {
+            lines.push(format!("错误：{}", e));
+        }
+        self.notify_share_sync(kind, &sub, Some(run_id), lines, true);
+    }
+
+    /// run 失败
+    fn notify_run_failed(&self, sub_id: &str, run_id: &str, err: &str) {
+        let Some(sub) = self.get_subscription(sub_id) else {
+            return;
+        };
+        self.notify_share_sync(
+            crate::notification::NotificationKind::ShareSyncFailed,
+            &sub,
+            Some(run_id),
+            vec![format!("错误：{}", err)],
+            true,
+        );
+    }
+
+    /// 以 Failed 收尾一条 run，并推送「分享同步失败」通知。
     fn fail_run(&self, run_id: &str, sub_id: &str, owner_uid: u64, err: &str) {
+        self.fail_run_inner(run_id, sub_id, owner_uid, err);
+        self.notify_run_failed(sub_id, run_id, err);
+    }
+
+    /// 以 Failed 收尾一条 run，但**不**推送通知：用于「本次触发被跳过」这类
+    /// 非真实失败（已有 run 在跑 / 等待续跑 / 链接已暂停），避免打扰用户。
+    fn fail_run_quiet(&self, run_id: &str, sub_id: &str, owner_uid: u64, err: &str) {
+        self.fail_run_inner(run_id, sub_id, owner_uid, err);
+    }
+
+    fn fail_run_inner(&self, run_id: &str, sub_id: &str, owner_uid: u64, err: &str) {
         use crate::share_sync::types::{DiffSummary, RunStatus};
         let now = chrono::Utc::now().timestamp();
         let _ = self.persistence.start_run(run_id, sub_id, now);
@@ -3242,6 +3365,18 @@ async fn is_waiting_for_download_slot(tm: &TransferManager, subscription_id: &st
     }
 
     no_progress_but_queued(statuses.iter())
+}
+
+/// 通知正文里的同步目标描述，如 `网盘 /a；本地 /data/b`
+fn describe_targets_for_notification(sub: &ShareSubscription) -> String {
+    sub.targets
+        .iter()
+        .map(|t| match t {
+            SyncTarget::Netdisk(n) => format!("网盘 {}", n.remote_path),
+            SyncTarget::Local(l) => format!("本地 {}", l.local_path.display()),
+        })
+        .collect::<Vec<_>>()
+        .join("；")
 }
 
 #[async_trait]

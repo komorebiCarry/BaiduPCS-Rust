@@ -55,6 +55,9 @@ pub mod share_sync;
 // 跨账号复制 / 移动（临时私密分享 + 转存 + 撤销分享）
 pub mod cross_account;
 
+// 消息通知（Gotify / 通用 Webhook）
+pub mod notification;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;
@@ -84,4 +87,7 @@ pub use config::PersistenceConfig;
 pub use persistence::{TaskMetadata, TaskPersistenceInfo, TaskType, WalRecord};
 
 // 🔥 导出任务槽池相关类型
-pub use task_slot_pool::{TaskSlot, TaskSlotPool, TaskSlotType, TaskPriority, SlotTouchThrottler, STALE_WARNING_THRESHOLD, STALE_RELEASE_THRESHOLD, CLEANUP_INTERVAL};
+pub use task_slot_pool::{
+    SlotTouchThrottler, TaskPriority, TaskSlot, TaskSlotPool, TaskSlotType, CLEANUP_INTERVAL,
+    STALE_RELEASE_THRESHOLD, STALE_WARNING_THRESHOLD,
+};

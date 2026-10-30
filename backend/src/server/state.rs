@@ -14,12 +14,14 @@ use crate::downloader::budget_scheduler::{
 use crate::downloader::{ChunkScheduler, DownloadManager, FolderDownloadManager};
 use crate::encryption::SnapshotManager;
 use crate::netdisk::{ClientPool, CloudDlMonitor, NetdiskClient};
+use crate::notification::{EventContext, NotificationKind, TaskEventInspector};
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, create_pre_migration_backup,
     ensure_backup_version_recorded, is_transient_sqlite_error, needs_pre_migration_backup,
     run_migration_matrix, scan_recoverable_tasks, DownloadRecoveryInfo, PersistenceManager,
     TaskType, TransferRecoveryInfo, UploadRecoveryInfo,
 };
+use crate::server::events::TaskEvent;
 use crate::server::websocket::WebSocketManager;
 use crate::share_sync::resolver::ShareSyncAccountResolver;
 use crate::share_sync::ShareSyncManager;
@@ -77,6 +79,151 @@ impl ShareSyncAccountResolver for AppStateShareSyncResolver {
 
     async fn active_uid(&self) -> Option<u64> {
         self.active_uid.read().await.map(|u| u.raw())
+    }
+}
+
+/// 消息通知的事件上下文补充器：按事件反查任务名称，并过滤分享同步 / 自动备份内部任务。
+///
+/// 同 [`AppStateShareSyncResolver`]，只持有所需的 per-uid 池句柄。
+struct AppStateNotificationInspector {
+    transfer_managers: Arc<DashMap<Uid, Arc<TransferManager>>>,
+    download_managers: Arc<DashMap<Uid, Arc<DownloadManager>>>,
+    autobackup_managers: Arc<DashMap<Uid, Arc<AutoBackupManager>>>,
+    folder_download_manager: Arc<FolderDownloadManager>,
+}
+
+impl AppStateNotificationInspector {
+    /// 事件带 owner_uid 时只查该账号；否则（老路径）遍历所有账号
+    fn candidates<T: Clone>(pool: &DashMap<Uid, T>, owner_uid: Option<u64>) -> Vec<T> {
+        match owner_uid {
+            Some(uid) => pool
+                .get(&Uid::new(uid))
+                .map(|e| vec![e.value().clone()])
+                .unwrap_or_default(),
+            None => pool.iter().map(|e| e.value().clone()).collect(),
+        }
+    }
+
+    async fn transfer_context(&self, task_id: &str, owner_uid: Option<u64>) -> EventContext {
+        for tm in Self::candidates(&self.transfer_managers, owner_uid) {
+            if let Some(task) = tm.get_task(task_id).await {
+                if task.is_internal || task.backup_config_id.is_some() {
+                    return EventContext::skip();
+                }
+                let name = task
+                    .file_name
+                    .clone()
+                    .filter(|n| !n.trim().is_empty())
+                    .or_else(|| task.file_list.first().map(|f| f.name.clone()));
+                let mut details = Vec::new();
+                if task.is_share_direct_download {
+                    if let Some(local) = task.local_download_path.as_deref() {
+                        details.push(format!("分享直下到：{}", local));
+                    }
+                } else if !task.save_path.is_empty() {
+                    details.push(format!("保存到：{}", task.save_path));
+                }
+                if task.total_count > 0 {
+                    details.push(format!(
+                        "文件数：{}/{}",
+                        task.transferred_count, task.total_count
+                    ));
+                }
+                return EventContext {
+                    skip: false,
+                    name,
+                    details,
+                };
+            }
+        }
+        EventContext::default()
+    }
+
+    async fn download_context(&self, task_id: &str, owner_uid: Option<u64>) -> EventContext {
+        for dm in Self::candidates(&self.download_managers, owner_uid) {
+            if let Some(task) = dm.get_task(task_id).await {
+                if task.is_backup || task.backup_config_id.is_some() {
+                    return EventContext::skip();
+                }
+                let name = task
+                    .original_filename
+                    .clone()
+                    .or_else(|| task.remote_path.rsplit('/').next().map(|s| s.to_string()))
+                    .filter(|n| !n.is_empty());
+                return EventContext {
+                    skip: false,
+                    name,
+                    details: vec![format!("本地路径：{}", task.local_path.display())],
+                };
+            }
+        }
+        EventContext::default()
+    }
+
+    async fn folder_context(&self, folder_id: &str) -> EventContext {
+        match self.folder_download_manager.get_folder(folder_id).await {
+            Some(folder) if folder.backup_config_id.is_some() => EventContext::skip(),
+            Some(folder) => EventContext {
+                skip: false,
+                name: Some(folder.name.clone()),
+                details: vec![
+                    format!("本地路径：{}", folder.local_root.display()),
+                    format!("文件数：{}/{}", folder.completed_count, folder.total_files),
+                ],
+            },
+            None => EventContext::default(),
+        }
+    }
+
+    async fn backup_context(&self, task_id: &str, owner_uid: Option<u64>) -> EventContext {
+        for am in Self::candidates(&self.autobackup_managers, owner_uid) {
+            if let Some(task) = am.get_task_async(task_id).await {
+                let name = am.get_config(&task.config_id).map(|c| c.name);
+                return EventContext {
+                    skip: false,
+                    name,
+                    details: vec![],
+                };
+            }
+        }
+        EventContext::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskEventInspector for AppStateNotificationInspector {
+    async fn inspect(&self, _kind: NotificationKind, event: &TaskEvent) -> EventContext {
+        use crate::server::events::{BackupEvent, DownloadEvent, FolderEvent, TransferEvent};
+        match event {
+            TaskEvent::Transfer(
+                TransferEvent::Completed {
+                    task_id, owner_uid, ..
+                }
+                | TransferEvent::Failed {
+                    task_id, owner_uid, ..
+                },
+            ) => self.transfer_context(task_id, *owner_uid).await,
+            TaskEvent::Download(
+                DownloadEvent::Completed {
+                    task_id, owner_uid, ..
+                }
+                | DownloadEvent::Failed {
+                    task_id, owner_uid, ..
+                },
+            ) => self.download_context(task_id, *owner_uid).await,
+            TaskEvent::Folder(
+                FolderEvent::Completed { folder_id, .. } | FolderEvent::Failed { folder_id, .. },
+            ) => self.folder_context(folder_id).await,
+            TaskEvent::Backup(
+                BackupEvent::Completed {
+                    task_id, owner_uid, ..
+                }
+                | BackupEvent::Failed {
+                    task_id, owner_uid, ..
+                },
+            ) => self.backup_context(task_id, *owner_uid).await,
+            _ => EventContext::default(),
+        }
     }
 }
 
@@ -434,7 +581,10 @@ impl AppState {
             ChunkScheduler::calculate_decrypt_concurrency(),
         ));
 
-        Ok(Self {
+        // 消息通知：按持久化配置初始化全局通知器（热更新见 handlers::config）
+        crate::notification::apply_config(&config.notification);
+
+        let state = Self {
             qrcode_auth: Arc::new(RwLock::new(QRCodeAuth::new_with_proxy(proxy_config)?)),
             account_manager,
             client_pool,
@@ -468,7 +618,16 @@ impl AppState {
             decrypt_semaphore,
             share_sync_manager: Arc::new(RwLock::new(None)),
             cross_account_jobs: Arc::new(crate::cross_account::CrossAccountRegistry::default()),
-        })
+        };
+
+        crate::notification::set_task_event_inspector(Arc::new(AppStateNotificationInspector {
+            transfer_managers: Arc::clone(&state.transfer_managers),
+            download_managers: Arc::clone(&state.download_managers),
+            autobackup_managers: Arc::clone(&state.autobackup_managers),
+            folder_download_manager: Arc::clone(&state.folder_download_manager),
+        }));
+
+        Ok(state)
     }
 
     /// 初始化时加载会话

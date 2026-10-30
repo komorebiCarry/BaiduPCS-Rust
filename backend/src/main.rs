@@ -497,6 +497,19 @@ async fn main() -> anyhow::Result<()> {
         // 转存配置API
         .route("/config/transfer", get(handlers::get_transfer_config))
         .route("/config/transfer", put(handlers::update_transfer_config))
+        // 消息通知（Gotify / 通用 Webhook）
+        .route(
+            "/config/notification",
+            get(handlers::get_notification_config),
+        )
+        .route(
+            "/config/notification",
+            put(handlers::update_notification_config),
+        )
+        .route(
+            "/config/notification/test",
+            post(handlers::test_notification),
+        )
         // 🔥 多账号资源配额 API
         .route("/budget", get(handlers::budget::get_budget))
         .route(

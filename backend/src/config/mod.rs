@@ -75,6 +75,9 @@ pub struct AppConfig {
     /// 界面偏好配置（仅前端使用，后端只负责持久化）
     #[serde(default)]
     pub ui: UiConfig,
+    /// 消息通知配置（Gotify / 通用 Webhook）；老配置缺该段时默认关闭
+    #[serde(default)]
+    pub notification: crate::notification::NotificationConfig,
 }
 
 // ============================================================================
@@ -1354,6 +1357,7 @@ impl Default for AppConfig {
             multi_account_vip_recommended: MultiAccountVipRecommendedConfig::default(),
             share_sync: ShareSyncConfig::default(),
             ui: UiConfig::default(),
+            notification: crate::notification::NotificationConfig::default(),
         }
     }
 }

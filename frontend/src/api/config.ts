@@ -229,6 +229,8 @@ export interface AppConfig {
   multi_account_vip_recommended?: MultiAccountVipRecommendedConfig
   share_sync?: ShareSyncConfig
   ui?: UiConfig
+  /** 消息通知；旧后端不返回该段 */
+  notification?: NotificationConfig
 }
 
 /// VIP 推荐配置
@@ -432,4 +434,151 @@ export interface ProxyTestResponse {
  */
 export async function testProxyConnection(config: ProxyConfig): Promise<ProxyTestResponse> {
   return apiClient.post('/proxy/test', config, { timeout: 15000 })
+}
+
+
+// ============================================
+// 消息通知 API（Gotify / 通用 Webhook）
+// ============================================
+
+/// Webhook 自定义请求头
+export interface WebhookHeader {
+  name: string
+  value: string
+}
+
+/// 通用 Webhook 渠道
+export interface WebhookChannelConfig {
+  enabled: boolean
+  /** http(s) 地址，支持占位符（URL 编码替换） */
+  url: string
+  /** POST / PUT / GET（GET 不发请求体） */
+  method: 'POST' | 'PUT' | 'GET' | string
+  headers: WebhookHeader[]
+  /** 含 json 时占位符按 JSON 字符串转义 */
+  content_type: string
+  body_template: string
+  timeout_secs: number
+}
+
+/// Gotify 渠道
+export interface GotifyChannelConfig {
+  enabled: boolean
+  server_url: string
+  app_token: string
+  /** 0-10 */
+  priority: number
+}
+
+/// 触发事件开关
+export interface NotificationEventToggles {
+  share_sync_updated: boolean
+  share_sync_failed: boolean
+  share_sync_link_invalid: boolean
+  transfer_completed: boolean
+  transfer_failed: boolean
+  download_completed: boolean
+  download_failed: boolean
+  backup_completed: boolean
+  backup_failed: boolean
+}
+
+/// 消息通知配置
+export interface NotificationConfig {
+  enabled: boolean
+  webhook: WebhookChannelConfig
+  gotify: GotifyChannelConfig
+  events: NotificationEventToggles
+}
+
+/** 与后端 DEFAULT_WEBHOOK_BODY_TEMPLATE 保持一致 */
+export const DEFAULT_WEBHOOK_BODY_TEMPLATE = `{
+  "event": "{{event}}",
+  "title": "{{title}}",
+  "message": "{{message}}",
+  "level": "{{level}}",
+  "name": "{{name}}",
+  "task_id": "{{task_id}}",
+  "account_uid": "{{account_uid}}",
+  "time": "{{time}}",
+  "timestamp": {{timestamp}}
+}`
+
+/** 默认通知配置（与后端 Default 一致：总开关关闭、事件全开） */
+export function defaultNotificationConfig(): NotificationConfig {
+  return {
+    enabled: false,
+    webhook: {
+      enabled: false,
+      url: '',
+      method: 'POST',
+      headers: [],
+      content_type: 'application/json',
+      body_template: DEFAULT_WEBHOOK_BODY_TEMPLATE,
+      timeout_secs: 10,
+    },
+    gotify: {
+      enabled: false,
+      server_url: '',
+      app_token: '',
+      priority: 5,
+    },
+    events: {
+      share_sync_updated: true,
+      share_sync_failed: true,
+      share_sync_link_invalid: true,
+      transfer_completed: true,
+      transfer_failed: true,
+      download_completed: true,
+      download_failed: true,
+      backup_completed: true,
+      backup_failed: true,
+    },
+  }
+}
+
+/** 用默认值补齐（兼容旧后端 / 缺字段） */
+export function normalizeNotificationConfig(cfg?: Partial<NotificationConfig> | null): NotificationConfig {
+  const d = defaultNotificationConfig()
+  return {
+    enabled: cfg?.enabled ?? d.enabled,
+    webhook: { ...d.webhook, ...(cfg?.webhook ?? {}), headers: [...(cfg?.webhook?.headers ?? [])] },
+    gotify: { ...d.gotify, ...(cfg?.gotify ?? {}) },
+    events: { ...d.events, ...(cfg?.events ?? {}) },
+  }
+}
+
+/// 单个渠道的测试结果
+export interface ChannelSendResult {
+  channel: 'webhook' | 'gotify' | string
+  success: boolean
+  error?: string
+}
+
+/// 测试通知响应
+export interface NotificationTestResponse {
+  success: boolean
+  results: ChannelSendResult[]
+}
+
+/**
+ * 获取消息通知配置
+ */
+export async function getNotificationConfig(): Promise<NotificationConfig> {
+  return apiClient.get('/config/notification')
+}
+
+/**
+ * 更新消息通知配置（立即生效）
+ */
+export async function updateNotificationConfig(config: NotificationConfig): Promise<NotificationConfig> {
+  return apiClient.put('/config/notification', config)
+}
+
+/**
+ * 发送测试通知；传入 config 时测试未保存的草稿，否则测试已保存配置
+ */
+export async function testNotification(config?: NotificationConfig): Promise<NotificationTestResponse> {
+  // 两个渠道并发，单渠道超时上限 60s
+  return apiClient.post('/config/notification/test', config ? { config } : {}, { timeout: 70000 })
 }

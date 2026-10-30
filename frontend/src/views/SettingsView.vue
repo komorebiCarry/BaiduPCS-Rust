@@ -955,6 +955,11 @@
                   </div>
                 </el-card>
 
+                <!-- 消息通知 -->
+                <div id="section-notification">
+                  <NotificationSettingsSection v-model="formData.notification!" />
+                </div>
+
                 <!-- 关于信息 -->
                 <el-card id="section-about" class="setting-card" shadow="hover">
                   <template #header>
@@ -1097,12 +1102,19 @@ import {
 import { getExcludeRuleCapabilities, validateExcludeRules } from '@/api/shareSync'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
-import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
+import {
+  getRecommendedConfig,
+  resetToRecommended,
+  getProxyStatus,
+  testProxyConnection,
+  normalizeNotificationConfig,
+} from '@/api/config'
 import type { UploadConflictStrategy } from '@/api/upload'
 import type { DownloadConflictStrategy } from '@/api/download'
 import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import AccountManagementSection from '@/components/settings/AccountManagementSection.vue'
+import NotificationSettingsSection from '@/components/settings/NotificationSettingsSection.vue'
 import BudgetPanel from '@/views/settings/BudgetPanel.vue'
 import ExcludeRuleHelp from '@/components/ExcludeRuleHelp.vue'
 import {
@@ -1303,6 +1315,7 @@ const navItems = [
   { id: 'section-encryption', label: '加密', color: '#f56c6c' },
   { id: 'section-backup', label: '自动备份', color: '#67c23a' },
   { id: 'section-proxy', label: '网络代理', color: '#9b59b6' },
+  { id: 'section-notification', label: '消息通知', color: '#e6a23c' },
   { id: 'section-about', label: '关于', color: '#909399' },
 ]
 
@@ -1438,6 +1451,11 @@ async function loadConfig() {
           normalizeRuleList(formData.value.share_sync.exclude_preset_rules)
       formData.value.share_sync.exclude_regex_preset_rules =
           normalizeRuleList(formData.value.share_sync.exclude_regex_preset_rules)
+    }
+
+    // 初始化消息通知（老后端不返回该段时用默认值）
+    if (formData.value) {
+      formData.value.notification = normalizeNotificationConfig(formData.value.notification)
     }
 
     // 初始化界面偏好（老后端不返回该段时用默认值）
@@ -1586,6 +1604,12 @@ async function handleSave() {
         ElMessage.error('代理端口不能为空')
         return
       }
+    }
+
+    // 消息通知：去掉未填写名称的请求头（后端会拒绝空名称）
+    if (formData.value.notification) {
+      formData.value.notification.webhook.headers =
+          formData.value.notification.webhook.headers.filter((h) => h.name.trim() !== '')
     }
 
     saving.value = true
