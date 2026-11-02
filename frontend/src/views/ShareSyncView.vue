@@ -2366,10 +2366,7 @@ onUnmounted(() => {
   padding: 16px 20px;
 }
 
-// 移动端底部为 fixed 标签栏（56px + 安全区）：限制本页高度，余下由 .ss-content 内部滚动
-.main-layout.is-mobile .share-sync-view {
-  max-height: calc(100vh - 60px - 56px - env(safe-area-inset-bottom, 0px));
-}
+// 移动端高度由 MainLayout 的 .main-content 约束（已扣除顶部栏与 fixed 标签栏），余下由 .ss-content 内部滚动
 .main-layout.is-mobile .ss-content {
   padding-bottom: 12px;
 }
