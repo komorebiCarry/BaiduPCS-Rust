@@ -657,6 +657,33 @@ pub struct ShareRecord {
     /// 浏览次数
     #[serde(rename = "vCnt", default)]
     pub view_count: i32,
+
+    /// 下载次数（`dCnt`，百度分享体系里与 `vCnt` 同组的计数字段，见分享页 / 公开分享列表响应）
+    ///
+    /// BaiduPCS-Go / BaiduPCS-Py 均未解析，`/share/record` 是否返回无公开文档；
+    /// 响应里没有时为 `None`，前端不显示，不会臆造为 0。
+    #[serde(rename = "dCnt", default, deserialize_with = "de_opt_count")]
+    pub download_count: Option<i64>,
+
+    /// 保存（转存）次数（`tCnt`），说明同 `download_count`
+    #[serde(rename = "tCnt", default, deserialize_with = "de_opt_count")]
+    pub transfer_count: Option<i64>,
+}
+
+/// 宽松解析可选计数：数字或数字字符串 → `Some`，其余（null / 空串 / 非数字 / 负数）→ `None`。
+///
+/// 这两个字段没有文档保证类型，解析失败不能连带整个分享列表失败。
+fn de_opt_count<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let n = match value {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    Ok(n.filter(|v| *v >= 0))
 }
 
 impl ShareRecord {
@@ -1291,6 +1318,33 @@ mod tests {
     }
 
     #[test]
+    fn share_record_optional_counts() {
+        // 没有 dCnt / tCnt：保持 None（前端不显示），不影响其它字段
+        let plain = record(r#"{"shareId":1,"status":0,"public":0,"vCnt":5}"#);
+        assert_eq!(plain.view_count, 5);
+        assert_eq!(plain.download_count, None);
+        assert_eq!(plain.transfer_count, None);
+
+        // 数字
+        let num = record(r#"{"shareId":1,"status":0,"public":0,"vCnt":356,"dCnt":29,"tCnt":184}"#);
+        assert_eq!(num.download_count, Some(29));
+        assert_eq!(num.transfer_count, Some(184));
+
+        // 数字字符串
+        let text = record(r#"{"shareId":1,"status":0,"public":0,"dCnt":"7","tCnt":" 3 "}"#);
+        assert_eq!(text.download_count, Some(7));
+        assert_eq!(text.transfer_count, Some(3));
+
+        // 异常值不拖垮整条记录
+        let odd = record(r#"{"shareId":1,"status":0,"public":0,"dCnt":null,"tCnt":"abc"}"#);
+        assert_eq!(odd.download_count, None);
+        assert_eq!(odd.transfer_count, None);
+        let neg = record(r#"{"shareId":1,"status":0,"public":0,"dCnt":-1,"tCnt":{}}"#);
+        assert_eq!(neg.download_count, None);
+        assert_eq!(neg.transfer_count, None);
+    }
+
+    #[test]
     fn share_set_error_reason_prefers_show_msg() {
         let resp = |errno: i32, errmsg: &str, show_msg: &str| ShareSetResponse {
             errno,
@@ -1323,7 +1377,7 @@ mod tests {
         let resp: ShareSetResponse = serde_json::from_str(
             r#"{"errno":42,"link":null,"pwd":null,"shareid":null,"errmsg":null,"show_msg":"原因"}"#,
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(resp.error_reason(), "原因（errno=42）");
         assert_eq!(resp.shareid, 0);
 

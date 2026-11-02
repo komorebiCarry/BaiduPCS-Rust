@@ -63,6 +63,12 @@
         </template>
       </el-table-column>
       <el-table-column label="浏览" prop="viewCount" width="80" align="center" />
+      <el-table-column v-if="showDownloadCount" label="下载" width="80" align="center">
+        <template #default="{ row }">{{ row.downloadCount ?? '-' }}</template>
+      </el-table-column>
+      <el-table-column v-if="showTransferCount" label="保存" width="80" align="center">
+        <template #default="{ row }">{{ row.transferCount ?? '-' }}</template>
+      </el-table-column>
       <el-table-column label="状态" width="100" align="center">
         <template #default="{ row }">
           <el-tag :type="getStatusType(row.status)" size="small">
@@ -118,6 +124,14 @@
           <div class="info-row">
             <span class="label">浏览:</span>
             <span class="value">{{ item.viewCount }} 次</span>
+          </div>
+          <div v-if="item.downloadCount != null" class="info-row">
+            <span class="label">下载:</span>
+            <span class="value">{{ item.downloadCount }} 次</span>
+          </div>
+          <div v-if="item.transferCount != null" class="info-row">
+            <span class="label">保存:</span>
+            <span class="value">{{ item.transferCount }} 次</span>
           </div>
           <div class="info-row">
             <span class="label">过期:</span>
@@ -217,6 +231,9 @@ const isMobile = useIsMobile()
 // 状态
 const loading = ref(false)
 const shareList = ref<ShareRecord[]>([])
+// 下载 / 保存次数：百度接口返回了才显示对应列（不返回时不臆造为 0）
+const showDownloadCount = computed(() => shareList.value.some((r) => r.downloadCount != null))
+const showTransferCount = computed(() => shareList.value.some((r) => r.transferCount != null))
 const total = ref(0)
 
 // 请求版本号 — 切账号 / 切页 时丢弃旧请求回包

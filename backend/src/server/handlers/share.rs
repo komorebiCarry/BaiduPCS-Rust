@@ -104,6 +104,12 @@ pub struct ShareRecordData {
     /// 浏览次数
     #[serde(rename = "viewCount")]
     pub view_count: i32,
+    /// 下载次数（百度未返回时省略该字段）
+    #[serde(rename = "downloadCount", skip_serializing_if = "Option::is_none")]
+    pub download_count: Option<i64>,
+    /// 保存（转存）次数（百度未返回时省略该字段）
+    #[serde(rename = "transferCount", skip_serializing_if = "Option::is_none")]
+    pub transfer_count: Option<i64>,
 }
 
 /// 分享详情数据
@@ -425,6 +431,8 @@ pub async fn get_share_list(
                         typical_path: record.typical_path,
                         expired_type: record.expired_type,
                         view_count: record.view_count,
+                        download_count: record.download_count,
+                        transfer_count: record.transfer_count,
                     })
                     .collect();
 

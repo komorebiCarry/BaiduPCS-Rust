@@ -54,6 +54,10 @@ export interface ShareRecord {
   expiredTime: number
   /** 浏览次数 */
   viewCount: number
+  /** 下载次数（百度 dCnt；接口未返回时缺省，界面不显示） */
+  downloadCount?: number
+  /** 保存（转存）次数（百度 tCnt；接口未返回时缺省，界面不显示） */
+  transferCount?: number
 }
 
 /**
