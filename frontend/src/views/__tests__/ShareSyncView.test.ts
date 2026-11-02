@@ -981,3 +981,177 @@ describe('ShareSyncView 跨账号目标（#179）', () => {
     wrapper.unmount()
   })
 })
+
+describe('ShareSyncView 运行详情文件动作筛选', () => {
+  const FACETS = {
+    status_counts: { completed: 7200, failed: 157, skipped: 120, downloading: 7 },
+    action_counts: { added: 7000, modified: 400, skipped: 84 },
+  }
+  const RUN_DETAIL = {
+    id: 'run-9',
+    started_at: 1,
+    finished_at: 2,
+    status: 'completed_with_errors',
+    total_count: 7484,
+    added_count: 7000,
+    modified_count: 400,
+    removed_count: 0,
+    unchanged_count: 0,
+    failed_count: 157,
+    skipped_count: 84,
+    overwritten_count: 400,
+    error: null,
+    items: [],
+    item_total_count: 7484,
+    item_page: 1,
+    item_page_size: 100,
+    item_facets: FACETS,
+  }
+
+  type Vm = {
+    openRun: (id: string) => Promise<void>
+    onRunItemsPageChange: (page: number) => void
+    applyRunItemFilter: () => void
+    runItemFilter: { status: string; action: string; q: string }
+    runItemStatusOptions: Array<{ value: string; label: string }>
+    runItemActionOptions: Array<{ value: string; label: string }>
+    runItemsHeaderCount: string
+    currentRun: { item_page: number; item_total_count: number } | null
+  }
+
+  async function mountAndOpenRun() {
+    api.getRun.mockReset().mockResolvedValue(structuredClone(RUN_DETAIL))
+    api.listRunItems.mockReset().mockImplementation(
+        async (_id: string, page: number, pageSize: number, filter?: { status?: string }) => ({
+          items: [],
+          total: filter?.status === 'failed' ? 157 : 7484,
+          page,
+          page_size: pageSize,
+          facets: FACETS,
+        }),
+    )
+    const wrapper = mount(ShareSyncView, {
+      attachTo: document.body,
+      global: {
+        plugins: [ElementPlus],
+        // happy-dom 下 el-table 的 MutationObserver 不可用，表格本身不在本组测试范围
+        stubs: {
+          AccountFilter: true, AccountBadge: true, TransferDialog: true,
+          ShareIncludeExcludeEditor: true, CronExprEditor: true, FilePickerModal: true,
+          'el-table': true, 'el-table-column': true,
+        },
+      },
+    })
+    await flushPromises()
+    const vm = wrapper.vm as unknown as Vm
+    await vm.openRun('run-9')
+    await flushPromises()
+    return { wrapper, vm }
+  }
+
+  it('筛选选项显示整个 run 的分组计数，进行中合并未终态状态', async () => {
+    const { wrapper, vm } = await mountAndOpenRun()
+    const status = Object.fromEntries(vm.runItemStatusOptions.map((o) => [o.value, o.label]))
+    expect(status).toEqual({
+      all: '全部状态（7484）',
+      failed: '失败（157）',
+      completed: '完成（7200）',
+      skipped: '跳过（120）',
+      in_progress: '进行中（7）',
+    })
+    const action = Object.fromEntries(vm.runItemActionOptions.map((o) => [o.value, o.label]))
+    expect(action).toEqual({
+      all: '全部动作（7484）',
+      added: '新增（7000）',
+      modified: '修改（400）',
+      removed: '删除（0）',
+      skipped: '跳过（84）',
+    })
+    expect(vm.runItemsHeaderCount).toBe('7484')
+    wrapper.unmount()
+  })
+
+  it('点「只看失败」按失败筛选、回到第 1 页，total 用筛选后的条数', async () => {
+    const { wrapper, vm } = await mountAndOpenRun()
+    vm.onRunItemsPageChange(40)
+    await flushPromises()
+    expect(vm.currentRun!.item_page).toBe(40)
+
+    const link = document.body.querySelector<HTMLElement>('.run-failed-link')
+    expect(link, '有失败项时应显示「只看失败」').toBeTruthy()
+    link!.click()
+    await flushPromises()
+
+    expect(api.listRunItems).toHaveBeenLastCalledWith('run-9', 1, 100, { status: 'failed', action: 'all', q: '' })
+    expect(vm.currentRun!.item_page).toBe(1)
+    expect(vm.currentRun!.item_total_count).toBe(157)
+    expect(vm.runItemsHeaderCount).toBe('筛选出 157 / 共 7484')
+    // 翻页沿用当前筛选
+    vm.onRunItemsPageChange(2)
+    await flushPromises()
+    expect(api.listRunItems).toHaveBeenLastCalledWith('run-9', 2, 100, { status: 'failed', action: 'all', q: '' })
+    wrapper.unmount()
+  })
+
+  it('路径关键字输入防抖后查询，换 run 时筛选归零', async () => {
+    vi.useFakeTimers()
+    try {
+      const { wrapper, vm } = await mountAndOpenRun()
+      const input = document.body.querySelector<HTMLInputElement>('.run-item-keyword-filter input')
+      expect(input).toBeTruthy()
+      input!.value = 'S01'
+      input!.dispatchEvent(new Event('input'))
+      await flushPromises()
+      expect(api.listRunItems).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(300)
+      await flushPromises()
+      expect(api.listRunItems).toHaveBeenCalledTimes(1)
+      expect(api.listRunItems).toHaveBeenLastCalledWith('run-9', 1, 100, { status: 'all', action: 'all', q: 'S01' })
+
+      await vm.openRun('run-9')
+      await flushPromises()
+      expect(vm.runItemFilter).toEqual({ status: 'all', action: 'all', q: '' })
+      wrapper.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('慢的旧请求回包不覆盖新筛选结果', async () => {
+    const { wrapper, vm } = await mountAndOpenRun()
+    let resolveOld!: (v: unknown) => void
+    api.listRunItems.mockImplementationOnce(() => new Promise((r) => { resolveOld = r }))
+    vm.onRunItemsPageChange(5)
+    vm.runItemFilter.status = 'failed'
+    vm.applyRunItemFilter()
+    await flushPromises()
+    expect(vm.currentRun!.item_total_count).toBe(157)
+    resolveOld({ items: [], total: 7484, page: 5, page_size: 100, facets: FACETS })
+    await flushPromises()
+    expect(vm.currentRun!.item_total_count).toBe(157)
+    expect(vm.currentRun!.item_page).toBe(1)
+    wrapper.unmount()
+  })
+
+  it('API 客户端只在有筛选时附加查询参数（未筛选时与旧请求一致）', async () => {
+    const { rawApiClient } = await import('@/api/client')
+    const actual = await vi.importActual<typeof import('@/api/shareSync')>('@/api/shareSync')
+    const get = vi.spyOn(rawApiClient, 'get').mockResolvedValue({ data: { success: true, data: {} } })
+    try {
+      await actual.listRunItems('r', 2, 100)
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r/items', { params: { page: 2, page_size: 100 } })
+      await actual.listRunItems('r', 1, 100, { status: 'all', action: 'all', q: '  ' })
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r/items', { params: { page: 1, page_size: 100 } })
+      await actual.listRunItems('r', 1, 100, { status: 'failed', action: 'modified', q: ' 第1集 ' })
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r/items', {
+        params: { page: 1, page_size: 100, status: 'failed', action: 'modified', q: '第1集' },
+      })
+      await actual.getRun('r', 1, 100, { status: 'failed' })
+      expect(get).toHaveBeenLastCalledWith('/share-sync/runs/r', {
+        params: { page: 1, page_size: 100, status: 'failed' },
+      })
+    } finally {
+      get.mockRestore()
+    }
+  })
+})

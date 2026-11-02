@@ -2400,10 +2400,7 @@ impl ShareSyncManager {
 
     /// 记录本次要推送的失败指纹；与该订阅上次已推送的相同则返回 false（不推）。
     fn claim_failure_notification(&self, sub_id: &str, fingerprint: String) -> bool {
-        let mut last = self
-            .failure_notified
-            .entry(sub_id.to_string())
-            .or_default();
+        let mut last = self.failure_notified.entry(sub_id.to_string()).or_default();
         if *last == fingerprint {
             return false;
         }
@@ -2461,7 +2458,10 @@ impl ShareSyncManager {
             );
             return;
         }
-        if !matches!(status, RunStatus::Completed | RunStatus::CompletedWithErrors) {
+        if !matches!(
+            status,
+            RunStatus::Completed | RunStatus::CompletedWithErrors
+        ) {
             return;
         }
         let (headline, fp_kind) = if status == RunStatus::CompletedWithErrors {
@@ -5675,7 +5675,10 @@ mod tests {
 
         let fp = "partial:账号(uid=2)未登录".to_string();
         assert!(m.claim_failure_notification(&s.id, fp.clone()));
-        assert!(!m.claim_failure_notification(&s.id, fp.clone()), "同一故障不再推");
+        assert!(
+            !m.claim_failure_notification(&s.id, fp.clone()),
+            "同一故障不再推"
+        );
         assert!(
             m.claim_failure_notification(&s.id, "failed:网络错误".into()),
             "原因变化要推"

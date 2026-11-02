@@ -188,16 +188,49 @@ export interface RunDetail {
   /** 运行中 run 的当前阶段（后端 RunDetailDto 用 serde flatten 透传 RunRecord 的字段） */
   phase?: RunPhase | string | null
   items: RunItemRecord[]
+  /** 符合筛选条件的条数（未筛选时 = 全部条数） */
   item_total_count: number
   item_page: number
   item_page_size: number
+  /** 整个 run 按状态 / 动作分组计数（不受筛选影响）；老后端不返回 */
+  item_facets?: RunItemFacets
+}
+
+/** 运行详情「文件动作」分组计数：键为后端 status / action 原值 */
+export interface RunItemFacets {
+  status_counts: Record<string, number>
+  action_counts: Record<string, number>
+}
+
+/**
+ * 运行详情「文件动作」服务端筛选条件。字段为空 / 'all' 表示不筛选。
+ * status 除后端原值外还支持分组值 'in_progress'（等待 / 转存中 / 下载中 / 删除中）。
+ */
+export interface RunItemFilter {
+  status?: string
+  action?: string
+  /** 路径关键字（字面包含匹配，不区分大小写） */
+  q?: string
 }
 
 export interface RunItemsPage {
   items: RunItemRecord[]
+  /** 符合筛选条件的条数 */
   total: number
   page: number
   page_size: number
+  /** 老后端不返回 */
+  facets?: RunItemFacets
+}
+
+/** 只把有效筛选条件放进查询参数，未筛选时请求与旧版完全一致 */
+function runItemFilterParams(filter?: RunItemFilter): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (filter?.status && filter.status !== 'all') out.status = filter.status
+  if (filter?.action && filter.action !== 'all') out.action = filter.action
+  const q = filter?.q?.trim()
+  if (q) out.q = q
+  return out
 }
 
 export interface ShareSnapshotItem {
@@ -390,16 +423,21 @@ export async function listRuns(id: string, page = 1, pageSize = 20): Promise<Run
   return r.data.data
 }
 
-export async function getRun(runId: string, page = 1, pageSize = 100): Promise<RunDetail> {
+export async function getRun(runId: string, page = 1, pageSize = 100, filter?: RunItemFilter): Promise<RunDetail> {
   const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, ...runItemFilterParams(filter) }
   })
   return r.data.data
 }
 
-export async function listRunItems(runId: string, page = 1, pageSize = 100): Promise<RunItemsPage> {
+export async function listRunItems(
+  runId: string,
+  page = 1,
+  pageSize = 100,
+  filter?: RunItemFilter,
+): Promise<RunItemsPage> {
   const r = await rawApiClient.get<{ success: boolean; data: RunItemsPage }>(`${BASE}/runs/${runId}/items`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, ...runItemFilterParams(filter) }
   })
   return r.data.data
 }

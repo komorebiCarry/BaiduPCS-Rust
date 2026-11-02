@@ -42,8 +42,9 @@ pub use manager::{
     ShareSyncSubtask,
 };
 pub use persistence::{
-    normalize_pagination, RunItemRecord, RunRecord, ShareSyncPersistence, DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE, RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
+    normalize_pagination, RunItemFacets, RunItemFilter, RunItemRecord, RunRecord,
+    ShareSyncPersistence, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, RUN_ITEM_STATUS_IN_PROGRESS,
+    RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
 };
 pub use resolver::{ShareSyncAccountResolver, StaticAccountResolver};
 pub use snapshot::{

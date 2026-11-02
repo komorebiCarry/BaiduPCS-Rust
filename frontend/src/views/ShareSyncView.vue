@@ -554,13 +554,70 @@
           <el-descriptions-item label="覆盖">{{ runOverwrittenCount(currentRun) }}</el-descriptions-item>
           <el-descriptions-item label="一致跳过">{{ runUnchangedCount(currentRun) }}</el-descriptions-item>
           <el-descriptions-item label="其它跳过">{{ runSkippedCount(currentRun) }}</el-descriptions-item>
-          <el-descriptions-item label="失败">{{ currentRun.failed_count }}</el-descriptions-item>
+          <el-descriptions-item label="失败">
+            <el-link
+                v-if="currentRun.failed_count > 0"
+                type="danger"
+                class="run-failed-link"
+                @click="filterRunItemsByStatus('failed')"
+            >{{ currentRun.failed_count }}（只看失败）</el-link>
+            <template v-else>{{ currentRun.failed_count }}</template>
+          </el-descriptions-item>
           <el-descriptions-item label="错误" v-if="currentRun.error">
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
         </el-descriptions>
-        <h4 style="margin-top: 16px">文件动作（{{ currentRun.item_total_count }}）</h4>
-        <el-table :data="currentRun.items" size="small" max-height="400" v-loading="runItemsLoading">
+        <div class="run-items-header">
+          <h4>文件动作（{{ runItemsHeaderCount }}）</h4>
+          <!-- 服务端筛选：total / 分页都按筛选后的结果算，几千条里也能直接定位失败项 -->
+          <div class="run-items-filters">
+            <el-select
+                v-model="runItemFilter.status"
+                size="small"
+                class="run-item-status-filter"
+                aria-label="按状态筛选"
+                @change="applyRunItemFilter"
+            >
+              <el-option
+                  v-for="opt in runItemStatusOptions"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+              />
+            </el-select>
+            <el-select
+                v-model="runItemFilter.action"
+                size="small"
+                class="run-item-action-filter"
+                aria-label="按动作筛选"
+                @change="applyRunItemFilter"
+            >
+              <el-option
+                  v-for="opt in runItemActionOptions"
+                  :key="opt.value"
+                  :label="opt.label"
+                  :value="opt.value"
+              />
+            </el-select>
+            <el-input
+                v-model="runItemFilter.q"
+                size="small"
+                clearable
+                placeholder="搜索路径"
+                class="run-item-keyword-filter"
+                @input="onRunItemKeywordInput"
+                @clear="applyRunItemFilter"
+                @keyup.enter="applyRunItemFilter"
+            />
+          </div>
+        </div>
+        <el-table
+            :data="currentRun.items"
+            size="small"
+            max-height="400"
+            v-loading="runItemsLoading"
+            :empty-text="runItemFilterActive ? '没有符合筛选条件的文件' : '暂无数据'"
+        >
           <el-table-column prop="path" label="路径" />
           <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
           <el-table-column prop="target" label="目标" width="120" :formatter="describeTarget" />
@@ -630,7 +687,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AxiosError } from 'axios'
 import { useAuthStore } from '@/stores/auth'
@@ -699,6 +756,119 @@ const runs = ref<RunRecord[]>([])
 const currentRun = ref<RunDetail | null>(null)
 const currentRunId = ref<string | null>(null)
 const runItemsLoading = ref(false)
+
+// ---- 运行详情「文件动作」服务端筛选 ----
+const runItemFilter = reactive({ status: 'all', action: 'all', q: '' })
+// 请求版本号：切筛选 / 翻页 / 换 run 时丢弃旧回包，避免慢请求覆盖新结果
+let runItemsRequestVersion = 0
+let runItemKeywordTimer: ReturnType<typeof setTimeout> | null = null
+const RUN_ITEM_IN_PROGRESS_STATUSES = ['pending', 'transferring', 'downloading', 'deleting']
+
+const runItemFilterActive = computed(
+    () => runItemFilter.status !== 'all' || runItemFilter.action !== 'all' || runItemFilter.q.trim() !== '',
+)
+
+/** 整个 run 的明细条数：优先用分组计数（不受筛选影响），老后端回退到 item_total_count */
+const runItemsAllCount = computed(() => {
+  const run = currentRun.value
+  if (!run) return 0
+  const counts = run.item_facets?.status_counts
+  if (counts) return Object.values(counts).reduce((a, b) => a + b, 0)
+  return run.item_total_count
+})
+
+const runItemsHeaderCount = computed(() => {
+  const run = currentRun.value
+  if (!run) return ''
+  return runItemFilterActive.value
+      ? `筛选出 ${run.item_total_count} / 共 ${runItemsAllCount.value}`
+      : `${run.item_total_count}`
+})
+
+function withCount(label: string, n: number | undefined): string {
+  return n === undefined ? label : `${label}（${n}）`
+}
+
+const runItemStatusOptions = computed(() => {
+  const counts = currentRun.value?.item_facets?.status_counts
+  const pick = (k: string) => (counts ? counts[k] ?? 0 : undefined)
+  const inProgress = counts
+      ? RUN_ITEM_IN_PROGRESS_STATUSES.reduce((a, k) => a + (counts[k] ?? 0), 0)
+      : undefined
+  return [
+    { value: 'all', label: withCount('全部状态', counts ? runItemsAllCount.value : undefined) },
+    { value: 'failed', label: withCount('失败', pick('failed')) },
+    { value: 'completed', label: withCount('完成', pick('completed')) },
+    { value: 'skipped', label: withCount('跳过', pick('skipped')) },
+    { value: 'in_progress', label: withCount('进行中', inProgress) },
+  ]
+})
+
+const runItemActionOptions = computed(() => {
+  const counts = currentRun.value?.item_facets?.action_counts
+  const pick = (k: string) => (counts ? counts[k] ?? 0 : undefined)
+  return [
+    { value: 'all', label: withCount('全部动作', counts ? runItemsAllCount.value : undefined) },
+    ...['added', 'modified', 'removed', 'skipped'].map((k) => ({
+      value: k,
+      label: withCount(ACTION_LABELS[k] ?? k, pick(k)),
+    })),
+  ]
+})
+
+function clearRunItemKeywordTimer() {
+  if (runItemKeywordTimer) {
+    clearTimeout(runItemKeywordTimer)
+    runItemKeywordTimer = null
+  }
+}
+
+function resetRunItemFilter() {
+  clearRunItemKeywordTimer()
+  runItemFilter.status = 'all'
+  runItemFilter.action = 'all'
+  runItemFilter.q = ''
+}
+
+async function loadRunItems(page: number) {
+  if (!currentRunId.value || !currentRun.value) return
+  const runId = currentRunId.value
+  const version = ++runItemsRequestVersion
+  runItemsLoading.value = true
+  try {
+    const res = await listRunItems(runId, page, currentRun.value.item_page_size, { ...runItemFilter })
+    if (version !== runItemsRequestVersion || currentRunId.value !== runId || !currentRun.value) return
+    currentRun.value.items = res.items
+    currentRun.value.item_page = res.page
+    currentRun.value.item_total_count = res.total
+    if (res.facets) currentRun.value.item_facets = res.facets
+  } catch (e) {
+    if (version === runItemsRequestVersion) {
+      ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
+    }
+  } finally {
+    if (version === runItemsRequestVersion) runItemsLoading.value = false
+  }
+}
+
+/** 筛选条件变化：回到第 1 页重新查询 */
+function applyRunItemFilter() {
+  clearRunItemKeywordTimer()
+  void loadRunItems(1)
+}
+
+function onRunItemKeywordInput() {
+  clearRunItemKeywordTimer()
+  runItemKeywordTimer = setTimeout(() => {
+    runItemKeywordTimer = null
+    void loadRunItems(1)
+  }, 300)
+}
+
+function filterRunItemsByStatus(status: string) {
+  runItemFilter.status = status
+  applyRunItemFilter()
+}
 
 // 进行中子任务：subscription_id -> 子任务列表（WS item_progress 实时更新 + REST 轮询兜底）
 const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
@@ -1762,6 +1932,10 @@ async function cancelScanNow(s?: ShareSubscription) {
 }
 
 async function openRun(runId: string) {
+  // 换 run：筛选条件归零，并作废上一个 run 还在路上的明细请求
+  resetRunItemFilter()
+  runItemsRequestVersion++
+  runItemsLoading.value = false
   try {
     currentRunId.value = runId
     currentRun.value = await getRun(runId)
@@ -1771,18 +1945,8 @@ async function openRun(runId: string) {
   }
 }
 
-async function onRunItemsPageChange(page: number) {
-  if (!currentRunId.value || !currentRun.value) return
-  runItemsLoading.value = true
-  try {
-    const res = await listRunItems(currentRunId.value, page, currentRun.value.item_page_size)
-    currentRun.value.items = res.items
-    currentRun.value.item_page = res.page
-  } catch (e) {
-    ElMessage.error(`加载运行明细失败: ${getApiErrorMessage(e)}`)
-  } finally {
-    runItemsLoading.value = false
-  }
+function onRunItemsPageChange(page: number) {
+  void loadRunItems(page)
 }
 
 // ==================== 本地目录选择（对齐转存） ====================
@@ -2312,6 +2476,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  clearRunItemKeywordTimer()
   unsubWs?.()
   unsubConnState?.()
   subtaskPoller.stop()
@@ -2667,6 +2832,23 @@ onUnmounted(() => {
 .run-stats { font-size: 12px; color: #909399; margin-top: 2px; }
 
 .run-detail { h4 { margin: 16px 0 8px; } }
+.run-items-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 16px 0 8px;
+  h4 { margin: 0; }
+}
+.run-items-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  .run-item-status-filter,
+  .run-item-action-filter { width: 130px; }
+  .run-item-keyword-filter { width: 160px; }
+}
 
 .path-editor {
   display: flex;
