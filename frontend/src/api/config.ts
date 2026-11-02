@@ -70,6 +70,7 @@ export interface UploadConfig {
   max_retries: number              // 最大重试次数
   skip_hidden_files: boolean       // 上传文件夹时是否跳过隐藏文件
   recent_directory?: string        // 最近使用的上传源目录
+  skip_rapid_upload?: boolean      // 默认跳过秒传（BaiduPCS-Go --norapid），缺省 false
 }
 
 /// 转存配置

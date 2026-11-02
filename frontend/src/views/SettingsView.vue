@@ -322,6 +322,19 @@
                     </div>
                   </el-form-item>
 
+                  <el-form-item label="跳过秒传" prop="upload.skip_rapid_upload">
+                    <el-switch
+                        v-model="formData.upload.skip_rapid_upload"
+                        active-text="默认跳过"
+                        inactive-text="先尝试秒传"
+                    />
+                    <div class="form-tip">
+                      同 BaiduPCS-Go v4.0.0 的 <code>--norapid</code>：开启后上传不再整文件计算 MD5、不尝试秒传，直接分片上传（合并时使用服务器返回的分片校验值）。
+                      适合上传网盘里肯定没有的新文件（如自己打包的压缩包），可省去读取整个文件的时间；但相同文件也会重新完整上传。
+                      上传对话框中可对单次上传单独开关；自动备份等未单独指定的上传跟随此设置，修改后对之后开始的任务生效。
+                    </div>
+                  </el-form-item>
+
                   <!-- 分片大小说明（自适应，不可配置） -->
                   <el-alert
                       title="智能分片大小（自动适配）"

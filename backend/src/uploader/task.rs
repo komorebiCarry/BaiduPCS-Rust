@@ -156,6 +156,13 @@ pub struct UploadTask {
     #[serde(default)]
     pub conflict_strategy: crate::uploader::UploadConflictStrategy,
 
+    /// 本任务是否跳过秒传（BaiduPCS-Go `--norapid`）
+    ///
+    /// `None` = 跟随全局设置 `upload.skip_rapid_upload`（在任务真正开始 precreate 时读取）；
+    /// `Some(true/false)` = 本次上传显式指定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_rapid_upload: Option<bool>,
+
     // === 🔥 多账号字段 ===
     /// 任务所属 UID（运态 `Uid`；持久化层用 `#[serde(default)]` 接受旧 JSON 缺省 → `Uid(0)`）
     ///
@@ -217,6 +224,8 @@ impl UploadTask {
             encryption_key_version: 1,
             // 冲突策略初始化
             conflict_strategy: crate::uploader::UploadConflictStrategy::default(),
+            // 秒传策略：默认跟随全局设置
+            skip_rapid_upload: None,
             // 多账号字段初始化（new 默认 Uid(0)，调用方应通过 with_owner_uid 注入正确归属）
             owner_uid: crate::auth::types::Uid::default(),
             failure_reason: None,
@@ -567,8 +576,14 @@ mod tests {
         // 🔥 验证加密完成后状态自动转换为 Uploading
         assert_eq!(task.status, UploadTaskStatus::Uploading);
         // 🔥 验证加密元数据已保存
-        assert_eq!(task.encrypted_name, Some("BPR_BKUP_test-uuid.bkup".to_string()));
-        assert_eq!(task.encryption_nonce, Some("base64_nonce_value".to_string()));
+        assert_eq!(
+            task.encrypted_name,
+            Some("BPR_BKUP_test-uuid.bkup".to_string())
+        );
+        assert_eq!(
+            task.encryption_nonce,
+            Some("base64_nonce_value".to_string())
+        );
         assert_eq!(task.encryption_algorithm, Some("aes-256-gcm".to_string()));
         assert_eq!(task.encryption_version, 1);
     }

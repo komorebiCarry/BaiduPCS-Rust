@@ -174,6 +174,7 @@ pub async fn reset_to_recommended(
             .update_max_concurrent_tasks(eff_up_concurrent)
             .await;
         upload_manager.update_max_retries(eff_up_retries);
+        upload_manager.update_skip_rapid_upload(config.upload.skip_rapid_upload);
         info!(
             "✓ 上传管理器已更新为推荐配置 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
             uid.raw(),
@@ -376,6 +377,7 @@ pub async fn update_config(
                     .update_max_concurrent_tasks(eff_up_concurrent)
                     .await;
                 upload_manager.update_max_retries(eff_up_retries);
+                upload_manager.update_skip_rapid_upload(new_config.upload.skip_rapid_upload);
                 info!(
                     "✓ 上传管理器配置已动态更新 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
                     uid.raw(),

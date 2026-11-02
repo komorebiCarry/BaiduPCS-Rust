@@ -372,3 +372,21 @@ describe('SettingsView 词表异步校验快照（F2）', () => {
     wrapper.unmount()
   })
 })
+
+describe('SettingsView 上传：跳过秒传', () => {
+  it('显示默认跳过秒传开关，旧配置缺字段时为关闭，切换后写入 upload.skip_rapid_upload', async () => {
+    const wrapper = await mountSettings()
+    const item = Array.from(document.querySelectorAll<HTMLElement>('.el-form-item')).find(
+      (el) => el.querySelector('.el-form-item__label')?.textContent?.trim() === '跳过秒传',
+    )
+    expect(item, '上传设置里应有"跳过秒传"').toBeTruthy()
+    expect(item!.textContent).toContain('--norapid')
+    const sw = item!.querySelector<HTMLElement>('.el-switch')!
+    expect(sw.classList.contains('is-checked')).toBe(false)
+
+    sw.click()
+    await flushPromises()
+    expect((wrapper.vm as any).formData.upload.skip_rapid_upload).toBe(true)
+    wrapper.unmount()
+  })
+})

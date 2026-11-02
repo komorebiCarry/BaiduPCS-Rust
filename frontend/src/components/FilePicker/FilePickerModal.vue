@@ -83,6 +83,10 @@
                 <span>加密上传</span>
                 <el-switch v-model="encryptEnabled" size="small" />
               </div>
+              <div v-if="showSkipRapid" class="skip-rapid-switch" title="不计算本地 MD5、不尝试秒传，直接分片上传（同 BaiduPCS-Go --norapid）。适合确定网盘里没有的新文件，可省去整文件读取一遍的时间">
+                <span>跳过秒传</span>
+                <el-switch v-model="skipRapidUpload" size="small" />
+              </div>
               <div v-if="showConflictStrategy" class="conflict-strategy-inline">
                 <span class="label">冲突策略:</span>
                 <el-select
@@ -231,6 +235,8 @@ const props = withDefaults(defineProps<{
   showConflictStrategy?: boolean  // 是否显示冲突策略选择
   defaultConflictStrategy?: string  // 默认冲突策略
   defaultUploadConflictStrategy?: string  // 默认上传冲突策略
+  showSkipRapid?: boolean  // 是否显示"跳过秒传"开关（上传模式）
+  defaultSkipRapidUpload?: boolean  // "跳过秒传"默认值（来自设置）
 }>(), {
   selectType: 'both',
   title: '选择文件',
@@ -241,12 +247,14 @@ const props = withDefaults(defineProps<{
   showConflictStrategy: false,
   defaultConflictStrategy: 'overwrite',
   defaultUploadConflictStrategy: 'smart_dedup',
+  showSkipRapid: false,
+  defaultSkipRapidUpload: false,
 })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  'select': [entry: FileEntry, encrypt: boolean, conflictStrategy?: string]
-  'select-multiple': [entries: FileEntry[], encrypt: boolean, conflictStrategy?: string]  // 多选确认事件
+  'select': [entry: FileEntry, encrypt: boolean, conflictStrategy?: string, skipRapidUpload?: boolean]
+  'select-multiple': [entries: FileEntry[], encrypt: boolean, conflictStrategy?: string, skipRapidUpload?: boolean]  // 多选确认事件
   'confirm-download': [payload: { path: string, setAsDefault: boolean, conflictStrategy?: string }]
   'confirm': [path: string]  // 纯目录选择模式
   'use-default': [conflictStrategy?: string]
@@ -261,6 +269,7 @@ const conflictStrategy = ref(props.defaultConflictStrategy)
 // 上传模式状态
 const encryptEnabled = ref(false)
 const uploadConflictStrategy = ref(props.defaultUploadConflictStrategy)
+const skipRapidUpload = ref(props.defaultSkipRapidUpload)
 
 // 是否启用多选模式（上传模式 + multiple 为 true）
 const isMultiSelectMode = computed(() => {
@@ -334,6 +343,7 @@ function handleOpen() {
   encryptEnabled.value = false
   conflictStrategy.value = props.defaultConflictStrategy
   uploadConflictStrategy.value = props.defaultUploadConflictStrategy
+  skipRapidUpload.value = props.defaultSkipRapidUpload
 
   // 根据模式确定初始路径
   if (props.mode === 'download') {
@@ -426,7 +436,8 @@ function handleConfirm() {
       emit('select-multiple',
           [...store.multiSelection],
           encryptEnabled.value,
-          props.showConflictStrategy ? uploadConflictStrategy.value : undefined
+          props.showConflictStrategy ? uploadConflictStrategy.value : undefined,
+          props.showSkipRapid ? skipRapidUpload.value : undefined
       )
       visible.value = false
     } else if (store.selection && canConfirmUpload.value) {
@@ -434,7 +445,8 @@ function handleConfirm() {
       emit('select',
           store.selection,
           encryptEnabled.value,
-          props.showConflictStrategy ? uploadConflictStrategy.value : undefined
+          props.showConflictStrategy ? uploadConflictStrategy.value : undefined,
+          props.showSkipRapid ? skipRapidUpload.value : undefined
       )
       visible.value = false
     }
@@ -525,7 +537,8 @@ watch(() => props.selectType, () => {
   gap: 8px;
 }
 
-.encrypt-switch {
+.encrypt-switch,
+.skip-rapid-switch {
   display: flex;
   align-items: center;
   gap: 6px;

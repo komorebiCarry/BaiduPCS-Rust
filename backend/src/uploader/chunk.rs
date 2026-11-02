@@ -236,6 +236,16 @@ impl UploadChunkManager {
         Self::new(total_size, chunk_size)
     }
 
+    /// 不创建分片列表，只计算 `with_vip_type` 会产生的分片数（与 `new` 的切分规则一致）
+    pub fn expected_chunk_count(total_size: u64, vip_type: VipType) -> usize {
+        if total_size <= MIN_UPLOAD_CHUNK_SIZE {
+            return 1;
+        }
+        let chunk_size = calculate_recommended_chunk_size(total_size, vip_type)
+            .clamp(MIN_UPLOAD_CHUNK_SIZE, MAX_UPLOAD_CHUNK_SIZE);
+        total_size.div_ceil(chunk_size) as usize
+    }
+
     /// 使用默认分片大小创建（普通用户 4MB）
     pub fn with_default_chunk_size(total_size: u64) -> Self {
         Self::new(total_size, DEFAULT_UPLOAD_CHUNK_SIZE)
@@ -379,6 +389,15 @@ impl UploadChunkManager {
     pub fn get_block_list(&self) -> Vec<String> {
         self.chunks.iter().filter_map(|c| c.md5.clone()).collect()
     }
+
+    /// 跳过秒传模式下合并用的 block_list：按分片顺序取服务端返回的 MD5
+    ///
+    /// 任一分片缺少 MD5 则返回错误（见 [`crate::uploader::norapid::block_list_from_chunk_md5s`]）。
+    pub fn server_md5_block_list(&self) -> anyhow::Result<String> {
+        crate::uploader::norapid::block_list_from_chunk_md5s(
+            self.chunks.iter().map(|c| c.md5.as_deref()),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -456,7 +475,11 @@ mod tests {
         manager.mark_completed(0, Some("md5_0".to_string()));
         manager.mark_completed(0, Some("md5_0".to_string()));
         manager.mark_completed(0, Some("md5_0".to_string()));
-        assert_eq!(manager.uploaded_bytes(), 4 * 1024 * 1024, "重复完成只计一次");
+        assert_eq!(
+            manager.uploaded_bytes(),
+            4 * 1024 * 1024,
+            "重复完成只计一次"
+        );
         assert_eq!(manager.completed_count(), 1);
 
         // 全部完成后正好等于 total，绝不超出
@@ -618,5 +641,41 @@ mod tests {
         let chunk_size = calculate_recommended_chunk_size(large_file, VipType::Svip);
         // 应该使用最大分片大小
         assert_eq!(chunk_size, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_expected_chunk_count_matches_manager() {
+        let mb = 1024 * 1024u64;
+        for vip in [VipType::Normal, VipType::Vip, VipType::Svip] {
+            for size in [
+                0,
+                1,
+                4 * mb,
+                4 * mb + 1,
+                33 * mb,
+                100 * mb + 7,
+                5 * 1024 * mb + 3,
+            ] {
+                assert_eq!(
+                    UploadChunkManager::expected_chunk_count(size, vip),
+                    UploadChunkManager::with_vip_type(size, vip).chunk_count(),
+                    "size={size} vip={vip:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_md5_block_list() {
+        let mut cm = UploadChunkManager::new(9 * 1024 * 1024, 4 * 1024 * 1024);
+        assert_eq!(cm.chunk_count(), 3);
+        cm.mark_completed(0, Some("m0".to_string()));
+        cm.mark_completed(2, Some("m2".to_string()));
+        assert!(
+            cm.server_md5_block_list().is_err(),
+            "分片 1 缺 MD5 必须报错"
+        );
+        cm.mark_completed(1, Some("m1".to_string()));
+        assert_eq!(cm.server_md5_block_list().unwrap(), r#"["m0","m1","m2"]"#);
     }
 }
