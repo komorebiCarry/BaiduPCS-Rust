@@ -262,7 +262,7 @@
     </div>
 
     <!-- 个人信息弹窗 -->
-    <UserProfileDialog v-model="profileDialogVisible" :user="authStore.user" />
+    <UserProfileDialog v-model="profileDialogVisible" :user="authStore.activeProfile" />
   </el-container>
 </template>
 

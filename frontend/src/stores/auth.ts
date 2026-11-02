@@ -65,6 +65,31 @@ export const useAuthStore = defineStore('auth', () => {
     if (activeAccount.value) return activeAccount.value.avatar_url || ''
     return user.value?.avatar_url || ''
   })
+  /**
+   * 个人信息弹窗展示用：当前活跃账号的资料。
+   *
+   * 以账号摘要（`/accounts/list`、WS 事件，刷新页面后也有）为准；旧 `user` 只在本标签页
+   * 扫码 / Cookie 登录时赋值，刷新后为 null、切换账号后也不会更新，单独使用会让弹窗
+   * 的用户名 / UID / 登录时间变成空白或显示成别的账号。`user` 与活跃账号同 UID 时用来补齐
+   * 摘要缺失的字段（如旧后端未下发的登录时间 / 空间）。
+   */
+  const activeProfile = computed<UserAuth | null>(() => {
+    const acc = activeAccount.value
+    const legacy = user.value
+    if (!acc) return legacy
+    const same = legacy && legacy.uid === acc.uid ? legacy : null
+    return {
+      uid: acc.uid,
+      username: acc.username || same?.username || '',
+      nickname: acc.nickname ?? same?.nickname ?? undefined,
+      avatar_url: acc.avatar_url ?? same?.avatar_url ?? undefined,
+      vip_type: acc.vip_type ?? same?.vip_type ?? undefined,
+      vip_level: acc.vip_level ?? same?.vip_level ?? undefined,
+      total_space: acc.total_space ?? same?.total_space ?? undefined,
+      used_space: acc.used_space ?? same?.used_space ?? undefined,
+      login_time: acc.login_time || same?.login_time || 0,
+    }
+  })
   /** 是否有多账号（true 时 UI 应显示账号切换器 / 过滤器） */
   const hasMultipleAccounts = computed(() => accounts.value.length > 1)
 
@@ -336,6 +361,7 @@ export const useAuthStore = defineStore('auth', () => {
     username,
     avatar,
     activeAccount,
+    activeProfile,
     hasMultipleAccounts,
     // ───── 兼容方法 ─────
     generateQRCode,
