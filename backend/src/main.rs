@@ -733,6 +733,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/shares", post(handlers::create_share))
         .route("/shares", get(handlers::get_share_list))
         .route("/shares/cancel", post(handlers::cancel_share))
+        .route("/shares/expire", post(handlers::modify_share_expire))
         .route("/shares/:id", get(handlers::get_share_detail))
         // 🔥 系统能力检测 API
         .route(
