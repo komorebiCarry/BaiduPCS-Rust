@@ -172,6 +172,15 @@ pub enum ShareSyncEvent {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// 一次同步被用户取消（当前仅扫描阶段可取消）
+    ///
+    /// 与 `RunFailed` 分开：取消不是失败，不该显示成红色错误，也不该触发重试。
+    RunCancelled {
+        run_id: String,
+        subscription_id: String,
+        #[serde(default)]
+        owner_uid: u64,
+    },
 }
 
 impl ShareSyncEvent {
@@ -213,6 +222,9 @@ impl ShareSyncEvent {
             }
             | Self::RunFailed {
                 subscription_id, ..
+            }
+            | Self::RunCancelled {
+                subscription_id, ..
             } => subscription_id,
         }
     }
@@ -231,7 +243,8 @@ impl ShareSyncEvent {
             | Self::ItemStatusChanged { owner_uid, .. }
             | Self::ItemProgress { owner_uid, .. }
             | Self::RunCompleted { owner_uid, .. }
-            | Self::RunFailed { owner_uid, .. } => *owner_uid,
+            | Self::RunFailed { owner_uid, .. }
+            | Self::RunCancelled { owner_uid, .. } => *owner_uid,
         }
     }
 
@@ -250,6 +263,7 @@ impl ShareSyncEvent {
             Self::ItemProgress { .. } => "item_progress",
             Self::RunCompleted { .. } => "run_completed",
             Self::RunFailed { .. } => "run_failed",
+            Self::RunCancelled { .. } => "run_cancelled",
         }
     }
 }

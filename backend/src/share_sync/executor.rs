@@ -93,7 +93,7 @@ fn action_for_path(action_by_path: &ActionByPath, path: &str) -> SyncAction {
         .unwrap_or(SyncAction::Added)
 }
 
-fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
+pub(crate) fn seed_diff_summary(summary: &mut DiffSummary, diff: &ShareDiff) {
     let added = diff.added.iter().filter(|item| !item.is_dir).count();
     let modified = diff.modified.iter().filter(|item| !item.new.is_dir).count();
     let removed = diff.removed.iter().filter(|item| !item.is_dir).count();
@@ -249,6 +249,12 @@ pub struct ShareSyncExecutor<'a> {
     subscription: &'a ShareSubscription,
     persistence: &'a ShareSyncPersistence,
     hooks: &'a dyn ExecutorHooks,
+    /// 结束时是否把汇总写回 run 记录（`finish_run`）。
+    /// 跨账号订阅按账号分腿执行，由调用方合并各腿结果后统一写一次。
+    finalize_run: bool,
+    /// 跨账号执行腿的账号：写 run item 时标注在 `target` 上（见
+    /// [`ShareSyncPersistence::add_run_item_for_account`]）。所属账号的腿为 `None`。
+    item_account_uid: Option<u64>,
 }
 
 impl<'a> ShareSyncExecutor<'a> {
@@ -261,7 +267,69 @@ impl<'a> ShareSyncExecutor<'a> {
             subscription,
             persistence,
             hooks,
+            finalize_run: true,
+            item_account_uid: None,
         }
+    }
+
+    /// 标注本执行器写入的 run item 属于哪个账号（跨账号订阅的非所属账号腿）
+    pub fn with_item_account(mut self, uid: Option<u64>) -> Self {
+        self.item_account_uid = uid;
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_run_item(
+        &self,
+        run_id: &str,
+        path: &str,
+        action: SyncAction,
+        target: TargetKind,
+        transfer_task_id: Option<&str>,
+        download_task_id: Option<&str>,
+        status: RunItemStatus,
+        versioned_old_path: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<i64, ShareSyncError> {
+        self.persistence.add_run_item_for_account(
+            run_id,
+            path,
+            action,
+            target,
+            self.item_account_uid,
+            transfer_task_id,
+            download_task_id,
+            status,
+            versioned_old_path,
+            reason,
+        )
+    }
+
+    /// 把 run 终态与汇总写回持久层（`without_run_finalize` 时跳过）
+    fn record_run_finished(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        summary: &DiffSummary,
+        error: Option<&str>,
+    ) {
+        if !self.finalize_run {
+            return;
+        }
+        let finished_at = Utc::now().timestamp();
+        if let Err(e) = self
+            .persistence
+            .finish_run(run_id, finished_at, status, summary, error)
+        {
+            warn!("finish_run 失败: {}", e);
+        }
+    }
+
+    /// 不在执行结束时写 run 终态：多条执行腿共用一个 run 时，由调用方合并后统一收尾，
+    /// 避免第一条腿跑完就把 run 标成已结束。
+    pub fn without_run_finalize(mut self) -> Self {
+        self.finalize_run = false;
+        self
     }
 
     /// 计算「同步到本地」时转存子任务应落到的网盘目录。
@@ -476,7 +544,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         SyncTarget::Netdisk(_) => TargetKind::Netdisk,
                         SyncTarget::Local(_) => TargetKind::Local,
                     };
-                    let _ = self.persistence.add_run_item(
+                    let _ = self.add_run_item(
                         &run_id,
                         &item.path,
                         SyncAction::Removed,
@@ -529,16 +597,7 @@ impl<'a> ShareSyncExecutor<'a> {
         } else {
             error
         };
-        let finished_at = Utc::now().timestamp();
-        if let Err(e) = self.persistence.finish_run(
-            &run_id,
-            finished_at,
-            status,
-            &summary,
-            run_error.as_deref(),
-        ) {
-            warn!("finish_run 失败: {}", e);
-        }
+        self.record_run_finished(&run_id, status, &summary, run_error.as_deref());
 
         ApplyOutcome {
             run_id,
@@ -704,7 +763,7 @@ impl<'a> ShareSyncExecutor<'a> {
                     Ok(task_id) => {
                         // 整组成功：每条 item 记一条 run_item（共享 task_id）
                         for item in &items {
-                            let _ = self.persistence.add_run_item(
+                            let _ = self.add_run_item(
                                 &run_id,
                                 &item.path,
                                 action,
@@ -795,7 +854,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             // 其它失败：保持原行为——整组标 Failed
                             for item in &items {
                                 summary.failed += 1;
-                                let _ = self.persistence.add_run_item(
+                                let _ = self.add_run_item(
                                     &run_id,
                                     &item.path,
                                     action,
@@ -857,7 +916,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         // 提交阶段其它失败：整组标 Failed
                         for item in &items {
                             summary.failed += 1;
-                            let _ = self.persistence.add_run_item(
+                            let _ = self.add_run_item(
                                 &run_id,
                                 &item.path,
                                 action,
@@ -885,7 +944,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         SyncTarget::Netdisk(_) => TargetKind::Netdisk,
                         SyncTarget::Local(_) => TargetKind::Local,
                     };
-                    let _ = self.persistence.add_run_item(
+                    let _ = self.add_run_item(
                         &run_id,
                         &item.path,
                         SyncAction::Removed,
@@ -940,13 +999,7 @@ impl<'a> ShareSyncExecutor<'a> {
             None
         };
 
-        let finished_at = Utc::now().timestamp();
-        if let Err(e) =
-            self.persistence
-                .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
-        {
-            warn!("finish_run 失败: {}", e);
-        }
+        self.record_run_finished(&run_id, status, &summary, error.as_deref());
 
         ApplyOutcome {
             run_id,
@@ -1150,7 +1203,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         SyncTarget::Netdisk(_) => TargetKind::Netdisk,
                         SyncTarget::Local(_) => TargetKind::Local,
                     };
-                    let _ = self.persistence.add_run_item(
+                    let _ = self.add_run_item(
                         &run_id,
                         &item.path,
                         SyncAction::Removed,
@@ -1200,13 +1253,7 @@ impl<'a> ShareSyncExecutor<'a> {
             None
         };
 
-        let finished_at = Utc::now().timestamp();
-        if let Err(e) =
-            self.persistence
-                .finish_run(&run_id, finished_at, status, &summary, error.as_deref())
-        {
-            warn!("finish_run 失败: {}", e);
-        }
+        self.record_run_finished(&run_id, status, &summary, error.as_deref());
 
         ApplyOutcome {
             run_id,
@@ -1485,7 +1532,7 @@ impl<'a> ShareSyncExecutor<'a> {
                     };
                     for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i)) {
                         let leaf = tree.get(leaf_idx);
-                        let _ = self.persistence.add_run_item(
+                        let _ = self.add_run_item(
                             run_id,
                             &leaf.path,
                             action_for_path(action_by_path, &leaf.path),
@@ -1515,7 +1562,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             }
                             for leaf_idx in all_leaves {
                                 let leaf = tree.get(leaf_idx);
-                                let _ = self.persistence.add_run_item(
+                                let _ = self.add_run_item(
                                     run_id,
                                     &leaf.path,
                                     action_for_path(action_by_path, &leaf.path),
@@ -1594,7 +1641,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         if existing_status == RunItemStatus::Skipped {
                             summary.skipped += 1;
                         }
-                        let _ = self.persistence.add_run_item(
+                        let _ = self.add_run_item(
                             run_id,
                             &leaf.path,
                             action_for_path(action_by_path, &leaf.path),
@@ -1627,7 +1674,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i))
                             {
                                 let leaf = tree.get(leaf_idx);
-                                let _ = self.persistence.add_run_item(
+                                let _ = self.add_run_item(
                                     run_id,
                                     &leaf.path,
                                     action_for_path(action_by_path, &leaf.path),
@@ -1662,7 +1709,7 @@ impl<'a> ShareSyncExecutor<'a> {
                             for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i))
                             {
                                 let leaf = tree.get(leaf_idx);
-                                let _ = self.persistence.add_run_item(
+                                let _ = self.add_run_item(
                                     run_id,
                                     &leaf.path,
                                     action_for_path(action_by_path, &leaf.path),
@@ -1766,7 +1813,7 @@ impl<'a> ShareSyncExecutor<'a> {
 
             if let Some(local_dir) = local_recovery_dir {
                 if local_file_matches(local_dir, &leaf.path, leaf.size) {
-                    let _ = self.persistence.add_run_item(
+                    let _ = self.add_run_item(
                         run_id,
                         &leaf.path,
                         action_for_path(action_by_path, &leaf.path),
@@ -1805,7 +1852,7 @@ impl<'a> ShareSyncExecutor<'a> {
                     (RunItemStatus::Failed, None)
                 }
             };
-            match self.persistence.add_run_item(
+            match self.add_run_item(
                 run_id,
                 &leaf.path,
                 action_for_path(action_by_path, &leaf.path),
@@ -1871,7 +1918,7 @@ impl<'a> ShareSyncExecutor<'a> {
                     if local_file_exists(&t.local_path, &leaf.path) {
                         skipped_existing_count += 1;
                         summary.skipped += 1;
-                        let _ = self.persistence.add_run_item(
+                        let _ = self.add_run_item(
                             run_id,
                             &leaf.path,
                             action_for_path(action_by_path, &leaf.path),
@@ -2003,7 +2050,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 match (strategy, existing) {
                     (ConflictStrategy::Skip, Some(_)) => {
                         summary.skipped += 1;
-                        self.persistence.add_run_item(
+                        self.add_run_item(
                             run_id,
                             &item.path,
                             action,
@@ -2070,7 +2117,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 if let SyncTarget::Local(t) = target {
                     if local_file_exists(&t.local_path, &item.path) {
                         summary.skipped += 1;
-                        self.persistence.add_run_item(
+                        self.add_run_item(
                             run_id,
                             &item.path,
                             action,
@@ -2149,7 +2196,7 @@ impl<'a> ShareSyncExecutor<'a> {
                         )?;
                         existing_id
                     } else {
-                        let new_id = self.persistence.add_run_item(
+                        let new_id = self.add_run_item(
                             run_id,
                             &item.path,
                             action,
@@ -2356,7 +2403,7 @@ impl<'a> ShareSyncExecutor<'a> {
         };
         match res {
             Ok(()) => {
-                self.persistence.add_run_item(
+                self.add_run_item(
                     run_id,
                     &item.path,
                     SyncAction::Removed,
@@ -2371,7 +2418,7 @@ impl<'a> ShareSyncExecutor<'a> {
             }
             Err(e) => {
                 summary.failed += 1;
-                self.persistence.add_run_item(
+                self.add_run_item(
                     run_id,
                     &item.path,
                     SyncAction::Removed,
@@ -2430,7 +2477,7 @@ impl<'a> ShareSyncExecutor<'a> {
         error: &ShareSyncError,
     ) {
         summary.failed += 1;
-        match self.persistence.add_run_item(
+        match self.add_run_item(
             run_id,
             &item.path,
             action,
@@ -2469,7 +2516,7 @@ impl<'a> ShareSyncExecutor<'a> {
         reason: &'static str,
         error: &ShareSyncError,
     ) {
-        match self.persistence.add_run_item(
+        match self.add_run_item(
             run_id,
             &item.path,
             action,
@@ -2698,11 +2745,14 @@ fn _suppress_unused() {
             remote_path: String::new(),
             save_fs_id: 0,
             conflict_strategy: None,
+            account_uid: None,
         },
         LocalTarget {
             local_path: PathBuf::new(),
             conflict_strategy: None,
             mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            download_uid: None,
+            use_default_download_account: false,
         },
     );
 }
@@ -2725,6 +2775,8 @@ mod tests {
                 local_path: PathBuf::from("/tmp/x"),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })],
         )
     }
@@ -2930,6 +2982,7 @@ mod tests {
                 remote_path: "/dest".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -2996,6 +3049,7 @@ mod tests {
                 remote_path: "/apps".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3093,6 +3147,7 @@ mod tests {
                 remote_path: "/dest".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3146,6 +3201,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -3176,6 +3233,7 @@ mod tests {
                 remote_path: "/我的资源/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3203,6 +3261,7 @@ mod tests {
                 remote_path: "/我的资源/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3236,6 +3295,7 @@ mod tests {
                 remote_path: "/我的资源/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3272,6 +3332,7 @@ mod tests {
                 remote_path: "/我的资源/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3306,12 +3367,15 @@ mod tests {
                     remote_path: "/x".into(),
                     save_fs_id: 0,
                     conflict_strategy: None,
+                    account_uid: None,
                 }),
                 SyncTarget::Local(LocalTarget {
                     local_path: dir.path().to_path_buf(),
                     conflict_strategy: None,
                     // 老订阅即便存了 ShareDirect，也按「有网盘目标」自动推导为转存并下载
                     mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                    download_uid: None,
+                    use_default_download_account: false,
                 }),
             ];
             s
@@ -3350,11 +3414,14 @@ mod tests {
                     remote_path: "/x".into(),
                     save_fs_id: 0,
                     conflict_strategy: None,
+                    account_uid: None,
                 }),
                 SyncTarget::Local(LocalTarget {
                     local_path: dir.path().to_path_buf(),
                     conflict_strategy: None,
                     mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                    download_uid: None,
+                    use_default_download_account: false,
                 }),
             ];
             s
@@ -3389,6 +3456,7 @@ mod tests {
                 remote_path: "/x".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3416,6 +3484,8 @@ mod tests {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -3452,6 +3522,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -3494,6 +3566,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -3520,6 +3594,8 @@ mod tests {
                 local_path: dir.path().to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s.delete_missing = false;
             s
@@ -3549,6 +3625,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s.delete_missing = true;
             s
@@ -3626,6 +3704,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -3669,6 +3749,7 @@ mod tests {
             remote_path: "/同步".into(),
             save_fs_id: 0,
             conflict_strategy: None,
+            account_uid: None,
         })];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
         pm.upsert_subscription(&s).unwrap();
@@ -3716,6 +3797,7 @@ mod tests {
             remote_path: "/同步".into(),
             save_fs_id: 0,
             conflict_strategy: None,
+            account_uid: None,
         })];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
         pm.upsert_subscription(&s).unwrap();
@@ -3766,11 +3848,14 @@ mod tests {
                 remote_path: "/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             }),
             SyncTarget::Local(LocalTarget {
                 local_path: db_dir.join("local"),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             }),
         ];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
@@ -3831,6 +3916,8 @@ mod tests {
             local_path: db_dir.join("local"),
             conflict_strategy: None,
             mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            download_uid: None,
+            use_default_download_account: false,
         })];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
         pm.upsert_subscription(&s).unwrap();
@@ -3886,11 +3973,14 @@ mod tests {
                 remote_path: "/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             }),
             SyncTarget::Local(LocalTarget {
                 local_path: db_dir.join("local"),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             }),
         ];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
@@ -3936,6 +4026,7 @@ mod tests {
                 remote_path: "/我的资源/同步".into(),
                 save_fs_id: 0,
                 conflict_strategy: None,
+                account_uid: None,
             })];
             s
         };
@@ -3984,6 +4075,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -4027,6 +4120,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -4066,6 +4161,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -4102,6 +4199,8 @@ mod tests {
                 local_path: p.to_path_buf(),
                 conflict_strategy: None,
                 mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
             })];
             s
         };
@@ -4151,6 +4250,8 @@ mod tests {
             local_path: p.to_path_buf(),
             conflict_strategy: None,
             mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            download_uid: None,
+            use_default_download_account: false,
         })];
         s.include_paths = vec!["/monthly".into()]; // 让 group_by_dir_root 把 /monthly/* 归一组
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
@@ -4221,6 +4322,8 @@ mod tests {
             local_path: p.to_path_buf(),
             conflict_strategy: None,
             mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            download_uid: None,
+            use_default_download_account: false,
         })];
         s.include_paths = vec!["/monthly".into()];
         let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();

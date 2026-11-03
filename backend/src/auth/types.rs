@@ -63,6 +63,16 @@ pub struct AccountSummary {
     /// 会员成长等级（如 SVIP5 的 5）；未获取到时为 `None`
     pub vip_level: Option<u32>,
     pub is_active: bool,
+    /// 登录时间戳（秒）。个人信息弹窗按活跃账号展示，刷新页面后也能拿到，
+    /// 不再依赖仅在本标签页登录时才赋值的前端 `authStore.user`。
+    #[serde(default)]
+    pub login_time: i64,
+    /// 网盘总空间（字节）；未获取到时为 `None`
+    #[serde(default)]
+    pub total_space: Option<u64>,
+    /// 网盘已用空间（字节）；未获取到时为 `None`
+    #[serde(default)]
+    pub used_space: Option<u64>,
     /// 持久化的账号自定义配置
     ///
     /// 暴露用途：前端 `BudgetPanel.vue` 在初始化每账号配置表单时优先采用真实持久化
@@ -86,6 +96,9 @@ impl AccountSummary {
             vip_type: user.vip_type,
             vip_level: user.vip_level,
             is_active: active_uid == Some(user.uid),
+            login_time: user.login_time,
+            total_space: user.total_space,
+            used_space: user.used_space,
             custom_config: user.custom_config.clone(),
         }
     }
@@ -508,5 +521,36 @@ mod tests {
         assert!(active.is_active);
         let inactive = AccountSummary::from_user(&user, Some(99));
         assert!(!inactive.is_active);
+    }
+
+    #[test]
+    fn account_summary_carries_profile_fields_without_credentials() {
+        // 个人信息弹窗按活跃账号摘要展示：登录时间 / 空间必须随摘要下发（Cookie 登录与扫码登录同一路径）
+        let mut user = UserAuth::new_with_details(
+            7,
+            "cookie_user".into(),
+            "SECRET_BDUSS".into(),
+            Some("nick".into()),
+            None,
+            Some(2),
+            Some(2048),
+            Some(1024),
+        );
+        user.login_time = 1_700_000_000;
+        user.stoken = Some("SECRET_STOKEN".into());
+        user.cookies = Some("BDUSS=SECRET_BDUSS".into());
+        let summary = AccountSummary::from_user(&user, Some(7));
+        assert_eq!(summary.login_time, 1_700_000_000);
+        assert_eq!(summary.total_space, Some(2048));
+        assert_eq!(summary.used_space, Some(1024));
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"login_time\":1700000000"), "{json}");
+        assert!(!json.contains("SECRET"), "{json}");
+
+        // 旧格式（无新字段）仍可反序列化
+        let legacy = r#"{"uid":1,"username":"u","nickname":null,"avatar_url":null,"vip_type":null,"vip_level":null,"is_active":true,"custom_config":{}}"#;
+        let back: AccountSummary = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.login_time, 0);
+        assert!(back.total_space.is_none());
     }
 }

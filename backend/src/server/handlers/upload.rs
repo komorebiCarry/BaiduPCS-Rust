@@ -27,6 +27,11 @@ pub struct CreateUploadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<UploadConflictStrategy>,
+    /// 是否跳过秒传（可选，对应 BaiduPCS-Go `upload --norapid`）
+    ///
+    /// 未指定（null/缺省）= 跟随全局设置 `upload.skip_rapid_upload`。
+    #[serde(default)]
+    pub skip_rapid_upload: Option<bool>,
     /// 显式指定 owner_uid
     ///
     /// **字段名兼容**：
@@ -51,6 +56,11 @@ pub struct CreateFolderUploadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<UploadConflictStrategy>,
+    /// 是否跳过秒传（可选，对应 BaiduPCS-Go `upload --norapid`）
+    ///
+    /// 未指定（null/缺省）= 跟随全局设置 `upload.skip_rapid_upload`。
+    #[serde(default)]
+    pub skip_rapid_upload: Option<bool>,
     /// 显式指定 owner_uid
     ///
     /// **字段名兼容**：
@@ -135,6 +145,11 @@ pub struct CreateBatchUploadRequest {
     /// 冲突策略（可选，未指定则使用默认值）
     #[serde(default)]
     pub conflict_strategy: Option<UploadConflictStrategy>,
+    /// 是否跳过秒传（可选，对应 BaiduPCS-Go `upload --norapid`）
+    ///
+    /// 未指定（null/缺省）= 跟随全局设置 `upload.skip_rapid_upload`。
+    #[serde(default)]
+    pub skip_rapid_upload: Option<bool>,
     /// 显式指定 owner_uid
     ///
     /// **字段名兼容**：
@@ -206,6 +221,7 @@ pub async fn create_upload(
             req.encrypt,
             false,
             conflict_strategy,
+            req.skip_rapid_upload,
             effective_uid,
         )
         .await
@@ -264,9 +280,11 @@ pub async fn create_folder_upload(
         }
         None => match *app_state.active_uid.read().await {
             Some(uid) => uid,
-            None => return Err(ApiError::BadRequest(
-                "无活跃账号，无法启动文件夹扫描".to_string(),
-            )),
+            None => {
+                return Err(ApiError::BadRequest(
+                    "无活跃账号，无法启动文件夹扫描".to_string(),
+                ))
+            }
         },
     };
 
@@ -325,6 +343,7 @@ pub async fn create_folder_upload(
             scan_options,
             req.encrypt,
             conflict_strategy,
+            req.skip_rapid_upload,
             effective_uid,
         )
         .await
@@ -386,7 +405,13 @@ pub async fn create_batch_upload(
     // 用 create_batch_tasks_with_owner 在创建瞬间
     // 写入 effective_uid，避免事后纠错路径下 Created event 短暂带启动账号。
     match upload_manager
-        .create_batch_tasks_with_owner(files, req.encrypt, conflict_strategy, effective_uid)
+        .create_batch_tasks_with_owner(
+            files,
+            req.encrypt,
+            conflict_strategy,
+            req.skip_rapid_upload,
+            effective_uid,
+        )
         .await
     {
         Ok(task_ids) => {
@@ -572,7 +597,11 @@ pub async fn clear_completed_uploads(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let count = upload_manager.clear_completed_for_uid(uid).await;
-    info!("清除了 {} 个已完成的上传任务（owner_uid={}）", count, uid.raw());
+    info!(
+        "清除了 {} 个已完成的上传任务（owner_uid={}）",
+        count,
+        uid.raw()
+    );
     Ok(Json(ApiResponse::success(count)))
 }
 
@@ -591,7 +620,11 @@ pub async fn clear_failed_uploads(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let count = upload_manager.clear_failed_for_uid(uid).await;
-    info!("清除了 {} 个失败的上传任务（owner_uid={}）", count, uid.raw());
+    info!(
+        "清除了 {} 个失败的上传任务（owner_uid={}）",
+        count,
+        uid.raw()
+    );
     Ok(Json(ApiResponse::success(count)))
 }
 
@@ -693,11 +726,15 @@ pub async fn batch_pause_uploads(
             error: err,
         })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
@@ -732,11 +769,15 @@ pub async fn batch_resume_uploads(
             error: err,
         })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
@@ -771,12 +812,44 @@ pub async fn batch_delete_uploads(
             error: err,
         })
         .collect();
-    results.extend(denied_pairs.into_iter().map(|(id, reason)| BatchOperationItem {
-        task_id: id,
-        success: false,
-        error: Some(reason),
-    }));
+    results.extend(
+        denied_pairs
+            .into_iter()
+            .map(|(id, reason)| BatchOperationItem {
+                task_id: id,
+                success: false,
+                error: Some(reason),
+            }),
+    );
     Ok(Json(ApiResponse::success(
         BatchOperationResponse::from_results(results),
     )))
+}
+
+#[cfg(test)]
+mod skip_rapid_upload_request_tests {
+    use super::*;
+
+    #[test]
+    fn requests_accept_optional_skip_rapid_upload() {
+        // 旧请求不带字段 → None（跟随全局设置）
+        let r: CreateUploadRequest =
+            serde_json::from_str(r#"{"local_path":"/a","remote_path":"/b"}"#).unwrap();
+        assert_eq!(r.skip_rapid_upload, None);
+        let r: CreateUploadRequest = serde_json::from_str(
+            r#"{"local_path":"/a","remote_path":"/b","skip_rapid_upload":true}"#,
+        )
+        .unwrap();
+        assert_eq!(r.skip_rapid_upload, Some(true));
+
+        let r: CreateFolderUploadRequest = serde_json::from_str(
+            r#"{"local_folder":"/a","remote_folder":"/b","skip_rapid_upload":false}"#,
+        )
+        .unwrap();
+        assert_eq!(r.skip_rapid_upload, Some(false));
+
+        let r: CreateBatchUploadRequest =
+            serde_json::from_str(r#"{"files":[["/a","/b"]],"skip_rapid_upload":null}"#).unwrap();
+        assert_eq!(r.skip_rapid_upload, None);
+    }
 }

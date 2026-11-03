@@ -1,7 +1,8 @@
 // 配置管理 API
 
 use crate::config::{
-    AppConfig, DownloadConfig, PathValidationResult, VipRecommendedConfig, VipType, APP_CONFIG_PATH,
+    AppConfig, DownloadConfig, PathValidationResult, ShareSyncConfig, VipRecommendedConfig,
+    VipType, APP_CONFIG_PATH,
 };
 use crate::server::error::{ApiError, ApiResult};
 use axum::{extract::State, response::Json};
@@ -173,6 +174,7 @@ pub async fn reset_to_recommended(
             .update_max_concurrent_tasks(eff_up_concurrent)
             .await;
         upload_manager.update_max_retries(eff_up_retries);
+        upload_manager.update_skip_rapid_upload(config.upload.skip_rapid_upload);
         info!(
             "✓ 上传管理器已更新为推荐配置 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
             uid.raw(),
@@ -190,9 +192,12 @@ pub async fn reset_to_recommended(
 /// 更新配置
 pub async fn update_config(
     State(app_state): State<crate::server::AppState>,
-    Json(mut new_config): Json<AppConfig>,
+    Json(raw): Json<serde_json::Value>,
 ) -> ApiResult<Json<ApiResponse<ConfigUpdateResponse>>> {
     info!("更新应用配置");
+
+    let mut new_config: AppConfig = serde_json::from_value(raw.clone())
+        .map_err(|e| ApiError::BadRequest(format!("配置格式不合法: {}", e)))?;
 
     // 基本验证
     if new_config.download.max_global_threads == 0 {
@@ -258,6 +263,21 @@ pub async fn update_config(
         // 当前值为准，防止旧值或伪造值关闭认证（issue #177）
         new_config.web_auth = guard.web_auth.clone();
 
+        preserve_missing_regex_presets(&raw, &mut new_config, &guard.share_sync);
+        // 旧版前端提交的整份配置不含 notification 段：保留服务端当前值，避免被默认值覆盖
+        if raw.get("notification").is_none() {
+            new_config.notification = guard.notification.clone();
+        }
+        if let Err(e) = new_config.notification.validate() {
+            return Err(ApiError::BadRequest(format!("消息通知配置校验失败: {}", e)));
+        }
+        if let Err(e) = new_config.share_sync.validate() {
+            return Err(ApiError::BadRequest(format!(
+                "分享同步排除规则校验失败: {}",
+                e
+            )));
+        }
+
         // 保存到文件（包含完整的路径验证）
         let validation_result = new_config
             .save_to_file(APP_CONFIG_PATH)
@@ -266,6 +286,7 @@ pub async fn update_config(
 
         // 更新内存中的配置
         *guard = new_config.clone();
+        crate::notification::apply_config(&new_config.notification);
         (validation_result, proxy_changed)
     };
 
@@ -356,6 +377,7 @@ pub async fn update_config(
                     .update_max_concurrent_tasks(eff_up_concurrent)
                     .await;
                 upload_manager.update_max_retries(eff_up_retries);
+                upload_manager.update_skip_rapid_upload(new_config.upload.skip_rapid_upload);
                 info!(
                     "✓ 上传管理器配置已动态更新 (uid={}): 线程数={}, 最大任务数={}, 最大重试={}",
                     uid.raw(),
@@ -962,6 +984,99 @@ pub async fn get_proxy_status(
     })))
 }
 
+/// GET /api/v1/config/notification
+/// 获取消息通知配置
+pub async fn get_notification_config(
+    State(app_state): State<crate::server::AppState>,
+) -> ApiResult<Json<ApiResponse<crate::notification::NotificationConfig>>> {
+    let cfg = app_state.config.read().await.notification.clone();
+    Ok(Json(ApiResponse::success(cfg)))
+}
+
+/// PUT /api/v1/config/notification
+/// 更新消息通知配置（只改 notification 段，立即热生效）
+pub async fn update_notification_config(
+    State(app_state): State<crate::server::AppState>,
+    Json(req): Json<crate::notification::NotificationConfig>,
+) -> ApiResult<Json<ApiResponse<crate::notification::NotificationConfig>>> {
+    // 注意：不打印请求体（含 Gotify Token / Webhook 请求头等敏感信息）
+    info!(
+        "更新消息通知配置: enabled={}, webhook={}, gotify={}",
+        req.enabled, req.webhook.enabled, req.gotify.enabled
+    );
+    req.validate()
+        .map_err(|e| ApiError::BadRequest(format!("消息通知配置校验失败: {}", e)))?;
+
+    // 持写锁完成「改 → 落盘 → 回写内存」，避免与其他保存交错丢更新
+    {
+        let mut guard = app_state.config.write().await;
+        let mut config = guard.clone();
+        config.notification = req.clone();
+        config
+            .save_to_file(APP_CONFIG_PATH)
+            .await
+            .map_err(ApiError::Internal)?;
+        *guard = config;
+        crate::notification::apply_config(&req);
+    }
+
+    Ok(Json(ApiResponse::success(req)))
+}
+
+/// 发送测试通知请求（请求体可为 `{}`）
+#[derive(Debug, Default, Deserialize)]
+pub struct NotificationTestRequest {
+    /// 待测试的配置（设置页未保存的草稿）；缺省时使用已保存配置
+    #[serde(default)]
+    pub config: Option<crate::notification::NotificationConfig>,
+}
+
+/// 发送测试通知响应
+#[derive(Debug, Serialize)]
+pub struct NotificationTestResponse {
+    /// 所有已启用渠道均发送成功
+    pub success: bool,
+    pub results: Vec<crate::notification::ChannelSendResult>,
+}
+
+/// POST /api/v1/config/notification/test
+/// 发送测试通知：同步等待各渠道结果；只看渠道开关，不受总开关 / 事件开关影响。
+/// 纯无副作用：不修改已保存配置。
+pub async fn test_notification(
+    State(app_state): State<crate::server::AppState>,
+    Json(req): Json<NotificationTestRequest>,
+) -> ApiResult<Json<ApiResponse<NotificationTestResponse>>> {
+    let cfg = match req.config {
+        Some(cfg) => cfg,
+        None => app_state.config.read().await.notification.clone(),
+    };
+    if !cfg.has_active_channel() {
+        return Err(ApiError::BadRequest(
+            "请至少启用一个通知渠道（Webhook 或 Gotify）".to_string(),
+        ));
+    }
+    cfg.validate()
+        .map_err(|e| ApiError::BadRequest(format!("消息通知配置校验失败: {}", e)))?;
+
+    let results = crate::notification::send_test(&cfg).await;
+    let success = !results.is_empty() && results.iter().all(|r| r.success);
+    for r in &results {
+        if r.success {
+            info!("测试通知发送成功: {}", r.channel);
+        } else {
+            warn!(
+                "测试通知发送失败: {}: {}",
+                r.channel,
+                r.error.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(Json(ApiResponse::success(NotificationTestResponse {
+        success,
+        results,
+    })))
+}
+
 /// 代理测试连接请求（复用 ProxyConfig）
 /// POST /api/v1/proxy/test
 /// 纯无副作用：不修改 AppState，不影响当前代理状态
@@ -1017,5 +1132,105 @@ mod tests {
         // 默认配置应该有效
         assert!(config.download.max_global_threads > 0);
         assert!(config.download.chunk_size_mb > 0);
+    }
+}
+
+/// 检查原始 JSON 以区分「字段缺失」与「显式空列表」（字段默认值为空），缺失时保留已存词表。
+fn preserve_missing_regex_presets(
+    raw: &serde_json::Value,
+    incoming: &mut AppConfig,
+    stored: &ShareSyncConfig,
+) {
+    let present = raw
+        .get("share_sync")
+        .and_then(|v| v.get("exclude_regex_preset_rules"))
+        .is_some();
+    if !present {
+        incoming.share_sync.exclude_regex_preset_rules = stored.exclude_regex_preset_rules.clone();
+    }
+}
+
+#[cfg(test)]
+mod regex_preset_update_tests {
+    use super::*;
+
+    fn stored() -> ShareSyncConfig {
+        ShareSyncConfig {
+            exclude_preset_rules: vec!["*.nfo".into()],
+            exclude_regex_preset_rules: vec!["^/股票/按月归档/2025.*$".into()],
+        }
+    }
+
+    /// 按旧客户端的方式构造请求：完整配置 JSON 但删掉新字段。
+    fn raw_without_regex_field() -> serde_json::Value {
+        let mut raw = serde_json::to_value(AppConfig::default()).unwrap();
+        raw.get_mut("share_sync")
+            .and_then(|v| v.as_object_mut())
+            .expect("share_sync 必须存在")
+            .remove("exclude_regex_preset_rules");
+        raw
+    }
+
+    fn set_regex_presets(raw: &mut serde_json::Value, value: serde_json::Value) {
+        raw["share_sync"]["exclude_regex_preset_rules"] = value;
+    }
+
+    fn parse(raw: &serde_json::Value) -> AppConfig {
+        serde_json::from_value(raw.clone()).unwrap()
+    }
+
+    #[test]
+    fn missing_field_preserves_stored_regex_presets() {
+        let raw = raw_without_regex_field();
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert_eq!(
+            cfg.share_sync.exclude_regex_preset_rules,
+            vec!["^/股票/按月归档/2025.*$".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_field_keeps_glob_presets_from_request() {
+        let mut raw = raw_without_regex_field();
+        raw["share_sync"]["exclude_preset_rules"] = serde_json::json!(["*.tmp"]);
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert_eq!(
+            cfg.share_sync.exclude_preset_rules,
+            vec!["*.tmp".to_string()]
+        );
+        assert_eq!(cfg.share_sync.exclude_regex_preset_rules.len(), 1);
+    }
+
+    #[test]
+    fn explicit_empty_list_clears_regex_presets() {
+        let mut raw = raw_without_regex_field();
+        set_regex_presets(&mut raw, serde_json::json!([]));
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert!(cfg.share_sync.exclude_regex_preset_rules.is_empty());
+    }
+
+    #[test]
+    fn explicit_list_replaces_regex_presets() {
+        let mut raw = raw_without_regex_field();
+        set_regex_presets(&mut raw, serde_json::json!(["^/基金/.*$"]));
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        assert_eq!(
+            cfg.share_sync.exclude_regex_preset_rules,
+            vec!["^/基金/.*$".to_string()]
+        );
+    }
+
+    #[test]
+    fn invalid_regex_presets_are_rejected_before_save() {
+        let mut raw = raw_without_regex_field();
+        set_regex_presets(&mut raw, serde_json::json!(["("]));
+        let mut cfg = parse(&raw);
+        preserve_missing_regex_presets(&raw, &mut cfg, &stored());
+        let err = cfg.share_sync.validate().unwrap_err();
+        assert!(err.contains("正则"), "{err}");
     }
 }

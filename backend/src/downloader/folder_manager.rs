@@ -3096,6 +3096,33 @@ impl FolderDownloadManager {
             .collect()
     }
 
+    /// 按 `backup_config_id` + 所属账号筛选文件夹下载。
+    ///
+    /// `FolderDownloadManager` 是全进程单例，而子文件任务挂在**文件夹所属账号**的
+    /// per-uid `DownloadManager` 上。按账号遍历时（跨账号分享同步）必须只取本账号的
+    /// 文件夹，否则会拿别的账号的 `DownloadManager` 去查子任务，得到一条无子任务、
+    /// 速度为 0 的假记录。
+    pub async fn get_folders_by_backup_config_for_owner(
+        &self,
+        backup_config_id: &str,
+        owner_uid: Uid,
+    ) -> Vec<FolderDownload> {
+        let folders = self.folders.read().await;
+        folders
+            .values()
+            .filter(|f| {
+                f.owner_uid == owner_uid && f.backup_config_id.as_deref() == Some(backup_config_id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 测试辅助：直接把文件夹放进内存表（不持久化、不调度）
+    #[cfg(test)]
+    pub(crate) async fn insert_folder_for_test(&self, folder: FolderDownload) {
+        self.folders.write().await.insert(folder.id.clone(), folder);
+    }
+
     /// 获取所有文件夹下载（内存 + 历史数据库）
     ///
     /// 类似于 DownloadManager::get_all_tasks()，合并内存中的文件夹和历史数据库中的已完成文件夹
@@ -6017,6 +6044,48 @@ impl FolderDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 全局单例按账号筛选：同一 backup_config 下不同账号的文件夹互不可见
+    #[tokio::test]
+    async fn test_get_folders_by_backup_config_for_owner_filters_by_account() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+        let mut a = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        a.owner_uid = Uid::new(1);
+        a.backup_config_id = Some("share-sync:s".into());
+        let mut b = FolderDownload::new("/b".into(), PathBuf::from("./b"));
+        b.owner_uid = Uid::new(2);
+        b.backup_config_id = Some("share-sync:s".into());
+        let mut other_cfg = FolderDownload::new("/c".into(), PathBuf::from("./c"));
+        other_cfg.owner_uid = Uid::new(1);
+        other_cfg.backup_config_id = Some("share-sync:other".into());
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        fm.insert_folder_for_test(a).await;
+        fm.insert_folder_for_test(b).await;
+        fm.insert_folder_for_test(other_cfg).await;
+
+        let ids = |v: Vec<FolderDownload>| v.into_iter().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(fm
+                .get_folders_by_backup_config_for_owner("share-sync:s", Uid::new(1))
+                .await),
+            vec![a_id]
+        );
+        assert_eq!(
+            ids(fm
+                .get_folders_by_backup_config_for_owner("share-sync:s", Uid::new(2))
+                .await),
+            vec![b_id]
+        );
+        assert!(fm
+            .get_folders_by_backup_config_for_owner("share-sync:s", Uid::new(3))
+            .await
+            .is_empty());
+        // 不按账号的老接口仍返回全部
+        assert_eq!(
+            fm.get_folders_by_backup_config("share-sync:s").await.len(),
+            2
+        );
+    }
 
     /// 回归 issue #138：文件夹自己没拿到固定槽位时，绝不能把「文件夹固定槽位」
     /// 发给子任务 —— 否则子任务会带着 `uses_folder_fixed_slot=true` 被拉起，

@@ -262,7 +262,7 @@
     </div>
 
     <!-- 个人信息弹窗 -->
-    <UserProfileDialog v-model="profileDialogVisible" :user="authStore.user" />
+    <UserProfileDialog v-model="profileDialogVisible" :user="authStore.activeProfile" />
   </el-container>
 </template>
 
@@ -456,6 +456,8 @@ watch(
 .main-layout {
   width: 100%;
   height: 100vh;
+  // 移动浏览器地址栏/工具栏会占用部分 100vh，支持时改用动态视口高度
+  height: 100dvh;
   display: flex;
   flex-direction: row;
 
@@ -469,6 +471,8 @@ watch(
   display: flex;
   flex-direction: column;
   min-width: 0;
+  // 纵向 flex 子项默认 min-height:auto，会被内容撑高；置 0 才能被约束在视口内
+  min-height: 0;
 }
 
 .sidebar {
@@ -576,6 +580,8 @@ watch(
   background: #f5f5f5;
   overflow: hidden;
   flex: 1;
+  // 同上：允许内容区收缩到可用高度，由各页面在内部滚动
+  min-height: 0;
 
   // 移动端有底部导航栏时，增加底部内边距
   &.has-tabbar {
@@ -684,7 +690,7 @@ watch(
   right: 0;
   z-index: 1000;
   // iOS 安全区域适配
-  padding-bottom: env(safe-area-inset-bottom, 0);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 
   .tabbar-item {
     display: flex;
@@ -762,10 +768,15 @@ watch(
   box-shadow: 0 0 0 1.5px white;
 }
 
-// 移动端内容区底部留白（为底部导航栏留空间）
+// 移动端内容区高度：视口 - 顶部栏 60px - fixed 底部导航栏 56px - 安全区
+// 注意：env() 的回退值必须带单位（0px）。写成 env(..., 0) 时 calc(长度 - 数字) 在计算值阶段无效，
+// 整条 height 声明失效退回 auto，内容区会被内容撑高、被外层 overflow:hidden 裁掉而无法滚动
+// （离线下载 / 分享管理 / 系统设置 只能看到前几项的根因）。
 .is-mobile {
   .main-content {
-    height: calc(100vh - 60px - 56px - env(safe-area-inset-bottom, 0));
+    flex: none;
+    height: calc(100vh - 60px - 56px - env(safe-area-inset-bottom, 0px));
+    height: calc(100dvh - 60px - 56px - env(safe-area-inset-bottom, 0px));
   }
 }
 

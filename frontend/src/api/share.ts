@@ -54,6 +54,10 @@ export interface ShareRecord {
   expiredTime: number
   /** 浏览次数 */
   viewCount: number
+  /** 下载次数（百度 dCnt；接口未返回时缺省，界面不显示） */
+  downloadCount?: number
+  /** 保存（转存）次数（百度 tCnt；接口未返回时缺省，界面不显示） */
+  transferCount?: number
 }
 
 /**
@@ -86,6 +90,44 @@ export interface CancelShareResult {
   success: boolean
 }
 
+/**
+ * 分享有效期选项（与网页端一致）：1 / 3 / 7 / 30 天，-1 = 永久有效
+ */
+export type ShareExpireDays = 1 | 3 | 7 | 30 | -1
+
+export const SHARE_EXPIRE_OPTIONS: ReadonlyArray<{ days: ShareExpireDays; label: string }> = [
+  { days: 1, label: '1天有效' },
+  { days: 3, label: '3天有效' },
+  { days: 7, label: '7天有效' },
+  { days: 30, label: '30天有效' },
+  { days: -1, label: '永久有效' },
+]
+
+/**
+ * 单条分享修改有效期结果
+ */
+export interface ShareExpireItemResult {
+  shareId: number
+  success: boolean
+  /** 新的过期状态（成功时返回，语义同 ShareRecord.expiredType） */
+  expiredType?: number
+  /** 新的过期时间点（Unix 秒，永久为 0；成功时返回） */
+  expiredTime?: number
+  /** 百度返回的过期时间文本（北京时间，可能缺省） */
+  expireDate?: string
+  /** 失败原因 */
+  error?: string
+}
+
+/**
+ * 修改分享有效期结果
+ */
+export interface ModifyShareExpireResult {
+  results: ShareExpireItemResult[]
+  successCount: number
+  failedCount: number
+}
+
 // =====================================================
 // API 函数
 // =====================================================
@@ -106,6 +148,23 @@ export async function createShare(params: CreateShareParams): Promise<ShareResul
  */
 export async function cancelShare(shareIds: number[]): Promise<CancelShareResult> {
   return apiClient.post('/shares/cancel', { share_ids: shareIds })
+}
+
+/**
+ * 修改分享有效期（单条或批量）
+ * @param shareIds 分享ID列表
+ * @param days 1 / 3 / 7 / 30，-1 = 永久有效
+ */
+export async function modifyShareExpire(
+  shareIds: number[],
+  days: ShareExpireDays,
+): Promise<ModifyShareExpireResult> {
+  // 后端逐条调用百度接口：按条数放宽超时，避免批量时前端先超时而实际已修改
+  return apiClient.post(
+    '/shares/expire',
+    { share_ids: shareIds, days },
+    { timeout: 30000 + 5000 * shareIds.length },
+  )
 }
 
 /**

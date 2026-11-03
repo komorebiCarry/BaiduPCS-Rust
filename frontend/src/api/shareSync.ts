@@ -22,6 +22,11 @@ export interface NetdiskTarget {
   remote_path: string
   save_fs_id: number
   conflict_strategy?: ConflictStrategy | null
+  /**
+   * 转存到哪个账号的网盘（跨账号保存 / 多账号归集）。
+   * 缺省或 null = 订阅所属账号（兼容老订阅）。同一订阅里每个账号最多 1 个网盘目标。
+   */
+  account_uid?: number | null
 }
 
 export interface LocalTarget {
@@ -30,6 +35,13 @@ export interface LocalTarget {
   conflict_strategy?: ConflictStrategy | null
   /** 本地同步模式；缺省时后端按 `share_direct` 反序列化（兼容老订阅） */
   mode?: LocalSyncMode
+  /**
+   * 用哪个账号下载到本地（如「小号留底 + VIP 大号下载」）。
+   * 缺省或 null = 订阅所属账号；`use_default_download_account` 为 true 时忽略本字段。
+   */
+  download_uid?: number | null
+  /** 跟随全局「默认下载账号」（运行时解析；未设置时回退订阅所属账号） */
+  use_default_download_account?: boolean
 }
 
 export type SyncTarget = NetdiskTarget | LocalTarget
@@ -63,6 +75,10 @@ export interface ShareSubscription {
   password?: string | null
   include_paths: string[]
   exclude_patterns: string[]
+  /** 排除正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
+  exclude_regex_patterns?: string[]
+  /** 精确排除的目录路径（相对分享根）；命中的目录连同其中全部内容一起排除 */
+  exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
   delete_missing: boolean
@@ -86,6 +102,10 @@ export interface CreateShareSubscriptionRequest {
   password?: string | null
   include_paths?: string[]
   exclude_patterns?: string[]
+  /** 排除正则（Rust 语法，整条路径匹配） */
+  exclude_regex_patterns?: string[]
+  /** 精确排除的目录路径（相对分享根） */
+  exclude_paths?: string[]
   targets: SyncTarget[]
   conflict_strategy?: ConflictStrategy
   delete_missing?: boolean
@@ -100,6 +120,10 @@ export interface UpdateShareSubscriptionRequest {
   password?: string | null
   include_paths?: string[]
   exclude_patterns?: string[]
+  /** 缺省 = 保留已存正则；显式 [] = 清空 */
+  exclude_regex_patterns?: string[]
+  /** 精确排除的目录路径（相对分享根） */
+  exclude_paths?: string[]
   targets?: SyncTarget[]
   conflict_strategy?: ConflictStrategy
   delete_missing?: boolean
@@ -164,16 +188,49 @@ export interface RunDetail {
   /** 运行中 run 的当前阶段（后端 RunDetailDto 用 serde flatten 透传 RunRecord 的字段） */
   phase?: RunPhase | string | null
   items: RunItemRecord[]
+  /** 符合筛选条件的条数（未筛选时 = 全部条数） */
   item_total_count: number
   item_page: number
   item_page_size: number
+  /** 整个 run 按状态 / 动作分组计数（不受筛选影响）；老后端不返回 */
+  item_facets?: RunItemFacets
+}
+
+/** 运行详情「文件动作」分组计数：键为后端 status / action 原值 */
+export interface RunItemFacets {
+  status_counts: Record<string, number>
+  action_counts: Record<string, number>
+}
+
+/**
+ * 运行详情「文件动作」服务端筛选条件。字段为空 / 'all' 表示不筛选。
+ * status 除后端原值外还支持分组值 'in_progress'（等待 / 转存中 / 下载中 / 删除中）。
+ */
+export interface RunItemFilter {
+  status?: string
+  action?: string
+  /** 路径关键字（字面包含匹配，不区分大小写） */
+  q?: string
 }
 
 export interface RunItemsPage {
   items: RunItemRecord[]
+  /** 符合筛选条件的条数 */
   total: number
   page: number
   page_size: number
+  /** 老后端不返回 */
+  facets?: RunItemFacets
+}
+
+/** 只把有效筛选条件放进查询参数，未筛选时请求与旧版完全一致 */
+function runItemFilterParams(filter?: RunItemFilter): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (filter?.status && filter.status !== 'all') out.status = filter.status
+  if (filter?.action && filter.action !== 'all') out.action = filter.action
+  const q = filter?.q?.trim()
+  if (q) out.q = q
+  return out
 }
 
 export interface ShareSnapshotItem {
@@ -238,6 +295,16 @@ export interface TriggerSubscriptionResponse {
 }
 
 /**
+ * 取消扫描的结果。只有扫描阶段可取消。
+ */
+export interface CancelScanResponse {
+  subscription_id: string
+  /** 被取消的那一轮 run_id */
+  run_id: string
+  cancelled: boolean
+}
+
+/**
  * 分享同步 WS 事件载荷（与后端 ShareSyncEvent 对齐）
  */
 export type ShareSyncWsEvent =
@@ -273,6 +340,7 @@ export type ShareSyncWsEvent =
 }
     | { type: 'run_completed'; run_id: string; subscription_id: string; added: number; modified: number; removed: number; failed: number; owner_uid?: number }
     | { type: 'run_failed'; run_id: string; subscription_id: string; error: string; owner_uid?: number }
+    | { type: 'run_cancelled'; run_id: string; subscription_id: string; owner_uid?: number }
     | {
   type: 'item_progress'
   run_id: string
@@ -336,6 +404,18 @@ export async function resumeSubscription(id: string): Promise<void> {
   await rawApiClient.post(`${BASE}/subscriptions/${id}/resume`)
 }
 
+/**
+ * 取消当前扫描（不影响订阅本身）。`runId` 是用户观察到的那一轮，后端先比对
+ * run 身份再取消，迟到请求不会取消新一轮；不可取消时返回 409。
+ */
+export async function cancelScan(id: string, runId: string): Promise<CancelScanResponse> {
+  const r = await rawApiClient.post<{ success: boolean; data: CancelScanResponse }>(
+      `${BASE}/subscriptions/${id}/cancel-scan`,
+      { run_id: runId }
+  )
+  return r.data.data
+}
+
 export async function listRuns(id: string, page = 1, pageSize = 20): Promise<RunRecord[]> {
   const r = await rawApiClient.get<{ success: boolean; data: RunRecord[] }>(`${BASE}/subscriptions/${id}/runs`, {
     params: { page, page_size: pageSize }
@@ -343,16 +423,21 @@ export async function listRuns(id: string, page = 1, pageSize = 20): Promise<Run
   return r.data.data
 }
 
-export async function getRun(runId: string, page = 1, pageSize = 100): Promise<RunDetail> {
+export async function getRun(runId: string, page = 1, pageSize = 100, filter?: RunItemFilter): Promise<RunDetail> {
   const r = await rawApiClient.get<{ success: boolean; data: RunDetail }>(`${BASE}/runs/${runId}`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, ...runItemFilterParams(filter) }
   })
   return r.data.data
 }
 
-export async function listRunItems(runId: string, page = 1, pageSize = 100): Promise<RunItemsPage> {
+export async function listRunItems(
+  runId: string,
+  page = 1,
+  pageSize = 100,
+  filter?: RunItemFilter,
+): Promise<RunItemsPage> {
   const r = await rawApiClient.get<{ success: boolean; data: RunItemsPage }>(`${BASE}/runs/${runId}/items`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, ...runItemFilterParams(filter) }
   })
   return r.data.data
 }
@@ -418,6 +503,76 @@ export async function previewTree(
         depth,
         // 按订阅所属账号路由网盘 client（编辑非当前账号订阅时必需）；不传则后端回退 active 账号
         owner_uid: ownerUid ?? undefined,
+      }
+  )
+  return r.data.data
+}
+
+// ==================== 排除规则能力与试匹配 ====================
+
+/** 规则错误类型，与后端 `kind` 取值一致 */
+export type ExcludeRuleKind = 'glob' | 'regex' | 'path' | 'rules'
+
+export interface ExcludeRuleError {
+  kind: ExcludeRuleKind
+  /** 0 起的列表下标；列表级错误没有 */
+  index?: number
+  message: string
+}
+
+export interface ExcludeRegexLimits {
+  max_rules: number
+  max_rule_bytes: number
+  max_total_bytes: number
+  max_test_path_bytes: number
+}
+
+export interface ExcludeRuleCapabilities {
+  supports_regex: boolean
+  regex_limits: ExcludeRegexLimits
+}
+
+export interface ValidateExcludeRulesRequest {
+  exclude_patterns?: string[]
+  exclude_regex_patterns?: string[]
+  /** 可选试匹配路径（相对分享根） */
+  test_path?: string
+}
+
+export interface ValidateExcludeRulesResponse {
+  valid: boolean
+  errors: ExcludeRuleError[]
+  /** 仅规则合法且提供了 test_path 时返回 */
+  excluded?: boolean
+}
+
+/**
+ * 服务端是否支持正则排除规则及其限制。
+ *
+ * 失败（404 / 网络不可用）时调用方必须保持纯 glob 编辑，不能把异常当成「支持」。
+ */
+export async function getExcludeRuleCapabilities(): Promise<ExcludeRuleCapabilities> {
+  const r = await rawApiClient.get<{ success: boolean; data: ExcludeRuleCapabilities }>(
+      `${BASE}/exclude-rules/capabilities`
+  )
+  return r.data.data
+}
+
+/**
+ * 校验排除规则，可选对一条相对分享根路径试匹配。
+ *
+ * 只覆盖请求里的两份规则列表（不含同步范围与精确排除目录）；规则非法时
+ * `valid:false` 且后端不会执行匹配。
+ */
+export async function validateExcludeRules(
+    req: ValidateExcludeRulesRequest
+): Promise<ValidateExcludeRulesResponse> {
+  const r = await rawApiClient.post<{ success: boolean; data: ValidateExcludeRulesResponse }>(
+      `${BASE}/exclude-rules/validate`,
+      {
+        exclude_patterns: req.exclude_patterns ?? [],
+        exclude_regex_patterns: req.exclude_regex_patterns ?? [],
+        ...(req.test_path === undefined ? {} : { test_path: req.test_path }),
       }
   )
   return r.data.data

@@ -15,6 +15,28 @@
             <el-icon><Refresh /></el-icon>
             刷新
           </el-button>
+          <el-dropdown
+              v-if="selectedIds.length > 0"
+              class="batch-expire-dropdown"
+              trigger="click"
+              @command="handleBatchExpire"
+          >
+            <el-button :loading="batchExpireUpdating">
+              <el-icon><Timer /></el-icon>
+              批量修改有效期 ({{ selectedIds.length }})
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                    v-for="opt in SHARE_EXPIRE_OPTIONS"
+                    :key="opt.days"
+                    :command="opt.days"
+                >
+                  {{ opt.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
           <el-button
               v-if="selectedIds.length > 0"
               type="danger"
@@ -29,6 +51,27 @@
           <el-button circle @click="refreshList" :loading="loading">
             <el-icon><Refresh /></el-icon>
           </el-button>
+          <el-dropdown
+              v-if="selectedIds.length > 0"
+              class="batch-expire-dropdown"
+              trigger="click"
+              @command="handleBatchExpire"
+          >
+            <el-button circle :loading="batchExpireUpdating" aria-label="批量修改有效期">
+              <el-icon><Timer /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                    v-for="opt in SHARE_EXPIRE_OPTIONS"
+                    :key="opt.days"
+                    :command="opt.days"
+                >
+                  {{ opt.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
           <el-button
               v-if="selectedIds.length > 0"
               circle
@@ -63,6 +106,12 @@
         </template>
       </el-table-column>
       <el-table-column label="浏览" prop="viewCount" width="80" align="center" />
+      <el-table-column v-if="showDownloadCount" label="下载" width="80" align="center">
+        <template #default="{ row }">{{ row.downloadCount ?? '-' }}</template>
+      </el-table-column>
+      <el-table-column v-if="showTransferCount" label="保存" width="80" align="center">
+        <template #default="{ row }">{{ row.transferCount ?? '-' }}</template>
+      </el-table-column>
       <el-table-column label="状态" width="100" align="center">
         <template #default="{ row }">
           <el-tag :type="getStatusType(row.status)" size="small">
@@ -75,7 +124,7 @@
           {{ formatExpireTime(row) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="220" fixed="right">
+      <el-table-column label="操作" width="360" fixed="right">
         <template #default="{ row }">
           <el-button size="small" @click="handleGetDetail(row)" :icon="Key">
             提取码
@@ -83,6 +132,33 @@
           <el-button size="small" @click="handleCopyLink(row)" :icon="Link">
             复制
           </el-button>
+          <el-dropdown
+              class="row-expire-dropdown"
+              trigger="click"
+              :disabled="isExpireLocked(row)"
+              @command="(days: ShareExpireDays) => handleModifyExpire(row, days)"
+          >
+            <el-button
+                size="small"
+                :icon="Timer"
+                :disabled="isExpireLocked(row)"
+                :loading="expireUpdatingIds.includes(row.shareId)"
+                :title="isExpired(row) ? '已过期的分享不能修改有效期' : '修改有效期'"
+            >
+              有效期
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                    v-for="opt in SHARE_EXPIRE_OPTIONS"
+                    :key="opt.days"
+                    :command="opt.days"
+                >
+                  {{ opt.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
           <el-button size="small" type="danger" @click="handleCancel(row)" :icon="Delete">
             取消
           </el-button>
@@ -119,6 +195,14 @@
             <span class="label">浏览:</span>
             <span class="value">{{ item.viewCount }} 次</span>
           </div>
+          <div v-if="item.downloadCount != null" class="info-row">
+            <span class="label">下载:</span>
+            <span class="value">{{ item.downloadCount }} 次</span>
+          </div>
+          <div v-if="item.transferCount != null" class="info-row">
+            <span class="label">保存:</span>
+            <span class="value">{{ item.transferCount }} 次</span>
+          </div>
           <div class="info-row">
             <span class="label">过期:</span>
             <span class="value">{{ formatExpireTime(item) }}</span>
@@ -128,6 +212,32 @@
         <div class="card-actions" @click.stop>
           <el-button size="small" :icon="Key" @click="handleGetDetail(item)">提取码</el-button>
           <el-button size="small" :icon="Link" @click="handleCopyLink(item)">复制</el-button>
+          <el-dropdown
+              class="row-expire-dropdown"
+              trigger="click"
+              :disabled="isExpireLocked(item)"
+              @command="(days: ShareExpireDays) => handleModifyExpire(item, days)"
+          >
+            <el-button
+                size="small"
+                :icon="Timer"
+                :disabled="isExpireLocked(item)"
+                :loading="expireUpdatingIds.includes(item.shareId)"
+            >
+              有效期
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                    v-for="opt in SHARE_EXPIRE_OPTIONS"
+                    :key="opt.days"
+                    :command="opt.days"
+                >
+                  {{ opt.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
           <el-button size="small" type="danger" :icon="Delete" @click="handleCancel(item)">取消</el-button>
         </div>
       </div>
@@ -201,12 +311,17 @@ import {
   Key,
   Link,
   DocumentCopy,
+  Timer,
 } from '@element-plus/icons-vue'
 import { useIsMobile } from '@/utils/responsive'
 import {
   getShareList,
   getShareDetail,
   cancelShare,
+  modifyShareExpire,
+  SHARE_EXPIRE_OPTIONS,
+  type ShareExpireDays,
+  type ShareExpireItemResult,
   type ShareRecord,
   type ShareDetailData,
 } from '@/api/share'
@@ -217,6 +332,9 @@ const isMobile = useIsMobile()
 // 状态
 const loading = ref(false)
 const shareList = ref<ShareRecord[]>([])
+// 下载 / 保存次数：百度接口返回了才显示对应列（不返回时不臆造为 0）
+const showDownloadCount = computed(() => shareList.value.some((r) => r.downloadCount != null))
+const showTransferCount = computed(() => shareList.value.some((r) => r.transferCount != null))
 const total = ref(0)
 
 // 请求版本号 — 切账号 / 切页 时丢弃旧请求回包
@@ -230,6 +348,11 @@ let shareDetailRequestVersion = 0
 const currentPage = ref(1)
 const pageSize = 20
 const selectedIds = ref<number[]>([])
+// 正在修改有效期的分享（按钮 loading / 防重复提交）
+const expireUpdatingIds = ref<number[]>([])
+const batchExpireUpdating = ref(false)
+// 账号代次：切账号后丢弃旧账号的有效期修改回包，避免写到新账号列表上
+let accountEpoch = 0
 
 // 详情弹窗状态
 const detailVisible = ref(false)
@@ -302,6 +425,121 @@ function formatExpireTime(record: ShareRecord): string {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+// 是否已过期（与 formatExpireTime 判定一致）
+function isExpired(record: ShareRecord): boolean {
+  if (record.expiredType === -1) return true
+  const ts = record.expiredTime
+  if (!ts) return false
+  const ms = ts > 10000000000 ? ts : ts * 1000
+  return ms < Date.now()
+}
+
+// 网页端同样不允许修改已过期分享的有效期；修改中也锁住
+function isExpireLocked(record: ShareRecord): boolean {
+  return isExpired(record) || expireUpdatingIds.value.includes(record.shareId) || batchExpireUpdating.value
+}
+
+function expireLabel(days: ShareExpireDays): string {
+  return SHARE_EXPIRE_OPTIONS.find((o) => o.days === days)?.label ?? `${days}天有效`
+}
+
+// 用接口返回值就地更新行，不整表刷新
+function applyExpireResults(results: ShareExpireItemResult[]) {
+  for (const r of results) {
+    if (!r.success || r.expiredType == null || r.expiredTime == null) continue
+    const row = shareList.value.find((item) => item.shareId === r.shareId)
+    if (row) {
+      row.expiredType = r.expiredType
+      row.expiredTime = r.expiredTime
+    }
+  }
+}
+
+async function runModifyExpire(shareIds: number[], days: ShareExpireDays) {
+  const epoch = accountEpoch
+  const data = await modifyShareExpire(shareIds, days)
+  if (epoch !== accountEpoch) return null
+  applyExpireResults(data.results)
+  return data
+}
+
+// 修改单个分享有效期
+async function handleModifyExpire(record: ShareRecord, days: ShareExpireDays) {
+  if (isExpireLocked(record)) return
+  const id = record.shareId
+  const epoch = accountEpoch
+  expireUpdatingIds.value.push(id)
+  try {
+    const data = await runModifyExpire([id], days)
+    if (!data) return
+    const r = data.results.find((x) => x.shareId === id)
+    if (r?.success) {
+      ElMessage.success(`有效期已改为「${expireLabel(days)}」`)
+    } else {
+      ElMessage.error(`修改有效期失败：${r?.error || '未知错误'}`)
+    }
+  } catch (error: any) {
+    console.error('修改有效期失败:', error)
+    ElMessage.error(error.message || '修改有效期失败')
+    // 请求失败（超时 / 网络）时结果未知，重新拉列表以显示真实有效期
+    if (epoch === accountEpoch) refreshList()
+  } finally {
+    if (epoch === accountEpoch) {
+      expireUpdatingIds.value = expireUpdatingIds.value.filter((x) => x !== id)
+    }
+  }
+}
+
+// 批量修改有效期（跳过已过期的分享，与网页端一致）
+async function handleBatchExpire(days: ShareExpireDays) {
+  if (selectedIds.value.length === 0 || batchExpireUpdating.value) return
+  // 只跳过当前列表里能确认已过期的；不在当前页的选中项交给后端（失败会逐条返回原因）
+  const targets = selectedIds.value.filter((id) => {
+    const row = shareList.value.find((item) => item.shareId === id)
+    return !row || !isExpired(row)
+  })
+  const skipped = selectedIds.value.length - targets.length
+  if (targets.length === 0) {
+    ElMessage.warning('选中的分享都已过期，无法修改有效期')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+        `确定把选中的 ${targets.length} 个分享的有效期改为「${expireLabel(days)}」吗？` +
+        (skipped > 0 ? `（已跳过 ${skipped} 个已过期的分享）` : ''),
+        '批量修改有效期',
+        { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
+    )
+  } catch {
+    return
+  }
+  const epoch = accountEpoch
+  batchExpireUpdating.value = true
+  try {
+    const data = await runModifyExpire(targets, days)
+    if (!data) return
+    if (data.failedCount === 0) {
+      ElMessage.success(`已将 ${data.successCount} 个分享的有效期改为「${expireLabel(days)}」`)
+    } else {
+      const firstError = data.results.find((r) => !r.success)?.error || '未知错误'
+      const msg = `成功 ${data.successCount} 个，失败 ${data.failedCount} 个：${firstError}`
+      if (data.successCount > 0) {
+        ElMessage.warning(msg)
+      } else {
+        ElMessage.error(msg)
+      }
+    }
+  } catch (error: any) {
+    console.error('批量修改有效期失败:', error)
+    ElMessage.error(error.message || '批量修改有效期失败')
+    if (epoch === accountEpoch) refreshList()
+  } finally {
+    if (epoch === accountEpoch) {
+      batchExpireUpdating.value = false
+    }
+  }
 }
 
 // 刷新列表
@@ -465,6 +703,9 @@ async function handleBatchCancel() {
 // 让旧账号 in-flight `getShareList` 回包被 refreshList 内部 version check 丢弃，
 // 避免覆盖新账号视图。
 function handleActiveChanged() {
+  accountEpoch++ // 丢弃旧账号有效期修改回包
+  expireUpdatingIds.value = []
+  batchExpireUpdating.value = false
   shareListRequestVersion++
   shareDetailRequestVersion++ // 丢弃旧账号详情请求回包
   shareList.value = []
@@ -535,6 +776,12 @@ onBeforeUnmount(() => {
 /* =====================
    PC端表格样式
    ===================== */
+/* 表格行内「有效期」下拉：与相邻按钮保持 Element Plus 默认 12px 间距 */
+.share-table .row-expire-dropdown {
+  margin: 0 12px;
+  vertical-align: middle;
+}
+
 .share-table {
   flex: 1;
 
@@ -616,6 +863,20 @@ onBeforeUnmount(() => {
   .el-button {
     flex: 1;
     min-height: 44px; /* 触摸友好的最小高度 */
+  }
+
+  /* 下拉包裹的按钮与相邻按钮保持和原来一致的间距（gap + Element Plus 的 12px） */
+  .row-expire-dropdown {
+    flex: 1;
+    margin-left: 12px;
+
+    .el-button {
+      width: 100%;
+    }
+  }
+
+  .row-expire-dropdown + .el-button {
+    margin-left: 12px;
   }
 }
 

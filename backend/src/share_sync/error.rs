@@ -50,6 +50,14 @@ pub enum ShareSyncError {
     #[error("订阅已有同步任务在执行中: {0}")]
     AlreadyRunning(String),
 
+    /// 扫描被用户主动取消 —— 不是失败，不计入链接失效，也不触发重试
+    #[error("扫描已取消: {0}")]
+    ScanCancelled(String),
+
+    /// 当前无法取消扫描：没有正在进行的扫描，或该轮已进入执行阶段
+    #[error("无法取消扫描: {0}")]
+    ScanNotCancellable(String),
+
     /// 内部错误
     #[error("内部错误: {0}")]
     Internal(String),

@@ -224,6 +224,8 @@
         :show-encryption="hasEncryptionKey"
         :show-conflict-strategy="true"
         :default-upload-conflict-strategy="uploadConflictStrategy"
+        :show-skip-rapid="true"
+        :default-skip-rapid-upload="uploadConfig?.skip_rapid_upload ?? false"
         @select="handleFilePickerSelect"
         @select-multiple="handleFilePickerMultiSelect"
     />
@@ -956,7 +958,7 @@ async function handleDownloadFolder(folder: FileItem) {
 }
 
 // 处理 FilePicker 选择结果
-async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false, conflictStrategy?: string) {
+async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false, conflictStrategy?: string, skipRapidUpload?: boolean) {
   // 如果用户选择了冲突策略，更新当前策略
   if (conflictStrategy) {
     uploadConflictStrategy.value = conflictStrategy as any
@@ -974,6 +976,7 @@ async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false
         remote_path: remotePath,
         encrypt,
         conflict_strategy: uploadConflictStrategy.value,
+        skip_rapid_upload: skipRapidUpload,
       })
 
       ElMessage.success(encrypt ? '已添加加密上传任务' : '已添加上传任务')
@@ -988,6 +991,7 @@ async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false
         remote_folder: remoteFolderPath,
         encrypt,
         conflict_strategy: uploadConflictStrategy.value,
+        skip_rapid_upload: skipRapidUpload,
       })
 
       ElMessage.success(encrypt ? '已添加加密文件夹上传任务' : '已添加文件夹上传任务')
@@ -1009,7 +1013,7 @@ async function handleFilePickerSelect(entry: FileEntry, encrypt: boolean = false
 }
 
 // 处理 FilePicker 多选结果
-async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolean = false, conflictStrategy?: string) {
+async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolean = false, conflictStrategy?: string, skipRapidUpload?: boolean) {
   if (entries.length === 0) return
 
   // 如果用户选择了冲突策略，更新当前策略
@@ -1035,6 +1039,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolea
           remote_path: remotePath,
           encrypt,
           conflict_strategy: uploadConflictStrategy.value,
+          skip_rapid_upload: skipRapidUpload,
         })
         successCount++
       } else {
@@ -1048,6 +1053,7 @@ async function handleFilePickerMultiSelect(entries: FileEntry[], encrypt: boolea
           remote_folder: remoteFolderPath,
           encrypt,
           conflict_strategy: uploadConflictStrategy.value,
+          skip_rapid_upload: skipRapidUpload,
         })
         successCount++
       }
@@ -2552,9 +2558,6 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
 // 移动端样式
 // =====================
 .is-mobile {
-  // 移动端高度适配（减去顶部栏60px和底部导航栏56px）
-  height: calc(100vh - 60px - 56px);
-
   .breadcrumb-bar {
     padding: 12px 16px;
     flex-wrap: wrap;

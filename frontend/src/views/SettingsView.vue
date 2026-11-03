@@ -322,6 +322,19 @@
                     </div>
                   </el-form-item>
 
+                  <el-form-item label="跳过秒传" prop="upload.skip_rapid_upload">
+                    <el-switch
+                        v-model="formData.upload.skip_rapid_upload"
+                        active-text="默认跳过"
+                        inactive-text="先尝试秒传"
+                    />
+                    <div class="form-tip">
+                      同 BaiduPCS-Go v4.0.0 的 <code>--norapid</code>：开启后上传不再整文件计算 MD5、不尝试秒传，直接分片上传（合并时使用服务器返回的分片校验值）。
+                      适合上传网盘里肯定没有的新文件（如自己打包的压缩包），可省去读取整个文件的时间；但相同文件也会重新完整上传。
+                      上传对话框中可对单次上传单独开关；自动备份等未单独指定的上传跟随此设置，修改后对之后开始的任务生效。
+                    </div>
+                  </el-form-item>
+
                   <!-- 分片大小说明（自适应，不可配置） -->
                   <el-alert
                       title="智能分片大小（自动适配）"
@@ -485,17 +498,27 @@
 
                   <el-form-item label="排除规则常用词表">
                     <div class="preset-rules-editor">
+                      <div class="preset-rules-kind-row">
+                        <el-radio-group v-model="presetKind" size="small" aria-label="常用规则类型">
+                          <el-radio-button value="glob">通配符</el-radio-button>
+                          <el-radio-button value="regex" :disabled="!regexRuleSupported">正则表达式</el-radio-button>
+                        </el-radio-group>
+                        <span
+                            v-if="!regexRuleSupported && regexRuleReady"
+                            class="preset-rules-empty"
+                        >当前后端仅支持通配符</span>
+                      </div>
                       <div class="preset-rules-tags">
                         <el-tag
-                            v-for="(p, i) in formData.share_sync!.exclude_preset_rules"
-                            :key="p + i"
+                            v-for="(p, i) in activePresetRules"
+                            :key="presetKind + p + i"
                             closable
-                            type="info"
+                            :type="presetKind === 'regex' ? 'warning' : 'info'"
                             style="margin: 2px 4px 2px 0"
                             @close="removePresetRule(i)"
-                        >{{ p }}</el-tag>
+                        ><span v-if="presetKind === 'regex'" class="rule-kind">正则</span>{{ p }}</el-tag>
                         <span
-                            v-if="formData.share_sync!.exclude_preset_rules.length === 0"
+                            v-if="activePresetRules.length === 0"
                             class="preset-rules-empty"
                         >暂无常用规则</span>
                       </div>
@@ -508,20 +531,22 @@
                             :autosize="{ minRows: 1, maxRows: 4 }"
                             resize="none"
                             size="small"
-                            placeholder="输入规则后回车添加；可粘贴多行一次添加（每行一条）"
+                            :placeholder="presetKind === 'regex' ? '输入正则，每行一条' : '输入规则，每行一条'"
+                            :aria-label="presetKind === 'regex' ? '输入正则常用规则' : '输入通配符常用规则'"
                             style="width: 320px"
                             @keydown.enter="onPresetRuleEnter"
                         />
-                        <el-button size="small" plain type="primary" @click="addPresetRules">添加</el-button>
+                        <el-button size="small" plain type="primary" :loading="validatingPresets" @click="addPresetRules">添加</el-button>
                         <el-button size="small" text type="primary" @click="showPresetRuleHelp = !showPresetRuleHelp">
                           <el-icon style="margin-right: 2px"><QuestionFilled /></el-icon>使用说明
                         </el-button>
                       </div>
+                      <p v-if="presetRuleError" class="preset-rules-error" role="alert">{{ presetRuleError }}</p>
                     </div>
                     <div class="form-tip">
                       创建/编辑分享同步订阅时，词表中的规则可一键点选添加，免去重复手输。
                     </div>
-                    <ExcludeRuleHelp v-if="showPresetRuleHelp" />
+                    <ExcludeRuleHelp v-if="showPresetRuleHelp" :kind="presetKind" />
                   </el-form-item>
                 </el-card>
 
@@ -943,6 +968,11 @@
                   </div>
                 </el-card>
 
+                <!-- 消息通知 -->
+                <div id="section-notification">
+                  <NotificationSettingsSection v-model="formData.notification!" />
+                </div>
+
                 <!-- 关于信息 -->
                 <el-card id="section-about" class="setting-card" shadow="hover">
                   <template #header>
@@ -1069,20 +1099,35 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useIsMobile } from '@/utils/responsive'
 import { APP_VERSION_LABEL } from '@/utils/version'
-import { mergeRules, parseRuleInput } from '@/utils/excludeRules'
+import {
+  describeRuleErrorFrom,
+  mergeRules,
+  normalizeRuleList,
+  parseRuleInput,
+  sameRuleList,
+  type ExcludeRuleKind as RuleKind,
+} from '@/utils/excludeRules'
+import { getExcludeRuleCapabilities, validateExcludeRules } from '@/api/shareSync'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
-import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
+import {
+  getRecommendedConfig,
+  resetToRecommended,
+  getProxyStatus,
+  testProxyConnection,
+  normalizeNotificationConfig,
+} from '@/api/config'
 import type { UploadConflictStrategy } from '@/api/upload'
 import type { DownloadConflictStrategy } from '@/api/download'
 import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import AccountManagementSection from '@/components/settings/AccountManagementSection.vue'
+import NotificationSettingsSection from '@/components/settings/NotificationSettingsSection.vue'
 import BudgetPanel from '@/views/settings/BudgetPanel.vue'
 import ExcludeRuleHelp from '@/components/ExcludeRuleHelp.vue'
 import {
@@ -1147,15 +1192,97 @@ const transferBehavior = ref('transfer_only')
 // ==================== 分享同步：排除规则常用词表 ====================
 const presetRuleInput = ref('')
 const showPresetRuleHelp = ref(false)
+// 词表类型：通配符（历史默认）/ 正则，两类独立存储
+const presetKind = ref<RuleKind>('glob')
+const regexRuleSupported = ref(false)
+const regexRuleReady = ref(false)
+const presetRuleError = ref<string | null>(null)
+const validatingPresets = ref(false)
 
-/** 提交输入框内容：按行拆成规则（行内逗号等标点属于规则本身，不切分；与订阅编辑器一致） */
-function addPresetRules() {
-  if (!formData.value?.share_sync) return
-  formData.value.share_sync.exclude_preset_rules = mergeRules(
-      formData.value.share_sync.exclude_preset_rules,
-      parseRuleInput(presetRuleInput.value),
-  )
+const activePresetRules = computed<string[]>(() => {
+  const cfg = formData.value?.share_sync
+  if (!cfg) return []
+  return presetKind.value === 'regex'
+      ? normalizeRuleList(cfg.exclude_regex_preset_rules)
+      : normalizeRuleList(cfg.exclude_preset_rules)
+})
+
+async function loadRuleCapabilities() {
+  try {
+    const caps = await getExcludeRuleCapabilities()
+    regexRuleSupported.value = caps.supports_regex === true
+  } catch {
+    regexRuleSupported.value = false
+  } finally {
+    regexRuleReady.value = true
+  }
+}
+
+/**
+ * 提交输入框内容：按行拆成规则并写入当前类型的词表（正则先经后端校验）。
+ *
+ * 校验是异步的：发起时快照类型、输入与两份词表，返回后任何一项已变（用户继续
+ * 输入、切换类型、删除/重载词表）就整批丢弃，既不覆盖更新的文本，也不会把
+ * 已删掉的词表项复活。只有来源输入仍未变时才清空它。
+ */
+async function addPresetRules() {
+  const cfg = formData.value?.share_sync
+  if (!cfg) return
+  const inputSnapshot = presetRuleInput.value
+  const incoming = parseRuleInput(inputSnapshot)
+  if (incoming.length === 0 || validatingPresets.value) return
+  const kind = presetKind.value
+  const globs = normalizeRuleList(cfg.exclude_preset_rules)
+  const regexes = normalizeRuleList(cfg.exclude_regex_preset_rules)
+  const nextGlobs = kind === 'glob' ? mergeRules(globs, incoming) : globs
+  const nextRegexes = kind === 'regex' ? mergeRules(regexes, incoming) : regexes
+
+  /** 发起时的输入、类型与两份词表是否都还保持原样 */
+  const unchanged = () => {
+    if (presetKind.value !== kind) return false
+    if (presetRuleInput.value !== inputSnapshot) return false
+    const cur = formData.value?.share_sync
+    if (!cur) return false
+    return sameRuleList(normalizeRuleList(cur.exclude_preset_rules), globs)
+        && sameRuleList(normalizeRuleList(cur.exclude_regex_preset_rules), regexes)
+  }
+
+  if (nextRegexes.length > 0 && kind === 'regex') {
+    validatingPresets.value = true
+    try {
+      const resp = await validateExcludeRules({
+        exclude_patterns: nextGlobs,
+        exclude_regex_patterns: nextRegexes,
+      })
+      if (!unchanged()) return
+      if (!resp.valid) {
+        const baseLength = kind === 'regex' ? regexes.length : globs.length
+        presetRuleError.value = resp.errors.length
+            ? describeRuleErrorFrom(resp.errors[0], kind, baseLength)
+            : '常用规则校验失败'
+        return
+      }
+    } catch (e) {
+      if (unchanged()) presetRuleError.value = ruleValidationUnavailable(e)
+      return
+    } finally {
+      validatingPresets.value = false
+    }
+  }
+
+  if (!unchanged()) return
+  presetRuleError.value = null
+  cfg.exclude_preset_rules = nextGlobs
+  cfg.exclude_regex_preset_rules = nextRegexes
   presetRuleInput.value = ''
+}
+
+/** 后端不可用时给出可读文案，绝不把失败当成校验通过 */
+function ruleValidationUnavailable(e: unknown): string {
+  const detail = (e as Error)?.message
+  return detail
+      ? `无法校验常用规则：${detail}`
+      : '无法校验常用规则：当前后端不支持正则校验'
 }
 
 /** textarea 回车 = 提交而非换行；输入法组词期间的回车（选字）不触发 */
@@ -1163,11 +1290,22 @@ function onPresetRuleEnter(e: Event) {
   const ke = e as KeyboardEvent
   if (ke.isComposing) return
   ke.preventDefault()
-  addPresetRules()
+  void addPresetRules()
 }
 
 function removePresetRule(i: number) {
-  formData.value?.share_sync?.exclude_preset_rules.splice(i, 1)
+  const cfg = formData.value?.share_sync
+  if (!cfg) return
+  presetRuleError.value = null
+  if (presetKind.value === 'regex') {
+    const list = normalizeRuleList(cfg.exclude_regex_preset_rules)
+    list.splice(i, 1)
+    cfg.exclude_regex_preset_rules = list
+    return
+  }
+  const list = normalizeRuleList(cfg.exclude_preset_rules)
+  list.splice(i, 1)
+  cfg.exclude_preset_rules = list
 }
 const showDirPicker = ref(false)
 
@@ -1190,6 +1328,7 @@ const navItems = [
   { id: 'section-encryption', label: '加密', color: '#f56c6c' },
   { id: 'section-backup', label: '自动备份', color: '#67c23a' },
   { id: 'section-proxy', label: '网络代理', color: '#9b59b6' },
+  { id: 'section-notification', label: '消息通知', color: '#e6a23c' },
   { id: 'section-about', label: '关于', color: '#909399' },
 ]
 
@@ -1317,9 +1456,19 @@ async function loadConfig() {
       }
     }
 
-    // 初始化分享同步配置（老后端不返回该段时兜底为空词表）
+    // 初始化分享同步配置（老后端不返回该段 / 缺新字段时兜底为空词表）
     if (formData.value && !formData.value.share_sync) {
-      formData.value.share_sync = { exclude_preset_rules: [] }
+      formData.value.share_sync = { exclude_preset_rules: [], exclude_regex_preset_rules: [] }
+    } else if (formData.value?.share_sync) {
+      formData.value.share_sync.exclude_preset_rules =
+          normalizeRuleList(formData.value.share_sync.exclude_preset_rules)
+      formData.value.share_sync.exclude_regex_preset_rules =
+          normalizeRuleList(formData.value.share_sync.exclude_regex_preset_rules)
+    }
+
+    // 初始化消息通知（老后端不返回该段时用默认值）
+    if (formData.value) {
+      formData.value.notification = normalizeNotificationConfig(formData.value.notification)
     }
 
     // 初始化界面偏好（老后端不返回该段时用默认值）
@@ -1468,6 +1617,12 @@ async function handleSave() {
         ElMessage.error('代理端口不能为空')
         return
       }
+    }
+
+    // 消息通知：去掉未填写名称的请求头（后端会拒绝空名称）
+    if (formData.value.notification) {
+      formData.value.notification.webhook.headers =
+          formData.value.notification.webhook.headers.filter((h) => h.name.trim() !== '')
     }
 
     saving.value = true
@@ -1854,6 +2009,7 @@ function initSectionObserver() {
 
 onMounted(() => {
   loadConfig()
+  void loadRuleCapabilities()
   loadEncryptionStatus()
   loadWatchCapability()
   loadTriggerConfig()
@@ -2042,9 +2198,34 @@ onUnmounted(() => {
   color: #999;
 }
 
+.preset-rules-kind-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-bottom: 6px;
+}
+
+.preset-rules-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--el-color-danger);
+  word-break: break-word;
+}
+
+.rule-kind {
+  margin-right: 4px;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.06);
+  font-size: 11px;
+}
+
 .preset-rules-input-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
   margin-top: 4px;
 }

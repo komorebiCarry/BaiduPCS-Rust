@@ -32,6 +32,8 @@ export interface UploadTask {
   encrypt_enabled?: boolean
   encrypt_progress?: number
   original_size?: number
+  /** 本任务是否跳过秒传（缺省 = 跟随全局设置） */
+  skip_rapid_upload?: boolean | null
 }
 
 /// 创建上传任务请求
@@ -40,6 +42,8 @@ export interface CreateUploadRequest {
   remote_path: string
   encrypt?: boolean
   conflict_strategy?: UploadConflictStrategy
+  /** 是否跳过秒传（对应 BaiduPCS-Go `--norapid`）；不传则跟随设置中的默认值 */
+  skip_rapid_upload?: boolean
   /** 任务归属账号 UID（不传默认为当前活跃账号） */
   owner_uid?: number
 }
@@ -59,6 +63,8 @@ export interface CreateFolderUploadRequest {
   scan_options?: FolderScanOptions
   encrypt?: boolean
   conflict_strategy?: UploadConflictStrategy
+  /** 是否跳过秒传（对应 BaiduPCS-Go `--norapid`）；不传则跟随设置中的默认值 */
+  skip_rapid_upload?: boolean
   /** 任务归属账号 UID */
   owner_uid?: number
 }
@@ -68,6 +74,8 @@ export interface CreateBatchUploadRequest {
   files: [string, string][] // [(本地路径, 远程路径)]
   encrypt?: boolean
   conflict_strategy?: UploadConflictStrategy
+  /** 是否跳过秒传（对应 BaiduPCS-Go `--norapid`）；不传则跟随设置中的默认值 */
+  skip_rapid_upload?: boolean
   /** 任务归属账号 UID */
   owner_uid?: number
 }

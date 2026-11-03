@@ -497,6 +497,19 @@ async fn main() -> anyhow::Result<()> {
         // 转存配置API
         .route("/config/transfer", get(handlers::get_transfer_config))
         .route("/config/transfer", put(handlers::update_transfer_config))
+        // 消息通知（Gotify / 通用 Webhook）
+        .route(
+            "/config/notification",
+            get(handlers::get_notification_config),
+        )
+        .route(
+            "/config/notification",
+            put(handlers::update_notification_config),
+        )
+        .route(
+            "/config/notification/test",
+            post(handlers::test_notification),
+        )
         // 🔥 多账号资源配额 API
         .route("/budget", get(handlers::budget::get_budget))
         .route(
@@ -662,6 +675,10 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::resume_subscription),
         )
         .route(
+            "/share-sync/subscriptions/:id/cancel-scan",
+            post(handlers::share_sync::cancel_scan),
+        )
+        .route(
             "/share-sync/subscriptions/:id/runs",
             get(handlers::list_runs),
         )
@@ -677,6 +694,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/share-sync/preview-tree", post(handlers::preview_tree))
         .route("/share-sync/cron/preview", post(handlers::preview_cron))
+        .route(
+            "/share-sync/exclude-rules/capabilities",
+            get(handlers::exclude_rule_capabilities),
+        )
+        .route(
+            "/share-sync/exclude-rules/validate",
+            post(handlers::validate_exclude_rules),
+        )
         // 🔥 加密数据导出 API
         .route("/encryption/export-bundle", post(handlers::export_bundle))
         .route("/encryption/export-mapping", get(handlers::export_mapping))
@@ -708,6 +733,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/shares", post(handlers::create_share))
         .route("/shares", get(handlers::get_share_list))
         .route("/shares/cancel", post(handlers::cancel_share))
+        .route("/shares/expire", post(handlers::modify_share_expire))
         .route("/shares/:id", get(handlers::get_share_detail))
         // 🔥 系统能力检测 API
         .route(

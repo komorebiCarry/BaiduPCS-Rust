@@ -722,6 +722,8 @@ fn build_transfer_request(
         // 内部任务：分享撤销后无法重试，不进「转存管理」
         is_internal: true,
         backup_config_id: Some(format!("{}{}", INTERNAL_CONFIG_PREFIX, job.id)),
+        // 目标目录属于目标账号，不能写成活跃账号的「最近保存目录」
+        remember_recent_dir: false,
     };
     match job.mode {
         CrossAccountMode::Copy | CrossAccountMode::Move => base,

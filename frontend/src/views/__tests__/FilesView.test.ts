@@ -256,7 +256,7 @@ describe('FilesView 右键菜单', () => {
       expose({
         clearSelection: () => tableCalls.push(['clear']),
         toggleRowSelection: (row: { fs_id: number }, selected: boolean) =>
-            tableCalls.push(['toggle', row.fs_id, selected]),
+          tableCalls.push(['toggle', row.fs_id, selected]),
       })
       return () => h('div')
     },
@@ -795,6 +795,75 @@ describe('FilesView 目录记忆与定位', () => {
     // @ts-expect-error setup 内部状态
     expect(wrapper.vm.locatedPath).toBeNull()
 
+    wrapper.unmount()
+  })
+})
+
+describe('FilesView 上传跳过秒传', () => {
+  function mountFilesView() {
+    return mount(FilesView, {
+      global: {
+        plugins: [ElementPlus],
+        stubs: {
+          'el-table': true,
+          'el-table-column': true,
+          FilePickerModal: true,
+          TransferDialog: true,
+          ShareDialog: true,
+          ShareDirectDownloadDialog: true,
+        },
+      },
+    })
+  }
+
+  it('上传对话框显示开关，默认值取自上传设置（缺省为 false）', async () => {
+    const wrapper = mountFilesView()
+    await flushPromises()
+    const picker = wrapper
+      .findAllComponents({ name: 'FilePickerModal' })
+      .find((c) => c.props('title') === '选择上传文件')!
+    expect(picker).toBeTruthy()
+    expect(picker.props('showSkipRapid')).toBe(true)
+    expect(picker.props('defaultSkipRapidUpload')).toBe(false)
+    wrapper.unmount()
+
+    // 设置里开启了"默认跳过秒传"
+    const { getConfig } = await import('@/api/config')
+    const base = await vi.mocked(getConfig)()
+    vi.mocked(getConfig).mockResolvedValueOnce({
+      ...base,
+      upload: { ...base.upload, skip_rapid_upload: true },
+    } as any)
+    const wrapper2 = mountFilesView()
+    await flushPromises()
+    const picker2 = wrapper2
+      .findAllComponents({ name: 'FilePickerModal' })
+      .find((c) => c.props('title') === '选择上传文件')!
+    expect(picker2.props('defaultSkipRapidUpload')).toBe(true)
+    wrapper2.unmount()
+  })
+
+  it('把对话框里的选择透传给单文件与文件夹上传接口', async () => {
+    const { createUpload, createFolderUpload } = await import('@/api/upload')
+    vi.mocked(createUpload).mockClear()
+    vi.mocked(createFolderUpload).mockClear()
+    const wrapper = mountFilesView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+
+    const file = { id: 'f', name: 'a.zip', entryType: 'file', size: 1, createdAt: '', updatedAt: '', path: '/d/a.zip' }
+    const dir = { id: 'd', name: 'pics', entryType: 'directory', size: null, createdAt: '', updatedAt: '', path: '/d/pics' }
+
+    await vm.handleFilePickerSelect(file, false, 'smart_dedup', true)
+    expect(vi.mocked(createUpload).mock.calls[0][0]).toMatchObject({ local_path: '/d/a.zip', skip_rapid_upload: true })
+
+    await vm.handleFilePickerMultiSelect([file, dir], false, 'smart_dedup', false)
+    expect(vi.mocked(createUpload).mock.calls[1][0]).toMatchObject({ skip_rapid_upload: false })
+    expect(vi.mocked(createFolderUpload).mock.calls[0][0]).toMatchObject({ local_folder: '/d/pics', skip_rapid_upload: false })
+
+    // 未传（旧调用方式）→ 不带该字段，由后端跟随全局设置
+    await vm.handleFilePickerSelect(file, false)
+    expect(vi.mocked(createUpload).mock.calls[2][0].skip_rapid_upload).toBeUndefined()
     wrapper.unmount()
   })
 })

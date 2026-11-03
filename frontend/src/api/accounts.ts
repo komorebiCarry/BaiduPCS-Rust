@@ -64,6 +64,12 @@ export interface AccountSummary {
   /** 会员成长等级（如 SVIP5 的 5）；后端后台刷新，旧后端 / 未刷新到时缺失 */
   vip_level?: number | null
   is_active: boolean
+  /** 登录时间戳（秒）；旧后端不返回 */
+  login_time?: number
+  /** 网盘总空间（字节）；未获取到时为 null，旧后端不返回 */
+  total_space?: number | null
+  /** 网盘已用空间（字节）；未获取到时为 null，旧后端不返回 */
+  used_space?: number | null
   /**
    * 持久化的账号自定义配置。
    *

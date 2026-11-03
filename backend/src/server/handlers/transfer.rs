@@ -144,9 +144,10 @@ pub async fn create_transfer(
 ) -> Json<TransferApiResponse<CreateTransferResponse>> {
     // 🔥 解析 effective_uid
     // 优先使用前端显式 `req.uid`（owner_uid alias），否则回退到当前 active_uid。
+    let active_uid = *app_state.active_uid.read().await;
     let effective_uid = match req.uid {
         Some(uid_raw) => crate::auth::Uid::new(uid_raw),
-        None => match *app_state.active_uid.read().await {
+        None => match active_uid {
             Some(uid) => uid,
             None => {
                 error!("create_transfer: 未登录且无 explicit uid");
@@ -162,7 +163,10 @@ pub async fn create_transfer(
     {
         let mgr = app_state.account_manager.lock().await;
         if mgr.get_user(effective_uid).is_none() {
-            error!("create_transfer: 目标账号不存在: uid={}", effective_uid.raw());
+            error!(
+                "create_transfer: 目标账号不存在: uid={}",
+                effective_uid.raw()
+            );
             return Json(TransferApiResponse::error(
                 error_codes::MANAGER_NOT_READY,
                 format!("账号 uid={} 不存在", effective_uid.raw()),
@@ -203,6 +207,8 @@ pub async fn create_transfer(
         // 用户手动转存：非内部任务、无同步归属
         is_internal: false,
         backup_config_id: None,
+        // 「最近保存目录」是活跃账号转存对话框的默认位置：跨账号保存不记
+        remember_recent_dir: active_uid == Some(effective_uid),
     };
 
     // 创建任务
@@ -527,7 +533,10 @@ pub async fn preview_share_files(
             error!("预览分享文件失败: {}", err_msg);
 
             // 根据错误内容返回不同的错误码（与 create_transfer 一致）
-            let code = if err_msg.contains("需要密码") || err_msg.contains("need password") || err_msg.contains("需要提取码") {
+            let code = if err_msg.contains("需要密码")
+                || err_msg.contains("need password")
+                || err_msg.contains("需要提取码")
+            {
                 error_codes::NEED_PASSWORD
             } else if err_msg.contains("提取码错误") || err_msg.contains("-9") {
                 error_codes::INVALID_PASSWORD
@@ -607,8 +616,15 @@ pub async fn preview_share_dir(
         .await
     {
         Ok(files) => {
-            info!("浏览分享子目录成功: {} 个文件, dir={}", files.len(), req.dir);
-            Json(TransferApiResponse::success(PreviewShareResponse { files, share_info: None }))
+            info!(
+                "浏览分享子目录成功: {} 个文件, dir={}",
+                files.len(),
+                req.dir
+            );
+            Json(TransferApiResponse::success(PreviewShareResponse {
+                files,
+                share_info: None,
+            }))
         }
         Err(e) => {
             let err_msg = e.to_string();
@@ -627,7 +643,10 @@ pub async fn cleanup_orphaned_temp_dirs(
     State(app_state): State<AppState>,
     Query(query): Query<CleanupOrphanedQuery>,
 ) -> Json<TransferApiResponse<CleanupOrphanedResponse>> {
-    info!("手动清理孤立临时目录: include_foreign={}", query.include_foreign);
+    info!(
+        "手动清理孤立临时目录: include_foreign={}",
+        query.include_foreign
+    );
 
     let transfer_manager = match app_state.transfer_manager_for_active().await {
         Some(tm) => tm,

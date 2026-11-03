@@ -175,6 +175,8 @@ pub enum RunStatus {
     Failed,
     /// 进程重启时被打断（未跑完）——非失败,会在启动时自动重跑
     Interrupted,
+    /// 用户主动取消（当前仅扫描阶段可取消）——非失败,不算链接/网络异常
+    Cancelled,
 }
 
 impl std::fmt::Display for RunStatus {
@@ -192,6 +194,7 @@ impl RunStatus {
             RunStatus::CompletedWithErrors => "completed_with_errors",
             RunStatus::Failed => "failed",
             RunStatus::Interrupted => "interrupted",
+            RunStatus::Cancelled => "cancelled",
         }
     }
 }

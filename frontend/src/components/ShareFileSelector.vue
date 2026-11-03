@@ -38,7 +38,7 @@
             全选
           </el-checkbox>
           <span class="select-info">
-            已选 {{ totalSelectedCount }} 个文件
+            已选 {{ totalSelectedCount }} 个{{ folderOnly ? '文件夹' : '文件' }}
             <span v-if="selectedTotalSize > 0" class="size-info">
               ({{ formatFileSize(selectedTotalSize) }})
             </span>
@@ -56,6 +56,7 @@
               @click="handleItemClick(file)"
           >
             <el-checkbox
+                v-if="!folderOnly || file.is_dir"
                 :model-value="isFolderChecked(file)"
                 :indeterminate="isFolderIndeterminate(file)"
                 @change="(val: boolean) => handleCheckChange(file.fs_id, val, file)"
@@ -117,6 +118,13 @@ const props = defineProps<{
   shareUrl?: string
   /** 首次预览的密码 */
   sharePassword?: string
+  /**
+   * 仅允许选择文件夹（用于「排除目录」场景）。
+   *
+   * 文件不可勾选、点击文件不切换选中；进入子目录也不会把子文件自动选中 ——
+   * 否则排除目录会被展开成一批文件路径，语义全乱。
+   */
+  folderOnly?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -161,6 +169,7 @@ const folderChildren = ref<Map<number, number[]>>(new Map())
 // - 进入过的文件夹：看子文件是否全选
 function isFolderChecked(file: SharedFileInfo): boolean {
   if (!file.is_dir) return checkedFsIds.value.has(file.fs_id)
+  if (props.folderOnly) return checkedFsIds.value.has(file.fs_id)
   const children = folderChildren.value.get(file.fs_id)
   if (!children || children.length === 0) {
     // 没进入过，用文件夹自身的选中状态
@@ -173,6 +182,7 @@ function isFolderChecked(file: SharedFileInfo): boolean {
 // 文件夹半选状态：进入过且部分子文件选中
 function isFolderIndeterminate(file: SharedFileInfo): boolean {
   if (!file.is_dir) return false
+  if (props.folderOnly) return false
   const children = folderChildren.value.get(file.fs_id)
   if (!children || children.length === 0) return false
   const selectedCount = children.filter(id => checkedFsIds.value.has(id)).length
@@ -181,17 +191,23 @@ function isFolderIndeterminate(file: SharedFileInfo): boolean {
 
 // 当前目录的全选状态（考虑文件夹的展开状态）
 const isAllCurrentSelected = computed(() => {
-  if (currentFiles.value.length === 0) return false
-  return currentFiles.value.every(f => isFolderChecked(f))
+  const targets = props.folderOnly
+    ? currentFiles.value.filter(f => f.is_dir)
+    : currentFiles.value
+  if (targets.length === 0) return false
+  return targets.every(f => isFolderChecked(f))
 })
 
 const isCurrentIndeterminate = computed(() => {
-  if (currentFiles.value.length === 0) return false
-  const checkedCount = currentFiles.value.filter(f => isFolderChecked(f)).length
-  const indeterminateCount = currentFiles.value.filter(f => isFolderIndeterminate(f)).length
+  const targets = props.folderOnly
+    ? currentFiles.value.filter(f => f.is_dir)
+    : currentFiles.value
+  if (targets.length === 0) return false
+  const checkedCount = targets.filter(f => isFolderChecked(f)).length
+  const indeterminateCount = targets.filter(f => isFolderIndeterminate(f)).length
   // 有半选的文件夹也算 indeterminate
   if (indeterminateCount > 0) return true
-  return checkedCount > 0 && checkedCount < currentFiles.value.length
+  return checkedCount > 0 && checkedCount < targets.length
 })
 
 const totalSelectedCount = computed(() => checkedFsIds.value.size)
@@ -220,6 +236,8 @@ watch(() => props.files, (newFiles) => {
 
   for (const f of newFiles) {
     allKnownFiles.value.set(f.fs_id, f)
+    // 排除目录必须逐个确认：仅选文件夹模式不默认勾选。
+    if (props.folderOnly) continue
     checkedFsIds.value.add(f.fs_id)
   }
   emitSelection()
@@ -229,6 +247,16 @@ watch(() => props.files, (newFiles) => {
 function handleSelectAllCurrent(val: boolean | string | number) {
   const newSet = new Set(checkedFsIds.value)
   for (const file of currentFiles.value) {
+    // 仅选文件夹模式只操作文件夹自身，不展开成子文件。
+    if (props.folderOnly) {
+      if (!file.is_dir) continue
+      if (val) {
+        newSet.add(file.fs_id)
+      } else {
+        newSet.delete(file.fs_id)
+      }
+      continue
+    }
     // 对于进入过的文件夹，操作其子文件
     const children = file.is_dir ? folderChildren.value.get(file.fs_id) : null
     if (children && children.length > 0) {
@@ -256,6 +284,18 @@ function handleSelectAllCurrent(val: boolean | string | number) {
 // 单个文件选择变化
 function handleCheckChange(fsId: number, checked: boolean | string | number, file?: SharedFileInfo) {
   const newSet = new Set(checkedFsIds.value)
+
+  if (props.folderOnly) {
+    if (!file?.is_dir) return
+    if (checked) {
+      newSet.add(fsId)
+    } else {
+      newSet.delete(fsId)
+    }
+    checkedFsIds.value = newSet
+    emitSelection()
+    return
+  }
 
   // 如果是进入过的文件夹，勾选/取消勾选要联动子文件
   if (file?.is_dir) {
@@ -296,6 +336,7 @@ function handleItemClick(file: SharedFileInfo) {
   if (file.is_dir && props.shareInfo) {
     navigateIntoDir(file)
   } else {
+    if (props.folderOnly) return
     // 切换选择
     const newSet = new Set(checkedFsIds.value)
     if (newSet.has(file.fs_id)) {
@@ -368,12 +409,15 @@ async function navigateIntoDir(folder: SharedFileInfo) {
     // 如果文件夹之前是选中的 → 子文件默认全选（展开文件夹）
     // 如果文件夹之前未选中 → 子文件默认不选
     const newSet = new Set(checkedFsIds.value)
-    newSet.delete(folder.fs_id) // 移除父文件夹（用子文件替代）
     for (const f of response.files) {
       allKnownFiles.value.set(f.fs_id, f)
+      if (props.folderOnly) continue
       if (wasFolderChecked) {
         newSet.add(f.fs_id)
       }
+    }
+    if (!props.folderOnly) {
+      newSet.delete(folder.fs_id) // 移除父文件夹（用子文件替代）
     }
     checkedFsIds.value = newSet
     emitSelection()
@@ -480,6 +524,8 @@ async function loadMore() {
       const newSet = new Set(checkedFsIds.value)
       for (const f of moreFiles) {
         allKnownFiles.value.set(f.fs_id, f)
+        // 翻页不自动勾选：未经点击的目录不得成为排除项。
+        if (props.folderOnly) continue
         if (!checkedFsIds.value.has(f.fs_id)) {
           newSet.add(f.fs_id)
         }
@@ -525,12 +571,30 @@ onBeforeUnmount(() => {
 
 // 发送选中的 fs_id 列表
 // 核心逻辑：
+// - 仅选文件夹模式：只发**被显式勾选**的目录 id，不做「子项全选 → 折叠成
+//   父目录」的归并（否则勾选一个子目录会被提升成未勾选的父目录，
+//   把排除范围悄悄放大到整个父目录）
 // - 没进入过的文件夹：在 checkedFsIds 中就发文件夹 fs_id
 // - 进入过的文件夹，子文件全选 → 发文件夹 fs_id（不发子文件）
 // - 进入过的文件夹，部分选中 → 不发文件夹 fs_id，只发选中的子项（递归同理）
 // - 普通文件 → 在 checkedFsIds 中就发
 function emitSelection() {
   const result: number[] = []
+
+  if (props.folderOnly) {
+    for (const fsId of checkedFsIds.value) {
+      const file = allKnownFiles.value.get(fsId)
+      if (file && !file.is_dir) continue
+      result.push(fsId)
+    }
+    emit('update:selectedFsIds', result)
+    const selectedFiles: SharedFileInfo[] = result
+        .map(fsId => allKnownFiles.value.get(fsId))
+        .filter((f): f is SharedFileInfo => f !== undefined)
+    emit('update:selectedFiles', selectedFiles)
+    return
+  }
+
   // 收集所有"被进入过的文件夹的子文件 id"，用于后续判断是否需要折叠
   const coveredByFolder = new Set<number>()
 

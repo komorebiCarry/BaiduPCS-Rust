@@ -952,9 +952,6 @@ onUnmounted(() => {
 // 移动端样式
 // =====================
 .is-mobile {
-  // 移动端高度适配（减去顶部栏60px和底部导航栏56px）
-  height: calc(100vh - 60px - 56px);
-
   .toolbar {
     padding: 12px 16px;
 

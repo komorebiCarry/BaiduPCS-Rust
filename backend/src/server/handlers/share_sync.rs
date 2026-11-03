@@ -15,8 +15,8 @@ use crate::server::extractors::{ensure_client_available, resolve_owner_uid_for_c
 use crate::server::AppState;
 use crate::share_sync::{
     infer_share_root, normalize_pagination, normalize_share_path, CreateShareSubscriptionRequest,
-    CronSchedule, RunItemRecord, RunRecord, ShareSubscription, ShareSyncError, ShareSyncManager,
-    UpdateShareSubscriptionRequest, MIN_POLL_INTERVAL_SECS,
+    CronSchedule, RunItemFacets, RunItemFilter, RunItemRecord, RunRecord, ShareSubscription,
+    ShareSyncError, ShareSyncManager, UpdateShareSubscriptionRequest, MIN_POLL_INTERVAL_SECS,
 };
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -68,6 +68,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
         ShareSyncError::SubscriptionNotFound(m) => err_not_found(&m),
         ShareSyncError::SubscriptionExists(m) => ApiError::Conflict(m),
         ShareSyncError::AlreadyRunning(m) => ApiError::Conflict(m),
+        ShareSyncError::ScanNotCancellable(m) => ApiError::Conflict(m),
         ShareSyncError::ConfigError(m) => err_bad(&m),
         ShareSyncError::ShareLinkError(m) => err_bad(&m),
         ShareSyncError::FileSystemError(m) => err_bad(&m),
@@ -87,6 +88,7 @@ fn map_share_err(e: ShareSyncError) -> ApiError {
         ShareSyncError::TransferError(m) => err_bad(&m),
         ShareSyncError::DownloadError(m) => err_bad(&m),
         ShareSyncError::SchedulerError(m) => err_bad(&m),
+        ShareSyncError::ScanCancelled(m) => err_bad(&m),
         ShareSyncError::Internal(m) => err_internal(&m),
     }
 }
@@ -151,6 +153,7 @@ pub async fn create_subscription(
 ) -> ApiResult<Json<ApiResponse<ShareSubscription>>> {
     let owner_uid = resolve_owner_uid_for_create(&state, req.uid).await?;
     ensure_client_available(&state, owner_uid).await?;
+    ensure_target_accounts_available(&state, &req.targets, &[]).await?;
     let m = get_manager(&state).await?;
     let mut sub = req.into_subscription();
     sub.owner_uid = owner_uid.raw();
@@ -158,6 +161,36 @@ pub async fn create_subscription(
         Ok(s) => Ok(Json(ApiResponse::success(s))),
         Err(e) => Err(map_share_err(e)),
     }
+}
+
+/// 校验同步目标里显式指定的账号（跨账号保存）都已登录。
+///
+/// 只校验本次新引入的账号：沿用原配置里的账号即使暂时掉线也允许保存其他修改，
+/// 执行时该账号的目标会单独报错。「跟随默认下载账号」在执行时实时解析，不在此校验。
+async fn ensure_target_accounts_available(
+    state: &AppState,
+    targets: &[crate::share_sync::SyncTarget],
+    previous: &[crate::share_sync::SyncTarget],
+) -> Result<(), ApiError> {
+    let known: Vec<u64> = previous
+        .iter()
+        .filter_map(|t| t.explicit_account_uid())
+        .collect();
+    for uid in targets.iter().filter_map(|t| t.explicit_account_uid()) {
+        if known.contains(&uid) {
+            continue;
+        }
+        if ensure_client_available(state, crate::auth::Uid::new(uid))
+            .await
+            .is_err()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "同步目标指定的账号(uid={})未登录或不存在",
+                uid
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// PUT /api/v1/share-sync/subscriptions/:id
@@ -184,7 +217,14 @@ pub async fn update_subscription(
     if let Some(v) = req.exclude_patterns {
         new_sub.exclude_patterns = v;
     }
+    if let Some(v) = req.exclude_regex_patterns {
+        new_sub.exclude_regex_patterns = v;
+    }
+    if let Some(v) = req.exclude_paths {
+        new_sub.exclude_paths = v;
+    }
     if let Some(v) = req.targets {
+        ensure_target_accounts_available(&state, &v, &existing.targets).await?;
         new_sub.targets = v;
     }
     if let Some(v) = req.conflict_strategy {
@@ -283,16 +323,70 @@ pub async fn trigger_subscription(
     }))))
 }
 
+/// 取消扫描的请求体。
+///
+/// `run_id` 必须是用户观察到的那一轮：迟到的旧请求不得取消新一轮。缺失或不匹配
+/// 一律返回 409，且不取消任何一轮。
+#[derive(Debug, Deserialize)]
+pub struct CancelScanRequest {
+    /// 必填：要取消的那一轮扫描
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+/// POST /api/v1/share-sync/subscriptions/:id/cancel-scan
+///
+/// 取消当前扫描（不影响订阅本身）：必须带上观察到的那一轮 `run_id`，
+/// 没有扫描、轮次已变化或已进入执行阶段时返回 409。
+pub async fn cancel_scan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CancelScanRequest>,
+) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
+    tracing::info!("share-sync: POST /subscriptions/{}/cancel-scan", id);
+    let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
+    let expected_run_id = req.run_id.unwrap_or_default().trim().to_string();
+    if expected_run_id.is_empty() {
+        return Err(ApiError::Conflict(
+            "缺少 run_id：无法确认要取消哪一轮扫描".to_string(),
+        ));
+    }
+    let outcome = m
+        .cancel_scan(&id, &expected_run_id)
+        .map_err(map_share_err)?;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "subscription_id": id,
+        "run_id": outcome.run_id,
+        "cancelled": true,
+    }))))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RunsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
 }
-
 #[derive(Debug, Deserialize)]
 pub struct RunItemsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
+    /// 按状态筛选（`failed` / `completed` / `skipped` / `in_progress` …；空或 `all` = 不筛选）
+    pub status: Option<String>,
+    /// 按动作筛选（`added` / `modified` / `removed` / `skipped`；空或 `all` = 不筛选）
+    pub action: Option<String>,
+    /// 路径关键字（字面包含匹配）
+    pub q: Option<String>,
+}
+
+impl RunItemsQuery {
+    fn filter(&self) -> RunItemFilter {
+        RunItemFilter::from_query(
+            self.status.as_deref(),
+            self.action.as_deref(),
+            self.q.as_deref(),
+        )
+    }
 }
 
 const RUN_ITEM_DEFAULT_PAGE_SIZE: usize = 100;
@@ -335,13 +429,18 @@ pub async fn get_run(
         .map_err(map_share_err)?
         .ok_or_else(|| err_not_found("运行记录不存在"))?;
     let (page, page_size) = normalize_run_item_pagination(q.page, q.page_size);
+    let filter = q.filter();
     let item_total_count = m
         .persistence()
-        .count_run_items(&id)
+        .count_run_items_filtered(&id, &filter)
         .map_err(map_share_err)?;
     let items = m
         .persistence()
-        .list_run_items_page(&id, page, page_size)
+        .list_run_items_page_filtered(&id, &filter, page, page_size)
+        .map_err(map_share_err)?;
+    let item_facets = m
+        .persistence()
+        .run_item_facets(&id)
         .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(RunDetailDto {
         run: rec,
@@ -349,6 +448,7 @@ pub async fn get_run(
         item_total_count,
         item_page: page,
         item_page_size: page_size,
+        item_facets,
     })))
 }
 
@@ -357,9 +457,12 @@ pub struct RunDetailDto {
     #[serde(flatten)]
     pub run: RunRecord,
     pub items: Vec<RunItemRecord>,
+    /// 符合筛选条件的条数（未传筛选参数时 = 全部条数，与旧版一致）
     pub item_total_count: usize,
     pub item_page: usize,
     pub item_page_size: usize,
+    /// 整个 run 按状态 / 动作分组计数（不受筛选影响），新增字段
+    pub item_facets: RunItemFacets,
 }
 
 /// GET /api/v1/share-sync/runs/:id/items
@@ -377,28 +480,37 @@ pub async fn list_run_items(
         return Err(err_not_found("运行记录不存在"));
     }
     let (page, page_size) = normalize_run_item_pagination(q.page, q.page_size);
+    let filter = q.filter();
     let total = m
         .persistence()
-        .count_run_items(&id)
+        .count_run_items_filtered(&id, &filter)
         .map_err(map_share_err)?;
     let items = m
         .persistence()
-        .list_run_items_page(&id, page, page_size)
+        .list_run_items_page_filtered(&id, &filter, page, page_size)
+        .map_err(map_share_err)?;
+    let facets = m
+        .persistence()
+        .run_item_facets(&id)
         .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(RunItemsPageDto {
         items,
         total,
         page,
         page_size,
+        facets,
     })))
 }
 
 #[derive(Debug, Serialize)]
 pub struct RunItemsPageDto {
     pub items: Vec<RunItemRecord>,
+    /// 符合筛选条件的条数
     pub total: usize,
     pub page: usize,
     pub page_size: usize,
+    /// 整个 run 按状态 / 动作分组计数（不受筛选影响），新增字段
+    pub facets: RunItemFacets,
 }
 
 /// GET /api/v1/share-sync/subscriptions/:id/subtasks
@@ -727,11 +839,141 @@ where
     }
 }
 
+// =====================================================
+// 排除规则能力与试匹配
+// =====================================================
+
+/// 正则规则限制（与 `share_sync::exclusion` 的实际编译边界一致）。
+#[derive(Debug, Serialize)]
+pub struct RegexRuleLimits {
+    pub max_rules: usize,
+    pub max_rule_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_test_path_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExcludeRuleCapabilities {
+    pub supports_regex: bool,
+    pub regex_limits: RegexRuleLimits,
+}
+
+/// GET /api/v1/share-sync/exclude-rules/capabilities
+///
+/// 前端据此决定是否提供「正则表达式」选项；不支持时保持纯 glob 编辑。
+pub async fn exclude_rule_capabilities() -> ApiResult<Json<ApiResponse<ExcludeRuleCapabilities>>> {
+    use crate::share_sync::exclusion::{
+        MAX_REGEX_RULES, MAX_REGEX_RULE_BYTES, MAX_REGEX_TOTAL_BYTES, MAX_TEST_PATH_BYTES,
+    };
+    Ok(Json(ApiResponse::success(ExcludeRuleCapabilities {
+        supports_regex: true,
+        regex_limits: RegexRuleLimits {
+            max_rules: MAX_REGEX_RULES,
+            max_rule_bytes: MAX_REGEX_RULE_BYTES,
+            max_total_bytes: MAX_REGEX_TOTAL_BYTES,
+            max_test_path_bytes: MAX_TEST_PATH_BYTES,
+        },
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ValidateExcludeRulesRequest {
+    /// 通配符规则（历史字段）
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
+    /// 正则规则
+    #[serde(default)]
+    pub exclude_regex_patterns: Vec<String>,
+    /// 可选试匹配路径（相对分享根）
+    #[serde(default)]
+    pub test_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuleValidationError {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidateExcludeRulesResponse {
+    pub valid: bool,
+    pub errors: Vec<RuleValidationError>,
+    /// 仅在规则全部合法且提供了 `test_path` 时返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<bool>,
+}
+
+fn rule_validation_error(err: crate::share_sync::exclusion::RuleError) -> RuleValidationError {
+    RuleValidationError {
+        kind: err.kind.as_str(),
+        index: err.index,
+        message: err.message,
+    }
+}
+
+/// POST /api/v1/share-sync/exclude-rules/validate
+///
+/// 只校验/试匹配请求里的两份规则列表（不涉及 include 路径、精确目录排除、分享链接）。
+/// 规则非法时返回 `valid:false` 且不执行任何匹配。
+pub async fn validate_exclude_rules(
+    Json(req): Json<ValidateExcludeRulesRequest>,
+) -> ApiResult<Json<ApiResponse<ValidateExcludeRulesResponse>>> {
+    use crate::share_sync::exclusion;
+
+    if let Err(e) = exclusion::validate_rules(&req.exclude_patterns, &req.exclude_regex_patterns) {
+        return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+            valid: false,
+            errors: vec![rule_validation_error(e)],
+            excluded: None,
+        })));
+    }
+
+    let Some(raw_path) = req.test_path else {
+        return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+            valid: true,
+            errors: Vec::new(),
+            excluded: None,
+        })));
+    };
+
+    let path = match exclusion::normalize_test_path(&raw_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+                valid: false,
+                errors: vec![rule_validation_error(e)],
+                excluded: None,
+            })))
+        }
+    };
+
+    let compiled =
+        match exclusion::CompiledRules::compile(&req.exclude_patterns, &req.exclude_regex_patterns)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+                    valid: false,
+                    errors: vec![rule_validation_error(e)],
+                    excluded: None,
+                })))
+            }
+        };
+
+    Ok(Json(ApiResponse::success(ValidateExcludeRulesResponse {
+        valid: true,
+        errors: Vec::new(),
+        excluded: Some(compiled.matches_path(&path)),
+    })))
+}
+
 #[cfg(test)]
 mod cron_preview_tests {
     use super::*;
     use chrono::{FixedOffset, TimeZone};
-
     #[test]
     fn preview_valid_expression() {
         let tz = FixedOffset::east_opt(8 * 3600).unwrap();
@@ -769,4 +1011,169 @@ mod cron_preview_tests {
 #[allow(dead_code)]
 fn _suppress_unused_status() -> StatusCode {
     StatusCode::OK
+}
+
+#[cfg(test)]
+mod exclude_rule_endpoint_tests {
+    use super::*;
+
+    async fn validate(
+        patterns: &[&str],
+        regexes: &[&str],
+        path: Option<&str>,
+    ) -> ValidateExcludeRulesResponse {
+        let req = ValidateExcludeRulesRequest {
+            exclude_patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            exclude_regex_patterns: regexes.iter().map(|p| p.to_string()).collect(),
+            test_path: path.map(|p| p.to_string()),
+        };
+        let Json(resp) = validate_exclude_rules(Json(req))
+            .await
+            .expect("不应返回传输错误");
+        resp.data
+    }
+
+    #[tokio::test]
+    async fn capabilities_advertise_regex_and_limits() {
+        let Json(resp) = exclude_rule_capabilities().await.unwrap();
+        assert!(resp.data.supports_regex);
+        assert_eq!(resp.data.regex_limits.max_rules, 64);
+        assert_eq!(resp.data.regex_limits.max_rule_bytes, 1024);
+        assert_eq!(resp.data.regex_limits.max_total_bytes, 32768);
+        assert_eq!(resp.data.regex_limits.max_test_path_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn valid_rules_without_path_have_no_result() {
+        let r = validate(&["*.tmp"], &["^/股票/按月归档/2025.*$"], None).await;
+        assert!(r.valid);
+        assert!(r.errors.is_empty());
+        assert!(r.excluded.is_none());
+    }
+
+    #[tokio::test]
+    async fn glob_and_regex_both_participate() {
+        let glob = validate(&["*.tmp"], &[], Some("/a/b.tmp")).await;
+        assert_eq!(glob.excluded, Some(true));
+        let regex = validate(
+            &[],
+            &["^/股票/按月归档/2025.*$"],
+            Some("/股票/按月归档/2025-03/x.mp4"),
+        )
+        .await;
+        assert_eq!(regex.excluded, Some(true));
+        let neither = validate(&["*.tmp"], &["^/股票/.*$"], Some("/基金/2026-01/a.bin")).await;
+        assert_eq!(neither.excluded, Some(false));
+    }
+
+    #[tokio::test]
+    async fn regex_ancestor_prunes_descendants() {
+        let r = validate(
+            &[],
+            &["^/股票/按月归档/临时文件$"],
+            Some("/股票/按月归档/临时文件/深层/a.bin"),
+        )
+        .await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(true));
+    }
+
+    #[tokio::test]
+    async fn invalid_regex_reports_kind_and_index_without_matching() {
+        let r = validate(&["*.tmp"], &["^/ok$", "("], Some("/a.tmp")).await;
+        assert!(!r.valid);
+        assert!(r.excluded.is_none(), "非法规则不得执行匹配");
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].kind, "regex");
+        assert_eq!(r.errors[0].index, Some(1));
+        assert!(!r.errors[0].message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_regex_is_rejected() {
+        let r = validate(&[], &["  "], None).await;
+        assert!(!r.valid);
+        assert_eq!(r.errors[0].kind, "regex");
+        assert_eq!(r.errors[0].index, Some(0));
+    }
+
+    #[tokio::test]
+    async fn too_many_regex_rules_is_list_level_error() {
+        let many: Vec<String> = (0..65).map(|i| format!("^/{i}$")).collect();
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let r = validate(&[], &refs, None).await;
+        assert!(!r.valid);
+        assert_eq!(r.errors[0].kind, "rules");
+        assert!(r.errors[0].index.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_test_path_is_path_error() {
+        let long = format!("/{}", "a".repeat(5000));
+        let r = validate(&["*.tmp"], &[], Some(&long)).await;
+        assert!(!r.valid);
+        assert_eq!(r.errors[0].kind, "path");
+        assert!(r.errors[0].message.contains("4096"));
+    }
+
+    #[tokio::test]
+    async fn test_path_is_normalized_like_snapshot_paths() {
+        let r = validate(&[], &["^/a/b$"], Some("//a//b/")).await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(true));
+        // 空路径归一为虚拟根：只有能匹配 `/` 的规则才命中
+        let root = validate(&[], &["^/a$"], Some("  ")).await;
+        assert_eq!(root.excluded, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_matches_only_rule_lists_not_exact_dirs() {
+        // 精确目录排除不在本接口内，试匹配只反映两份规则列表
+        let r = validate(&[], &[], Some("/股票/按月归档/临时文件")).await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(false));
+    }
+
+    #[tokio::test]
+    async fn match_all_regex_is_legal() {
+        let r = validate(&[], &[".*"], Some("/任何/路径")).await;
+        assert!(r.valid);
+        assert_eq!(r.excluded, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod run_items_query_tests {
+    use super::*;
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    fn parse(qs: &str) -> RunItemsQuery {
+        let uri: Uri = format!("/api/v1/share-sync/runs/r/items?{qs}")
+            .parse()
+            .unwrap();
+        Query::<RunItemsQuery>::try_from_uri(&uri).unwrap().0
+    }
+
+    #[test]
+    fn legacy_query_without_filters_means_no_filter() {
+        let q = parse("page=2&page_size=100");
+        assert_eq!((q.page, q.page_size), (Some(2), Some(100)));
+        assert_eq!(q.filter(), RunItemFilter::default());
+    }
+
+    #[test]
+    fn filter_params_are_parsed_and_all_is_ignored() {
+        let q = parse("page=1&status=failed&action=modified&q=%E8%A7%86%E9%A2%91");
+        assert_eq!(
+            q.filter(),
+            RunItemFilter {
+                status: Some("failed".into()),
+                action: Some("modified".into()),
+                keyword: Some("视频".into()),
+            }
+        );
+        let q = parse("status=all&action=&q=");
+        assert_eq!(q.filter(), RunItemFilter::default());
+    }
 }

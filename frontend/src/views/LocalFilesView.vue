@@ -418,8 +418,6 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
 }
 
 .is-mobile {
-  height: calc(100vh - 60px - 56px);
-
   .breadcrumb-bar {
     padding: 12px 16px;
     flex-wrap: wrap;
