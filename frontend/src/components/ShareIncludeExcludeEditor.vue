@@ -43,7 +43,7 @@
             :key="p + i"
             closable
             @close="removeInclude(i)"
-        >{{ p }}</el-tag>
+        >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
       <p v-if="showIncludeHelp" class="field-help">
         不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。
@@ -96,7 +96,7 @@
             closable
             type="warning"
             @close="removeExcludePath(i)"
-        >{{ p }}</el-tag>
+        >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
       <p v-if="showExcludeFolderHelp" class="field-help">
         选择文件只排除该文件；选择目录则连同其中全部内容一起排除，均不参与同步。
@@ -276,6 +276,7 @@ import {
   parseRuleInput,
   type ExcludeRuleKind as RuleKind,
 } from '@/utils/excludeRules'
+import { formatSharePathForDisplay } from '@/utils/shareSelection'
 import {
   previewShareFiles,
   type SharedFileInfo,

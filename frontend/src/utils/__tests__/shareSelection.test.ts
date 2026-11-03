@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildShareRootAliases,
   createShareSelection,
   deselectSharePath,
+  formatSharePathForDisplay,
   isSharePathAncestor,
+  normalizeShareKey,
   normalizeSharePath,
+  rehydrateShareSelection,
+  resolveShareKey,
   selectSharePath,
   shareSelectionCovers,
   shareSelectionPaths,
@@ -138,6 +143,141 @@ describe('shareSelection 选择状态', () => {
     expect(outcome.ok).toBe(true)
     expect(shareSelectionPaths(outcome.state)).toEqual([])
     expect(shareSelectionReady(outcome.state, true)).toBe(false)
+  })
+})
+
+describe('shareSelection 根目录上下文别名', () => {
+  const aliases = buildShareRootAliases([
+    { rawPath: '/apps/bypy/A', logicalName: 'A' },
+    { rawPath: '/apps/bypy/B', logicalName: 'B' },
+  ])
+
+  it('只按实际根项做段边界前缀替换，不做后缀猜测', () => {
+    expect(aliases.conflict).toBe('')
+    expect(resolveShareKey('apps/bypy/A', aliases)).toBe('A')
+    expect(resolveShareKey('apps/bypy/A/x.txt', aliases)).toBe('A/x.txt')
+    expect(resolveShareKey('A/x.txt', aliases)).toBe('A/x.txt')
+    expect(resolveShareKey('x/apps/bypy/A', aliases)).toBe('x/apps/bypy/A')
+    expect(resolveShareKey('apps/bypy/AB/x', aliases)).toBe('apps/bypy/AB/x')
+  })
+
+  it('物理旧路径可按别名还原，且 no-op 仍回显原始数组', () => {
+    const state = createShareSelection(['/apps/bypy/A/x.txt '], false, aliases)
+    expect([...state.selected]).toEqual(['A/x.txt '])
+    expect(shareSelectionPaths(state)).toEqual(['/apps/bypy/A/x.txt '])
+  })
+
+  it('别名晚到时迁移已改动选择，保留原始 raw 与未加载项', () => {
+    const early = createShareSelection(['/apps/bypy/A/x.txt'], false)
+    const changed = selectSharePath(early, { key: 'A/y.txt', raw: '/sharelink1-2/A/y.txt', isDir: false })
+    const late = buildShareRootAliases([{ rawPath: '/apps/bypy/A', logicalName: 'A' }])
+    const hydrated = rehydrateShareSelection(changed, late)
+    expect(shareSelectionPaths(hydrated)).toEqual(['/apps/bypy/A/x.txt', '/sharelink1-2/A/y.txt'])
+    expect(shareSelectionTriState(hydrated, 'A', true)).toBe('indeterminate')
+  })
+
+  it('逻辑 key 保留字面 sharelink 文件名，只有原始路径才剥离一次命名空间', () => {
+    const literalAliases = buildShareRootAliases([
+      { rawPath: '/apps/bypy/sharelink1-2', logicalName: 'sharelink1-2' },
+    ])
+    expect(literalAliases.conflict).toBe('')
+    expect(literalAliases.byRaw.get('apps/bypy/sharelink1-2')).toBe('sharelink1-2')
+    const state = createShareSelection(['/sharelink9-8/sharelink1-2/x.txt'], false, literalAliases)
+    expect([...state.selected]).toEqual(['sharelink1-2/x.txt'])
+    expect(shareSelectionPaths(state)).toEqual(['/sharelink9-8/sharelink1-2/x.txt'])
+
+    expect(normalizeSharePath('/sharelink9-8/sharelink1-2/x.txt')).toBe('sharelink1-2/x.txt')
+    expect(normalizeShareKey('sharelink1-2/x.txt')).toBe('sharelink1-2/x.txt')
+    expect(normalizeShareKey('/A/sharelink3-4/x.txt')).toBe('A/sharelink3-4/x.txt')
+    expect(formatSharePathForDisplay('/sharelink9-8/sharelink1-2/x.txt')).toBe('/sharelink1-2/x.txt')
+  })
+
+  it('raw 与 logical 的交叉重叠按段边界整体失败', () => {
+    const rawUnderOtherLogical = buildShareRootAliases([
+      { rawPath: '/apps/bypy/A', logicalName: 'A' },
+      { rawPath: '/other/apps', logicalName: 'apps' },
+    ])
+    expect(rawUnderOtherLogical.conflict).not.toBe('')
+
+    const rawAncestorOfOtherLogical = buildShareRootAliases([
+      { rawPath: '/apps', logicalName: 'X' },
+      { rawPath: '/other/y', logicalName: 'apps/bypy' },
+    ])
+    expect(rawAncestorOfOtherLogical.conflict).not.toBe('')
+
+    const rawEqualsOtherLogical = buildShareRootAliases([
+      { rawPath: '/A', logicalName: 'B' },
+      { rawPath: '/apps/bypy/A', logicalName: 'A' },
+    ])
+    expect(rawEqualsOtherLogical.conflict).not.toBe('')
+
+    const sameRootDescendant = buildShareRootAliases([
+      { rawPath: '/A/A', logicalName: 'A' },
+    ])
+    expect(sameRootDescendant.conflict).not.toBe('')
+
+    const sameRootAncestor = buildShareRootAliases([
+      { rawPath: '/A', logicalName: 'A/B' },
+    ])
+    expect(sameRootAncestor.conflict).not.toBe('')
+
+    expect(buildShareRootAliases([{ rawPath: '/A', logicalName: 'A' }]).conflict).toBe('')
+    expect(buildShareRootAliases([
+      { rawPath: '/A', logicalName: 'A' },
+      { rawPath: '/B', logicalName: 'B' },
+    ]).conflict).toBe('')
+    expect(buildShareRootAliases([
+      { rawPath: '/apps/bypy/A', logicalName: 'A' },
+    ]).conflict).toBe('')
+    expect(buildShareRootAliases([
+      { rawPath: '/other/apps', logicalName: 'apps' },
+      { rawPath: '/other/apps2', logicalName: 'apps2' },
+    ]).conflict).toBe('')
+  })
+
+  it('明确的别名冲突整体失败，不合并不同内容', () => {
+    const duplicateLogical = buildShareRootAliases([
+      { rawPath: '/apps/bypy/A', logicalName: '同名' },
+      { rawPath: '/other/同名', logicalName: '同名' },
+    ])
+    expect(duplicateLogical.conflict).not.toBe('')
+    expect(duplicateLogical.byRaw.size).toBe(0)
+
+    const overlapping = buildShareRootAliases([
+      { rawPath: '/apps/bypy/A', logicalName: 'A' },
+      { rawPath: '/apps/bypy/A/B', logicalName: 'B' },
+    ])
+    expect(overlapping.conflict).not.toBe('')
+
+    const rawLogicalCollision = buildShareRootAliases([
+      { rawPath: 'A', logicalName: 'B' },
+      { rawPath: 'apps/bypy/A', logicalName: 'A' },
+    ])
+    expect(rawLogicalCollision.conflict).not.toBe('')
+
+    const sameRawDifferentLogical = buildShareRootAliases([
+      { rawPath: '/root/f0', logicalName: 'f0' },
+      { rawPath: '/root/f0', logicalName: 'other' },
+    ])
+    expect(sameRawDifferentLogical.conflict).not.toBe('')
+    expect(sameRawDifferentLogical.byRaw.size).toBe(0)
+
+    const exactDuplicate = buildShareRootAliases([
+      { rawPath: '/root/f0', logicalName: 'f0' },
+      { rawPath: '/root/f0', logicalName: 'f0' },
+    ])
+    expect(exactDuplicate.conflict).toBe('')
+    expect(exactDuplicate.byRaw.get('root/f0')).toBe('f0')
+  })
+
+  it('展示只去掉最前面合法的合成命名空间，保留其他路径与空白', () => {
+    expect(formatSharePathForDisplay('/sharelink1-2/A/x.txt')).toBe('/A/x.txt')
+    expect(formatSharePathForDisplay('sharelink1-2/A/x.txt')).toBe('A/x.txt')
+    expect(formatSharePathForDisplay('/sharelink1-2/A/ 报告 .txt')).toBe('/A/ 报告 .txt')
+    expect(formatSharePathForDisplay('/apps/bypy/A/x.txt')).toBe('/apps/bypy/A/x.txt')
+    expect(formatSharePathForDisplay('/sharelinkAB-2/A/x.txt')).toBe('/sharelinkAB-2/A/x.txt')
+    expect(formatSharePathForDisplay('/foo/sharelink1-2/A/x.txt')).toBe('/foo/sharelink1-2/A/x.txt')
+    expect(formatSharePathForDisplay('/sharelink1-2')).toBe('/sharelink1-2')
   })
 })
 

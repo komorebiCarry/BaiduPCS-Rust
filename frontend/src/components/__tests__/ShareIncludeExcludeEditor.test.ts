@@ -470,6 +470,26 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
     wrapper.unmount()
   })
 
+  it('展示时去掉合法合成命名空间，移除仍按原始路径发出', async () => {
+    const wrapper = mountEditor({
+      includePaths: ['/sharelink1-2/A/报告 .txt', '/apps/bypy/B'],
+      excludePaths: ['/sharelink1-2/C/广告. '],
+    })
+    await flushPromises()
+
+    const includeTags = Array.from(fieldBlock('同步内容').querySelectorAll('.path-tags .el-tag'))
+    expect(includeTags.map((tag) => tag.textContent?.trim())).toEqual(['/A/报告 .txt', '/apps/bypy/B'])
+    const excludeTag = fieldBlock('排除内容').querySelector('.path-tags .el-tag')
+    expect(excludeTag?.textContent).toBe('/C/广告. ')
+
+    fieldBlock('排除内容')
+        .querySelector<HTMLElement>('.path-tags .el-tag .el-tag__close')!
+        .click()
+    await flushPromises()
+    expect(wrapper.emitted('update:excludePaths')![0][0]).toEqual([])
+    wrapper.unmount()
+  })
+
   it('三处使用说明默认全部折叠（aria-expanded=false 且无说明文案）', async () => {
     const wrapper = mountEditor()
     await flushPromises()

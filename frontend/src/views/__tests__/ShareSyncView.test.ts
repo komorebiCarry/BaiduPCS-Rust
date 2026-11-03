@@ -595,6 +595,26 @@ describe('ShareSyncView 排除内容文案', () => {
     expect(labels, '详情不再使用「排除目录」措辞').not.toContain('排除目录')
     wrapper.unmount()
   })
+
+  it('详情标签只省略合成命名空间，其他路径原样显示', async () => {
+    api.listSubscriptions.mockResolvedValue([{
+      ...SUB,
+      include_paths: ['/sharelink1-2/A/报告 .txt', '/apps/bypy/B'],
+      exclude_paths: ['/sharelink1-2/C/广告. '],
+    }])
+    const wrapper = mountView()
+    await flushPromises()
+
+    document.body.querySelector<HTMLElement>('.config-card')!.click()
+    await flushPromises()
+
+    const tags = Array.from(document.body.querySelectorAll<HTMLElement>('.path-tags .el-tag'))
+        .map((tag) => tag.textContent?.trim())
+    expect(tags).toContain('/A/报告 .txt')
+    expect(tags).toContain('/apps/bypy/B')
+    expect(tags).toContain('/C/广告.')
+    wrapper.unmount()
+  })
 })
 
 describe('ShareSyncView 正则排除规则', () => {

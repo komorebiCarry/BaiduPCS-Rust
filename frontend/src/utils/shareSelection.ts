@@ -47,26 +47,154 @@ export interface ShareDeselectOutcome {
   error?: string
 }
 
+/** 根目录别名无法唯一对应时的提示 */
+export const SHARE_ALIAS_CONFLICT_MESSAGE = '分享目录路径存在冲突，无法安全匹配已选内容，请重新打开选择器'
+
+/** 根目录列表中的一项：原始路径 + 逻辑文件名 */
+export interface ShareRootAliasItem {
+  rawPath: string
+  logicalName: string
+}
+
+/** 根目录上下文别名：原始根 key → 逻辑根 key */
+export interface ShareRootAliases {
+  byRaw: Map<string, string>
+  conflict: string
+}
+
 /** 合成的 sharelink 命名空间段（与后端一致，忽略它但不做大小写折叠） */
 const NAMESPACE_SEGMENT = /^sharelink\d+-\d+$/
 
+/** 拆分路径段：只处理分隔符与分隔符前空白，文件名空白原样保留 */
+function sharePathSegments(raw: string): string[] {
+  if (!raw) return []
+  // 根分隔符之前的空白只属于分隔符，不属于任何文件名；分隔符之后的空白属于
+  // 文件名本身，必须保留。
+  const lead = /^\s*/.exec(raw)?.[0] ?? ''
+  const rest = lead.length > 0 && raw.charAt(lead.length) === '/' ? raw.slice(lead.length) : raw
+  return rest.split('/').filter(segment => segment.length > 0)
+}
+
 /**
- * 规范化分享路径：合并重复斜杠、去掉首尾斜杠，并丢弃合成的 sharelink 命名空间段。
+ * 规范化分享路径（原始 API / 已保存的完整路径）：合并重复斜杠、去掉首尾斜杠，
+ * 并丢弃最前面合成的 sharelink 命名空间段。
  *
  * 只规整分隔符与合成命名空间：**文件名里的空白一律原样保留**（含结尾空格），
  * 否则「报告. 」这类文件名会与「报告.」归一成同一个 key，导致还原与选择串档。
  */
 export function normalizeSharePath(raw: string): string {
-  if (!raw) return ''
-  // 根分隔符之前的空白只属于分隔符，不属于任何文件名；分隔符之后的空白属于
-  // 文件名本身，必须保留。
-  const lead = /^\s*/.exec(raw)?.[0] ?? ''
-  const rest = lead.length > 0 && raw.charAt(lead.length) === '/' ? raw.slice(lead.length) : raw
-  const segments = rest.split('/').filter(segment => segment.length > 0)
+  const segments = sharePathSegments(raw)
   if (segments.length > 0 && NAMESPACE_SEGMENT.test(segments[0])) {
     segments.shift()
   }
   return segments.join('/')
+}
+
+/**
+ * 规范化逻辑 key（已去掉虚拟命名空间后的内容路径或 server_filename）：只处理
+ * 分隔符，不剥离任何命名空间。整个文件名恰好形如 sharelink1-2 时必须保持字面值。
+ */
+export function normalizeShareKey(raw: string): string {
+  return sharePathSegments(raw).join('/')
+}
+
+/**
+ * 根据根目录实际列表建立「原始根路径 → 逻辑根名」别名。
+ *
+ * 只接受真实列举到的根项：不按后缀猜测，也不全局剥离 /apps/bypy。任何无法唯一
+ * 对应的组合都整体失败（返回空表 + 冲突提示），避免把不同内容错并成一个 key。
+ */
+export function buildShareRootAliases(items: ShareRootAliasItem[]): ShareRootAliases {
+  const byRaw = new Map<string, string>()
+  const logicalOwners = new Map<string, string>()
+  let conflict = ''
+
+  for (const item of items) {
+    const rawKey = normalizeSharePath(item.rawPath)
+    const logicalKey = normalizeShareKey(item.logicalName)
+    if (!rawKey || !logicalKey) continue
+    const existing = byRaw.get(rawKey)
+    if (existing !== undefined) {
+      if (existing !== logicalKey) conflict = SHARE_ALIAS_CONFLICT_MESSAGE
+      continue
+    }
+    const owner = logicalOwners.get(logicalKey)
+    if (owner !== undefined && owner !== rawKey) {
+      conflict = SHARE_ALIAS_CONFLICT_MESSAGE
+      continue
+    }
+    byRaw.set(rawKey, logicalKey)
+    logicalOwners.set(logicalKey, rawKey)
+  }
+
+  if (conflict) return { byRaw: new Map(), conflict }
+
+  const raws = [...byRaw.keys()]
+  for (let i = 0; i < raws.length; i++) {
+    for (let j = i + 1; j < raws.length; j++) {
+      if (isSharePathAncestor(raws[i], raws[j]) || isSharePathAncestor(raws[j], raws[i])) {
+        conflict = SHARE_ALIAS_CONFLICT_MESSAGE
+        break
+      }
+    }
+    if (conflict) break
+  }
+
+  if (!conflict) {
+    // raw 与 logical 也必须在段边界上互不包含：否则某个 logical 后代可能恰好以
+    // 另一条 raw 为前缀，映射会把保存的逻辑路径改写到不同内容。自身 raw==logical
+    // 的恒等项允许，但仅在不与任何其他根重叠时成立；非恒等的自身包含也失败。
+    const mappings = [...byRaw].map(([raw, logical]) => ({ raw, logical }))
+    const logicals = [...logicalOwners.keys()]
+    for (const mapping of mappings) {
+      for (const logical of logicals) {
+        const identitySelf = mapping.raw === mapping.logical && logical === mapping.logical
+        if (identitySelf) continue
+        if (mapping.raw === logical) {
+          conflict = SHARE_ALIAS_CONFLICT_MESSAGE
+          break
+        }
+        if (
+          isSharePathAncestor(mapping.raw, logical)
+          || isSharePathAncestor(logical, mapping.raw)
+        ) {
+          conflict = SHARE_ALIAS_CONFLICT_MESSAGE
+          break
+        }
+      }
+      if (conflict) break
+    }
+  }
+
+  if (conflict) return { byRaw: new Map(), conflict }
+  return { byRaw, conflict: '' }
+}
+
+/** 用根目录别名解析任意 key：精确匹配或按路径段替换前缀，其余保持不变 */
+export function resolveShareKey(key: string, aliases: ShareRootAliases): string {
+  if (!key || aliases.byRaw.size === 0) return key
+  const direct = aliases.byRaw.get(key)
+  if (direct !== undefined) return direct
+  let matchedRaw = ''
+  for (const raw of aliases.byRaw.keys()) {
+    if (key.startsWith(`${raw}/`) && raw.length > matchedRaw.length) matchedRaw = raw
+  }
+  if (!matchedRaw) return key
+  const logical = aliases.byRaw.get(matchedRaw)
+  return logical ? `${logical}/${key.slice(matchedRaw.length + 1)}` : key
+}
+
+/**
+ * 展示用路径：仅去掉路径最前面合法的合成 sharelink<digit>-<digit> 命名空间段。
+ * 不改模型值、请求值或规则输入，也不动文件名空白与其他相似写法。
+ */
+export function formatSharePathForDisplay(path: string): string {
+  if (!path) return path
+  const match = /^(\/?)(sharelink\d+-\d+)\//.exec(path)
+  if (!match) return path
+  const rest = path.slice(match[0].length)
+  if (!rest) return path
+  return `${match[1]}${rest}`
 }
 
 /** ancestor 是否为 descendant 的祖先（按路径段边界判定） */
@@ -80,12 +208,13 @@ export function isSharePathAncestor(ancestorKey: string, descendantKey: string):
 export function createShareSelection(
   initialPaths: string[] = [],
   emptySelectionMeansAll = false,
+  aliases?: ShareRootAliases,
 ): ShareSelectionState {
   const initialRaw = [...initialPaths]
   const selected = new Set<string>()
   const rawPaths = new Map<string, string>()
   for (const path of initialRaw) {
-    const key = normalizeSharePath(path)
+    const key = resolveShareKey(normalizeSharePath(path), aliases ?? { byRaw: new Map(), conflict: '' })
     if (!key) continue
     selected.add(key)
     if (!rawPaths.has(key)) rawPaths.set(key, path)
@@ -165,13 +294,57 @@ export function shareSelectionTriState(
 }
 
 /** 当前选择是否与打开时完全一致 */
-function isUnchanged(state: ShareSelectionState): boolean {
+export function isShareSelectionUnchanged(state: ShareSelectionState): boolean {
   if (state.wholeShare !== state.initialWholeShare) return false
   if (state.selected.size !== state.initialKeys.size) return false
   for (const key of state.selected) {
     if (!state.initialKeys.has(key)) return false
   }
   return true
+}
+
+/** 当前选择是否与打开时完全一致 */
+function isUnchanged(state: ShareSelectionState): boolean {
+  return isShareSelectionUnchanged(state)
+}
+
+/**
+ * 根目录别名变化后用新别名重新解释同一份选择。
+ *
+ * 未改动时按初始原始数组重建，保证 no-op 仍逐字节回显初始写法；用户已改动时只
+ * 迁移 key，保留原始 raw 与顺序，未加载出的选择不受影响。
+ */
+export function rehydrateShareSelection(
+  state: ShareSelectionState,
+  aliases: ShareRootAliases,
+): ShareSelectionState {
+  if (isUnchanged(state)) {
+    return createShareSelection(state.initialRaw, state.initialWholeShare, aliases)
+  }
+
+  const selected = new Set<string>()
+  const rawPaths = new Map<string, string>()
+  for (const key of state.selected) {
+    const nextKey = resolveShareKey(key, aliases)
+    if (!nextKey) continue
+    selected.add(nextKey)
+    if (!rawPaths.has(nextKey)) rawPaths.set(nextKey, state.rawPaths.get(key) ?? key)
+  }
+
+  const initialKeys = new Set<string>()
+  for (const raw of state.initialRaw) {
+    const key = resolveShareKey(normalizeSharePath(raw), aliases)
+    if (key) initialKeys.add(key)
+  }
+
+  return {
+    selected,
+    rawPaths,
+    wholeShare: state.wholeShare,
+    initialRaw: state.initialRaw,
+    initialKeys,
+    initialWholeShare: state.initialWholeShare,
+  }
 }
 
 /**
@@ -235,7 +408,7 @@ export async function deselectSharePath(
   targetKey: string,
   loadChildren: ShareChildrenLoader,
 ): Promise<ShareDeselectOutcome> {
-  const target = normalizeSharePath(targetKey)
+  const target = normalizeShareKey(targetKey)
   if (!target) {
     return { ok: false, state, error: '无效路径' }
   }

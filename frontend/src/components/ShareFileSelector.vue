@@ -51,9 +51,9 @@
             </template>
           </span>
         </div>
-        <div v-if="pathMode && (selectionBusy || selectionError)" class="selection-status">
+        <div v-if="pathMode && (selectionBusy || selectionProblem)" class="selection-status">
           <span v-if="selectionBusy">正在展开目录…</span>
-          <span v-else class="selection-error">{{ selectionError }}</span>
+          <span v-else class="selection-error">{{ selectionProblem }}</span>
         </div>
       </div>
 
@@ -118,15 +118,21 @@ import { useIsMobile } from '@/utils/responsive'
 import { formatFileSize } from '@/api/utils'
 import { previewShareDir, previewShareFiles, type SharedFileInfo, type PreviewShareInfo } from '@/api/transfer'
 import {
+  buildShareRootAliases,
   cloneShareSelection,
   createShareSelection,
   deselectSharePath,
+  normalizeShareKey,
   normalizeSharePath,
+  rehydrateShareSelection,
+  resolveShareKey,
   selectSharePath,
+  SHARE_ALIAS_CONFLICT_MESSAGE,
   shareSelectionCovers,
   shareSelectionPaths,
   shareSelectionReady,
   shareSelectionTriState,
+  type ShareRootAliases,
   type ShareSelectionEntry,
   type ShareSelectionState,
   type ShareTriState,
@@ -232,9 +238,16 @@ const folderChildren = ref<Map<number, number[]>>(new Map())
 const pathMode = computed(() => props.pathSelection === true)
 const emptyMeansAll = computed(() => props.emptySelectionMeansAll === true)
 
+/** 根目录上下文别名：物理根路径与虚拟命名空间后代归一到同一逻辑 key */
+const rootAliases = ref<ShareRootAliases>(buildShareRootAliases([]))
 const selectionState = ref<ShareSelectionState>(createShareSelection([], false))
 const selectionBusy = ref(false)
 const selectionError = ref('')
+/** 事务内发现的根目录别名冲突：不落盘所选内容，但必须阻止确认 */
+const contextConflict = ref('')
+
+const aliasConflict = computed(() => rootAliases.value.conflict)
+const selectionProblem = computed(() => aliasConflict.value || contextConflict.value || selectionError.value)
 
 /**
  * ElementPlus 复选框会先更新内部勾选视觉再调用 change 回调；事务回滚时模型没有变化，
@@ -302,6 +315,7 @@ let navigationGeneration = 0
  */
 function cancelSelectionTransaction(restoreFocus = true) {
   selectionGeneration++
+  contextConflict.value = ''
   if (!selectionBusy.value && !selectionError.value) return
   selectionBusy.value = false
   selectionError.value = ''
@@ -310,7 +324,9 @@ function cancelSelectionTransaction(restoreFocus = true) {
 
 /** 路径模式的只读就绪状态：事务 / 导航 / 首次加载未结束前一律不就绪 */
 function selectionReadiness(): boolean {
-  return !selectionBusy.value
+  return !aliasConflict.value
+      && !contextConflict.value
+      && !selectionBusy.value
       && !navigating.value
       && !props.loading
       && shareSelectionReady(selectionState.value, emptyMeansAll.value)
@@ -324,6 +340,47 @@ function emitSelectionReady() {
 
 const initialPathsSignature = computed(() => (props.initialSelectedPaths ?? []).join('\u0001'))
 
+function currentRootFiles(): SharedFileInfo[] {
+  return [...props.files, ...rootExtraFiles.value]
+}
+
+/** 别名更新后同步已缓存条目与请求索引，避免同一内容留下两种 key */
+function remapAliasedCaches(aliases: ShareRootAliases) {
+  if (aliases.byRaw.size === 0) return
+  const nextCache = new Map<string, { entries: ShareSelectionEntry[]; complete: boolean }>()
+  for (const [dirKey, cached] of childrenCache.value) {
+    const nextDirKey = resolveShareKey(dirKey, aliases)
+    const entries = cached.entries.map((entry) => {
+      const key = resolveShareKey(entry.key, aliases)
+      return key === entry.key ? entry : { ...entry, key }
+    })
+    const existing = nextCache.get(nextDirKey)
+    nextCache.set(nextDirKey, {
+      entries: existing ? [...existing.entries, ...entries] : entries,
+      complete: existing ? existing.complete && cached.complete : cached.complete,
+    })
+  }
+  childrenCache.value = nextCache
+
+  const nextIndex = new Map<string, string>()
+  for (const [key, raw] of pathIndex) {
+    nextIndex.set(resolveShareKey(key, aliases), raw)
+  }
+  pathIndex.clear()
+  for (const [key, raw] of nextIndex) pathIndex.set(key, raw)
+}
+
+/** 从当前根列表重建别名；晚到的根分页只补映射，不重置用户已改动选择 */
+function refreshRootAliases(files: SharedFileInfo[] = currentRootFiles()) {
+  const aliases = buildShareRootAliases(
+    files.map(file => ({ rawPath: file.path, logicalName: file.name })),
+  )
+  rootAliases.value = aliases
+  if (!pathMode.value) return
+  remapAliasedCaches(aliases)
+  selectionState.value = rehydrateShareSelection(selectionState.value, aliases)
+}
+
 watch(
   [initialPathsSignature, emptyMeansAll, pathMode],
   () => {
@@ -331,7 +388,11 @@ watch(
     cancelSelectionTransaction()
     childrenCache.value = new Map()
     pathIndex.clear()
-    selectionState.value = createShareSelection(props.initialSelectedPaths ?? [], emptyMeansAll.value)
+    selectionState.value = createShareSelection(
+      props.initialSelectedPaths ?? [],
+      emptyMeansAll.value,
+      rootAliases.value,
+    )
     selectionError.value = ''
     selectionBusy.value = false
     emitSelection()
@@ -348,9 +409,9 @@ function currentDirKey(): string {
   return pathStack.value[pathStack.value.length - 1].key
 }
 
-/** 条目自身的规范化 key */
+/** 条目自身的规范化 key（根目录先按实际列表别名归一，再参与所有选择计算） */
 function pathKeyOf(file: SharedFileInfo): string {
-  return normalizeSharePath(file.path)
+  return resolveShareKey(normalizeSharePath(file.path), rootAliases.value)
 }
 
 /** 记录某个目录的直接子项，供三态推导复用 */
@@ -413,6 +474,10 @@ function dirRequestPath(dirKey: string): string {
     return raw ?? `/${dirKey}`
   }
   const prefix = shareInfo ? `/sharelink${shareInfo.uk}-${shareInfo.shareid}` : ''
+  if (pathMode.value) {
+    // 路径模式一律用逻辑 key 组合虚拟命名空间，不能把根目录的物理路径塞进 sharelink
+    return `${prefix}/${dirKey}`
+  }
   if (raw) {
     if (raw.startsWith('/sharelink')) return raw
     return `${prefix}/${raw.replace(/^\/+/, '')}`
@@ -447,31 +512,64 @@ async function fetchChildrenPage(dirKey: string, page: number): Promise<SharedFi
   return response.files || []
 }
 
-/** 拉取某目录的全部直接子项（分页到底，重复响应立即中止） */
+interface FetchedChildren {
+  entries: ShareSelectionEntry[]
+  /** 根目录事务内一并验证出的别名；仅在代次仍有效时才会落盘 */
+  aliases?: ShareRootAliases
+  cancelled?: boolean
+}
+
+/**
+ * 拉取某目录的全部直接子项（分页到底，重复响应立即中止）。
+ *
+ * 根目录必须先把**所有页**的原始项收集齐，再按与展示列表相同的别名规则统一
+ * 验证并生成 canonical key；任何一页出现别名冲突都整体失败，不能边翻页边合并。
+ */
 async function fetchAllChildren(
   dirKey: string,
   generation?: number,
-): Promise<ShareSelectionEntry[]> {
-  const entries: ShareSelectionEntry[] = []
-  const seen = new Set<string>()
+): Promise<FetchedChildren> {
+  const rawFiles: SharedFileInfo[] = []
+  const seenEvidence = new Set<string>()
+  const isCurrent = () => generation === undefined || generation === selectionGeneration
   for (let page = 1; ; page++) {
     // 事务已取消时不再发起下一页请求，而不是等整个目录拉完再丢弃
-    if (generation !== undefined && generation !== selectionGeneration) return entries
+    if (!isCurrent()) return { entries: [], cancelled: true }
     const files = await fetchChildrenPage(dirKey, page)
-    if (generation !== undefined && generation !== selectionGeneration) return entries
+    if (!isCurrent()) return { entries: [], cancelled: true }
     if (!files || files.length === 0) break
     let fresh = 0
     for (const file of files) {
-      const key = pathKeyOf(file)
-      if (!key || seen.has(key)) continue
-      seen.add(key)
+      const rawKey = normalizeSharePath(file.path)
+      if (!rawKey) continue
+      // 根目录必须保留同名原始路径的全部名称证据：只有 raw+name 完全相同的普通
+      // 重复分页才可去重；同一 raw 对应不同 server_filename 要留给别名校验报冲突。
+      const logicalKey = normalizeShareKey(file.name)
+      const evidenceKey = dirKey === '' ? `${rawKey}\u0000${logicalKey}` : rawKey
+      if (seenEvidence.has(evidenceKey)) continue
+      seenEvidence.add(evidenceKey)
       fresh++
-      entries.push({ key, raw: file.path, isDir: file.is_dir })
+      rawFiles.push(file)
     }
     if (fresh === 0) throw new Error('目录分页返回重复内容，已中止')
     if (files.length < PAGE_SIZE) break
   }
-  return entries
+  if (!isCurrent()) return { entries: [], cancelled: true }
+
+  const aliases = dirKey === ''
+    ? buildShareRootAliases(rawFiles.map(file => ({ rawPath: file.path, logicalName: file.name })))
+    : rootAliases.value
+  if (dirKey === '' && aliases.conflict) throw new Error(aliases.conflict)
+
+  const entries: ShareSelectionEntry[] = []
+  const seenKeys = new Set<string>()
+  for (const file of rawFiles) {
+    const key = resolveShareKey(normalizeSharePath(file.path), aliases)
+    if (!key || seenKeys.has(key)) continue
+    seenKeys.add(key)
+    entries.push({ key, raw: file.path, isDir: file.is_dir })
+  }
+  return { entries, aliases: dirKey === '' ? aliases : undefined }
 }
 
 /** 取得某目录的全部直接子项（已知完整则复用缓存） */
@@ -481,16 +579,23 @@ async function loadCompleteChildren(
 ): Promise<ShareSelectionEntry[]> {
   const cached = childrenCache.value.get(dirKey)
   if (cached?.complete) return cached.entries
-  const entries = await fetchAllChildren(dirKey, generation)
+  const fetched = await fetchAllChildren(dirKey, generation)
   // 导航或新事务已作废旧代次：结果直接丢弃，不写缓存也不改路径索引
-  if (generation !== undefined && generation !== selectionGeneration) return entries
-  for (const entry of entries) {
+  if (fetched.cancelled) return fetched.entries
+  if (generation !== undefined && generation !== selectionGeneration) return fetched.entries
+  if (fetched.aliases) {
+    // 所有根页已统一验证通过，才允许提交别名并迁移当前编辑中的选择
+    rootAliases.value = fetched.aliases
+    remapAliasedCaches(fetched.aliases)
+    selectionState.value = rehydrateShareSelection(selectionState.value, fetched.aliases)
+  }
+  for (const entry of fetched.entries) {
     pathIndex.set(entry.key, entry.raw)
   }
   const next = new Map(childrenCache.value)
-  next.set(dirKey, { entries, complete: true })
+  next.set(dirKey, { entries: fetched.entries, complete: true })
   childrenCache.value = next
-  return entries
+  return fetched.entries
 }
 
 /** 路径模式下应用一次选择变更并向外同步 */
@@ -519,6 +624,7 @@ async function deselectPath(key: string) {
   const generation = ++selectionGeneration
   selectionBusy.value = true
   selectionError.value = ''
+  contextConflict.value = ''
   emitSelectionReady()
   try {
     const outcome = await deselectSharePath(
@@ -528,14 +634,20 @@ async function deselectPath(key: string) {
     )
     if (generation !== selectionGeneration) return
     if (!outcome.ok) {
-      selectionError.value = outcome.error || '取消选择失败，请稍后重试'
+      const message = outcome.error || '取消选择失败，请稍后重试'
+      if (message === SHARE_ALIAS_CONFLICT_MESSAGE) contextConflict.value = message
+      else selectionError.value = message
       resyncSelectionVisuals(focusTarget)
       return
     }
-    selectionState.value = outcome.state
-  } catch {
+    selectionState.value = rehydrateShareSelection(outcome.state, rootAliases.value)
+  } catch (error) {
     if (generation !== selectionGeneration) return
-    selectionError.value = '取消选择失败，请稍后重试'
+    const message = error instanceof Error && error.message
+      ? error.message
+      : '取消选择失败，请稍后重试'
+    if (message === SHARE_ALIAS_CONFLICT_MESSAGE) contextConflict.value = message
+    else selectionError.value = message
     resyncSelectionVisuals(focusTarget)
   } finally {
     // 先释放 busy 再统一外发，就绪状态才不会在事务未结束时被点亮；
@@ -568,6 +680,7 @@ async function handleSelectAllCurrentPath() {
   const generation = ++selectionGeneration
   selectionBusy.value = true
   selectionError.value = ''
+  contextConflict.value = ''
   emitSelectionReady()
   try {
     const children = await loadCompleteChildren(dirKey, generation)
@@ -577,9 +690,13 @@ async function handleSelectAllCurrentPath() {
       next = selectSharePath(next, child)
     }
     selectionState.value = next
-  } catch {
+  } catch (error) {
     if (generation !== selectionGeneration) return
-    selectionError.value = '加载目录失败，请稍后重试'
+    const message = error instanceof Error && error.message
+      ? error.message
+      : '加载目录失败，请稍后重试'
+    if (message === SHARE_ALIAS_CONFLICT_MESSAGE) contextConflict.value = message
+    else selectionError.value = '加载目录失败，请稍后重试'
     resyncSelectionVisuals(focusTarget)
   } finally {
     if (generation === selectionGeneration) {
@@ -696,6 +813,7 @@ watch(() => props.files, (newFiles) => {
     navigating.value = false
     childrenCache.value = new Map()
     pathIndex.clear()
+    refreshRootAliases(newFiles)
     recordListingPage('', newFiles, newFiles.length)
     emitSelectionReady()
     return
@@ -839,6 +957,13 @@ function buildShareDir(folder: SharedFileInfo): string {
   if (props.shareInfo?.kind === 'apaas') {
     return folder.path
   }
+  if (pathMode.value) {
+    // 路径模式用逻辑 key 组合：根目录物理路径不能直接拼进 sharelink 命名空间
+    if (props.shareInfo) {
+      return `/sharelink${props.shareInfo.uk}-${props.shareInfo.shareid}/${pathKeyOf(folder)}`
+    }
+    return folder.path
+  }
   // 如果 path 已经是 sharelink 格式，直接用
   if (folder.path.startsWith('/sharelink')) {
     return folder.path
@@ -881,7 +1006,8 @@ async function navigateIntoDir(folder: SharedFileInfo) {
     if (nav !== navigationGeneration) return
 
     // 记录路径，重置分页
-    pathStack.value.push({ name: folder.name, dir, key: normalizeSharePath(folder.path) })
+    const dirKey = pathKeyOf(folder)
+    pathStack.value.push({ name: folder.name, dir, key: dirKey })
     dirFiles.value = response.files
     currentPage.value = 1
     hasMore.value = response.files.length >= PAGE_SIZE
@@ -910,7 +1036,7 @@ async function navigateIntoDir(folder: SharedFileInfo) {
     checkedFsIds.value = newSet
     if (pathMode.value) {
       // 路径模式只记录目录内容，不改变已选路径；就绪状态在导航结束后统一结算
-      recordListingPage(normalizeSharePath(folder.path), response.files, response.files.length)
+      recordListingPage(dirKey, response.files, response.files.length)
     } else {
       emitSelection()
     }
@@ -1060,6 +1186,11 @@ async function loadMore() {
     } else {
       rootHasMore.value = false
       hasMore.value = false
+    }
+
+    if (pathMode.value && !subdir) {
+      // 根目录晚到分页可能补齐物理路径别名；只补映射，不重置已改动选择
+      refreshRootAliases()
     }
 
     if (pathMode.value) {

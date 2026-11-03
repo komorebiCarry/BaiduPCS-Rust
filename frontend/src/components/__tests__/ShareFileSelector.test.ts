@@ -71,6 +71,7 @@ interface PathSelectorOptions {
   files?: typeof ROOT_FILES
   initialSelectedPaths?: string[]
   emptySelectionMeansAll?: boolean
+  shareInfo?: typeof PATH_SHARE_INFO
 }
 
 function mountPathSelector(options: PathSelectorOptions = {}) {
@@ -79,7 +80,7 @@ function mountPathSelector(options: PathSelectorOptions = {}) {
     props: {
       files: options.files ?? ROOT_FILES,
       loading: false,
-      shareInfo: PATH_SHARE_INFO,
+      shareInfo: options.shareInfo ?? PATH_SHARE_INFO,
       shareUrl: 'https://pan.baidu.com/s/1y7CluAbCdEfGh',
       pathSelection: true,
       initialSelectedPaths: options.initialSelectedPaths ?? [],
@@ -278,6 +279,406 @@ describe('ShareFileSelector 路径选择模式', () => {
       expect(checkboxState('剧集')).toEqual({ checked: true, indeterminate: false })
       // 未改动时原样回显初始写法
       expect(emittedPaths(wrapper)).toEqual(['/sharelink0-1/剧集'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('根目录物理路径与虚拟已选后代按同一内容组成半选', async () => {
+    const shareInfo = { ...SHARE_INFO, uk: '1', shareid: '2' }
+    const rootFiles = [
+      { fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+      { fs_id: 12, is_dir: true, path: '/apps/bypy/B', size: 0, name: 'B' },
+    ]
+    transfer.previewShareDir.mockResolvedValue({
+      files: [
+        { fs_id: 111, is_dir: false, path: '/sharelink1-2/A/x.txt', size: 1, name: 'x.txt' },
+        { fs_id: 112, is_dir: false, path: '/sharelink1-2/A/y.txt', size: 1, name: 'y.txt' },
+      ],
+    })
+    const wrapper = mountPathSelector({
+      files: rootFiles,
+      shareInfo,
+      initialSelectedPaths: ['/sharelink1-2/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(checkboxState('A'), '根目录行应反映虚拟后代的选择').toEqual({ checked: false, indeterminate: true })
+      expect(headerState(), '根目录表头应反映虚拟后代的选择').toEqual({ checked: false, indeterminate: true })
+
+      itemByName('A').click()
+      await flushPromises()
+      expect(transfer.previewShareDir).toHaveBeenCalledWith(
+        expect.objectContaining({ dir: '/sharelink1-2/A' }),
+      )
+      expect(checkboxState('x.txt')).toEqual({ checked: true, indeterminate: false })
+      expect(checkboxState('y.txt')).toEqual({ checked: false, indeterminate: false })
+      expect(headerState()).toEqual({ checked: false, indeterminate: true })
+
+      const rootBtn = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+          .find((b) => b.textContent?.trim() === '根目录')
+      expect(rootBtn).toBeTruthy()
+      rootBtn!.click()
+      await flushPromises()
+      expect(checkboxState('A')).toEqual({ checked: false, indeterminate: true })
+      expect(headerState()).toEqual({ checked: false, indeterminate: true })
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink1-2/A/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('物理旧路径作为初始选择时还原为同一逻辑内容且原样回显', async () => {
+    const shareInfo = { ...SHARE_INFO, uk: '1', shareid: '2' }
+    const rootFiles = [{ fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' }]
+    transfer.previewShareDir.mockResolvedValue({
+      files: [
+        { fs_id: 111, is_dir: false, path: '/sharelink1-2/A/x.txt', size: 1, name: 'x.txt' },
+      ],
+    })
+    const wrapper = mountPathSelector({
+      files: rootFiles,
+      shareInfo,
+      initialSelectedPaths: ['/apps/bypy/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(checkboxState('A')).toEqual({ checked: false, indeterminate: true })
+      expect(headerState()).toEqual({ checked: false, indeterminate: true })
+      expect(emittedPaths(wrapper)).toEqual(['/apps/bypy/A/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('根目录晚到分页补齐别名时保留用户已改动选择', async () => {
+    const shareInfo = { ...SHARE_INFO, uk: '1', shareid: '2' }
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      fs_id: i + 1, is_dir: false, path: `/root/f${String(i).padStart(3, '0')}.txt`, size: 1,
+      name: `f${String(i).padStart(3, '0')}.txt`,
+    }))
+    transfer.previewShareFiles.mockResolvedValueOnce({
+      files: [{ fs_id: 201, is_dir: true, path: '/apps/bypy/B', size: 0, name: 'B' }],
+    })
+    const wrapper = mountPathSelector({
+      files: page1,
+      shareInfo,
+      initialSelectedPaths: ['/apps/bypy/B/y.txt'],
+    })
+    try {
+      await flushPromises()
+      itemByName('f000.txt').querySelector<HTMLInputElement>('input[type="checkbox"]')!.click()
+      await flushPromises()
+
+      await wrapper.get('.el-scrollbar__wrap').trigger('scroll')
+      await flushPromises()
+
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(1)
+      expect(emittedPaths(wrapper)).toEqual(['/apps/bypy/B/y.txt', '/root/f000.txt'])
+      expect(checkboxState('B'), '晚到的根项应反映已保存的物理后代').toEqual({
+        checked: false,
+        indeterminate: true,
+      })
+      expect(emittedReady(wrapper)).toBe(true)
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('根目录别名冲突时显示错误并禁止确认', async () => {
+    const shareInfo = { ...SHARE_INFO, uk: '1', shareid: '2' }
+    const wrapper = mountPathSelector({
+      files: [
+        { fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+        { fs_id: 12, is_dir: true, path: '/other/A', size: 0, name: 'A' },
+      ],
+      shareInfo,
+      initialSelectedPaths: ['/sharelink1-2/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink1-2/A/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整目录展开遇到后页别名冲突时阻止确认', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      fs_id: i + 1, is_dir: false, path: `/root/f${i}`, size: 1, name: `f${i}`,
+    }))
+    transfer.previewShareFiles.mockResolvedValueOnce({ files: page1 }).mockResolvedValueOnce({
+      files: [{ fs_id: 201, is_dir: false, path: '/other/f0', size: 1, name: 'f0' }],
+    })
+    const wrapper = mountPathSelector({ files: page1, initialSelectedPaths: ['/root/f1'] })
+    try {
+      await flushPromises()
+      document.body.querySelector<HTMLInputElement>('.selector-header input[type="checkbox"]')!.click()
+      await flushPromises()
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(2)
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedPaths(wrapper)).toEqual(['/root/f1'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整目录后页同一原始路径对应不同根名时阻止确认', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      fs_id: i + 1, is_dir: false, path: `/root/f${i}`, size: 1, name: `f${i}`,
+    }))
+    transfer.previewShareFiles.mockResolvedValueOnce({ files: page1 }).mockResolvedValueOnce({
+      files: [
+        { fs_id: 201, is_dir: false, path: '/root/f0', size: 1, name: 'other' },
+        { fs_id: 202, is_dir: false, path: '/root/new', size: 1, name: 'new' },
+      ],
+    })
+    const wrapper = mountPathSelector({ files: page1, initialSelectedPaths: ['/root/f1'] })
+    try {
+      await flushPromises()
+      headerCheckbox().click()
+      await flushPromises()
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(2)
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedPaths(wrapper)).toEqual(['/root/f1'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('根目录滚动后页同一原始路径对应不同根名时冲突并阻止确认', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      fs_id: i + 1, is_dir: false, path: `/root/f${i}`, size: 1, name: `f${i}`,
+    }))
+    transfer.previewShareFiles.mockResolvedValueOnce({
+      files: [
+        { fs_id: 201, is_dir: false, path: '/root/f0', size: 1, name: 'other' },
+        { fs_id: 202, is_dir: false, path: '/root/new', size: 1, name: 'new' },
+      ],
+    })
+    const wrapper = mountPathSelector({ files: page1, initialSelectedPaths: ['/root/f1'] })
+    try {
+      await flushPromises()
+      await wrapper.get('.el-scrollbar__wrap').trigger('scroll')
+      await flushPromises()
+
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(1)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(emittedPaths(wrapper)).toEqual(['/root/f1'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('企业分享路径模式目录导航使用原始目录路径', async () => {
+    const wrapper = mount(ShareFileSelector, {
+      attachTo: document.body,
+      props: {
+        files: [{ fs_id: 11, is_dir: true, path: '/enterprise/root/A', size: 0, name: 'A' }],
+        loading: false,
+        shareInfo: { ...PATH_SHARE_INFO, kind: 'apaas' as const },
+        shareUrl: 'https://pan.baidu.com/s/1y7CluAbCdEfGh',
+        pathSelection: true,
+        initialSelectedPaths: ['/enterprise/root/A/x.txt'],
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    try {
+      await flushPromises()
+      itemByName('A').click()
+      await flushPromises()
+      expect(transfer.previewShareDir).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'apaas', dir: '/enterprise/root/A', page: 1,
+      }))
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('企业分享子项取消时展开所有分页且请求原始目录路径', async () => {
+    const files = Array.from({ length: 101 }, (_, i) => ({
+      fs_id: 200 + i, is_dir: false, path: `/enterprise/root/A/f${i}`, size: 1, name: `f${i}`,
+    }))
+    transfer.previewShareDir.mockImplementation(async (args: { page: number }) => ({
+      files: args.page === 1 ? files.slice(0, 100) : files.slice(100),
+    }))
+    const wrapper = mount(ShareFileSelector, {
+      attachTo: document.body,
+      props: {
+        files: [{ fs_id: 11, is_dir: true, path: '/enterprise/root/A', size: 0, name: 'A' }],
+        loading: false,
+        shareInfo: { ...PATH_SHARE_INFO, kind: 'apaas' as const },
+        shareUrl: 'https://pan.baidu.com/s/1y7CluAbCdEfGh',
+        pathSelection: true,
+        initialSelectedPaths: ['/enterprise/root/A'],
+      },
+      global: { plugins: [ElementPlus] },
+    })
+    try {
+      await flushPromises()
+      itemByName('A').click()
+      await flushPromises()
+      itemByName('f0').querySelector<HTMLInputElement>('input[type="checkbox"]')!.click()
+      await flushPromises()
+      expect(transfer.previewShareDir).toHaveBeenCalledWith(expect.objectContaining({ kind: 'apaas', dir: '/enterprise/root/A', page: 2 }))
+      expect(emittedPaths(wrapper)).toHaveLength(100)
+      expect(emittedPaths(wrapper)).not.toContain('/enterprise/root/A/f0')
+      expect(emittedPaths(wrapper)).toContain('/enterprise/root/A/f100')
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('根目录名恰好是 sharelink 格式时按实际文件名还原后代', async () => {
+    const wrapper = mountPathSelector({
+      files: [{ fs_id: 11, is_dir: true, path: '/apps/bypy/sharelink1-2', size: 0, name: 'sharelink1-2' }],
+      shareInfo: { ...PATH_SHARE_INFO, uk: '9', shareid: '8' },
+      initialSelectedPaths: ['/sharelink9-8/sharelink1-2/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(headerState()).toEqual({ checked: false, indeterminate: true })
+      expect(checkboxState('sharelink1-2')).toEqual({ checked: false, indeterminate: true })
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink9-8/sharelink1-2/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('字面 sharelink 根名导航与请求使用逻辑名，no-op 保留原始路径', async () => {
+    const shareInfo = { ...PATH_SHARE_INFO, uk: '9', shareid: '8' }
+    transfer.previewShareDir.mockResolvedValue({
+      files: [{ fs_id: 111, is_dir: false, path: '/sharelink9-8/sharelink1-2/x.txt', size: 1, name: 'x.txt' }],
+    })
+    const wrapper = mountPathSelector({
+      files: [{ fs_id: 11, is_dir: true, path: '/apps/bypy/sharelink1-2', size: 0, name: 'sharelink1-2' }],
+      shareInfo,
+      initialSelectedPaths: ['/sharelink9-8/sharelink1-2/x.txt'],
+    })
+    try {
+      await flushPromises()
+      itemByName('sharelink1-2').click()
+      await flushPromises()
+
+      expect(transfer.previewShareDir).toHaveBeenCalledWith(expect.objectContaining({
+        dir: '/sharelink9-8/sharelink1-2',
+        page: 1,
+      }))
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink9-8/sharelink1-2/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('字面 sharelink 根名的物理旧路径同样还原且 no-op 原样回显', async () => {
+    const shareInfo = { ...PATH_SHARE_INFO, uk: '9', shareid: '8' }
+    const wrapper = mountPathSelector({
+      files: [{ fs_id: 11, is_dir: true, path: '/apps/bypy/sharelink1-2', size: 0, name: 'sharelink1-2' }],
+      shareInfo,
+      initialSelectedPaths: ['/apps/bypy/sharelink1-2/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(checkboxState('sharelink1-2')).toEqual({ checked: false, indeterminate: true })
+      expect(headerState()).toEqual({ checked: false, indeterminate: true })
+      expect(emittedPaths(wrapper)).toEqual(['/apps/bypy/sharelink1-2/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('物理根路径与另一逻辑根的后代重叠时阻止确认', async () => {
+    const wrapper = mountPathSelector({
+      files: [
+        { fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+        { fs_id: 12, is_dir: true, path: '/other/apps', size: 0, name: 'apps' },
+      ],
+      initialSelectedPaths: ['/sharelink1-2/apps/bypy/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink1-2/apps/bypy/A/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('物理保存路径与另一逻辑根后代重叠时同样阻止确认', async () => {
+    const wrapper = mountPathSelector({
+      files: [
+        { fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+        { fs_id: 12, is_dir: true, path: '/other/apps', size: 0, name: 'apps' },
+      ],
+      initialSelectedPaths: ['/apps/bypy/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedPaths(wrapper)).toEqual(['/apps/bypy/A/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('根目录后页补入交叉重叠逻辑根时阻止确认', async () => {
+    const page1 = [
+      { fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+      ...Array.from({ length: 99 }, (_, i) => ({
+        fs_id: 1000 + i, is_dir: false, path: `/root/f${i}`, size: 1, name: `f${i}`,
+      })),
+    ]
+    transfer.previewShareFiles.mockResolvedValueOnce({
+      files: [{ fs_id: 2001, is_dir: true, path: '/other/apps', size: 0, name: 'apps' }],
+    })
+    const wrapper = mountPathSelector({
+      files: page1,
+      initialSelectedPaths: ['/sharelink1-2/apps/bypy/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      await wrapper.get('.el-scrollbar__wrap').trigger('scroll')
+      await flushPromises()
+
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(1)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink1-2/apps/bypy/A/x.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整目录展开的后页交叉重叠根同样阻止确认', async () => {
+    const page1 = [
+      { fs_id: 11, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+      ...Array.from({ length: 99 }, (_, i) => ({
+        fs_id: 1000 + i, is_dir: false, path: `/root/f${i}`, size: 1, name: `f${i}`,
+      })),
+    ]
+    transfer.previewShareFiles.mockResolvedValueOnce({ files: page1 }).mockResolvedValueOnce({
+      files: [{ fs_id: 2001, is_dir: true, path: '/other/apps', size: 0, name: 'apps' }],
+    })
+    const wrapper = mountPathSelector({
+      files: page1,
+      initialSelectedPaths: ['/sharelink1-2/apps/bypy/A/x.txt'],
+    })
+    try {
+      await flushPromises()
+      headerCheckbox().click()
+      await flushPromises()
+
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(2)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(emittedPaths(wrapper)).toEqual(['/sharelink1-2/apps/bypy/A/x.txt'])
     } finally {
       wrapper.unmount()
     }
@@ -547,6 +948,144 @@ describe('ShareFileSelector 路径选择模式', () => {
       await flushPromises()
       expect(transfer.previewShareFiles).toHaveBeenCalledTimes(1)
       expect(emittedPaths(wrapper)).toEqual(['/文件0.txt'])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+})
+
+describe('ShareFileSelector 整目录事务的根页别名', () => {
+  interface Deferred<T> {
+    promise: Promise<T>
+    resolve: (value: T) => void
+    reject: (reason?: unknown) => void
+  }
+
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void
+    let reject!: (reason?: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  function uniqueRootPage(count: number) {
+    return Array.from({ length: count }, (_, i) => ({
+      fs_id: 1000 + i, is_dir: false, path: `/root/f${i}`, size: 1, name: `f${i}`,
+    }))
+  }
+
+  it('整体分享下取消子项遇到后页别名冲突时保留原选择并阻止确认', async () => {
+    const page1 = uniqueRootPage(100)
+    transfer.previewShareFiles.mockResolvedValueOnce({ files: page1 }).mockResolvedValueOnce({
+      files: [{ fs_id: 2001, is_dir: false, path: '/other/f0', size: 1, name: 'f0' }],
+    })
+    const wrapper = mountPathSelector({ files: page1, emptySelectionMeansAll: true })
+    try {
+      await flushPromises()
+      itemByName('f0').querySelector<HTMLInputElement>('input[type="checkbox"]')!.click()
+      await flushPromises()
+
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(2)
+      expect(document.body.querySelector('.selection-error')?.textContent).toContain('冲突')
+      expect(emittedReady(wrapper)).toBe(false)
+      expect(emittedPaths(wrapper)).toEqual([])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整目录展开的迟到冲突在数据源重置后丢弃', async () => {
+    const page1 = uniqueRootPage(100)
+    const pending = deferred<{ files: Array<{ fs_id: number; is_dir: boolean; path: string; size: number; name: string }> }>()
+    transfer.previewShareFiles.mockImplementation((req: { page?: number }) =>
+      (req.page ?? 1) === 1 ? Promise.resolve({ files: page1 }) : pending.promise,
+    )
+    const wrapper = mountPathSelector({ files: page1, initialSelectedPaths: ['/root/f1'] })
+    try {
+      await flushPromises()
+      headerCheckbox().click()
+      await flushPromises()
+      expect(transfer.previewShareFiles).toHaveBeenCalledTimes(2)
+
+      await wrapper.setProps({
+        files: [
+          { fs_id: 501, is_dir: false, path: '/new/a.txt', size: 1, name: 'a.txt' },
+          { fs_id: 502, is_dir: false, path: '/new/b.txt', size: 1, name: 'b.txt' },
+        ],
+      })
+      await flushPromises()
+
+      pending.resolve({
+        files: [{ fs_id: 1001, is_dir: false, path: '/other/f0', size: 1, name: 'f0' }],
+      })
+      await flushPromises()
+
+      expect((document.body.textContent ?? '')).not.toContain('冲突')
+      expect(document.body.querySelector('.selection-error')).toBeNull()
+      expect(emittedPaths(wrapper)).toEqual(['/root/f1'])
+      expect(emittedReady(wrapper)).toBe(true)
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整目录展开的迟到冲突在导航取消后不覆盖新目录', async () => {
+    const page1 = [
+      { fs_id: 10, is_dir: true, path: '/apps/bypy/A', size: 0, name: 'A' },
+      ...uniqueRootPage(99),
+    ]
+    const pending = deferred<{ files: Array<{ fs_id: number; is_dir: boolean; path: string; size: number; name: string }> }>()
+    transfer.previewShareFiles.mockImplementation((req: { page?: number }) =>
+      (req.page ?? 1) === 1 ? Promise.resolve({ files: page1 }) : pending.promise,
+    )
+    transfer.previewShareDir.mockResolvedValue({
+      files: [{ fs_id: 111, is_dir: false, path: '/sharelink1-2/A/x.txt', size: 1, name: 'x.txt' }],
+    })
+    const wrapper = mountPathSelector({ files: page1 })
+    try {
+      await flushPromises()
+      headerCheckbox().click()
+      await flushPromises()
+      itemByName('A').click()
+      await flushPromises()
+      expect(transfer.previewShareDir).toHaveBeenCalled()
+
+      pending.resolve({
+        files: [{ fs_id: 1001, is_dir: false, path: '/other/f0', size: 1, name: 'f0' }],
+      })
+      await flushPromises()
+
+      expect((document.body.textContent ?? '')).not.toContain('冲突')
+      expect(itemByName('x.txt')).toBeTruthy()
+      expect(emittedReady(wrapper)).toBe(true)
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整目录展开的迟到合法根页仍按统一别名全选', async () => {
+    const page1 = uniqueRootPage(100)
+    const pending = deferred<{ files: Array<{ fs_id: number; is_dir: boolean; path: string; size: number; name: string }> }>()
+    transfer.previewShareFiles.mockImplementation((req: { page?: number }) =>
+      (req.page ?? 1) === 1 ? Promise.resolve({ files: page1 }) : pending.promise,
+    )
+    const wrapper = mountPathSelector({ files: page1 })
+    try {
+      await flushPromises()
+      headerCheckbox().click()
+      await flushPromises()
+      pending.resolve({
+        files: [{ fs_id: 1001, is_dir: true, path: '/apps/bypy/B', size: 0, name: 'B' }],
+      })
+      await flushPromises()
+
+      expect(headerState()).toEqual({ checked: true, indeterminate: false })
+      expect(emittedPaths(wrapper)).toHaveLength(101)
+      expect(emittedPaths(wrapper)).toContain('/apps/bypy/B')
+      expect(emittedReady(wrapper)).toBe(true)
     } finally {
       wrapper.unmount()
     }

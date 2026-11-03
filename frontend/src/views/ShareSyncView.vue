@@ -292,7 +292,7 @@
                   size="small"
                   type="info"
               >
-                {{ p }}
+                {{ formatSharePathForDisplay(p) }}
               </el-tag>
             </div>
             <span v-else>同步整个分享</span>
@@ -329,7 +329,7 @@
                   size="small"
                   type="warning"
               >
-                {{ p }}
+                {{ formatSharePathForDisplay(p) }}
               </el-tag>
             </div>
             <span v-else>无</span>
@@ -721,6 +721,7 @@ import {
 } from '@/api/shareSync'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { createAdaptivePoller } from '@/utils/backendHealth'
+import { formatSharePathForDisplay } from '@/utils/shareSelection'
 
 const subscriptions = ref<ShareSubscription[]>([])
 const selected = ref<ShareSubscription | null>(null)
