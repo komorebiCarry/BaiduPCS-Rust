@@ -67,7 +67,7 @@
                   <span class="dot">·</span><span>排除正则 {{ s.exclude_regex_patterns!.length }} 条</span>
                 </template>
                 <template v-if="s.exclude_paths?.length">
-                  <span class="dot">·</span><span>排除目录 {{ s.exclude_paths.length }} 个</span>
+                  <span class="dot">·</span><span>排除内容 {{ s.exclude_paths.length }} 项</span>
                 </template>
                 <template v-if="s.delete_missing">
                   <span class="dot">·</span><span class="danger-text">删除缺失</span>
@@ -321,7 +321,7 @@
             </div>
             <span v-else>无</span>
           </el-descriptions-item>
-          <el-descriptions-item label="排除目录">
+          <el-descriptions-item label="排除内容">
             <div v-if="(selected.exclude_paths?.length ?? 0) > 0" class="path-tags">
               <el-tag
                   v-for="(p, i) in selected.exclude_paths"
@@ -1736,6 +1736,21 @@ function normalizePath(v: string): string {
   return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
 }
 
+/**
+ * 选中的同步 / 排除路径提交前归一：只规整分隔符，文件名里的空白（含结尾空格）
+ * 原样保留 —— 否则「报告. 」会被存成「报告.」，选中与排除都会串到同名文件上。
+ * 手工输入的网盘 / 本地目标路径仍走 normalizePath（需要 trim）。
+ */
+function normalizeSelectedPath(v: string): string {
+  if (!v.trim()) return ''
+  const lead = /^\s*/.exec(v)?.[0] ?? ''
+  const rest = lead.length > 0 && v.charAt(lead.length) === '/' ? v.slice(lead.length) : v
+  const collapsed = rest.replace(/\/+/g, '/')
+  const prefixed = collapsed.startsWith('/') ? collapsed : `/${collapsed}`
+  if (prefixed.length === 1) return '/'
+  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
+}
+
 function normalizeRemotePath(v: string): string {
   return normalizePath(v) || '/'
 }
@@ -1743,7 +1758,7 @@ function normalizeRemotePath(v: string): string {
 function buildSanitizedPayload() {
   const includeSet = new Set<string>()
   for (const p of form.value.include_paths) {
-    const n = normalizePath(p)
+    const n = normalizeSelectedPath(p)
     if (n) {
       includeSet.add(n)
     }
@@ -1764,7 +1779,7 @@ function buildSanitizedPayload() {
   }
   const excludePathSet = new Set<string>()
   for (const p of form.value.exclude_paths) {
-    const n = normalizePath(p)
+    const n = normalizeSelectedPath(p)
     if (n) {
       excludePathSet.add(n)
     }

@@ -576,6 +576,27 @@ describe('ShareSyncView 扫描当前路径展示', () => {
   })
 })
 
+describe('ShareSyncView 排除内容文案', () => {
+  it('卡片摘要与详情都用「排除内容」措辞', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.textContent).toContain('排除内容 1 项')
+    expect(card.textContent, '不再使用「排除目录」措辞').not.toContain('排除目录')
+
+    card.click()
+    await flushPromises()
+
+    const labels = Array.from(
+        document.body.querySelectorAll<HTMLElement>('.el-descriptions__label'),
+    ).map((el) => el.textContent?.trim())
+    expect(labels).toContain('排除内容')
+    expect(labels, '详情不再使用「排除目录」措辞').not.toContain('排除目录')
+    wrapper.unmount()
+  })
+})
+
 describe('ShareSyncView 正则排除规则', () => {
   const WITH_REGEX = {
     ...SUB,
@@ -1153,5 +1174,112 @@ describe('ShareSyncView 运行详情文件动作筛选', () => {
     } finally {
       get.mockRestore()
     }
+  })
+})
+
+describe('ShareSyncView 选中路径提交保真', () => {
+  function editButtonOf(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    const btn = Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')
+    expect(btn, `「${name}」应有编辑按钮`).toBeTruthy()
+    return btn!
+  }
+
+  function saveButton(): HTMLElement {
+    const btn = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')
+    expect(btn, '应有「保存」按钮').toBeTruthy()
+    return btn!
+  }
+
+  type EditorSub = Omit<typeof SUB, 'include_paths' | 'exclude_paths' | 'targets'> & {
+    include_paths: string[]
+    exclude_paths: string[]
+    targets: Array<Record<string, unknown>>
+  }
+
+  async function openEditor(sub: EditorSub) {
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue({ ...sub })
+    const wrapper = mountView()
+    await flushPromises()
+    editButtonOf(sub.name).click()
+    await flushPromises()
+    return wrapper
+  }
+
+  it('保存时按原字节保留选中路径的文件名空白', async () => {
+    const withSpaces = {
+      ...SUB,
+      include_paths: ['/剧集/报告. '],
+      exclude_paths: ['/剧集/广告. '],
+    }
+    const wrapper = await openEditor(withSpaces)
+
+    saveButton().click()
+    await flushPromises()
+
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      include_paths: string[]
+      exclude_paths: string[]
+    }
+    expect(req.include_paths, '同步内容保留文件名结尾空格').toEqual(['/剧集/报告. '])
+    expect(req.exclude_paths, '排除内容保留文件名结尾空格').toEqual(['/剧集/广告. '])
+    wrapper.unmount()
+  })
+
+  it('仅结尾空格不同的两条选中路径都保留，不会被去重成一个', async () => {
+    const pair = {
+      ...SUB,
+      include_paths: ['/剧集/报告.', '/剧集/报告. '],
+      exclude_paths: [],
+    }
+    const wrapper = await openEditor(pair)
+
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { include_paths: string[] }
+    expect(req.include_paths, '仅结尾空格不同即两个文件，不能去重').toEqual([
+      '/剧集/报告.',
+      '/剧集/报告. ',
+    ])
+    wrapper.unmount()
+  })
+
+  it('选中路径只规整分隔符，手工输入的网盘目标仍按原规则 trim', async () => {
+    const messy = {
+      ...SUB,
+      include_paths: ['/剧集//报告. //'],
+      exclude_paths: ['//剧集/广告. '],
+      targets: [
+        { kind: 'netdisk' as const, remote_path: '/我的资源', save_fs_id: 0 },
+        { kind: 'local' as const, local_path: '/tmp', mode: 'transfer_and_download' as const },
+      ],
+    }
+    const wrapper = await openEditor(messy)
+
+    const netdiskInput = document.body.querySelector<HTMLInputElement>(
+      '.subscription-dialog .target-path input',
+    )!
+    netdiskInput.value = '  /我的资源/同步  '
+    netdiskInput.dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      include_paths: string[]
+      exclude_paths: string[]
+      targets: Array<Record<string, unknown>>
+    }
+    expect(req.include_paths, '只合并冗余斜杠，文件名空白不动').toEqual(['/剧集/报告. '])
+    expect(req.exclude_paths).toEqual(['/剧集/广告. '])
+    expect(req.targets[0].remote_path, '手工目标路径仍走 trim 归一').toBe('/我的资源/同步')
+    wrapper.unmount()
   })
 })

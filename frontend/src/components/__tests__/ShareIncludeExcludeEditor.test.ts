@@ -139,6 +139,36 @@ function confirmButton(): HTMLElement {
   return btn!
 }
 
+function cancelButton(): HTMLElement {
+  const btns = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+  const btn = btns.find((b) => b.textContent?.trim() === '取消')
+  expect(btn, '选择器应有「取消」按钮').toBeTruthy()
+  return btn!
+}
+
+/** 选择器里某个条目的复选框状态（标准 checked / indeterminate） */
+function checkboxStateOf(name: string): { checked: boolean; indeterminate: boolean } {
+  const input = fileItem(name).querySelector<HTMLElement>('.el-checkbox__input')
+  expect(input, `条目「${name}」应有复选框`).toBeTruthy()
+  return {
+    checked: input!.classList.contains('is-checked'),
+    indeterminate: input!.classList.contains('is-indeterminate'),
+  }
+}
+
+/** 选择器头部的全选框 */
+function headerCheckbox(): HTMLInputElement {
+  const input = document.body.querySelector<HTMLInputElement>('.selector-header input[type="checkbox"]')
+  expect(input, '选择器应有全选框').toBeTruthy()
+  return input!
+}
+
+/** 选择器底部的状态提示 */
+function pickerHint(): string {
+  const hint = document.body.querySelector<HTMLElement>('.picker-hint')
+  return hint?.textContent?.trim() ?? ''
+}
+
 beforeEach(() => {
   transfer.previewShareFiles.mockReset()
   transfer.previewShareDir.mockReset()
@@ -149,6 +179,12 @@ beforeEach(() => {
       { fs_id: 2, is_dir: false, path: '/说明.txt', size: 10, name: '说明.txt' },
     ],
     share_info: SHARE_INFO,
+  })
+  transfer.previewShareDir.mockResolvedValue({
+    files: [
+      { fs_id: 11, is_dir: false, path: '/剧集/01.mp4', size: 5, name: '01.mp4' },
+      { fs_id: 12, is_dir: false, path: '/剧集/02.mp4', size: 5, name: '02.mp4' },
+    ],
   })
   config.presetRules = []
   config.regexPresetRules = []
@@ -172,73 +208,235 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
-describe('ShareIncludeExcludeEditor 排除目录', () => {
-  it('排除目录浏览只允许选文件夹，保存的是精确路径而非 glob', async () => {
+describe('ShareIncludeExcludeEditor 排除内容', () => {
+  it('排除内容浏览可选文件与目录，保存的是精确路径而非 glob', async () => {
     const wrapper = mountEditor()
     await flushPromises()
 
-    browseButton('排除目录').click()
+    browseButton('排除内容').click()
     await flushPromises()
 
-    // 文件不可选，文件夹可选
-    expect(checkboxOf(fileItem('说明.txt')), '排除模式下文件不应可勾选').toBeNull()
-    const dirCheckbox = checkboxOf(fileItem('剧集'))
-    expect(dirCheckbox, '排除模式下文件夹应可勾选').toBeTruthy()
+    // 文件与目录都可勾选
+    expect(checkboxOf(fileItem('说明.txt')), '排除内容模式下文件应可勾选').toBeTruthy()
+    expect(checkboxOf(fileItem('剧集')), '排除内容模式下目录应可勾选').toBeTruthy()
 
-    dirCheckbox!.click()
+    checkboxOf(fileItem('说明.txt'))!.click()
     await flushPromises()
 
     confirmButton().click()
     await flushPromises()
 
     const emitted = wrapper.emitted('update:excludePaths')
-    expect(emitted, '应发出排除目录变更').toBeTruthy()
-    expect(emitted![0][0]).toEqual(['/剧集'])
+    expect(emitted, '应发出排除内容变更').toBeTruthy()
+    expect(emitted![0][0]).toEqual(['/说明.txt'])
     // 精确排除不带任何通配符，避免「前缀相似目录被误排除」
     expect((emitted![0][0] as string[])[0]).not.toContain('*')
-    // 排除目录不影响同步内容
+    // 排除内容不影响同步内容
     expect(wrapper.emitted('update:includePaths')).toBeUndefined()
   })
 
-  it('排除目录与已有排除目录合并去重，并裁掉被祖先覆盖的后代', async () => {
-    const wrapper = mountEditor({ excludePaths: ['/剧集/S01'] })
+  it('排除内容确认替换旧模型，不把已删除的排除项合并回来', async () => {
+    const wrapper = mountEditor({ excludePaths: ['/广告'] })
     await flushPromises()
 
-    browseButton('排除目录').click()
+    browseButton('排除内容').click()
     await flushPromises()
 
-    checkboxOf(fileItem('剧集'))!.click()
+    // 打开时带出已存的排除项
+    expect(checkboxStateOf('广告').checked).toBe(true)
+
+    checkboxOf(fileItem('广告'))!.click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
     await flushPromises()
 
     confirmButton().click()
     await flushPromises()
 
     const emitted = wrapper.emitted('update:excludePaths')!
-    const value = emitted[emitted.length - 1][0] as string[]
-    // /剧集 覆盖 /剧集/S01 → 后者不必单独保留
-    expect(value).toEqual(['/剧集'])
+    expect(emitted[emitted.length - 1][0]).toEqual(['/说明.txt'])
   })
 
-  it('同步内容浏览仍可选文件与文件夹，保存到 includePaths', async () => {
+  it('同步内容浏览整体呈现为整个分享，取消勾选后才产出显式路径', async () => {
     const wrapper = mountEditor()
     await flushPromises()
 
     browseButton('同步内容').click()
     await flushPromises()
 
-    // 同步内容模式下文件可勾选（默认全选，可逐个取消）
-    const fileCheckbox = checkboxOf(fileItem('说明.txt'))
-    expect(fileCheckbox, '同步内容模式下文件应可勾选').toBeTruthy()
+    // 初始为「整个分享」：全部勾选，确认后仍是整个分享
+    expect(checkboxStateOf('剧集').checked).toBe(true)
+    expect(checkboxStateOf('说明.txt').checked).toBe(true)
+    expect(pickerHint()).toBe('整个分享')
+
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
 
     confirmButton().click()
     await flushPromises()
 
     const emitted = wrapper.emitted('update:includePaths')
     expect(emitted).toBeTruthy()
-    const value = emitted![0][0] as string[]
-    expect(value).toContain('/剧集')
-    expect(value).toContain('/说明.txt')
+    expect(emitted![0][0]).toEqual(['/剧集', '/广告'])
     expect(wrapper.emitted('update:excludePaths')).toBeUndefined()
+  })
+})
+
+describe('ShareIncludeExcludeEditor 路径选择（P1 集成）', () => {
+  it('重新打开已存同步内容：带出目录与文件，父目录为半选', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集/S01', '/剧集/S02'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+
+    expect(checkboxStateOf('剧集')).toEqual({ checked: false, indeterminate: true })
+    expect(checkboxStateOf('说明.txt')).toEqual({ checked: false, indeterminate: false })
+    wrapper.unmount()
+  })
+
+  it('新增一个文件保留全部既有选择', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集/S01', '/剧集/S02'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    confirmButton().click()
+    await flushPromises()
+
+    const emitted = wrapper.emitted('update:includePaths')!
+    expect(emitted[emitted.length - 1][0]).toEqual(['/剧集/S01', '/剧集/S02', '/说明.txt'])
+    wrapper.unmount()
+  })
+
+  it('取消勾选会真正移除该路径', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集', '/说明.txt'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    confirmButton().click()
+    await flushPromises()
+
+    const emitted = wrapper.emitted('update:includePaths')!
+    expect(emitted[emitted.length - 1][0]).toEqual(['/剧集'])
+    wrapper.unmount()
+  })
+
+  it('取消不写任何模型，重新打开确认仍是原值', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    cancelButton().click()
+    await flushPromises()
+    expect(wrapper.emitted('update:includePaths'), '取消不得写入模型').toBeUndefined()
+
+    // 重新打开：回到已存内容，不保留上一次的临时改动
+    browseButton('同步内容').click()
+    await flushPromises()
+    expect(checkboxStateOf('说明.txt').checked).toBe(false)
+    confirmButton().click()
+    await flushPromises()
+
+    const emitted = wrapper.emitted('update:includePaths')!
+    expect(emitted[emitted.length - 1][0]).toEqual(['/剧集'])
+    wrapper.unmount()
+  })
+
+  it('清空同步内容后不可确认，提示改选同步内容', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    headerCheckbox().click()
+    await flushPromises()
+
+    expect(pickerHint()).toBe('请选择要同步的内容')
+    expect((confirmButton() as HTMLButtonElement).disabled, '不可确认时确定按钮应禁用').toBe(true)
+    expect(wrapper.emitted('update:includePaths'), '未确认不得写入模型').toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('排除内容里被选中目录的子项：展开后保留其余兄弟路径', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    fileItem('剧集').click()
+    await flushPromises()
+
+    // 子项属于被选中的目录：取消勾选后目录被替换成剩余兄弟
+    checkboxOf(fileItem('01.mp4'))!.click()
+    await flushPromises()
+    confirmButton().click()
+    await flushPromises()
+
+    const emitted = wrapper.emitted('update:includePaths')!
+    expect(emitted[emitted.length - 1][0]).toEqual(['/剧集/02.mp4'])
+    wrapper.unmount()
+  })
+
+  it('展开失败时保留原选择，不会退回整个分享', async () => {
+    const many = Array.from({ length: 100 }, (_, i) => ({
+      fs_id: 100 + i,
+      is_dir: false,
+      path: `/剧集/${String(i).padStart(3, '0')}.mp4`,
+      size: 1,
+      name: `${String(i).padStart(3, '0')}.mp4`,
+    }))
+    let dirCalls = 0
+    transfer.previewShareDir.mockImplementation(async () => {
+      dirCalls += 1
+      // 导航只拿到第一页（目录尚未列全），展开时再取后续页失败
+      if (dirCalls === 1) return { files: many }
+      throw new Error('网络中断')
+    })
+    const wrapper = mountEditor({ includePaths: ['/剧集'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    fileItem('剧集').click()
+    await flushPromises()
+
+    checkboxOf(fileItem('000.mp4'))!.click()
+    await flushPromises()
+
+    confirmButton().click()
+    await flushPromises()
+
+    const emitted = wrapper.emitted('update:includePaths')!
+    expect(emitted[emitted.length - 1][0]).toEqual(['/剧集'])
+    wrapper.unmount()
+  })
+
+  it('排除内容同样支持文件与目录的精确选择', async () => {
+    const wrapper = mountEditor({ excludePaths: ['/剧集/S01'] })
+    await flushPromises()
+
+    browseButton('排除内容').click()
+    await flushPromises()
+
+    expect(checkboxStateOf('剧集')).toEqual({ checked: false, indeterminate: true })
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    confirmButton().click()
+    await flushPromises()
+
+    const emitted = wrapper.emitted('update:excludePaths')!
+    expect(emitted[emitted.length - 1][0]).toEqual(['/剧集/S01', '/说明.txt'])
+    expect(wrapper.emitted('update:includePaths'), '排除内容不得影响同步内容').toBeUndefined()
+    wrapper.unmount()
   })
 })
 
@@ -247,7 +445,7 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
     const wrapper = mountEditor()
     await flushPromises()
 
-    expect(fieldLabelTexts()).toEqual(['同步内容', '排除目录', '排除规则'])
+    expect(fieldLabelTexts()).toEqual(['同步内容', '排除内容', '排除规则'])
     wrapper.unmount()
   })
 
@@ -278,7 +476,7 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
 
     for (const [name, label] of [
       ['同步内容使用说明', '同步内容'],
-      ['排除目录使用说明', '排除目录'],
+      ['排除内容使用说明', '排除内容'],
       ['排除规则使用说明', '排除规则'],
     ]) {
       const btn = helpButton(name)
@@ -302,22 +500,22 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
         '不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。',
     )
     // 另两处仍是折叠状态
-    expect(helpButton('排除目录使用说明').getAttribute('aria-expanded')).toBe('false')
-    expect(helpText('排除目录')).toBeNull()
+    expect(helpButton('排除内容使用说明').getAttribute('aria-expanded')).toBe('false')
+    expect(helpText('排除内容')).toBeNull()
     expect(helpButton('排除规则使用说明').getAttribute('aria-expanded')).toBe('false')
 
-    // 再开排除目录：两处同时展开，互不关闭
-    helpButton('排除目录使用说明').click()
+    // 再开排除内容：两处同时展开，互不关闭
+    helpButton('排除内容使用说明').click()
     await flushPromises()
-    expect(helpText('排除目录')).toBe('所选目录及其全部内容均不扫描、不参与同步。')
+    expect(helpText('排除内容')).toBe('选择文件只排除该文件；选择目录则连同其中全部内容一起排除，均不参与同步。')
     expect(helpText('同步内容')).toBeTruthy()
 
-    // 关掉同步内容：排除目录说明保持展开
+    // 关掉同步内容：排除内容说明保持展开
     helpButton('同步内容使用说明').click()
     await flushPromises()
     expect(helpButton('同步内容使用说明').getAttribute('aria-expanded')).toBe('false')
     expect(helpText('同步内容')).toBeNull()
-    expect(helpText('排除目录')).toBe('所选目录及其全部内容均不扫描、不参与同步。')
+    expect(helpText('排除内容')).toBe('选择文件只排除该文件；选择目录则连同其中全部内容一起排除，均不参与同步。')
     wrapper.unmount()
   })
 
@@ -325,7 +523,7 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
     const wrapper = mountEditor()
     await flushPromises()
 
-    const names = ['同步内容使用说明', '排除目录使用说明', '排除规则使用说明']
+    const names = ['同步内容使用说明', '排除内容使用说明', '排除规则使用说明']
     const caretOf = (name: string) => helpButton(name).querySelector<HTMLElement>('.help-caret')!
     const closedCaret = new Map<string, string>()
 
@@ -373,9 +571,9 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
 
     expect(wrapper.emitted('update:includePaths')![0][0]).toEqual(['/广告'])
 
-    const excludeClose = fieldBlock('排除目录')
+    const excludeClose = fieldBlock('排除内容')
         .querySelector<HTMLElement>('.path-tags .el-tag .el-tag__close')
-    expect(excludeClose, '排除目录标签应可关闭').toBeTruthy()
+    expect(excludeClose, '排除内容标签应可关闭').toBeTruthy()
     excludeClose!.click()
     await flushPromises()
 
@@ -739,7 +937,7 @@ describe('ShareIncludeExcludeEditor 正则规则', () => {
     expect(
         rulesBlock().textContent,
         '冗长的测试范围说明句已移除',
-    ).not.toContain('测试已添加规则（不含同步范围与精确排除目录）')
+    ).not.toContain('测试已添加规则（不含同步范围与精确排除内容）')
     expect(rulesBlock().querySelector('.rule-test-title'), '不应保留标题节点').toBeNull()
     expect(rulesBlock().textContent).toContain('相对分享根目录')
 
@@ -1246,6 +1444,76 @@ describe('ShareIncludeExcludeEditor 常用规则保存回读', () => {
     expect(savedConfig(0).share_sync.exclude_regex_preset_rules)
         .toEqual(['^/当前没有样本的目录/.*$'])
     expect(rules.validate, '保存词表不做试匹配，不要求命中样本').not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+})
+
+describe('ShareIncludeExcludeEditor 选择就绪与导航竞态', () => {
+  const DIR_FILES = Array.from({ length: 100 }, (_, i) => ({
+    fs_id: 10 + i,
+    is_dir: false,
+    path: `/剧集/${String(i).padStart(3, '0')}.mp4`,
+    size: 1,
+    name: `${String(i).padStart(3, '0')}.mp4`,
+  }))
+
+  interface Deferred<T> {
+    promise: Promise<T>
+    resolve: (value: T) => void
+  }
+
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((res) => {
+      resolve = res
+    })
+    return { promise, resolve }
+  }
+
+  function rootBreadcrumb(): HTMLElement {
+    const btn = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '根目录')
+    expect(btn, '选择器应有「根目录」面包屑').toBeTruthy()
+    return btn!
+  }
+
+  it('确定按钮跟随真实就绪：事务中禁用，导航取消后按旧选择恢复', async () => {
+    const pending = deferred<{ files: typeof DIR_FILES }>()
+    let dirCalls = 0
+    transfer.previewShareDir.mockImplementation(async () => {
+      dirCalls++
+      if (dirCalls === 1) return { files: DIR_FILES }
+      return pending.promise
+    })
+    const wrapper = mountEditor({ includePaths: ['/剧集'] })
+    await flushPromises()
+
+    browseButton('同步内容').click()
+    await flushPromises()
+    fileItem('剧集').click()
+    await flushPromises()
+
+    // 取消被目录覆盖的子项：需要展开全部分页，事务进行中就绪必须为 false
+    checkboxOf(fileItem('000.mp4'))!.click()
+    await flushPromises()
+    expect(document.body.textContent).toContain('正在展开目录')
+    expect((confirmButton() as HTMLButtonElement).disabled, '事务中不得确认').toBe(true)
+
+    // 事务未结束时导航：原子取消，旧选择不变，确定按钮按真实就绪恢复
+    rootBreadcrumb().click()
+    await flushPromises()
+    expect(document.body.textContent).not.toContain('正在展开目录')
+    expect((confirmButton() as HTMLButtonElement).disabled, '导航取消后应可确认旧选择').toBe(false)
+
+    // 迟到的展开结果不得改变就绪或选择
+    pending.resolve({ files: DIR_FILES })
+    await flushPromises()
+    expect((confirmButton() as HTMLButtonElement).disabled).toBe(false)
+
+    confirmButton().click()
+    await flushPromises()
+    const emitted = wrapper.emitted('update:includePaths')!
+    expect(emitted[emitted.length - 1][0], '确认写入的仍是原选择').toEqual(['/剧集'])
     wrapper.unmount()
   })
 })

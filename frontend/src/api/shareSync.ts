@@ -77,7 +77,7 @@ export interface ShareSubscription {
   exclude_patterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根）；命中的目录连同其中全部内容一起排除 */
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
@@ -104,7 +104,7 @@ export interface CreateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 排除正则（Rust 语法，整条路径匹配） */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets: SyncTarget[]
   conflict_strategy?: ConflictStrategy
@@ -122,7 +122,7 @@ export interface UpdateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 缺省 = 保留已存正则；显式 [] = 清空 */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets?: SyncTarget[]
   conflict_strategy?: ConflictStrategy
@@ -561,7 +561,7 @@ export async function getExcludeRuleCapabilities(): Promise<ExcludeRuleCapabilit
 /**
  * 校验排除规则，可选对一条相对分享根路径试匹配。
  *
- * 只覆盖请求里的两份规则列表（不含同步范围与精确排除目录）；规则非法时
+ * 只覆盖请求里的两份规则列表（不含同步范围与精确排除内容）；规则非法时
  * `valid:false` 且后端不会执行匹配。
  */
 export async function validateExcludeRules(

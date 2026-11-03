@@ -36,6 +36,16 @@ describe('ExcludeRuleHelp', () => {
     wrapper.unmount()
   })
 
+  it('说明里「排除内容」与 glob/正则规则并列且互相独立', () => {
+    for (const kind of ['glob', 'regex'] as const) {
+      const wrapper = mountHelp({ kind })
+      const text = wrapper.text()
+      expect(text, `${kind} 说明应提到「排除内容」`).toContain('排除内容')
+      expect(text, `${kind} 说明不应再提「排除目录」`).not.toContain('排除目录')
+      wrapper.unmount()
+    }
+  })
+
   it('glob 与 regex 说明都保持折叠前的纯文本块，只渲染一个根节点', () => {
     for (const kind of ['glob', 'regex'] as const) {
       const wrapper = mountHelp({ kind })

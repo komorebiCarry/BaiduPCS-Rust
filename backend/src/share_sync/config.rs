@@ -238,7 +238,8 @@ pub struct ShareSubscription {
     /// 排除正则列表（Rust 语法，整条路径匹配）；旧配置缺省为空。
     #[serde(default)]
     pub exclude_regex_patterns: Vec<String>,
-    /// 精确排除的目录路径（相对分享根）：连同全部内容排除，且不再递归列举。
+    /// 精确排除的文件或目录路径（相对分享根）：文件只排除自身，目录连同全部内容
+    /// 一起排除且不再递归列举。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
     /// 同步目标（至少 1 个）
@@ -542,7 +543,7 @@ pub struct CreateShareSubscriptionRequest {
     /// 排除正则列表（Rust 语法，整条路径匹配）；缺省为空。
     #[serde(default)]
     pub exclude_regex_patterns: Vec<String>,
-    /// 精确排除的目录路径（相对分享根）；缺省为空 = 不排除。
+    /// 精确排除的文件或目录路径（相对分享根）；缺省为空 = 不排除。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
     pub targets: Vec<SyncTarget>,
@@ -596,6 +597,7 @@ pub struct UpdateShareSubscriptionRequest {
     /// 缺省（字段缺失）= 保留已有正则规则；显式 `[]` = 清空。
     #[serde(default)]
     pub exclude_regex_patterns: Option<Vec<String>>,
+    /// 精确排除的文件或目录路径（相对分享根）；缺省 = 保留已有，显式 `[]` = 清空。
     #[serde(default)]
     pub exclude_paths: Option<Vec<String>>,
     #[serde(default)]
