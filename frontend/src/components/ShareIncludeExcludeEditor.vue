@@ -45,9 +45,7 @@
             @close="removeInclude(i)"
         >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
-      <p v-if="showIncludeHelp" class="field-help">
-        不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。
-      </p>
+      <p v-if="showIncludeHelp" class="field-help">{{ INCLUDE_HELP_TEXT }}</p>
       <div v-if="ownerLoggedIn === false" class="owner-offline-hint">
         订阅所属账号未登录，目录树预览不可用，请先登录该账号
       </div>
@@ -233,6 +231,18 @@
         destroy-on-close
         append-to-body
     >
+      <el-alert
+          v-if="followLostNotice"
+          class="follow-lost-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="followLostNotice.title"
+      >
+        <template #default>
+          <span class="follow-lost-desc">{{ followLostNotice.description }}</span>
+        </template>
+      </el-alert>
       <ShareFileSelector
           :key="pickerKey"
           :files="previewFiles"
@@ -245,6 +255,7 @@
           :empty-selection-means-all="pickerMode === 'include'"
           @update:selected-paths="onSelectedPaths"
           @update:selection-ready="onSelectionReady"
+          @update:follow-lost-dirs="onFollowLostDirs"
       />
       <template #footer>
         <span class="picker-hint">{{ pickerHint }}</span>
@@ -711,6 +722,7 @@ async function openPicker() {
   pendingPaths.value = [...props.includePaths]
   selectionReady.value = true
   pickerKey.value += 1
+  followLostDirs.value = []
   await loadPickerFiles()
 }
 
@@ -728,6 +740,7 @@ async function openExcludePicker() {
   pendingPaths.value = [...props.excludePaths]
   selectionReady.value = true
   pickerKey.value += 1
+  followLostDirs.value = []
   await loadPickerFiles()
 }
 
@@ -738,6 +751,48 @@ function onSelectedPaths(paths: string[]) {
 function onSelectionReady(ready: boolean) {
   selectionReady.value = ready
 }
+
+// 中文文案之间不能有模板换行带来的空格，因此拼接成一段
+const INCLUDE_HELP_TEXT = [
+  '不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。',
+  '在已整体选中的文件夹（或整个分享）里取消个别项目，会把它改为逐项选择，之后新增的内容不再自动同步；',
+  '只想跳过个别内容时，建议保留整体选择，改用「排除内容」。',
+].join('')
+
+/** 本次选择中被拆成逐项选择、且尚未重新整体勾选的目录（'' = 整个分享） */
+const followLostDirs = ref<string[]>([])
+
+function onFollowLostDirs(dirs: string[]) {
+  followLostDirs.value = [...dirs]
+}
+
+/** 最多列 3 个位置，其余折叠为「等 N 处」 */
+function describeFollowLostDirs(dirs: string[]): string {
+  const names = dirs.map((d) => (d === '' ? '整个分享' : `「${formatSharePathForDisplay(d)}」`))
+  if (names.length <= 3) return names.join('、')
+  return `${names.slice(0, 3).join('、')} 等 ${names.length} 处`
+}
+
+/**
+ * 取消整体选中目录里的个别项目后的提示：该目录被拆成逐项选择，之后新增的内容不会
+ * 再被自动同步 / 排除。目录被重新整体勾选后提示自动消失；不弹窗、不打断操作。
+ */
+const followLostNotice = computed<{ title: string; description: string } | null>(() => {
+  const dirs = followLostDirs.value
+  if (dirs.length === 0) return null
+  const where = describeFollowLostDirs(dirs)
+  if (pickerMode.value === 'exclude') {
+    return {
+      title: `${where}已改为逐项排除`,
+      description: '这些目录之后新增的内容不会再被自动排除。如需继续整体排除，请重新勾选该目录。',
+    }
+  }
+  return {
+    title: `${where}已改为逐项选择`,
+    description: '这些位置之后新增的内容将不再自动同步。如果只是想跳过个别内容、并让目录继续自动包含新内容，'
+        + '请点「取消」放弃本次修改，保留整体选择，改用「排除内容」排除不需要的项目。',
+  }
+})
 
 /** 选择器底部提示：整体分享、清空待确认或已选条目数 */
 const pickerHint = computed(() => {
@@ -894,6 +949,14 @@ function confirmPicker() {
   margin: 6px 0 0;
   font-size: 12px;
   color: var(--el-text-color-primary);
+}
+
+.follow-lost-alert {
+  margin-bottom: 10px;
+}
+
+.follow-lost-desc {
+  line-height: 1.5;
 }
 
 .picker-hint {

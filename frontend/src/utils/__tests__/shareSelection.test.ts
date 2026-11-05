@@ -11,6 +11,7 @@ import {
   resolveShareKey,
   selectSharePath,
   shareSelectionCovers,
+  shareSelectionCoversWhole,
   shareSelectionPaths,
   shareSelectionReady,
   shareSelectionTriState,
@@ -391,5 +392,62 @@ describe('shareSelection 取消后代', () => {
     const outcome = await deselectSharePath(state, '不存在的目录', load)
     expect(outcome.ok).toBe(false)
     expect(outcome.state.wholeShare).toBe(true)
+  })
+})
+
+describe('shareSelection 拆成逐项选择的目录（expandedDirs）', () => {
+  it('未发生展开时不报告：取消显式选中项、取消未被覆盖的后代', async () => {
+    const { load } = loaderOf({})
+    const explicit = await deselectSharePath(createShareSelection(['/剧集', '/说明.txt'], false), '说明.txt', load)
+    expect(explicit.ok).toBe(true)
+    expect(explicit.expandedDirs).toBeUndefined()
+
+    const partial = await deselectSharePath(createShareSelection(['/剧集/S01'], false), '剧集', load)
+    expect(partial.ok).toBe(true)
+    expect(partial.expandedDirs).toBeUndefined()
+  })
+
+  it('取消被目录覆盖的子项时报告该目录', async () => {
+    const { load } = loaderOf({
+      剧集: [entry('/剧集/01.mp4'), entry('/剧集/02.mp4')],
+    })
+    const outcome = await deselectSharePath(createShareSelection(['/剧集'], false), '剧集/01.mp4', load)
+    expect(outcome.ok).toBe(true)
+    expect(outcome.expandedDirs).toEqual(['剧集'])
+  })
+
+  it('沿祖先链展开时从外到内报告每一级目录', async () => {
+    const { load } = loaderOf({
+      A: [entry('/A/B', true), entry('/A/x.mp4')],
+      'A/B': [entry('/A/B/c.mp4'), entry('/A/B/d.mp4')],
+    })
+    const outcome = await deselectSharePath(createShareSelection(['/A'], false), 'A/B/c.mp4', load)
+    expect(outcome.ok).toBe(true)
+    expect(outcome.expandedDirs).toEqual(['A', 'A/B'])
+  })
+
+  it('整个分享下取消一项时报告整个分享（空 key）', async () => {
+    const { load } = loaderOf({
+      '': [entry('/剧集', true), entry('/说明.txt')],
+    })
+    const outcome = await deselectSharePath(createShareSelection([], true), '说明.txt', load)
+    expect(outcome.ok).toBe(true)
+    expect(outcome.expandedDirs).toEqual([''])
+  })
+
+  it('展开失败时不报告', async () => {
+    const { load } = loaderOf({})
+    const outcome = await deselectSharePath(createShareSelection(['/剧集'], false), '剧集/01.mp4', load)
+    expect(outcome.ok).toBe(false)
+    expect(outcome.expandedDirs).toBeUndefined()
+  })
+
+  it('shareSelectionCoversWhole：整个分享只认哨兵，目录认自身或祖先', () => {
+    expect(shareSelectionCoversWhole(createShareSelection([], true), '')).toBe(true)
+    expect(shareSelectionCoversWhole(createShareSelection(['/剧集', '/说明.txt'], true), '')).toBe(false)
+    const state = createShareSelection(['/A'], false)
+    expect(shareSelectionCoversWhole(state, 'A')).toBe(true)
+    expect(shareSelectionCoversWhole(state, 'A/B')).toBe(true)
+    expect(shareSelectionCoversWhole(createShareSelection(['/A/B/d.mp4'], false), 'A/B')).toBe(false)
   })
 })

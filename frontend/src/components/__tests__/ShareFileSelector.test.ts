@@ -1863,3 +1863,119 @@ describe('ShareFileSelector 分页请求所有权', () => {
     }
   })
 })
+
+describe('ShareFileSelector 拆成逐项选择的目录提示（update:followLostDirs）', () => {
+  function emittedFollowLost(wrapper: ReturnType<typeof mountPathSelector>): string[] | undefined {
+    const emitted = wrapper.emitted('update:followLostDirs')
+    const last = emitted?.[emitted.length - 1]
+    return last?.[0] as string[] | undefined
+  }
+
+  function clickCheckbox(name: string) {
+    itemByName(name).querySelector<HTMLInputElement>('input[type="checkbox"]')!.click()
+  }
+
+  it('取消已选目录里的子项后报告该目录；重新勾选目录后清空', async () => {
+    transfer.previewShareDir.mockResolvedValue({
+      files: [
+        { fs_id: 3, is_dir: false, path: '/剧集/01.mp4', size: 5, name: '01.mp4' },
+        { fs_id: 4, is_dir: false, path: '/剧集/02.mp4', size: 5, name: '02.mp4' },
+      ],
+    })
+    const wrapper = mountPathSelector({ initialSelectedPaths: ['/剧集'] })
+    try {
+      await flushPromises()
+      expect(emittedFollowLost(wrapper), '打开时没有任何提示').toBeUndefined()
+
+      itemByName('剧集').click()
+      await flushPromises()
+      clickCheckbox('01.mp4')
+      await flushPromises()
+      expect(emittedPaths(wrapper)).toEqual(['/剧集/02.mp4'])
+      expect(emittedFollowLost(wrapper)).toEqual(['/剧集'])
+
+      // 回到根目录重新整体勾选「剧集」：目录再次自动包含新内容，提示消失
+      const rootLink = document.body.querySelector<HTMLElement>('.breadcrumb button')
+      expect(rootLink, '子目录下应有返回根目录的面包屑').toBeTruthy()
+      rootLink!.click()
+      await flushPromises()
+      clickCheckbox('剧集')
+      await flushPromises()
+      expect(emittedPaths(wrapper)).toEqual(['/剧集'])
+      expect(emittedFollowLost(wrapper)).toEqual([])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('整个分享下取消一项后报告整个分享（空字符串）', async () => {
+    const wrapper = mountPathSelector({ emptySelectionMeansAll: true })
+    try {
+      await flushPromises()
+      clickCheckbox('说明.txt')
+      await flushPromises()
+      expect(emittedPaths(wrapper)).toEqual(['/剧集'])
+      expect(emittedFollowLost(wrapper)).toEqual([''])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('拆开后目录下已一项不选时不再报告', async () => {
+    transfer.previewShareDir.mockResolvedValue({
+      files: [
+        { fs_id: 3, is_dir: false, path: '/剧集/01.mp4', size: 5, name: '01.mp4' },
+        { fs_id: 4, is_dir: false, path: '/剧集/02.mp4', size: 5, name: '02.mp4' },
+      ],
+    })
+    const wrapper = mountPathSelector({ initialSelectedPaths: ['/剧集', '/说明.txt'] })
+    try {
+      await flushPromises()
+      itemByName('剧集').click()
+      await flushPromises()
+      clickCheckbox('01.mp4')
+      await flushPromises()
+      expect(emittedFollowLost(wrapper)).toEqual(['/剧集'])
+      clickCheckbox('02.mp4')
+      await flushPromises()
+      expect(emittedPaths(wrapper)).toEqual(['/说明.txt'])
+      expect(emittedFollowLost(wrapper)).toEqual([])
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('取消显式选中的条目或新增勾选都不报告', async () => {
+    const wrapper = mountPathSelector({ initialSelectedPaths: ['/剧集'] })
+    try {
+      await flushPromises()
+      clickCheckbox('说明.txt')
+      await flushPromises()
+      clickCheckbox('说明.txt')
+      await flushPromises()
+      clickCheckbox('剧集')
+      await flushPromises()
+      expect(emittedPaths(wrapper)).toEqual([])
+      expect(emittedFollowLost(wrapper)).toBeUndefined()
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  it('展开失败时不报告', async () => {
+    const files = Array.from({ length: 100 }, (_, i) => ({
+      fs_id: i + 10, is_dir: false, path: `/文件${i}.txt`, size: 1, name: `文件${i}.txt`,
+    }))
+    files[0] = { fs_id: 999, is_dir: false, path: '/说明.txt', size: 1, name: '说明.txt' }
+    transfer.previewShareFiles.mockRejectedValue(new Error('网络中断'))
+    const wrapper = mountPathSelector({ files, emptySelectionMeansAll: true })
+    try {
+      await flushPromises()
+      clickCheckbox('说明.txt')
+      await flushPromises()
+      expect(emittedFollowLost(wrapper)).toBeUndefined()
+    } finally {
+      wrapper.unmount()
+    }
+  })
+})

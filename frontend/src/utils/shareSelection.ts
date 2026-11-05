@@ -45,6 +45,12 @@ export interface ShareDeselectOutcome {
   state: ShareSelectionState
   /** 失败原因 */
   error?: string
+  /**
+   * 成功且发生了「覆盖者 → 剩余兄弟」展开时，按从外到内的顺序列出被拆成逐项选择的
+   * 目录 key（整个分享哨兵记为 ''）。这些目录不再整体选中，之后新增的内容不会被
+   * 自动覆盖；未发生展开时缺省。
+   */
+  expandedDirs?: string[]
 }
 
 /** 根目录别名无法唯一对应时的提示 */
@@ -438,8 +444,10 @@ export async function deselectSharePath(
   }
 
   const entries: ShareSelectionEntry[] = []
+  const expandedDirs: string[] = []
   let levelKey = outermost ?? ''
   for (;;) {
+    expandedDirs.push(levelKey)
     let children: ShareSelectionEntry[]
     try {
       children = await loadChildren(levelKey)
@@ -480,5 +488,16 @@ export async function deselectSharePath(
     next.selected.add(entry.key)
     if (!next.rawPaths.has(entry.key)) next.rawPaths.set(entry.key, entry.raw)
   }
-  return { ok: true, state: next }
+  return { ok: true, state: next, expandedDirs }
+}
+
+/**
+ * 目录（或整个分享哨兵 ''）当前是否仍被整体选中。
+ *
+ * 用于判断此前被拆成逐项选择的目录是否已被用户重新整体勾选：整体选中时其后续新增
+ * 内容会再次被自动覆盖。
+ */
+export function shareSelectionCoversWhole(state: ShareSelectionState, dirKey: string): boolean {
+  if (dirKey === '') return state.wholeShare
+  return shareSelectionCovers(state, dirKey)
 }

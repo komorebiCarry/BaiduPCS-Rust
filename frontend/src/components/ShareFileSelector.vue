@@ -129,6 +129,7 @@ import {
   selectSharePath,
   SHARE_ALIAS_CONFLICT_MESSAGE,
   shareSelectionCovers,
+  shareSelectionCoversWhole,
   shareSelectionPaths,
   shareSelectionReady,
   shareSelectionTriState,
@@ -184,6 +185,11 @@ const emit = defineEmits<{
   'update:selectedFiles': [files: SharedFileInfo[]]
   'update:selectedPaths': [paths: string[]]
   'update:selectionReady': [ready: boolean]
+  /**
+   * 因「取消整体选中目录里的个别项目」而被拆成逐项选择、且尚未被重新整体勾选的目录
+   * （展示用路径，如 `/剧集/S01`；整个分享记为 `''`）。仅路径选择模式发出。
+   */
+  'update:followLostDirs': [dirs: string[]]
 }>()
 
 // 目录导航状态
@@ -381,6 +387,45 @@ function refreshRootAliases(files: SharedFileInfo[] = currentRootFiles()) {
   selectionState.value = rehydrateShareSelection(selectionState.value, aliases)
 }
 
+/**
+ * 被拆成逐项选择的目录 key（从外到内、去重；整个分享为 ''）。
+ *
+ * 取消整体选中目录里的个别项目时，选择会把该目录替换成「剩余兄弟」的显式列表，
+ * 目录之后新增的内容不再被自动覆盖。这里记下这些目录，供父组件提示用户；目录被
+ * 重新整体勾选或其下已一项不选后自动从提示中消失。
+ */
+const followLostKeys = ref<string[]>([])
+
+const activeFollowLostDirs = computed(() => {
+  if (!pathMode.value) return []
+  const state = selectionState.value
+  const aliases = rootAliases.value
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const raw of followLostKeys.value) {
+    const key = raw === '' ? '' : resolveShareKey(raw, aliases)
+    if (seen.has(key)) continue
+    seen.add(key)
+    if (shareSelectionCoversWhole(state, key)) continue
+    // 目录下已一项不选：不存在「逐项选择」，也就无所谓自动跟随
+    const nothingLeft = key === ''
+      ? state.selected.size === 0
+      : shareSelectionTriState(state, key, true) === 'unchecked'
+    if (nothingLeft) continue
+    out.push(key === '' ? '' : `/${key}`)
+  }
+  return out
+})
+
+watch(
+  activeFollowLostDirs,
+  (dirs, prev) => {
+    if (!pathMode.value) return
+    if (prev && dirs.length === prev.length && dirs.every((d, i) => d === prev[i])) return
+    emit('update:followLostDirs', [...dirs])
+  },
+)
+
 watch(
   [initialPathsSignature, emptyMeansAll, pathMode],
   () => {
@@ -395,6 +440,7 @@ watch(
     )
     selectionError.value = ''
     selectionBusy.value = false
+    followLostKeys.value = []
     emitSelection()
   },
   { immediate: true },
@@ -641,6 +687,11 @@ async function deselectPath(key: string) {
       return
     }
     selectionState.value = rehydrateShareSelection(outcome.state, rootAliases.value)
+    if (outcome.expandedDirs?.length) {
+      const known = new Set(followLostKeys.value)
+      const added = outcome.expandedDirs.filter((key) => !known.has(key))
+      if (added.length > 0) followLostKeys.value = [...followLostKeys.value, ...added]
+    }
   } catch (error) {
     if (generation !== selectionGeneration) return
     const message = error instanceof Error && error.message

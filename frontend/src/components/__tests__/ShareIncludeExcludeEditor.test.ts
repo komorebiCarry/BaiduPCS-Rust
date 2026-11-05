@@ -517,7 +517,9 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
 
     expect(helpButton('同步内容使用说明').getAttribute('aria-expanded')).toBe('true')
     expect(helpText('同步内容')).toBe(
-        '不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。',
+        '不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。'
+        + '在已整体选中的文件夹（或整个分享）里取消个别项目，会把它改为逐项选择，之后新增的内容不再自动同步；'
+        + '只想跳过个别内容时，建议保留整体选择，改用「排除内容」。',
     )
     // 另两处仍是折叠状态
     expect(helpButton('排除内容使用说明').getAttribute('aria-expanded')).toBe('false')
@@ -1534,6 +1536,140 @@ describe('ShareIncludeExcludeEditor 选择就绪与导航竞态', () => {
     await flushPromises()
     const emitted = wrapper.emitted('update:includePaths')!
     expect(emitted[emitted.length - 1][0], '确认写入的仍是原选择').toEqual(['/剧集'])
+    wrapper.unmount()
+  })
+})
+
+describe('ShareIncludeExcludeEditor 拆成逐项选择的提示', () => {
+  function followLostAlert(): HTMLElement | null {
+    return document.body.querySelector<HTMLElement>('.follow-lost-alert')
+  }
+
+  it('打开选择器、新增勾选或取消显式选中项时都不提示', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集'] })
+    await flushPromises()
+    browseButton('同步内容').click()
+    await flushPromises()
+    expect(followLostAlert()).toBeNull()
+
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    expect(followLostAlert()).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('整个分享下取消一项时提示整个分享改为逐项选择，并建议改用排除内容', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+    browseButton('同步内容').click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+
+    const alert = followLostAlert()
+    expect(alert, '应出现提示').toBeTruthy()
+    const text = alert!.textContent ?? ''
+    expect(text).toContain('整个分享已改为逐项选择')
+    expect(text).toContain('之后新增的内容将不再自动同步')
+    expect(text).toContain('「排除内容」')
+    // 只是提示，不拦截确认
+    expect((confirmButton() as HTMLButtonElement).disabled).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('已选目录里取消子项时提示该目录；重新整体勾选后提示消失', async () => {
+    const wrapper = mountEditor({ includePaths: ['/剧集'] })
+    await flushPromises()
+    browseButton('同步内容').click()
+    await flushPromises()
+    fileItem('剧集').click()
+    await flushPromises()
+    checkboxOf(fileItem('01.mp4'))!.click()
+    await flushPromises()
+
+    expect(followLostAlert()?.textContent ?? '').toContain('「/剧集」已改为逐项选择')
+
+    document.body.querySelector<HTMLElement>('.breadcrumb button')!.click()
+    await flushPromises()
+    checkboxOf(fileItem('剧集'))!.click()
+    await flushPromises()
+    expect(followLostAlert()).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('提示中的目录去掉合成命名空间前缀', async () => {
+    // 根列表本身带合成命名空间时，提示与已选标签一致，只展示逻辑路径
+    transfer.previewShareFiles.mockResolvedValue({
+      files: [
+        { fs_id: 1, is_dir: true, path: '/sharelink1-2/剧集', size: 0, name: '剧集' },
+        { fs_id: 2, is_dir: false, path: '/sharelink1-2/说明.txt', size: 10, name: '说明.txt' },
+      ],
+      share_info: SHARE_INFO,
+    })
+    transfer.previewShareDir.mockResolvedValue({
+      files: [
+        { fs_id: 11, is_dir: false, path: '/sharelink1-2/剧集/01.mp4', size: 5, name: '01.mp4' },
+        { fs_id: 12, is_dir: false, path: '/sharelink1-2/剧集/02.mp4', size: 5, name: '02.mp4' },
+      ],
+    })
+    const wrapper = mountEditor({ includePaths: ['/sharelink1-2/剧集'] })
+    await flushPromises()
+    browseButton('同步内容').click()
+    await flushPromises()
+    fileItem('剧集').click()
+    await flushPromises()
+    checkboxOf(fileItem('01.mp4'))!.click()
+    await flushPromises()
+
+    const text = followLostAlert()?.textContent ?? ''
+    expect(text).toContain('「/剧集」已改为逐项选择')
+    expect(text).not.toContain('sharelink')
+    wrapper.unmount()
+  })
+
+  it('取消后重新打开选择器不残留上一次的提示', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+    browseButton('同步内容').click()
+    await flushPromises()
+    checkboxOf(fileItem('说明.txt'))!.click()
+    await flushPromises()
+    expect(followLostAlert()).toBeTruthy()
+
+    cancelButton().click()
+    await flushPromises()
+    browseButton('同步内容').click()
+    await flushPromises()
+    expect(followLostAlert()).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('排除内容里取消被选中目录的子项时使用排除语义的文案', async () => {
+    const wrapper = mountEditor({ excludePaths: ['/剧集'] })
+    await flushPromises()
+    browseButton('排除内容').click()
+    await flushPromises()
+    fileItem('剧集').click()
+    await flushPromises()
+    checkboxOf(fileItem('01.mp4'))!.click()
+    await flushPromises()
+
+    const text = followLostAlert()?.textContent ?? ''
+    expect(text).toContain('「/剧集」已改为逐项排除')
+    expect(text).toContain('之后新增的内容不会再被自动排除')
+    expect(text).not.toContain('自动同步')
+    wrapper.unmount()
+  })
+
+  it('同步内容使用说明提到取消个别项目的影响', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+    helpButton('同步内容使用说明').click()
+    await flushPromises()
+    expect(helpText('同步内容')).toContain('之后新增的内容不再自动同步')
+    expect(helpText('同步内容')).toContain('「排除内容」')
     wrapper.unmount()
   })
 })

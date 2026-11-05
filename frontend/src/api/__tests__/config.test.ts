@@ -12,7 +12,7 @@ import {
 function rustConst(name: string, pattern: RegExp): string {
   const m = pattern.exec(backendConfigRs)
   expect(m, `后端应定义 ${name}`).toBeTruthy()
-  return m![1]
+  return m![1].replace(/\r\n/g, '\n')
 }
 
 describe('通知配置与后端保持一致', () => {
