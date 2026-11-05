@@ -68,6 +68,7 @@ vi.mock('@/api/file', () => ({
   formatFileSize: vi.fn((size: number) => `${size}B`),
   formatTime: vi.fn(() => '2026-04-10 00:00:00'),
   createFolder: vi.fn(),
+  renameFile: vi.fn(),
   joinPath: vi.fn((parent: string, name: string) => (parent === '/' ? `/${name}` : `${parent}/${name}`)),
   basename: vi.fn((p: string) => p.slice(p.lastIndexOf('/') + 1)),
   dirname: vi.fn((p: string) => (p.lastIndexOf('/') <= 0 ? '/' : p.slice(0, p.lastIndexOf('/')))),
@@ -864,6 +865,151 @@ describe('FilesView 上传跳过秒传', () => {
     // 未传（旧调用方式）→ 不带该字段，由后端跟随全局设置
     await vm.handleFilePickerSelect(file, false)
     expect(vi.mocked(createUpload).mock.calls[2][0].skip_rapid_upload).toBeUndefined()
+    wrapper.unmount()
+  })
+})
+
+describe('FilesView 新建文件夹/重命名 回车提交', () => {
+  // 回归：对话框里的 el-form 只有一个输入框，回车会触发浏览器"隐式提交"→ 整页刷新回到根目录，
+  // 而且 @keyup.enter 在刷新开始后才触发，请求发不出去。修复后回车走表单 submit（已 preventDefault）。
+  function mountFilesView() {
+    return mount(FilesView, {
+      attachTo: document.body,
+      global: {
+        plugins: [ElementPlus],
+        stubs: {
+          'el-table': true,
+          'el-table-column': true,
+          FilePickerModal: true,
+          TransferDialog: true,
+          ShareDialog: true,
+          ShareDirectDownloadDialog: true,
+          NetdiskFolderPickerModal: true,
+        },
+      },
+    })
+  }
+
+  async function flush() {
+    for (let i = 0; i < 5; i++) {
+      await Promise.resolve()
+      await nextTick()
+    }
+  }
+
+  function dialogForm(placeholder: string) {
+    const input = document.body.querySelector<HTMLInputElement>(`input[placeholder="${placeholder}"]`)
+    expect(input, `输入框 ${placeholder}`).toBeTruthy()
+    const form = input!.closest('form')
+    expect(form, `${placeholder} 所在的 form`).toBeTruthy()
+    return { input: input!, form: form! }
+  }
+
+  function submit(form: HTMLFormElement) {
+    const event = new Event('submit', { bubbles: true, cancelable: true })
+    form.dispatchEvent(event)
+    return event
+  }
+
+  afterEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  it('新建文件夹：表单提交（回车）阻止原生刷新并创建到当前目录，进行中不重复提交', async () => {
+    const { createFolder } = await import('@/api/file')
+    vi.mocked(createFolder).mockReset()
+    let resolveCreate!: () => void
+    vi.mocked(createFolder).mockImplementation(
+      () => new Promise((resolve) => { resolveCreate = () => resolve({} as never) }),
+    )
+
+    const wrapper = mountFilesView()
+    await flush()
+    // @ts-expect-error setup 内部状态
+    wrapper.vm.currentDir = '/sub'
+    // @ts-expect-error setup 内部状态
+    wrapper.vm.createFolderDialogVisible = true
+    await flush()
+    // @ts-expect-error setup 内部状态
+    wrapper.vm.createFolderForm.folderName = 'newdir'
+    await flush()
+
+    const { input, form } = dialogForm('请输入文件夹名称')
+    // 输入框上不再挂 keyup.enter（否则回车会与表单 submit 重复触发）
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+    await flush()
+    expect(createFolder).not.toHaveBeenCalled()
+
+    const event = submit(form)
+    expect(event.defaultPrevented).toBe(true)
+    submit(form) // 请求未返回时再次回车
+    await flush()
+    expect(createFolder).toHaveBeenCalledTimes(1)
+    expect(createFolder).toHaveBeenCalledWith('/sub/newdir')
+
+    resolveCreate()
+    await flush()
+    // @ts-expect-error setup 内部状态
+    expect(wrapper.vm.createFolderDialogVisible).toBe(false)
+    // @ts-expect-error setup 内部状态
+    expect(wrapper.vm.currentDir).toBe('/sub')
+    wrapper.unmount()
+  })
+
+  it('新建文件夹：名称为空时回车不提交、不刷新', async () => {
+    const { createFolder } = await import('@/api/file')
+    vi.mocked(createFolder).mockReset()
+    const wrapper = mountFilesView()
+    await flush()
+    // @ts-expect-error setup 内部状态
+    wrapper.vm.createFolderDialogVisible = true
+    await flush()
+    const event = submit(dialogForm('请输入文件夹名称').form)
+    await flush()
+    expect(event.defaultPrevented).toBe(true)
+    expect(createFolder).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('重命名：表单提交（回车）阻止原生刷新并调用重命名，进行中不重复提交', async () => {
+    const { renameFile } = await import('@/api/file')
+    vi.mocked(renameFile).mockReset()
+    let resolveRename!: () => void
+    vi.mocked(renameFile).mockImplementation(
+      () => new Promise((resolve) => {
+        resolveRename = () => resolve({ kind: 'success', taskid: null, total: 1, list: [] } as never)
+      }),
+    )
+
+    const wrapper = mountFilesView()
+    await flush()
+    // @ts-expect-error setup 内部方法
+    wrapper.vm.handleSingleRename({
+      fs_id: 7, path: '/sub/old.txt', server_filename: 'old.txt', size: 1, isdir: 0, category: 6,
+      server_ctime: 0, server_mtime: 0, local_ctime: 0, local_mtime: 0,
+      is_encrypted: false, is_encrypted_folder: false,
+    })
+    await flush()
+    // @ts-expect-error setup 内部状态
+    wrapper.vm.renameNewName = 'new.txt'
+    await flush()
+
+    const { input, form } = dialogForm('输入新名称')
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+    await flush()
+    expect(renameFile).not.toHaveBeenCalled()
+
+    const event = submit(form)
+    expect(event.defaultPrevented).toBe(true)
+    submit(form)
+    await flush()
+    expect(renameFile).toHaveBeenCalledTimes(1)
+    expect(renameFile).toHaveBeenCalledWith({ path: '/sub/old.txt', newname: 'new.txt', id: 7 })
+
+    resolveRename()
+    await flush()
+    // @ts-expect-error setup 内部状态
+    expect(wrapper.vm.renameDialogVisible).toBe(false)
     wrapper.unmount()
   })
 })

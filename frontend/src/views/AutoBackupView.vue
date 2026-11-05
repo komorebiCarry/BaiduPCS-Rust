@@ -1139,7 +1139,7 @@ watch(hasActiveTask, () => {
 
     <!-- 创建配置对话框 -->
     <el-dialog v-model="showCreateDialog" title="新建备份配置" width="500px" :close-on-click-modal="false">
-      <el-form label-position="top">
+      <el-form label-position="top" @submit.prevent>
         <!-- 多账号归属选择 -->
         <el-form-item v-if="authStore.hasMultipleAccounts" label="归属账号">
           <AccountSelect v-model="newConfigOwnerUid" placeholder="使用当前活跃账号" style="width: 100%" />

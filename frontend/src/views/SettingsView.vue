@@ -54,6 +54,7 @@
                   :rules="rules"
                   label-width="140px"
                   label-position="left"
+                  @submit.prevent
               >
                 <!-- 账号管理 -->
                 <div id="section-accounts">

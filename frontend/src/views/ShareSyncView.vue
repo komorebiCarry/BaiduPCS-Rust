@@ -357,7 +357,7 @@
         width="640px"
         @close="resetForm"
     >
-      <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef">
+      <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef" @submit.prevent>
         <el-form-item label="名称" prop="name">
           <el-input v-model="form.name" placeholder="如：剧集合集同步" />
         </el-form-item>

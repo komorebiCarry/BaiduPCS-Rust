@@ -396,12 +396,15 @@
         width="500px"
         @close="handleDialogClose"
     >
-      <el-form :model="createFolderForm" label-width="80px">
+      <!--
+        表单里只有一个输入框时，浏览器会把回车当作"隐式提交"，整页刷新（页面状态丢失 → 回到根目录），
+        所以必须 @submit.prevent；回车创建也走表单 submit（而不是 keyup.enter，后者在刷新开始后才触发）
+      -->
+      <el-form :model="createFolderForm" label-width="80px" @submit.prevent="handleCreateFolder">
         <el-form-item label="文件夹名">
           <el-input
               v-model="createFolderForm.folderName"
               placeholder="请输入文件夹名称"
-              @keyup.enter="handleCreateFolder"
               autofocus
           />
         </el-form-item>
@@ -500,7 +503,8 @@
         width="500px"
         @close="resetRenameDialog"
     >
-      <el-form label-width="80px">
+      <!-- 同新建文件夹：单输入框表单回车会整页刷新，必须 @submit.prevent，并由 submit 触发重命名 -->
+      <el-form label-width="80px" @submit.prevent="handleRenameConfirm">
         <el-form-item label="原名称">
           <el-text>{{ renameTarget?.server_filename }}</el-text>
         </el-form-item>
@@ -509,7 +513,6 @@
               v-model="renameNewName"
               placeholder="输入新名称"
               autofocus
-              @keyup.enter="handleRenameConfirm"
           />
         </el-form-item>
         <el-form-item label="所在目录">
@@ -1111,6 +1114,8 @@ function handleDialogClose() {
 
 // 创建文件夹
 async function handleCreateFolder() {
+  // 回车与按钮可能连续触发，创建中不重复提交
+  if (creatingFolder.value) return
   const folderName = createFolderForm.value.folderName.trim()
 
   // 验证文件夹名
@@ -2063,7 +2068,7 @@ function resetRenameDialog() {
 }
 
 async function handleRenameConfirm() {
-  if (!renameTarget.value) return
+  if (!renameTarget.value || renameSubmitting.value) return
   if (renameNameError.value) {
     ElMessage.error(renameNameError.value)
     return

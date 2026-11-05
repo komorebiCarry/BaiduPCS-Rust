@@ -212,7 +212,7 @@
         :fullscreen="isMobile"
         @close="resetAddForm"
     >
-      <el-form :model="addForm" label-width="100px" :label-position="isMobile ? 'top' : 'right'">
+      <el-form :model="addForm" label-width="100px" :label-position="isMobile ? 'top' : 'right'" @submit.prevent>
         <!--
           🔥
           CloudDl 收紧为 active-only（与 SharesView 同语义），UI 不再展示账号维度。
