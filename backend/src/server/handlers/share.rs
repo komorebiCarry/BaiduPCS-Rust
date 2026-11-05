@@ -107,10 +107,53 @@ pub struct ModifyShareExpireResult {
 pub struct ShareListData {
     /// 分享记录列表
     pub list: Vec<ShareRecordData>,
-    /// 总数
+    /// 总数（百度 `/share/record` 实际不返回，通常为 0；前端不要依赖）
     pub total: u32,
+    /// 本页条数（百度 `count`，缺失时为 list 长度）
+    pub count: usize,
+    /// 是否还有下一页（百度 `nextpage` > 0）
+    pub has_more: bool,
+    /// 百度返回的下一页页码（0 = 没有下一页）
+    pub nextpage: i64,
     /// 当前页码
     pub page: u32,
+}
+
+/// 百度分享列表响应 → API 响应（`expiredTime` 统一转成过期时间点）
+fn share_list_data(
+    response: crate::netdisk::ShareListResponse,
+    page: u32,
+    now: i64,
+) -> ShareListData {
+    let count = response.page_count();
+    let has_more = response.has_more();
+    let nextpage = response.nextpage.unwrap_or(0);
+    let list: Vec<ShareRecordData> = response
+        .list
+        .into_iter()
+        .map(|record| ShareRecordData {
+            expired_time: record.expire_at(now),
+            share_id: record.share_id,
+            fs_ids: record.fs_ids,
+            shortlink: record.shortlink,
+            status: record.status,
+            public: record.public,
+            typical_category: record.typical_category,
+            typical_path: record.typical_path,
+            expired_type: record.expired_type,
+            view_count: record.view_count,
+            download_count: record.download_count,
+            transfer_count: record.transfer_count,
+        })
+        .collect();
+    ShareListData {
+        list,
+        total: response.total,
+        count,
+        has_more,
+        nextpage,
+        page,
+    }
 }
 
 /// 分享记录数据（用于API响应）
@@ -575,35 +618,12 @@ pub async fn get_share_list(
     match client.share_list(params.page).await {
         Ok(response) => {
             if response.is_success() {
-                // 转换为API响应格式
                 // 百度返回的 expiredTime 是剩余秒数，这里统一转成过期时间点
-                let now = chrono::Utc::now().timestamp();
-                let list: Vec<ShareRecordData> = response
-                    .list
-                    .into_iter()
-                    .map(|record| ShareRecordData {
-                        expired_time: record.expire_at(now),
-                        share_id: record.share_id,
-                        fs_ids: record.fs_ids,
-                        shortlink: record.shortlink,
-                        status: record.status,
-                        public: record.public,
-                        typical_category: record.typical_category,
-                        typical_path: record.typical_path,
-                        expired_type: record.expired_type,
-                        view_count: record.view_count,
-                        download_count: record.download_count,
-                        transfer_count: record.transfer_count,
-                    })
-                    .collect();
-
-                let data = ShareListData {
-                    list,
-                    total: response.total,
-                    page: params.page,
-                };
-
-                info!("获取分享列表成功: total={}", data.total);
+                let data = share_list_data(response, params.page, chrono::Utc::now().timestamp());
+                info!(
+                    "获取分享列表成功: page={}, count={}, has_more={}",
+                    data.page, data.count, data.has_more
+                );
                 Ok(Json(ApiResponse::success(data)))
             } else {
                 error!(
@@ -693,6 +713,31 @@ mod tests {
             share_ids: ids,
             days,
         }
+    }
+
+    #[test]
+    fn share_list_data_uses_count_and_nextpage() {
+        let resp: crate::netdisk::ShareListResponse = serde_json::from_str(include_str!(
+            "../../netdisk/testdata/share_record_page1.json"
+        ))
+        .unwrap();
+        let data = share_list_data(resp, 1, 1_761_000_000);
+        assert_eq!(
+            (data.total, data.count, data.has_more, data.nextpage),
+            (0, 4, false, 0)
+        );
+        assert_eq!(data.list[0].expired_time, 1_764_592_000);
+        let v = serde_json::to_value(&data).unwrap();
+        assert_eq!(v["count"], 4);
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["list"][3]["typicalPath"], "分享的文件已被删除");
+        assert_eq!(v["list"][1]["downloadCount"], 0);
+
+        let more: crate::netdisk::ShareListResponse =
+            serde_json::from_str(r#"{"errno":0,"list":[],"count":50,"nextpage":2}"#).unwrap();
+        let data = share_list_data(more, 1, 0);
+        assert!(data.has_more);
+        assert_eq!(data.nextpage, 2);
     }
 
     #[test]

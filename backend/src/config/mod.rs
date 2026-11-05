@@ -93,6 +93,12 @@ pub struct UiConfig {
     /// 顶部栏显示多账号横向快捷切换条（点击头像一键切换账号）
     #[serde(default)]
     pub account_quick_bar: bool,
+    /// 「我的分享」里用浅色底高亮失效分享（文件已删除 / 已过期）
+    #[serde(default = "default_true")]
+    pub highlight_dead_shares: bool,
+    /// 失效分享只保留「取消分享」操作（提取码 / 复制链接 / 修改有效期置灰）
+    #[serde(default)]
+    pub disable_dead_share_actions: bool,
 }
 
 impl Default for UiConfig {
@@ -100,6 +106,8 @@ impl Default for UiConfig {
         Self {
             remember_netdisk_path: true,
             account_quick_bar: false,
+            highlight_dead_shares: true,
+            disable_dead_share_actions: false,
         }
     }
 }
@@ -1803,14 +1811,25 @@ port = 1"
         let legacy: UiConfig = toml::from_str("").unwrap();
         assert!(legacy.remember_netdisk_path);
         assert!(!legacy.account_quick_bar);
+        assert!(legacy.highlight_dead_shares, "失效分享高亮默认开启");
+        assert!(
+            !legacy.disable_dead_share_actions,
+            "默认不禁用失效分享的操作"
+        );
 
         let saved: UiConfig = toml::from_str(
             "remember_netdisk_path = false
-account_quick_bar = true",
+account_quick_bar = true
+highlight_dead_shares = false
+disable_dead_share_actions = true",
         )
         .unwrap();
         assert!(!saved.remember_netdisk_path);
         assert!(saved.account_quick_bar);
+        assert!(!saved.highlight_dead_shares);
+        assert!(saved.disable_dead_share_actions);
+        let back: UiConfig = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(back, saved);
     }
 
     #[test]

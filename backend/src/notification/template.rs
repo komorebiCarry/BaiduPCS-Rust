@@ -32,6 +32,7 @@ fn lookup(n: &Notification, key: &str) -> Option<String> {
         "account_uid" => n.account_uid.map(|u| u.to_string()).unwrap_or_default(),
         "time" => n.time.format("%Y-%m-%d %H:%M:%S").to_string(),
         "timestamp" => n.time.timestamp().to_string(),
+        "files" => n.files.clone(),
         _ => return None,
     })
 }
@@ -116,6 +117,18 @@ mod tests {
         assert_eq!(v["account_uid"], "42");
         assert_eq!(v["level"], "error");
         assert!(v["timestamp"].is_i64());
+    }
+
+    #[test]
+    fn test_files_placeholder_json_escaped() {
+        let n = sample().with_files("a \"1\".mp4\nb.mkv");
+        let body = render(DEFAULT_WEBHOOK_BODY_TEMPLATE, &n, Escape::Json);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["files"], "a \"1\".mp4\nb.mkv");
+        // 未填写时为空串
+        let body = render(DEFAULT_WEBHOOK_BODY_TEMPLATE, &sample(), Escape::Json);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["files"], "");
     }
 
     #[test]

@@ -809,7 +809,9 @@ impl ShareSyncManager {
             None => "重启续跑：本批下载存在失败项".to_string(),
         };
 
-        let items = self.persistence.list_run_items(run_id).unwrap_or_default();
+        let mut items = self.persistence.list_run_items(run_id).unwrap_or_default();
+        // 被排除条目只是记录（没有执行动作），不参与收尾统计
+        items.retain(|it| it.status != RunItemStatus::Excluded.as_str());
         let mut failed = 0usize;
         let mut completed = 0usize;
         let mut skipped = 0usize;
@@ -1800,7 +1802,7 @@ impl ShareSyncManager {
             .persistence
             .update_run_phase(&run_id, RUN_PHASE_SCANNING);
 
-        let (captured, curr_snapshot) = {
+        let (captured, curr_snapshot, excluded_entries) = {
             let scan_token = scan_handle.token.clone();
             let collector_token = scan_token.clone();
             // 用 select 让取消信号与整个扫描 future 竞争，可打断请求、重试退避与限速等待。
@@ -1827,7 +1829,7 @@ impl ShareSyncManager {
                                 .with_progress(Arc::clone(&scan_sink))
                                 .with_cache(Arc::clone(&scan_cache))
                                 .with_cancel(collector_token.clone())
-                                .collect()
+                                .collect_detailed()
                                 .await
                                 .map_err(|e| ("抓取失败", e)),
                             Err(e) => Err(("抓取初始化失败", e)),
@@ -1930,6 +1932,22 @@ impl ShareSyncManager {
             self.fail_run(&run_id, id, owner_uid, &format!("本地目标校验失败: {}", e));
             return Err(e);
         }
+
+        // 被排除规则剔除的条目：只记录（不执行），供运行详情说明「命中了哪条规则」。
+        // 写失败只告警，不影响本轮同步。
+        if !excluded_entries.is_empty() {
+            if let Err(e) = self.persistence.record_excluded_items(
+                &run_id,
+                &excluded_entries,
+                crate::share_sync::persistence::EXCLUDED_ITEMS_CAP,
+            ) {
+                warn!(
+                    "记录被排除条目失败（不影响同步）: run_id={}, error={}",
+                    run_id, e
+                );
+            }
+        }
+        drop(excluded_entries);
 
         self.publisher.publish(ShareSyncEvent::DiffDetected {
             run_id: run_id.clone(),
@@ -2380,6 +2398,16 @@ impl ShareSyncManager {
             }
             lines.push("该问题恢复前不再重复提醒".to_string());
         }
+        // 确定要推送后才查文件名（两条带 LIMIT 的轻量查询，走 run_id 索引）；
+        // 没有 run（如链接失效）就没有文件可列
+        let files = match run_id {
+            Some(rid) => self.notification_file_lines(rid),
+            None => Vec::new(),
+        };
+        if !files.is_empty() {
+            lines.push("文件：".to_string());
+            lines.extend(files.iter().cloned());
+        }
         let targets = describe_targets_for_notification(sub);
         if !targets.is_empty() {
             lines.push(format!("同步目标：{}", targets));
@@ -2391,11 +2419,32 @@ impl ShareSyncManager {
         let mut n =
             crate::notification::Notification::new(kind, Some(sub.name.clone()), lines.join("\n"))
                 .with_task_id(sub.id.clone())
-                .with_account(Some(sub.owner_uid));
+                .with_account(Some(sub.owner_uid))
+                .with_files(files.join("\n"));
         if dedup {
             n = n.with_dedup_key(format!("{}:{}", kind.as_str(), run_id.unwrap_or(&sub.id)));
         }
         crate::notification::notify(n);
+    }
+
+    /// 通知里列出的文件名行：新增/更新（已落地）优先，其次失败；共列
+    /// `share_sync_file_list_limit` 个，超出追加「等 N 个文件」。上限为 0 时返回空。
+    fn notification_file_lines(&self, run_id: &str) -> Vec<String> {
+        let limit = crate::notification::current_config().share_sync_file_list_limit as usize;
+        if limit == 0 {
+            return Vec::new();
+        }
+        let query = |failed: bool, n: usize| {
+            self.persistence
+                .run_item_paths_for_notification(run_id, failed, n)
+                .unwrap_or_else(|e| {
+                    warn!("读取通知文件列表失败: run_id={}, error={}", run_id, e);
+                    (Vec::new(), 0)
+                })
+        };
+        let (changed, changed_total) = query(false, limit);
+        let (failed, failed_total) = query(true, limit.saturating_sub(changed.len()));
+        format_notification_file_lines(&changed, &failed, changed_total + failed_total)
     }
 
     /// 记录本次要推送的失败指纹；与该订阅上次已推送的相同则返回 false（不推）。
@@ -2794,10 +2843,10 @@ fn no_progress_but_queued<'a>(
 
 /// run_item 是否已到终态（不会再变）。
 ///
-/// 对应 [`RunItemStatus`] 里的 `Completed` / `Failed` / `Skipped`；
+/// 对应 [`RunItemStatus`] 里的 `Completed` / `Failed` / `Skipped` / `Excluded`（只记录不执行）；
 /// `Pending` / `Transferring` / `Downloading` / `Deleting` 都还在途中。
 fn is_terminal_run_item_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "skipped")
+    matches!(status, "completed" | "failed" | "skipped" | "excluded")
 }
 
 /// 文件夹是否「还有活没做完，但一个都没在跑」。
@@ -3742,6 +3791,28 @@ async fn is_waiting_for_download_slot(tm: &TransferManager, subscription_id: &st
     }
 
     no_progress_but_queued(statuses.iter())
+}
+
+/// 把通知文件列表格式化成正文行：`· 文件名`，失败的标「（失败）」；
+/// `total` 超过列出的数量时追加「等 N 个文件」（N 为总数）。
+fn format_notification_file_lines(
+    changed: &[String],
+    failed: &[String],
+    total: usize,
+) -> Vec<String> {
+    fn file_name(path: &str) -> &str {
+        let p = path.trim_end_matches('/');
+        p.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or(p)
+    }
+    let mut lines: Vec<String> = changed
+        .iter()
+        .map(|p| format!("· {}", file_name(p)))
+        .chain(failed.iter().map(|p| format!("· {}（失败）", file_name(p))))
+        .collect();
+    if !lines.is_empty() && total > lines.len() {
+        lines.push(format!("等 {} 个文件", total));
+    }
+    lines
 }
 
 /// 通知正文里的同步目标描述，如 `网盘 /a；本地 /data/b`
@@ -5716,6 +5787,20 @@ mod tests {
         // 删除订阅一并清掉
         m.delete_subscription(&s.id).await.unwrap();
         assert!(m.failure_notified.get(&s.id).is_none());
+    }
+
+    #[test]
+    fn test_format_notification_file_lines() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(format_notification_file_lines(&[], &[], 0).is_empty());
+        assert_eq!(
+            format_notification_file_lines(&v(&["/剧集/S01/1.mp4", "/2.mp4"]), &v(&["/坏.mkv"]), 3),
+            v(&["· 1.mp4", "· 2.mp4", "· 坏.mkv（失败）"])
+        );
+        assert_eq!(
+            format_notification_file_lines(&v(&["/a/", "/b"]), &[], 12),
+            v(&["· a", "· b", "等 12 个文件"])
+        );
     }
 
     /// 离线构造某账号的转存管理器（共享同一个全局 FolderDownloadManager）
