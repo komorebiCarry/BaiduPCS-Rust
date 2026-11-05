@@ -13,7 +13,7 @@
         :size="14"
         class="account-badge__avatar"
     />
-    <span class="account-badge__name">{{ displayName }}</span>
+    <span class="account-badge__name">{{ namePrefix }}{{ displayName }}</span>
   </el-tag>
 </template>
 
@@ -46,6 +46,8 @@ const props = withDefaults(
       size?: '' | 'large' | 'default' | 'small'
       /** el-tag effect */
       effect?: 'dark' | 'light' | 'plain'
+      /** 名称前缀（如「所属：」），默认无 */
+      namePrefix?: string
     }>(),
     {
       ownerUid: null,
@@ -53,6 +55,7 @@ const props = withDefaults(
       showAvatar: true,
       size: 'small',
       effect: 'plain',
+      namePrefix: '',
     },
 )
 

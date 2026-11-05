@@ -156,6 +156,10 @@ export interface RunRecord {
   error: string | null
   /** 运行中 run 的当前阶段；老后端不返回该字段时为 undefined */
   phase?: RunPhase | string | null
+  /** 被排除规则剔除的条目数（每条分支只计最上层）；老后端 / 老 run 为 undefined / 0 */
+  excluded_count?: number
+  /** 被排除条目超过单轮记录上限，明细只记录了一部分 */
+  excluded_truncated?: boolean
 }
 
 export interface RunItemRecord {
@@ -187,6 +191,10 @@ export interface RunDetail {
   error: string | null
   /** 运行中 run 的当前阶段（后端 RunDetailDto 用 serde flatten 透传 RunRecord 的字段） */
   phase?: RunPhase | string | null
+  /** 同 RunRecord.excluded_count */
+  excluded_count?: number
+  /** 同 RunRecord.excluded_truncated */
+  excluded_truncated?: boolean
   items: RunItemRecord[]
   /** 符合筛选条件的条数（未筛选时 = 全部条数） */
   item_total_count: number

@@ -1,5 +1,5 @@
 <template>
-  <div class="share-sync-view">
+  <div class="share-sync-view" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏（与其他页面一致） -->
     <div class="toolbar">
       <div class="header-left">
@@ -42,7 +42,7 @@
               <div class="config-title">
                 <el-icon :size="18" class="direction-icon"><Link /></el-icon>
                 <span class="config-name">{{ s.name }}</span>
-                <AccountBadge :owner-uid="s.owner_uid" size="small" class="task-account-badge" />
+                <AccountBadge :owner-uid="s.owner_uid" size="small" name-prefix="所属：" class="task-account-badge" />
                 <el-tag :type="s.enabled ? 'success' : 'info'" size="small">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
                 <el-tooltip
                     v-if="s.link_invalid"
@@ -412,6 +412,11 @@
                   aria-label="网盘目标账号"
               />
             </div>
+            <div v-if="showTargetAccountControls && netdiskEnabled" class="sync-mode-hint owner-hint">
+              「网盘账号」只决定转存到哪个账号的网盘，不会改变订阅的所属账号<template
+                  v-if="selected"
+              >（所属：{{ ownerName(selected.owner_uid) }}）</template>。
+            </div>
 
             <!-- 多账号归集：同一订阅额外转存到其他账号的网盘（每个账号最多 1 个网盘目标） -->
             <!-- 归集目标是「额外」的网盘目标：跟随「转存到网盘」开关，关闭时隐藏且不提交 -->
@@ -563,6 +568,26 @@
             >{{ currentRun.failed_count }}（只看失败）</el-link>
             <template v-else>{{ currentRun.failed_count }}</template>
           </el-descriptions-item>
+          <el-descriptions-item v-if="(currentRun.excluded_count ?? 0) > 0" label="已排除">
+            <template v-if="runExcludedDetailsPruned">
+              {{ currentRun.excluded_count }}
+              <span class="run-excluded-truncated run-excluded-pruned">
+                明细已清理（只保留最近 20 次运行）
+              </span>
+            </template>
+            <el-link
+                v-else
+                type="info"
+                class="run-excluded-link"
+                @click="filterRunItemsByStatus('excluded')"
+            >{{ currentRun.excluded_count }}（查看命中规则）</el-link>
+            <span
+                v-if="currentRun.excluded_truncated && !runExcludedDetailsPruned"
+                class="run-excluded-truncated"
+            >
+              明细只记录了前 {{ runExcludedRecordedCount }} 条
+            </span>
+          </el-descriptions-item>
           <el-descriptions-item label="错误" v-if="currentRun.error">
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
           </el-descriptions-item>
@@ -622,7 +647,7 @@
           <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
           <el-table-column prop="target" label="目标" width="120" :formatter="describeTarget" />
           <el-table-column prop="status" label="状态" width="100" :formatter="describeItemStatus" />
-          <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
+          <el-table-column prop="reason" label="原因" width="160" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
         </el-table>
         <el-pagination
@@ -691,6 +716,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AxiosError } from 'axios'
 import { useAuthStore } from '@/stores/auth'
+import { useOwnerName } from '@/composables/useOwnerName'
 import { useIsMobile } from '@/utils/responsive'
 import AccountFilter from '@/components/AccountFilter.vue'
 import AccountBadge from '@/components/AccountBadge.vue'
@@ -730,6 +756,7 @@ const isMobile = useIsMobile()
 
 // 多账号：账号过滤（null=全部账号）
 const authStore = useAuthStore()
+const { ownerName } = useOwnerName()
 const ownerFilter = ref<number | null>(null)
 
 // 按账号过滤后的订阅列表（与 transfer/autobackup 一致：null 显示全部）
@@ -778,6 +805,19 @@ const runItemsAllCount = computed(() => {
   return run.item_total_count
 })
 
+// 被排除条目实际记录到明细里的条数（超过上限时只记录一部分）
+const runExcludedRecordedCount = computed(
+    () => currentRun.value?.item_facets?.status_counts?.excluded ?? 0,
+)
+
+// 有排除计数但明细已被清理（后端每个订阅只保留最近 20 次运行的排除明细）
+const runExcludedDetailsPruned = computed(
+    () =>
+        (currentRun.value?.excluded_count ?? 0) > 0
+        && currentRun.value?.item_facets != null
+        && runExcludedRecordedCount.value === 0,
+)
+
 const runItemsHeaderCount = computed(() => {
   const run = currentRun.value
   if (!run) return ''
@@ -801,6 +841,7 @@ const runItemStatusOptions = computed(() => {
     { value: 'failed', label: withCount('失败', pick('failed')) },
     { value: 'completed', label: withCount('完成', pick('completed')) },
     { value: 'skipped', label: withCount('跳过', pick('skipped')) },
+    { value: 'excluded', label: withCount('已排除', pick('excluded')) },
     { value: 'in_progress', label: withCount('进行中', inProgress) },
   ]
 })
@@ -810,7 +851,7 @@ const runItemActionOptions = computed(() => {
   const pick = (k: string) => (counts ? counts[k] ?? 0 : undefined)
   return [
     { value: 'all', label: withCount('全部动作', counts ? runItemsAllCount.value : undefined) },
-    ...['added', 'modified', 'removed', 'skipped'].map((k) => ({
+    ...['added', 'modified', 'removed', 'skipped', 'excluded'].map((k) => ({
       value: k,
       label: withCount(ACTION_LABELS[k] ?? k, pick(k)),
     })),
@@ -2045,17 +2086,18 @@ function describeInterval(p: PollConfig): string {
 }
 
 function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
-  // 只标注落在其他账号上的目标（缺省 / 0 / 等于所属账号都是所属账号）
+  // 只标注落在其他账号上的目标（缺省 / 0 / 等于所属账号都是所属账号）；
+  // 显示目标账号昵称（找不到时回退 UID），如「网盘→账号B」
   const other = (uid: number | null | undefined) =>
     typeof uid === 'number' && uid > 0 && uid !== ownerUid ? uid : null
   return targets.map(t => {
     if (t.kind === 'netdisk') {
       const uid = other(t.account_uid)
-      return uid !== null ? `网盘(UID ${uid})` : '网盘'
+      return uid !== null ? `网盘→${ownerName(uid)}` : '网盘'
     }
     if (t.use_default_download_account) return '本地(默认下载账号)'
     const uid = other(t.download_uid)
-    return uid !== null ? `本地(UID ${uid})` : '本地'
+    return uid !== null ? `本地→${ownerName(uid)}` : '本地'
   }).join(' + ')
 }
 
@@ -2105,11 +2147,14 @@ const ACTION_LABELS: Record<string, string> = {
   modified: '修改',
   removed: '删除',
   skipped: '跳过',
+  excluded: '已排除',
 }
 const TARGET_LABELS: Record<string, string> = {
   netdisk: '网盘',
   local: '本地',
   netdisk_and_local: '网盘+本地',
+  // 被排除的条目没有执行目标
+  none: '—',
 }
 const ITEM_STATUS_LABELS: Record<string, string> = {
   pending: '等待',
@@ -2119,6 +2164,7 @@ const ITEM_STATUS_LABELS: Record<string, string> = {
   completed: '完成',
   failed: '失败',
   skipped: '跳过',
+  excluded: '已排除',
 }
 const REASON_LABELS: Record<string, string> = {
   quota_full: '网盘空间不足',
@@ -2130,16 +2176,25 @@ function describeAction(_r: unknown, _c: unknown, v: string): string {
   return ACTION_LABELS[v] ?? v
 }
 function describeTarget(_r: unknown, _c: unknown, v: string): string {
-  // 跨账号执行腿的动作记为 `netdisk@<uid>` / `local@<uid>`（所属账号不带后缀）
+  // 跨账号执行腿的动作记为 `netdisk@<uid>` / `local@<uid>`（所属账号不带后缀）；
+  // 与订阅卡片一致写作「网盘→账号名」，账号不在列表时回退 UID
   const m = /^(.+)@(\d+)$/.exec(v || '')
-  if (m) return `${TARGET_LABELS[m[1]] ?? m[1]}(UID ${m[2]})`
+  if (m) return `${TARGET_LABELS[m[1]] ?? m[1]}→${ownerName(Number(m[2]))}`
   return TARGET_LABELS[v] ?? v
 }
 function describeItemStatus(_r: unknown, _c: unknown, v: string): string {
   return ITEM_STATUS_LABELS[v] ?? v
 }
+// 被排除规则命中：后端记为 `excluded:<path|glob|regex>:<规则原文>`
+const EXCLUDED_REASON_KINDS: Record<string, string> = {
+  path: '排除内容',
+  glob: '通配符',
+  regex: '正则',
+}
 function describeReason(_r: unknown, _c: unknown, v: string | null | undefined): string {
   if (!v) return '—'
+  const m = /^excluded:(path|glob|regex):([\s\S]*)$/.exec(v)
+  if (m) return `命中${EXCLUDED_REASON_KINDS[m[1]]} ${m[2]}`
   return REASON_LABELS[v] ?? v
 }
 
@@ -2601,11 +2656,30 @@ onUnmounted(() => {
   .dot { color: #c0c4cc; }
   .danger-text { color: #f56c6c; }
 }
+.run-excluded-truncated {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
 .config-actions {
   display: flex;
   gap: 8px;
   flex-shrink: 0;
   flex-wrap: wrap;
+}
+// 窄屏：标题区占满整行，操作按钮换到标题下方，避免把标题挤成一列竖字
+.share-sync-view.is-mobile {
+  .config-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .config-actions {
+    flex-shrink: 1;
+    width: 100%;
+    row-gap: 8px;
+    .el-button + .el-button { margin-left: 0; }
+  }
 }
 
 // 进行中子任务（内联）

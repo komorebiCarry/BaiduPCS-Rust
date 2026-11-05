@@ -54,7 +54,7 @@ export interface ShareRecord {
   expiredTime: number
   /** 浏览次数 */
   viewCount: number
-  /** 下载次数（百度 dCnt；接口未返回时缺省，界面不显示） */
+  /** 下载次数（百度 dCnt；实测总会返回（可为 0）；接口未返回时缺省，界面不显示） */
   downloadCount?: number
   /** 保存（转存）次数（百度 tCnt；接口未返回时缺省，界面不显示） */
   transferCount?: number
@@ -66,10 +66,36 @@ export interface ShareRecord {
 export interface ShareListData {
   /** 分享记录列表 */
   list: ShareRecord[]
-  /** 总数 */
+  /** 总数（百度 /share/record 实际不返回，通常为 0，不能用于分页） */
   total: number
+  /** 本页条数（百度 count；旧后端不返回） */
+  count?: number
+  /** 是否还有下一页（百度 nextpage > 0；旧后端不返回） */
+  has_more?: boolean
+  /** 百度返回的下一页页码（0 = 没有下一页） */
+  nextpage?: number
   /** 当前页码 */
   page: number
+}
+
+/** 百度对「分享的文件已被删除」的分享，typicalPath 返回这段文字而不是路径 */
+export const SHARE_DELETED_MARKER = '分享的文件已被删除'
+/** 百度对已过期的分享，typicalPath 返回这段文字而不是路径 */
+export const SHARE_EXPIRED_MARKER = '分享已过期'
+
+/** 失效分享类型：deleted = 文件已被删除，expired = 已过期；正常分享为 null */
+export type DeadShareKind = 'deleted' | 'expired' | null
+
+/**
+ * 判断分享是否失效（只看百度返回的字段，不臆造）：
+ * - 文件已删除：typicalPath 为「分享的文件已被删除」（此时 expiredType=1、status=0，看起来像正常永久分享）；
+ * - 已过期：expiredType = -1，或 typicalPath 为「分享已过期」（这类 status 常为 10）。
+ */
+export function deadShareKind(record: Pick<ShareRecord, 'typicalPath' | 'expiredType'>): DeadShareKind {
+  const path = (record.typicalPath ?? '').trim()
+  if (path === SHARE_DELETED_MARKER) return 'deleted'
+  if (record.expiredType === -1 || path === SHARE_EXPIRED_MARKER) return 'expired'
+  return null
 }
 
 /**

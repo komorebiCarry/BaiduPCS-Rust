@@ -390,3 +390,41 @@ describe('SettingsView 上传：跳过秒传', () => {
     wrapper.unmount()
   })
 })
+
+describe('SettingsView 界面偏好：失效分享（#183）', () => {
+  function switchItem(label: string): HTMLElement {
+    const item = Array.from(document.querySelectorAll<HTMLElement>('.el-form-item')).find(
+      (el) => el.querySelector('.el-form-item__label')?.textContent?.trim() === label,
+    )
+    expect(item, `界面偏好里应有"${label}"`).toBeTruthy()
+    return item!
+  }
+
+  it('旧配置缺字段时：高亮默认开、只能取消默认关；切换后写入 ui', async () => {
+    const wrapper = await mountSettings()
+    const highlight = switchItem('高亮失效分享').querySelector<HTMLElement>('.el-switch')!
+    const lock = switchItem('失效分享只能取消').querySelector<HTMLElement>('.el-switch')!
+    expect(switchItem('高亮失效分享').closest('#section-ui, .setting-card')).toBeTruthy()
+    expect(highlight.classList.contains('is-checked')).toBe(true)
+    expect(lock.classList.contains('is-checked')).toBe(false)
+
+    highlight.click()
+    lock.click()
+    await flushPromises()
+    const ui = (wrapper.vm as unknown as { formData: { ui: Record<string, unknown> } }).formData.ui
+    expect(ui.highlight_dead_shares).toBe(false)
+    expect(ui.disable_dead_share_actions).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('已保存的偏好原样回显', async () => {
+    configApi.getConfig.mockResolvedValue({
+      ...JSON.parse(JSON.stringify(BASE_CONFIG)),
+      ui: { highlight_dead_shares: false, disable_dead_share_actions: true },
+    })
+    const wrapper = await mountSettings()
+    expect(switchItem('高亮失效分享').querySelector('.el-switch')!.classList.contains('is-checked')).toBe(false)
+    expect(switchItem('失效分享只能取消').querySelector('.el-switch')!.classList.contains('is-checked')).toBe(true)
+    wrapper.unmount()
+  })
+})
