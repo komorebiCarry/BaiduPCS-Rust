@@ -43,7 +43,7 @@
             :key="p + i"
             closable
             @close="removeInclude(i)"
-        >{{ p }}</el-tag>
+        >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
       <p v-if="showIncludeHelp" class="field-help">
         不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。
@@ -53,10 +53,10 @@
       </div>
     </div>
 
-    <!-- 排除目录（exclude_paths）：精确目录排除 -->
+    <!-- 排除内容（exclude_paths）：精确排除文件或目录 -->
     <div class="field-block">
       <div class="field-header">
-        <span class="field-label">排除目录</span>
+        <span class="field-label">排除内容</span>
         <div class="path-actions">
           <el-tooltip
               :disabled="ownerLoggedIn !== false"
@@ -78,7 +78,7 @@
               text
               type="primary"
               :aria-expanded="showExcludeFolderHelp"
-              aria-label="排除目录使用说明"
+              aria-label="排除内容使用说明"
               @click="showExcludeFolderHelp = !showExcludeFolderHelp"
           >
             使用说明
@@ -96,10 +96,10 @@
             closable
             type="warning"
             @close="removeExcludePath(i)"
-        >{{ p }}</el-tag>
+        >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
       <p v-if="showExcludeFolderHelp" class="field-help">
-        所选目录及其全部内容均不扫描、不参与同步。
+        选择文件只排除该文件；选择目录则连同其中全部内容一起排除，均不参与同步。
       </p>
     </div>
 
@@ -224,27 +224,32 @@
       </div>
     </div>
 
-    <!-- 从分享选择子路径：复用转存同款 ShareFileSelector -->
+    <!-- 从分享选择内容：复用转存同款 ShareFileSelector（路径选择模式） -->
     <el-dialog
         v-model="pickerVisible"
-        :title="pickerMode === 'exclude' ? '从分享中选择要排除的目录' : '从分享中选择要同步的子路径'"
+        :title="pickerMode === 'exclude' ? '从分享中选择要排除的内容' : '从分享中选择要同步的内容'"
         width="680px"
         :close-on-click-modal="false"
+        destroy-on-close
         append-to-body
     >
       <ShareFileSelector
+          :key="pickerKey"
           :files="previewFiles"
           :loading="previewing"
           :share-info="previewShareInfo"
           :share-url="shareUrl"
           :share-password="password || undefined"
-          :folder-only="pickerMode === 'exclude'"
-          @update:selected-files="onSelectedFiles"
+          path-selection
+          :initial-selected-paths="pickerInitialPaths"
+          :empty-selection-means-all="pickerMode === 'include'"
+          @update:selected-paths="onSelectedPaths"
+          @update:selection-ready="onSelectionReady"
       />
       <template #footer>
-        <span class="picker-hint">已选 {{ pendingSelected.length }} 项</span>
+        <span class="picker-hint">{{ pickerHint }}</span>
         <el-button @click="pickerVisible = false">取消</el-button>
-        <el-button type="primary" @click="confirmPicker">确定</el-button>
+        <el-button type="primary" :disabled="!selectionReady" @click="confirmPicker">确定</el-button>
       </template>
     </el-dialog>
   </div>
@@ -271,6 +276,7 @@ import {
   parseRuleInput,
   type ExcludeRuleKind as RuleKind,
 } from '@/utils/excludeRules'
+import { formatSharePathForDisplay } from '@/utils/shareSelection'
 import {
   previewShareFiles,
   type SharedFileInfo,
@@ -284,7 +290,7 @@ const props = defineProps<{
   excludePatterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；缺省按空处理 */
   excludeRegexPatterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 精确排除的文件或目录路径（相对分享根） */
   excludePaths: string[]
   // 订阅所属账号：编辑订阅时传订阅自己的 owner_uid，预览目录树按该账号路由 client
   // （不传则后端回退当前 active 账号——转存对话框创建场景 owner=active）
@@ -321,20 +327,21 @@ const validating = ref(false)
 
 // 分享文件选择器（与转存对话框同款体验）
 const pickerVisible = ref(false)
-// 选择器用途：同步子路径 / 排除目录（后者只允许选文件夹）
+// 选择器用途：同步内容 / 排除内容（两者都按路径选择，文件与目录都可选）
 const pickerMode = ref<'include' | 'exclude'>('include')
 const previewing = ref(false)
 const previewFiles = ref<SharedFileInfo[]>([])
 const previewShareInfo = ref<PreviewShareInfo | null>(null)
-const pendingSelected = ref<SharedFileInfo[]>([])
-
-function normalizePath(v: string): string {
-  const s = v.trim().replace(/\/+/g, '/')
-  if (!s) return ''
-  const prefixed = s.startsWith('/') ? s : `/${s}`
-  if (prefixed.length === 1) return '/'
-  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
-}
+/** 打开时的已存路径快照：只作初始种子，不随待确认状态变化 */
+const pickerInitialPaths = ref<string[]>([])
+/** 选择器当前待确认的路径 */
+const pendingPaths = ref<string[]>([])
+/** 选择器是否可以确认（清空同步内容时为 false） */
+const selectionReady = ref(true)
+/** 选择器会话代号：预览响应回来时会话已变则丢弃，避免改动已重开的对话框 */
+let pickerSession = 0
+/** 选择器实例代号：每次打开都换新实例，保证回到的是已存内容而非上次的临时改动 */
+const pickerKey = ref(0)
 
 function removeInclude(i: number) {
   const next = [...props.includePaths]
@@ -665,16 +672,18 @@ defineExpose({ validateRules })
 
 async function loadPickerFiles() {
   previewing.value = true
+  const session = ++pickerSession
   try {
     const resp = await previewShareFiles({
       share_url: props.shareUrl.trim(),
       password: props.password || undefined,
     })
+    if (session !== pickerSession) return
     previewFiles.value = resp.files || []
     previewShareInfo.value = resp.share_info ?? null
-    pendingSelected.value = []
     pickerVisible.value = true
   } catch (e) {
+    if (session !== pickerSession) return
     const ax = e as AxiosError<{ message?: string; error?: string }>
     ElMessage.error(
         ax?.response?.data?.message ||
@@ -683,7 +692,7 @@ async function loadPickerFiles() {
         '加载分享文件失败',
     )
   } finally {
-    previewing.value = false
+    if (session === pickerSession) previewing.value = false
   }
 }
 
@@ -697,6 +706,11 @@ async function openPicker() {
     return
   }
   pickerMode.value = 'include'
+  // 打开时快照已存路径：选择器以它为初始种子，待确认状态不参与
+  pickerInitialPaths.value = [...props.includePaths]
+  pendingPaths.value = [...props.includePaths]
+  selectionReady.value = true
+  pickerKey.value += 1
   await loadPickerFiles()
 }
 
@@ -710,46 +724,41 @@ async function openExcludePicker() {
     return
   }
   pickerMode.value = 'exclude'
+  pickerInitialPaths.value = [...props.excludePaths]
+  pendingPaths.value = [...props.excludePaths]
+  selectionReady.value = true
+  pickerKey.value += 1
   await loadPickerFiles()
 }
 
-function onSelectedFiles(files: SharedFileInfo[]) {
-  pendingSelected.value = files
+function onSelectedPaths(paths: string[]) {
+  pendingPaths.value = [...paths]
 }
 
+function onSelectionReady(ready: boolean) {
+  selectionReady.value = ready
+}
+
+/** 选择器底部提示：整体分享、清空待确认或已选条目数 */
+const pickerHint = computed(() => {
+  if (!selectionReady.value) return '请选择要同步的内容'
+  if (pickerMode.value === 'include' && pendingPaths.value.length === 0) return '整个分享'
+  return `已选 ${pendingPaths.value.length} 项`
+})
+
+/**
+ * 确认后**替换**对应模型：选择器给出的就是最终路径集合，不再与旧路径合并，
+ * 避免已删除的排除项被旧数据合并回来。取消 / 关闭不写任何模型。
+ */
 function confirmPicker() {
-  const selectedPaths = pendingSelected.value
-      .map((f) => normalizePath(f.path))
-      .filter((p) => p.length > 0)
+  if (!selectionReady.value) return
+  const paths = [...pendingPaths.value]
+  pickerVisible.value = false
   if (pickerMode.value === 'exclude') {
-    // 精确排除：合并去重；祖先目录已覆盖的后代不必单独保留
-    const merged: string[] = []
-    const seen = new Set<string>()
-    for (const p of [...props.excludePaths, ...selectedPaths]) {
-      if (seen.has(p)) continue
-      seen.add(p)
-      merged.push(p)
-    }
-    const trimmed = merged.filter(
-        (p) => !merged.some((a) => a !== p && p.startsWith(`${a}/`)),
-    )
-    emit('update:excludePaths', trimmed)
-    pickerVisible.value = false
+    emit('update:excludePaths', paths)
     return
   }
-  // 与已有路径合并去重；勾选目录即代表整棵子树，裁剪掉被祖先覆盖的冗余后代
-  const merged: string[] = []
-  const seen = new Set<string>()
-  for (const p of [...props.includePaths, ...selectedPaths]) {
-    if (seen.has(p)) continue
-    seen.add(p)
-    merged.push(p)
-  }
-  const trimmed = merged.filter(
-      (p) => !merged.some((a) => a !== p && p.startsWith(`${a}/`)),
-  )
-  emit('update:includePaths', trimmed)
-  pickerVisible.value = false
+  emit('update:includePaths', paths)
 }
 </script>
 
