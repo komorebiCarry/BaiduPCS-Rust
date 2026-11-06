@@ -39,15 +39,6 @@
 
       <!-- 移动端工具栏 -->
       <div v-else class="toolbar-buttons-mobile">
-        <el-button
-            v-if="selectedFiles.length > 0"
-            type="danger"
-            circle
-            :loading="batchDeleting"
-            @click="handleBatchDelete"
-        >
-          <el-icon><Delete /></el-icon>
-        </el-button>
         <el-button type="primary" circle @click="refreshFileList">
           <el-icon><Refresh /></el-icon>
         </el-button>
@@ -55,7 +46,12 @@
     </div>
 
     <!-- 文件列表 -->
-    <div class="file-list" ref="fileListRef" @scroll="handleScroll">
+    <div
+        class="file-list"
+        :class="{ 'has-mobile-batch-bar': isMobile && selectedFiles.length > 0 }"
+        ref="fileListRef"
+        @scroll="handleScroll"
+    >
       <!-- PC端表格视图 -->
       <el-table
           v-if="!isMobile"
@@ -101,9 +97,18 @@
             v-for="item in fileList"
             :key="item.id"
             class="mobile-file-card"
-            :class="{ 'is-folder': item.entryType === 'directory' }"
+            :class="{
+              'is-folder': item.entryType === 'directory',
+              'is-selected': isFileSelected(item),
+            }"
             @click="handleRowClick(item)"
         >
+          <el-checkbox
+              class="file-card-checkbox"
+              :model-value="isFileSelected(item)"
+              @click.stop
+              @change="() => toggleMobileSelect(item)"
+          />
           <div class="file-card-main">
             <el-icon :size="36" class="file-card-icon" :color="item.entryType === 'directory' ? '#e6a23c' : '#409eff'">
               <Folder v-if="item.entryType === 'directory'"/>
@@ -133,6 +138,26 @@
 
       <!-- 空状态 -->
       <el-empty v-if="!loading && fileList.length === 0" description="当前目录为空"/>
+    </div>
+
+    <div
+        v-if="isMobile && selectedFiles.length > 0"
+        class="mobile-batch-bar"
+    >
+      <div class="mobile-batch-bar__meta">
+        <span class="mobile-batch-bar__count">已选 {{ selectedFiles.length }} 项</span>
+        <el-button class="mobile-batch-bar__select-all" text type="primary" size="small" @click="selectAllLoaded">全选</el-button>
+        <el-button class="mobile-batch-bar__clear" text size="small" @click="clearMobileSelection">取消</el-button>
+      </div>
+      <div class="mobile-batch-bar__actions">
+        <el-button
+            class="mobile-batch-bar__delete"
+            size="small"
+            type="danger"
+            :loading="batchDeleting"
+            @click="handleBatchDelete"
+        >删除</el-button>
+      </div>
     </div>
   </div>
 </template>
@@ -200,6 +225,8 @@ async function loadFiles(path: string, append: boolean = false) {
       if (!rootPath.value) {
         rootPath.value = data.currentPath
       }
+      // 与桌面端 el-table 换数据后清空勾选一致（含切目录 / 刷新 / 排序）
+      selectedFiles.value = []
     }
 
     hasMore.value = data.hasMore
@@ -259,6 +286,27 @@ function getRowClassName({ row }: { row: FileEntry }) {
 
 function handleSelectionChange(selection: FileEntry[]) {
   selectedFiles.value = selection
+}
+
+function isFileSelected(item: FileEntry): boolean {
+  return selectedFiles.value.some((f) => f.id === item.id)
+}
+
+function toggleMobileSelect(item: FileEntry) {
+  const index = selectedFiles.value.findIndex((f) => f.id === item.id)
+  if (index === -1) {
+    selectedFiles.value = [...selectedFiles.value, item]
+  } else {
+    selectedFiles.value = selectedFiles.value.filter((_, i) => i !== index)
+  }
+}
+
+function selectAllLoaded() {
+  selectedFiles.value = [...fileList.value]
+}
+
+function clearMobileSelection() {
+  selectedFiles.value = []
 }
 
 async function handleBatchDelete() {
@@ -425,6 +473,52 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
 
   .file-list {
     padding: 12px;
+
+    &.has-mobile-batch-bar {
+      padding-bottom: 128px;
+    }
+  }
+}
+
+.mobile-batch-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--el-bg-color);
+  border-top: 1px solid var(--el-border-color-lighter);
+  box-shadow: 0 -6px 18px rgba(15, 23, 42, 0.08);
+  box-sizing: border-box;
+
+  &__meta {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 4px;
+  }
+
+  &__count {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--el-text-color-primary);
+    margin-right: 4px;
+    flex-shrink: 0;
+  }
+
+  &__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+
+    :deep(.el-button) {
+      margin: 0;
+    }
   }
 }
 
@@ -438,7 +532,7 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 12px 12px 12px 10px;
   background: #f9f9f9;
   border-radius: 12px;
   cursor: pointer;
@@ -455,6 +549,28 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
     &:active {
       background: #fff3d9;
     }
+  }
+
+  &.is-selected {
+    background: var(--el-color-primary-light-9);
+
+    &:active {
+      background: var(--el-color-primary-light-8);
+    }
+
+    &.is-folder {
+      background: var(--el-color-primary-light-9);
+
+      &:active {
+        background: var(--el-color-primary-light-8);
+      }
+    }
+  }
+
+  .file-card-checkbox {
+    flex-shrink: 0;
+    margin-right: 8px;
+    height: 22px;
   }
 
   .file-card-main {
@@ -490,6 +606,10 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
     display: flex;
     align-items: center;
     gap: 4px;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 
     .meta-divider {
       color: #dcdfe6;
