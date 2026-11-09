@@ -33,6 +33,7 @@ use crate::share_sync::types::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -244,6 +245,40 @@ pub struct ApplyOutcome {
     pub resource_skipped: bool,
 }
 
+/// 网盘目标校验得出的补传计划（针对分享侧未变化、但目标上缺失或不一致的文件）。
+///
+/// 已有同名文件但大小不一致的项不能交给 tree 整目录/批量转存：目标已有同名文件时
+/// 百度返回「已存在」，tree 会把它当成已完成，坏文件永远留着。改为逐个走
+/// [`ShareSyncExecutor`] 的单文件路径，按冲突策略先删除（覆盖）或改名（新版本）再转存。
+#[derive(Debug, Clone, Default)]
+pub struct NetdiskRepairPlan {
+    /// 需要在网盘目标上按冲突策略逐个替换的分享路径
+    pub conflict_paths: BTreeSet<String>,
+    /// 其中本地目标也需要补齐的路径：网盘侧替换后仍留在 tree 里交给本地腿
+    pub keep_in_tree: BTreeSet<String>,
+    /// 只有网盘目标缺失、本地目标完好的路径：只转存到网盘，不走「网盘+本地」合并腿
+    /// （否则会把本地好好的文件再下一遍，按「新版本」策略还会多出一份改名副本）
+    pub netdisk_only_paths: BTreeSet<String>,
+}
+
+impl NetdiskRepairPlan {
+    /// 该路径是否只在网盘侧逐个处理、不再进入 tree
+    pub fn excluded_from_tree(&self, path: &str) -> bool {
+        self.conflict_paths.contains(path) && !self.keep_in_tree.contains(path)
+    }
+
+    /// 该路径是否不进主 tree（逐个替换，或只转存到网盘目标）
+    pub fn excluded_from_main_tree(&self, path: &str) -> bool {
+        self.excluded_from_tree(path)
+            || (self.netdisk_only_paths.contains(path) && !self.conflict_paths.contains(path))
+    }
+
+    /// 只转存到网盘目标（不进合并腿）的路径
+    pub fn is_netdisk_only(&self, path: &str) -> bool {
+        self.netdisk_only_paths.contains(path) && !self.conflict_paths.contains(path)
+    }
+}
+
 /// 同步执行器
 pub struct ShareSyncExecutor<'a> {
     subscription: &'a ShareSubscription,
@@ -255,6 +290,8 @@ pub struct ShareSyncExecutor<'a> {
     /// 跨账号执行腿的账号：写 run item 时标注在 `target` 上（见
     /// [`ShareSyncPersistence::add_run_item_for_account`]）。所属账号的腿为 `None`。
     item_account_uid: Option<u64>,
+    /// 网盘目标侧的补传计划（见 [`NetdiskRepairPlan`]）
+    netdisk_repairs: NetdiskRepairPlan,
 }
 
 impl<'a> ShareSyncExecutor<'a> {
@@ -269,7 +306,55 @@ impl<'a> ShareSyncExecutor<'a> {
             hooks,
             finalize_run: true,
             item_account_uid: None,
+            netdisk_repairs: NetdiskRepairPlan::default(),
         }
+    }
+
+    /// 指定网盘目标侧的补传计划
+    pub fn with_netdisk_repairs(mut self, repairs: NetdiskRepairPlan) -> Self {
+        self.netdisk_repairs = repairs;
+        self
+    }
+
+    /// 逐个处理 [`NetdiskRepairPlan::conflict_paths`]：只针对网盘目标、按冲突策略
+    /// 删除/改名/跳过已有同名文件后单独转存。返回各失败项的错误类别。
+    async fn process_netdisk_repairs(
+        &self,
+        captured: &CapturedShare,
+        run_id: &str,
+        diff: &ShareDiff,
+        summary: &mut DiffSummary,
+    ) -> Vec<(ErrorCategory, String)> {
+        let mut failures = Vec::new();
+        if self.netdisk_repairs.conflict_paths.is_empty() {
+            return failures;
+        }
+        for ShareModifiedItem { old: _, new } in &diff.modified {
+            if new.is_dir || !self.netdisk_repairs.conflict_paths.contains(&new.path) {
+                continue;
+            }
+            for target in &self.subscription.targets {
+                if !matches!(target, SyncTarget::Netdisk(_)) {
+                    continue;
+                }
+                if let Err(e) = self
+                    .process_added_or_modified(
+                        captured,
+                        run_id,
+                        new,
+                        SyncAction::Modified,
+                        target,
+                        TargetKind::Netdisk,
+                        summary,
+                    )
+                    .await
+                {
+                    warn!("网盘目标替换失败: path={}, err={}", new.path, e);
+                    failures.push((e.category(), e.user_message()));
+                }
+            }
+        }
+        failures
     }
 
     /// 标注本执行器写入的 run item 属于哪个账号（跨账号订阅的非所属账号腿）
@@ -463,6 +548,22 @@ impl<'a> ShareSyncExecutor<'a> {
         // 有效转存操作（网盘+本地合并为一条腿，消除重复转存）
         let ops = self.effective_transfer_ops();
 
+        // 网盘目标上大小不一致的同名文件：先按冲突策略逐个替换
+        for (category, msg) in self
+            .process_netdisk_repairs(captured, run_id.as_str(), diff, &mut summary)
+            .await
+        {
+            if matches!(
+                category,
+                ErrorCategory::Quota | ErrorCategory::LocalDiskFull
+            ) {
+                any_quota_skip = true;
+                last_quota_skip_msg = Some(msg);
+            } else {
+                any_failure = true;
+            }
+        }
+
         // 处理 added
         for item in &diff.added {
             if item.is_dir {
@@ -504,7 +605,23 @@ impl<'a> ShareSyncExecutor<'a> {
             if new.is_dir {
                 continue;
             }
-            for &(ti, record_kind) in &ops {
+            if self.netdisk_repairs.excluded_from_tree(&new.path) {
+                summary.modified += 1;
+                continue;
+            }
+            let item_ops: Vec<(usize, TargetKind)> =
+                if self.netdisk_repairs.is_netdisk_only(&new.path) {
+                    self.subscription
+                        .targets
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, target)| matches!(target, SyncTarget::Netdisk(_)))
+                        .map(|(ti, _)| (ti, TargetKind::Netdisk))
+                        .collect()
+                } else {
+                    ops.clone()
+                };
+            for &(ti, record_kind) in &item_ops {
                 let target = &self.subscription.targets[ti];
                 let _ = self
                     .process_added_or_modified(
@@ -1050,12 +1167,34 @@ impl<'a> ShareSyncExecutor<'a> {
         let mut any_failure = false;
         let mut run_failure_reason: Option<&'static str> = None;
 
+        // 0) 网盘目标上大小不一致的同名文件：不进 tree（「已存在」会被当成已完成），
+        //    先逐个按冲突策略替换；本地也要补的仍留在 tree 交给本地腿。
+        for (category, _) in self
+            .process_netdisk_repairs(captured, run_id.as_str(), diff, &mut summary)
+            .await
+        {
+            any_failure = true;
+            run_failure_reason = update_run_failure_reason(run_failure_reason, category);
+        }
+        let tree_modified: Vec<&ShareModifiedItem> = diff
+            .modified
+            .iter()
+            .filter(|m| !self.netdisk_repairs.excluded_from_main_tree(&m.new.path))
+            .collect();
+        // 只缺在网盘目标上的文件单独建一棵树，只配网盘目标的转存腿
+        let netdisk_only_items: Vec<ShareSnapshotItem> = diff
+            .modified
+            .iter()
+            .filter(|m| !m.new.is_dir && self.netdisk_repairs.is_netdisk_only(&m.new.path))
+            .map(|m| m.new.clone())
+            .collect();
+
         // 1) 合并 added + modified 项(**保留 is_dir**——让 tree 重建出目录骨架,
         //    然后我们才能用目录 fs_id 整体提交)
         let mut items: Vec<ShareSnapshotItem> =
-            Vec::with_capacity(diff.added.len() + diff.modified.len());
+            Vec::with_capacity(diff.added.len() + tree_modified.len());
         items.extend(diff.added.iter().cloned());
-        items.extend(diff.modified.iter().map(|m| m.new.clone()));
+        items.extend(tree_modified.iter().map(|m| m.new.clone()));
 
         let mut action_by_path: ActionByPath = ActionByPath::new();
         for item in &diff.added {
@@ -1063,14 +1202,18 @@ impl<'a> ShareSyncExecutor<'a> {
                 action_by_path.insert(item.path.clone(), SyncAction::Added);
             }
         }
-        for ShareModifiedItem { old: _, new } in &diff.modified {
+        for ShareModifiedItem { old: _, new } in tree_modified.iter().copied() {
             if !new.is_dir {
                 action_by_path.insert(new.path.clone(), SyncAction::Modified);
             }
         }
+        for item in &netdisk_only_items {
+            action_by_path.insert(item.path.clone(), SyncAction::Modified);
+        }
 
         // 2) 重建树(虚拟根的 children 就是顶层节点)
         let t = tree::build(&items);
+        let t_netdisk_only = tree::build(&netdisk_only_items);
 
         // 3) 对每个顶层节点 × 每个 target 调 process_subtree
         let top_nodes: Vec<usize> = t.get(t.root).children.clone();
@@ -1111,10 +1254,25 @@ impl<'a> ShareSyncExecutor<'a> {
             .max(1);
         // 有效转存操作（网盘+本地合并为一条 NetdiskAndLocal 腿，消除重复转存）
         let ops = self.effective_transfer_ops();
-        // 拼工作单元: (top_node_idx, target_idx, record_kind)
-        let work: Vec<(usize, usize, TargetKind)> = top_nodes
+        let netdisk_ops: Vec<(usize, TargetKind)> = self
+            .subscription
+            .targets
             .iter()
-            .flat_map(|&n| ops.iter().map(move |&(ti, rk)| (n, ti, rk)))
+            .enumerate()
+            .filter(|(_, target)| matches!(target, SyncTarget::Netdisk(_)))
+            .map(|(ti, _)| (ti, TargetKind::Netdisk))
+            .collect();
+        // 拼工作单元: (是否「只转网盘」那棵树, top_node_idx, target_idx, record_kind)
+        let work: Vec<(bool, usize, usize, TargetKind)> = top_nodes
+            .iter()
+            .flat_map(|&n| ops.iter().map(move |&(ti, rk)| (false, n, ti, rk)))
+            .chain(
+                t_netdisk_only
+                    .get(t_netdisk_only.root)
+                    .children
+                    .iter()
+                    .flat_map(|&n| netdisk_ops.iter().map(move |&(ti, rk)| (true, n, ti, rk))),
+            )
             .collect();
 
         let results: Vec<(DiffSummary, Result<(), ErrorCategory>)> =
@@ -1126,13 +1284,15 @@ impl<'a> ShareSyncExecutor<'a> {
                     work.len(),
                     concurrency
                 );
-                let t_ref = &t;
+                let t_main = &t;
+                let t_nd = &t_netdisk_only;
                 let captured_ref = captured;
                 let run_id_ref = run_id.as_str();
                 let action_by_path_ref = &action_by_path;
                 stream::iter(work.into_iter())
-                    .map(|(node_idx, target_idx, record_kind)| {
+                    .map(|(netdisk_only, node_idx, target_idx, record_kind)| {
                         let target = &self.subscription.targets[target_idx];
+                        let t_ref = if netdisk_only { t_nd } else { t_main };
                         async move {
                             let mut local = DiffSummary::default();
                             let res = self
@@ -1155,14 +1315,15 @@ impl<'a> ShareSyncExecutor<'a> {
                     .await
             } else {
                 let mut out = Vec::with_capacity(work.len());
-                for (node_idx, target_idx, record_kind) in work {
+                for (netdisk_only, node_idx, target_idx, record_kind) in work {
                     let target = &self.subscription.targets[target_idx];
+                    let t_ref = if netdisk_only { &t_netdisk_only } else { &t };
                     let mut local = DiffSummary::default();
                     let res = self
                         .process_subtree(
                             captured,
                             run_id.as_str(),
-                            &t,
+                            t_ref,
                             node_idx,
                             target,
                             record_kind,
@@ -2968,6 +3129,225 @@ mod tests {
             g.push((fs_ids, paths, dir.to_path_buf()));
             Ok(id)
         }
+    }
+
+    /// 构造「分享侧未变化、网盘目标同名文件大小不一致」的 modified diff
+    fn mismatch_fixture(
+        strategy: ConflictStrategy,
+        with_local: Option<PathBuf>,
+    ) -> (ShareSubscription, ShareDiff, MockHooks) {
+        let mut s = sub();
+        s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+            remote_path: "/backup".into(),
+            save_fs_id: 0,
+            conflict_strategy: None,
+            account_uid: None,
+        })];
+        if let Some(local) = with_local {
+            s.targets.push(SyncTarget::Local(LocalTarget {
+                local_path: local,
+                conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+                download_uid: None,
+                use_default_download_account: false,
+            }));
+        }
+        s.conflict_strategy = strategy;
+        let a = item("/a.csv", 1, 4);
+        let ok = item("/b.csv", 2, 4);
+        let diff = ShareDiff {
+            added: vec![ok],
+            modified: vec![ShareModifiedItem {
+                old: a.clone(),
+                new: a,
+            }],
+            removed: vec![],
+            unchanged_count: 0,
+        };
+        let hooks = MockHooks::default();
+        hooks.netdisk_files.lock().unwrap().insert(
+            "/backup/a.csv".into(),
+            existing_netdisk_entry("/backup/a.csv", "a.csv", 99),
+        );
+        (s, diff, hooks)
+    }
+
+    fn repairs_for(path: &str, keep_in_tree: bool) -> NetdiskRepairPlan {
+        let paths = BTreeSet::from([path.to_string()]);
+        NetdiskRepairPlan {
+            keep_in_tree: if keep_in_tree {
+                paths.clone()
+            } else {
+                BTreeSet::new()
+            },
+            conflict_paths: paths,
+            netdisk_only_paths: BTreeSet::new(),
+        }
+    }
+
+    /// 审查 A2：tree 模式下，网盘目标上大小不一致的同名文件按「覆盖」策略先删后单独转存，
+    /// 不进入批量转存（否则「已存在」会被当成完成、坏文件永远不替换）。
+    #[test]
+    fn test_tree_netdisk_mismatch_overwrites_individually() {
+        let dir = tempdir().unwrap();
+        let (s, diff, hooks) = mismatch_fixture(ConflictStrategy::Overwrite, None);
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks)
+            .with_netdisk_repairs(repairs_for("/a.csv", false));
+        let outcome =
+            futures::executor::block_on(ex.apply_with_run_id_tree("r".into(), &captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            *hooks.netdisk_deletes.lock().unwrap(),
+            vec!["/backup/a.csv".to_string()]
+        );
+        let single: Vec<u64> = hooks
+            .transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.1)
+            .collect();
+        assert_eq!(single, vec![1], "替换项应单独转存");
+        let batched: Vec<u64> = hooks
+            .batch_transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, ids, _)| ids.clone())
+            .collect();
+        assert!(
+            !batched.contains(&1),
+            "替换项不得再进 tree 批量转存: {batched:?}"
+        );
+        assert_eq!(outcome.diff_summary.modified, 1);
+        assert_eq!(outcome.diff_summary.overwritten, 1);
+    }
+
+    /// 「新版本」策略：旧文件改名保留，再单独转存新文件
+    #[test]
+    fn test_tree_netdisk_mismatch_versioned_renames_old() {
+        let dir = tempdir().unwrap();
+        let (s, diff, hooks) = mismatch_fixture(ConflictStrategy::Versioned, None);
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks)
+            .with_netdisk_repairs(repairs_for("/a.csv", false));
+        let outcome =
+            futures::executor::block_on(ex.apply_with_run_id_tree("r".into(), &captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        let renames = hooks.netdisk_renames.lock().unwrap();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].0, "/backup/a.csv");
+        assert!(hooks.netdisk_deletes.lock().unwrap().is_empty());
+        assert_eq!(hooks.transfers.lock().unwrap().len(), 1);
+    }
+
+    /// 本地也要补的替换项：网盘侧先单独替换，本地仍由 tree 的合并腿下载
+    #[test]
+    fn test_tree_netdisk_mismatch_kept_in_tree_for_local_leg() {
+        let dir = tempdir().unwrap();
+        let local = dir.path().join("local");
+        let (s, diff, hooks) = mismatch_fixture(ConflictStrategy::Overwrite, Some(local));
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks)
+            .with_netdisk_repairs(repairs_for("/a.csv", true));
+        let outcome =
+            futures::executor::block_on(ex.apply_with_run_id_tree("r".into(), &captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            *hooks.netdisk_deletes.lock().unwrap(),
+            vec!["/backup/a.csv".to_string()]
+        );
+        let mut downloaded: Vec<u64> = hooks
+            .downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.0)
+            .chain(
+                hooks
+                    .batch_downloads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(ids, _, _)| ids.clone()),
+            )
+            .collect();
+        downloaded.sort();
+        assert_eq!(downloaded, vec![1, 2], "本地腿应下载替换项与新增项");
+    }
+
+    /// 「网盘+本地」订阅里只缺在网盘目标上的文件：只转存到网盘，不再重复下载到本地
+    #[test]
+    fn test_tree_netdisk_only_missing_file_skips_local_leg() {
+        let dir = tempdir().unwrap();
+        let local = dir.path().join("local");
+        let (s, mut diff, hooks) = mismatch_fixture(ConflictStrategy::Versioned, Some(local));
+        hooks.netdisk_files.lock().unwrap().clear();
+        diff.added.clear();
+        let ex = {
+            let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+            pm.upsert_subscription(&s).unwrap();
+            let repairs = NetdiskRepairPlan {
+                netdisk_only_paths: BTreeSet::from(["/a.csv".to_string()]),
+                ..Default::default()
+            };
+            let outcome = futures::executor::block_on(
+                ShareSyncExecutor::new(&s, &pm, &hooks)
+                    .with_netdisk_repairs(repairs)
+                    .apply_with_run_id_tree("r".into(), &captured(), &diff),
+            );
+            outcome
+        };
+        assert_eq!(ex.status, RunStatus::Completed);
+        assert!(hooks.downloads.lock().unwrap().is_empty());
+        assert!(hooks.batch_downloads.lock().unwrap().is_empty());
+        let transferred: Vec<(String, u64)> = hooks
+            .transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| (t.0.clone(), t.1))
+            .chain(
+                hooks
+                    .batch_transfers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(target, ids, _)| ids.iter().map(|id| (target.clone(), *id))),
+            )
+            .collect();
+        assert_eq!(transferred, vec![("/backup".to_string(), 1)]);
+        assert!(hooks.netdisk_renames.lock().unwrap().is_empty());
+        assert_eq!(ex.diff_summary.modified, 1);
+    }
+
+    /// 旧单文件路径同样只在网盘侧按冲突策略替换一次
+    #[test]
+    fn test_legacy_netdisk_mismatch_overwrites_once() {
+        let dir = tempdir().unwrap();
+        let (s, diff, hooks) = mismatch_fixture(ConflictStrategy::Overwrite, None);
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks)
+            .with_netdisk_repairs(repairs_for("/a.csv", false));
+        let outcome =
+            futures::executor::block_on(ex.apply_with_run_id("r".into(), &captured(), &diff));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(hooks.netdisk_deletes.lock().unwrap().len(), 1);
+        let single: Vec<u64> = hooks
+            .transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.1)
+            .collect();
+        assert_eq!(single, vec![1, 2]);
+        assert_eq!(outcome.diff_summary.modified, 1);
+        assert_eq!(outcome.diff_summary.added, 1);
     }
 
     /// 回归：含被 exclude/include 剔除后代的目录（subtree_pruned=true）不得被整目录
