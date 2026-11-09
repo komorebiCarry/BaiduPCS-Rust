@@ -130,6 +130,8 @@
                 v-model:include-paths="form.includePaths"
                 v-model:exclude-patterns="form.excludePatterns"
                 v-model:exclude-regex-patterns="form.excludeRegexPatterns"
+                v-model:include-patterns="form.includePatterns"
+                v-model:include-regex-patterns="form.includeRegexPatterns"
                 v-model:exclude-paths="form.excludePaths"
             />
           </el-form-item>
@@ -344,6 +346,8 @@ const form = reactive({
   includePaths: [] as string[],
   excludePatterns: [] as string[],
   excludeRegexPatterns: [] as string[],
+  includePatterns: [] as string[],
+  includeRegexPatterns: [] as string[],
   excludePaths: [] as string[],
   // 订阅目标开关（至少开一个）：转存到网盘 / 同步到本地
   syncToNetdisk: true,
@@ -463,6 +467,8 @@ async function handleOpen() {
   form.includePaths = []
   form.excludePatterns = []
   form.excludeRegexPatterns = []
+  form.includePatterns = []
+  form.includeRegexPatterns = []
   form.excludePaths = []
 
   try {
@@ -525,6 +531,8 @@ function handleClose() {
   form.includePaths = []
   form.excludePatterns = []
   form.excludeRegexPatterns = []
+  form.includePatterns = []
+  form.includeRegexPatterns = []
   form.excludePaths = []
   form.syncToNetdisk = true
   form.syncToLocal = false
@@ -714,6 +722,8 @@ async function createSyncSubscription() {
       include_paths: form.includePaths,
       exclude_patterns: form.excludePatterns,
       exclude_regex_patterns: form.excludeRegexPatterns,
+      include_patterns: form.includePatterns,
+      include_regex_patterns: form.includeRegexPatterns,
       exclude_paths: form.excludePaths,
       targets: buildSyncTargets(),
       poll_config: pollConfig,

@@ -220,6 +220,12 @@ pub async fn update_subscription(
     if let Some(v) = req.exclude_regex_patterns {
         new_sub.exclude_regex_patterns = v;
     }
+    if let Some(v) = req.include_patterns {
+        new_sub.include_patterns = v;
+    }
+    if let Some(v) = req.include_regex_patterns {
+        new_sub.include_regex_patterns = v;
+    }
     if let Some(v) = req.exclude_paths {
         new_sub.exclude_paths = v;
     }

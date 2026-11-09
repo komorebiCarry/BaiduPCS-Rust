@@ -63,6 +63,12 @@
                 <template v-if="s.exclude_patterns.length">
                   <span class="dot">·</span><span>排除通配符 {{ s.exclude_patterns.length }} 条</span>
                 </template>
+                <template v-if="(s.include_patterns?.length ?? 0) > 0">
+                  <span class="dot">·</span><span>包含通配符 {{ s.include_patterns!.length }} 条</span>
+                </template>
+                <template v-if="(s.include_regex_patterns?.length ?? 0) > 0">
+                  <span class="dot">·</span><span>包含正则 {{ s.include_regex_patterns!.length }} 条</span>
+                </template>
                 <template v-if="(s.exclude_regex_patterns?.length ?? 0) > 0">
                   <span class="dot">·</span><span>排除正则 {{ s.exclude_regex_patterns!.length }} 条</span>
                 </template>
@@ -297,6 +303,30 @@
             </div>
             <span v-else>同步整个分享</span>
           </el-descriptions-item>
+          <el-descriptions-item label="包含规则">
+            <div
+                v-if="(selected.include_patterns?.length ?? 0) > 0 || (selected.include_regex_patterns?.length ?? 0) > 0"
+                class="path-tags"
+            >
+              <el-tag
+                  v-for="(p, i) in (selected.include_patterns ?? [])"
+                  :key="`incp-${i}`"
+                  size="small"
+                  type="success"
+              >
+                {{ p }}
+              </el-tag>
+              <el-tag
+                  v-for="(p, i) in (selected.include_regex_patterns ?? [])"
+                  :key="`incr-${i}`"
+                  size="small"
+                  type="success"
+              >
+                <span class="rule-kind">正则</span>{{ p }}
+              </el-tag>
+            </div>
+            <span v-else>无（不额外限制）</span>
+          </el-descriptions-item>
           <el-descriptions-item label="排除规则">
             <div
                 v-if="selected.exclude_patterns.length > 0 || (selected.exclude_regex_patterns?.length ?? 0) > 0"
@@ -377,6 +407,8 @@
               v-model:include-paths="form.include_paths"
               v-model:exclude-patterns="form.exclude_patterns"
               v-model:exclude-regex-patterns="form.exclude_regex_patterns"
+              v-model:include-patterns="form.include_patterns"
+              v-model:include-regex-patterns="form.include_regex_patterns"
               v-model:exclude-paths="form.exclude_paths"
           />
         </el-form-item>
@@ -1417,6 +1449,8 @@ const defaultForm = (): {
   include_paths: string[]
   exclude_patterns: string[]
   exclude_regex_patterns: string[]
+  include_patterns: string[]
+  include_regex_patterns: string[]
   exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
@@ -1429,6 +1463,8 @@ const defaultForm = (): {
   include_paths: [],
   exclude_patterns: [],
   exclude_regex_patterns: [],
+  include_patterns: [],
+  include_regex_patterns: [],
   exclude_paths: [],
   targets: [createDefaultTarget()],
   conflict_strategy: 'overwrite',
@@ -1589,6 +1625,8 @@ function openEdit(s?: ShareSubscription) {
     include_paths: [...selected.value.include_paths],
     exclude_patterns: [...selected.value.exclude_patterns],
     exclude_regex_patterns: [...(selected.value.exclude_regex_patterns ?? [])],
+    include_patterns: [...(selected.value.include_patterns ?? [])],
+    include_regex_patterns: [...(selected.value.include_regex_patterns ?? [])],
     exclude_paths: [...(selected.value.exclude_paths ?? [])],
     targets: [] as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
@@ -1658,6 +1696,8 @@ async function saveForm() {
         include_paths: form.value.include_paths,
         exclude_patterns: form.value.exclude_patterns,
         exclude_regex_patterns: form.value.exclude_regex_patterns,
+        include_patterns: form.value.include_patterns,
+        include_regex_patterns: form.value.include_regex_patterns,
         exclude_paths: form.value.exclude_paths,
         targets: submitTargets(),
         conflict_strategy: form.value.conflict_strategy,
@@ -1819,6 +1859,20 @@ function buildSanitizedPayload() {
       regexSet.add(n)
     }
   }
+  const includePatternSet = new Set<string>()
+  for (const p of form.value.include_patterns) {
+    const n = p.trim()
+    if (n) {
+      includePatternSet.add(n)
+    }
+  }
+  const includeRegexSet = new Set<string>()
+  for (const p of form.value.include_regex_patterns) {
+    const n = p.trim()
+    if (n && !includeRegexSet.has(n)) {
+      includeRegexSet.add(n)
+    }
+  }
   const excludePathSet = new Set<string>()
   for (const p of form.value.exclude_paths) {
     const n = normalizeSelectedPath(p)
@@ -1829,6 +1883,8 @@ function buildSanitizedPayload() {
   form.value.include_paths = Array.from(includeSet)
   form.value.exclude_patterns = Array.from(excludeSet)
   form.value.exclude_regex_patterns = Array.from(regexSet)
+  form.value.include_patterns = Array.from(includePatternSet)
+  form.value.include_regex_patterns = Array.from(includeRegexSet)
   form.value.exclude_paths = Array.from(excludePathSet)
 
   // 额外归集网盘目标单独归一化（保持表单模型不变，校验失败时界面状态不丢）

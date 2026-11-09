@@ -51,6 +51,72 @@
       </div>
     </div>
 
+    <!-- 包含规则（include_patterns 通配符 / include_regex_patterns 正则） -->
+    <div class="field-block">
+      <div class="field-header">
+        <span class="field-label">包含规则</span>
+        <div class="path-actions">
+          <el-button
+              size="small"
+              text
+              type="primary"
+              :aria-expanded="showIncludeRuleHelp"
+              aria-label="包含规则使用说明"
+              @click="showIncludeRuleHelp = !showIncludeRuleHelp"
+          >
+            使用说明
+            <el-icon class="help-caret" aria-hidden="true">
+              <ArrowUp v-if="showIncludeRuleHelp" />
+              <ArrowDown v-else />
+            </el-icon>
+          </el-button>
+        </div>
+      </div>
+      <div v-if="includePatternList.length > 0 || includeRegexList.length > 0" class="path-tags">
+        <el-tag
+            v-for="(p, i) in includePatternList"
+            :key="'inc-glob-' + p + i"
+            closable
+            type="success"
+            @close="removeIncludePattern(i)"
+        >{{ p }}</el-tag>
+        <el-tag
+            v-for="(p, i) in includeRegexList"
+            :key="'inc-regex-' + p + i"
+            closable
+            type="success"
+            @close="removeIncludeRegex(i)"
+        ><span class="rule-kind">正则</span>{{ p }}</el-tag>
+      </div>
+      <div class="exclude-input-row">
+        <div class="rule-input-group">
+          <el-select
+              v-model="includeRuleKind"
+              class="rule-kind-select"
+              size="small"
+              aria-label="新增包含规则类型"
+          >
+            <el-option label="通配符" value="glob" />
+            <el-option label="正则表达式" value="regex" :disabled="!regexSupported" />
+          </el-select>
+          <el-input
+              v-model="includeInput"
+              class="exclude-input"
+              type="textarea"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              resize="none"
+              size="small"
+              :placeholder="includeRuleKind === 'regex' ? '输入正则，每行一条' : '输入规则，每行一条'"
+              :aria-label="includeRuleKind === 'regex' ? '输入正则包含规则' : '输入通配符包含规则'"
+              @keydown.enter="onIncludeEnter"
+          />
+        </div>
+        <el-button size="small" plain type="primary" :loading="includeValidating" @click="addIncludeRule">添加</el-button>
+      </div>
+      <p v-if="includeRuleError" class="rule-error" role="alert">{{ includeRuleError }}</p>
+      <ExcludeRuleHelp v-if="showIncludeRuleHelp" :kind="includeRuleKind" mode="include" />
+    </div>
+
     <!-- 排除内容（exclude_paths）：精确排除文件或目录 -->
     <div class="field-block">
       <div class="field-header">
@@ -301,6 +367,10 @@ const props = defineProps<{
   excludePatterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；缺省按空处理 */
   excludeRegexPatterns?: string[]
+  /** 包含通配符；缺省按空处理（不额外限制） */
+  includePatterns?: string[]
+  /** 包含正则（Rust 语法，整条路径匹配）；缺省按空处理 */
+  includeRegexPatterns?: string[]
   /** 精确排除的文件或目录路径（相对分享根） */
   excludePaths: string[]
   // 订阅所属账号：编辑订阅时传订阅自己的 owner_uid，预览目录树按该账号路由 client
@@ -315,6 +385,8 @@ const emit = defineEmits<{
   'update:includePaths': [value: string[]]
   'update:excludePatterns': [value: string[]]
   'update:excludeRegexPatterns': [value: string[]]
+  'update:includePatterns': [value: string[]]
+  'update:includeRegexPatterns': [value: string[]]
   'update:excludePaths': [value: string[]]
 }>()
 
@@ -322,6 +394,8 @@ const router = useRouter()
 const excludeInput = ref('')
 
 const regexPatterns = computed<string[]>(() => props.excludeRegexPatterns ?? [])
+const includePatternList = computed<string[]>(() => props.includePatterns ?? [])
+const includeRegexList = computed<string[]>(() => props.includeRegexPatterns ?? [])
 const activeRuleList = computed<string[]>(() =>
     ruleKind.value === 'regex' ? regexPatterns.value : props.excludePatterns,
 )
@@ -368,8 +442,14 @@ function removeExcludePath(i: number) {
 
 // 各字段的使用说明展开态（彼此独立，默认全部折叠）
 const showIncludeHelp = ref(false)
+const showIncludeRuleHelp = ref(false)
 const showExcludeFolderHelp = ref(false)
 const showExcludeHelp = ref(false)
+
+const includeInput = ref('')
+const includeRuleKind = ref<RuleKind>('glob')
+const includeRuleError = ref<string | null>(null)
+const includeValidating = ref(false)
 
 // ==================== 规则新增（后端权威校验） ====================
 
@@ -657,18 +737,111 @@ function goManagePresets() {
  * 供父组件在保存前调用：存在正则规则时必须由后端确认整份配置合法。
  * 后端不可用 / 校验失败都返回不通过，绝不静默当作成功。
  */
+function includeCandidateLists(kind: RuleKind, incoming: string[]) {
+  const globs = kind === 'glob'
+      ? mergeRules(includePatternList.value, incoming)
+      : [...includePatternList.value]
+  const regexes = kind === 'regex'
+      ? mergeRules(includeRegexList.value, incoming)
+      : [...includeRegexList.value]
+  return { globs, regexes }
+}
+
+async function commitIncludeRules(kind: RuleKind, incoming: string[]) {
+  if (includeValidating.value || incoming.length === 0) return
+  const inputSnapshot = includeInput.value
+  const globsSnapshot = [...includePatternList.value]
+  const regexesSnapshot = [...includeRegexList.value]
+  const { globs, regexes } = includeCandidateLists(kind, incoming)
+  const changed = kind === 'glob'
+      ? globs.length !== globsSnapshot.length
+      : regexes.length !== regexesSnapshot.length
+  if (!changed) {
+    if (includeInput.value === inputSnapshot) includeInput.value = ''
+    return
+  }
+  if (regexes.length > 0) {
+    includeValidating.value = true
+    try {
+      const resp = await validateExcludeRules({
+        exclude_patterns: globs,
+        exclude_regex_patterns: regexes,
+      })
+      if (includeInput.value !== inputSnapshot || includeRuleKind.value !== kind) return
+      if (!resp.valid) {
+        const baseLength = kind === 'glob' ? globsSnapshot.length : regexesSnapshot.length
+        includeRuleError.value = resp.errors.length
+            ? describeRuleErrorFrom(resp.errors[0], kind, baseLength)
+            : '包含规则校验失败'
+        return
+      }
+    } catch (e) {
+      if (includeInput.value === inputSnapshot && includeRuleKind.value === kind) {
+        includeRuleError.value = validationUnavailable(e).replace('排除规则', '包含规则')
+      }
+      return
+    } finally {
+      includeValidating.value = false
+    }
+  }
+  includeRuleError.value = null
+  if (kind === 'glob') emit('update:includePatterns', globs)
+  else emit('update:includeRegexPatterns', regexes)
+  if (includeInput.value === inputSnapshot) includeInput.value = ''
+}
+
+function addIncludeRule() {
+  void commitIncludeRules(includeRuleKind.value, parseRuleInput(includeInput.value))
+}
+
+function onIncludeEnter(e: Event) {
+  const ke = e as KeyboardEvent
+  if (ke.isComposing) return
+  ke.preventDefault()
+  addIncludeRule()
+}
+
+function removeIncludePattern(i: number) {
+  const next = [...includePatternList.value]
+  next.splice(i, 1)
+  includeRuleError.value = null
+  emit('update:includePatterns', next)
+}
+
+function removeIncludeRegex(i: number) {
+  const next = [...includeRegexList.value]
+  next.splice(i, 1)
+  includeRuleError.value = null
+  emit('update:includeRegexPatterns', next)
+}
+
 async function validateRules(): Promise<{ ok: boolean; message?: string }> {
-  const regexes = [...regexPatterns.value]
-  if (regexes.length === 0) return { ok: true }
+  const excludeRegexes = [...regexPatterns.value]
+  const includeRegexes = [...includeRegexList.value]
+  if (excludeRegexes.length === 0 && includeRegexes.length === 0) return { ok: true }
   try {
-    const resp = await validateExcludeRules({
-      exclude_patterns: [...props.excludePatterns],
-      exclude_regex_patterns: regexes,
-    })
-    if (!resp.valid) {
-      return {
-        ok: false,
-        message: resp.errors.length ? describeRuleError(resp.errors[0]) : '排除规则校验失败',
+    if (excludeRegexes.length > 0) {
+      const resp = await validateExcludeRules({
+        exclude_patterns: [...props.excludePatterns],
+        exclude_regex_patterns: excludeRegexes,
+      })
+      if (!resp.valid) {
+        return {
+          ok: false,
+          message: resp.errors.length ? describeRuleError(resp.errors[0]) : '排除规则校验失败',
+        }
+      }
+    }
+    if (includeRegexes.length > 0) {
+      const resp = await validateExcludeRules({
+        exclude_patterns: [...includePatternList.value],
+        exclude_regex_patterns: includeRegexes,
+      })
+      if (!resp.valid) {
+        return {
+          ok: false,
+          message: resp.errors.length ? describeRuleError(resp.errors[0]) : '包含规则校验失败',
+        }
       }
     }
     return { ok: true }

@@ -113,9 +113,13 @@ function mountView() {
           name: 'ShareIncludeExcludeEditor',
           props: [
             'shareUrl', 'password', 'includePaths', 'excludePatterns',
-            'excludeRegexPatterns', 'excludePaths', 'ownerUid', 'ownerLoggedIn',
+            'excludeRegexPatterns', 'includePatterns', 'includeRegexPatterns',
+            'excludePaths', 'ownerUid', 'ownerLoggedIn',
           ],
-          emits: ['update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns', 'update:excludePaths'],
+          emits: [
+            'update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns',
+            'update:includePatterns', 'update:includeRegexPatterns', 'update:excludePaths',
+          ],
           template: '<div class="include-exclude-editor-stub" />',
           setup(_props: unknown, { expose }: { expose: (e: Record<string, unknown>) => void }) {
             expose({ validateRules: editorStub.validateRules })

@@ -1820,6 +1820,8 @@ impl ShareSyncManager {
                             sub.exclude_patterns.clone(),
                             sub.exclude_regex_patterns.clone(),
                             sub.exclude_paths.clone(),
+                            sub.include_patterns.clone(),
+                            sub.include_regex_patterns.clone(),
                             // 列目录抓快照与转存提交共用同一个全局风控限速器
                             self.rate_limiter.clone(),
                         )
@@ -2246,6 +2248,8 @@ impl ShareSyncManager {
                 netdisk.as_ref(),
                 &sub.share_url,
                 sub.password.clone(),
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),

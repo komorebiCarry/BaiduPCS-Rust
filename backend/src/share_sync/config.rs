@@ -238,6 +238,13 @@ pub struct ShareSubscription {
     /// 排除正则列表（Rust 语法，整条路径匹配）；旧配置缺省为空。
     #[serde(default)]
     pub exclude_regex_patterns: Vec<String>,
+    /// 包含通配符列表（与排除规则对称）。任意包含规则非空时，文件须至少命中一条
+    /// 才进入快照；目录不会因名称未命中而跳过扫描。旧配置缺省为空 = 不额外限制。
+    #[serde(default)]
+    pub include_patterns: Vec<String>,
+    /// 包含正则列表（Rust 语法，整条路径匹配）；旧配置缺省为空。
+    #[serde(default)]
+    pub include_regex_patterns: Vec<String>,
     /// 精确排除的文件或目录路径（相对分享根）：文件只排除自身，目录连同全部内容
     /// 一起排除且不再递归列举。
     #[serde(default)]
@@ -292,6 +299,8 @@ impl ShareSubscription {
             include_paths: Vec::new(),
             exclude_patterns: Vec::new(),
             exclude_regex_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+            include_regex_patterns: Vec::new(),
             exclude_paths: Vec::new(),
             targets,
             conflict_strategy: ConflictStrategy::default(),
@@ -346,6 +355,11 @@ impl ShareSubscription {
             return Err("分享链接不能为空".into());
         }
         validate_share_url(&self.share_url)?;
+        crate::share_sync::exclusion::validate_rules(
+            &self.include_patterns,
+            &self.include_regex_patterns,
+        )
+        .map_err(|e| format!("包含规则：{e}"))?;
         crate::share_sync::exclusion::validate_rules(
             &self.exclude_patterns,
             &self.exclude_regex_patterns,
@@ -543,6 +557,12 @@ pub struct CreateShareSubscriptionRequest {
     /// 排除正则列表（Rust 语法，整条路径匹配）；缺省为空。
     #[serde(default)]
     pub exclude_regex_patterns: Vec<String>,
+    /// 包含通配符；缺省为空 = 不额外限制。
+    #[serde(default)]
+    pub include_patterns: Vec<String>,
+    /// 包含正则（Rust 语法，整条路径匹配）；缺省为空。
+    #[serde(default)]
+    pub include_regex_patterns: Vec<String>,
     /// 精确排除的文件或目录路径（相对分享根）；缺省为空 = 不排除。
     #[serde(default)]
     pub exclude_paths: Vec<String>,
@@ -567,6 +587,8 @@ impl CreateShareSubscriptionRequest {
         sub.include_paths = self.include_paths;
         sub.exclude_patterns = self.exclude_patterns;
         sub.exclude_regex_patterns = self.exclude_regex_patterns;
+        sub.include_patterns = self.include_patterns;
+        sub.include_regex_patterns = self.include_regex_patterns;
         sub.exclude_paths = self.exclude_paths;
         if let Some(s) = self.conflict_strategy {
             sub.conflict_strategy = s;
@@ -597,6 +619,12 @@ pub struct UpdateShareSubscriptionRequest {
     /// 缺省（字段缺失）= 保留已有正则规则；显式 `[]` = 清空。
     #[serde(default)]
     pub exclude_regex_patterns: Option<Vec<String>>,
+    /// 包含通配符；缺省 = 保留已有，显式 `[]` = 清空。
+    #[serde(default)]
+    pub include_patterns: Option<Vec<String>>,
+    /// 包含正则；缺省 = 保留已有，显式 `[]` = 清空。
+    #[serde(default)]
+    pub include_regex_patterns: Option<Vec<String>>,
     /// 精确排除的文件或目录路径（相对分享根）；缺省 = 保留已有，显式 `[]` = 清空。
     #[serde(default)]
     pub exclude_paths: Option<Vec<String>>,
@@ -1035,6 +1063,8 @@ mod tests {
             include_paths: vec!["/a".into()],
             exclude_patterns: vec![],
             exclude_regex_patterns: vec!["^/股票/2025.*$".into()],
+            include_patterns: vec!["*.mp4".into()],
+            include_regex_patterns: vec!["^/剧集/.*SE.*$".into()],
             exclude_paths: vec!["/a/tmp".into()],
             targets: vec![SyncTarget::Netdisk(NetdiskTarget {
                 remote_path: "/y".into(),
@@ -1063,6 +1093,11 @@ mod tests {
         assert_eq!(sub.poll_config.mode, PollMode::Scheduled);
         assert_eq!(sub.poll_config.schedule_hour, Some(3));
         assert_eq!(sub.exclude_paths, vec!["/a/tmp".to_string()]);
+        assert_eq!(sub.include_patterns, vec!["*.mp4".to_string()]);
+        assert_eq!(
+            sub.include_regex_patterns,
+            vec!["^/剧集/.*SE.*$".to_string()]
+        );
     }
 
     /// 老订阅没有 exclude_paths 字段，必须仍能反序列化。
@@ -1080,6 +1115,8 @@ mod tests {
         }"#;
         let sub: ShareSubscription = serde_json::from_str(json).unwrap();
         assert!(sub.exclude_paths.is_empty());
+        assert!(sub.include_patterns.is_empty());
+        assert!(sub.include_regex_patterns.is_empty());
         assert_eq!(sub.include_paths, vec!["/a".to_string()]);
         assert_eq!(sub.exclude_patterns, vec!["*.tmp".to_string()]);
     }
@@ -1178,6 +1215,80 @@ mod tests {
         let cleared: UpdateShareSubscriptionRequest =
             serde_json::from_str(r#"{"exclude_regex_patterns":[]}"#).unwrap();
         assert_eq!(cleared.exclude_regex_patterns, Some(Vec::new()));
+    }
+
+    /// 老订阅没有 include_patterns / include_regex_patterns 字段时必须仍能反序列化。
+    #[test]
+    fn test_subscription_without_include_rules_deserializes() {
+        let json = r#"{
+            "id": "s1",
+            "name": "t",
+            "share_url": "https://pan.baidu.com/s/1y7CluAbCdEfGh",
+            "include_paths": [],
+            "exclude_patterns": [],
+            "targets": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let sub: ShareSubscription = serde_json::from_str(json).unwrap();
+        assert!(sub.include_patterns.is_empty());
+        assert!(sub.include_regex_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_include_rules_roundtrip() {
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+                account_uid: None,
+            })],
+        );
+        sub.include_patterns = vec!["*SE*".into(), "*.mp4".into()];
+        sub.include_regex_patterns = vec![r".*/[^/]*SE[^/]*\.mp4$".into()];
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: ShareSubscription = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.include_patterns,
+            vec!["*SE*".to_string(), "*.mp4".to_string()]
+        );
+        assert_eq!(
+            back.include_regex_patterns,
+            vec![r".*/[^/]*SE[^/]*\.mp4$".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_include_regex() {
+        let mut sub = ShareSubscription::new(
+            "t".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/x".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+                account_uid: None,
+            })],
+        );
+        sub.include_regex_patterns = vec!["(".into()];
+        let err = sub.validate().unwrap_err();
+        assert!(err.contains("包含规则"), "{err}");
+        assert!(err.contains("第 1 条"), "{err}");
+    }
+
+    #[test]
+    fn test_update_request_missing_vs_empty_include_list() {
+        let missing: UpdateShareSubscriptionRequest =
+            serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert!(missing.include_patterns.is_none());
+        assert!(missing.include_regex_patterns.is_none());
+        let cleared: UpdateShareSubscriptionRequest =
+            serde_json::from_str(r#"{"include_patterns":[],"include_regex_patterns":[]}"#).unwrap();
+        assert_eq!(cleared.include_patterns, Some(Vec::new()));
+        assert_eq!(cleared.include_regex_patterns, Some(Vec::new()));
     }
 
     /// 精确目录排除随订阅序列化往返，编辑后不丢失。

@@ -86,6 +86,20 @@ function mountEditor(props: Record<string, unknown> = {}) {
   })
 }
 
+
+/** 当前可见的 el-select 下拉项。页面上现有「包含规则」和「排除规则」两个类型下拉，不能全页 query。 */
+function visibleSelectDropdownItems(): HTMLElement[] {
+  const poppers = Array.from(document.body.querySelectorAll<HTMLElement>('.el-popper')).filter((el) => {
+    if (!el.querySelector('.el-select-dropdown')) return false
+    if (el.getAttribute('aria-hidden') === 'true') return false
+    if ((el as HTMLElement).style.display === 'none') return false
+    return true
+  })
+  const popper = poppers.at(-1)
+  if (!popper) return []
+  return Array.from(popper.querySelectorAll<HTMLElement>('.el-select-dropdown__item:not(.is-disabled-hidden)'))
+}
+
 /** 某个字段区块（按标签文案定位） */
 function fieldBlock(label: string): HTMLElement {
   const blocks = Array.from(document.body.querySelectorAll<HTMLElement>('.field-block'))
@@ -445,7 +459,7 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
     const wrapper = mountEditor()
     await flushPromises()
 
-    expect(fieldLabelTexts()).toEqual(['同步内容', '排除内容', '排除规则'])
+    expect(fieldLabelTexts()).toEqual(['同步内容', '包含规则', '排除内容', '排除规则'])
     wrapper.unmount()
   })
 
@@ -496,6 +510,7 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
 
     for (const [name, label] of [
       ['同步内容使用说明', '同步内容'],
+      ['包含规则使用说明', '包含规则'],
       ['排除内容使用说明', '排除内容'],
       ['排除规则使用说明', '排除规则'],
     ]) {
@@ -545,7 +560,7 @@ describe('ShareIncludeExcludeEditor 头部与折叠说明', () => {
     const wrapper = mountEditor()
     await flushPromises()
 
-    const names = ['同步内容使用说明', '排除内容使用说明', '排除规则使用说明']
+    const names = ['同步内容使用说明', '包含规则使用说明', '排除内容使用说明', '排除规则使用说明']
     const caretOf = (name: string) => helpButton(name).querySelector<HTMLElement>('.help-caret')!
     const closedCaret = new Map<string, string>()
 
@@ -726,8 +741,7 @@ describe('ShareIncludeExcludeEditor 正则规则', () => {
       Array.from(rulesBlock().querySelectorAll<HTMLButtonElement>('.exclude-input-row button'))
           .find((b) => b.textContent?.trim() === '添加')!
   const kindSelect = () => rulesBlock().querySelector<HTMLElement>('.rule-kind-select')!
-  const kindOptions = () =>
-      Array.from(document.body.querySelectorAll<HTMLElement>('.el-select-dropdown__item:not(.is-disabled-hidden)'))
+  const kindOptions = () => visibleSelectDropdownItems()
   const regexTags = () =>
       Array.from(rulesBlock().querySelectorAll<HTMLElement>('.path-tags .el-tag'))
           .filter((el) => el.textContent?.includes('正则'))
@@ -1178,7 +1192,7 @@ describe('ShareIncludeExcludeEditor 词表点选保留草稿（F3）', () => {
   const switchToRegex = async () => {
     rulesBlock().querySelector<HTMLElement>('.rule-kind-select .el-select__wrapper')!.click()
     await flushPromises()
-    const option = Array.from(document.body.querySelectorAll<HTMLElement>('.el-select-dropdown__item'))
+    const option = visibleSelectDropdownItems()
         .find((o) => o.textContent?.trim() === '正则表达式')
     expect(option, '下拉框应有「正则表达式」选项').toBeTruthy()
     option!.click()
@@ -1310,11 +1324,8 @@ describe('ShareIncludeExcludeEditor 常用规则保存回读', () => {
     rulesBlock().querySelector<HTMLElement>('.rule-kind-select .el-select__wrapper')!.click()
     await flushPromises()
     const label = kind === 'regex' ? '正则表达式' : '通配符'
-    const option = Array.from(
-        document.body.querySelectorAll<HTMLElement>(
-            '.el-select-dropdown__item:not(.is-disabled-hidden)',
-        ),
-    ).find((o) => o.textContent?.trim() === label)
+    const option = visibleSelectDropdownItems()
+        .find((o) => o.textContent?.trim() === label)
     expect(option, `下拉框应有「${label}」选项`).toBeTruthy()
     option!.click()
     await flushPromises()
@@ -1670,6 +1681,35 @@ describe('ShareIncludeExcludeEditor 拆成逐项选择的提示', () => {
     await flushPromises()
     expect(helpText('同步内容')).toContain('之后新增的内容不再自动同步')
     expect(helpText('同步内容')).toContain('「排除内容」')
+    wrapper.unmount()
+  })
+
+  it('包含规则添加通配符后发出 includePatterns，不影响排除规则', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+    const block = fieldBlock('包含规则')
+    const input = block.querySelector<HTMLTextAreaElement>('.exclude-input textarea')!
+    input.value = '*SE*\n*.mp4'
+    input.dispatchEvent(new Event('input'))
+    await flushPromises()
+    const add = Array.from(block.querySelectorAll<HTMLButtonElement>('.exclude-input-row button'))
+        .find((b) => b.textContent?.trim() === '添加')!
+    add.click()
+    await flushPromises()
+    expect(wrapper.emitted('update:includePatterns')![0][0]).toEqual(['*SE*', '*.mp4'])
+    expect(wrapper.emitted('update:excludePatterns')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('包含规则说明说明白名单语义', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+    helpButton('包含规则使用说明').click()
+    await flushPromises()
+    const help = fieldBlock('包含规则').querySelector('.exclude-help')
+    expect(help?.textContent).toContain('至少命中一条才会同步')
+    expect(help?.textContent).toContain('目录不会因为名称未命中就被跳过')
+    expect(help?.textContent).toContain('仍会再应用排除规则')
     wrapper.unmount()
   })
 })

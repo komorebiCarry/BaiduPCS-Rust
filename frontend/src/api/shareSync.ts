@@ -77,6 +77,10 @@ export interface ShareSubscription {
   exclude_patterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
   exclude_regex_patterns?: string[]
+  /** 包含通配符；任意包含规则非空时文件须至少命中一条。旧响应可能缺该字段 */
+  include_patterns?: string[]
+  /** 包含正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
+  include_regex_patterns?: string[]
   /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths: string[]
   targets: SyncTarget[]
@@ -104,6 +108,8 @@ export interface CreateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 排除正则（Rust 语法，整条路径匹配） */
   exclude_regex_patterns?: string[]
+  include_patterns?: string[]
+  include_regex_patterns?: string[]
   /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets: SyncTarget[]
@@ -122,6 +128,10 @@ export interface UpdateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 缺省 = 保留已存正则；显式 [] = 清空 */
   exclude_regex_patterns?: string[]
+  /** 缺省 = 保留已存包含通配符；显式 [] = 清空 */
+  include_patterns?: string[]
+  /** 缺省 = 保留已存包含正则；显式 [] = 清空 */
+  include_regex_patterns?: string[]
   /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets?: SyncTarget[]
