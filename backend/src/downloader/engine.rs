@@ -230,9 +230,7 @@ fn is_server_throttled_error(err: &anyhow::Error) -> bool {
 /// 实测中一个 CDN 节点对某文件持续 403，任务因此卡了 8 分钟才靠换链接自愈。
 fn is_permanent_http_error(err: &anyhow::Error) -> bool {
     let msg = format!("{:#}", err);
-    msg.contains("HTTP错误: 403")
-        || msg.contains("HTTP错误: 404")
-        || msg.contains("HTTP错误: 410")
+    msg.contains("HTTP错误: 403") || msg.contains("HTTP错误: 404") || msg.contains("HTTP错误: 410")
 }
 
 /// 🔥 计算指数退避延迟
@@ -1230,15 +1228,16 @@ impl DownloadEngine {
         // 从 user_auth 中提取 VIP 等级
         let vip_type = VipType::from_u32(user_auth.vip_type.unwrap_or(0));
 
-        let netdisk_client = NetdiskClient::new_with_proxy(user_auth, proxy_config, fallback_mgr.clone())
-            .expect("Failed to create NetdiskClient");
+        let netdisk_client =
+            NetdiskClient::new_with_proxy(user_auth, proxy_config, fallback_mgr.clone())
+                .expect("Failed to create NetdiskClient");
         let netdisk_client = Arc::new(StdRwLock::new(netdisk_client));
 
         let proxy_config_shared = Arc::new(StdRwLock::new(proxy_config.cloned()));
 
         // 创建初始共享下载客户端（首次创建不强制 HTTP/1.1）
-        let initial_download_client = Self::build_download_client(proxy_config, false)
-            .expect("初始创建下载客户端失败");
+        let initial_download_client =
+            Self::build_download_client(proxy_config, false).expect("初始创建下载客户端失败");
         let shared_download_client = Arc::new(StdRwLock::new(initial_download_client));
 
         Self {
@@ -1259,7 +1258,10 @@ impl DownloadEngine {
     /// # 参数
     /// - `proxy_config`: 代理配置
     /// - `force_http11`: 是否强制 HTTP/1.1（HTTP/2 降级期间为 true）
-    fn build_download_client(proxy_config: Option<&ProxyConfig>, force_http11: bool) -> Result<Client> {
+    fn build_download_client(
+        proxy_config: Option<&ProxyConfig>,
+        force_http11: bool,
+    ) -> Result<Client> {
         // 使用 Android 客户端的 User-Agent（与 NetdiskClient 一致）
         let pan_ua = "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
 
@@ -1287,7 +1289,8 @@ impl DownloadEngine {
         }
 
         if let Some(proxy) = proxy_config {
-            builder = proxy.apply_to_builder(builder)
+            builder = proxy
+                .apply_to_builder(builder)
                 .context("下载客户端应用代理配置失败")?;
         }
 
@@ -1348,9 +1351,7 @@ impl DownloadEngine {
     /// 由 `download_chunk_with_retry` 在「本次尝试收到任意字节」时调用（通过
     /// `H2DowngradeSignal::DataReceived` 闭包），表示链路本身并未失效。
     pub fn reset_h2_zero_failure_counter(&self) {
-        let prev = self
-            .consecutive_h2_zero_failures
-            .swap(0, Ordering::SeqCst);
+        let prev = self.consecutive_h2_zero_failures.swap(0, Ordering::SeqCst);
         if prev > 0 {
             debug!("HTTP/2 零字节失败计数从 {} 重置为 0", prev);
         }
@@ -1437,9 +1438,7 @@ impl DownloadEngine {
                         match Self::build_download_client(proxy.as_ref(), false) {
                             Ok(new_client) => {
                                 *shared_client.write().unwrap() = new_client;
-                                tracing::info!(
-                                    "✓ HTTP/1.1 降级冷却到期，已恢复 HTTP/2 下载客户端"
-                                );
+                                tracing::info!("✓ HTTP/1.1 降级冷却到期，已恢复 HTTP/2 下载客户端");
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1543,6 +1542,9 @@ impl DownloadEngine {
     )> {
         let (fs_id, remote_path, local_path, total_size, owner_uid) = {
             let t = task.lock().await;
+            if cancellation_token.is_cancelled() || t.deletion_token.is_cancelled() {
+                anyhow::bail!("任务已被取消");
+            }
             (
                 t.fs_id,
                 t.remote_path.clone(),
@@ -1637,7 +1639,7 @@ impl DownloadEngine {
                             let result = Self::probe_download_link_parallel(
                                 &client, &bduss, &url, total_size,
                             )
-                                .await;
+                            .await;
                             (global_idx, url, result)
                         }
                     })
@@ -1755,10 +1757,8 @@ impl DownloadEngine {
                     let mut t = task.lock().await;
                     t.total_size = server_size;
                 }
-                let new_chunk_size = DownloadConfig::calculate_adaptive_chunk_size(
-                    server_size,
-                    self.vip_type,
-                );
+                let new_chunk_size =
+                    DownloadConfig::calculate_adaptive_chunk_size(server_size, self.vip_type);
                 (server_size, new_chunk_size)
             }
             _ => (total_size, chunk_size),
@@ -1770,7 +1770,9 @@ impl DownloadEngine {
             .context("准备本地文件失败")?;
 
         // 7. 创建分片管理器
-        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size, owner_uid)));
+        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(
+            total_size, chunk_size, owner_uid,
+        )));
 
         // 8. 创建速度计算器
         let speed_calc = Arc::new(Mutex::new(SpeedCalculator::with_default_window()));
@@ -1778,6 +1780,9 @@ impl DownloadEngine {
         // 9. 标记为下载中
         {
             let mut t = task.lock().await;
+            if cancellation_token.is_cancelled() || t.deletion_token.is_cancelled() {
+                anyhow::bail!("任务已被取消");
+            }
             t.mark_downloading();
         }
 
@@ -2055,7 +2060,9 @@ impl DownloadEngine {
 
         // 6. 创建分片管理器（使用自适应计算的 chunk_size）
         let owner_uid = { task.lock().await.owner_uid };
-        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(total_size, chunk_size, owner_uid)));
+        let chunk_manager = Arc::new(Mutex::new(ChunkManager::new(
+            total_size, chunk_size, owner_uid,
+        )));
 
         // 7. 创建速度计算器
         let speed_calc = Arc::new(Mutex::new(SpeedCalculator::with_default_window()));
@@ -2108,7 +2115,7 @@ impl DownloadEngine {
                                 &url,
                                 total_size,
                             )
-                                .await
+                            .await
                             {
                                 Ok(speed) => {
                                     let health = health_clone.lock().await;
@@ -2173,19 +2180,20 @@ impl DownloadEngine {
         };
 
         // 10. 并发下载分片（使用全局 Semaphore 和复用的 download_client，使用 URL 健康管理器）
-        let download_result = self.download_chunks(
-            task.clone(),
-            chunk_manager.clone(),
-            speed_calc.clone(),
-            global_semaphore,
-            &download_client, // 传递复用的 client
-            url_health,       // 传递 URL 健康管理器
-            &temp_path,       // 使用临时路径
-            chunk_size,         // 传递分片大小用于计算超时
-            total_size,         // 传递文件总大小用于计算延迟
-            referer.as_deref(), // 传递 Referer 头（如果存在）
-            cancellation_token, // 传递取消令牌
-        )
+        let download_result = self
+            .download_chunks(
+                task.clone(),
+                chunk_manager.clone(),
+                speed_calc.clone(),
+                global_semaphore,
+                &download_client,   // 传递复用的 client
+                url_health,         // 传递 URL 健康管理器
+                &temp_path,         // 使用临时路径
+                chunk_size,         // 传递分片大小用于计算超时
+                total_size,         // 传递文件总大小用于计算延迟
+                referer.as_deref(), // 传递 Referer 头（如果存在）
+                cancellation_token, // 传递取消令牌
+            )
             .await;
         // 无论成功失败都要停掉刷新协程，避免它挂在已结束的任务上空转
         speed_refresh_handle.abort();
@@ -3080,7 +3088,10 @@ impl DownloadEngine {
         }
 
         if existed {
-            info!("文件准备完成: {:?}, 大小: {} bytes (复用已有文件)", path, size);
+            info!(
+                "文件准备完成: {:?}, 大小: {} bytes (复用已有文件)",
+                path, size
+            );
         } else {
             info!("文件准备完成: {:?}, 大小: {} bytes", path, size);
         }
@@ -3107,7 +3118,10 @@ impl DownloadEngine {
                 tokio::fs::rename(final_path, &temp_path)
                     .await
                     .context("迁移旧格式下载文件失败")?;
-                info!("检测到旧格式下载文件，已迁移为临时文件: {:?} -> {:?}", final_path, temp_path);
+                info!(
+                    "检测到旧格式下载文件，已迁移为临时文件: {:?} -> {:?}",
+                    final_path, temp_path
+                );
             }
         }
 
@@ -3276,19 +3290,19 @@ impl DownloadEngine {
                     total_size,
                     cancellation_token,
                     "usize".parse()?,
-                    None, // ws_manager（独立模式不需要）
-                    None, // progress_throttler（独立模式不需要）
+                    None,          // ws_manager（独立模式不需要）
+                    None,          // progress_throttler（独立模式不需要）
                     String::new(), // task_id（独立模式不需要）
-                    None, // folder_progress_tx（独立模式不需要）
-                    None, // backup_notification_tx（独立模式不需要）
-                    None, // slot_touch_throttler（独立模式不需要）
-                    3,    // max_retries（独立模式使用默认值）
-                    None, // fallback_mgr（独立模式不需要）
-                    None, // http11_trigger（独立模式不需要）
+                    None,          // folder_progress_tx（独立模式不需要）
+                    None,          // backup_notification_tx（独立模式不需要）
+                    None,          // slot_touch_throttler（独立模式不需要）
+                    3,             // max_retries（独立模式使用默认值）
+                    None,          // fallback_mgr（独立模式不需要）
+                    None,          // http11_trigger（独立模式不需要）
                 )
-                    .await
-                    // 🔥 独立模式不关心失败分类，解包为 anyhow::Error
-                    .map_err(|e| e.into_error());
+                .await
+                // 🔥 独立模式不关心失败分类，解包为 anyhow::Error
+                .map_err(|e| e.into_error());
 
                 drop(permit); // 🔥 释放 permit，其他等待的分片可以使用
 
@@ -3561,7 +3575,13 @@ impl DownloadEngine {
                             calc.add_sample(bytes);
                             t.speed = calc.speed();
 
-                            (downloaded, t.speed, t.group_id.clone(), t.is_backup, t.owner_uid.raw())
+                            (
+                                downloaded,
+                                t.speed,
+                                t.group_id.clone(),
+                                t.is_backup,
+                                t.owner_uid.raw(),
+                            )
                         };
 
                         // 🔧 克隆一个临时变量用于 send
@@ -3764,18 +3784,21 @@ impl DownloadEngine {
                     // 🔥 代理回退：下载失败时检测是否为代理/连接错误
                     if let Some(ref mgr) = fallback_mgr {
                         if !mgr.is_fallen_back()
-                            && crate::common::proxy_fallback::is_proxy_or_connection_error(&e) {
+                            && crate::common::proxy_fallback::is_proxy_or_connection_error(&e)
+                        {
                             let should_fallback = mgr.record_failure();
                             if should_fallback {
                                 // 检查 allow_fallback 配置
-                                let allow = mgr.user_proxy_config().await
+                                let allow = mgr
+                                    .user_proxy_config()
+                                    .await
                                     .map(|c| c.allow_fallback)
                                     .unwrap_or(true);
                                 if allow {
                                     warn!(
-                                            "[分片线程{}] ⚠ 代理连续失败达到阈值，触发回退到直连",
-                                            chunk_thread_id
-                                        );
+                                        "[分片线程{}] ⚠ 代理连续失败达到阈值，触发回退到直连",
+                                        chunk_thread_id
+                                    );
                                     // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
                                     mgr.execute_fallback().await;
                                 } else {
@@ -3901,8 +3924,9 @@ impl DownloadEngine {
                                 tried_urls.len(),
                                 retries
                             );
-                            let err = last_error
-                                .unwrap_or_else(|| anyhow::anyhow!("分片 #{} 下载失败", chunk_index));
+                            let err = last_error.unwrap_or_else(|| {
+                                anyhow::anyhow!("分片 #{} 下载失败", chunk_index)
+                            });
                             // 🔥 根据错误类型返回精细化失败分类
                             let failure = if is_throttled {
                                 ChunkDownloadFailure::ServerThrottled(err)
@@ -3954,7 +3978,7 @@ mod tests {
             username: "test_user".to_string(),
             nickname: Some("测试用户".to_string()),
             avatar_url: Some("https://example.com/avatar.jpg".to_string()),
-            vip_type: Some(2),                                // SVIP
+            vip_type: Some(2), // SVIP
             vip_level: None,
             total_space: Some(2 * 1024 * 1024 * 1024 * 1024), // 2TB
             used_space: Some(500 * 1024 * 1024 * 1024),       // 500GB
@@ -4090,7 +4114,9 @@ mod tests {
     /// 会全部落到同一条链接，任务所有连接压在一个 CDN 节点上。
     #[test]
     fn test_get_url_hybrid_spreads_concurrent_chunks() {
-        let urls: Vec<String> = (0..6).map(|i| format!("https://cdn{i}.example.com/f")).collect();
+        let urls: Vec<String> = (0..6)
+            .map(|i| format!("https://cdn{i}.example.com/f"))
+            .collect();
         let health = UrlHealthManager::new(urls.clone(), vec![160.0; 6]);
 
         // 模拟 EWMA 预热到真实分片速度（5MB / 0.7s ≈ 7300 KB/s）
@@ -4115,7 +4141,9 @@ mod tests {
     /// 长期分流比例仍要收敛到权重比例（加权语义不能因为打散而丢失）
     #[test]
     fn test_get_url_hybrid_respects_weight_ratio() {
-        let urls: Vec<String> = (0..3).map(|i| format!("https://cdn{i}.example.com/f")).collect();
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://cdn{i}.example.com/f"))
+            .collect();
         let health = UrlHealthManager::new(urls.clone(), vec![100.0, 200.0, 700.0]);
         for url in &urls {
             health.url_scores.insert(url.clone(), 100);
@@ -4143,7 +4171,9 @@ mod tests {
     /// 并发环境变化后，竞争期学到的 score / EWMA 必须回到中立值
     #[test]
     fn test_reset_learned_state_clears_contended_judgements() {
-        let urls: Vec<String> = (0..3).map(|i| format!("https://cdn{i}.example.com/f")).collect();
+        let urls: Vec<String> = (0..3)
+            .map(|i| format!("https://cdn{i}.example.com/f"))
+            .collect();
         let health = UrlHealthManager::new(urls.clone(), vec![150.0, 150.0, 150.0]);
 
         // 竞争期：EWMA 被压低、score 被扣分、窗口塞满样本
@@ -4164,7 +4194,14 @@ mod tests {
             assert_eq!(*health.url_scores.get(url).unwrap(), 50);
             assert_eq!(*health.url_avg_speeds.get(url).unwrap(), 150.0);
             assert_eq!(*health.url_sample_counts.get(url).unwrap(), 0);
-            assert!(health.url_recent_speeds.get(url).unwrap().value().lock().unwrap().is_empty());
+            assert!(health
+                .url_recent_speeds
+                .get(url)
+                .unwrap()
+                .value()
+                .lock()
+                .unwrap()
+                .is_empty());
         }
 
         // 已降权的链接保持降权，交给 try_restore_links 的探测流程

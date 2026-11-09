@@ -30,7 +30,10 @@ impl TaskStatus {
     /// 仅过滤 `Downloading` 会漏掉 `Decrypting`/`Pending` 子任务的速度贡献，
     /// 导致前端展示速度恒为 0。
     pub fn is_active_download_status(&self) -> bool {
-        matches!(self, TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting)
+        matches!(
+            self,
+            TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
+        )
     }
 }
 
@@ -180,6 +183,11 @@ pub struct DownloadTask {
     #[serde(skip)]
     pub decrypt_epoch: u64,
 
+    /// Permanent delete intent, separate from the download token which is also
+    /// cancelled on normal finalization. Never reset on pause/resume.
+    #[serde(skip)]
+    pub deletion_token: tokio_util::sync::CancellationToken,
+
     /// 🔥 解密原子提交标志（不可中断的收尾标记）
     ///
     /// 用于闭合 R21 注释里诚实标注的剩余时序窗口：rename(attempt → final)
@@ -278,6 +286,7 @@ impl DownloadTask {
             next_retry_at: None,
             // 🔥 解密协程版本号字段初始化
             decrypt_epoch: 0,
+            deletion_token: tokio_util::sync::CancellationToken::new(),
             // 🔥 解密原子提交标志初始化
             decrypt_committed: false,
             // 🔥 收尾/解密协程已 spawn 标记初始化
@@ -361,6 +370,21 @@ impl DownloadTask {
     pub fn mark_decrypting(&mut self) {
         self.status = TaskStatus::Decrypting;
         self.speed = 0;
+    }
+
+    /// Claim deletion without changing status: delete still owns the active
+    /// count and must retain the original completed/unfinished file semantics.
+    pub fn request_delete(&mut self) {
+        if !self.deletion_token.is_cancelled() {
+            self.deletion_token.cancel();
+            self.invalidate_decrypt_epoch();
+        }
+    }
+
+    pub fn finalize_is_stale(&self, epoch: u64) -> bool {
+        self.deletion_token.is_cancelled()
+            || self.status == TaskStatus::Paused
+            || self.decrypt_epoch != epoch
     }
 
     /// 🔥 失效正在进行的解密协程
@@ -612,7 +636,9 @@ mod tests {
     #[test]
     fn test_detect_encrypted_filename() {
         // 有效的加密文件名：UUID.dat
-        assert!(DownloadTask::detect_encrypted_filename("a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"));
+        assert!(DownloadTask::detect_encrypted_filename(
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890.dat"
+        ));
         // 无效的文件名
         assert!(!DownloadTask::detect_encrypted_filename("normal_file.txt"));
         assert!(!DownloadTask::detect_encrypted_filename("not-a-uuid.dat"));

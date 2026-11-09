@@ -803,6 +803,10 @@ impl DownloadManager {
         // 检查任务状态
         let is_folder_task = {
             let t = task.lock().await;
+            // 🔥 issue192：删除中的任务不得启动/分配槽位/入队
+            if t.deletion_token.is_cancelled() {
+                anyhow::bail!("任务正在删除");
+            }
             if t.status == TaskStatus::Downloading {
                 anyhow::bail!("任务已在下载中");
             }
@@ -1021,6 +1025,11 @@ impl DownloadManager {
             }
         }
 
+        // 🔥 issue192：分配槽位期间 delete 可能已完成；命中则回收刚分配的槽位，不启动
+        if self.abandon_start_if_deleted(task_id, &task).await {
+            return Ok(());
+        }
+
         // 立即启动任务
         self.start_task_internal(task_id).await
     }
@@ -1066,6 +1075,138 @@ impl DownloadManager {
         }
     }
 
+    /// 🔥 issue192：启动/重排路径的删除闸门。
+    ///
+    /// 返回 true 表示任务已进入删除流程（`deletion_token` 已触发），或已不在 tasks 表
+    /// （删除已完成），此时绝不能再启动或重排。
+    /// 删除意图总是在任务被移出 tasks 表之前于任务锁内设置，所以"先查在表、再锁内查
+    /// deletion_token"不会漏判。
+    async fn start_blocked_by_delete_static(
+        tasks: &Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
+        task_id: &str,
+        task: &Arc<Mutex<DownloadTask>>,
+    ) -> bool {
+        // 只看 id 是否仍在表：若表项被换成另一个 Arc（当前无此路径），不在这里按 id
+        // 回收资源，以免误伤新表项持有的槽位。
+        let present = tasks.read().await.contains_key(task_id);
+        if !present {
+            return true;
+        }
+        task.lock().await.deletion_token.is_cancelled()
+    }
+
+    /// 🔥 issue192：删除闸门命中后，撤销启动路径为该任务取得的资源。
+    ///
+    /// - 取消并移除该任务的取消令牌：被删除的任务不会再有新一代 token，按 id 移除安全；
+    /// - 按 task_id 归属释放三种槽位（普通/备份固定位、文件夹固定位映射、借调位映射）。
+    ///   全部按 owner 匹配、幂等，与 delete_task 自身的按字段释放重复执行也无副作用；
+    ///   且不依赖 task 字段——任务可能已被移出 tasks 表，字段写入可能根本没落到任务上。
+    async fn abandon_deleted_start_static(
+        task_id: &str,
+        group_id: Option<&str>,
+        cancellation_tokens: &Arc<RwLock<HashMap<String, CancellationToken>>>,
+        task_slot_pool: &Arc<crate::task_slot_pool::TaskSlotPool>,
+        folder_manager: &Arc<RwLock<Option<Arc<crate::downloader::FolderDownloadManager>>>>,
+    ) {
+        if let Some(token) = cancellation_tokens.write().await.remove(task_id) {
+            token.cancel();
+        }
+        task_slot_pool.release_fixed_slot(task_id).await;
+        if let Some(folder_id) = group_id {
+            let folder_mgr = folder_manager.read().await.clone();
+            if let Some(fm) = folder_mgr {
+                fm.release_fixed_slot_from_subtask(folder_id, task_id).await;
+                fm.release_subtask_borrowed_slot(folder_id, task_id).await;
+            }
+        }
+        info!(
+            "删除闸门：回收任务 {} 的取消令牌与按 id 归属的槽位",
+            task_id
+        );
+    }
+
+    /// 🔥 issue192 队列不变量：已删除（不在 tasks 表）或删除中的任务绝不进入 waiting_queue。
+    ///
+    /// 必须在**持有 waiting_queue 写锁**时调用。delete 在把任务移出 tasks 表之后，会在同一把
+    /// 队列写锁下做最终清扫（[`Self::final_delete_sweep`]），因此"锁内判活 + 入队"与
+    /// "移出 + 清扫"严格串行：入队要么发生在清扫之前（被清扫掉），要么发生在移出之后（判活失败）。
+    ///
+    /// 任务锁只用 `try_lock`：不在队列锁内等待任务锁，避免与持任务锁再入队的路径形成锁序反转。
+    /// 拿不到任务锁时按存活处理——若其实正在删除，同样由最终清扫兜底。
+    fn queue_admits_locked(
+        tasks: &HashMap<String, Arc<Mutex<DownloadTask>>>,
+        task_id: &str,
+    ) -> bool {
+        match tasks.get(task_id) {
+            None => false,
+            Some(task) => match task.try_lock() {
+                Ok(t) => !t.deletion_token.is_cancelled(),
+                Err(_) => true,
+            },
+        }
+    }
+
+    /// 🔥 issue192：等待队列消费点"出队后未能启动 → 放回队尾"的唯一入口（受删除保护）。
+    ///
+    /// 返回是否真的放回。已删除/删除中的任务直接丢弃，不会复活为僵尸 id。
+    async fn requeue_back_if_alive_static(
+        waiting_queue: &Arc<RwLock<VecDeque<String>>>,
+        tasks: &Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
+        task_id: String,
+    ) -> bool {
+        let mut queue = waiting_queue.write().await;
+        if !Self::queue_admits_locked(&*tasks.read().await, &task_id) {
+            debug!("任务 {} 已删除或正在删除，不放回等待队列", task_id);
+            return false;
+        }
+        queue.push_back(task_id);
+        true
+    }
+
+    /// 🔥 issue192：删除的最终清扫——必须在任务已被移出 tasks 表之后调用。
+    ///
+    /// 与上面的受保护入队、启动路径的分配后闸门配合，保证删除完成后不残留：
+    /// - waiting_queue 中的该 id（在队列写锁内清扫，与 `queue_admits_locked` 串行）；
+    /// - 该任务的取消令牌（删除屏障之后才登记的令牌）；
+    /// - 以 task_id 为 owner 的普通/备份固定位、文件夹固定位映射、借调位映射
+    ///   （删除读取槽位字段之后才完成的分配）。
+    ///
+    /// 全部幂等。此后再发生的分配，都会被分配后的删除闸门看到"任务不在表"而回收。
+    async fn final_delete_sweep(&self, task_id: &str, group_id: Option<&str>) {
+        self.waiting_queue.write().await.retain(|id| id != task_id);
+        Self::abandon_deleted_start_static(
+            task_id,
+            group_id,
+            &self.cancellation_tokens,
+            &self.task_slot_pool,
+            &self.folder_manager,
+        )
+        .await;
+    }
+
+    /// 🔥 issue192：start_task / resume_task 分配槽位之后、真正启动之前的删除闸门。
+    ///
+    /// 命中则按 id 回收刚分配的槽位并返回 true（调用方以 Ok(()) 结束，不再启动）。
+    async fn abandon_start_if_deleted(
+        &self,
+        task_id: &str,
+        task: &Arc<Mutex<DownloadTask>>,
+    ) -> bool {
+        if !Self::start_blocked_by_delete_static(&self.tasks, task_id, task).await {
+            return false;
+        }
+        let group_id = task.lock().await.group_id.clone();
+        Self::abandon_deleted_start_static(
+            task_id,
+            group_id.as_deref(),
+            &self.cancellation_tokens,
+            &self.task_slot_pool,
+            &self.folder_manager,
+        )
+        .await;
+        true
+    }
+
     /// 处理任务准备或注册失败的统一逻辑
     ///
     /// - 文件夹子任务 / 备份任务：累加 `start_retry_count`，未超上限则重置为 Pending 放回等待队列；
@@ -1102,6 +1243,7 @@ impl DownloadManager {
             is_borrowed_slot,
             uses_folder_fixed_slot,
             start_retry_count,
+            deletion_requested,
         ) = {
             let t = task.lock().await;
             (
@@ -1111,10 +1253,13 @@ impl DownloadManager {
                 t.is_borrowed_slot,
                 t.uses_folder_fixed_slot,
                 t.start_retry_count,
+                t.deletion_token.is_cancelled(),
             )
         };
 
         // 🔥 typed rollback：先释放槽位，再处理状态变更
+        //    删除意图已出现时也必须先释放（兜底）：启动路径可能在 delete 读取槽位字段之后
+        //    才分配/写入槽位，只靠 delete 自身释放会泄漏。
         Self::release_task_slot_by_kind_static(
             &task_id,
             group_id.as_deref(),
@@ -1125,6 +1270,19 @@ impl DownloadManager {
             &folder_manager,
         )
         .await;
+
+        if deletion_requested {
+            // 删除流程接管状态/计数/持久化/事件；这里只回收令牌与槽位，不重排、不标失败。
+            Self::abandon_deleted_start_static(
+                &task_id,
+                group_id.as_deref(),
+                &cancellation_tokens,
+                &task_slot_pool,
+                &folder_manager,
+            )
+            .await;
+            return;
+        }
 
         let is_folder_subtask = group_id.is_some();
 
@@ -1144,6 +1302,18 @@ impl DownloadManager {
             // 将任务状态重置为 Pending，清空槽位字段，累加 start_retry_count
             {
                 let mut t = task.lock().await;
+                if t.deletion_token.is_cancelled() {
+                    drop(t);
+                    Self::abandon_deleted_start_static(
+                        &task_id,
+                        group_id.as_deref(),
+                        &cancellation_tokens,
+                        &task_slot_pool,
+                        &folder_manager,
+                    )
+                    .await;
+                    return;
+                }
                 t.status = TaskStatus::Pending;
                 t.error = Some(error_msg);
                 t.slot_id = None;
@@ -1181,6 +1351,18 @@ impl DownloadManager {
         // handle_task_failure 是无 self 的 standalone async fn，无法访问 manager.owner_uid。
         let owner_uid_raw_for_failed: Option<u64> = {
             let mut t = task.lock().await;
+            if t.deletion_token.is_cancelled() {
+                drop(t);
+                Self::abandon_deleted_start_static(
+                    &task_id,
+                    group_id.as_deref(),
+                    &cancellation_tokens,
+                    &task_slot_pool,
+                    &folder_manager,
+                )
+                .await;
+                return;
+            }
             t.mark_failed(error_msg.clone());
             t.slot_id = None;
             t.is_borrowed_slot = false;
@@ -1360,6 +1542,11 @@ impl DownloadManager {
         //   写者并发写同一文件导致"大小对但内容坏"（错误二）。
         {
             let t = task.lock().await;
+            // 🔥 issue192：删除流程已接管，不再重排
+            if t.deletion_token.is_cancelled() {
+                debug!("auto_requeue_task: 任务 {} 正在删除，跳过", task_id);
+                return Ok(());
+            }
             if t.status == TaskStatus::Decrypting
                 || t.finalize_spawned
                 || (t.total_size > 0 && t.downloaded_size >= t.total_size)
@@ -1375,6 +1562,10 @@ impl DownloadManager {
         // 🔥 退回次数上限：耗尽后不再重排，真正置为 Failed，让上层（文件夹重试 / 用户）接手
         {
             let mut t = task.lock().await;
+            if t.deletion_token.is_cancelled() {
+                debug!("auto_requeue_task: 任务 {} 正在删除，跳过", task_id);
+                return Ok(());
+            }
             if t.requeue_count >= MAX_AUTO_REQUEUE {
                 let error_msg = format!(
                     "自动重排 {} 次仍失败（最后原因: {}）",
@@ -1419,6 +1610,10 @@ impl DownloadManager {
             task_owner_uid_raw,
         ) = {
             let t = task.lock().await;
+            if t.deletion_token.is_cancelled() {
+                debug!("auto_requeue_task: 任务 {} 正在删除，跳过", task_id);
+                return Ok(());
+            }
             (
                 match t.status {
                     TaskStatus::Pending => "pending".to_string(),
@@ -1465,8 +1660,24 @@ impl DownloadManager {
 
         // 4. 清除进度、重置状态、写入冷却时间戳
         let now_ms = chrono::Utc::now().timestamp_millis();
-        {
+        // 🔥 issue192：删除检查与 Pending 状态转换必须在同一把任务锁内原子完成。
+        //    delete 在任务锁内设置 deletion_token 并按当时状态快照 was_active：
+        //    - delete 先拿锁 → 这里看到删除意图，直接返回（槽位/令牌由 delete 回收，
+        //      上面已做的取消/释放均按 owner 幂等）；
+        //    - 这里先拿锁 → 任务已是 Pending（计入活跃），delete 随后只减一次。
+        //    活跃计数口径与创建/恢复/漂移校准一致：Pending|Downloading|Decrypting 计入活跃。
+        //    因此从活跃态退回 Pending 计数不变；仅从非活跃态（Paused/Failed）退回时 +1。
+        //    （旧实现无条件 -1，会与 delete 的 was_active 扣减叠加成双减。）
+        let became_active = {
             let mut t = task.lock().await;
+            if t.deletion_token.is_cancelled() {
+                debug!("auto_requeue_task: 任务 {} 正在删除，放弃重排", task_id);
+                return Ok(());
+            }
+            let was_active = matches!(
+                t.status,
+                TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
+            );
             t.status = TaskStatus::Pending;
             // 清零已下载大小（分片内断点续传信息保留在持久化 chunk_progress，下次调度会读取）
             t.downloaded_size = 0;
@@ -1476,10 +1687,24 @@ impl DownloadManager {
             t.slot_id = None;
             t.is_borrowed_slot = false;
             t.uses_folder_fixed_slot = false;
+            !was_active
+        };
+        if became_active {
+            self.inc_active();
         }
 
         // 5. 清理取消令牌（避免后续 start_task_internal 读到旧 token）
         self.cancellation_tokens.write().await.remove(task_id);
+
+        // 🔥 issue192：删除若在上面的锁之后才到达，它会接管计数/持久化/队列/事件，
+        //    这里不再落盘 Pending、不再入队、不再发 Pending 事件（避免复活已删除任务）。
+        if task.lock().await.deletion_token.is_cancelled() {
+            debug!(
+                "auto_requeue_task: 任务 {} 在重排途中被删除，停止后续步骤",
+                task_id
+            );
+            return Ok(());
+        }
 
         // 6. 持久化：写入错误原因但保持状态为 Pending（与内存语义一致，避免误标 Failed）
         if let Some(ref pm) = self.persistence_manager {
@@ -1497,8 +1722,17 @@ impl DownloadManager {
         self.add_to_waiting_queue_for_retry(task_id, is_backup, is_folder_subtask)
             .await;
 
-        // 8. 活跃计数 -1（退回等待队列不算活跃）
-        self.dec_active();
+        // 8. 入队后复核删除意图：delete 若在入队前已完成两次 retain，这里补删残留入队项，
+        //    且不再发送 Pending 事件；若 delete 在复核之后才设置意图，它自己的 retain 会清掉入队项。
+        //    （活跃计数已在第 4 步按状态口径处理，不再无条件 -1。）
+        if task.lock().await.deletion_token.is_cancelled() {
+            self.waiting_queue.write().await.retain(|id| id != task_id);
+            debug!(
+                "auto_requeue_task: 任务 {} 入队后发现已删除，撤回入队项",
+                task_id
+            );
+            return Ok(());
+        }
 
         // 9. 发送 StatusChanged 事件（携带退回原因）
         // 🔥 备份任务走 BackupTransferNotification::StatusChanged（publish_event 会跳过备份任务），
@@ -1657,6 +1891,19 @@ impl DownloadManager {
             return;
         }
 
+        // Acquire admission before spawning any detached loop. A cancellation
+        // during configuration loading must not create background work.
+        let Some(speed_guard) = chunk_scheduler.track_worker(task_id, &cancellation_token) else {
+            return;
+        };
+        let Some(stagnation_guard) = chunk_scheduler.track_worker(task_id, &cancellation_token)
+        else {
+            return;
+        };
+        let Some(refresh_guard) = chunk_scheduler.track_worker(task_id, &cancellation_token) else {
+            return;
+        };
+
         // 每个任务独立一个协调器，防止三条循环并发刷新同一个任务
         let refresh_coordinator = Arc::new(RefreshCoordinator::new(
             cdn_config.to_refresh_coordinator_config(),
@@ -1694,14 +1941,46 @@ impl DownloadManager {
             url_health,
             download_client,
             refresh_coordinator,
-            cancellation_token,
+            cancellation_token.clone(),
             cdn_config.refresh_interval_minutes,
         );
+
+        Self::join_detection_loop(
+            speed_guard,
+            _speed_anomaly_handle,
+            cancellation_token.clone(),
+        );
+        Self::join_detection_loop(
+            stagnation_guard,
+            _stagnation_handle,
+            cancellation_token.clone(),
+        );
+        Self::join_detection_loop(refresh_guard, _periodic_refresh_handle, cancellation_token);
 
         info!(
             "📈 任务 {} CDN链接检测已启动（速度异常 + 线程停滞 + 每 {} 分钟定时刷新）",
             task_id, cdn_config.refresh_interval_minutes
         );
+    }
+
+    // Detection loops only perform network/memory work, so aborting them is
+    // safe (unlike workers with outstanding tokio::fs or spawn_blocking IO).
+    fn join_detection_loop(
+        guard: tokio_util::task::task_tracker::TaskTrackerToken,
+        mut handle: tokio::task::JoinHandle<()>,
+        token: CancellationToken,
+    ) {
+        tokio::spawn(async move {
+            let _guard = guard;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                _ = &mut handle => {}
+            }
+        });
     }
 
     /// 内部方法：真正启动一个任务
@@ -1778,7 +2057,12 @@ impl DownloadManager {
         let app_config_arc_clone = deps.app_config.clone();
         let max_retries = deps.max_retries;
 
+        let Some(worker_guard) = chunk_scheduler_clone.track_worker(&id_clone, &cancellation_token)
+        else {
+            return;
+        };
         tokio::spawn(async move {
+            let _worker_guard = worker_guard;
             // 获取 WebSocket 管理器和文件夹进度发送器
             let ws_manager = ws_manager_arc_clone.read().await.clone();
             let folder_progress_tx = folder_progress_tx_arc_clone.read().await.clone();
@@ -1864,6 +2148,11 @@ impl DownloadManager {
                         task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
                     }
 
+                    let event_task = task_clone.lock().await;
+                    if cancellation_token.is_cancelled() || event_task.deletion_token.is_cancelled()
+                    {
+                        return;
+                    }
                     // 🔥 发送状态变更事件：pending → downloading
                     // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
                     if is_backup {
@@ -1895,6 +2184,8 @@ impl DownloadManager {
                             group_id.clone(),
                         );
                     }
+
+                    drop(event_task);
 
                     // 🔥 检测是否为加密文件，并获取 key_version
                     let (is_encrypted, encryption_key_version) = {
@@ -1942,24 +2233,33 @@ impl DownloadManager {
                     // 🔥 注册任务到持久化管理器
                     // 显式传 task.owner_uid
                     if let Some(ref pm) = persistence_manager_clone {
-                        if let Err(e) = pm.lock().await.register_download_task(
-                            id_clone.clone(),
-                            fs_id,
-                            remote_path.clone(),
-                            local_path.clone(),
-                            total_size,
-                            chunk_size,
-                            total_chunks,
-                            group_id.clone(),
-                            group_root.clone(),
-                            relative_path.clone(),
-                            is_backup,
-                            backup_config_id.clone(),
-                            is_encrypted,
-                            encryption_key_version,
-                            transfer_task_id.clone(),
-                            Some(task_owner_uid.raw()),
-                        ) {
+                        let registration = {
+                            let pm = pm.lock().await;
+                            let t = task_clone.lock().await;
+                            if cancellation_token.is_cancelled() || t.deletion_token.is_cancelled()
+                            {
+                                return;
+                            }
+                            pm.register_download_task(
+                                id_clone.clone(),
+                                fs_id,
+                                remote_path.clone(),
+                                local_path.clone(),
+                                total_size,
+                                chunk_size,
+                                total_chunks,
+                                group_id.clone(),
+                                group_root.clone(),
+                                relative_path.clone(),
+                                is_backup,
+                                backup_config_id.clone(),
+                                is_encrypted,
+                                encryption_key_version,
+                                transfer_task_id.clone(),
+                                Some(task_owner_uid.raw()),
+                            )
+                        };
+                        if let Err(e) = registration {
                             warn!("{path_label}：注册任务到持久化管理器失败: {}", e);
                         } else {
                             // 🔥 任务已落盘 → 把对应文件从 pending_files 摘掉，
@@ -2104,7 +2404,8 @@ impl DownloadManager {
 
                     // 注册任务到调度器
                     match chunk_scheduler_clone.register_task(task_info).await {
-                        Ok(()) => {
+                        Ok(false) => return,
+                        Ok(true) => {
                             // 注册成功，启动速度异常检测循环和线程停滞检测循环
                             info!("{task_label} {} 注册成功，启动CDN链接检测", id_clone);
 
@@ -2134,6 +2435,9 @@ impl DownloadManager {
                             .await;
                         }
                         Err(e) => {
+                            if cancellation_token.is_cancelled() {
+                                return;
+                            }
                             let error_msg = e.to_string();
                             error!("{path_label}：注册任务失败: {}", error_msg);
 
@@ -2181,27 +2485,49 @@ impl DownloadManager {
         });
     }
     async fn start_task_internal(&self, task_id: &str) -> Result<()> {
-        let task = self
-            .tasks
-            .read()
-            .await
-            .get(task_id)
-            .cloned()
-            .context("任务不存在")?;
+        let task = self.tasks.read().await.get(task_id).cloned();
+        let Some(task) = task else {
+            // 🔥 issue192：调用方可能已为其分配了槽位/登记了令牌，而 delete 已把任务移出表。
+            //    按 id 幂等回收（group 未知时只覆盖普通/备份固定位；文件夹映射由调用方的
+            //    分配后闸门或 delete 的最终清扫负责）。
+            Self::abandon_deleted_start_static(
+                task_id,
+                None,
+                &self.cancellation_tokens,
+                &self.task_slot_pool,
+                &self.folder_manager,
+            )
+            .await;
+            anyhow::bail!("任务不存在");
+        };
 
         // 🔥 关键修复：检查任务是否有"可用的槽位"
         // 三种合法的"已持有槽位"情形（任一满足即可启动）：
         //   1. slot_id=Some           → 普通固定槽位 / 借调槽位
         //   2. uses_folder_fixed_slot → 文件夹固定槽位（task_slot_pool 不可见，但已由 folder_manager 分配）
         // 仅当三者都不成立时才视为"无槽位"。
-        let (has_slot, is_folder_task, uses_folder_fixed_slot) = {
+        let (has_slot, is_folder_task, uses_folder_fixed_slot, start_group_id, deleting) = {
             let t = task.lock().await;
             (
                 t.slot_id.is_some(),
                 t.group_id.is_some(),
                 t.uses_folder_fixed_slot,
+                t.group_id.clone(),
+                t.deletion_token.is_cancelled(),
             )
         };
+        // 🔥 issue192：删除中的任务不得启动/重新入队；调用方可能已为其分配槽位，按 id 回收
+        if deleting {
+            Self::abandon_deleted_start_static(
+                task_id,
+                start_group_id.as_deref(),
+                &self.cancellation_tokens,
+                &self.task_slot_pool,
+                &self.folder_manager,
+            )
+            .await;
+            return Ok(());
+        }
         let has_any_slot = has_slot || uses_folder_fixed_slot;
 
         // 🔥 文件夹子任务必须已持有某种槽位才能启动
@@ -2224,6 +2550,20 @@ impl DownloadManager {
             .write()
             .await
             .insert(task_id.to_string(), cancellation_token.clone());
+
+        // 🔥 issue192：先登记令牌再复核删除意图（与等待队列消费点同一闸门）：
+        //    delete 若在复核之后设置意图，其屏障必能取消这枚令牌；否则这里回收令牌与槽位。
+        if Self::start_blocked_by_delete_static(&self.tasks, task_id, &task).await {
+            Self::abandon_deleted_start_static(
+                task_id,
+                start_group_id.as_deref(),
+                &self.cancellation_tokens,
+                &self.task_slot_pool,
+                &self.folder_manager,
+            )
+            .await;
+            return Ok(());
+        }
 
         // 准备任务（获取下载链接、创建分片管理器等）
         let engine = self.engine.clone();
@@ -2253,7 +2593,12 @@ impl DownloadManager {
         // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
         // 事件归属一律读 `task.owner_uid`（已在下方 prepare 后从 task 读出 task_owner_uid）。
 
+        let Some(worker_guard) = chunk_scheduler.track_worker(&task_id_clone, &cancellation_token)
+        else {
+            return Ok(());
+        };
         tokio::spawn(async move {
+            let _worker_guard = worker_guard;
             // 获取 WebSocket 管理器和文件夹进度发送器
             let ws_manager = ws_manager_arc.read().await.clone();
             let folder_progress_tx = folder_progress_tx_arc.read().await.clone();
@@ -2340,6 +2685,11 @@ impl DownloadManager {
                         task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
                     }
 
+                    let event_task = task_clone.lock().await;
+                    if cancellation_token.is_cancelled() || event_task.deletion_token.is_cancelled()
+                    {
+                        return;
+                    }
                     // 🔥 发送状态变更事件：pending → downloading
                     // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
                     if is_backup {
@@ -2371,6 +2721,8 @@ impl DownloadManager {
                             group_id.clone(),
                         );
                     }
+
+                    drop(event_task);
 
                     // 🔥 检测是否为加密文件，并获取 key_version
                     let (is_encrypted, encryption_key_version) = {
@@ -2417,24 +2769,33 @@ impl DownloadManager {
                     // 启动账号与 task 实际归属不一致（per-uid manager 架构下 PersistenceManager
                     // 是 manager 自己 uid 的 sqlite，但跨 manager 历史路径仍可能出现错配）。
                     if let Some(ref pm) = persistence_manager {
-                        if let Err(e) = pm.lock().await.register_download_task(
-                            task_id_clone.clone(),
-                            fs_id,
-                            remote_path.clone(),
-                            local_path.clone(),
-                            total_size,
-                            chunk_size,
-                            total_chunks,
-                            group_id.clone(),
-                            group_root.clone(),
-                            relative_path.clone(),
-                            is_backup,
-                            backup_config_id.clone(),
-                            is_encrypted,
-                            encryption_key_version,
-                            transfer_task_id.clone(),
-                            Some(task_owner_uid.raw()),
-                        ) {
+                        let registration = {
+                            let pm = pm.lock().await;
+                            let t = task_clone.lock().await;
+                            if cancellation_token.is_cancelled() || t.deletion_token.is_cancelled()
+                            {
+                                return;
+                            }
+                            pm.register_download_task(
+                                task_id_clone.clone(),
+                                fs_id,
+                                remote_path.clone(),
+                                local_path.clone(),
+                                total_size,
+                                chunk_size,
+                                total_chunks,
+                                group_id.clone(),
+                                group_root.clone(),
+                                relative_path.clone(),
+                                is_backup,
+                                backup_config_id.clone(),
+                                is_encrypted,
+                                encryption_key_version,
+                                transfer_task_id.clone(),
+                                Some(task_owner_uid.raw()),
+                            )
+                        };
+                        if let Err(e) = registration {
                             warn!("注册任务到持久化管理器失败: {}", e);
                         } else {
                             // 🔥 任务已落盘 → 通知 folder_manager 把对应文件从
@@ -2580,7 +2941,8 @@ impl DownloadManager {
 
                     // 注册到调度器
                     match chunk_scheduler.register_task(task_info).await {
-                        Ok(()) => {
+                        Ok(false) => return,
+                        Ok(true) => {
                             // 注册成功，启动速度异常检测循环和线程停滞检测循环
                             info!("任务 {} 注册成功，启动CDN链接检测", task_id_clone);
 
@@ -2612,6 +2974,9 @@ impl DownloadManager {
                             .await;
                         }
                         Err(e) => {
+                            if cancellation_token.is_cancelled() {
+                                return;
+                            }
                             let error_msg = e.to_string();
                             error!("注册任务到调度器失败: {}", error_msg);
 
@@ -2730,6 +3095,7 @@ impl DownloadManager {
                     // 🔥 获取任务信息：是否为备份任务、是否需要槽位、是否为文件夹子任务、group_id、next_retry_at
                     // needs_slot 同时排除 uses_folder_fixed_slot=true 的子任务，避免它们重新申请槽位
                     let (
+                        task_arc,
                         is_backup,
                         needs_slot,
                         is_folder_subtask,
@@ -2738,13 +3104,20 @@ impl DownloadManager {
                     ) = {
                         if let Some(task) = self.tasks.read().await.get(&id).cloned() {
                             let t = task.lock().await;
-                            (
+                            // 🔥 issue192：删除中的任务出队后直接丢弃，不分配槽位、不放回队列
+                            if t.deletion_token.is_cancelled() {
+                                debug!("等待队列中的任务 {} 正在删除，跳过", id);
+                                continue;
+                            }
+                            let fields = (
                                 t.is_backup,
                                 t.slot_id.is_none() && !t.uses_folder_fixed_slot,
                                 t.group_id.is_some(),
                                 t.group_id.clone(),
                                 t.next_retry_at,
-                            )
+                            );
+                            drop(t);
+                            (task, fields.0, fields.1, fields.2, fields.3, fields.4)
                         } else {
                             // 任务不存在，跳过
                             warn!("等待队列中的任务 {} 不存在，跳过", id);
@@ -2762,14 +3135,24 @@ impl DownloadManager {
                         if chrono::Utc::now().timestamp_millis() < until_ms {
                             // 若本轮所有候选都冷却中，跳出避免死循环
                             if skipped_cooling.contains(&id) {
-                                self.waiting_queue.write().await.push_back(id);
+                                Self::requeue_back_if_alive_static(
+                                    &self.waiting_queue,
+                                    &self.tasks,
+                                    id,
+                                )
+                                .await;
                                 debug!(
                                     "try_start_waiting_tasks: 队列中任务全部处于冷却期，暂停启动"
                                 );
                                 break;
                             }
                             skipped_cooling.insert(id.clone());
-                            self.waiting_queue.write().await.push_back(id);
+                            Self::requeue_back_if_alive_static(
+                                &self.waiting_queue,
+                                &self.tasks,
+                                id,
+                            )
+                            .await;
                             continue;
                         }
                     }
@@ -2779,7 +3162,12 @@ impl DownloadManager {
                         let has_normal_waiting = self.has_normal_tasks_waiting().await;
                         if has_normal_waiting {
                             // 有普通任务等待，备份任务放回队列末尾，让普通任务先执行
-                            self.waiting_queue.write().await.push_back(id);
+                            Self::requeue_back_if_alive_static(
+                                &self.waiting_queue,
+                                &self.tasks,
+                                id,
+                            )
+                            .await;
                             info!("备份任务让位：有普通任务等待，备份任务放回队列末尾");
                             continue;
                         }
@@ -2816,12 +3204,18 @@ impl DownloadManager {
                         // 必须走全局槽位但 pool 已空 → 放回队尾并跳过
                         // 若本轮此 id 已经因同一原因被放回过，说明队列里所有此类任务都过不去，跳出
                         if skipped_no_global_slot.contains(&id) {
-                            self.waiting_queue.write().await.push_back(id);
+                            Self::requeue_back_if_alive_static(
+                                &self.waiting_queue,
+                                &self.tasks,
+                                id,
+                            )
+                            .await;
                             debug!("try_start_waiting_tasks: 全局槽位耗尽且队列中剩余任务均需全局槽，暂停启动");
                             break;
                         }
                         skipped_no_global_slot.insert(id.clone());
-                        self.waiting_queue.write().await.push_back(id);
+                        Self::requeue_back_if_alive_static(&self.waiting_queue, &self.tasks, id)
+                            .await;
                         continue;
                     }
 
@@ -2905,7 +3299,12 @@ impl DownloadManager {
                             } else {
                                 // 分配失败，放回队列末尾（备份任务优先级最低）
                                 warn!("无法为备份任务 {} 分配槽位，放回等待队列末尾", id);
-                                self.waiting_queue.write().await.push_back(id);
+                                Self::requeue_back_if_alive_static(
+                                    &self.waiting_queue,
+                                    &self.tasks,
+                                    id,
+                                )
+                                .await;
                                 break;
                             }
                         } else {
@@ -2984,6 +3383,21 @@ impl DownloadManager {
                                 }
                             }
                         }
+                    }
+
+                    // 🔥 issue192：删除可能发生在出队检查与槽位分配之间（甚至已把任务移出
+                    //    tasks 表，使上面的槽位字段写入落空）。分配之后复核，命中则按 id
+                    //    回收刚分配的槽位，不清错误、不启动。
+                    if Self::start_blocked_by_delete_static(&self.tasks, &id, &task_arc).await {
+                        Self::abandon_deleted_start_static(
+                            &id,
+                            try_start_group_id.as_deref(),
+                            &self.cancellation_tokens,
+                            &self.task_slot_pool,
+                            &self.folder_manager,
+                        )
+                        .await;
+                        continue;
                     }
 
                     // 🔥 任务被真正拉起：清除冷却字段和错误信息
@@ -3070,7 +3484,8 @@ impl DownloadManager {
                                 }
                             };
                             if cooling {
-                                waiting_queue.write().await.push_back(id);
+                                Self::requeue_back_if_alive_static(&waiting_queue, &tasks, id)
+                                    .await;
                                 // 冷却任务放回队尾，跳出当前循环等待下一轮 tick
                                 break;
                             }
@@ -3082,6 +3497,11 @@ impl DownloadManager {
                                 // 文件夹固定槽位子任务（uses_folder_fixed_slot=true）不需要再申请槽位
                                 let (needs_slot, is_backup, is_folder_subtask, monitor_group_id) = {
                                     let t = task.lock().await;
+                                    // 🔥 issue192：删除中的任务出队后直接丢弃
+                                    if t.deletion_token.is_cancelled() {
+                                        debug!("等待队列中的任务 {} 正在删除，跳过", id);
+                                        continue;
+                                    }
                                     (
                                         t.slot_id.is_none() && !t.uses_folder_fixed_slot,
                                         t.is_backup,
@@ -3102,11 +3522,17 @@ impl DownloadManager {
                                 if needs_slot && !can_try_folder_fixed_slot && available_slots == 0
                                 {
                                     if skipped_no_global_slot.contains(&id) {
-                                        waiting_queue.write().await.push_back(id);
+                                        Self::requeue_back_if_alive_static(
+                                            &waiting_queue,
+                                            &tasks,
+                                            id,
+                                        )
+                                        .await;
                                         break;
                                     }
                                     skipped_no_global_slot.insert(id.clone());
-                                    waiting_queue.write().await.push_back(id);
+                                    Self::requeue_back_if_alive_static(&waiting_queue, &tasks, id)
+                                        .await;
                                     continue;
                                 }
 
@@ -3233,6 +3659,21 @@ impl DownloadManager {
                                     .await
                                     .insert(id.clone(), cancellation_token.clone());
 
+                                // 🔥 issue192：先登记令牌再复核删除意图。delete 若在复核之后才设置
+                                //    意图，其屏障必能读到并取消这枚令牌；若在之前，则这里回收刚分配的
+                                //    槽位与令牌，不启动。
+                                if Self::start_blocked_by_delete_static(&tasks, &id, &task).await {
+                                    Self::abandon_deleted_start_static(
+                                        &id,
+                                        monitor_group_id.as_deref(),
+                                        &cancellation_tokens,
+                                        &task_slot_pool,
+                                        &folder_manager_arc_for_monitor,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+
                                 // 启动任务：与另一条等待队列链路共用同一份实现（见 spawn_started_task）
                                 Self::spawn_started_task(
                                     deps_for_start.clone(),
@@ -3295,19 +3736,30 @@ impl DownloadManager {
                 let tasks_guard = tasks.read().await;
                 if let Some(task) = tasks_guard.get(&task_id) {
                     // 🔥 先在锁内读出后续要用到的字段，再尽快释放锁，避免发送通知时持锁过久
-                    let (group_id, fs_id, total_size, is_backup, task_owner_uid_raw) = {
+                    let stale_fields = {
                         let mut t = task.lock().await;
-                        t.status = crate::downloader::TaskStatus::Failed;
-                        t.error = Some(STALE_ERROR_MSG.to_string());
-                        // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
-                        t.slot_id = None;
-                        (
-                            t.group_id.clone(),
-                            t.fs_id,
-                            t.total_size,
-                            t.is_backup,
-                            t.owner_uid.raw(),
-                        )
+                        // 🔥 issue192：删除中的任务由删除流程接管，不翻 Failed、不落盘、不发事件
+                        if t.deletion_token.is_cancelled() {
+                            None
+                        } else {
+                            t.status = crate::downloader::TaskStatus::Failed;
+                            t.error = Some(STALE_ERROR_MSG.to_string());
+                            // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
+                            t.slot_id = None;
+                            Some((
+                                t.group_id.clone(),
+                                t.fs_id,
+                                t.total_size,
+                                t.is_backup,
+                                t.owner_uid.raw(),
+                            ))
+                        }
+                    };
+                    let Some((group_id, fs_id, total_size, is_backup, task_owner_uid_raw)) =
+                        stale_fields
+                    else {
+                        debug!("槽位超时释放：任务 {} 正在删除，交由删除流程处理", task_id);
+                        continue;
                     };
 
                     // 🔥 真正停掉下载 worker：先触发取消令牌终止当前分片循环，再让调度器
@@ -3453,7 +3905,8 @@ impl DownloadManager {
                                 }
                             };
                             if cooling {
-                                waiting_queue.write().await.push_back(id);
+                                Self::requeue_back_if_alive_static(&waiting_queue, &tasks, id)
+                                    .await;
                                 // 冷却任务放回队尾，跳出此轮触发
                                 break;
                             }
@@ -3465,6 +3918,11 @@ impl DownloadManager {
                                 // 文件夹固定槽位子任务（uses_folder_fixed_slot=true）不需要再申请槽位
                                 let (needs_slot, is_backup, is_folder_subtask, zero_delay_group_id) = {
                                     let t = task.lock().await;
+                                    // 🔥 issue192：删除中的任务出队后直接丢弃
+                                    if t.deletion_token.is_cancelled() {
+                                        debug!("等待队列中的任务 {} 正在删除，跳过", id);
+                                        continue;
+                                    }
                                     (
                                         t.slot_id.is_none() && !t.uses_folder_fixed_slot,
                                         t.is_backup,
@@ -3485,11 +3943,17 @@ impl DownloadManager {
                                 if needs_slot && !can_try_folder_fixed_slot && available_slots == 0
                                 {
                                     if skipped_no_global_slot.contains(&id) {
-                                        waiting_queue.write().await.push_back(id);
+                                        Self::requeue_back_if_alive_static(
+                                            &waiting_queue,
+                                            &tasks,
+                                            id,
+                                        )
+                                        .await;
                                         break;
                                     }
                                     skipped_no_global_slot.insert(id.clone());
-                                    waiting_queue.write().await.push_back(id);
+                                    Self::requeue_back_if_alive_static(&waiting_queue, &tasks, id)
+                                        .await;
                                     continue;
                                 }
 
@@ -3611,6 +4075,21 @@ impl DownloadManager {
                                     .await
                                     .insert(id.clone(), cancellation_token.clone());
 
+                                // 🔥 issue192：先登记令牌再复核删除意图。delete 若在复核之后才设置
+                                //    意图，其屏障必能读到并取消这枚令牌；若在之前，则这里回收刚分配的
+                                //    槽位与令牌，不启动。
+                                if Self::start_blocked_by_delete_static(&tasks, &id, &task).await {
+                                    Self::abandon_deleted_start_static(
+                                        &id,
+                                        zero_delay_group_id.as_deref(),
+                                        &cancellation_tokens,
+                                        &task_slot_pool,
+                                        &folder_manager_arc_for_trigger,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+
                                 // 启动任务：与另一条等待队列链路共用同一份实现（见 spawn_started_task）
                                 Self::spawn_started_task(
                                     deps_for_start.clone(),
@@ -3653,6 +4132,9 @@ impl DownloadManager {
             .context("任务不存在")?;
 
         let mut t = task.lock().await;
+        if t.deletion_token.is_cancelled() {
+            anyhow::bail!("任务正在删除");
+        }
         let group_id = t.group_id.clone();
         let is_backup = t.is_backup;
         // 从 task 取真实 owner_uid（共享 manager 下 self.owner_uid 不可靠）
@@ -3826,10 +4308,17 @@ impl DownloadManager {
                 }
             };
             let mut t = task.lock().await;
+            // 🔥 issue192：删除中的任务不再翻回 Pending / 入队
+            if t.deletion_token.is_cancelled() {
+                debug!("被抢占任务 {} 正在删除，跳过重新入队", task_id);
+                return;
+            }
             // 只有 Paused 状态的任务才需要转换为 Pending
             if t.status == TaskStatus::Paused {
                 t.status = TaskStatus::Pending;
                 info!("被抢占的备份任务 {} 状态已从 Paused 改为 Pending", task_id);
+                // 🔥 issue192：Paused → Pending 重新进入活跃集合（与 pause_preempted_task 的 -1 配对）
+                self.inc_active();
             }
             // 🔥 进入等待队列即不再产生流量，速度必须归零。
             // 否则 `speed` 会一直保留被抢占那一刻的瞬时值，被上层的速度聚合
@@ -3905,6 +4394,11 @@ impl DownloadManager {
         is_folder_subtask: bool,
     ) {
         let mut queue = waiting_queue.write().await;
+        // 🔥 issue192：受删除保护的入队（见 queue_admits_locked）
+        if !Self::queue_admits_locked(&*tasks.read().await, task_id) {
+            debug!("任务 {} 已删除或正在删除，拒绝加入等待队列", task_id);
+            return;
+        }
 
         if is_backup {
             queue.push_back(task_id.to_string());
@@ -4003,9 +4497,11 @@ impl DownloadManager {
         let task = tasks.read().await.get(preempted_id).cloned();
         if let Some(task) = task {
             // 更新任务状态：Downloading -> Paused -> Pending
-            {
+            let deleting = {
                 let mut t = task.lock().await;
-                if t.status == TaskStatus::Downloading {
+                let deleting = t.deletion_token.is_cancelled();
+                // 🔥 issue192：删除中的任务不翻回 Pending、不重新入队（仍需停掉其 worker）
+                if !deleting && t.status == TaskStatus::Downloading {
                     // 🔥 问题2/3修复：直接将状态改为 Pending（跳过 Paused 中间状态）
                     // 因为被抢占的任务会立即加入等待队列，应该是 Pending 状态
                     t.status = TaskStatus::Pending;
@@ -4014,11 +4510,15 @@ impl DownloadManager {
                     t.is_borrowed_slot = false;
                     info!("被抢占的备份任务 {} 状态已改为 Pending", preempted_id);
                 }
-            }
+                deleting
+            };
 
             // 取消任务的取消令牌
             if let Some(token) = cancellation_tokens.write().await.remove(preempted_id) {
                 token.cancel();
+            }
+            if deleting {
+                return;
             }
 
             // 将被抢占的任务加入等待队列末尾（备份任务优先级最低）
@@ -4044,6 +4544,11 @@ impl DownloadManager {
         is_folder_subtask: bool,
     ) {
         let mut queue = self.waiting_queue.write().await;
+        // 🔥 issue192：受删除保护的入队（见 queue_admits_locked）
+        if !Self::queue_admits_locked(&*self.tasks.read().await, task_id) {
+            debug!("任务 {} 已删除或正在删除，拒绝加入等待队列", task_id);
+            return;
+        }
 
         if is_backup {
             // 备份任务：直接加入队列末尾
@@ -4169,7 +4674,8 @@ impl DownloadManager {
             if let Some(task_arc) = tasks.get(task_id) {
                 let mut task = task_arc.lock().await;
                 // 只暂停 Pending 状态的任务（等待队列中的任务应该是 Pending 状态）
-                if task.status == TaskStatus::Pending {
+                // 🔥 issue192：删除中的任务不翻 Paused（否则批删逐个删除时按 Paused 漏 -1）
+                if task.status == TaskStatus::Pending && !task.deletion_token.is_cancelled() {
                     let old_status = format!("{:?}", task.status).to_lowercase();
                     let group_id = task.group_id.clone();
                     let is_backup = task.is_backup;
@@ -4340,6 +4846,11 @@ impl DownloadManager {
         // 取真实 owner_uid
         let (group_id, is_backup, task_owner_uid_raw) = {
             let mut t = task.lock().await;
+            // 🔥 issue192：删除中的任务由删除流程接管（状态/计数/持久化/事件），这里不再翻 Paused
+            if t.deletion_token.is_cancelled() {
+                debug!("被抢占任务 {} 正在删除，跳过暂停", task_id);
+                return;
+            }
             if t.status != TaskStatus::Downloading {
                 warn!(
                     "暂停被抢占任务失败：任务 {} 不在下载中，当前状态: {:?}",
@@ -4356,6 +4867,11 @@ impl DownloadManager {
             t.is_borrowed_slot = false;
             (group_id, is_backup, task_owner_uid_raw)
         };
+        // 🔥 issue192：Downloading → Paused 即离开活跃集合，在本步自行 -1；
+        //    随后 add_preempted_backup_to_queue 的 Paused → Pending 再 +1。
+        //    两步各自自洽：若 delete 恰好插在两步之间（后一步被删除拦截），
+        //    任务停在 Paused、计数已 -1，delete 按 Paused 不再扣减，不泄漏。
+        self.dec_active();
 
         // 从调度器取消任务
         self.chunk_scheduler.cancel_task(task_id).await;
@@ -4452,6 +4968,9 @@ impl DownloadManager {
 
         {
             let mut t = task.lock().await;
+            if t.deletion_token.is_cancelled() {
+                anyhow::bail!("任务正在删除");
+            }
             match t.status {
                 TaskStatus::Paused => {
                     old_status = "paused".to_string();
@@ -4718,6 +5237,11 @@ impl DownloadManager {
             }
         }
 
+        // 🔥 issue192：分配槽位期间 delete 可能已完成；命中则回收刚分配的槽位，不启动
+        if self.abandon_start_if_deleted(task_id, &task).await {
+            return Ok(());
+        }
+
         // 有槽位，立即启动
         self.start_task_internal(task_id).await
     }
@@ -4752,6 +5276,9 @@ impl DownloadManager {
         // 检查任务状态并将 Paused 改回 Pending
         {
             let mut t = task.lock().await;
+            if t.deletion_token.is_cancelled() {
+                anyhow::bail!("任务正在删除");
+            }
             if t.status != TaskStatus::Paused {
                 anyhow::bail!("任务未暂停，无法重新入队，当前状态: {:?}", t.status);
             }
@@ -4821,7 +5348,10 @@ impl DownloadManager {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(task_id) {
                 let mut t = task.lock().await;
-                if t.status == TaskStatus::Downloading || t.status == TaskStatus::Pending {
+                // 🔥 issue192：删除中的任务由删除流程按入口快照统一 -1，这里不得再翻 Paused / -1
+                if t.deletion_token.is_cancelled() {
+                    false
+                } else if t.status == TaskStatus::Downloading || t.status == TaskStatus::Pending {
                     t.mark_paused(); // 立即标记为暂停
                     info!("任务 {} 状态已更新为 Paused（取消中）", task_id);
                     true
@@ -4857,7 +5387,8 @@ impl DownloadManager {
         let (group_id, is_backup, was_active, task_owner_uid_raw) = {
             let tasks = self.tasks.read().await;
             if let Some(task_arc) = tasks.get(task_id) {
-                let t = task_arc.lock().await;
+                let mut t = task_arc.lock().await;
+                t.request_delete();
                 let active = matches!(
                     t.status,
                     TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
@@ -4892,21 +5423,7 @@ impl DownloadManager {
             queue.retain(|id| id != task_id);
         }
 
-        // 从调度器取消任务（已注册的任务）
-        self.chunk_scheduler.cancel_task(task_id).await;
-
-        // 先触发取消令牌（通知正在探测的任务停止），再移除
-        // 注意：必须先 cancel 再 remove，否则探测中的任务检测不到取消
-        {
-            let tokens = self.cancellation_tokens.read().await;
-            if let Some(token) = tokens.get(task_id) {
-                token.cancel();
-            }
-        }
-        self.cancellation_tokens.write().await.remove(task_id);
-
-        // 等待一小段时间让下载任务有机会清理
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        self.stop_task_before_delete(task_id).await;
 
         // 🔥 释放任务槽位（在移除任务前获取槽位信息，覆盖三种持有方式：
         //    普通固定位 / 文件夹借调位 / 文件夹固定位直持有）
@@ -4933,6 +5450,8 @@ impl DownloadManager {
 
         // 读取任务（内存或历史）
         let removed_task = self.tasks.write().await.remove(task_id);
+        // 🔥 issue192：移出 tasks 表之后做最终清扫（队列 / 令牌 / 按 id 的槽位）
+        self.final_delete_sweep(task_id, group_id.as_deref()).await;
         let mut local_path = None;
         let mut status_completed = None;
 
@@ -5066,7 +5585,7 @@ impl DownloadManager {
     ///
     /// 与逐个调用 delete_task 相比，此方法：
     /// - 一次性清理 waiting_queue（O(n) 而非 O(n²)）
-    /// - 跳过每个任务的 100ms sleep
+    /// - 批量发出取消，再逐个等待退出（不使用固定延时）
     /// - 仅在所有任务删除完成后调用一次 try_start_waiting_tasks
     pub async fn batch_delete_tasks(
         &self,
@@ -5085,6 +5604,15 @@ impl DownloadManager {
             queue.retain(|id| !id_set.contains(id.as_str()));
         }
 
+        // Invalidate ALL finalizers before waiting on the first task. Preserve
+        // status so each internal delete still owns its original active count.
+        for task_id in task_ids {
+            let task = self.tasks.read().await.get(task_id).cloned();
+            if let Some(task) = task {
+                task.lock().await.request_delete();
+            }
+        }
+
         // 2. 批量取消所有任务的 cancellation token
         {
             let tokens = self.cancellation_tokens.read().await;
@@ -5092,17 +5620,6 @@ impl DownloadManager {
                 if let Some(token) = tokens.get(task_id.as_str()) {
                     token.cancel();
                 }
-            }
-        }
-
-        // 等待一次让所有任务有机会清理
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // 批量移除 cancellation tokens
-        {
-            let mut tokens = self.cancellation_tokens.write().await;
-            for task_id in task_ids {
-                tokens.remove(task_id.as_str());
             }
         }
 
@@ -5125,14 +5642,35 @@ impl DownloadManager {
         (success, failed)
     }
 
-    /// 删除单个下载任务的内部实现（不触发 waiting_queue 清理、sleep 和 try_start_waiting_tasks）
+    /// Shared single/batch delete barrier. Cancel preparation first so it cannot
+    /// register new chunks while the scheduler drains already-admitted workers.
+    async fn stop_task_before_delete(&self, task_id: &str) {
+        let task = self.tasks.read().await.get(task_id).cloned();
+        if let Some(task) = task {
+            task.lock().await.request_delete();
+        }
+        {
+            let tokens = self.cancellation_tokens.read().await;
+            if let Some(token) = tokens.get(task_id) {
+                token.cancel();
+            }
+        }
+        self.chunk_scheduler.cancel_task_and_wait(task_id).await;
+        // A failure rollback admitted before delete intent may have requeued
+        // while we were draining preparation. Remove that late entry as well.
+        self.waiting_queue.write().await.retain(|id| id != task_id);
+        self.cancellation_tokens.write().await.remove(task_id);
+    }
+
+    /// 删除单个下载任务的内部实现（不触发 waiting_queue 清理和 try_start_waiting_tasks）
     async fn delete_task_internal(&self, task_id: &str, delete_file: bool) -> Result<()> {
         // 获取任务信息
         // 取真实 owner_uid
         let (group_id, is_backup, was_active, task_owner_uid_raw) = {
             let tasks = self.tasks.read().await;
             if let Some(task_arc) = tasks.get(task_id) {
-                let t = task_arc.lock().await;
+                let mut t = task_arc.lock().await;
+                t.request_delete();
                 let active = matches!(
                     t.status,
                     TaskStatus::Pending | TaskStatus::Downloading | TaskStatus::Decrypting
@@ -5143,8 +5681,7 @@ impl DownloadManager {
             }
         };
 
-        // 从调度器取消
-        self.chunk_scheduler.cancel_task(task_id).await;
+        self.stop_task_before_delete(task_id).await;
 
         // 🔥 释放槽位（覆盖三种持有方式：普通固定位 / 文件夹借调位 / 文件夹固定位直持有）
         let (slot_id_to_release, is_borrowed, uses_folder_fixed_slot) = {
@@ -5169,6 +5706,8 @@ impl DownloadManager {
 
         // 移除任务
         let removed_task = self.tasks.write().await.remove(task_id);
+        // 🔥 issue192：移出 tasks 表之后做最终清扫（队列 / 令牌 / 按 id 的槽位）
+        self.final_delete_sweep(task_id, group_id.as_deref()).await;
         let mut local_path = None;
         let mut status_completed = None;
 
@@ -5181,6 +5720,17 @@ impl DownloadManager {
             local_path = Some(t.local_path.clone());
             status_completed = Some(t.status == TaskStatus::Completed);
             drop(t);
+        } else if let Some(ref pm) = self.persistence_manager {
+            let pm = pm.lock().await;
+            let metadata = pm
+                .get_history_task(task_id)
+                .or_else(|| crate::persistence::metadata::load_metadata(pm.wal_dir(), task_id));
+            if let Some(meta) = metadata {
+                local_path = meta.local_path;
+                status_completed = meta.status.map(|status| {
+                    status == crate::persistence::types::TaskPersistenceStatus::Completed
+                });
+            }
         }
 
         // 决定是否删除本地文件
@@ -5431,6 +5981,9 @@ impl DownloadManager {
             let tasks = self.tasks.read().await;
             if let Some(task) = tasks.get(task_id) {
                 let mut t = task.lock().await;
+                if t.deletion_token.is_cancelled() {
+                    anyhow::bail!("任务正在删除: {}", task_id);
+                }
                 let old = format!("{:?}", t.status).to_lowercase();
                 let gid = t.group_id.clone();
                 let backup = t.is_backup;
@@ -5932,6 +6485,7 @@ impl DownloadManager {
             next_retry_at: None,
             // 🔥 R20: 解密协程版本号（历史任务从 0 开始，无遗留协程，安全）
             decrypt_epoch: 0,
+            deletion_token: CancellationToken::new(),
             // 🔥 R22: 解密原子提交标志（历史任务已是 Completed，无关运行时收尾）
             decrypt_committed: false,
             // 🔥 收尾/解密协程已 spawn 标记（历史任务无遗留协程，从 false 开始）
@@ -6062,7 +6616,10 @@ impl DownloadManager {
             let task = self.tasks.read().await.get(id).cloned();
             if let Some(task) = task {
                 let mut t = task.lock().await;
-                if t.status == TaskStatus::Pending && !t.is_backup {
+                if t.status == TaskStatus::Pending
+                    && !t.is_backup
+                    && !t.deletion_token.is_cancelled()
+                {
                     let group_id = t.group_id.clone();
                     let is_backup = t.is_backup;
                     // 取真实 owner_uid
@@ -6943,6 +7500,7 @@ impl DownloadManager {
                 // scheduler::try_decrypt_if_encrypted 7.8 段的实现注释。
                 let already_committed = task.decrypt_committed;
                 let active = !already_committed
+                    && !task.deletion_token.is_cancelled()
                     && matches!(
                         task.status,
                         TaskStatus::Downloading | TaskStatus::Pending | TaskStatus::Decrypting
@@ -7289,7 +7847,7 @@ impl Drop for DownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::UserAuth;
+    use crate::auth::{Uid, UserAuth};
     use tempfile::TempDir;
 
     pub(super) fn create_mock_user_auth() -> UserAuth {
@@ -7667,6 +8225,846 @@ mod tests {
             manager.lookup_aggregate_outcome("does_not_exist").await,
             DownloadAggregateOutcome::NotFound,
         );
+    }
+    /// A delayed worker opens the output only after delete has cancelled it.
+    /// Both entry points must join it before cleaning up, even when the task
+    /// was already removed from the scheduler (e.g. pause/requeue).
+    async fn issue192_schedule_info(
+        manager: &DownloadManager,
+        task: Arc<Mutex<DownloadTask>>,
+        token: CancellationToken,
+    ) -> TaskScheduleInfo {
+        let t = task.lock().await;
+        let mut chunks =
+            crate::downloader::ChunkManager::new(t.total_size, t.total_size, t.owner_uid);
+        chunks.mark_completed(0);
+        TaskScheduleInfo {
+            task_id: t.id.clone(),
+            task: task.clone(),
+            chunk_manager: Arc::new(Mutex::new(chunks)),
+            speed_calc: Arc::new(Mutex::new(
+                crate::downloader::SpeedCalculator::with_default_window(),
+            )),
+            client: Arc::new(std::sync::RwLock::new(reqwest::Client::new())),
+            cookie: String::new(),
+            referer: None,
+            url_health: Arc::new(Mutex::new(UrlHealthManager::new(vec![], vec![]))),
+            output_path: PathBuf::from(format!("{}.downloading", t.local_path.display())),
+            chunk_size: t.total_size,
+            total_size: t.total_size,
+            cancellation_token: token,
+            active_chunk_count: Arc::new(AtomicUsize::new(0)),
+            consecutive_chunk_failures: Arc::new(AtomicU32::new(0)),
+            max_concurrent_chunks: 1,
+            persistence_manager: manager.persistence_manager.clone(),
+            ws_manager: None,
+            progress_throttler: Arc::new(ProgressThrottler::default()),
+            folder_progress_tx: None,
+            backup_notification_tx: None,
+            slot_id: None,
+            is_borrowed_slot: false,
+            task_slot_pool: None,
+            encryption_service: None,
+            snapshot_manager: None,
+            encryption_config_store: None,
+            manager_tasks: Some(manager.tasks.clone()),
+            max_retries: 1,
+            fallback_mgr: None,
+            slot_touch_throttler: Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                manager.task_slot_pool.clone(),
+                t.id.clone(),
+            )),
+            requeue_tx: None,
+            http11_trigger: None,
+            folder_manager: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_issue192_delete_queued_finalize_without_archive_or_count_leak() {
+        use crate::downloader::budget_scheduler::BudgetScheduler;
+        for batch in [false, true] {
+            for delete_file in [false, true] {
+                let dir = TempDir::new().unwrap();
+                // No permits: deterministically stop the real finalizer before IO.
+                let manager = DownloadManager::new_for_account(
+                    create_mock_user_auth(),
+                    dir.path().to_path_buf(),
+                    10,
+                    5,
+                    3,
+                    None,
+                    None,
+                    BudgetScheduler::new(Default::default()),
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                )
+                .unwrap();
+                let path = dir.path().join("queued.bin");
+                let temporary = PathBuf::from(format!("{}.downloading", path.display()));
+                tokio::fs::write(&temporary, b"data").await.unwrap();
+                let mut t =
+                    DownloadTask::new(1, "/queued.bin".into(), path.clone(), 4, Uid::default());
+                t.mark_downloading();
+                let id = t.id.clone();
+                let task = Arc::new(Mutex::new(t));
+                manager.tasks.write().await.insert(id.clone(), task.clone());
+                manager.inc_active();
+                let token = CancellationToken::new();
+                manager
+                    .cancellation_tokens
+                    .write()
+                    .await
+                    .insert(id.clone(), token.clone());
+                let info = issue192_schedule_info(&manager, task.clone(), token.clone()).await;
+                assert!(manager.chunk_scheduler.register_task(info).await.unwrap());
+                tokio::time::timeout(std::time::Duration::from_secs(2), token.cancelled())
+                    .await
+                    .unwrap();
+                assert!(task.lock().await.finalize_spawned);
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    if batch {
+                        assert_eq!(
+                            manager
+                                .batch_delete_tasks(std::slice::from_ref(&id), delete_file)
+                                .await,
+                            (1, 0)
+                        );
+                    } else {
+                        manager.delete_task(&id, delete_file).await.unwrap();
+                    }
+                })
+                .await
+                .expect("delete must wake a finalizer waiting on the decrypt semaphore");
+                assert_eq!(manager.active_task_count(), 0);
+                assert!(manager.get_task(&id).await.is_none());
+                assert!(!path.exists());
+                assert!(!temporary.exists());
+                assert_ne!(task.lock().await.status, TaskStatus::Completed);
+            }
+        }
+    }
+
+    /// issue192 v3 helper: a downloading task registered in the manager that owns
+    /// a real global fixed slot and a cancellation token.
+    async fn issue192_task_with_slot(
+        manager: &DownloadManager,
+        dir: &TempDir,
+        name: &str,
+    ) -> (String, Arc<Mutex<DownloadTask>>, CancellationToken) {
+        let mut t = DownloadTask::new(
+            1,
+            format!("/{name}"),
+            dir.path().join(name),
+            4,
+            Uid::default(),
+        );
+        t.mark_downloading();
+        let id = t.id.clone();
+        let (sid, preempted) = manager
+            .task_slot_pool
+            .allocate_fixed_slot_with_priority(
+                &id,
+                false,
+                crate::task_slot_pool::TaskPriority::Normal,
+            )
+            .await
+            .expect("test pool must have a free slot");
+        assert!(preempted.is_none());
+        t.slot_id = Some(sid);
+        let task = Arc::new(Mutex::new(t));
+        manager.tasks.write().await.insert(id.clone(), task.clone());
+        manager.inc_active();
+        let token = CancellationToken::new();
+        manager
+            .cancellation_tokens
+            .write()
+            .await
+            .insert(id.clone(), token.clone());
+        (id, task, token)
+    }
+
+    #[tokio::test]
+    async fn test_issue192_auto_requeue_skips_deleting_task_without_double_dec() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let free_before = manager.task_slot_pool.available_slots().await;
+        // A second active task makes a double decrement observable (dec_active clamps at 0).
+        let (_other, _other_task, _other_token) =
+            issue192_task_with_slot(&manager, &dir, "other.bin").await;
+        let (id, task, _token) = issue192_task_with_slot(&manager, &dir, "victim.bin").await;
+        assert_eq!(manager.active_task_count(), 2);
+
+        task.lock().await.request_delete();
+        manager
+            .auto_requeue_task(&id, "network".into())
+            .await
+            .unwrap();
+        {
+            let t = task.lock().await;
+            assert_eq!(
+                t.status,
+                TaskStatus::Downloading,
+                "must not flip to Pending"
+            );
+            assert_eq!(t.requeue_count, 0);
+            assert!(t.next_retry_at.is_none());
+        }
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+        assert_eq!(
+            manager.active_task_count(),
+            2,
+            "requeue must not touch the count"
+        );
+
+        manager.delete_task(&id, true).await.unwrap();
+        assert_eq!(
+            manager.active_task_count(),
+            1,
+            "delete decrements exactly once"
+        );
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+        assert!(!manager.cancellation_tokens.read().await.contains_key(&id));
+        assert_eq!(
+            manager.task_slot_pool.available_slots().await,
+            free_before - 1,
+            "only the other task still owns a slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue192_auto_requeue_then_delete_keeps_active_count_consistent() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let free_before = manager.task_slot_pool.available_slots().await;
+        let (_other, _other_task, _other_token) =
+            issue192_task_with_slot(&manager, &dir, "other.bin").await;
+        let (id, task, token) = issue192_task_with_slot(&manager, &dir, "victim.bin").await;
+
+        manager
+            .auto_requeue_task(&id, "network".into())
+            .await
+            .unwrap();
+        assert!(token.is_cancelled());
+        assert_eq!(task.lock().await.status, TaskStatus::Pending);
+        assert!(manager.waiting_queue.read().await.contains(&id));
+        // Pending counts as active (create/resume/calibration semantics).
+        assert_eq!(manager.active_task_count(), 2);
+        assert_eq!(
+            manager.task_slot_pool.available_slots().await,
+            free_before - 1
+        );
+
+        manager.delete_task(&id, true).await.unwrap();
+        assert_eq!(manager.active_task_count(), 1, "no double decrement");
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+
+        // Paused -> Pending through auto_requeue re-enters the active set.
+        let (pid, ptask, _ptoken) = issue192_task_with_slot(&manager, &dir, "paused.bin").await;
+        ptask.lock().await.mark_paused();
+        manager.dec_active();
+        assert_eq!(manager.active_task_count(), 1);
+        manager
+            .auto_requeue_task(&pid, "network".into())
+            .await
+            .unwrap();
+        assert_eq!(ptask.lock().await.status, TaskStatus::Pending);
+        assert_eq!(manager.active_task_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_issue192_start_paths_reclaim_slot_of_deleting_task() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let free_before = manager.task_slot_pool.available_slots().await;
+
+        // start_task_internal: caller already allocated a slot, then delete intent appears.
+        let (id, task, _token) = issue192_task_with_slot(&manager, &dir, "start.bin").await;
+        manager.cancellation_tokens.write().await.remove(&id);
+        task.lock().await.request_delete();
+        manager.start_task_internal(&id).await.unwrap();
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+        assert!(!manager.cancellation_tokens.read().await.contains_key(&id));
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+
+        // Waiting-queue consumer: a deleting task is dropped after pop, no slot allocated,
+        // not requeued, no token created.
+        let mut t = DownloadTask::new(1, "/q".into(), dir.path().join("q"), 4, Uid::default());
+        t.request_delete();
+        let qid = t.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(qid.clone(), Arc::new(Mutex::new(t)));
+        manager.waiting_queue.write().await.push_back(qid.clone());
+        manager.try_start_waiting_tasks().await;
+        assert!(!manager.waiting_queue.read().await.contains(&qid));
+        assert!(!manager.cancellation_tokens.read().await.contains_key(&qid));
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+
+        // Post-allocation gate: delete finished (task gone) after the slot was taken.
+        let ghost = "issue192-ghost".to_string();
+        let ghost_task = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/g".into(),
+            dir.path().join("g"),
+            4,
+            Uid::default(),
+        )));
+        manager
+            .task_slot_pool
+            .allocate_fixed_slot_with_priority(
+                &ghost,
+                false,
+                crate::task_slot_pool::TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        let ghost_token = CancellationToken::new();
+        manager
+            .cancellation_tokens
+            .write()
+            .await
+            .insert(ghost.clone(), ghost_token.clone());
+        assert!(
+            DownloadManager::start_blocked_by_delete_static(&manager.tasks, &ghost, &ghost_task)
+                .await
+        );
+        DownloadManager::abandon_deleted_start_static(
+            &ghost,
+            None,
+            &manager.cancellation_tokens,
+            &manager.task_slot_pool,
+            &manager.folder_manager,
+        )
+        .await;
+        assert!(ghost_token.is_cancelled());
+        assert!(!manager
+            .cancellation_tokens
+            .read()
+            .await
+            .contains_key(&ghost));
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+
+        // A live, non-deleting task in the table passes the gate.
+        let live = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/l".into(),
+            dir.path().join("l"),
+            4,
+            Uid::default(),
+        )));
+        let lid = live.lock().await.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(lid.clone(), live.clone());
+        assert!(
+            !DownloadManager::start_blocked_by_delete_static(&manager.tasks, &lid, &live).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue192_failure_rollback_releases_slot_of_deleting_task() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let free_before = manager.task_slot_pool.available_slots().await;
+        let (id, task, token) = issue192_task_with_slot(&manager, &dir, "fail.bin").await;
+        task.lock().await.request_delete();
+
+        DownloadManager::handle_task_failure(
+            id.clone(),
+            task.clone(),
+            "prepare failed".into(),
+            manager.waiting_queue.clone(),
+            manager.cancellation_tokens.clone(),
+            None,
+            None,
+            manager.tasks.clone(),
+            manager.task_slot_pool.clone(),
+            manager.folder_manager.clone(),
+            None,
+            manager.chunk_scheduler.clone(),
+        )
+        .await;
+
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+        assert!(token.is_cancelled());
+        assert!(!manager.cancellation_tokens.read().await.contains_key(&id));
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+        assert_eq!(
+            task.lock().await.status,
+            TaskStatus::Downloading,
+            "not marked failed"
+        );
+
+        manager.delete_task(&id, true).await.unwrap();
+        assert_eq!(manager.active_task_count(), 0);
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+    }
+
+    #[tokio::test]
+    async fn test_issue192_preempted_deleting_task_is_not_requeued() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let (id, task, token) = issue192_task_with_slot(&manager, &dir, "pre.bin").await;
+        task.lock().await.request_delete();
+        DownloadManager::pause_and_requeue_preempted_task(
+            &manager.tasks,
+            &manager.cancellation_tokens,
+            &manager.waiting_queue,
+            &id,
+        )
+        .await;
+        assert!(token.is_cancelled());
+        assert_eq!(task.lock().await.status, TaskStatus::Downloading);
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+
+        task.lock().await.mark_paused();
+        manager.add_preempted_backup_to_queue(&id).await;
+        assert_eq!(task.lock().await.status, TaskStatus::Paused);
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+        assert!(manager.resume_task(&id).await.is_err());
+        assert!(manager.requeue_paused_task(&id).await.is_err());
+        assert!(manager.set_task_pending_and_queue(&id).await.is_err());
+        assert_eq!(task.lock().await.status, TaskStatus::Paused);
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn test_issue192_v4_queue_never_admits_deleted_or_deleting_ids() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let (id, task, _token) = issue192_task_with_slot(&manager, &dir, "q.bin").await;
+        task.lock().await.request_delete();
+        // Every fallback enqueue helper refuses a deleting task.
+        manager
+            .add_to_waiting_queue_with_task_type(&id, false, false)
+            .await;
+        manager.add_to_waiting_queue_by_priority(&id, true).await;
+        DownloadManager::add_to_queue_by_priority(
+            &manager.waiting_queue,
+            &manager.tasks,
+            &id,
+            false,
+            true,
+        )
+        .await;
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+
+        manager.delete_task(&id, true).await.unwrap();
+        // A consumer that popped the id before delete and re-pushes after it finished.
+        DownloadManager::add_to_queue_by_priority(
+            &manager.waiting_queue,
+            &manager.tasks,
+            &id,
+            false,
+            false,
+        )
+        .await;
+        manager
+            .add_to_waiting_queue_with_task_type(&id, true, false)
+            .await;
+        assert!(!manager.waiting_queue.read().await.contains(&id));
+
+        // Live tasks are still admitted.
+        let live = DownloadTask::new(1, "/l".into(), dir.path().join("l"), 4, Uid::default());
+        let lid = live.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(lid.clone(), Arc::new(Mutex::new(live)));
+        manager
+            .add_to_waiting_queue_with_task_type(&lid, false, false)
+            .await;
+        assert!(manager.waiting_queue.read().await.contains(&lid));
+    }
+
+    #[tokio::test]
+    async fn test_issue192_v4_monitor_drops_cooling_deleting_task() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut t = DownloadTask::new(1, "/c".into(), dir.path().join("c"), 4, Uid::default());
+        t.next_retry_at = Some(chrono::Utc::now().timestamp_millis() + 600_000);
+        t.request_delete();
+        let id = t.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(t)));
+        manager.waiting_queue.write().await.push_back(id.clone());
+        manager.start_waiting_queue_monitor();
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            !manager.waiting_queue.read().await.contains(&id),
+            "cooling check must not resurrect a deleting id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue192_v4_delete_sweeps_late_slot_and_absent_start() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let free_before = manager.task_slot_pool.available_slots().await;
+
+        // A consumer allocated a slot owned by the id but had not yet written slot_id
+        // when delete read the task fields: delete's final sweep must release it.
+        let t = DownloadTask::new(1, "/s".into(), dir.path().join("s"), 4, Uid::default());
+        let id = t.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(t)));
+        manager.inc_active();
+        manager
+            .task_slot_pool
+            .allocate_fixed_slot_with_priority(
+                &id,
+                false,
+                crate::task_slot_pool::TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        manager.delete_task(&id, true).await.unwrap();
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+        assert_eq!(manager.active_task_count(), 0);
+
+        // start_task/resume_task allocated, then delete removed the task before
+        // start_task_internal ran: the slot must not leak.
+        let ghost = "issue192-v4-ghost";
+        manager
+            .task_slot_pool
+            .allocate_backup_slot(ghost)
+            .await
+            .unwrap();
+        assert!(manager.start_task_internal(ghost).await.is_err());
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+
+        // start_task on a deleting task: no slot, no enqueue, error.
+        let mut b = DownloadTask::new(1, "/b".into(), dir.path().join("b"), 4, Uid::default());
+        b.request_delete();
+        let bid = b.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(bid.clone(), Arc::new(Mutex::new(b)));
+        assert!(manager.start_task(&bid).await.is_err());
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+        assert!(!manager.waiting_queue.read().await.contains(&bid));
+        assert!(!manager.cancellation_tokens.read().await.contains_key(&bid));
+
+        // Post-allocation gate used by start_task/resume_task.
+        let live = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/g".into(),
+            dir.path().join("g"),
+            4,
+            Uid::default(),
+        )));
+        let gid = live.lock().await.id.clone();
+        manager
+            .task_slot_pool
+            .allocate_fixed_slot_with_priority(
+                &gid,
+                false,
+                crate::task_slot_pool::TaskPriority::Normal,
+            )
+            .await
+            .unwrap();
+        assert!(manager.abandon_start_if_deleted(&gid, &live).await);
+        assert_eq!(manager.task_slot_pool.available_slots().await, free_before);
+    }
+
+    #[tokio::test]
+    async fn test_issue192_v4_pause_paths_do_not_break_delete_accounting() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        // Keeps the counter above 0 so clamped double decrements are visible.
+        let (_o, _ot, _otok) = issue192_task_with_slot(&manager, &dir, "other.bin").await;
+
+        // cancel_task_without_delete during a delete must not decrement.
+        let (id, task, _t) = issue192_task_with_slot(&manager, &dir, "cancel.bin").await;
+        assert_eq!(manager.active_task_count(), 2);
+        task.lock().await.request_delete();
+        manager.cancel_task_without_delete(&id).await;
+        assert_eq!(task.lock().await.status, TaskStatus::Downloading);
+        assert_eq!(manager.active_task_count(), 2);
+        manager.delete_task(&id, true).await.unwrap();
+        assert_eq!(manager.active_task_count(), 1);
+
+        // pause_waiting_tasks between batch pre-mark and per-task delete.
+        let mut p = DownloadTask::new(1, "/p".into(), dir.path().join("p"), 4, Uid::default());
+        let pid = p.id.clone();
+        p.request_delete();
+        let ptask = Arc::new(Mutex::new(p));
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(pid.clone(), ptask.clone());
+        manager.inc_active();
+        assert_eq!(
+            manager
+                .pause_waiting_tasks(std::slice::from_ref(&pid))
+                .await,
+            0
+        );
+        assert_eq!(ptask.lock().await.status, TaskStatus::Pending);
+        manager.delete_task_internal(&pid, true).await.unwrap();
+        assert_eq!(manager.active_task_count(), 1);
+
+        // Preempted backup: delete lands between pause_preempted_task and
+        // add_preempted_backup_to_queue.
+        let (bid, btask, _bt) = issue192_task_with_slot(&manager, &dir, "backup.bin").await;
+        btask.lock().await.is_backup = true;
+        assert_eq!(manager.active_task_count(), 2);
+        manager.pause_preempted_task(&bid).await;
+        btask.lock().await.request_delete();
+        manager.add_preempted_backup_to_queue(&bid).await;
+        assert_eq!(btask.lock().await.status, TaskStatus::Paused);
+        manager.delete_task(&bid, true).await.unwrap();
+        assert_eq!(manager.active_task_count(), 1, "no +1 leak");
+
+        // Without a delete the preempt pair is count-neutral.
+        let (cid, ctask, _ct) = issue192_task_with_slot(&manager, &dir, "backup2.bin").await;
+        ctask.lock().await.is_backup = true;
+        manager.pause_preempted_task(&cid).await;
+        manager.add_preempted_backup_to_queue(&cid).await;
+        assert_eq!(ctask.lock().await.status, TaskStatus::Pending);
+        assert_eq!(manager.active_task_count(), 2);
+
+        // pause_preempted_task on a deleting task is a no-op.
+        ctask.lock().await.mark_downloading();
+        ctask.lock().await.request_delete();
+        manager.pause_preempted_task(&cid).await;
+        assert_eq!(ctask.lock().await.status, TaskStatus::Downloading);
+        assert_eq!(manager.active_task_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_issue192_register_cancel_is_not_success() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        for delete_intent_only in [false, true] {
+            let task = Arc::new(Mutex::new(DownloadTask::new(
+                1,
+                "/cancel".into(),
+                dir.path().join("cancel"),
+                4,
+                Uid::default(),
+            )));
+            let token = CancellationToken::new();
+            let info = issue192_schedule_info(&manager, task.clone(), token.clone()).await;
+            if delete_intent_only {
+                task.lock().await.request_delete();
+            } else {
+                token.cancel();
+            }
+            assert!(!manager.chunk_scheduler.register_task(info).await.unwrap());
+            assert_eq!(manager.chunk_scheduler.active_task_count().await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_issue192_detection_loop_is_joined_on_cancel() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let guard = manager
+            .chunk_scheduler
+            .track_worker("detection", &token)
+            .unwrap();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let cleanup = OnDrop(Some(dropped_tx));
+        let handle = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            std::future::pending::<()>().await;
+        });
+        DownloadManager::join_detection_loop(guard, handle, token.clone());
+        token.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.chunk_scheduler.cancel_task_and_wait("detection"),
+        )
+        .await
+        .unwrap();
+        dropped_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_issue192_single_and_batch_delete_join_late_worker() {
+        for batch in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let manager = Arc::new(
+                DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let path = dir.path().join("late.bin");
+            let temp_path = PathBuf::from(format!("{}.downloading", path.display()));
+            tokio::fs::write(&temp_path, b"old progress").await.unwrap();
+            let mut task = DownloadTask::new(1, "/late.bin".into(), path, 4, Uid::default());
+            task.status = TaskStatus::Paused;
+            let id = task.id.clone();
+            manager
+                .tasks
+                .write()
+                .await
+                .insert(id.clone(), Arc::new(Mutex::new(task)));
+            let token = CancellationToken::new();
+            manager
+                .cancellation_tokens
+                .write()
+                .await
+                .insert(id.clone(), token.clone());
+            let guard = manager.chunk_scheduler.track_worker(&id, &token).unwrap();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let late_path = temp_path.clone();
+            let worker = tokio::spawn(async move {
+                let _guard = guard;
+                release_rx.await.unwrap();
+                let mut file = tokio::fs::File::create(late_path).await.unwrap();
+                tokio::io::AsyncWriteExt::write_all(&mut file, b"late")
+                    .await
+                    .unwrap();
+                tokio::io::AsyncWriteExt::flush(&mut file).await.unwrap();
+            });
+            let delete = async {
+                if batch {
+                    assert_eq!(
+                        manager
+                            .batch_delete_tasks(std::slice::from_ref(&id), false)
+                            .await,
+                        (1, 0)
+                    );
+                } else {
+                    manager.delete_task(&id, false).await.unwrap();
+                }
+            };
+            tokio::pin!(delete);
+            // Old code returns after 100ms, without waiting for the held worker.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut delete)
+                    .await
+                    .is_err()
+            );
+            assert!(token.is_cancelled());
+            assert!(
+                temp_path.exists(),
+                "cleanup ran while a writer was still alive"
+            );
+            assert!(
+                manager
+                    .chunk_scheduler
+                    .track_worker(&id, &CancellationToken::new())
+                    .is_none(),
+                "closed tracker admitted a late worker"
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), delete)
+                .await
+                .unwrap();
+            worker.await.unwrap();
+            assert!(!temp_path.exists());
+            assert!(manager.get_task(&id).await.is_none());
+            // Reusing the id for a fresh generation must not inherit a closed tracker.
+            assert!(manager
+                .chunk_scheduler
+                .track_worker(&id, &CancellationToken::new())
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_issue192_delete_false_preserves_completed_file() {
+        for batch in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let path = dir.path().join("complete.bin");
+            let temp_path = PathBuf::from(format!("{}.downloading", path.display()));
+            tokio::fs::write(&path, b"final").await.unwrap();
+            tokio::fs::write(&temp_path, b"stale").await.unwrap();
+            let mut task =
+                DownloadTask::new(1, "/complete.bin".into(), path.clone(), 5, Uid::default());
+            task.status = TaskStatus::Completed;
+            let id = task.id.clone();
+            manager
+                .tasks
+                .write()
+                .await
+                .insert(id.clone(), Arc::new(Mutex::new(task)));
+            if batch {
+                assert_eq!(manager.batch_delete_tasks(&[id], false).await, (1, 0));
+            } else {
+                manager.delete_task(&id, false).await.unwrap();
+            }
+            assert_eq!(tokio::fs::read(path).await.unwrap(), b"final");
+            assert!(!temp_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_issue192_tracking_allows_resume_and_retry_generations() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let old_token = CancellationToken::new();
+        let old_guard = manager
+            .chunk_scheduler
+            .track_worker("generation", &old_token)
+            .unwrap();
+        old_token.cancel(); // pause/auto-requeue; the old worker has not exited yet
+        let new_token = CancellationToken::new();
+        let new_guard = manager
+            .chunk_scheduler
+            .track_worker("generation", &new_token)
+            .unwrap();
+        assert!(manager
+            .chunk_scheduler
+            .track_worker("generation", &old_token)
+            .is_none());
+        drop(old_guard);
+        drop(new_guard);
+        assert!(manager
+            .chunk_scheduler
+            .track_worker("generation", &new_token)
+            .is_some());
     }
 }
 

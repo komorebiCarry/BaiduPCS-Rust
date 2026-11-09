@@ -188,11 +188,15 @@ impl Chunk {
             request = request.header("Referer", referer_val);
         }
 
-        let resp = request
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .send()
-            .await
-            .context("发送HTTP请求失败")?;
+        let resp = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                anyhow::bail!("分片 #{} 下载被取消", self.index);
+            }
+            response = request.timeout(std::time::Duration::from_secs(timeout_secs)).send() => {
+                response.context("发送HTTP请求失败")?
+            }
+        };
 
         // 🔥 严格校验 Range 响应
         let status = resp.status();
@@ -212,8 +216,7 @@ impl Chunk {
         // 🔥 校验 Content-Range 头（防止 CDN 返回错误的字节范围）
         if let Some(content_range) = resp.headers().get("content-range") {
             if let Ok(cr_str) = content_range.to_str() {
-                let expected_prefix =
-                    format!("bytes {}-{}", effective_start, self.range.end - 1);
+                let expected_prefix = format!("bytes {}-{}", effective_start, self.range.end - 1);
                 if !cr_str.starts_with(&expected_prefix) {
                     anyhow::bail!(
                         "Content-Range 不匹配: 期望以 '{}' 开头，实际 '{}'",
@@ -245,131 +248,141 @@ impl Chunk {
             .await
             .context("打开输出文件失败")?;
 
-        file.seek(std::io::SeekFrom::Start(effective_start))
-            .await
-            .context("文件定位失败")?;
+        let result: Result<u64> = async {
+            file.seek(std::io::SeekFrom::Start(effective_start))
+                .await
+                .context("文件定位失败")?;
 
-        // 3. 流式读取并写入文件，批量更新进度（减少锁竞争）
-        let mut stream = resp.bytes_stream();
-        let mut total_bytes_downloaded = 0u64;
-        let mut pending_progress = 0u64; // 累积的待更新字节数
-        const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
-        const PROGRESS_UPDATE_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(500);
-        let mut last_progress_update = std::time::Instant::now();
-        // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
-        // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
-        // 需要对每次stream.next()单独设置超时
-        // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
+            // 3. 流式读取并写入文件，批量更新进度（减少锁竞争）
+            let mut stream = resp.bytes_stream();
+            let mut total_bytes_downloaded = 0u64;
+            let mut pending_progress = 0u64; // 累积的待更新字节数
+            const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
+            const PROGRESS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+            let mut last_progress_update = std::time::Instant::now();
+            // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
+            // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
+            // 需要对每次stream.next()单独设置超时
+            // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
 
-        let read_timeout_dur = std::time::Duration::from_secs(read_timeout_secs);
+            let read_timeout_dur = std::time::Duration::from_secs(read_timeout_secs);
 
-        loop {
-            // 🔥 tokio::select! 同时等待三个信号：
-            //   1. cancellation_token.cancelled()  — pause/cancel 立即中断
-            //   2. tokio::time::sleep(read_timeout) — 读取超时
-            //   3. stream.next()                    — 数据到达
-            // 这保证取消在 stream.next() 阻塞期间也能生效
-            let chunk_data = tokio::select! {
-                biased; // 优先检查取消，避免数据就绪时漏掉取消信号
+            loop {
+                // 🔥 tokio::select! 同时等待三个信号：
+                //   1. cancellation_token.cancelled()  — pause/cancel 立即中断
+                //   2. tokio::time::sleep(read_timeout) — 读取超时
+                //   3. stream.next()                    — 数据到达
+                // 这保证取消在 stream.next() 阻塞期间也能生效
+                let chunk_data = tokio::select! {
+                    biased; // 优先检查取消，避免数据就绪时漏掉取消信号
 
-                _ = cancellation_token.cancelled() => {
-                    if pending_progress > 0 {
-                        progress_callback(pending_progress);
+                    _ = cancellation_token.cancelled() => {
+                        if pending_progress > 0 {
+                            progress_callback(pending_progress);
+                        }
+                        self.bytes_downloaded += total_bytes_downloaded;
+                        info!(
+                            "[分片线程{}] 分片 #{} 流式读取被取消，本次已下载 {} bytes，累计 {} bytes",
+                            chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
+                        );
+                        anyhow::bail!("分片 #{} 下载被取消", self.index);
                     }
-                    self.bytes_downloaded += total_bytes_downloaded;
-                    info!(
-                        "[分片线程{}] 分片 #{} 流式读取被取消，本次已下载 {} bytes，累计 {} bytes",
-                        chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
+
+                    result = tokio::time::timeout(read_timeout_dur, stream.next()) => {
+                        match result {
+                            Ok(Some(Ok(data))) => data,
+                            Ok(Some(Err(e))) => {
+                                // 🔥 流式读取错误：保存已写入的部分进度
+                                if pending_progress > 0 {
+                                    progress_callback(pending_progress);
+                                }
+                                self.bytes_downloaded += total_bytes_downloaded;
+                                warn!(
+                                    "[分片线程{}] 分片 #{} 读取数据流失败，本次已下载 {} bytes，累计 {} bytes",
+                                    chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
+                                );
+                                return Err(anyhow::Error::new(e).context("读取数据流失败"));
+                            }
+                            Ok(None) => break, // 流结束
+                            Err(_) => {
+                                // 🔥 读取超时：保存已写入的部分进度
+                                if pending_progress > 0 {
+                                    progress_callback(pending_progress);
+                                }
+                                self.bytes_downloaded += total_bytes_downloaded;
+                                warn!(
+                                    "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，本次已下载 {} bytes，累计 {} bytes",
+                                    chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded, self.bytes_downloaded
+                                );
+                                anyhow::bail!(
+                                    "读取数据流超时: {}秒内无数据到达",
+                                    read_timeout_secs
+                                );
+                            }
+                        }
+                    }
+                };
+                let chunk_len = chunk_data.len() as u64;
+
+                // 🔥 溢出保护：防止写入超过分片边界
+                if total_bytes_downloaded + chunk_len > remaining {
+                    let safe_len = (remaining - total_bytes_downloaded) as usize;
+                    warn!(
+                        "[分片线程{}] 分片 #{} 收到超量数据 (已下载 {} + 本次 {} > 剩余 {})，截断到 {} bytes",
+                        chunk_thread_id, self.index, total_bytes_downloaded, chunk_len, remaining, safe_len
                     );
-                    anyhow::bail!("分片 #{} 下载被取消", self.index);
-                }
-
-                result = tokio::time::timeout(read_timeout_dur, stream.next()) => {
-                    match result {
-                        Ok(Some(Ok(data))) => data,
-                        Ok(Some(Err(e))) => {
-                            // 🔥 流式读取错误：保存已写入的部分进度
-                            if pending_progress > 0 {
-                                progress_callback(pending_progress);
-                            }
-                            self.bytes_downloaded += total_bytes_downloaded;
-                            warn!(
-                                "[分片线程{}] 分片 #{} 读取数据流失败，本次已下载 {} bytes，累计 {} bytes",
-                                chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
-                            );
-                            return Err(anyhow::Error::new(e).context("读取数据流失败"));
-                        }
-                        Ok(None) => break, // 流结束
-                        Err(_) => {
-                            // 🔥 读取超时：保存已写入的部分进度
-                            if pending_progress > 0 {
-                                progress_callback(pending_progress);
-                            }
-                            self.bytes_downloaded += total_bytes_downloaded;
-                            warn!(
-                                "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，本次已下载 {} bytes，累计 {} bytes",
-                                chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded, self.bytes_downloaded
-                            );
-                            anyhow::bail!(
-                                "读取数据流超时: {}秒内无数据到达",
-                                read_timeout_secs
-                            );
-                        }
+                    if safe_len > 0 {
+                        file.write_all(&chunk_data[..safe_len])
+                            .await
+                            .context("写入文件失败")?;
+                        total_bytes_downloaded += safe_len as u64;
+                        pending_progress += safe_len as u64;
                     }
+                    break;
                 }
-            };
-            let chunk_len = chunk_data.len() as u64;
 
-            // 🔥 溢出保护：防止写入超过分片边界
-            if total_bytes_downloaded + chunk_len > remaining {
-                let safe_len = (remaining - total_bytes_downloaded) as usize;
-                warn!(
-                    "[分片线程{}] 分片 #{} 收到超量数据 (已下载 {} + 本次 {} > 剩余 {})，截断到 {} bytes",
-                    chunk_thread_id, self.index, total_bytes_downloaded, chunk_len, remaining, safe_len
-                );
-                if safe_len > 0 {
-                    file.write_all(&chunk_data[..safe_len]).await.context("写入文件失败")?;
-                    total_bytes_downloaded += safe_len as u64;
-                    pending_progress += safe_len as u64;
+                // 写入文件
+                file.write_all(&chunk_data).await.context("写入文件失败")?;
+
+                total_bytes_downloaded += chunk_len;
+                pending_progress += chunk_len;
+
+                // 批量更新进度：高速下载按字节阈值刷新，低速下载至少每 500ms 刷新一次。
+                if pending_progress >= PROGRESS_UPDATE_THRESHOLD
+                    || last_progress_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
+                    || total_bytes_downloaded >= remaining
+                {
+                    progress_callback(pending_progress);
+                    pending_progress = 0;
+                    last_progress_update = std::time::Instant::now();
                 }
-                break;
             }
 
-            // 写入文件
-            file.write_all(&chunk_data).await.context("写入文件失败")?;
-
-            total_bytes_downloaded += chunk_len;
-            pending_progress += chunk_len;
-
-            // 批量更新进度：高速下载按字节阈值刷新，低速下载至少每 500ms 刷新一次。
-            if pending_progress >= PROGRESS_UPDATE_THRESHOLD
-                || last_progress_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
-                || total_bytes_downloaded >= remaining
-            {
+            // 确保剩余的进度被更新
+            if pending_progress > 0 {
                 progress_callback(pending_progress);
-                pending_progress = 0;
-                last_progress_update = std::time::Instant::now();
             }
-        }
 
-        // 确保剩余的进度被更新
-        if pending_progress > 0 {
-            progress_callback(pending_progress);
-        }
+            // 🔥 校验最终字节数：流正常结束但数据不完整
+            if total_bytes_downloaded < remaining {
+                self.bytes_downloaded += total_bytes_downloaded;
+                anyhow::bail!(
+                    "分片 #{} 数据不完整: 期望 {} bytes，实际收到 {} bytes (差 {} bytes)",
+                    self.index,
+                    remaining,
+                    total_bytes_downloaded,
+                    remaining - total_bytes_downloaded
+                );
+            }
 
-        // 🔥 校验最终字节数：流正常结束但数据不完整
-        if total_bytes_downloaded < remaining {
-            self.bytes_downloaded += total_bytes_downloaded;
-            anyhow::bail!(
-                "分片 #{} 数据不完整: 期望 {} bytes，实际收到 {} bytes (差 {} bytes)",
-                self.index, remaining, total_bytes_downloaded,
-                remaining - total_bytes_downloaded
-            );
+            Ok(total_bytes_downloaded)
         }
-
-        // 4. 刷新文件缓冲
-        file.flush().await.context("刷新文件缓冲失败")?;
+        .await;
+        // Even cancellation/error paths must wait for outstanding filesystem IO.
+        // Dropping a tokio File alone can leave its blocking write running.
+        let flush_result = file.flush().await.context("刷新文件缓冲失败");
+        let total_bytes_downloaded = result?;
+        flush_result?;
 
         self.bytes_downloaded += total_bytes_downloaded;
         self.completed = true;
@@ -644,7 +657,10 @@ impl ChunkManager {
 
     /// 获取分片的已下载字节数（分片内断点续传持久化）
     pub fn get_bytes_downloaded(&self, index: usize) -> u64 {
-        self.chunks.get(index).map(|c| c.bytes_downloaded).unwrap_or(0)
+        self.chunks
+            .get(index)
+            .map(|c| c.bytes_downloaded)
+            .unwrap_or(0)
     }
 
     /// 重置所有分片状态
@@ -830,5 +846,168 @@ mod tests {
         let chunk = Chunk::new(0, 0..100, Uid::new(1));
         // 不同 uid 应触发 panic
         ChunkManager::assert_chunk_owner(Uid::new(2), &chunk);
+    }
+    /// Hold the response behind a barrier so cancellation/cleanup always wins
+    /// before the late HTTP headers arrive (no Baidu account or timing sleep).
+    #[tokio::test]
+    async fn test_cancelled_request_does_not_recreate_output() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.downloading");
+        tokio::fs::write(&path, b"previous progress").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let (requested_tx, requested_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            requested_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let _ = socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata").await;
+        });
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let output = path.clone();
+        let worker = tokio::spawn(async move {
+            Chunk::new(0, 0..4, Uid::default())
+                .download(
+                    &Client::builder().no_proxy().build().unwrap(),
+                    "",
+                    None,
+                    &url,
+                    &output,
+                    10,
+                    0,
+                    10,
+                    &worker_token,
+                    |_| {},
+                )
+                .await
+        });
+        requested_rx.await.unwrap();
+        token.cancel();
+        tokio::fs::remove_file(&path).await.unwrap();
+        release_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        server.await.unwrap();
+        assert!(
+            !path.exists(),
+            "late response recreated the cancelled .downloading file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue192_stream_cancel_flushes_progress_and_resumes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+        const HALF: usize = 256 * 1024;
+        async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            String::from_utf8(request).unwrap().to_lowercase()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume.downloading");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut socket)
+                .await
+                .contains("range: bytes=0-524287"));
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-524287/524288\r\nContent-Length: 524288\r\n\r\n").await.unwrap();
+            socket.write_all(&vec![b'a'; HALF]).await.unwrap();
+            release_rx.await.unwrap();
+            drop(socket);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut socket)
+                .await
+                .contains("range: bytes=262144-524287"));
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 262144-524287/524288\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(&vec![b'b'; HALF]).await.unwrap();
+        });
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let output = path.clone();
+        let worker_url = url.clone();
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let progress_tx = std::sync::Mutex::new(Some(progress_tx));
+        let worker = tokio::spawn(async move {
+            let mut chunk = Chunk::new(0, 0..(2 * HALF) as u64, Uid::default());
+            let result = chunk
+                .download(
+                    &Client::builder().no_proxy().build().unwrap(),
+                    "",
+                    None,
+                    &worker_url,
+                    &output,
+                    10,
+                    0,
+                    10,
+                    &worker_token,
+                    |_| {
+                        if let Some(tx) = progress_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    },
+                )
+                .await;
+            (chunk, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), progress_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        token.cancel();
+        let (mut chunk, result) = tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(chunk.bytes_downloaded, HALF as u64);
+        assert!(!chunk.completed);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), vec![b'a'; HALF]);
+        release_tx.send(()).unwrap();
+        let resumed = chunk
+            .download(
+                &Client::builder().no_proxy().build().unwrap(),
+                "",
+                None,
+                &url,
+                &path,
+                10,
+                0,
+                10,
+                &CancellationToken::new(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, HALF as u64);
+        assert!(chunk.completed);
+        assert_eq!(chunk.bytes_downloaded, (2 * HALF) as u64);
+        assert_eq!(
+            tokio::fs::read(path).await.unwrap(),
+            [vec![b'a'; HALF], vec![b'b'; HALF]].concat()
+        );
+        server.await.unwrap();
     }
 }
