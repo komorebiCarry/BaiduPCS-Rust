@@ -116,7 +116,11 @@
       </div>
 
       <!-- 移动端工具栏（图标按钮） -->
-      <div v-else class="toolbar-buttons-mobile">
+      <div
+          v-else
+          class="toolbar-buttons-mobile"
+          :class="{ 'search-open': searchExpanded || isSearchMode }"
+      >
         <div
             ref="searchWrapperRef"
             class="search-wrapper"
@@ -2628,8 +2632,33 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     flex-wrap: wrap;
   }
 
+  // 只有搜索框展开/处于搜索结果时才让工具栏独占一整行（搜索框在下方铺满）；
+  // 收起时保持原样，与面包屑同一行。
+  .toolbar-buttons-mobile.search-open {
+    flex-wrap: wrap;
+    width: 100%;
+    justify-content: flex-end;
+  }
+
   .search-wrapper {
-    --search-expand-width: min(200px, calc(100vw - 56px));
+    --search-expand-width: 100%;
+
+    &.expanded,
+    &.active {
+      flex: 1 0 100%;
+      width: 100%;
+      order: 1;
+      height: var(--toolbar-control-size);
+
+      .search-shell {
+        position: relative;
+        top: auto;
+        right: auto;
+        left: auto;
+        transform: none;
+        width: 100%;
+      }
+    }
   }
 
   .file-list {

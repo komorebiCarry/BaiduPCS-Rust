@@ -481,6 +481,10 @@ watch(() => form.value.pwd, () => {
   flex-direction: column;
   gap: 12px;
   margin-top: 20px;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
 }
 
 /* =====================

@@ -1090,6 +1090,10 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 12px;
   margin-top: 24px;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
 }
 
 .block-btn {
@@ -1133,15 +1137,20 @@ onBeforeUnmount(() => {
    ===================== */
 @media (max-width: 768px) {
   .page-header {
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 8px;
   }
 
   .header-left {
-    justify-content: space-between;
+    flex: 1 1 auto;
+    min-width: 0;
+    justify-content: flex-start;
   }
 
   .header-right {
+    flex: 0 0 auto;
     justify-content: flex-end;
   }
 }
