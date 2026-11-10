@@ -15,6 +15,9 @@ use crate::downloader::folder::{FolderDownload, FolderStatus, PendingFile, Skipp
 /// 文件夹持久化状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderPersisted {
+    /// File-level data lives in wal/folder_files/<id>.sqlite. Missing DB is fatal.
+    #[serde(default)]
+    pub sqlite_files: bool,
     /// 文件夹ID
     pub id: String,
     /// 文件夹名称
@@ -107,6 +110,7 @@ impl FolderPersisted {
     /// 从 FolderDownload 转换
     pub fn from_folder(folder: &FolderDownload) -> Self {
         Self {
+            sqlite_files: folder.sqlite_files || folder.file_store.is_some(),
             id: folder.id.clone(),
             name: folder.name.clone(),
             remote_root: folder.remote_root.clone(),
@@ -119,8 +123,8 @@ impl FolderPersisted {
             downloaded_size: folder.downloaded_size,
             scan_completed: folder.scan_completed,
             scan_progress: folder.scan_progress.clone(),
-            pending_files: folder.pending_files.clone(),
-            counted_fs_ids: folder.counted_fs_ids.clone(),
+            pending_files: if folder.file_store.is_some() { Vec::new() } else { folder.pending_files.clone() },
+            counted_fs_ids: if folder.file_store.is_some() { HashSet::new() } else { folder.counted_fs_ids.clone() },
             created_at: folder.created_at,
             started_at: folder.started_at,
             completed_at: folder.completed_at,
@@ -135,13 +139,15 @@ impl FolderPersisted {
             conflict_strategy: folder.conflict_strategy,
             skipped_count: folder.skipped_count,
             skipped_size: folder.skipped_size,
-            skipped_entries: folder.skipped_entries.clone(),
+            skipped_entries: if folder.file_store.is_some() { Vec::new() } else { folder.skipped_entries.clone() },
         }
     }
 
     /// 转换为 FolderDownload
     pub fn to_folder(&self) -> FolderDownload {
         FolderDownload {
+            file_store: None,
+            sqlite_files: self.sqlite_files,
             id: self.id.clone(),
             name: self.name.clone(),
             remote_root: self.remote_root.clone(),
@@ -196,7 +202,17 @@ pub fn save_folder(wal_dir: &Path, folder: &FolderPersisted) -> std::io::Result<
     let file_path = folders_dir.join(format!("folder_{}.json", folder.id));
     let content = serde_json::to_string_pretty(folder)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&file_path, content)?;
+    // Keep the old summary intact if a write is interrupted during SQLite migration.
+    let temp_path = folders_dir.join(format!("folder_{}.{}.tmp", folder.id, uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp_path, &file_path)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp_path); }
+    result?;
 
     debug!("保存文件夹状态: {} -> {:?}", folder.id, file_path);
     Ok(())

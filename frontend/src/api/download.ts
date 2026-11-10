@@ -294,8 +294,8 @@ export interface SkippedFile {
  * 跳过的文件不会创建子任务，不出现在 /downloads/all 里，需单独取回后
  * 以「跳过」状态补进详情列表。
  */
-export async function getFolderSkippedFiles(folderId: string): Promise<SkippedFile[]> {
-  return apiClient.get(`/downloads/folder/${folderId}/skipped`)
+export async function getFolderSkippedFiles(folderId: string, offset = 0, limit = 500): Promise<SkippedFile[]> {
+  return apiClient.get(`/downloads/folder/${folderId}/skipped`, { params: { offset, limit } })
 }
 
 /// 树形节点（用于展示）

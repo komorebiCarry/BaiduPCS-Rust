@@ -658,6 +658,9 @@ pub struct ServerConfig {
 /// 下载配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadConfig {
+    /// 文件夹下载排除规则；默认关闭，按完整目录名匹配。
+    #[serde(default)]
+    pub folder_exclude: FolderExcludeConfig,
     /// 默认下载目录
     pub download_dir: PathBuf,
     /// 用户设置的默认目录（用于"设置为默认"功能）
@@ -683,6 +686,310 @@ pub struct DownloadConfig {
     /// CDN刷新配置
     #[serde(default)]
     pub cdn_refresh: CdnRefreshConfig,
+    /// 高级配置（链接预取、HTTP/2降级等）
+    #[serde(default)]
+    pub advanced: AdvancedDownloadConfig,
+    /// 🔥 小文件优化配置
+    #[serde(default)]
+    pub small_file_optimization: SmallFileOptimizationConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FolderExcludeConfig {
+    pub enabled: bool,
+    pub directory_names: Vec<String>,
+}
+
+impl Default for FolderExcludeConfig {
+    fn default() -> Self {
+        Self { enabled: false, directory_names: ["node_modules", ".git", ".cache", ".next", ".nuxt", "target", "bin", "obj"]
+            .into_iter().map(str::to_owned).collect() }
+    }
+}
+
+impl FolderExcludeConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.directory_names.len() <= 64, "下载目录排除规则最多 64 条");
+        for name in &self.directory_names {
+            anyhow::ensure!(!name.is_empty() && name.len() <= 255 && name != "." && name != ".."
+                && !name.contains(['/', '\\']) && !name.chars().any(char::is_control),
+                "排除规则必须是单个目录名（1～255 字节），不能包含路径: {:?}", name);
+        }
+        Ok(())
+    }
+
+    pub fn excludes(&self, name: &str) -> bool {
+        self.enabled && self.directory_names.iter().any(|rule| rule == name)
+    }
+}
+
+#[cfg(test)]
+mod folder_exclude_tests {
+    use super::FolderExcludeConfig;
+
+    #[test]
+    fn default_is_off_and_legacy_config_works() {
+        let config: FolderExcludeConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.excludes("node_modules"));
+        assert!(config.directory_names.iter().any(|n|n==".git"));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn exact_directory_names_only() {
+        let mut config=FolderExcludeConfig::default();
+        config.enabled=true;
+        for name in ["node_modules", ".git", ".cache", "bin", "obj", "target"] {
+            assert!(config.excludes(name));
+        }
+        for name in ["Node_Modules", "my_node_modules", "node_modules_backup", ".github", "binary", "src"] {
+            assert!(!config.excludes(name));
+        }
+        config.directory_names=vec!["custom-cache".into()];
+        assert!(config.excludes("custom-cache"));
+        assert!(!config.excludes("node_modules"));
+    }
+
+    #[test]
+    fn rejects_paths_empty_names_and_excessive_rules() {
+        for name in ["", ".", "..", "foo/bar", "foo\\bar", "line\nname"] {
+            let config=FolderExcludeConfig {enabled:true,directory_names:vec![name.into()]};
+            assert!(config.validate().is_err(),"{name:?}");
+        }
+        assert!(FolderExcludeConfig {enabled:true,directory_names:vec!["cache".into();65]}.validate().is_err());
+    }
+}
+
+/// 下载高级配置
+///
+/// 用于配置链接预取、HTTP/2降级等高级参数
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedDownloadConfig {
+    /// 链接预取并发数（默认8）
+    /// 控制同时获取下载链接的并发数，避免触发百度风控
+    /// 若出现 errno=132/8002，降低到 4-6
+    #[serde(default = "default_link_prefetch_concurrency")]
+    pub link_prefetch_concurrency: usize,
+
+    /// 链接预取缓存上限（默认256）
+    #[serde(default = "default_link_prefetch_max_entries")]
+    pub link_prefetch_max_entries: usize,
+
+    /// 链接预取缓存有效期（秒，默认480即8分钟）
+    #[serde(default = "default_link_prefetch_ttl_secs")]
+    pub link_prefetch_ttl_secs: u64,
+
+    /// HTTP/2 降级冷却时长（秒，默认600即10分钟）
+    #[serde(default = "default_http11_downgrade_cooldown_secs")]
+    pub http11_downgrade_cooldown_secs: u64,
+
+    /// 连续零字节失败触发 HTTP/1.1 降级的阈值（默认3）
+    #[serde(default = "default_http2_zero_failure_threshold")]
+    pub http2_zero_failure_threshold: u32,
+}
+
+// 高级配置默认值函数
+fn default_link_prefetch_concurrency() -> usize {
+    8
+}
+
+fn default_link_prefetch_max_entries() -> usize {
+    256
+}
+
+fn default_link_prefetch_ttl_secs() -> u64 {
+    480 // 8分钟
+}
+
+fn default_http11_downgrade_cooldown_secs() -> u64 {
+    600 // 10分钟
+}
+
+fn default_http2_zero_failure_threshold() -> u32 {
+    3
+}
+
+impl Default for AdvancedDownloadConfig {
+    fn default() -> Self {
+        Self {
+            link_prefetch_concurrency: default_link_prefetch_concurrency(),
+            link_prefetch_max_entries: default_link_prefetch_max_entries(),
+            link_prefetch_ttl_secs: default_link_prefetch_ttl_secs(),
+            http11_downgrade_cooldown_secs: default_http11_downgrade_cooldown_secs(),
+            http2_zero_failure_threshold: default_http2_zero_failure_threshold(),
+        }
+    }
+}
+
+/// 🔥 小文件优化配置
+///
+/// 用于配置海量小文件下载的优化策略
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmallFileOptimizationConfig {
+    /// 是否启用小文件优化（默认 true）
+    #[serde(default = "default_small_file_optimization_enabled")]
+    pub enabled: bool,
+
+    /// 流式任务队列配置
+    #[serde(default)]
+    pub streaming_queue: StreamingQueueConfig,
+
+    /// 批量链接获取配置
+    #[serde(default)]
+    pub batch_link_fetcher: BatchLinkFetcherConfig,
+
+    /// 小文件下载器配置
+    #[serde(default)]
+    pub small_file_downloader: SmallFileDownloaderConfig,
+}
+
+/// 流式任务队列配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingQueueConfig {
+    /// 内存中最大活跃任务数（默认 500）
+    #[serde(default = "default_streaming_max_active_tasks")]
+    pub max_active_tasks: usize,
+
+    /// 批量加载任务数量（默认 100）
+    #[serde(default = "default_streaming_batch_fetch_size")]
+    pub batch_fetch_size: usize,
+
+    /// 批量提交任务数量（默认 100）
+    #[serde(default = "default_streaming_batch_commit_size")]
+    pub batch_commit_size: usize,
+}
+
+/// 批量链接获取配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchLinkFetcherConfig {
+    /// 每批获取的文件数量（默认 50）
+    #[serde(default = "default_batch_link_batch_size")]
+    pub batch_size: usize,
+
+    /// 批次间延迟（毫秒，默认 100）
+    #[serde(default = "default_batch_link_interval_ms")]
+    pub batch_interval_ms: u64,
+
+    /// 最大并发批次数（默认 3）
+    #[serde(default = "default_batch_link_max_concurrent")]
+    pub max_concurrent_batches: usize,
+
+    /// 链接缓存有效期（秒，默认 480 即 8 分钟）
+    #[serde(default = "default_batch_link_cache_ttl_secs")]
+    pub link_cache_ttl_secs: u64,
+
+    /// 是否启用自适应延迟（默认 true）
+    #[serde(default = "default_batch_link_adaptive_delay")]
+    pub enable_adaptive_delay: bool,
+}
+
+/// 小文件下载器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmallFileDownloaderConfig {
+    /// 批量下载数量（默认 50）
+    #[serde(default = "default_small_file_batch_size")]
+    pub batch_size: usize,
+
+    /// HTTP/2 最大并发流（默认 100）
+    #[serde(default = "default_small_file_max_concurrent_streams")]
+    pub max_concurrent_streams: usize,
+
+    /// 下载超时（秒，默认 60）
+    #[serde(default = "default_small_file_timeout_secs")]
+    pub download_timeout_secs: u64,
+}
+
+// 小文件优化配置默认值函数
+fn default_small_file_optimization_enabled() -> bool {
+    true
+}
+
+fn default_streaming_max_active_tasks() -> usize {
+    500
+}
+
+fn default_streaming_batch_fetch_size() -> usize {
+    100
+}
+
+fn default_streaming_batch_commit_size() -> usize {
+    100
+}
+
+fn default_batch_link_batch_size() -> usize {
+    50
+}
+
+fn default_batch_link_interval_ms() -> u64 {
+    100
+}
+
+fn default_batch_link_max_concurrent() -> usize {
+    3
+}
+
+fn default_batch_link_cache_ttl_secs() -> u64 {
+    480 // 8 分钟
+}
+
+fn default_batch_link_adaptive_delay() -> bool {
+    true
+}
+
+fn default_small_file_batch_size() -> usize {
+    50
+}
+
+fn default_small_file_max_concurrent_streams() -> usize {
+    100
+}
+
+fn default_small_file_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for SmallFileOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_small_file_optimization_enabled(),
+            streaming_queue: StreamingQueueConfig::default(),
+            batch_link_fetcher: BatchLinkFetcherConfig::default(),
+            small_file_downloader: SmallFileDownloaderConfig::default(),
+        }
+    }
+}
+
+impl Default for StreamingQueueConfig {
+    fn default() -> Self {
+        Self {
+            max_active_tasks: default_streaming_max_active_tasks(),
+            batch_fetch_size: default_streaming_batch_fetch_size(),
+            batch_commit_size: default_streaming_batch_commit_size(),
+        }
+    }
+}
+
+impl Default for BatchLinkFetcherConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: default_batch_link_batch_size(),
+            batch_interval_ms: default_batch_link_interval_ms(),
+            max_concurrent_batches: default_batch_link_max_concurrent(),
+            link_cache_ttl_secs: default_batch_link_cache_ttl_secs(),
+            enable_adaptive_delay: default_batch_link_adaptive_delay(),
+        }
+    }
+}
+
+impl Default for SmallFileDownloaderConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: default_small_file_batch_size(),
+            max_concurrent_streams: default_small_file_max_concurrent_streams(),
+            download_timeout_secs: default_small_file_timeout_secs(),
+        }
+    }
 }
 
 /// CDN链接刷新配置
@@ -1126,6 +1433,7 @@ impl DownloadConfig {
     /// - Ok(()): 路径是绝对路径
     /// - Err: 路径不是绝对路径或格式无效
     pub fn validate_download_dir(&self) -> Result<()> {
+        self.folder_exclude.validate()?;
         if !self.download_dir.is_absolute() {
             anyhow::bail!(
                 "下载目录必须是绝对路径，当前值: {:?}\n\
@@ -1338,6 +1646,7 @@ impl Default for AppConfig {
                 cors_origins: vec!["*".to_string()],
             },
             download: DownloadConfig {
+                folder_exclude: FolderExcludeConfig::default(),
                 download_dir,
                 default_directory: None,
                 recent_directory: None,
@@ -1348,6 +1657,8 @@ impl Default for AppConfig {
                 max_concurrent_tasks: svip_config.max_tasks,
                 max_retries: 3,
                 cdn_refresh: CdnRefreshConfig::default(),
+                advanced: AdvancedDownloadConfig::default(),
+                small_file_optimization: SmallFileOptimizationConfig::default(),
             },
             upload: UploadConfig::default(),
             transfer: TransferConfig::default(),
@@ -1837,6 +2148,7 @@ account_quick_bar = true",
     #[test]
     fn test_config_validation() {
         let mut config = DownloadConfig {
+            folder_exclude: FolderExcludeConfig::default(),
             download_dir: std::env::current_dir().unwrap().join("downloads"),
             default_directory: None,
             recent_directory: None,
@@ -1847,6 +2159,8 @@ account_quick_bar = true",
             max_concurrent_tasks: 2,
             max_retries: 3,
             cdn_refresh: CdnRefreshConfig::default(),
+            advanced: AdvancedDownloadConfig::default(),
+            small_file_optimization: SmallFileOptimizationConfig::default(),
         };
 
         // 普通用户：5个线程应该触发警告
@@ -1868,6 +2182,7 @@ account_quick_bar = true",
         // 测试绝对路径验证（使用当前目录，确保跨平台兼容）
         let absolute_path = std::env::current_dir().unwrap().join("downloads");
         let absolute_config = DownloadConfig {
+            folder_exclude: FolderExcludeConfig::default(),
             download_dir: absolute_path,
             default_directory: None,
             recent_directory: None,
@@ -1878,11 +2193,14 @@ account_quick_bar = true",
             max_concurrent_tasks: 2,
             max_retries: 3,
             cdn_refresh: CdnRefreshConfig::default(),
+            advanced: AdvancedDownloadConfig::default(),
+            small_file_optimization: SmallFileOptimizationConfig::default(),
         };
         assert!(absolute_config.validate_download_dir().is_ok());
 
         // 测试相对路径验证（应该失败）
         let relative_config = DownloadConfig {
+            folder_exclude: FolderExcludeConfig::default(),
             download_dir: PathBuf::from("downloads"),
             default_directory: None,
             recent_directory: None,
@@ -1893,6 +2211,8 @@ account_quick_bar = true",
             max_concurrent_tasks: 2,
             max_retries: 3,
             cdn_refresh: CdnRefreshConfig::default(),
+            advanced: AdvancedDownloadConfig::default(),
+            small_file_optimization: SmallFileOptimizationConfig::default(),
         };
         assert!(relative_config.validate_download_dir().is_err());
 
@@ -1900,6 +2220,7 @@ account_quick_bar = true",
         #[cfg(target_os = "windows")]
         {
             let windows_config = DownloadConfig {
+                folder_exclude: FolderExcludeConfig::default(),
                 download_dir: PathBuf::from("D:\\Downloads"),
                 default_directory: None,
                 recent_directory: None,
@@ -1910,6 +2231,8 @@ account_quick_bar = true",
                 max_concurrent_tasks: 2,
                 max_retries: 3,
                 cdn_refresh: CdnRefreshConfig::default(),
+                advanced: AdvancedDownloadConfig::default(),
+                small_file_optimization: SmallFileOptimizationConfig::default(),
             };
             assert!(windows_config.validate_download_dir().is_ok());
         }
@@ -1917,6 +2240,7 @@ account_quick_bar = true",
         #[cfg(not(target_os = "windows"))]
         {
             let unix_config = DownloadConfig {
+                folder_exclude: FolderExcludeConfig::default(),
                 download_dir: PathBuf::from("/app/downloads"),
                 default_directory: None,
                 recent_directory: None,
@@ -1927,6 +2251,8 @@ account_quick_bar = true",
                 max_concurrent_tasks: 2,
                 max_retries: 3,
                 cdn_refresh: CdnRefreshConfig::default(),
+                advanced: AdvancedDownloadConfig::default(),
+                small_file_optimization: SmallFileOptimizationConfig::default(),
             };
             assert!(unix_config.validate_download_dir().is_ok());
         }
@@ -2035,6 +2361,7 @@ account_quick_bar = true",
     fn test_download_config_with_cdn_refresh() {
         // 测试 DownloadConfig 包含 cdn_refresh 的序列化/反序列化
         let download_config = DownloadConfig {
+            folder_exclude: FolderExcludeConfig::default(),
             download_dir: std::env::current_dir().unwrap().join("downloads"),
             default_directory: None,
             recent_directory: None,
@@ -2049,6 +2376,8 @@ account_quick_bar = true",
                 refresh_interval_minutes: 15,
                 ..Default::default()
             },
+            advanced: AdvancedDownloadConfig::default(),
+            small_file_optimization: SmallFileOptimizationConfig::default(),
         };
 
         // 验证 cdn_refresh 配置被正确包含

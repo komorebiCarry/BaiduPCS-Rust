@@ -55,6 +55,7 @@
 
 pub mod backup;
 pub mod folder;
+pub mod folder_files;
 pub mod history;
 pub mod history_db;
 pub mod manager;

@@ -302,6 +302,23 @@ pub enum FolderEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
+    /// 扫描进度（扫描阶段周期性推送）
+    ///
+    /// 扫描期此前**完全不发事件**：`scan_progress` 只写内存字段，而前端在 WS
+    /// 连接后会停掉轮询，于是整个扫描阶段页面静止不动，用户看到的就是「卡在
+    /// 扫描中」。该事件按时间节流（默认 500ms）推送，仅用于让前端「已发现 N
+    /// 个文件」持续增长，不保证精确。
+    ScanProgress {
+        folder_id: String,
+        /// 已发现的文件数（累计）
+        scanned_files: u64,
+        /// 已发现的字节数（累计）
+        scanned_size: u64,
+        /// 当前正在列表的目录，仅用于展示
+        current_dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_uid: Option<u64>,
+    },
     /// 扫描完成
     ScanCompleted {
         folder_id: String,
@@ -345,6 +362,7 @@ impl FolderEvent {
         match self {
             FolderEvent::Created { folder_id, .. } => folder_id,
             FolderEvent::Progress { folder_id, .. } => folder_id,
+            FolderEvent::ScanProgress { folder_id, .. } => folder_id,
             FolderEvent::StatusChanged { folder_id, .. } => folder_id,
             FolderEvent::ScanCompleted { folder_id, .. } => folder_id,
             FolderEvent::Completed { folder_id, .. } => folder_id,
@@ -359,6 +377,8 @@ impl FolderEvent {
     pub fn priority(&self) -> EventPriority {
         match self {
             FolderEvent::Progress { .. } => EventPriority::Low,
+            // 扫描期高频事件，与进度同级，允许被批量/节流通道带走
+            FolderEvent::ScanProgress { .. } => EventPriority::Low,
             FolderEvent::StatusChanged { .. } => EventPriority::Medium,
             FolderEvent::Created { .. }
             | FolderEvent::ScanCompleted { .. }
@@ -375,6 +395,7 @@ impl FolderEvent {
         match self {
             FolderEvent::Created { .. } => "created",
             FolderEvent::Progress { .. } => "progress",
+            FolderEvent::ScanProgress { .. } => "scan_progress",
             FolderEvent::StatusChanged { .. } => "status_changed",
             FolderEvent::ScanCompleted { .. } => "scan_completed",
             FolderEvent::Completed { .. } => "completed",
@@ -1376,6 +1397,30 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("progress"));
         assert!(json.contains("test-123"));
+    }
+
+    /// 扫描阶段此前没有任何事件，前端 WS 连上后又停掉轮询 → 页面在整个扫描期
+    /// 静止。这里锁住新事件的线缆格式，避免改字段时把前端读的 key 弄丢。
+    #[test]
+    fn test_folder_scan_progress_serialization() {
+        let event = FolderEvent::ScanProgress {
+            folder_id: "folder-1".to_string(),
+            scanned_files: 1234,
+            scanned_size: 5678,
+            current_dir: "/a/b".to_string(),
+            owner_uid: Some(42),
+        };
+
+        assert_eq!(event.folder_id(), "folder-1");
+        assert_eq!(event.event_type_name(), "scan_progress");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event_type\":\"scan_progress\""));
+        assert!(json.contains("\"scanned_files\":1234"));
+        assert!(json.contains("\"scanned_size\":5678"));
+        assert!(json.contains("\"current_dir\":\"/a/b\""));
+        // owner_uid 为 Some 时应出现在线缆上（多账号按 uid 过滤依赖它）
+        assert!(json.contains("\"owner_uid\":42"));
     }
 
     #[test]

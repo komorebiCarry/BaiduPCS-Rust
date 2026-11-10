@@ -184,6 +184,24 @@ export interface FolderEventScanCompleted {
   owner_uid?: number
 }
 
+/**
+ * 扫描进度（扫描阶段周期性推送，约 500ms 一帧）
+ *
+ * 扫描期后端此前不发任何事件，而 WS 连上后前端会停掉轮询，导致整个扫描阶段
+ * 页面静止。该事件只带累计的「已发现」计数，用于让数字持续跳动。
+ */
+export interface FolderEventScanProgress {
+  event_type: 'scan_progress'
+  folder_id: string
+  /** 已发现的文件数（累计） */
+  scanned_files: number
+  /** 已发现的字节数（累计） */
+  scanned_size: number
+  /** 当前正在列表的目录（展示用） */
+  current_dir: string
+  owner_uid?: number
+}
+
 export interface FolderEventCompleted {
   event_type: 'completed'
   folder_id: string
@@ -219,6 +237,7 @@ export interface FolderEventDeleted {
 export type FolderEvent =
     | FolderEventCreated
     | FolderEventProgress
+    | FolderEventScanProgress
     | FolderEventStatusChanged
     | FolderEventScanCompleted
     | FolderEventCompleted

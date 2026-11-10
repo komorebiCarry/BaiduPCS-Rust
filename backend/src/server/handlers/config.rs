@@ -198,6 +198,8 @@ pub async fn update_config(
 
     let mut new_config: AppConfig = serde_json::from_value(raw.clone())
         .map_err(|e| ApiError::BadRequest(format!("配置格式不合法: {}", e)))?;
+    new_config.download.folder_exclude.validate()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // 基本验证
     if new_config.download.max_global_threads == 0 {
@@ -262,6 +264,9 @@ pub async fn update_config(
         // 设置页会把 GET /config 拿到的整份配置原样提交回来，这里一律以服务端
         // 当前值为准，防止旧值或伪造值关闭认证（issue #177）
         new_config.web_auth = guard.web_auth.clone();
+        if raw.get("download").and_then(|v|v.get("folder_exclude")).is_none() {
+            new_config.download.folder_exclude = guard.download.folder_exclude.clone();
+        }
 
         preserve_missing_regex_presets(&raw, &mut new_config, &guard.share_sync);
         // 旧版前端提交的整份配置不含 notification 段：保留服务端当前值，避免被默认值覆盖

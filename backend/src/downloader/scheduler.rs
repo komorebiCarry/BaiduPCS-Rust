@@ -124,14 +124,26 @@ impl ChunkSlotPool {
 
     /// 获取一个空闲槽位，如果没有则返回备用ID
     fn acquire(&self) -> usize {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("ChunkSlotPool state lock poisoned, recovering...");
+                poisoned.into_inner()
+            }
+        };
         let max = state.max_slots;
         state.available.pop().unwrap_or(max + 1) // 没空闲槽位 → 备用 ID
     }
 
     /// 归还槽位
     fn release(&self, slot_id: usize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("ChunkSlotPool state lock poisoned during release, recovering...");
+                poisoned.into_inner()
+            }
+        };
         if slot_id <= state.max_slots && !state.available.contains(&slot_id) {
             state.available.push(slot_id);
         }
@@ -145,19 +157,32 @@ impl ChunkSlotPool {
     ///   高 ID 槽位会在 `release` 时被忽略（不重新入栈），自然消亡
     /// - 不变：直接返回
     fn resize(&self, new_max: usize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("ChunkSlotPool state lock poisoned during resize, recovering...");
+                poisoned.into_inner()
+            }
+        };
         let old_max = state.max_slots;
         if new_max == old_max {
             return;
         }
+
         if new_max > old_max {
-            // 扩容：新增 (old_max+1 ..= new_max)，从大到小压栈（与 new() 顺序一致）
-            for id in ((old_max + 1)..=new_max).rev() {
-                state.available.push(id);
+            // 扩容：添加新槽位（从大到小，pop 时得到小的）
+            for slot_id in (old_max + 1..=new_max).rev() {
+                state.available.push(slot_id);
             }
+            info!("ChunkSlotPool 扩容: {} -> {}", old_max, new_max);
         } else {
-            // 缩容：移除可用栈中所有 > new_max 的 ID
+            // 缩容：移除高于 new_max 的可用槽位
             state.available.retain(|&id| id <= new_max);
+            // 🔧 添加警告：正在使用中的高ID槽位会在 release 时被丢弃
+            warn!(
+                "ChunkSlotPool 缩容: {} -> {}，正在使用的高ID槽位({}-{})将在释放时被忽略",
+                old_max, new_max, new_max + 1, old_max
+            );
         }
         state.max_slots = new_max;
     }

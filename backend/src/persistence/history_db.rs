@@ -230,6 +230,7 @@ impl HistoryDbManager {
             "ALTER TABLE folder_history ADD COLUMN skipped_entries_json TEXT",
             [],
         );
+        let _ = conn.execute("ALTER TABLE folder_history ADD COLUMN sqlite_files INTEGER NOT NULL DEFAULT 0", []);
 
         info!("历史数据库表初始化完成");
         Ok(())
@@ -1152,6 +1153,18 @@ impl HistoryDbManager {
         Ok(result)
     }
 
+    /// Stream legacy history into the file ledger without materializing all paths.
+    pub fn reconcile_folder_files(&self, group_id:&str, store:&super::folder_files::FolderFileStore) -> Result<()> {
+        let conn=self.conn.lock().map_err(|e|anyhow!("获取数据库锁失败: {}",e))?;
+        let mut stmt=conn.prepare("SELECT relative_path,MAX(fs_id),MAX(file_size) FROM task_history WHERE group_id=?1 AND status='completed' AND relative_path IS NOT NULL AND relative_path!='' GROUP BY relative_path")?;
+        let rows=stmt.query_map([group_id],|r| Ok(CompletedGroupFile {
+            relative_path:r.get(0)?,
+            fs_id:r.get::<_,Option<i64>>(1)?.filter(|id|*id>0).map(|id|id as u64),
+            file_size:r.get::<_,Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+        }))?;
+        store.import_history(rows)
+    }
+
     /// 按 group_id 删除任务
     pub fn remove_tasks_by_group(&self, group_id: &str) -> Result<usize> {
         let conn = self
@@ -1252,14 +1265,14 @@ impl HistoryDbManager {
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
                 transfer_task_id, pending_files_json, owner_uid, backup_config_id,
-                skipped_count, skipped_size, skipped_entries_json
+                skipped_count, skipped_size, skipped_entries_json, sqlite_files
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12,
                 ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23
+                ?21, ?22, ?23, ?24
             )
             "#,
             params![
@@ -1287,6 +1300,7 @@ impl HistoryDbManager {
                 folder.skipped_count as i64,
                 folder.skipped_size as i64,
                 skipped_entries_json,
+                folder.sqlite_files,
             ],
         )?;
 
@@ -1317,14 +1331,14 @@ impl HistoryDbManager {
                     scan_completed, scan_progress,
                     created_at, started_at, completed_at, error,
                     transfer_task_id, pending_files_json, owner_uid, backup_config_id,
-                    skipped_count, skipped_size, skipped_entries_json
+                    skipped_count, skipped_size, skipped_entries_json, sqlite_files
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5,
                     ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12,
                     ?13, ?14, ?15, ?16,
                     ?17, ?18, ?19, ?20,
-                    ?21, ?22, ?23
+                    ?21, ?22, ?23, ?24
                 )
                 "#,
             )?;
@@ -1368,6 +1382,7 @@ impl HistoryDbManager {
                     folder.skipped_count as i64,
                     folder.skipped_size as i64,
                     skipped_entries_json,
+                    folder.sqlite_files,
                 ])?;
                 count += 1;
             }
@@ -1393,7 +1408,7 @@ impl HistoryDbManager {
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
                 transfer_task_id, pending_files_json, owner_uid, backup_config_id,
-                skipped_count, skipped_size, skipped_entries_json
+                skipped_count, skipped_size, skipped_entries_json, sqlite_files
             FROM folder_history
             ORDER BY completed_at DESC
             "#,
@@ -1401,6 +1416,7 @@ impl HistoryDbManager {
 
         let rows = stmt.query_map([], |row| {
             Ok(FolderHistoryRow {
+                sqlite_files: row.get(23)?,
                 folder_id: row.get(0)?,
                 name: row.get(1)?,
                 remote_root: row.get(2)?,
@@ -1689,6 +1705,7 @@ impl HistoryDbManager {
             .unwrap_or_default();
 
         Ok(FolderPersisted {
+            sqlite_files: row.sqlite_files,
             id: row.folder_id,
             name: row.name,
             remote_root: row.remote_root,
@@ -1771,6 +1788,7 @@ struct TaskHistoryRow {
 
 /// 文件夹历史行
 struct FolderHistoryRow {
+    sqlite_files: bool,
     folder_id: String,
     name: String,
     remote_root: String,
@@ -2061,6 +2079,7 @@ mod tests {
 
     fn sample_folder() -> FolderPersisted {
         FolderPersisted {
+            sqlite_files: false,
             id: "f-1".into(),
             name: "23真题和解析".into(),
             remote_root: "/13/23真题和解析".into(),

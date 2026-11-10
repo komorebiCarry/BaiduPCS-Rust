@@ -218,7 +218,17 @@ async fn download_summary(app_state: &AppState) -> TransferSummary {
 
     let mut units = Vec::new();
     // 文件夹子任务不单独计数，只把速度汇总到所属文件夹
-    let mut folder_speed: HashMap<String, u64> = HashMap::new();
+    //
+    // 主口径：`folder_speeds_snapshot`（文件夹累计字节的跨任务差分）。逐子任务求和
+    // 对海量小文件是失效的 —— 小文件几十毫秒就下完，各自 SpeedCalculator 达不到
+    // 1 秒预热门槛，速度恒为 0，聚合出来也是 0。
+    // 兜底：子任务速度求和，覆盖「文件夹刚启动、速度计还在预热」和大文件场景，
+    // 两者取较大值合并，不做相加（否则同一个字节会被算两遍）。
+    let mut folder_speed = app_state
+        .folder_download_manager
+        .folder_speeds_snapshot()
+        .await;
+    let mut folder_task_speed: HashMap<String, u64> = HashMap::new();
 
     for (_uid, dm) in app_state.list_download_managers() {
         dm.visit_tasks(|t| {
@@ -229,13 +239,18 @@ async fn download_summary(app_state: &AppState) -> TransferSummary {
             match &t.group_id {
                 Some(group_id) => {
                     if t.status == TaskStatus::Downloading && t.speed > 0 {
-                        *folder_speed.entry(group_id.clone()).or_default() += t.speed;
+                        *folder_task_speed.entry(group_id.clone()).or_default() += t.speed;
                     }
                 }
                 None => units.push(download_task_unit(t)),
             }
         })
         .await;
+    }
+
+    for (folder_id, task_speed) in folder_task_speed {
+        let slot = folder_speed.entry(folder_id).or_default();
+        *slot = (*slot).max(task_speed);
     }
 
     app_state
