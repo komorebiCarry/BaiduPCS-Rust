@@ -11,7 +11,7 @@
               content="订阅所属账号未登录，请先登录该账号再预览目录树"
               placement="top"
           >
-            <span>
+            <span class="browse-action">
               <el-button
                   size="small"
                   :icon="FolderOpened"
@@ -127,7 +127,7 @@
               content="订阅所属账号未登录，请先登录该账号再预览目录树"
               placement="top"
           >
-            <span>
+            <span class="browse-action">
               <el-button
                   size="small"
                   :icon="FolderOpened"
@@ -1197,4 +1197,92 @@ function confirmPicker() {
   user-select: none;
 }
 
+
+// ===== 手机端（与全局 mobile.scss 断点一致）=====
+// 头部统一：「使用说明」等文字按钮始终在标题行右端；「从分享浏览」独占下一行并撑满，
+// 各字段块位置一致。规则输入：类型下拉独占一行，输入框与「添加」同一行等高（32px）。
+@media (max-width: 767px) {
+  .field-header {
+    gap: 6px 8px;
+    min-height: 24px;
+  }
+
+  // 让操作按钮直接参与 .field-header 的弹性布局，便于分别安排位置
+  .path-actions {
+    display: contents;
+  }
+
+  .path-actions > .el-button {
+    margin-left: 0;
+  }
+
+  .path-actions > .el-button.is-text {
+    padding-left: 4px;
+    padding-right: 0;
+  }
+
+  // 第一个文字按钮推到行尾，多个文字按钮（测试规则 + 使用说明）依次靠右
+  .path-actions > .el-button.is-text:first-of-type {
+    margin-left: auto;
+  }
+
+  .browse-action {
+    order: 10;
+    flex: 0 0 100%;
+    display: flex;
+
+    :deep(.el-button) {
+      flex: 1 1 auto;
+      height: 32px;
+    }
+  }
+
+  .exclude-input-row {
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .rule-input-group {
+    display: contents;
+  }
+
+  .rule-kind-select {
+    flex: 0 0 100%;
+    width: 100%;
+  }
+
+  .rule-kind-select :deep(.el-select__wrapper) {
+    min-height: 32px;
+  }
+
+  .exclude-input {
+    flex: 1 1 0;
+  }
+
+  // 单行时 5 + 20 + 5 + 边框 = 32px，与下拉 / 按钮同高；autosize 按同一样式计算多行高度
+  .exclude-input :deep(.el-textarea__inner) {
+    padding-top: 5px;
+    padding-bottom: 5px;
+    line-height: 20px;
+    // autosize 以行内样式写入单行高度，这里保证单行时不矮于下拉与按钮
+    min-height: 32px !important;
+  }
+
+  .exclude-input-row > .el-button {
+    flex: 0 0 auto;
+    height: 32px;
+    min-height: 32px;
+  }
+
+  // 「存为常用 / 管理常用规则」文字按钮与内容区左缘对齐
+  .preset-row {
+    gap: 4px 16px;
+  }
+
+  .preset-row > .el-button.is-text {
+    margin-left: 0;
+    padding-left: 0;
+    padding-right: 0;
+  }
+}
 </style>

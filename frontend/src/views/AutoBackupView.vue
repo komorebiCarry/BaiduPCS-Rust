@@ -895,6 +895,15 @@ watch(hasActiveTask, () => {
   <div class="autobackup-container" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
+      <!-- 手机端：账号筛选独占一行 -->
+      <div v-if="isMobile && authStore.hasMultipleAccounts" class="toolbar-account-row">
+        <AccountFilter
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            block
+            class="account-filter-slot"
+        />
+      </div>
       <div class="header-left">
         <h2 v-if="!isMobile">自动备份</h2>
         <el-tag v-if="managerStatus" :type="managerStatus.active_task_count > 0 ? 'success' : 'info'" size="large">
@@ -902,7 +911,7 @@ watch(hasActiveTask, () => {
         </el-tag>
         <!-- 多账号过滤器 -->
         <AccountFilter
-            v-if="authStore.hasMultipleAccounts"
+            v-if="authStore.hasMultipleAccounts && !isMobile"
             v-model="ownerFilter"
             :counts="ownerFilterCounts"
             size="large"
@@ -921,10 +930,10 @@ watch(hasActiveTask, () => {
           </el-button>
         </template>
         <template v-else>
-          <el-button circle @click="loadData">
+          <el-button circle aria-label="刷新" title="刷新" @click="loadData">
             <el-icon><Refresh /></el-icon>
           </el-button>
-          <el-button circle type="primary" @click="handleOpenCreateDialog">
+          <el-button circle type="primary" aria-label="新建配置" title="新建配置" @click="handleOpenCreateDialog">
             <el-icon><Plus /></el-icon>
           </el-button>
         </template>
@@ -1370,6 +1379,7 @@ watch(hasActiveTask, () => {
 </template>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 .autobackup-container {
   width: 100%;
   height: 100%;
@@ -1840,17 +1850,10 @@ watch(hasActiveTask, () => {
 
 // 移动端适配
 .is-mobile {
-  .toolbar {
-    padding: 12px 16px;
-
-    .header-left {
-      gap: 12px;
-    }
-  }
-
+  // 左右内边距与工具栏一致（mt.$mobile-inset）
   .stats-grid {
     grid-template-columns: repeat(2, 1fr);
-    padding: 12px 16px;
+    padding: 12px mt.$mobile-inset;
     gap: 12px;
 
     .stat-card {
@@ -1863,7 +1866,7 @@ watch(hasActiveTask, () => {
   }
 
   .config-container {
-    padding: 0 16px 16px;
+    padding: 0 mt.$mobile-inset 16px;
   }
 
   .config-header {
@@ -1929,5 +1932,10 @@ watch(hasActiveTask, () => {
   color: #909399;
   margin-top: 4px;
   line-height: 1.5;
+}
+
+// 手机端工具栏：统一规则见 styles/_mobile-toolbar.scss（放在最后以覆盖上方桌面样式）
+.autobackup-container.is-mobile {
+  @include mt.mobile-toolbar;
 }
 </style>

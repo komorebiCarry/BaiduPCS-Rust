@@ -2,6 +2,15 @@
   <div class="downloads-container" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
+      <!-- 手机端：账号筛选独占一行 -->
+      <div v-if="isMobile && authStore.hasMultipleAccounts" class="toolbar-account-row">
+        <AccountFilter
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            block
+            class="account-filter-slot"
+        />
+      </div>
       <div class="header-left">
         <h2 v-if="!isMobile">下载管理</h2>
         <el-tag :type="activeCountType" size="large">
@@ -9,7 +18,7 @@
         </el-tag>
         <!-- 多账号过滤器 -->
         <AccountFilter
-            v-if="authStore.hasMultipleAccounts"
+            v-if="authStore.hasMultipleAccounts && !isMobile"
             v-model="ownerFilter"
             :counts="ownerFilterCounts"
             size="large"
@@ -17,8 +26,35 @@
         />
       </div>
       <div class="header-right">
+        <!-- 手机端：排序收进一个下拉（字段 + 升降序），避免挤出屏幕 -->
+        <el-dropdown v-if="isMobile" trigger="click" @command="handleSortCommand">
+          <el-button circle :aria-label="sortAriaLabel" :title="sortAriaLabel">
+            <el-icon><SortUp v-if="sortOrder === 'asc'"/><SortDown v-else/></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item
+                  v-for="opt in sortOptions"
+                  :key="opt.value"
+                  :command="`field:${opt.value}`"
+                  :class="{ 'is-active': sortField === opt.value }"
+              >
+                <el-icon><Check v-if="sortField === opt.value"/></el-icon>
+                {{ opt.label }}
+              </el-dropdown-item>
+              <el-dropdown-item command="order:asc" divided :class="{ 'is-active': sortOrder === 'asc' }">
+                <el-icon><SortUp/></el-icon>
+                升序
+              </el-dropdown-item>
+              <el-dropdown-item command="order:desc" :class="{ 'is-active': sortOrder === 'desc' }">
+                <el-icon><SortDown/></el-icon>
+                降序
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <!-- 排序控件 -->
-        <div class="sort-control">
+        <div v-else class="sort-control">
           <el-select
               v-model="sortField"
               size="default"
@@ -40,12 +76,15 @@
             <span v-if="!isMobile">{{ sortOrder === 'asc' ? '升序' : '降序' }}</span>
           </el-button>
         </div>
-        <el-button @click="refreshTasks" :circle="isMobile">
+        <el-button @click="refreshTasks" :circle="isMobile" aria-label="刷新" :title="isMobile ? '刷新' : undefined">
           <el-icon><Refresh/></el-icon>
           <span v-if="!isMobile">刷新</span>
         </el-button>
         <el-dropdown @command="handleBatchCommand" trigger="click">
-          <el-button>
+          <el-button v-if="isMobile" circle aria-label="批量操作" title="批量操作">
+            <el-icon><MoreFilled/></el-icon>
+          </el-button>
+          <el-button v-else>
             批量操作
             <el-icon class="el-icon--right"><ArrowDown/></el-icon>
           </el-button>
@@ -75,16 +114,18 @@
 
     <!-- 状态筛选栏 -->
     <div class="status-filter-bar">
-      <el-radio-group v-model="statusFilter" size="default">
-        <el-radio-button
-            v-for="opt in statusFilterOptions"
-            :key="opt.value"
-            :value="opt.value"
-        >
-          {{ opt.label }}
-          <span class="status-count">{{ statusFilterCounts[opt.value] }}</span>
-        </el-radio-button>
-      </el-radio-group>
+      <div class="status-filter-scroll">
+        <el-radio-group v-model="statusFilter" size="default">
+          <el-radio-button
+              v-for="opt in statusFilterOptions"
+              :key="opt.value"
+              :value="opt.value"
+          >
+            {{ opt.label }}
+            <span class="status-count">{{ statusFilterCounts[opt.value] }}</span>
+          </el-radio-button>
+        </el-radio-group>
+      </div>
     </div>
 
     <!-- 下载任务列表 -->
@@ -491,6 +532,8 @@ import {
   ArrowDown,
   SortUp,
   SortDown,
+  Check,
+  MoreFilled,
 } from '@element-plus/icons-vue'
 import {useRouter, useRoute} from 'vue-router'
 import {getOpenFolderCapability, openLocalFolder} from '@/api/system'
@@ -526,6 +569,19 @@ const sortOptions: { label: string; value: SortField }[] = [
 function toggleSortOrder() {
   sortOrder.value = sortOrder.value === 'asc' ? 'desc' : 'asc'
 }
+// 手机端排序下拉：`field:<字段>` 切换排序字段，`order:<asc|desc>` 切换方向
+function handleSortCommand(command: string) {
+  const [kind, value] = command.split(':')
+  if (kind === 'field' && sortOptions.some(o => o.value === value)) {
+    sortField.value = value as SortField
+  } else if (kind === 'order' && (value === 'asc' || value === 'desc')) {
+    sortOrder.value = value
+  }
+}
+const sortAriaLabel = computed(() => {
+  const label = sortOptions.find(o => o.value === sortField.value)?.label ?? ''
+  return `排序：${label}，${sortOrder.value === 'asc' ? '升序' : '降序'}`
+})
 
 // 状态筛选控件
 type StatusFilter = 'all' | 'active' | 'waiting' | 'completed' | 'failed'
@@ -1928,6 +1984,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 
 .skipped-hint {
   margin-left: 4px;
@@ -1978,11 +2035,6 @@ onUnmounted(() => {
   }
 }
 
-// 移动端：排序下拉收窄
-.downloads-container.is-mobile .toolbar .sort-control .sort-select {
-  width: 92px;
-}
-
 .status-filter-bar {
   background: white;
   border-bottom: 1px solid #e0e0e0;
@@ -2000,10 +2052,6 @@ onUnmounted(() => {
     background: rgba(0, 0, 0, 0.06);
     color: inherit;
   }
-}
-
-.downloads-container.is-mobile .status-filter-bar {
-  padding: 8px 12px;
 }
 
 .task-container {
@@ -2263,14 +2311,6 @@ onUnmounted(() => {
 // 移动端样式
 // =====================
 .is-mobile {
-  .toolbar {
-    padding: 12px 16px;
-
-    .header-left {
-      gap: 12px;
-    }
-  }
-
   .task-container {
     padding: 12px;
   }
@@ -2321,5 +2361,11 @@ onUnmounted(() => {
   .folder-detail .folder-stats {
     grid-template-columns: repeat(2, 1fr);
   }
+}
+
+// 手机端工具栏 / 状态筛选：统一规则见 styles/_mobile-toolbar.scss（放在最后以覆盖上方桌面样式）
+.downloads-container.is-mobile {
+  @include mt.mobile-toolbar;
+  @include mt.mobile-status-filter;
 }
 </style>

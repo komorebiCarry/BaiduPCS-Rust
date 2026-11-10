@@ -1,0 +1,119 @@
+// =====================================================================
+// 手机端页面顶部工具栏（下载 / 上传 / 转存 / 自动备份 / 分享同步 / 离线下载 / 我的分享）
+//
+// 统一规则：
+//   - 左右内边距 = 列表内容区内边距（$inset），工具栏、状态筛选栏、列表三者左右边界对齐；
+//   - 账号筛选（.toolbar-account-row）独占第一行：按钮组均分整行，放不下时横向滚动，不折行；
+//   - 第二行：左侧状态/计数，右侧操作按钮，同一行垂直居中，按钮统一 32px、间距 $gap；
+//   - 操作按钮不收缩、不换行，左侧计数在极窄屏可省略显示。
+//
+// 在各视图 `<style scoped lang="scss">` 中 `@use` 后于 `.xxx-container.is-mobile` 内 include，
+// 生成的仍是带 scope 的选择器。
+// =====================================================================
+$mobile-inset: 12px;
+$mobile-toolbar-gap: 8px;
+
+// $inset / $padding-y：工具栏自身内边距。离线下载、我的分享的工具栏位于已有内边距的容器内，
+// 传 0 由容器提供左右边界；$margin-bottom 为工具栏与下方列表的间距。
+@mixin mobile-toolbar($inset: $mobile-inset, $gap: $mobile-toolbar-gap, $padding-y: 10px, $margin-bottom: 0) {
+  .toolbar,
+  .page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px $gap;
+    padding: $padding-y $inset;
+    margin-bottom: $margin-bottom;
+    box-sizing: border-box;
+  }
+
+  .toolbar-account-row {
+    flex: 0 0 100%;
+    min-width: 0;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: $gap;
+    width: auto;
+    justify-content: flex-start;
+
+    > .el-tag {
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 100%;
+
+      :deep(.el-tag__content) {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    }
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    gap: $gap;
+    width: auto;
+    margin-left: auto;
+    justify-content: flex-end;
+
+    // 由 gap 统一控制间距，去掉 Element Plus 相邻按钮自带的 12px 左外边距
+    :deep(.el-button + .el-button) {
+      margin-left: 0;
+    }
+  }
+}
+
+// 状态筛选（单选按钮组）：一行展示，首尾与内容边界对齐；放不下时在内层容器中横向滚动。
+@mixin mobile-status-filter($inset: $mobile-inset) {
+  .status-filter-bar {
+    padding: 8px $inset;
+    overflow: hidden;
+    white-space: normal;
+  }
+
+  .status-filter-scroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+
+    &::-webkit-scrollbar {
+      display: none;
+    }
+
+    :deep(.el-radio-group) {
+      display: flex;
+      flex-wrap: nowrap;
+      width: max-content;
+      min-width: 100%;
+    }
+
+    :deep(.el-radio-button) {
+      flex: 1 0 auto;
+    }
+
+    :deep(.el-radio-button__inner) {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      height: 32px;
+      padding: 0 6px;
+      font-size: 13px;
+    }
+
+    :deep(.status-count) {
+      margin-left: 3px;
+      padding: 0 4px;
+    }
+  }
+}

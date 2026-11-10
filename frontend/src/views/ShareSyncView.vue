@@ -2,10 +2,20 @@
   <div class="share-sync-view" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏（与其他页面一致） -->
     <div class="toolbar">
+      <!-- 手机端：账号筛选独占一行 -->
+      <div v-if="isMobile && authStore.hasMultipleAccounts" class="toolbar-account-row">
+        <AccountFilter
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            :total-count="subscriptions.length"
+            block
+            class="account-filter-slot"
+        />
+      </div>
       <div class="header-left">
         <h2 v-if="!isMobile">分享同步</h2>
         <AccountFilter
-            v-if="authStore.hasMultipleAccounts"
+            v-if="authStore.hasMultipleAccounts && !isMobile"
             v-model="ownerFilter"
             :counts="ownerFilterCounts"
             :total-count="subscriptions.length"
@@ -268,10 +278,16 @@
             运行历史<span v-if="runs.length > 0">（{{ runs.length }}）</span>
           </el-button>
         </div>
-        <el-descriptions :column="1" border>
+        <!-- 手机端改为上下排列：标签独占一行横排，内容占满宽度，避免标签被挤成一列竖字 -->
+        <el-descriptions
+            :column="1"
+            border
+            :direction="isMobile ? 'vertical' : 'horizontal'"
+            class="subscription-detail"
+        >
           <el-descriptions-item label="名称">{{ selected.name }}</el-descriptions-item>
           <el-descriptions-item label="分享链接">
-            <el-link type="primary" :href="selected.share_url" target="_blank" :underline="false">
+            <el-link class="detail-share-link" type="primary" :href="selected.share_url" target="_blank" :underline="false">
               {{ selected.share_url }}
             </el-link>
           </el-descriptions-item>
@@ -282,10 +298,10 @@
           </el-descriptions-item>
           <el-descriptions-item label="目标">
             <div v-for="(t, i) in selected.targets" :key="i" class="target-line">
-              <el-tag :type="t.kind === 'netdisk' ? 'success' : 'warning'" size="small">
-                {{ t.kind === 'netdisk' ? '网盘' : '本地' }}
+              <el-tag :type="t.kind === 'netdisk' ? 'success' : 'warning'" size="small" class="target-kind-tag">
+                {{ describeSyncTarget(t, selected.targets, selected.owner_uid) }}
               </el-tag>
-              <span style="margin-left: 6px">
+              <span class="target-path-text">
                 {{ t.kind === 'netdisk' ? t.remote_path : t.local_path }}
               </span>
             </div>
@@ -413,7 +429,7 @@
           />
         </el-form-item>
         <el-form-item label="冲突策略">
-          <el-radio-group v-model="form.conflict_strategy">
+          <el-radio-group v-model="form.conflict_strategy" class="conflict-mode-group">
             <el-radio-button value="overwrite">覆盖式</el-radio-button>
             <el-radio-button value="versioned">新版本式</el-radio-button>
             <el-radio-button value="skip">跳过</el-radio-button>
@@ -548,7 +564,7 @@
         </el-form-item>
         <el-form-item v-if="form.poll_config.mode === 'interval'" label="间隔（秒）">
           <el-input-number v-model="form.poll_config.interval_secs" :min="600" :max="86400" :step="300" />
-          <span style="margin-left: 8px; color: #909399; font-size: 12px">最少 600 秒（10 分钟）</span>
+          <span class="form-inline-tip">最少 600 秒（10 分钟）</span>
         </el-form-item>
         <el-form-item v-if="form.poll_config.mode === 'scheduled'" label="时刻">
           <el-time-picker
@@ -563,7 +579,7 @@
         </el-form-item>
         <el-form-item label="删除缺失">
           <el-switch v-model="form.delete_missing" />
-          <span style="margin-left: 8px; color: #909399; font-size: 12px">分享者删除文件时同步删除目标副本</span>
+          <span class="form-inline-tip">分享者删除文件时同步删除目标副本</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -2141,20 +2157,29 @@ function describeInterval(p: PollConfig): string {
   return '已禁用'
 }
 
-function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
-  // 只标注落在其他账号上的目标（缺省 / 0 / 等于所属账号都是所属账号）；
-  // 显示目标账号昵称（找不到时回退 UID），如「网盘→账号B」
+/**
+ * 单个同步目标的简短标签。
+ *
+ * 落在其他账号上的目标标注账号昵称（找不到时回退 UID），如「网盘→账号B」；
+ * 缺省 / 0 / 等于所属账号都算所属账号。同一订阅有多个网盘目标时，所属账号自己的网盘
+ * 目标也写明「网盘→所属账号」，否则多个目标都只显示「网盘」无法区分。
+ */
+function describeSyncTarget(t: SyncTarget, targets: SyncTarget[], ownerUid?: number | null): string {
   const other = (uid: number | null | undefined) =>
     typeof uid === 'number' && uid > 0 && uid !== ownerUid ? uid : null
-  return targets.map(t => {
-    if (t.kind === 'netdisk') {
-      const uid = other(t.account_uid)
-      return uid !== null ? `网盘→${ownerName(uid)}` : '网盘'
-    }
-    if (t.use_default_download_account) return '本地(默认下载账号)'
-    const uid = other(t.download_uid)
-    return uid !== null ? `本地→${ownerName(uid)}` : '本地'
-  }).join(' + ')
+  if (t.kind === 'netdisk') {
+    const uid = other(t.account_uid)
+    if (uid !== null) return `网盘→${ownerName(uid)}`
+    const netdiskCount = targets.filter(x => x.kind === 'netdisk').length
+    return netdiskCount > 1 && typeof ownerUid === 'number' ? `网盘→${ownerName(ownerUid)}` : '网盘'
+  }
+  if (t.use_default_download_account) return '本地(默认下载账号)'
+  const uid = other(t.download_uid)
+  return uid !== null ? `本地→${ownerName(uid)}` : '本地'
+}
+
+function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
+  return targets.map(t => describeSyncTarget(t, targets, ownerUid)).join(' + ')
 }
 
 function describeStrategy(s: ConflictStrategy): string {
@@ -2615,6 +2640,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 .share-sync-view {
   width: 100%;
   height: 100%;
@@ -2902,11 +2928,68 @@ onUnmounted(() => {
   margin-bottom: 8px;
 }
 
-.target-line { margin: 4px 0; }
+.target-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 4px 0;
+}
+.target-kind-tag {
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+.target-path-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 24px;
+  word-break: break-all;
+}
+// 订阅详情：长链接 / 长路径在任意宽度下断行，不撑破弹窗
+.subscription-detail {
+  :deep(.el-descriptions__content) {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+  }
+  :deep(.el-descriptions__label) {
+    white-space: nowrap;
+  }
+  .detail-share-link {
+    display: inline;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    :deep(.el-link__inner) {
+      display: inline;
+      word-break: break-all;
+    }
+  }
+}
 .target-form-row { display: flex; align-items: center; margin-bottom: 8px; }
 .target-tip { margin-left: 8px; font-size: 12px; color: #909399; }
+// 表单项内跟在控件后的灰色说明；手机端独占一行并与控件左对齐（折行时不再缩进 8px）
+.form-inline-tip { margin-left: 8px; color: #909399; font-size: 12px; }
+@media (max-width: 767px) {
+  .form-inline-tip {
+    display: block;
+    flex: 0 0 100%;
+    margin-left: 0;
+    line-height: 1.5;
+    margin-top: 4px;
+  }
+}
 
 // 订阅编辑弹窗：头部与底部固定，只有表单主体滚动；四周至少保留 16px 视口边距。
+// 手机端：覆盖全局 mobile.scss 的 `margin: 5vh auto`，保持垂直居中，避免 5vh + (100dvh - 32px) 超出视口；
+// 页脚加分隔线，主体滚动时内容在分隔线处截断，不会被按钮区“压住”。
+@media (max-width: 767px) {
+  :deep(.subscription-dialog) {
+    margin: auto !important;
+
+    .el-dialog__footer {
+      border-top: 1px solid var(--el-border-color-lighter);
+    }
+  }
+}
+
 :deep(.subscription-dialog) {
   display: flex;
   flex-direction: column;
@@ -2974,6 +3057,67 @@ onUnmounted(() => {
   .target-account-select { width: 220px; }
 }
 
+// 手机端：账号选择不再固定 220px + 48px 缩进（窄屏会撑出弹窗），改为占满可用宽度；
+// 目录输入框独占一行，各目标行统一上下排列
+@media (max-width: 767px) {
+  .sync-mode-editor {
+    .target-account-row {
+      padding-left: 0;
+    }
+
+    .target-account-select {
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+    }
+
+    .extra-netdisk-row .target-switch {
+      flex: 1 1 100%;
+      min-width: 0;
+    }
+
+    .target-path {
+      flex: 1 1 100%;
+    }
+
+    // 表单内容区继承 32px 行高，多行提示会显得很松散
+    .sync-mode-hint {
+      line-height: 1.5;
+    }
+  }
+
+  // 冲突策略（3 项）/ 轮询方式（4 项）：窄屏折行时分段按钮左边框缺失、首尾错位，
+  // 改为等宽网格，每个选项完整边框，整齐对齐内容区左右边界
+  .conflict-mode-group,
+  .poll-mode-group {
+    display: grid;
+    gap: 6px;
+    width: 100%;
+
+    :deep(.el-radio-button__inner) {
+      width: 100%;
+      padding-left: 6px;
+      padding-right: 6px;
+      border-left: var(--el-border);
+      border-radius: var(--el-border-radius-base);
+      box-shadow: none;
+    }
+
+    // 选中态去掉 Element Plus 用来拼接相邻按钮的左侧 1px 阴影（网格有间距，会多出一条线）
+    :deep(.el-radio-button.is-active .el-radio-button__original-radio:not(:disabled) + .el-radio-button__inner) {
+      box-shadow: none;
+    }
+  }
+
+  .conflict-mode-group {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .poll-mode-group {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .run-item { cursor: pointer; &:hover { color: #409eff; } }
 .run-stats { font-size: 12px; color: #909399; margin-top: 2px; }
 
@@ -3027,4 +3171,14 @@ onUnmounted(() => {
 .tree-node { display: inline-flex; align-items: center; gap: 4px; }
 .tree-size { margin-left: 6px; color: #909399; font-size: 11px; }
 .poll-mode-group { flex-wrap: wrap; }
+
+// 手机端工具栏：统一规则见 styles/_mobile-toolbar.scss（放在最后以覆盖上方桌面样式）
+.share-sync-view.is-mobile {
+  @include mt.mobile-toolbar;
+
+  .ss-content {
+    padding-left: mt.$mobile-inset;
+    padding-right: mt.$mobile-inset;
+  }
+}
 </style>

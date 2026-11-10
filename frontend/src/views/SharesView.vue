@@ -48,7 +48,7 @@
         </template>
         <!-- 移动端按钮 -->
         <template v-else>
-          <el-button circle @click="refreshList" :loading="loading">
+          <el-button circle aria-label="刷新" title="刷新" @click="refreshList" :loading="loading">
             <el-icon><Refresh /></el-icon>
           </el-button>
           <el-dropdown
@@ -57,7 +57,7 @@
               trigger="click"
               @command="handleBatchExpire"
           >
-            <el-button circle :loading="batchExpireUpdating" aria-label="批量修改有效期">
+            <el-button circle :loading="batchExpireUpdating" aria-label="批量修改有效期" title="批量修改有效期">
               <el-icon><Timer /></el-icon>
             </el-button>
             <template #dropdown>
@@ -76,6 +76,8 @@
               v-if="selectedIds.length > 0"
               circle
               type="danger"
+              aria-label="批量取消分享"
+              title="批量取消分享"
               @click="handleBatchCancel"
           >
             <el-icon><Delete /></el-icon>
@@ -843,6 +845,7 @@ onBeforeUnmount(() => {
 
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 /* =====================
    容器样式
    ===================== */
@@ -1010,30 +1013,38 @@ onBeforeUnmount(() => {
   }
 }
 
+/* 四个操作等宽网格、统一 8px 间距，不再叠加 Element Plus 相邻按钮的 12px 外边距，
+   窄屏（< 360px）改两列，按钮始终不超出卡片 */
 .card-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--el-border-color-lighter);
 
   .el-button {
-    flex: 1;
+    width: 100%;
+    min-width: 0;
     min-height: 44px; /* 触摸友好的最小高度 */
+    margin-left: 0;
+    padding-left: 6px;
+    padding-right: 6px;
   }
 
-  /* 下拉包裹的按钮与相邻按钮保持和原来一致的间距（gap + Element Plus 的 12px） */
   .row-expire-dropdown {
-    flex: 1;
-    margin-left: 12px;
+    display: flex;
+    min-width: 0;
 
     .el-button {
       width: 100%;
     }
   }
+}
 
-  .row-expire-dropdown + .el-button {
-    margin-left: 12px;
+@media (max-width: 359px) {
+  .card-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -1135,24 +1146,10 @@ onBeforeUnmount(() => {
 /* =====================
    移动端响应式
    ===================== */
-@media (max-width: 768px) {
-  .page-header {
-    flex-direction: row;
-    align-items: center;
-    flex-wrap: nowrap;
-    gap: 8px;
-  }
-
-  .header-left {
-    flex: 1 1 auto;
-    min-width: 0;
-    justify-content: flex-start;
-  }
-
-  .header-right {
-    flex: 0 0 auto;
-    justify-content: flex-end;
-  }
+// 手机端工具栏：与下载 / 转存等页同一套规则（styles/_mobile-toolbar.scss）；
+// 页面容器已有 12px 内边距，工具栏自身不再加内边距
+.shares-container.is-mobile {
+  @include mt.mobile-toolbar($inset: 0, $padding-y: 0, $margin-bottom: 12px);
 }
 
 /* =====================
