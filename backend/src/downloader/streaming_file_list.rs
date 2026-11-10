@@ -39,7 +39,7 @@ pub struct StreamingFileList {
 
 impl StreamingFileList {
     /// 创建流式文件列表
-    pub fn new(
+    pub async fn new(
         folder_id: String,
         db: Arc<Mutex<Connection>>,
         config: StreamingFileListConfig,
@@ -50,13 +50,13 @@ impl StreamingFileList {
             folder_id,
         };
 
-        list.init_table_sync()?;
+        list.init_table().await?;
         Ok(list)
     }
 
     /// 初始化表
-    fn init_table_sync(&self) -> Result<()> {
-        let db = self.db.blocking_lock();
+    async fn init_table(&self) -> Result<()> {
+        let db = self.db.lock().await;
 
         db.execute(
             &format!(
@@ -272,6 +272,7 @@ mod tests {
             db,
             StreamingFileListConfig::default(),
         )
+        .await
         .unwrap();
 
         let mut cursor = list.cursor().await.unwrap();

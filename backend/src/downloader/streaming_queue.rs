@@ -204,11 +204,14 @@ impl StreamingTaskQueue {
                 completed_at INTEGER,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT,
-                owner_uid INTEGER NOT NULL,
-                INDEX idx_folder_status (folder_id, status),
-                INDEX idx_status_priority (status, priority DESC, id ASC)
+                owner_uid INTEGER NOT NULL
             )",
             [],
+        )?;
+
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_folder_status ON streaming_task_queue (folder_id, status);
+             CREATE INDEX IF NOT EXISTS idx_status_priority ON streaming_task_queue (status, priority DESC, id ASC);",
         )?;
 
         info!(

@@ -225,7 +225,7 @@ mod tests {
     fn test_calculate_files_hash() {
         let files = vec!["file1.txt", "file2.txt"];
         let hash = calculate_files_hash(&files);
-        assert_eq!(hash.len(), 32); // MD5 长度
+        assert_eq!(hash.len(), 64); // SHA-256 十六进制长度
     }
 
     #[test]
