@@ -2,7 +2,7 @@
 
 use crate::auth::types::Uid;
 use crate::autobackup::record::BackupRecordManager;
-use crate::downloader::{DownloadManager, DownloadTask, TaskStatus};
+use crate::downloader::{DownloadManager, DownloadTask, SpeedCalculator, TaskStatus};
 use crate::netdisk::{ClientPool, NetdiskClient};
 use crate::server::events::{DownloadEvent, FolderEvent, TaskEvent};
 use crate::server::websocket::WebSocketManager;
@@ -19,6 +19,22 @@ use crate::persistence::{
     delete_folder as delete_folder_persistence, load_all_folders, remove_folder_from_history,
     remove_tasks_by_group_from_history, save_folder, FolderPersisted, PersistenceManager,
 };
+
+/// 文件夹下载的「在途任务数」目标（活跃 + 排队）
+///
+/// 这**不只是批量大小**，而是总量上限：每完成一个子任务就补一个，使在途量恒定。
+///
+/// 原值 10 的问题：槽位一空出来，必须现场「从 pending 取文件 → 创建任务 → 分配槽位
+/// → 拉起」，这中间没有别的任务可以顶上去。实测排队等待中位 380ms，占单任务端到端
+/// 墙钟（858ms）的 44% —— 而下载本身只要 149ms。
+///
+/// 提高到 30 让队列里始终有富余任务：槽位释放时立刻能接管，不必等创建开销。
+/// 代价是同时在途的任务对象/WAL 变多（约 3 倍），对两万文件的文件夹仍可接受；
+/// 内存敏感场景可以调回 10，行为完全兼容。
+const FOLDER_INFLIGHT_TARGET: usize = 30;
+
+// 每个扫描 worker 最多额外持有一页；达到此水位后先等待下载消费。
+const FOLDER_SCAN_PENDING_HIGH_WATER: usize = 4096;
 
 /// 文件夹下载任务的槽位优先级。
 ///
@@ -41,6 +57,53 @@ fn folder_slot_priority(backup_config_id: Option<&str>) -> crate::task_slot_pool
     }
 }
 
+/// 扫描阶段"同时进行的列目录请求数"上限。
+///
+/// 默认 4。列表接口比下载接口轻得多，但同样计入百度侧的风控观测
+/// （errno=132/9019），所以不做成"越大越好"，也不必跟着下载线程数走。
+///
+/// 可用环境变量 `BAIDUPCS_SCAN_CONCURRENCY` 覆盖，设为 `1` 即退回串行行为：
+/// 出问题时不改代码、重启进程就能回滚。
+fn scan_list_concurrency() -> usize {
+    std::env::var("BAIDUPCS_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+}
+
+/// 有界并发目录工作队列：父目录完成后将其子目录入队，不等待无关兄弟目录。
+/// 取消时停止扫描；任一目录失败立即返回错误并丢弃未完成请求。
+async fn bfs_scan_dirs<F, Fut>(
+    roots: Vec<String>,
+    concurrency: usize,
+    cancel_token: &CancellationToken,
+    list_dir: F,
+) -> Result<Vec<String>>
+where
+    F: Fn(String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<Vec<String>>> + Send,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let concurrency = concurrency.max(1);
+    let mut pending: std::collections::VecDeque<String> = roots.into();
+    let mut running = FuturesUnordered::new();
+    let mut visited = Vec::new();
+    loop {
+        if cancel_token.is_cancelled() { break; }
+        while running.len() < concurrency {
+            let Some(dir) = pending.pop_front() else { break; };
+            visited.push(dir.clone());
+            running.push(list_dir(dir));
+        }
+        let Some(result) = (tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            result = running.next() => result,
+        }) else { break; };
+        pending.extend(result?);
+    }
+    Ok(visited)
+}
 /// 文件夹下载管理器
 #[derive(Debug)]
 pub struct FolderDownloadManager {
@@ -95,6 +158,27 @@ pub struct FolderDownloadManager {
     /// 仅用于在文件夹自身未携带冲突策略时回退到用户设置的全局默认值，
     /// 见 `resolve_conflict_strategy`。存引用而非快照，保证设置页改动即时生效。
     app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
+    /// 🔥 文件夹级速度计（跨子任务连续测量）
+    ///
+    /// 速度的本质是「字节流的导数」，而不是「单个任务内字节的导数」。每个子任务都
+    /// 有自己的 `SpeedCalculator`，但它要求至少 1 秒的测量跨度（见
+    /// `progress::MIN_MEASUREMENT_DURATION`）；海量小文件下载时子任务往往几十毫秒
+    /// 就结束，于是逐任务速度恒为 0，聚合出来自然也是 0 —— 界面表现为「有进度、
+    /// 但速度一直显示 0 B/s」。
+    ///
+    /// 这里按 `FolderDownload::downloaded_size`（单调累计值）做差分，测量跨度不随
+    /// 子任务生命周期重置，小文件流式下载时也能得到真实吞吐。
+    folder_speeds: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<SpeedCalculator>>>>,
+    /// 扫描进度事件的节流时间戳（folder_id -> 上次推送时刻）
+    ///
+    /// 扫描是「每页 100 条、几百个目录」的高频循环，逐页推送会把 WS 打爆；
+    /// 但完全不推又会让前端在整个扫描阶段静止（旧行为）。折中为每文件夹
+    /// 至少 [`SCAN_PROGRESS_EMIT_INTERVAL`] 推一帧。
+    scan_emit_at: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// 同一文件夹的扫描派发、定时补任务和完成通知共用互斥锁。
+    dispatch_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 🔥 小文件优化适配器（延迟初始化）
+    small_file_adapter: Arc<RwLock<Option<Arc<crate::downloader::SmallFileOptimizationAdapter>>>>,
 }
 
 /// 🔥 文件夹快照节流落盘的最小间隔
@@ -126,6 +210,12 @@ struct PersistThrottle {
 ///
 /// 现在改为自动把失败子任务重新排到等待队列尾部重试，耗尽次数才计入 `failed_count`。
 const MAX_SUBTASK_AUTO_RETRIES: u32 = 3;
+
+/// 扫描进度事件的推送间隔
+///
+/// 太小会把 WS 打爆（扫描每页 100 条、上千页），太大又显得页面卡顿。
+/// 500ms 约等于「每秒 2 帧」，够看出数字在涨，又不会淹没进度事件通道。
+const SCAN_PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// 🔥 一批补任务的结果，用于 `refill_tasks` 判断是否需要继续补下一批
 #[derive(Debug, Default, Clone, Copy)]
@@ -208,6 +298,9 @@ fn clear_failed_for_success(
     task_id: &str,
     fs_id: u64,
 ) -> bool {
+    if let Some(store)=&folder.file_store {
+        return store.clear_failure(fs_id,task_id).unwrap_or(false);
+    }
     let by_task = folder.failed_task_ids.remove(task_id);
     let by_fs = fs_id != 0 && folder.failed_fs_ids.remove(&fs_id);
     by_task || by_fs
@@ -251,13 +344,12 @@ async fn persist_folder_state(
             .insert(folder_id.to_string(), std::time::Instant::now());
     }
 
-    let folder = {
+    let persisted = {
         let guard = folders.read().await;
-        guard.get(folder_id).cloned()
+        guard.get(folder_id).map(FolderPersisted::from_folder)
     };
 
-    if let Some(folder) = folder {
-        let persisted = FolderPersisted::from_folder(&folder);
+    if let Some(persisted) = persisted {
         if let Err(e) = save_folder(&wal_dir, &persisted) {
             error!("持久化文件夹 {} 失败: {}", folder_id, e);
             // 没写成就还欠着，下一轮补写再试
@@ -271,6 +363,17 @@ async fn persist_folder_state(
 }
 
 impl FolderDownloadManager {
+    fn attach_file_store(folder: &mut FolderDownload, wal: &std::path::Path, required: bool) -> Result<()> {
+        let store = Arc::new(crate::persistence::folder_files::FolderFileStore::open(wal, &folder.id, required)?);
+        store.migrate(&folder.pending_files, &folder.counted_fs_ids, &folder.skipped_entries, (folder.completed_count,folder.completed_downloaded_size,folder.skipped_count,folder.skipped_size))?;
+        folder.pending_files = Vec::new();
+        folder.counted_fs_ids = HashSet::new();
+        folder.skipped_entries = Vec::new();
+        folder.file_store = Some(store);
+        folder.sqlite_files = true;
+        folder.sync_file_totals()?;
+        Ok(())
+    }
     /// 创建新的文件夹下载管理器
     pub fn new(download_dir: PathBuf) -> Self {
         Self {
@@ -289,6 +392,10 @@ impl FolderDownloadManager {
             download_manager_pool: Arc::new(RwLock::new(None)),
             persist_throttle: Arc::new(RwLock::new(PersistThrottle::default())),
             app_config: Arc::new(RwLock::new(None)),
+            folder_speeds: Arc::new(dashmap::DashMap::new()),
+            scan_emit_at: Arc::new(dashmap::DashMap::new()),
+            dispatch_locks: Arc::new(dashmap::DashMap::new()),
+            small_file_adapter: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -512,6 +619,75 @@ impl FolderDownloadManager {
         *guard = Some(config);
     }
 
+    /// 🔥 设置小文件优化适配器
+    pub async fn set_small_file_adapter(
+        &self,
+        adapter: Arc<crate::downloader::SmallFileOptimizationAdapter>,
+    ) {
+        let mut guard = self.small_file_adapter.write().await;
+        *guard = Some(adapter);
+        info!("FolderDownloadManager 已注入小文件优化适配器");
+    }
+
+    /// 🔥 获取小文件优化适配器
+    async fn get_small_file_adapter(
+        &self,
+    ) -> Option<Arc<crate::downloader::SmallFileOptimizationAdapter>> {
+        self.small_file_adapter.read().await.clone()
+    }
+
+    /// 🔥 检查并记录是否使用小文件优化
+    async fn check_and_log_optimization(&self, folder_id: &str) -> bool {
+        // 获取适配器
+        let adapter = match self.get_small_file_adapter().await {
+            Some(a) => a,
+            None => {
+                debug!("小文件优化适配器未初始化");
+                return false;
+            }
+        };
+
+        // 获取文件夹信息
+        let file_infos = {
+            let folders = self.folders.read().await;
+            let folder = match folders.get(folder_id) {
+                Some(f) => f,
+                None => return false,
+            };
+
+            // 构造 FileInfo 列表
+            folder
+                .pending_files
+                .iter()
+                .map(|pf| crate::downloader::FileInfo {
+                    fs_id: pf.fs_id,
+                    remote_path: pf.remote_path.clone(),
+                    local_path: pf.relative_path.clone(), // 使用 relative_path
+                    file_size: pf.size,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // 调用适配器判断
+        let should_use = adapter.should_use_optimization(&file_infos);
+
+        if should_use {
+            info!(
+                "🔥 文件夹 {} 满足小文件优化条件: {} 个文件",
+                folder_id,
+                file_infos.len()
+            );
+        } else {
+            info!(
+                "使用传统下载模式: folder_id={}, 文件数={}",
+                folder_id,
+                file_infos.len()
+            );
+        }
+
+        should_use
+    }
+
     /// 持久化文件夹状态
     async fn persist_folder(&self, folder_id: &str) {
         persist_folder_state(
@@ -546,6 +722,10 @@ impl FolderDownloadManager {
         let mut state = self.persist_throttle.write().await;
         state.last_at.remove(folder_id);
         state.dirty.remove(folder_id);
+        // 文件夹已销毁，速度计一并回收（否则 DashMap 会随历史文件夹无限增长）
+        drop(state);
+        self.folder_speeds.remove(folder_id);
+        self.scan_emit_at.remove(folder_id);
     }
 
     /// 🔥 补写被节流挡下的文件夹快照（见 `PersistThrottle::dirty`）
@@ -683,6 +863,32 @@ impl FolderDownloadManager {
 
             // 转换为 FolderDownload
             let mut folder = persisted.to_folder();
+            if !persisted.sqlite_files {
+                let source = wal_dir.join("folders").join(format!("folder_{}.json", persisted.id));
+                let backup = source.with_extension("json.pre-sqlite.bak");
+                if !backup.exists() {
+                    if let Err(e)=std::fs::copy(&source,&backup) {
+                        error!("备份旧文件夹快照失败，暂不迁移 {}: {}",persisted.id,e);
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            if let Err(e) = Self::attach_file_store(&mut folder, &wal_dir, persisted.sqlite_files) {
+                error!("文件夹文件级数据迁移/恢复失败，保留原快照: {}: {}", persisted.id, e);
+                folder.mark_failed(format!("文件级数据无法恢复: {}",e));
+                folder.failure_reason=Some("file_store_unavailable".into());
+                self.folders.write().await.insert(folder.id.clone(),folder);
+                skipped += 1;
+                continue;
+            }
+            if let Some(store) = &folder.file_store {
+                if let Err(e) = store.recover() {
+                    error!("恢复文件级队列失败: {}", e);
+                    skipped += 1;
+                    continue;
+                }
+            }
 
             // 🔥 folder.owner_uid==Uid(0) 视作 None，
             // 用 active_uid 兜底填充（与 classify_recovery_branch 的 LegacyFillActive 等价）
@@ -708,7 +914,7 @@ impl FolderDownloadManager {
                 folder_id,
                 folder.total_files,
                 folder.completed_count,
-                folder.pending_files.len()
+                folder.pending_len()
             );
 
             // 🔥 暂停状态的文件夹不分配槽位，等待用户手动恢复时再分配
@@ -904,7 +1110,7 @@ impl FolderDownloadManager {
                     // 只处理：已暂停、扫描完成、还有 pending_files 的文件夹
                     f.status == FolderStatus::Paused
                         && f.scan_completed
-                        && !f.pending_files.is_empty()
+                        && f.has_pending()
                 })
                 .map(|(id, f)| (id.clone(), f.owner_uid))
                 .collect()
@@ -958,14 +1164,19 @@ impl FolderDownloadManager {
                 if folder.status != FolderStatus::Paused || !folder.scan_completed {
                     continue;
                 }
+                if let Err(e) = folder.load_pending_page(needed + existing_tasks.len()) {
+                    folder.mark_failed(e.to_string());
+                    continue;
+                }
 
                 // 🔥 底账重建后 pending_files 可能包含「已经恢复出子任务」的文件，
                 //    按 fs_id 去重，只补真正缺任务的那些
                 let existing_fs_ids: std::collections::HashSet<u64> =
                     existing_tasks.iter().map(|t| t.fs_id).collect();
+                let existing_paths: HashSet<&str> = existing_tasks.iter().filter_map(|t|t.relative_path.as_deref()).collect();
                 folder
                     .pending_files
-                    .retain(|f| !existing_fs_ids.contains(&f.fs_id));
+                    .retain(|f| !existing_paths.contains(f.relative_path.as_str()) && (f.fs_id == 0 || !existing_fs_ids.contains(&f.fs_id)));
 
                 // 🔥 只挑选文件，**不从 pending_files 摘除**
                 //
@@ -980,10 +1191,11 @@ impl FolderDownloadManager {
                 // 保证不会重复建任务。
                 let existing_fs_ids: std::collections::HashSet<u64> =
                     existing_tasks.iter().map(|t| t.fs_id).collect();
+                let existing_paths: HashSet<&str> = existing_tasks.iter().filter_map(|t|t.relative_path.as_deref()).collect();
                 let files: Vec<_> = folder
                     .pending_files
                     .iter()
-                    .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                    .filter(|f| !existing_paths.contains(f.relative_path.as_str()) && (f.fs_id == 0 || !existing_fs_ids.contains(&f.fs_id)))
                     .take(needed)
                     .cloned()
                     .collect();
@@ -1039,9 +1251,10 @@ impl FolderDownloadManager {
                             {
                                 let mut folders_guard = self.folders.write().await;
                                 if let Some(folder) = folders_guard.get_mut(&folder_id) {
-                                    folder
-                                        .pending_files
-                                        .retain(|p| p.fs_id != pending_file.fs_id);
+                                    match folder.mark_skipped(&pending_file) {
+                                        Ok(true)=>{}, Ok(false)=>continue,
+                                        Err(e)=>{folder.mark_failed(e.to_string()); break;}
+                                    }
                                 }
                             }
                             skipped_count += 1;
@@ -1110,7 +1323,7 @@ impl FolderDownloadManager {
                         folder.created_count += created_count;
                         folder.skipped_count += skipped_count;
                         folder.skipped_size += skipped_bytes;
-                        folder.skipped_entries.append(&mut skipped_list);
+                        folder.append_skipped(&mut skipped_list);
                     }
                 }
                 total_created += created_count as usize;
@@ -1264,7 +1477,8 @@ impl FolderDownloadManager {
                     folders_guard
                         .iter()
                         .filter(|(_, f)| {
-                            f.status == FolderStatus::Downloading && !f.pending_files.is_empty()
+                            matches!(f.status, FolderStatus::Downloading | FolderStatus::Scanning)
+                                && f.has_pending()
                         })
                         .map(|(id, f)| (id.clone(), f.owner_uid))
                         .collect()
@@ -1285,7 +1499,7 @@ impl FolderDownloadManager {
                         continue;
                     }
 
-                    if let Err(e) = manager.refill_tasks(&folder_id, 10).await {
+                    if let Err(e) = manager.refill_tasks(&folder_id, FOLDER_INFLIGHT_TARGET).await {
                         warn!("待办补任务失败: folder={}, err={}", folder_id, e);
                     }
                 }
@@ -1307,6 +1521,7 @@ impl FolderDownloadManager {
         let ws_manager = self.ws_manager.clone();
         let wal_dir = self.wal_dir.clone();
         let persist_throttle = self.persist_throttle.clone();
+        let folder_speeds = self.folder_speeds.clone();
 
         tokio::spawn(async move {
             while let Some(folder_id) = rx.recv().await {
@@ -1370,13 +1585,6 @@ impl FolderDownloadManager {
                 // 获取该文件夹的所有活跃子任务
                 let tasks = dm.get_tasks_by_group(&folder_id).await;
 
-                // 🔥 速度只统计仍在下载中的子任务
-                let speed: u64 = tasks
-                    .iter()
-                    .filter(|t| t.status == TaskStatus::Downloading)
-                    .map(|t| t.speed)
-                    .sum();
-
                 // 🔥 使用 compute_downloaded_size：completed_downloaded_size + active_sum
                 // max() 保证即使完成通知和进度通知乱序也不会丢字节
                 let downloaded_size = {
@@ -1392,6 +1600,23 @@ impl FolderDownloadManager {
                         continue;
                     }
                 };
+
+                // 🔥 速度按「文件夹累计已下载字节」做差分，而不是逐子任务累加 `task.speed`
+                //
+                // 逐任务累加对海量小文件是失效的：每个子任务自带一个 SpeedCalculator，
+                // 必须有 ≥1 秒的测量跨度才出速度，而小文件往往几十毫秒就下完，于是每个
+                // 子任务的速度都是 0，求和仍是 0（用户看到「有进度、速度 0 B/s」）。
+                // 换成跨任务的累计字节差分后，测量跨度只在文件夹生命周期内重置一次。
+                // 分两句写：`RefMut` 临时值必须在 `.await` 前析构，否则借用会跨 await 存活。
+                let speed_calc = folder_speeds
+                    .entry(folder_id.clone())
+                    .or_insert_with(|| {
+                        Arc::new(tokio::sync::Mutex::new(
+                            SpeedCalculator::with_default_window(),
+                        ))
+                    })
+                    .clone();
+                let speed = speed_calc.lock().await.observe_total(downloaded_size);
 
                 // 发布文件夹进度事件
                 ws.send_if_subscribed(
@@ -1444,9 +1669,13 @@ impl FolderDownloadManager {
         let cancellation_tokens = self.cancellation_tokens.clone();
         let persist_throttle = self.persist_throttle.clone();
         let app_config = self.app_config.clone();
+        let dispatch_locks = self.dispatch_locks.clone();
 
         tokio::spawn(async move {
             while let Some((group_id, task_id, fs_id, file_size, is_success)) = rx.recv().await {
+                let dispatch_lock = dispatch_locks.entry(group_id.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+                let _dispatch_guard = dispatch_lock.lock().await;
                 // 🔥 先读 folder.owner_uid，再按 uid 解析 manager
                 let folder_owner_uid_for_routing = {
                     let folders_guard = folders.read().await;
@@ -1504,10 +1733,24 @@ impl FolderDownloadManager {
                             //    去重，会把所有这类文件折叠成一个，completed_count 永远涨不上去、
                             //    文件夹到不了终态 —— 比重复计数更糟。这种情况退回按 task_id 去重，
                             //    宁可多计也不少计。
-                            let already_counted = if fs_id != 0 {
-                                folder.counted_fs_ids.contains(&fs_id)
+                            let already_counted = if is_success {
+                                if let Some(store) = &folder.file_store {
+                                    match store.complete(fs_id, &task_id, file_size) {
+                                        Ok(inserted) => {
+                                            match store.failure_count() { Ok(n)=>folder.failed_count=n, Err(e)=>{folder.mark_failed(e.to_string()); continue;} }
+                                            !inserted
+                                        },
+                                        Err(e) => {
+                                            folder.mark_failed(format!("完成账本写入失败: {}", e));
+                                            continue;
+                                        }
+                                    }
+                                } else { folder.is_completed_file(fs_id, &task_id).unwrap_or(false) }
                             } else {
-                                folder.counted_task_ids.contains(&task_id)
+                                match folder.is_completed_file(fs_id, &task_id) {
+                                    Ok(done)=>done,
+                                    Err(e)=>{folder.mark_failed(e.to_string()); continue;}
+                                }
                             };
 
                             // A. 处理借调位映射
@@ -1552,7 +1795,7 @@ impl FolderDownloadManager {
                                     group_id, fs_id, task_id, file_size
                                 );
                                 // 仍要登记 task_id：否则这个已完成任务会被 active_sum 再算一遍
-                                folder.counted_task_ids.insert(task_id.clone());
+                                if folder.file_store.is_none() { folder.counted_task_ids.insert(task_id.clone()); }
                                 folder.subtask_retry_counts.remove(&task_id);
                                 // 🔥 自愈：能走到这个分支，说明该文件还赖在 pending_files 里
                                 //    （否则补任务路径不会再挑中它）。就地剪掉把循环斩断——
@@ -1566,7 +1809,7 @@ impl FolderDownloadManager {
                                 }
                             } else if is_success {
                                 // 🔥 成功且未计数：递增 completed_count
-                                folder.counted_task_ids.insert(task_id.clone());
+                                if folder.file_store.is_none() { folder.counted_task_ids.insert(task_id.clone()); }
                                 // 🔥 issue #156 续：登记完成 + 把文件剪出 pending_files，
                                 //    两件事绑在 mark_fs_id_completed 里一起做（说明见该方法）。
                                 //
@@ -1611,23 +1854,25 @@ impl FolderDownloadManager {
                                 }
                             } else if !is_success && !already_counted {
                                 // 🔥 失败：先看还有没有自动重试额度，耗尽才判死
-                                let attempts = folder
-                                    .subtask_retry_counts
-                                    .entry(task_id.clone())
-                                    .or_insert(0);
-                                if *attempts < MAX_SUBTASK_AUTO_RETRIES {
-                                    *attempts += 1;
-                                    retry_attempt = Some(*attempts);
+                                let attempts = if let Some(store)=&folder.file_store {
+                                    match store.retry(&task_id) { Ok(n)=>n, Err(e)=>{folder.mark_failed(e.to_string()); continue;} }
+                                } else {
+                                    let n=folder.subtask_retry_counts.entry(task_id.clone()).or_insert(0); *n+=1; *n
+                                };
+                                if attempts <= MAX_SUBTASK_AUTO_RETRIES {
+                                    retry_attempt = Some(attempts);
                                     info!(
                                         "文件夹 {} 子任务失败，将重新入队重试 ({}/{}, task_id={})",
-                                        group_id, *attempts, MAX_SUBTASK_AUTO_RETRIES, task_id
+                                        group_id, attempts, MAX_SUBTASK_AUTO_RETRIES, task_id
                                     );
                                     // 刻意不计入 failed_count：否则 completed+skipped+failed
                                     // 会提前凑满 total_files，重试还没跑文件夹就被判成终态
-                                } else if folder.failed_task_ids.insert(task_id.clone()) {
+                                } else if if let Some(store)=&folder.file_store {
+                                    match store.fail(fs_id,&task_id) { Ok(inserted)=>inserted, Err(e)=>{folder.mark_failed(e.to_string()); continue;} }
+                                } else { folder.failed_task_ids.insert(task_id.clone()) } {
                                     folder.failed_count += 1;
                                     // 🔥 同时按文件身份记一份，供成功侧抵消（见 failed_fs_ids）
-                                    if fs_id != 0 {
+                                    if fs_id != 0 && folder.file_store.is_none() {
                                         folder.failed_fs_ids.insert(fs_id);
                                     }
                                     warn!(
@@ -1790,7 +2035,7 @@ impl FolderDownloadManager {
                     //    冲过 total_files，严格相等就**永远不可能成立**，文件夹会卡在
                     //    downloading 无限补任务；失败终态分支又要求 failed_count > 0 也进不去。
                     //    去重本身在完成监听器里按 fs_id 兜住，这里再加一道不等式防御。
-                    if folder.pending_files.is_empty()
+                    if !folder.has_pending()
                         && folder.scan_completed
                         && active_count == 0
                         && completed_count + folder.skipped_count >= folder.total_files
@@ -1858,7 +2103,7 @@ impl FolderDownloadManager {
                     }
 
                     // 🔥 检查是否所有子任务都已终结（成功 + 失败 >= 总数）且有失败
-                    if folder.pending_files.is_empty()
+                    if !folder.has_pending()
                         && folder.scan_completed
                         && active_count == 0
                         && folder.failed_count > 0
@@ -1948,12 +2193,16 @@ impl FolderDownloadManager {
                     };
 
                     // 再次检查状态（可能在终态检查和此处之间被改变）
-                    if folder.status != FolderStatus::Downloading {
+                    if !matches!(folder.status, FolderStatus::Downloading | FolderStatus::Scanning) {
                         continue;
                     }
 
+                    if let Err(e) = folder.load_pending_page(available + tasks.len()) {
+                        folder.mark_failed(e.to_string());
+                        continue;
+                    }
                     // 检查是否还有待处理文件
-                    if folder.pending_files.is_empty() {
+                    if !folder.has_pending() {
                         continue;
                     }
 
@@ -1970,6 +2219,7 @@ impl FolderDownloadManager {
                     // 保证不会重复建任务。
                     let existing_fs_ids: std::collections::HashSet<u64> =
                         tasks.iter().map(|t| t.fs_id).collect();
+                let existing_paths: HashSet<&str> = tasks.iter().filter_map(|t|t.relative_path.as_deref()).collect();
                     // 🔥 issue #156 续：已下完的文件直接**挡掉**，不再只是打日志。
                     //
                     //    existing_fs_ids 只认"内存里还活着的任务"，而子任务一完成就被
@@ -1982,7 +2232,7 @@ impl FolderDownloadManager {
                     let files: Vec<_> = folder
                         .pending_files
                         .iter()
-                        .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                        .filter(|f| !existing_paths.contains(f.relative_path.as_str()) && (f.fs_id == 0 || !existing_fs_ids.contains(&f.fs_id)))
                         .filter(|f| {
                             let already_done =
                                 f.fs_id != 0 && folder.counted_fs_ids.contains(&f.fs_id);
@@ -2079,9 +2329,10 @@ impl FolderDownloadManager {
                                 {
                                     let mut folders_guard = folders.write().await;
                                     if let Some(folder) = folders_guard.get_mut(&group_id) {
-                                        folder
-                                            .pending_files
-                                            .retain(|p| p.fs_id != file_to_create.fs_id);
+                                        match folder.mark_skipped(&file_to_create) {
+                                            Ok(true)=>{}, Ok(false)=>continue,
+                                            Err(e)=>{folder.mark_failed(e.to_string()); break;}
+                                        }
                                     }
                                 }
                                 skipped_count += 1;
@@ -2256,7 +2507,7 @@ impl FolderDownloadManager {
                             folder.created_count += created_count;
                             folder.skipped_count += skipped_count;
                             folder.skipped_size += skipped_bytes;
-                            folder.skipped_entries.append(&mut skipped_list);
+                            folder.append_skipped(&mut skipped_list);
 
                             let returned = aborted_remainder.len();
                             if returned > 0 {
@@ -2509,6 +2760,9 @@ impl FolderDownloadManager {
         backup_config_id: Option<String>,
     ) -> Result<String> {
         let mut folder = FolderDownload::new(remote_path.clone(), local_root);
+        if let Some(wal) = self.wal_dir.read().await.as_ref() {
+            Self::attach_file_store(&mut folder, wal, false)?;
+        }
         let folder_id = folder.id.clone();
 
         // 🔥 多账号：设置 folder 归属 UID（与 ClientPool/per-uid downloader 路由对齐）
@@ -2710,6 +2964,10 @@ impl FolderDownloadManager {
             download_manager_pool: self.download_manager_pool.clone(),
             persist_throttle: self.persist_throttle.clone(),
             app_config: self.app_config.clone(),
+            folder_speeds: self.folder_speeds.clone(),
+            scan_emit_at: self.scan_emit_at.clone(),
+            dispatch_locks: self.dispatch_locks.clone(),
+            small_file_adapter: self.small_file_adapter.clone(),
         };
         let folder_id_clone = folder_id.clone();
 
@@ -2752,18 +3010,14 @@ impl FolderDownloadManager {
         Ok(folder_id)
     }
 
-    /// 递归扫描文件夹并创建任务（边扫描边创建）
+    /// 扫描文件夹并创建任务（边扫描边创建）
     async fn scan_folder_and_create_tasks(&self, folder_id: &str) -> Result<()> {
-        let (remote_root, local_root, owner_uid) = {
+        let (remote_root, owner_uid) = {
             let folders = self.folders.read().await;
             let folder = folders
                 .get(folder_id)
                 .ok_or_else(|| anyhow!("文件夹不存在"))?;
-            (
-                folder.remote_root.clone(),
-                folder.local_root.clone(),
-                folder.owner_uid,
-            )
+            (folder.remote_root.clone(), folder.owner_uid)
         };
 
         // 🔥 按 folder.owner_uid 路由网盘客户端
@@ -2779,6 +3033,32 @@ impl FolderDownloadManager {
             .await
             .ok_or_else(|| anyhow!("网盘客户端未初始化（owner_uid={}）", owner_uid.raw()))?;
 
+        // 🔥 重扫前清空上一轮的扫描累计值
+        //
+        // `total_files/total_size` 是 `scan_one_dir` 里的 `+=` 累加器，全项目没有第二个写入点；
+        // 而 `restore_folders` 会把快照原样恢复成 Paused（含 total_files 与 pending_files）。
+        // 扫描中途进程被杀时 `scan_completed` 仍是 false，恢复后点继续会从根目录重扫 ——
+        // 不清零就会把同一批文件二次累加：总数虚高后 `completed + skipped` 永远够不到，
+        // 文件夹卡在 downloading 进不了终态；pending 里还会留两条同 fs_id 的记录，重复下载。
+        let (prev_total, prev_pending) = {
+            let mut folders = self.folders.write().await;
+            match folders.get_mut(folder_id) {
+                Some(folder) => {
+                    let prev = (folder.total_files, folder.pending_len());
+                    if let Some(store) = &folder.file_store { store.clear_pending()?; }
+                    folder.reset_scan_result();
+                    prev
+                }
+                None => return Err(anyhow!("文件夹不存在")),
+            }
+        };
+        if prev_total > 0 || prev_pending > 0 {
+            info!(
+                "重新扫描文件夹 {}，已清空上一轮扫描结果（原 total_files={}, 原 pending={}）",
+                folder_id, prev_total, prev_pending
+            );
+        }
+
         // 创建取消令牌
         let cancel_token = CancellationToken::new();
         {
@@ -2786,16 +3066,38 @@ impl FolderDownloadManager {
             tokens.insert(folder_id.to_string(), cancel_token.clone());
         }
 
-        // 递归扫描并收集文件信息到 pending_files
-        self.scan_recursive(
-            folder_id,
-            &client,
-            &cancel_token,
-            &remote_root,
-            &remote_root,
-            &local_root,
-        )
-        .await?;
+        // 先补回历史完成账；扫描分页入队时会据此排除已完成文件。
+        self.reconcile_pending_files(folder_id).await;
+
+        // 扫描目录树，每页入队后即派发下载。
+        if let Err(error) = self.scan_folder_tree(folder_id, &client, &cancel_token, &remote_root).await {
+            // 流式扫描失败时已有下载在运行，先停下它们并归还槽位。
+            let _ = self.pause_folder(folder_id).await;
+            return Err(error);
+        }
+
+        // 🔥 扫描被中止（暂停 / 取消）时绝不能标记扫描完成
+        //
+        // 取消在下面两层都是"温和退出"：`scan_one_dir` 命中取消是 `return Ok(subdirs)`，
+        // `bfs_scan_dirs` 是 `break`，所以 `scan_folder_tree` 在只扫了一半时同样返回 `Ok`。
+        // 若在这里无条件下 `scan_completed = true`，用户点「继续」会直接进下载阶段 ——
+        // 没扫到的文件永远不会被发现，而且不报任何错。保留已发现结果落盘，下次继续时重扫。
+        if cancel_token.is_cancelled() {
+            let (scanned_files, pending) = {
+                let folders = self.folders.read().await;
+                match folders.get(folder_id) {
+                    Some(folder) => (folder.total_files, folder.pending_len()),
+                    None => (0, 0),
+                }
+            };
+            info!(
+                "扫描被中止，保留已发现结果但不标记扫描完成: folder_id={}, 已发现 {} 个文件, pending={}",
+                folder_id, scanned_files, pending
+            );
+            self.persist_folder(folder_id).await;
+            self.cancellation_tokens.write().await.remove(folder_id);
+            return Ok(());
+        }
 
         // 扫描完成，更新状态并对 pending_files 排序
         let should_publish_status_changed = {
@@ -2816,7 +3118,7 @@ impl FolderDownloadManager {
                     "文件夹扫描完成: {} 个文件, 总大小: {} bytes, pending队列: {} (已按路径排序)",
                     folder.total_files,
                     folder.total_size,
-                    folder.pending_files.len()
+                    folder.pending_len()
                 );
                 should_change
             } else {
@@ -2830,21 +3132,22 @@ impl FolderDownloadManager {
             tokens.remove(folder_id);
         }
 
-        // 🔥 重命名加密文件夹并更新路径（在创建任务前）
-        if let Err(e) = self
-            .rename_encrypted_folders_and_update_paths(folder_id)
-            .await
-        {
-            warn!("重命名加密文件夹失败: {}", e);
-        }
-
         // 🔥 补任务前对账：本方法也会被"重启时扫描未完成的文件夹"复用（恢复后重新扫描），
         //    此时队列里可能混有上次运行已经下载完成的文件，直接建任务会重复下载。
         //    全新文件夹没有任何子任务/历史记录，对账会立即返回，无额外开销。
         self.reconcile_pending_files(folder_id).await;
 
+        // 🔥 检查是否使用小文件优化
+        let use_optimization = self.check_and_log_optimization(folder_id).await;
+
+        if use_optimization {
+            info!("🚀 文件夹 {} 将使用小文件优化模式", folder_id);
+            // TODO: 实现优化流程
+            // 当前先使用传统流程，优化流程待后续实现
+        }
+
         // 扫描完成后，立即创建前10个任务
-        if let Err(e) = self.refill_tasks(folder_id, 10).await {
+        if let Err(e) = self.refill_tasks(folder_id, FOLDER_INFLIGHT_TARGET).await {
             error!("创建初始任务失败: {}", e);
         }
 
@@ -2886,42 +3189,105 @@ impl FolderDownloadManager {
         if let Some(event) = scan_event {
             self.publish_event(event).await;
         }
+        // 最后一页发现前，子任务可能已全部结束，不会再有完成通知驱动收尾。
+        self.finalize_folder_if_done(folder_id).await;
 
         Ok(())
     }
 
-    /// 递归扫描目录（只收集文件信息到 pending_files，不创建任务）
-    #[async_recursion::async_recursion]
-    async fn scan_recursive(
+    /// 有空闲扫描位就处理已发现的子目录；分页入队通过合并通知唤醒独立派发循环。
+    async fn scan_folder_tree(
         &self,
         folder_id: &str,
         client: &NetdiskClient,
         cancel_token: &CancellationToken,
         root_path: &str,
-        current_path: &str,
-        local_root: &PathBuf,
     ) -> Result<()> {
-        // 检查是否已取消
+        let wake = tokio::sync::Notify::new();
+        // 同一轮扫描固定规则，设置修改对下一轮生效。
+        let config = self.app_config.read().await.clone();
+        let exclude = match config {
+            Some(config) => config.read().await.download.folder_exclude.clone(),
+            None => crate::config::FolderExcludeConfig::default(),
+        };
+        exclude.validate()?;
+        let exclude_ref = &exclude;
+        let wake_ref = &wake;
+        let finished = CancellationToken::new();
+        let scan = async {
+        let result = bfs_scan_dirs(
+            vec![root_path.to_string()],
+            scan_list_concurrency(),
+            cancel_token,
+            |dir: String| async move {
+                self.scan_one_dir(folder_id, client, cancel_token, root_path, &dir, wake_ref, exclude_ref)
+                    .await
+            },
+        )
+        .await;
+        finished.cancel();
+        result
+        };
+        let dispatch = async {
+            loop {
+                tokio::select! {
+                    _ = finished.cancelled() => break,
+                    _ = cancel_token.cancelled() => break,
+                    _ = wake.notified() => {
+                        if let Err(e) = self.refill_tasks(folder_id, FOLDER_INFLIGHT_TARGET).await {
+                            finished.cancel();
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let (visited, ()) = tokio::try_join!(scan, dispatch)?;
+
         if cancel_token.is_cancelled() {
             info!("扫描任务被取消");
-            return Ok(());
         }
+        info!("扫描目录完成: 共 {} 个目录", visited.len());
+        Ok(())
+    }
 
+    /// 扫描单个目录（含分页），把文件批量并入 `pending_files`，返回其**直接子目录**。
+    ///
+    /// 子目录只收集路径、不在此处下探，由 [`Self::scan_folder_tree`] 统一工作队列调度。
+    async fn scan_one_dir(
+        &self,
+        folder_id: &str,
+        client: &NetdiskClient,
+        cancel_token: &CancellationToken,
+        root_path: &str,
+        dir_path: &str,
+        wake: &tokio::sync::Notify,
+        exclude: &crate::config::FolderExcludeConfig,
+    ) -> Result<Vec<String>> {
         let mut page = 1;
         let page_size = 100;
+        let mut subdirs: Vec<String> = Vec::new();
 
         loop {
             // 每页之前检查取消
             if cancel_token.is_cancelled() {
                 info!("扫描任务被取消");
-                return Ok(());
+                return Ok(subdirs);
+            }
+
+            if !self.wait_for_scan_capacity(folder_id, cancel_token).await {
+                return Ok(subdirs);
             }
 
             // 更新扫描进度
+            //
+            // 并发扫描时这里是"最后写入者获胜"，`scan_progress` 仅用于前端展示
+            // "当前扫到哪个目录"，不需要精确。
             {
                 let mut folders = self.folders.write().await;
                 if let Some(folder) = folders.get_mut(folder_id) {
-                    folder.scan_progress = Some(current_path.to_string());
+                    folder.scan_progress = Some(dir_path.to_string());
                 }
             }
 
@@ -2936,7 +3302,7 @@ impl FolderDownloadManager {
                 const SCAN_LIST_MAX_ATTEMPTS: u32 = 4;
                 let mut attempt = 0u32;
                 loop {
-                    match client.get_file_list(current_path, page, page_size).await {
+                    match client.get_file_list(dir_path, page, page_size).await {
                         Ok(list) => break list,
                         Err(e) => {
                             attempt += 1;
@@ -2946,7 +3312,7 @@ impl FolderDownloadManager {
                             let backoff = tokio::time::Duration::from_millis(800 * attempt as u64);
                             warn!(
                                 "扫描文件夹列表失败(第 {}/{} 次), {:?} 后重试: dir={}, page={}, err={}",
-                                attempt, SCAN_LIST_MAX_ATTEMPTS, backoff, current_path, page, e
+                                attempt, SCAN_LIST_MAX_ATTEMPTS, backoff, dir_path, page, e
                             );
                             tokio::time::sleep(backoff).await;
                         }
@@ -2960,10 +3326,18 @@ impl FolderDownloadManager {
             for item in &file_list.list {
                 // 检查取消
                 if cancel_token.is_cancelled() {
-                    return Ok(());
+                    return Ok(subdirs);
                 }
 
                 if item.isdir == 1 {
+                    let raw_name = item.path.rsplit('/').next().unwrap_or("");
+                    let name = if exclude.enabled && crate::encryption::service::EncryptionService::is_encrypted_folder_name(raw_name) {
+                        self.restore_folder_name(raw_name, dir_path).await.unwrap_or_else(|| raw_name.to_string())
+                    } else { raw_name.to_string() };
+                    if exclude.excludes(&name) {
+                        info!("排除目录，不扫描或下载: {}", item.path);
+                        continue;
+                    }
                     // 🔥 检查是否是加密文件夹，收集映射关系
                     let folder_name = item.path.rsplit('/').next().unwrap_or("");
 
@@ -2998,16 +3372,8 @@ impl FolderDownloadManager {
                         }
                     }
 
-                    // 递归处理子目录
-                    self.scan_recursive(
-                        folder_id,
-                        client,
-                        cancel_token,
-                        root_path,
-                        &item.path,
-                        local_root,
-                    )
-                    .await?;
+                    // 子目录交给上层工作队列，空闲扫描位无需等待其他分支
+                    subdirs.push(item.path.clone());
                 } else {
                     // 计算相对路径
                     let relative_path = item
@@ -3042,7 +3408,19 @@ impl FolderDownloadManager {
                 {
                     let mut folders = self.folders.write().await;
                     if let Some(folder) = folders.get_mut(folder_id) {
-                        folder.pending_files.extend(batch_files);
+                        if !matches!(folder.status, FolderStatus::Scanning | FolderStatus::Downloading) {
+                            return Ok(subdirs);
+                        }
+                        // 重扫保留完成/跳过账本，总数仍按本轮实际发现的文件统计。
+                        if let Some(store) = &folder.file_store {
+                            store.enqueue(&batch_files)?;
+                        } else {
+                            batch_files.retain(|file| {
+                                !(file.fs_id != 0 && folder.counted_fs_ids.contains(&file.fs_id))
+                                    && !folder.skipped_entries.iter().any(|entry| entry.relative_path == file.relative_path)
+                            });
+                            folder.pending_files.extend(batch_files);
+                        }
                         folder.total_files += batch_count as u64;
                         folder.total_size += batch_size;
                     }
@@ -3050,9 +3428,18 @@ impl FolderDownloadManager {
 
                 info!(
                     "扫描进度: 发现 {} 个文件，总大小 {} bytes (路径: {})",
-                    batch_count, batch_size, current_path
+                    batch_count, batch_size, dir_path
                 );
+                // 唤醒独立派发循环；扫描不再等待补任务。
+                wake.notify_one();
             }
+
+            // 推送扫描进度（内部按 500ms 节流）
+            //
+            // 放在 if 外：整页都是子目录（没有文件）时也要让前端看到"当前扫到哪"，
+            // 否则遇到目录密集的树会长时间无任何反馈。
+            self.emit_scan_progress_throttled(folder_id, dir_path)
+                .await;
 
             // 检查是否还有下一页
             if file_list.list.len() < page_size as usize {
@@ -3061,13 +3448,107 @@ impl FolderDownloadManager {
             page += 1;
         }
 
-        Ok(())
+        Ok(subdirs)
+    }
+
+    async fn wait_for_scan_capacity(&self, folder_id: &str, cancel_token: &CancellationToken) -> bool {
+        loop {
+            if cancel_token.is_cancelled() { return false; }
+            let should_wait = {
+                let folders = self.folders.read().await;
+                match folders.get(folder_id) {
+                    Some(folder) if matches!(folder.status, FolderStatus::Scanning | FolderStatus::Downloading) =>
+                        folder.file_store.is_none() && folder.pending_len() >= FOLDER_SCAN_PENDING_HIGH_WATER,
+                    _ => return false,
+                }
+            };
+            if !should_wait { return true; }
+            // 等待期间不持有状态锁或派发锁。
+            tokio::select! {
+                _ = cancel_token.cancelled() => return false,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+        }
+    }
+
+    /// 扫描期间按节流推送一次扫描进度
+    ///
+    /// 扫描期此前完全静默：`scan_progress` 只写内存字段、不发事件，而前端在
+    /// WS 连上后会停掉主列表轮询 —— 两边一叠加，整个扫描阶段页面停在「扫描中、
+    /// 已发现 0 个文件」一动不动。这里每 [`SCAN_PROGRESS_EMIT_INTERVAL`] 最多
+    /// 推一帧，"已发现 N 个文件"就能持续跳动。
+    ///
+    /// 计数直接读 `folder.total_files/total_size`（扫描边累加），所以是**已发现**
+    /// 而不是**已确认完成**，与最终值可能有偏差 —— 前端只把它当进度感使用。
+    async fn emit_scan_progress_throttled(&self, folder_id: &str, current_dir: &str) {
+        let now = std::time::Instant::now();
+        match self.scan_emit_at.get(folder_id) {
+            Some(last) if now.duration_since(*last) < SCAN_PROGRESS_EMIT_INTERVAL => return,
+            _ => {}
+        }
+        self.scan_emit_at.insert(folder_id.to_string(), now);
+
+        let (scanned_files, scanned_size, owner_uid) = {
+            let folders = self.folders.read().await;
+            match folders.get(folder_id) {
+                Some(folder) => (
+                    folder.total_files,
+                    folder.total_size,
+                    Some(folder.owner_uid.raw()),
+                ),
+                None => return,
+            }
+        };
+
+        let ws = {
+            let guard = self.ws_manager.read().await;
+            guard.clone()
+        };
+
+        if let Some(ws) = ws {
+            ws.send_if_subscribed(
+                TaskEvent::Folder(FolderEvent::ScanProgress {
+                    folder_id: folder_id.to_string(),
+                    scanned_files,
+                    scanned_size,
+                    current_dir: current_dir.to_string(),
+                    owner_uid,
+                }),
+                None,
+            );
+        }
     }
 
     /// 获取所有文件夹下载
     pub async fn get_all_folders(&self) -> Vec<FolderDownload> {
         let folders = self.folders.read().await;
         folders.values().cloned().collect()
+    }
+
+    pub async fn get_folder_api_snapshot(&self, folder_id: &str) -> Option<FolderDownload> {
+        self.folders.read().await.get(folder_id).map(FolderDownload::api_snapshot)
+    }
+
+    pub async fn get_folder_api_snapshots(&self) -> Vec<FolderDownload> {
+        self.folders.read().await.values().map(FolderDownload::api_snapshot).collect()
+    }
+
+    pub async fn skipped_page(&self, folder_id: &str, offset: usize, limit: usize) -> Result<Option<Vec<super::folder::SkippedFile>>> {
+        let (store, legacy) = {
+            let folders = self.folders.read().await;
+            match folders.get(folder_id) {
+                Some(f) => (f.file_store.clone(), Some(f.skipped_entries.iter().skip(offset).take(limit).cloned().collect::<Vec<_>>())),
+                None => (None, None),
+            }
+        };
+        if let Some(store)=store { return Ok(Some(store.skipped_page(offset,limit)?)); }
+        if let Some(wal)=self.wal_dir.read().await.as_ref() {
+            if wal.join("folder_files").join(format!("{folder_id}.sqlite")).is_file() {
+                let store=crate::persistence::folder_files::FolderFileStore::open(wal,folder_id,true)?;
+                return Ok(Some(store.skipped_page(offset,limit)?));
+            }
+        }
+        Ok(legacy)
     }
 
     /// 只读遍历内存中的全部文件夹下载
@@ -3079,6 +3560,27 @@ impl FolderDownloadManager {
         for folder in folders.values() {
             f(folder);
         }
+    }
+
+    /// 🔥 读取当前所有文件夹的速度（字节/秒）
+    ///
+    /// 供下载列表 / 任务摘要接口使用，与 WebSocket 的 `FolderEvent::Progress.speed`
+    /// 同源（都来自 `folder_speeds`），避免"页面实时刷新时有速度、手动刷新后变 0"。
+    ///
+    /// 用 `try_lock` 而不是 `lock`：进度监听器持锁时间极短（一次快照），抢不到直接跳过，
+    /// 由调用方原有的"子任务速度求和"兜底，绝不让 handler 卡在等锁上。
+    ///
+    /// 读 `speed()` 而不是 `refresh()`：`speed()` 的右端点取 `Instant::now()`，
+    /// 文件夹停滞（没有新进度事件、快照不推进）时分母持续增长，速度会自然衰减到 0，
+    /// 不会僵在最后一个值上。
+    pub async fn folder_speeds_snapshot(&self) -> HashMap<String, u64> {
+        let mut out = HashMap::with_capacity(self.folder_speeds.len());
+        for entry in self.folder_speeds.iter() {
+            if let Ok(calc) = entry.value().try_lock() {
+                out.insert(entry.key().clone(), calc.speed());
+            }
+        }
+        out
     }
 
     /// 🔥 获取归属指定 `backup_config_id`（如 `share-sync:{订阅id}`）的内存文件夹下载
@@ -3129,7 +3631,7 @@ impl FolderDownloadManager {
     pub async fn get_all_folders_with_history(&self) -> Vec<FolderDownload> {
         // 1. 获取内存中的文件夹
         let folders = self.folders.read().await;
-        let mut result: Vec<FolderDownload> = folders.values().cloned().collect();
+        let mut result: Vec<FolderDownload> = folders.values().map(FolderDownload::api_snapshot).collect();
         let folder_ids: std::collections::HashSet<String> = folders.keys().cloned().collect();
         drop(folders);
 
@@ -3185,6 +3687,7 @@ impl FolderDownloadManager {
                 .is_some_and(Self::is_completed_share_sync_folder)
             {
                 folders.remove(id);
+                self.folder_speeds.remove(id);
                 removed += 1;
             }
         }
@@ -3375,6 +3878,7 @@ impl FolderDownloadManager {
     /// 在恢复时调用，将历史归档的已完成文件夹加载到内存中
     /// 这样前端获取所有下载时可以看到历史完成的文件夹
     pub async fn load_history_folders_to_memory(&self) -> usize {
+        let file_wal = self.wal_dir.read().await.clone();
         // 优先从数据库加载
         let pm_opt = self.persistence_manager.read().await.clone();
         let history_folders: Vec<FolderPersisted> = if let Some(pm) = pm_opt {
@@ -3422,7 +3926,13 @@ impl FolderDownloadManager {
             for persisted in history_folders {
                 // 只添加不存在于内存中的文件夹（避免重复）
                 if !folders.contains_key(&persisted.id) {
-                    let folder = persisted.to_folder();
+                    let mut folder = persisted.to_folder();
+                    if let Some(wal)=&file_wal {
+                        if let Err(e)=Self::attach_file_store(&mut folder,wal,persisted.sqlite_files) {
+                            error!("历史文件级账本恢复失败: {}: {}",persisted.id,e);
+                            continue;
+                        }
+                    }
                     folders.insert(folder.id.clone(), folder);
                     loaded += 1;
                 }
@@ -3589,11 +4099,15 @@ impl FolderDownloadManager {
             if folder.status != FolderStatus::Paused && folder.status != FolderStatus::Failed {
                 return Err(anyhow!("文件夹状态不正确，当前状态: {:?}", folder.status));
             }
+            if folder.sqlite_files && folder.file_store.is_none() {
+                return Err(anyhow!("文件级数据库无法恢复，请恢复数据库文件后重启，不能以空队列继续"));
+            }
 
             let old_status = format!("{:?}", folder.status).to_lowercase();
 
             // 🔥 如果从 Failed 恢复，重置失败计数（失败的子任务将被重新调度）
             if folder.status == FolderStatus::Failed {
+                if let Some(store)=&folder.file_store { store.reset_failures()?; }
                 folder.failed_count = 0;
                 folder.failed_task_ids.clear();
                 // 用户手动点继续 = 明确要求重试，给一份新的自动重试额度
@@ -3934,6 +4448,10 @@ impl FolderDownloadManager {
                 download_manager_pool: self.download_manager_pool.clone(),
                 persist_throttle: self.persist_throttle.clone(),
                 app_config: self.app_config.clone(),
+                folder_speeds: self.folder_speeds.clone(),
+                scan_emit_at: self.scan_emit_at.clone(),
+                dispatch_locks: self.dispatch_locks.clone(),
+                small_file_adapter: self.small_file_adapter.clone(),
             };
             let folder_id = folder_id.to_string();
 
@@ -3950,7 +4468,7 @@ impl FolderDownloadManager {
             self.reconcile_pending_files(folder_id).await;
 
             // 如果扫描已完成，补充任务到10个
-            if let Err(e) = self.refill_tasks(folder_id, 10).await {
+            if let Err(e) = self.refill_tasks(folder_id, FOLDER_INFLIGHT_TARGET).await {
                 warn!("恢复时补充任务失败: {}", e);
             }
 
@@ -3983,10 +4501,11 @@ impl FolderDownloadManager {
             if let Some(folder) = folders.get_mut(folder_id) {
                 folder.mark_cancelled();
                 folder.pending_files.clear(); // 清空待处理队列
+                if let Some(store) = &folder.file_store { store.clear_pending()?; }
                 info!(
                     "文件夹 {} 已标记为取消，已清空 pending_files ({} 个待处理文件)",
                     folder.name,
-                    folder.pending_files.len()
+                    folder.pending_len()
                 );
                 (Some(folder.local_root.clone()), Some(folder.owner_uid))
             } else {
@@ -4228,12 +4747,33 @@ impl FolderDownloadManager {
         let (owner_uid, pending_before, completed_before) = {
             let folders = self.folders.read().await;
             match folders.get(folder_id) {
-                Some(f) => (f.owner_uid, f.pending_files.len(), f.completed_count),
+                Some(f) => (f.owner_uid, f.pending_len(), f.completed_count),
                 None => return,
             }
         };
 
         // 1) 已有子任务承载的相对路径（活跃 + 已恢复）；pending 为空时用不上，不必查
+        let store = self.folders.read().await.get(folder_id).and_then(|f|f.file_store.clone());
+        if let Some(store)=store {
+            let result: Result<()> = async {
+                if let Some(pm)=self.persistence_manager.read().await.clone() {
+                    let pm=pm.lock().await;
+                    if let Some(db)=pm.history_db() { db.reconcile_folder_files(folder_id,&store)?; }
+                }
+                if let Some(dm)=self.download_manager_for(owner_uid).await {
+                    for task in dm.get_tasks_by_group(folder_id).await {
+                        store.mark_active(task.fs_id,&task.id,task.relative_path.as_deref())?;
+                    }
+                }
+                if let Some(folder)=self.folders.write().await.get_mut(folder_id) { folder.sync_file_totals()?; }
+                Ok(())
+            }.await;
+            if let Err(e)=result {
+                if let Some(folder)=self.folders.write().await.get_mut(folder_id) {folder.mark_failed(e.to_string());}
+            }
+            self.persist_folder(folder_id).await;
+            return;
+        }
         let mut covered: HashSet<String> = HashSet::new();
         if pending_before > 0 {
             if let Some(dm) = self.download_manager_for(owner_uid).await {
@@ -4270,7 +4810,22 @@ impl FolderDownloadManager {
                 None => return,
             };
 
-            let history_changed = folder.merge_completed_history(&history);
+            let history_changed = if let Some(store) = &folder.file_store {
+                for file in &history {
+                    if let Err(e)=store.complete(file.fs_id.unwrap_or(0), &file.relative_path, file.file_size) {
+                        folder.mark_failed(e.to_string());
+                        return;
+                    }
+                }
+                if let Err(e)=folder.sync_file_totals() { folder.mark_failed(e.to_string()); return; }
+                folder.completed_count != completed_before
+            } else { folder.merge_completed_history(&history) };
+            if let Some(store) = &folder.file_store {
+                if let Err(e) = store.cover_paths(&covered) {
+                    folder.mark_failed(e.to_string());
+                    return;
+                }
+            }
 
             if !covered.is_empty() {
                 folder
@@ -4285,7 +4840,7 @@ impl FolderDownloadManager {
             //    counted_fs_ids 是持久化的、按网盘侧文件身份记的账，正好补这个口子。
             folder.prune_completed_from_pending();
 
-            let pending_after = folder.pending_files.len();
+            let pending_after = folder.pending_len();
             let removed = pending_before.saturating_sub(pending_after);
             (
                 history_changed,
@@ -4317,6 +4872,11 @@ impl FolderDownloadManager {
     /// 这是核心方法：检查活跃任务数，如果不足就从 pending_files 补充
     /// 🔥 修复：在分配借调位前，收集所有子任务已占用的槽位，避免重复分配
     async fn refill_tasks(&self, folder_id: &str, target_count: usize) -> Result<()> {
+        let dispatch_lock = self.dispatch_locks.entry(folder_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
+        let _dispatch_guard = dispatch_lock.lock().await;
+        // 与其他派发入口互斥，目录迁移必须先于子任务创建。
+        self.rename_encrypted_folders_and_update_paths(folder_id).await?;
         // 🔥 循环补批：命中"跳过"的文件不会占用槽位，若只补一批就返回，整批全被跳过时
         //    既没有子任务、也就没有完成事件来驱动下一次补任务，文件夹会卡在
         //    downloading 且详情里一个任务都看不到（issue #141 用户反馈的"长时间看不到
@@ -4396,6 +4956,7 @@ impl FolderDownloadManager {
             let folder = folders
                 .get_mut(folder_id)
                 .ok_or_else(|| anyhow!("文件夹不存在"))?;
+            folder.load_pending_page(needed + tasks.len())?;
 
             // 检查状态，如果暂停或取消，不补充任务
             if folder.status == FolderStatus::Paused
@@ -4418,11 +4979,12 @@ impl FolderDownloadManager {
             // 保证不会重复建任务。
             let existing_fs_ids: std::collections::HashSet<u64> =
                 tasks.iter().map(|t| t.fs_id).collect();
+                let existing_paths: HashSet<&str> = tasks.iter().filter_map(|t|t.relative_path.as_deref()).collect();
             // 🔥 已下完的文件直接挡掉（issue #156 续），理由见另一条补任务路径的同名过滤
             let files: Vec<_> = folder
                 .pending_files
                 .iter()
-                .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                .filter(|f| !existing_paths.contains(f.relative_path.as_str()) && (f.fs_id == 0 || !existing_fs_ids.contains(&f.fs_id)))
                 .filter(|f| {
                     let already_done =
                         f.fs_id != 0 && folder.counted_fs_ids.contains(&f.fs_id);
@@ -4526,9 +5088,7 @@ impl FolderDownloadManager {
                         {
                             let mut folders_guard = self.folders.write().await;
                             if let Some(folder) = folders_guard.get_mut(folder_id) {
-                                folder
-                                    .pending_files
-                                    .retain(|p| p.fs_id != pending_file.fs_id);
+                                if !folder.mark_skipped(&pending_file)? { continue; }
                             }
                         }
                         // 🔥 跳过的文件同样是"处理完毕"，必须计入 skipped_count。
@@ -4688,7 +5248,7 @@ impl FolderDownloadManager {
                     folder.created_count += created_count;
                     folder.skipped_count += skipped_count;
                     folder.skipped_size += skipped_bytes;
-                    folder.skipped_entries.append(&mut skipped_list);
+                    folder.append_skipped(&mut skipped_list);
 
                     let returned = aborted_remainder.len();
                     if returned > 0 {
@@ -4794,7 +5354,7 @@ impl FolderDownloadManager {
         self.finalize_folder_if_done(folder_id).await;
 
         // 补充任务：保持10个活跃任务（完成1个，进1个）
-        if let Err(e) = self.refill_tasks(folder_id, 10).await {
+        if let Err(e) = self.refill_tasks(folder_id, FOLDER_INFLIGHT_TARGET).await {
             warn!("补充任务失败: {}", e);
         }
 
@@ -4843,7 +5403,7 @@ impl FolderDownloadManager {
             if let Some(folder) = folders.get_mut(folder_id) {
                 // 检查是否全部完成（成功 + 失败 >= 总数）
                 if folder.scan_completed
-                    && folder.pending_files.is_empty()
+                    && !folder.has_pending()
                     && (folder.completed_count + folder.skipped_count + folder.failed_count)
                         >= folder.total_files
                     && folder.status != FolderStatus::Completed
@@ -5107,26 +5667,32 @@ impl FolderDownloadManager {
     ///
     /// 反过来，摘除推迟意味着这段时间里文件同时存在于 `pending_files` 和内存任务中，
     /// 补任务侧靠 `fs_id` 去重保证不会重复建。
-    pub async fn drop_pending_file_after_persist(&self, folder_id: &str, fs_id: u64) {
+    pub async fn drop_pending_file_after_persist(&self, folder_id: &str, fs_id: u64, task_id: &str, relative_path: Option<&str>) -> Result<()> {
         let removed = {
             let mut folders_guard = self.folders.write().await;
             let Some(folder) = folders_guard.get_mut(folder_id) else {
-                return;
+                return Ok(());
             };
-            let before = folder.pending_files.len();
+            let before = folder.pending_len();
+            if let Some(store) = &folder.file_store {
+                store.mark_active(fs_id, task_id, relative_path)?;
+            }
             folder.pending_files.retain(|f| f.fs_id != fs_id);
-            before != folder.pending_files.len()
+            before != folder.pending_len()
         };
 
         if !removed {
-            return;
+            return Ok(());
         }
 
         debug!(
             "文件夹 {} 子任务已落盘，从 pending_files 摘除 fs_id={}",
             folder_id, fs_id
         );
-        self.persist_folder(folder_id).await;
+        // 子任务 WAL 已成功写入；旧快照中的重复待办由恢复对账剔除。
+        // 不必让每个小文件等待整棵目录的快照重写。
+        self.persist_folder_throttled(folder_id).await;
+        Ok(())
     }
 
     /// 🔥 归还文件夹用不上的借调位
@@ -5147,7 +5713,7 @@ impl FolderDownloadManager {
                 Some(f) if !f.borrowed_slot_ids.is_empty() => (
                     f.owner_uid,
                     f.borrowed_slot_ids.clone(),
-                    f.pending_files.len(),
+                    f.pending_len(),
                 ),
                 _ => return,
             }
@@ -5982,6 +6548,7 @@ impl FolderDownloadManager {
         if !successful_renames.is_empty() {
             let mut folders = self.folders.write().await;
             if let Some(folder) = folders.get_mut(folder_id) {
+                if let Some(store) = &folder.file_store { store.rename_paths(&successful_renames)?; }
                 for pending_file in &mut folder.pending_files {
                     for (encrypted_rel, decrypted_rel) in &successful_renames {
                         // 替换路径中的加密部分
@@ -6044,6 +6611,118 @@ impl FolderDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_sqlite_ledger_is_visible_and_cannot_resume() {
+        let temp=tempfile::tempdir().unwrap();
+        let fm=FolderDownloadManager::new(temp.path().to_path_buf());
+        fm.set_wal_dir(temp.path().to_path_buf()).await;
+        let folder=FolderDownload::new("/root".into(),temp.path().join("local"));
+        let id=folder.id.clone();
+        let mut summary=FolderPersisted::from_folder(&folder);
+        summary.sqlite_files=true;
+        save_folder(temp.path(),&summary).unwrap();
+        assert_eq!(fm.restore_folders().await,(0,1));
+        assert_eq!(fm.folders.read().await[&id].status,FolderStatus::Failed);
+        assert!(fm.resume_folder(&id).await.is_err());
+        assert!(crate::persistence::folder::load_folder(temp.path(),&id).unwrap().unwrap().sqlite_files);
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_keeps_only_a_page_and_recovers_without_json_details() {
+        let temp=tempfile::tempdir().unwrap();
+        let fm=FolderDownloadManager::new(temp.path().to_path_buf());
+        fm.set_wal_dir(temp.path().to_path_buf()).await;
+        let mut folder=FolderDownload::new("/root".into(),temp.path().join("local"));
+        folder.scan_completed=true;
+        folder.total_files=10001;
+        folder.pending_files=(1..=10000).map(|id|PendingFile {fs_id:id,filename:id.to_string(),remote_path:format!("/root/{id}"),relative_path:format!("{id:05}"),size:10}).collect();
+        folder.counted_fs_ids.insert(10001);
+        folder.completed_count=1;
+        let id=folder.id.clone();
+        save_folder(temp.path(),&FolderPersisted::from_folder(&folder)).unwrap();
+        drop(folder);
+        assert_eq!(fm.restore_folders().await,(1,0));
+        {
+            let mut folders=fm.folders.write().await;
+            let f=folders.get_mut(&id).unwrap();
+            assert_eq!(f.pending_len(),10000);
+            assert!(f.pending_files.is_empty());
+            assert_eq!(f.pending_files.capacity(),0);
+            assert!(f.counted_fs_ids.is_empty());
+            f.load_pending_page(30).unwrap();
+            assert_eq!(f.pending_files.len(),30);
+            assert!(f.is_completed_file(10001,"").unwrap());
+        }
+        let summary=crate::persistence::folder::load_folder(temp.path(),&id).unwrap().unwrap();
+        assert!(summary.sqlite_files);
+        assert!(summary.pending_files.is_empty());
+        assert!(temp.path().join("folders").join(format!("folder_{id}.json.pre-sqlite.bak")).is_file());
+        fm.drop_pending_file_after_persist(&id,1,"task-1",Some("00001")).await.unwrap();
+        assert_eq!(fm.folders.read().await[&id].pending_len(),9999);
+        drop(fm);
+        let restored=FolderDownloadManager::new(temp.path().to_path_buf());
+        restored.set_wal_dir(temp.path().to_path_buf()).await;
+        assert_eq!(restored.restore_folders().await,(1,0));
+        assert_eq!(restored.folders.read().await[&id].pending_len(),10000);
+        assert!(restored.folders.read().await[&id].pending_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_backpressure_releases_on_consumption_and_cancel() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+        let mut folder = FolderDownload::new("/remote".into(), PathBuf::from("./local"));
+        let id = folder.id.clone();
+        folder.pending_files = (0..FOLDER_SCAN_PENDING_HIGH_WATER).map(|n| PendingFile {
+            fs_id: n as u64 + 1, filename: format!("{n}"), remote_path: format!("/remote/{n}"),
+            relative_path: format!("{n}"), size: 1,
+        }).collect();
+        fm.folders.write().await.insert(id.clone(), folder);
+        let token = CancellationToken::new();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), fm.wait_for_scan_capacity(&id, &token)).await.is_err());
+        fm.folders.write().await.get_mut(&id).unwrap().pending_files.pop();
+        assert!(fm.wait_for_scan_capacity(&id, &token).await);
+        token.cancel();
+        assert!(!fm.wait_for_scan_capacity(&id, &token).await);
+    }
+
+    #[tokio::test]
+    async fn persisted_child_removal_is_throttled_and_flushed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fm = FolderDownloadManager::new(temp.path().to_path_buf());
+        *fm.wal_dir.write().await = Some(temp.path().to_path_buf());
+        let mut folder = FolderDownload::new("/remote".into(), temp.path().join("local"));
+        let id = folder.id.clone();
+        folder.pending_files.push(PendingFile { fs_id: 42, filename: "a".into(), remote_path: "/remote/a".into(), relative_path: "a".into(), size: 1 });
+        fm.folders.write().await.insert(id.clone(), folder);
+        fm.persist_folder(&id).await;
+        fm.drop_pending_file_after_persist(&id, 42, "task-42", Some("a")).await.unwrap();
+        assert!(fm.folders.read().await[&id].pending_files.is_empty());
+        assert!(fm.persist_throttle.read().await.dirty.contains(&id));
+        assert_eq!(crate::persistence::folder::load_folder(temp.path(), &id).unwrap().unwrap().pending_files.len(), 1);
+        fm.flush_dirty_folders(true).await;
+        assert!(crate::persistence::folder::load_folder(temp.path(), &id).unwrap().unwrap().pending_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_scan_waits_for_scan_completion() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+        let mut folder = FolderDownload::new("/stream".into(), PathBuf::from("./stream"));
+        folder.total_files = 1;
+        folder.completed_count = 1;
+        let id = folder.id.clone();
+        fm.folders.write().await.insert(id.clone(), folder);
+        fm.finalize_folder_if_done(&id).await;
+        assert_eq!(fm.folders.read().await[&id].status, FolderStatus::Scanning);
+        {
+            let mut folders = fm.folders.write().await;
+            let folder = folders.get_mut(&id).unwrap();
+            folder.scan_completed = true;
+            folder.mark_downloading();
+        }
+        fm.finalize_folder_if_done(&id).await;
+        assert_eq!(fm.folders.read().await[&id].status, FolderStatus::Completed);
+    }
 
     /// 全局单例按账号筛选：同一 backup_config 下不同账号的文件夹互不可见
     #[tokio::test]
@@ -6575,5 +7254,246 @@ mod priority_tests {
             .expect("用户手动发起的下载应能抢占后台任务");
         assert_eq!(slot_id, 0);
         assert_eq!(preempted.as_deref(), Some("share-sync-file"));
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fast_child_runs_before_slow_sibling_finishes() {
+        let token = CancellationToken::new();
+        let child_started = Arc::new(tokio::sync::Notify::new());
+        let signal = child_started.clone();
+        let run = bfs_scan_dirs(vec!["root".into()], 2, &token, move |dir: String| {
+            let signal = signal.clone();
+            async move {
+                match dir.as_str() {
+                    "root" => Ok(vec!["slow".into(), "fast".into()]),
+                    "slow" => {
+                        tokio::time::timeout(std::time::Duration::from_secs(1), signal.notified())
+                            .await.map_err(|_| anyhow!("慢目录阻塞了其他分支的子目录"))?;
+                        Ok(vec![])
+                    }
+                    "fast" => Ok(vec!["child".into()]),
+                    "child" => { signal.notify_one(); Ok(vec![]) }
+                    _ => unreachable!(),
+                }
+            }
+        });
+        assert_eq!(run.await.unwrap().len(), 4);
+    }
+
+    // ==================== 目录树扫描调度（bfs_scan_dirs）====================
+
+    /// 构造一棵固定目录树：
+    /// `/root` → `/a`,`/b`,`/c`；`/a`→`/a1`，`/b`→`/b1`，`/c`→`/c1`；叶子无子目录。
+    fn sample_tree() -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            (
+                "/root".to_string(),
+                vec!["/a".to_string(), "/b".to_string(), "/c".to_string()],
+            ),
+            ("/a".to_string(), vec!["/a1".to_string()]),
+            ("/b".to_string(), vec!["/b1".to_string()]),
+            ("/c".to_string(), vec!["/c1".to_string()]),
+        ])
+    }
+
+    /// 记录"同时在跑的 list 请求数"峰值与调用过的目录
+    struct ScanProbe {
+        inflight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// 测试用的"列目录"future：所有捕获都是自有数据，因此可以 `'static`
+    type BoxedLister =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>>> + Send>>;
+
+    impl ScanProbe {
+        fn new() -> Self {
+            Self {
+                inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// 生成一个"列目录"闭包：睡眠 `delay_ms` 模拟 RTT，并统计并发峰值。
+        fn lister(
+            &self,
+            tree: HashMap<String, Vec<String>>,
+            delay_ms: u64,
+        ) -> impl Fn(String) -> BoxedLister + Send + Sync + '_ {
+            move |dir: String| {
+                use std::sync::atomic::Ordering::SeqCst;
+                let inflight = self.inflight.clone();
+                let peak = self.peak.clone();
+                let calls = self.calls.clone();
+                let tree = tree.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, SeqCst);
+                    let cur = inflight.fetch_add(1, SeqCst) + 1;
+                    peak.fetch_max(cur, SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    inflight.fetch_sub(1, SeqCst);
+                    Ok(tree.get(&dir).cloned().unwrap_or_default())
+                })
+            }
+        }
+    }
+
+    /// 并发不超过上限，每个父目录先于自己的子目录，所有目录被访问。
+    #[tokio::test]
+    async fn test_bfs_scan_dirs_concurrency_and_level_order() {
+        let probe = ScanProbe::new();
+        let token = CancellationToken::new();
+
+        let visited = bfs_scan_dirs(
+            vec!["/root".to_string()],
+            3,
+            &token,
+            probe.lister(sample_tree(), 30),
+        )
+        .await
+        .expect("扫描应成功");
+
+        assert_eq!(visited.len(), 7);
+        assert_eq!(visited[0], "/root");
+        for parent in ["/a", "/b", "/c"] {
+            let parent_index = visited.iter().position(|d| d == parent).unwrap();
+            let child_index = visited.iter().position(|d| d == &format!("{parent}1")).unwrap();
+            assert!(parent_index < child_index);
+        }
+        // 第 2 层有 3 个目录，并发上限 3 → 峰值应恰好打满
+        assert_eq!(probe.peak(), 3, "同层应并发到上限");
+        assert_eq!(probe.calls(), 7, "每个目录恰好列一次");
+    }
+
+    /// concurrency = 1 必须退回完全串行（也是出问题时的回滚开关）
+    #[tokio::test]
+    async fn test_bfs_scan_dirs_serial_when_concurrency_one() {
+        let probe = ScanProbe::new();
+        let token = CancellationToken::new();
+
+        let visited = bfs_scan_dirs(
+            vec!["/root".to_string()],
+            1,
+            &token,
+            probe.lister(sample_tree(), 5),
+        )
+        .await
+        .expect("扫描应成功");
+
+        assert_eq!(visited.len(), 7);
+        assert_eq!(probe.peak(), 1, "并发上限为 1 时不应有重叠请求");
+    }
+
+    /// 单目录失败立即向上传播，不再派发后续目录。
+    #[tokio::test]
+    async fn test_bfs_scan_dirs_propagates_error() {
+        let token = CancellationToken::new();
+        let requested: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let requested_inner = requested.clone();
+
+        let result: Result<Vec<String>> =
+            bfs_scan_dirs(vec!["/root".to_string()], 1, &token, move |dir: String| {
+                let requested = requested_inner.clone();
+                async move {
+                    requested.lock().unwrap().push(dir.clone());
+                    if dir == "/b" {
+                        anyhow::bail!("模拟 API error -9");
+                    }
+                    Ok(match dir.as_str() {
+                        "/root" => vec!["/a".to_string(), "/b".to_string(), "/c".to_string()],
+                        "/a" => vec!["/a1".to_string()],
+                        _ => vec![],
+                    })
+                }
+            })
+            .await;
+
+        let err = result.expect_err("应把错误抛给调用方");
+        assert!(err.to_string().contains("-9"), "错误信息应透传: {err}");
+
+        let requested = requested.lock().unwrap().clone();
+        assert_eq!(requested, vec!["/root", "/a", "/b"]);
+        assert!(
+            !requested.iter().any(|d| d.ends_with('1')),
+            "子层不应被启动: {requested:?}"
+        );
+    }
+
+    /// 已取消时不应再发任何列目录请求
+    #[tokio::test]
+    async fn test_bfs_scan_dirs_stops_when_cancelled() {
+        let probe = ScanProbe::new();
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let visited = bfs_scan_dirs(
+            vec!["/root".to_string()],
+            4,
+            &token,
+            probe.lister(sample_tree(), 1),
+        )
+        .await
+        .expect("取消不是错误");
+
+        assert!(visited.is_empty(), "取消后不应访问任何目录");
+        assert_eq!(probe.calls(), 0);
+    }
+
+    /// 扫描**中途**被取消时，`bfs_scan_dirs` 依然返回 `Ok`（只是提前收工）。
+    ///
+    /// 这条语义正是 `scan_folder_and_create_tasks` 必须在扫描后单独判
+    /// `cancel_token.is_cancelled()` 的原因：不能凭 `Ok` 就认定"扫完了"，
+    /// 否则暂停后被打了 `scan_completed=true`，继续时直接进下载，没扫到的文件永久丢失。
+    #[tokio::test]
+    async fn test_bfs_scan_dirs_returns_ok_when_cancelled_midway() {
+        let token = CancellationToken::new();
+        let token_inner = token.clone();
+        let requested: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let requested_inner = requested.clone();
+
+        let result = bfs_scan_dirs(
+            vec!["/root".to_string()],
+            1,
+            &token,
+            move |dir: String| {
+                let requested = requested_inner.clone();
+                let token = token_inner.clone();
+                async move {
+                    requested.lock().unwrap().push(dir.clone());
+                    // 第一个目录列完就"用户点了暂停"
+                    token.cancel();
+                    Ok(match dir.as_str() {
+                        "/root" => vec!["/a".to_string(), "/b".to_string()],
+                        _ => vec![],
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "取消不是错误，会走 Ok 分支");
+        let visited = result.unwrap();
+        assert_eq!(visited, vec!["/root".to_string()], "只扫到一半，子层未下探");
+        assert_eq!(
+            requested.lock().unwrap().clone(),
+            vec!["/root".to_string()],
+            "取消后不应继续列子目录"
+        );
+        assert!(token.is_cancelled(), "调用方必须能从 token 判断这是半途而废");
     }
 }

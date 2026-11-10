@@ -288,7 +288,7 @@ async fn get_snapshot(state: &AppState) -> WsServerMessage {
     let folders: Vec<serde_json::Value> = {
         state
             .folder_download_manager
-            .get_all_folders()
+            .get_folder_api_snapshots()
             .await
             .into_iter()
             .filter_map(|f| serde_json::to_value(&f).ok())

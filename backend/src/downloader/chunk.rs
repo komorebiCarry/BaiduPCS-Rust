@@ -278,6 +278,15 @@ impl Chunk {
                         progress_callback(pending_progress);
                     }
                     self.bytes_downloaded += total_bytes_downloaded;
+
+                    // 🔧 修复：确保已写入数据落盘，防止进程崩溃时数据丢失
+                    if let Err(e) = file.flush().await {
+                        warn!(
+                            "[分片线程{}] 分片 #{} 取消时 flush 失败: {}",
+                            chunk_thread_id, self.index, e
+                        );
+                    }
+
                     info!(
                         "[分片线程{}] 分片 #{} 流式读取被取消，本次已下载 {} bytes，累计 {} bytes",
                         chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
@@ -294,6 +303,15 @@ impl Chunk {
                                 progress_callback(pending_progress);
                             }
                             self.bytes_downloaded += total_bytes_downloaded;
+
+                            // 🔧 修复：确保已写入数据落盘
+                            if let Err(flush_err) = file.flush().await {
+                                warn!(
+                                    "[分片线程{}] 分片 #{} 读取错误后 flush 失败: {}",
+                                    chunk_thread_id, self.index, flush_err
+                                );
+                            }
+
                             warn!(
                                 "[分片线程{}] 分片 #{} 读取数据流失败，本次已下载 {} bytes，累计 {} bytes",
                                 chunk_thread_id, self.index, total_bytes_downloaded, self.bytes_downloaded
@@ -307,6 +325,15 @@ impl Chunk {
                                 progress_callback(pending_progress);
                             }
                             self.bytes_downloaded += total_bytes_downloaded;
+
+                            // 🔧 修复：确保已写入数据落盘
+                            if let Err(flush_err) = file.flush().await {
+                                warn!(
+                                    "[分片线程{}] 分片 #{} 读取超时后 flush 失败: {}",
+                                    chunk_thread_id, self.index, flush_err
+                                );
+                            }
+
                             warn!(
                                 "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，本次已下载 {} bytes，累计 {} bytes",
                                 chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded, self.bytes_downloaded

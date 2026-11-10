@@ -77,10 +77,10 @@ pub async fn create_folder_download(
     );
 
     // 如果未指定策略，从 AppConfig 读取默认值
-    let conflict_strategy = req.conflict_strategy.or_else(|| {
-        let config = app_state.config.blocking_read();
-        Some(config.conflict_strategy.default_download_strategy)
-    });
+    let conflict_strategy = match req.conflict_strategy {
+        Some(strategy) => Some(strategy),
+        None => Some(app_state.config.read().await.conflict_strategy.default_download_strategy),
+    };
 
     // 🔥 解析 effective_uid
     // 优先使用前端显式 `req.uid`（owner_uid alias），否则回退到 active_uid。
@@ -130,7 +130,7 @@ pub async fn get_all_folder_downloads(
     // 这些不应出现在「下载管理」，由对应业务页（分享同步）展示。
     let folders: Vec<FolderDownload> = app_state
         .folder_download_manager
-        .get_all_folders()
+        .get_folder_api_snapshots()
         .await
         .into_iter()
         .filter(|f| f.backup_config_id.is_none())
@@ -146,7 +146,7 @@ pub async fn get_folder_download(
 ) -> Result<Json<ApiResponse<FolderDownload>>, StatusCode> {
     match app_state
         .folder_download_manager
-        .get_folder(&folder_id)
+        .get_folder_api_snapshot(&folder_id)
         .await
     {
         Some(folder) => Ok(Json(ApiResponse::success(folder))),
@@ -163,17 +163,25 @@ pub async fn get_folder_download(
 ///
 /// 单独开接口而不是塞进文件夹列表：明细条数与文件数同量级，塞进列表会让大文件夹的
 /// 列表响应显著膨胀（`skipped_entries` 因此标了 `skip_serializing`）。
+#[derive(Debug, Default, Deserialize)]
+pub struct SkippedPageQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
 pub async fn get_folder_skipped_files(
     State(app_state): State<AppState>,
     Path(folder_id): Path<String>,
+    Query(page): Query<SkippedPageQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::downloader::folder::SkippedFile>>>, StatusCode> {
     match app_state
         .folder_download_manager
-        .get_folder(&folder_id)
+        .skipped_page(&folder_id, page.offset.unwrap_or(0), page.limit.unwrap_or(500).clamp(1,1000))
         .await
     {
-        Some(folder) => Ok(Json(ApiResponse::success(folder.skipped_entries))),
-        None => Err(StatusCode::NOT_FOUND),
+        Ok(Some(files)) => Ok(Json(ApiResponse::success(files))),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => { error!("读取跳过明细失败: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) },
     }
 }
 
@@ -232,6 +240,16 @@ pub async fn get_all_downloads_mixed(
 
     let mut items: Vec<DownloadItem> = Vec::new();
 
+    // 🔥 文件夹速度快照（跨子任务累计字节差分）
+    //
+    // 与 WebSocket 的进度事件同源，保证「实时推送」和「列表刷新」两条路径显示一致。
+    // 逐子任务求和在这里对海量小文件是失效的：小文件几十毫秒就下完，各子任务自己的
+    // SpeedCalculator 达不到 1 秒预热门槛，速度恒为 0。
+    let folder_speed_snapshot = app_state
+        .folder_download_manager
+        .folder_speeds_snapshot()
+        .await;
+
     // 添加单文件任务（排除属于文件夹的）
     for task in all_tasks.iter() {
         if task.group_id.is_none() {
@@ -241,17 +259,26 @@ pub async fn get_all_downloads_mixed(
 
     // 添加文件夹任务
     for mut folder in folders {
-        // 计算该文件夹的聚合速度（仅从活跃子任务）
+        // 计算该文件夹的聚合速度
+        //
+        // 主口径是 `folder_speeds` 的累计字节差分（对海量小文件有效）；子任务速度求和
+        // 只作兜底 —— 文件夹刚启动、速度计还在预热（不足 1 秒）时它可能是 0，
+        // 而大文件场景下逐任务速度本来就是准的，取两者较大值不会丢信息。
         let folder_tasks: Vec<&DownloadTask> = all_tasks
             .iter()
             .filter(|t| t.group_id.as_deref() == Some(&folder.id))
             .collect();
 
-        let speed: u64 = folder_tasks
+        let task_speed_sum: u64 = folder_tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Downloading)
             .map(|t| t.speed)
             .sum();
+        let speed = folder_speed_snapshot
+            .get(&folder.id)
+            .copied()
+            .unwrap_or(0)
+            .max(task_speed_sum);
 
         // 使用文件夹自身维护的 completed_count（由 start_task_completed_listener 递增）
         // 不再从内存子任务重新计数，因为已完成的任务会被移除

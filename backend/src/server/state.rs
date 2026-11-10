@@ -459,6 +459,33 @@ impl AppState {
         let folder_download_manager = Arc::new(FolderDownloadManager::new(
             config.download.download_dir.clone(),
         ));
+
+        // 🔥 创建并注入小文件优化适配器
+        {
+            let db_path = std::path::PathBuf::from(&config.persistence.db_path);
+            match rusqlite::Connection::open(&db_path) {
+                Ok(conn) => {
+                    let db = Arc::new(tokio::sync::Mutex::new(conn));
+                    match crate::downloader::SmallFileOptimizationAdapter::new(&config, db) {
+                        Ok(adapter) => {
+                            info!("✅ 小文件优化适配器已创建");
+                            let adapter_arc = Arc::new(adapter);
+                            let fdm = Arc::clone(&folder_download_manager);
+                            tokio::spawn(async move {
+                                fdm.set_small_file_adapter(adapter_arc).await;
+                                info!("✅ 小文件优化适配器已注入到 FolderDownloadManager");
+                            });
+                        }
+                        Err(e) => {
+                            warn!("小文件优化适配器创建失败: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("无法打开数据库用于小文件优化: {}", e);
+                }
+            }
+        }
         // 🔥 待办文件补任务兜底循环：拿不到槽位而退回 pending_files 的文件，
         //    在文件夹一个子任务都没在跑时没有任何事件驱动，靠这个循环兜住
         folder_download_manager.start_pending_refill_loop();

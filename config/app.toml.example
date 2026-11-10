@@ -15,11 +15,17 @@ cors_origins = ["*"]
 # 默认下载目录
 download_dir = "downloads"
 
-# 并发下载分片数（建议: 4-16）
-concurrent_chunks = 8
+# 全局最大线程数（所有下载任务共享）
+# 普通用户请填 1；普通会员 10；SVIP 建议 10-20（不建议超过 20）
+# 注意：调大只对"大文件"有效，<=10MB 的文件固定单连接，靠 max_concurrent_tasks 提升并发
+max_global_threads = 15
 
-# 每个分片的大小（单位: MB，建议: 5-20）
-chunk_size_mb = 10
+# 每个分片的大小（单位: MB）
+chunk_size_mb = 5
+
+# 最大同时下载文件数（海量小文件时这个值才是吞吐的真正开关）
+# 普通用户 1，普通会员 3，SVIP 5
+max_concurrent_tasks = 5
 
 # 下载失败后的最大重试次数
 max_retries = 3
@@ -68,4 +74,35 @@ cleanup_on_failure = true
 # 启动时是否清理孤立的临时目录（不属于任何活跃任务的目录）
 # 默认关闭，避免误删用户数据
 cleanup_orphaned_on_startup = false
+
+# ───────── 多账号 / 按 VIP 等级的并发推荐值 ─────────
+#
+# ⚠️ 重要：账号的 auto_apply_recommended 默认为 true，此时下载/上传的
+#   max_global_threads 与 max_concurrent_tasks **以本表为准**，
+#   [download] / [upload] 里的同名配置不生效。
+#   想真正提高并发（尤其是海量小文件），必须改这里的值。
+#   核对方式：启动日志「创建下载管理器」里的「最大同时下载数」即为生效值。
+#
+# 等级参考：普通用户 1；会员 3~5；超级会员 10~15（过高容易触发风控 errno=132）
+[multi_account_vip_recommended.normal]
+threads = 1
+chunk_size_mb = 4
+max_concurrent_tasks = 1
+
+[multi_account_vip_recommended.vip]
+threads = 10
+chunk_size_mb = 4
+max_concurrent_tasks = 3
+
+[multi_account_vip_recommended.svip]
+threads = 15
+chunk_size_mb = 5
+max_concurrent_tasks = 5
+
+# 文件夹下载源码目录模式，默认关闭。匹配完整目录名，区分大小写；不下探匹配的子目录。
+# 对下一轮扫描生效，不清理已有文件或已创建的下载任务。
+# bin / obj / target 可能含有需要备份的产物，可从列表移除。
+[download.folder_exclude]
+enabled = false
+directory_names = ["node_modules", ".git", ".cache", ".next", ".nuxt", "target", "bin", "obj"]
 

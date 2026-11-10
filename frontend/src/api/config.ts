@@ -50,6 +50,7 @@ export interface ServerConfig {
 
 /// 下载配置
 export interface DownloadConfig {
+  folder_exclude?: { enabled: boolean; directory_names: string[] }
   download_dir: string
   default_directory?: string       // 用户设置的默认下载目录
   recent_directory?: string        // 最近使用的下载目录

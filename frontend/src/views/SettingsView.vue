@@ -213,6 +213,21 @@
                     </div>
                   </el-form-item>
 
+                  <el-form-item v-if="formData.download.folder_exclude" label="源码目录模式">
+                    <el-switch v-model="formData.download.folder_exclude.enabled" />
+                    <div class="form-tip">开启后，文件夹下载会跳过下列目录及其全部内容。默认关闭，对下一轮扫描生效；不会删除已下载文件。</div>
+                    <el-select
+                        v-model="formData.download.folder_exclude.directory_names"
+                        multiple filterable allow-create default-first-option
+                        :multiple-limit="64"
+                        placeholder="输入完整目录名后按回车添加"
+                        style="width: 100%; margin-top: 8px"
+                    >
+                      <el-option v-for="name in ['node_modules', '.git', '.cache', '.next', '.nuxt', 'target', 'bin', 'obj']" :key="name" :label="name" :value="name" />
+                    </el-select>
+                    <div class="form-tip">按完整目录名匹配，区分大小写，不支持通配符。bin、obj、target 可能包含需要保留的产物，可移除。仅过滤所选根目录下的子目录，不影响单文件下载和转存。</div>
+                  </el-form-item>
+
                   <el-form-item label="下载时选择目录" prop="download.ask_each_time">
                     <el-switch
                         v-model="formData.download.ask_each_time"
@@ -1447,6 +1462,12 @@ async function loadConfig() {
   try {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
+    if (formData.value && !formData.value.download.folder_exclude) {
+      formData.value.download.folder_exclude = {
+        enabled: false,
+        directory_names: ['node_modules', '.git', '.cache', '.next', '.nuxt', 'target', 'bin', 'obj'],
+      }
+    }
 
     // 初始化冲突策略配置（如果不存在则使用默认值）
     if (formData.value && !formData.value.conflict_strategy) {

@@ -30,6 +30,40 @@ const MAX_BACKOFF_MS: u64 = 5000;
 /// 最少保留链接数
 const MIN_AVAILABLE_LINKS: usize = 2;
 
+/// 下载链接预取缓存的有效期（秒）
+///
+/// Locate 返回的 dlink 带时效签名，超过有效期直接换新链接即可（缓存过期只是回退到
+/// 同步取链，不会失败）。取 8 分钟：比 CDN 定时刷新（10 分钟）略短，保证命中的链接
+/// 一定是"新鲜"的。
+const LINK_PREFETCH_TTL_SECS: u64 = 8 * 60;
+
+/// 预取取链的并发上限
+///
+/// 海量小文件的瓶颈是每个文件一次 Locate 的 RTT。把取链提前到任务入队阶段可以隐藏
+/// 这段等待，但**不能**无限并发——百度风控看的是请求频次，取链请求打太密会直接把
+/// 账号打到 errno=132/8002。
+///
+/// 取 8 的依据：单次 Locate 实测约 0.7s，8 并发对应约 11 次/秒的取链能力，足以
+/// 喂饱 5 个下载槽位（小文件场景实测约 3~5 文件/秒，每个文件恰好一次 Locate）。
+/// 取 2 时取链能力只有 ~2.8 次/秒，反而成为新瓶颈。若出现 132/8002，先降这里。
+const LINK_PREFETCH_CONCURRENCY: usize = 8;
+
+/// 预取缓存条目上限
+///
+/// 批量创建任务（如一次提交上千个小文件）时避免无界增长。超限后不再预取，退化为
+/// 原来的同步取链，功能不受影响。
+const LINK_PREFETCH_MAX_ENTRIES: usize = 256;
+
+/// 「并发环境变化 → 主动刷新链接」这条路径的文件大小豁免阈值
+///
+/// 该机制的本意是：其他任务结束后带宽释放，重新拉一批链接让当前任务吃满带宽。
+/// 但小文件任务在这个事件发生后的存活时间只有几十毫秒，刷新根本来不及产生收益，
+/// 反而每个完成事件都会让别的活跃任务白打一次 Locate。
+///
+/// 实测海量小文件时，941 个任务的窗口内该路径贡献了 798 次刷新，占全部 Locate
+/// 请求的约一半 —— 全是没有回报的风控额度消耗。
+const CONCURRENCY_REFRESH_MIN_FILE_SIZE: u64 = 5 * 1024 * 1024;
+
 /// 「部分数据」续传一轮算作有效进展的最小净增字节数（issue #156）
 ///
 /// 分片上限是百度的 5MB Range 硬限，正常断流续传一轮少说也有几百 KB；
@@ -247,6 +281,27 @@ fn is_permanent_http_error(err: &anyhow::Error) -> bool {
 fn calculate_backoff_delay(retry_count: u32) -> u64 {
     let delay = INITIAL_BACKOFF_MS * 2u64.pow(retry_count);
     delay.min(MAX_BACKOFF_MS)
+}
+
+/// 🔧 安全的速度排序辅助函数（防止 NaN 导致 panic）
+///
+/// # 排序规则
+/// - 正常值按升序排序
+/// - NaN 值排到最后（视为最慢）
+/// - 两个 NaN 视为相等
+///
+/// # 为什么需要这个函数
+/// f64::partial_cmp 在遇到 NaN 时返回 None，直接 unwrap() 会 panic。
+/// 虽然速度值理论上不应该是 NaN，但在网络异常、除零错误等极端情况下可能出现。
+fn safe_sort_speeds(speeds: &mut [f64]) {
+    speeds.sort_by(|a, b| {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater, // NaN 排到最后
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
 }
 
 /// URL 健康状态管理器
@@ -772,7 +827,7 @@ impl UrlHealthManager {
         }
 
         let mut speeds: Vec<f64> = window.iter().copied().collect();
-        speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        safe_sort_speeds(&mut speeds);
 
         let mid = speeds.len() / 2;
         let median = if speeds.len().is_multiple_of(2) {
@@ -811,7 +866,7 @@ impl UrlHealthManager {
 
         // 对所有链接的窗口 median 再求中位数
         let mut sorted_medians = medians;
-        sorted_medians.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        safe_sort_speeds(&mut sorted_medians);
 
         let mid = sorted_medians.len() / 2;
         let global_median = if sorted_medians.len().is_multiple_of(2) {
@@ -1174,6 +1229,15 @@ impl UrlHealthManager {
     }
 }
 
+/// 一条预取到的下载链接
+#[derive(Debug, Clone)]
+struct PrefetchedLinks {
+    /// Locate 返回的可用链接列表
+    urls: Vec<String>,
+    /// 取链完成时刻，用于判断是否超过 [`LINK_PREFETCH_TTL_SECS`]
+    cached_at: std::time::Instant,
+}
+
 /// 下载引擎
 #[derive(Debug, Clone)]
 pub struct DownloadEngine {
@@ -1205,6 +1269,22 @@ pub struct DownloadEngine {
     /// 达到阈值触发降级并重置。字段名中的 `h2` 仅为历史命名，语义上
     /// 等价于「连续零字节失败计数」。
     consecutive_h2_zero_failures: Arc<AtomicU32>,
+
+    /// 🔥 下载链接预取缓存（`remote_path` → 已取到的 dlink 列表）
+    ///
+    /// 海量小文件场景下，每个文件的开销大头是「取链 RTT」而不是传输时间：
+    /// 1MB 文件约 0.3s 下完，而一次 Locate 往返同样量级，且它串行卡在下载前。
+    /// 任务**入队时**就后台取链并缓存在这里，等槽位空出来真正开跑时直接命中，
+    /// 把这段等待从关键路径上移走。缓存被消费即删除（一个文件一个任务）。
+    link_prefetch_cache: Arc<DashMap<String, PrefetchedLinks>>,
+
+    /// 🔥 预取在途标记
+    ///
+    /// 同一路径只允许一个预取在飞，避免重复取链浪费额度、也避免把风控打爆。
+    link_prefetch_inflight: Arc<DashMap<String, ()>>,
+
+    /// 🔥 预取并发闸门（见 [`LINK_PREFETCH_CONCURRENCY`]）
+    link_prefetch_sem: Arc<Semaphore>,
 }
 
 impl DownloadEngine {
@@ -1251,6 +1331,9 @@ impl DownloadEngine {
             fallback_mgr,
             http11_downgrade_until: Arc::new(StdRwLock::new(None)),
             consecutive_h2_zero_failures: Arc::new(AtomicU32::new(0)),
+            link_prefetch_cache: Arc::new(DashMap::new()),
+            link_prefetch_inflight: Arc::new(DashMap::new()),
+            link_prefetch_sem: Arc::new(Semaphore::new(LINK_PREFETCH_CONCURRENCY)),
         }
     }
 
@@ -1798,7 +1881,111 @@ impl DownloadEngine {
         ))
     }
 
+    /// 预取指定路径的下载链接（后台执行，不阻塞调用方）
+    ///
+    /// # 为什么需要
+    ///
+    /// 海量小文件（1MB 级）的耗时大头不是传输，而是**每个文件一次 Locate 的 RTT**：
+    /// 取链和下载在 `download()` 里是严格串行的，文件本身 0.3s 下完，取链往返又是
+    /// 0.1~0.3s，等于凭空多出 30%~50% 的墙钟时间；而真正并发的只有"任务槽位数"
+    /// （普通 1 / 会员 3 / SVIP 5）条连接，这点延迟没法靠并发掩盖。
+    ///
+    /// 任务创建/入队时（`DownloadManager::create_task_internal` 与
+    /// `DownloadManager::add_task`）调用本方法，把取链提前到排队阶段；等槽位空出来
+    /// 真正开跑时，`acquire_download_urls` 直接命中缓存。
+    ///
+    /// # 风控
+    ///
+    /// 并发由 [`LINK_PREFETCH_CONCURRENCY`] 闸门限制，且同一路径在途去重 —— 每个文件
+    /// 的 Locate 次数与改造前**完全一致**（命中即消费，不重复取），只是发生得更早。
+    /// 缓存条目上限 [`LINK_PREFETCH_MAX_ENTRIES`]，超限退化为同步取链。
+    pub fn prefetch_download_urls(&self, remote_path: String) {
+        // 已有缓存 / 缓存已满 → 不预取
+        if self.link_prefetch_cache.len() >= LINK_PREFETCH_MAX_ENTRIES
+            || self.link_prefetch_cache.contains_key(&remote_path)
+        {
+            return;
+        }
+
+        // 在途去重：insert 返回 Some 说明已有同路径预取在飞
+        if self.link_prefetch_inflight.insert(remote_path.clone(), ()).is_some() {
+            return;
+        }
+
+        let cache = Arc::clone(&self.link_prefetch_cache);
+        let inflight = Arc::clone(&self.link_prefetch_inflight);
+        let sem = Arc::clone(&self.link_prefetch_sem);
+        // 先克隆出客户端再进 spawn：NetdiskClient 内部是 Arc + tokio::Mutex，
+        // 克隆成本很低；同时避免把 std RwLock 的读锁跨 await 持有（那不是 Send）。
+        let client = self.get_netdisk_client();
+
+        tokio::spawn(async move {
+            // acquire_owned：拿 OwnedSemaphorePermit，不借用 sem，
+            // 免得把跨 await 的借用带进 spawn 的 future 里
+            let _permit = match Arc::clone(&sem).acquire_owned().await {
+                Ok(p) => p,
+                // 闸门被关闭（进程退出）→ 放弃预取
+                Err(_) => {
+                    inflight.remove(&remote_path);
+                    return;
+                }
+            };
+
+            match client.get_locate_download_url(&remote_path).await {
+                Ok(urls) if !urls.is_empty() => {
+                    debug!(
+                        "⚡ 预取下载链接成功: path={}, 链接数={}",
+                        remote_path,
+                        urls.len()
+                    );
+                    cache.insert(
+                        remote_path.clone(),
+                        PrefetchedLinks {
+                            urls,
+                            cached_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+                Ok(_) => {
+                    debug!("预取下载链接返回空列表，留给任务启动时重新取链: {}", remote_path);
+                }
+                Err(e) => {
+                    // 预取失败不影响任务：任务启动时会再走一次同步取链（含风控重试）
+                    debug!("预取下载链接失败(已忽略): path={}, err={}", remote_path, e);
+                }
+            }
+
+            // 无论成败都要清在途标记，否则该路径再也预取不了
+            inflight.remove(&remote_path);
+        });
+    }
+
+    /// 取出预取到的下载链接（消费语义：取走即删除）
+    ///
+    /// 返回 `None` 表示未命中 / 已过期，调用方应回退到同步取链。
+    fn take_prefetched_urls(&self, remote_path: &str) -> Option<Vec<String>> {
+        let (_, entry) = self.link_prefetch_cache.remove(remote_path)?;
+
+        let ttl = std::time::Duration::from_secs(LINK_PREFETCH_TTL_SECS);
+        if entry.cached_at.elapsed() > ttl {
+            debug!("预取链接已过期，回退同步取链: {}", remote_path);
+            return None;
+        }
+        if entry.urls.is_empty() {
+            return None;
+        }
+
+        info!(
+            "⚡ 命中预取下载链接，跳过取链往返: path={}, 链接数={}",
+            remote_path,
+            entry.urls.len()
+        );
+        Some(entry.urls)
+    }
+
     /// 获取下载链接（Locate）。
+    ///
+    /// 优先命中 [`Self::prefetch_download_urls`] 预取的缓存，未命中才真正发请求。
     ///
     /// Locate（pcs/file?method=locatedownload）对部分资源会偶发返回临时风控错误
     /// （errno=8002「参数异常,请更新最新版本客户端」、errno=9019「need verify」）。
@@ -1807,6 +1994,28 @@ impl DownloadEngine {
     ///
     /// 返回的链接列表保证非空，否则返回 Err。
     async fn acquire_download_urls(&self, remote_path: &str) -> Result<Vec<String>> {
+        if let Some(urls) = self.take_prefetched_urls(remote_path) {
+            return Ok(urls);
+        }
+
+        // 🔥 有在途预取时先等它一小会儿，别急着重复打一次 Locate。
+        //
+        // 预取和任务启动是并发的：任务刚轮到启动时，它的预取往往还差最后几十毫秒。
+        // 此时直接同步取链会白打一次请求（~700ms 等待 + 一份风控额度），而等预取
+        // 通常只需几十毫秒。上限 300ms —— 超过就说明预取卡住了，直接同步取链更快。
+        // 预取结束（无论成败）会清掉在途标记，循环随即退出，不会空等到上限。
+        if self.link_prefetch_inflight.contains_key(remote_path) {
+            for _ in 0..15 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if let Some(urls) = self.take_prefetched_urls(remote_path) {
+                    return Ok(urls);
+                }
+                if !self.link_prefetch_inflight.contains_key(remote_path) {
+                    break;
+                }
+            }
+        }
+
         let urls = self
             .get_netdisk_client()
             .get_locate_download_url(remote_path)
@@ -2856,7 +3065,8 @@ impl DownloadEngine {
                     if !matches!(
                         change,
                         Some(crate::downloader::ConcurrencyChange::Increased { .. })
-                    ) {
+                    ) && total_size > CONCURRENCY_REFRESH_MIN_FILE_SIZE
+                    {
                         if let Some(_guard) = refresh_coordinator.try_acquire() {
                             info!("🔄 活跃任务减少，主动刷新下载链接");
                             match engine

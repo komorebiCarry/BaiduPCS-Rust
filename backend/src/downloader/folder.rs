@@ -51,6 +51,10 @@ pub struct SkippedFile {
 /// 文件夹下载任务组
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderDownload {
+    #[serde(skip)]
+    pub file_store: Option<std::sync::Arc<crate::persistence::folder_files::FolderFileStore>>,
+    #[serde(skip)]
+    pub sqlite_files: bool,
     /// 文件夹ID
     pub id: String,
     /// 文件夹名称
@@ -233,6 +237,69 @@ pub struct FolderDownload {
 }
 
 impl FolderDownload {
+    pub fn pending_len(&self) -> usize {
+        self.file_store.as_ref().map_or(self.pending_files.len(), |s| s.pending_count())
+    }
+    pub fn has_pending(&self) -> bool { (self.sqlite_files && self.file_store.is_none()) || self.pending_len() != 0 }
+    pub fn load_pending_page(&mut self, limit: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.sqlite_files || self.file_store.is_some(), "文件级数据库尚未恢复，拒绝派发");
+        if let Some(store) = &self.file_store { self.pending_files = store.page(limit)?; }
+        Ok(())
+    }
+    pub fn is_completed_file(&self, fs_id:u64, task_id:&str) -> anyhow::Result<bool> {
+        match &self.file_store {
+            Some(s)=>s.is_completed(fs_id,task_id),
+            None=>Ok(if fs_id == 0 { self.counted_task_ids.contains(task_id) } else { self.counted_fs_ids.contains(&fs_id) }),
+        }
+    }
+    pub fn mark_skipped(&mut self, file:&PendingFile) -> anyhow::Result<bool> {
+        let inserted = if let Some(s)=&self.file_store { s.skip(file)? } else { true };
+        self.pending_files.retain(|p| p.relative_path != file.relative_path);
+        Ok(inserted)
+    }
+    pub fn append_skipped(&mut self, entries:&mut Vec<SkippedFile>) {
+        if self.file_store.is_some() { entries.clear(); } else { self.skipped_entries.append(entries); }
+    }
+    pub fn sync_file_totals(&mut self) -> anyhow::Result<()> {
+        if let Some(store)=&self.file_store {
+            let (done,bytes,skips,skip_bytes)=store.totals()?;
+            self.completed_count=self.completed_count.max(done);
+            self.completed_downloaded_size=self.completed_downloaded_size.max(bytes);
+            self.skipped_count=self.skipped_count.max(skips);
+            self.skipped_size=self.skipped_size.max(skip_bytes);
+            self.failed_count=store.failure_count()?;
+        }
+        Ok(())
+    }
+    /// API 投影：只复制可序列化字段，不复制扫描待办和运行时账本。
+    pub fn api_snapshot(&self) -> Self {
+        let mut snapshot = Self::new(self.remote_root.clone(), self.local_root.clone());
+        snapshot.id = self.id.clone();
+        snapshot.name = self.name.clone();
+        snapshot.status = self.status.clone();
+        snapshot.total_files = self.total_files;
+        snapshot.total_size = self.total_size;
+        snapshot.created_count = self.created_count;
+        snapshot.completed_count = self.completed_count;
+        snapshot.downloaded_size = self.downloaded_size;
+        snapshot.scan_completed = self.scan_completed;
+        snapshot.scan_progress = self.scan_progress.clone();
+        snapshot.created_at = self.created_at;
+        snapshot.started_at = self.started_at;
+        snapshot.completed_at = self.completed_at;
+        snapshot.error = self.error.clone();
+        snapshot.transfer_task_id = self.transfer_task_id.clone();
+        snapshot.backup_config_id = self.backup_config_id.clone();
+        snapshot.owner_uid = self.owner_uid;
+        snapshot.failure_reason = self.failure_reason.clone();
+        snapshot.skipped_count = self.skipped_count;
+        snapshot.skipped_size = self.skipped_size;
+        snapshot.completed_downloaded_size = self.completed_downloaded_size;
+        snapshot.file_store = self.file_store.clone();
+        snapshot.sqlite_files = self.sqlite_files;
+        snapshot
+    }
+
     /// 创建新的文件夹下载
     ///
     /// 🔥 修复：从 local_root 提取文件夹名称（解密后的原始名称）
@@ -246,6 +313,8 @@ impl FolderDownload {
             .to_string();
 
         Self {
+            file_store: None,
+            sqlite_files: false,
             id: Uuid::new_v4().to_string(),
             name,
             remote_root,
@@ -314,7 +383,7 @@ impl FolderDownload {
         if fs_id == 0 {
             return;
         }
-        self.counted_fs_ids.insert(fs_id);
+        if self.file_store.is_none() { self.counted_fs_ids.insert(fs_id); }
         self.pending_files.retain(|f| f.fs_id != fs_id);
     }
 
@@ -381,6 +450,26 @@ impl FolderDownload {
         if self.started_at.is_none() {
             self.started_at = Some(chrono::Utc::now().timestamp());
         }
+    }
+
+    /// 重扫前清空上一轮的扫描产物（累计计数 + 待办队列）
+    ///
+    /// `total_files` / `total_size` 是 `scan_one_dir` 里的 `+=` 累加器，全项目没有第二个
+    /// 写入点。扫描中途进程被杀时 `scan_completed` 仍是 `false`，而 `restore_folders` 会把
+    /// 快照原样恢复成 Paused —— 用户点继续就会从根目录重扫一遍。若不清零，同一批文件被
+    /// 二次累加：总数虚高后 `completed + skipped` 永远够不到，文件夹卡在 downloading 进不了
+    /// 终态；`pending_files` 里还会留下同一 `fs_id` 的两条记录，补任务时重复建任务、整文件重下。
+    ///
+    /// 只清「扫描产物」，不动 `completed_count` / `counted_fs_ids` 等下载账本 ——
+    /// 重启恢复时那些是既成事实，清了会导致重复下载。
+    pub fn reset_scan_result(&mut self) {
+        self.total_files = 0;
+        self.total_size = 0;
+        self.pending_files.clear();
+        self.scan_progress = None;
+        self.scan_completed = false;
+        // 加密目录映射是扫描过程收集的，重扫会重新收集；留着会和上一轮混在一起
+        self.encrypted_folder_mappings.clear();
     }
 
     /// 标记为已完成
@@ -450,7 +539,7 @@ impl FolderDownload {
     {
         tasks
             .into_iter()
-            .filter(|(id, _)| !self.counted_task_ids.contains(*id))
+            .filter(|(id, _)| !self.counted_task_ids.contains(*id) && self.file_store.as_ref().is_none_or(|s| !s.task_completed(id).unwrap_or(true)))
             .map(|(_, downloaded)| downloaded)
             .sum()
     }
@@ -459,6 +548,21 @@ impl FolderDownload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_snapshot_preserves_json_without_runtime_collections() {
+        let mut folder = FolderDownload::new("/remote".into(), PathBuf::from("./local"));
+        folder.pending_files.push(pending(42, "a.bin"));
+        folder.counted_fs_ids.insert(7);
+        folder.skipped_count = 2;
+        folder.skipped_size = 64;
+        folder.scan_progress = Some("/remote/sub".into());
+        let snapshot = folder.api_snapshot();
+        assert_eq!(serde_json::to_value(&folder).unwrap(), serde_json::to_value(&snapshot).unwrap());
+        assert!(snapshot.pending_files.is_empty());
+        assert!(snapshot.counted_fs_ids.is_empty());
+        assert_eq!(folder.pending_files.len(), 1);
+    }
 
     fn pending(fs_id: u64, name: &str) -> PendingFile {
         PendingFile {
@@ -493,6 +597,41 @@ mod tests {
             folder.pending_files.iter().any(|f| f.fs_id == 102),
             "未完成的文件不能被误删"
         );
+    }
+
+    /// 重扫必须清零累加器，否则"中断重启 → 继续"会让总数翻倍、文件夹永远收不了工。
+    ///
+    /// 场景：扫描到一半进程被杀 → 快照里 `total_files` 已有值、`scan_completed=false`
+    /// → 恢复成 Paused → 点继续 → `scan_folder_and_create_tasks` 从根目录重扫。
+    /// `total_files` 只在 `scan_one_dir` 里 `+=`，没有清零就会把同一批文件再加一遍。
+    #[test]
+    fn test_reset_scan_result_clears_accumulator_and_pending() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+        folder.total_files = 5;
+        folder.total_size = 5 * 1024;
+        folder.pending_files = vec![pending(1, "a.mp4"), pending(2, "b.mp4")];
+        folder.scan_progress = Some("/remote/sub".to_string());
+        folder
+            .encrypted_folder_mappings
+            .insert("enc".to_string(), "dec".to_string());
+        // 下载账本：重扫不该动
+        folder.completed_count = 3;
+        folder.counted_fs_ids.insert(9);
+
+        folder.reset_scan_result();
+
+        assert_eq!(folder.total_files, 0, "重扫前必须清零，否则同一批文件被二次累加");
+        assert_eq!(folder.total_size, 0, "字节数同理");
+        assert!(folder.pending_files.is_empty(), "上一轮的待办会被重扫重新灌入，留着会重复");
+        assert!(folder.scan_progress.is_none());
+        assert!(!folder.scan_completed);
+        assert!(
+            folder.encrypted_folder_mappings.is_empty(),
+            "加密目录映射由扫描过程收集，重扫会重建，混着上一轮会串"
+        );
+
+        assert_eq!(folder.completed_count, 3, "重扫不能动已完成的下载账");
+        assert!(folder.counted_fs_ids.contains(&9), "去重账本必须保留，否则会重复下载");
     }
 
     /// 重复完成（同一文件被两条路径各下了一遍）时也要自愈：

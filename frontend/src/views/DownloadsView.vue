@@ -129,7 +129,7 @@
                 <!-- 多账号 chip：只在多账号或非活跃任务上显示 -->
                 <AccountBadge :owner-uid="item.owner_uid" size="small" class="task-account-badge" />
                 <span v-if="item.type === 'folder' && item.status === 'scanning'" class="scanning-hint">
-                    (已发现 {{ item.total_files }} 个文件)
+                    (已完成 {{ item.completed_files || 0 }} / 已发现 {{ item.total_files }} 个文件)
                   </span>
                 <!-- 加密文件标识 -->
                 <el-tag v-if="item.is_encrypted" type="info" size="small">
@@ -373,6 +373,18 @@
             </template>
           </el-alert>
 
+          <div v-if="folderDetailDialog.skippedFiles > 0" style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px">
+            <span>跳过明细</span>
+            <el-pagination
+                small
+                layout="prev, pager, next"
+                :page-size="500"
+                :total="folderDetailDialog.skippedFiles"
+                :current-page="folderDetailDialog.skippedPage"
+                @current-change="changeSkippedPage"
+            />
+          </div>
+
           <el-table
               :data="filteredSubtasks"
               stripe
@@ -576,6 +588,7 @@ const folderDetailDialog = ref({
   totalFiles: 0,
   completedFiles: 0,
   skippedFiles: 0,
+  skippedPage: 1,
   downloadingFiles: 0,
   pendingFiles: 0,
   failedFiles: 0,
@@ -855,9 +868,18 @@ async function refreshTasks() {
 
 // 更新自动刷新状态
 function updateAutoRefresh() {
+  // 扫描态需要兜底轮询：扫描进度事件是"尽力而为"的（500ms 节流 + 批量通道可丢），
+  // 一旦丢帧，页面会停在旧计数上；而这阶段没有别的数据来源，只能靠低频拉取纠正。
+  const hasScanningTask = downloadItems.value.some(item => item.status === 'scanning')
+
   // 🔥 如果 WebSocket 已连接，不使用轮询（由 WebSocket 推送更新）
   if (wsConnected.value) {
-    if (refreshPoller.isRunning()) {
+    if (hasScanningTask) {
+      if (!refreshPoller.isRunning()) {
+        console.log('[DownloadsView] 存在扫描中任务，保留兜底轮询')
+        refreshPoller.start()
+      }
+    } else if (refreshPoller.isRunning()) {
       console.log('[DownloadsView] WebSocket 已连接，停止轮询')
       refreshPoller.stop()
     }
@@ -1165,6 +1187,7 @@ async function showFolderDetail(item: DownloadItemFromBackend) {
   folderDetailDialog.value.folderId = item.id
   folderDetailDialog.value.folderName = item.name || '未知文件夹'
   folderDetailDialog.value.searchText = ''
+  folderDetailDialog.value.skippedPage = 1
 
   const wsClient = getWebSocketClient()
 
@@ -1247,6 +1270,12 @@ function onFolderDetailClose() {
   // 🔥 主列表订阅保持不变（主列表一直需要订阅）
 }
 
+async function changeSkippedPage(page: number) {
+  folderDetailDialog.value.skippedPage = page
+  folderDetailAppliedSeq = ++folderDetailRequestSeq
+  await refreshFolderDetail()
+}
+
 // 刷新文件夹详情
 async function refreshFolderDetail() {
   const folderId = folderDetailDialog.value.folderId
@@ -1264,7 +1293,7 @@ async function refreshFolderDetail() {
     //    否则「全部跳过」的文件夹详情就是一片空白（issue #141 用户反馈）
     const [allTasks, skippedFiles] = await Promise.all([
       getAllDownloads(),
-      getFolderSkippedFiles(folderId).catch(() => []),
+      getFolderSkippedFiles(folderId, (folderDetailDialog.value.skippedPage - 1) * 500, 500).catch(() => []),
     ])
 
     // 🔥 防止异步响应覆盖：
@@ -1711,6 +1740,28 @@ function handleFolderEvent(event: FolderEvent) {
           owner_uid: event.owner_uid,
         } as DownloadItemFromBackend)
         mainListWsTime.set(folderId, Date.now())
+        // 进入扫描态 → 打开兜底轮询（扫描可能持续很久且事件稀疏）
+        updateAutoRefresh()
+      }
+      break
+
+    case 'scan_progress':
+      // 扫描阶段的进度感：只更新「已发现」计数，不碰状态与速度
+      //
+      // 扫描期事件是尽力而为的（500ms 节流 + 批量通道可丢），因此这里只做
+      // 单调递增的单向合并；真正的兜底由 scanning 态的低频轮询负责。
+      if (index !== -1) {
+        const currentStatus = downloadItems.value[index].status
+        if (currentStatus && ['paused', 'completed', 'failed', 'cancelled'].includes(currentStatus)) {
+          break
+        }
+        downloadItems.value[index].total_files = Math.max(
+            downloadItems.value[index].total_files ?? 0, event.scanned_files ?? 0
+        )
+        downloadItems.value[index].total_size = Math.max(
+            downloadItems.value[index].total_size ?? 0, event.scanned_size ?? 0
+        )
+        mainListWsTime.set(folderId, Date.now())
       }
       break
 
@@ -1748,7 +1799,16 @@ function handleFolderEvent(event: FolderEvent) {
         if (event.new_status !== 'downloading') {
           downloadItems.value[index].speed = 0
         }
+        // 进入扫描态 = 后端重扫（新任务或"暂停后继续"，后者会先清零累加器）。
+        // 这里同步清零，否则 scan_progress 的单调合并会一直压在上一次的旧值上，
+        // 数字看着像卡住了。
+        if (event.new_status === 'scanning') {
+          downloadItems.value[index].total_files = 0
+          downloadItems.value[index].total_size = 0
+        }
         mainListWsTime.set(folderId, Date.now())
+        // 扫描开始/结束会切换状态 → 重新评估是否需要兜底轮询
+        updateAutoRefresh()
       }
       break
 
@@ -1761,6 +1821,8 @@ function handleFolderEvent(event: FolderEvent) {
       }
       // 🔥 同步刷新详情弹窗统计（total_files 已变）
       updateFolderDetailStats()
+      // 扫描结束 → 可以停掉扫描态的兜底轮询
+      updateAutoRefresh()
       break
 
     case 'completed':

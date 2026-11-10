@@ -64,6 +64,29 @@ impl SpeedCalculator {
         self.record_snapshot(now);
     }
 
+    /// 直接用外部维护的**累计**字节数推进快照，并返回当前速度。
+    ///
+    /// 与 [`add_sample`](Self::add_sample) 的分工：`add_sample` 接收增量，供单个任务
+    /// 自己累加；本方法接收绝对累计值，供**跨任务**的场景把分散的字节流接成一条连续曲线。
+    ///
+    /// 为什么需要它：`MIN_MEASUREMENT_DURATION` 要求至少 1 秒的测量跨度，而海量小文件
+    /// 场景下每个子任务只有几十毫秒就结束 —— 每个子任务各自的 `SpeedCalculator` 永远
+    /// 达不到预热门槛，`speed()` 恒为 0，界面上表现为"下载在跑但速度一直是 0 B/s"。
+    /// 文件夹的累计已下载字节（`FolderDownload::downloaded_size`）是单调连续的量，
+    /// 对它做差分才反映真实吞吐。
+    ///
+    /// 累计值回退时（进度口径修正）直接接受新值：下一轮 `speed_at` 因
+    /// `saturating_sub` 得到 0，随后自然恢复，不会算出负速度或爆表速度。
+    pub fn observe_total(&mut self, total_bytes: u64) -> u64 {
+        self.observe_total_at(total_bytes, Instant::now())
+    }
+
+    fn observe_total_at(&mut self, total_bytes: u64, now: Instant) -> u64 {
+        self.total_bytes = total_bytes;
+        self.record_snapshot(now);
+        self.speed_at(now)
+    }
+
     fn refresh_at(&mut self, now: Instant) -> u64 {
         self.record_snapshot(now);
         self.speed_at(now)
@@ -235,6 +258,54 @@ mod tests {
         calc.add_sample_at(1024 * 1024, start + Duration::from_millis(500));
 
         assert_eq!(calc.speed_at(start + Duration::from_millis(500)), 0);
+    }
+
+    /// 海量小文件的回归测试：逐任务测速恒为 0，跨任务累计值差分才有速度。
+    ///
+    /// 每个小文件都是独立任务、独立 `SpeedCalculator`，各自只活 20ms —— 达不到
+    /// `MIN_MEASUREMENT_DURATION`，逐个算出来的速度全是 0，求和仍是 0。这正是
+    /// 「下载进度在涨、界面速度显示 0 B/s」的成因。
+    #[test]
+    fn test_observe_total_measures_speed_across_short_tasks() {
+        let start = Instant::now();
+        let file_size = 8 * 1024;
+
+        // 逐任务：每个任务只活 20ms，测不出速度
+        for i in 0..10 {
+            let mut per_task = SpeedCalculator::new(10);
+            let t0 = start + Duration::from_millis(i * 20);
+            per_task.observe_total_at(0, t0);
+            per_task.observe_total_at(file_size, t0 + Duration::from_millis(20));
+            assert_eq!(
+                per_task.speed_at(t0 + Duration::from_millis(20)),
+                0,
+                "单任务跨度不足 1 秒，必须报 0 而不是外推"
+            );
+        }
+
+        // 跨任务：文件夹累计字节连续推进，1 秒后能得到真实吞吐
+        let mut folder = SpeedCalculator::new(10);
+        folder.observe_total_at(0, start);
+        for i in 1..=10 {
+            folder.observe_total_at(file_size * i, start + Duration::from_millis(i * 100));
+        }
+        assert_eq!(
+            folder.speed_at(start + Duration::from_secs(1)),
+            file_size * 10
+        );
+    }
+
+    /// 累计值回退（进度口径修正）时不得算出负速度或爆表速度。
+    #[test]
+    fn test_observe_total_tolerates_regression() {
+        let mut calc = SpeedCalculator::new(10);
+        let start = Instant::now();
+
+        calc.observe_total_at(2 * 1024 * 1024, start);
+        calc.observe_total_at(1024 * 1024, start + Duration::from_secs(1));
+
+        assert_eq!(calc.total_bytes(), 1024 * 1024);
+        assert_eq!(calc.speed_at(start + Duration::from_secs(1)), 0);
     }
 
     /// 停滞后由定时刷新把空闲时间灌进窗口，速度衰减到 0。
