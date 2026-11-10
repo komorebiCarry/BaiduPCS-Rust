@@ -213,6 +213,17 @@
                     </div>
                   </el-form-item>
 
+                  <el-form-item label="并发扫描/边扫边下">
+                    <el-switch v-model="formData.download.concurrent_scan" />
+                    <div class="form-tip">默认关闭，串行扫描全部目录后再下载。开启后并发扫描并边扫边下载，请求频率会增加。保存后对下一轮扫描生效。</div>
+                  </el-form-item>
+                  <el-form-item label="扫描并发数">
+                    <el-select v-model="formData.download.scan_concurrency" :disabled="!formData.download.concurrent_scan">
+                      <el-option v-for="n in 4" :key="n" :label="String(n)" :value="n" />
+                    </el-select>
+                    <div class="form-tip">可选 1～4，开启后生效；选 1 时仍会边扫边下载。</div>
+                  </el-form-item>
+
                   <el-form-item v-if="formData.download.folder_exclude" label="源码目录模式">
                     <el-switch v-model="formData.download.folder_exclude.enabled" />
                     <div class="form-tip">开启后，文件夹下载会跳过下列目录及其全部内容。默认关闭，对下一轮扫描生效；不会删除已下载文件。</div>
@@ -1462,6 +1473,10 @@ async function loadConfig() {
   try {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
+    if (formData.value) {
+      formData.value.download.concurrent_scan ??= false
+      formData.value.download.scan_concurrency ??= 4
+    }
     if (formData.value && !formData.value.download.folder_exclude) {
       formData.value.download.folder_exclude = {
         enabled: false,

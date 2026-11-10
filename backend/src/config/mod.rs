@@ -658,6 +658,10 @@ pub struct ServerConfig {
 /// 下载配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadConfig {
+    #[serde(default)]
+    pub concurrent_scan: bool,
+    #[serde(default = "default_folder_scan_concurrency")]
+    pub scan_concurrency: usize,
     /// 文件夹下载排除规则；默认关闭，按完整目录名匹配。
     #[serde(default)]
     pub folder_exclude: FolderExcludeConfig,
@@ -700,6 +704,8 @@ pub struct FolderExcludeConfig {
     pub enabled: bool,
     pub directory_names: Vec<String>,
 }
+
+fn default_folder_scan_concurrency() -> usize { 4 }
 
 impl Default for FolderExcludeConfig {
     fn default() -> Self {
@@ -1433,7 +1439,7 @@ impl DownloadConfig {
     /// - Ok(()): 路径是绝对路径
     /// - Err: 路径不是绝对路径或格式无效
     pub fn validate_download_dir(&self) -> Result<()> {
-        self.folder_exclude.validate()?;
+        self.folder_exclude.validate()?; anyhow::ensure!((1..=4).contains(&self.scan_concurrency), "扫描并发数必须在 1～4 之间");
         if !self.download_dir.is_absolute() {
             anyhow::bail!(
                 "下载目录必须是绝对路径，当前值: {:?}\n\
@@ -1647,6 +1653,8 @@ impl Default for AppConfig {
             },
             download: DownloadConfig {
                 folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
                 download_dir,
                 default_directory: None,
                 recent_directory: None,
@@ -1886,6 +1894,25 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn folder_scan_defaults_and_bounds() {
+        let config = super::AppConfig::default();
+        let mut value = serde_json::to_value(&config.download).unwrap();
+        value.as_object_mut().unwrap().remove("concurrent_scan");
+        value.as_object_mut().unwrap().remove("scan_concurrency");
+        let mut download: super::DownloadConfig = serde_json::from_value(value).unwrap();
+        assert!(!download.concurrent_scan);
+        assert_eq!(download.scan_concurrency, 4);
+        download.download_dir = std::env::temp_dir();
+        for concurrency in 1..=4 {
+            download.scan_concurrency = concurrency;
+            assert!(download.validate_download_dir().is_ok());
+        }
+        for concurrency in [0, 5, usize::MAX] {
+            download.scan_concurrency = concurrency;
+            assert!(download.validate_download_dir().is_err());
+        }
+    }
     use super::*;
 
     #[test]
@@ -2149,6 +2176,8 @@ account_quick_bar = true",
     fn test_config_validation() {
         let mut config = DownloadConfig {
             folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
             download_dir: std::env::current_dir().unwrap().join("downloads"),
             default_directory: None,
             recent_directory: None,
@@ -2183,6 +2212,8 @@ account_quick_bar = true",
         let absolute_path = std::env::current_dir().unwrap().join("downloads");
         let absolute_config = DownloadConfig {
             folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
             download_dir: absolute_path,
             default_directory: None,
             recent_directory: None,
@@ -2201,6 +2232,8 @@ account_quick_bar = true",
         // 测试相对路径验证（应该失败）
         let relative_config = DownloadConfig {
             folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
             download_dir: PathBuf::from("downloads"),
             default_directory: None,
             recent_directory: None,
@@ -2221,6 +2254,8 @@ account_quick_bar = true",
         {
             let windows_config = DownloadConfig {
                 folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
                 download_dir: PathBuf::from("D:\\Downloads"),
                 default_directory: None,
                 recent_directory: None,
@@ -2241,6 +2276,8 @@ account_quick_bar = true",
         {
             let unix_config = DownloadConfig {
                 folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
                 download_dir: PathBuf::from("/app/downloads"),
                 default_directory: None,
                 recent_directory: None,
@@ -2362,6 +2399,8 @@ account_quick_bar = true",
         // 测试 DownloadConfig 包含 cdn_refresh 的序列化/反序列化
         let download_config = DownloadConfig {
             folder_exclude: FolderExcludeConfig::default(),
+                concurrent_scan: false,
+                scan_concurrency: default_folder_scan_concurrency(),
             download_dir: std::env::current_dir().unwrap().join("downloads"),
             default_directory: None,
             recent_directory: None,

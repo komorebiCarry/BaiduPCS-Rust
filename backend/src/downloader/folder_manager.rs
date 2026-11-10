@@ -57,21 +57,6 @@ fn folder_slot_priority(backup_config_id: Option<&str>) -> crate::task_slot_pool
     }
 }
 
-/// 扫描阶段"同时进行的列目录请求数"上限。
-///
-/// 默认 4。列表接口比下载接口轻得多，但同样计入百度侧的风控观测
-/// （errno=132/9019），所以不做成"越大越好"，也不必跟着下载线程数走。
-///
-/// 可用环境变量 `BAIDUPCS_SCAN_CONCURRENCY` 覆盖，设为 `1` 即退回串行行为：
-/// 出问题时不改代码、重启进程就能回滚。
-fn scan_list_concurrency() -> usize {
-    std::env::var("BAIDUPCS_SCAN_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(4)
-}
-
 /// 有界并发目录工作队列：父目录完成后将其子目录入队，不等待无关兄弟目录。
 /// 取消时停止扫描；任一目录失败立即返回错误并丢弃未完成请求。
 async fn bfs_scan_dirs<F, Fut>(
@@ -3206,9 +3191,12 @@ impl FolderDownloadManager {
         let wake = tokio::sync::Notify::new();
         // 同一轮扫描固定规则，设置修改对下一轮生效。
         let config = self.app_config.read().await.clone();
-        let exclude = match config {
-            Some(config) => config.read().await.download.folder_exclude.clone(),
-            None => crate::config::FolderExcludeConfig::default(),
+        let (exclude, concurrent_scan, concurrency) = match config {
+            Some(config) => {
+                let config = config.read().await;
+                (config.download.folder_exclude.clone(), config.download.concurrent_scan, config.download.scan_concurrency.clamp(1, 4))
+            }
+            None => (crate::config::FolderExcludeConfig::default(), false, 4),
         };
         exclude.validate()?;
         let exclude_ref = &exclude;
@@ -3217,10 +3205,10 @@ impl FolderDownloadManager {
         let scan = async {
         let result = bfs_scan_dirs(
             vec![root_path.to_string()],
-            scan_list_concurrency(),
+            if concurrent_scan { concurrency } else { 1 },
             cancel_token,
             |dir: String| async move {
-                self.scan_one_dir(folder_id, client, cancel_token, root_path, &dir, wake_ref, exclude_ref)
+                self.scan_one_dir(folder_id, client, cancel_token, root_path, &dir, wake_ref, exclude_ref, concurrent_scan)
                     .await
             },
         )
@@ -3229,6 +3217,7 @@ impl FolderDownloadManager {
         result
         };
         let dispatch = async {
+            if !concurrent_scan { return Ok::<(), anyhow::Error>(()); }
             loop {
                 tokio::select! {
                     _ = finished.cancelled() => break,
@@ -3264,6 +3253,7 @@ impl FolderDownloadManager {
         dir_path: &str,
         wake: &tokio::sync::Notify,
         exclude: &crate::config::FolderExcludeConfig,
+        concurrent_scan: bool,
     ) -> Result<Vec<String>> {
         let mut page = 1;
         let page_size = 100;
@@ -3276,7 +3266,7 @@ impl FolderDownloadManager {
                 return Ok(subdirs);
             }
 
-            if !self.wait_for_scan_capacity(folder_id, cancel_token).await {
+            if concurrent_scan && !self.wait_for_scan_capacity(folder_id, cancel_token).await {
                 return Ok(subdirs);
             }
 
