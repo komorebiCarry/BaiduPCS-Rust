@@ -116,7 +116,11 @@
       </div>
 
       <!-- 移动端工具栏（图标按钮） -->
-      <div v-else class="toolbar-buttons-mobile">
+      <div
+          v-else
+          class="toolbar-buttons-mobile"
+          :class="{ 'search-open': searchExpanded || isSearchMode }"
+      >
         <div
             ref="searchWrapperRef"
             class="search-wrapper"
@@ -149,52 +153,6 @@
             </el-button>
           </div>
         </div>
-        <!-- 批量操作下拉（移动端同样合并避免工具栏溢出） -->
-        <el-dropdown
-            v-if="selectedFiles.length > 0"
-            trigger="click"
-        >
-          <el-button
-              type="warning"
-              circle
-              :loading="batchDownloading || batchDeleting || batchCopying || batchMoving"
-              title="批量操作"
-          >
-            <el-icon><MoreFilled /></el-icon>
-          </el-button>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item @click="handleBatchDownload">
-                <el-icon><Download /></el-icon>
-                批量下载 ({{ selectedFiles.length }})
-              </el-dropdown-item>
-              <el-dropdown-item v-if="authStore.hasMultipleAccounts" @click="handleBatchCrossAccount('download')">
-                <el-icon><Download /></el-icon>
-                用其他账号下载...
-              </el-dropdown-item>
-              <el-dropdown-item @click="handleBatchShare">
-                <el-icon><Link /></el-icon>
-                分享 ({{ selectedFiles.length }})
-              </el-dropdown-item>
-              <el-dropdown-item @click="handleBatchCopy">
-                <el-icon><CopyDocument /></el-icon>
-                复制到...
-              </el-dropdown-item>
-              <el-dropdown-item @click="handleBatchMove">
-                <el-icon><Rank /></el-icon>
-                移动到...
-              </el-dropdown-item>
-              <el-dropdown-item v-if="authStore.hasMultipleAccounts" @click="handleBatchCrossAccount('copy')">
-                <el-icon><Switch /></el-icon>
-                复制/移动到其他账号...
-              </el-dropdown-item>
-              <el-dropdown-item divided @click="handleBatchDelete">
-                <el-icon><Delete /></el-icon>
-                删除 ({{ selectedFiles.length }})
-              </el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
         <el-button type="primary" circle @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
         </el-button>
@@ -231,7 +189,13 @@
     />
 
     <!-- 文件列表 -->
-    <div class="file-list" ref="fileListRef" @scroll="handleScroll" @contextmenu="handleBlankContextMenu">
+    <div
+        class="file-list"
+        :class="{ 'has-mobile-batch-bar': isMobile && selectedFiles.length > 0 }"
+        ref="fileListRef"
+        @scroll="handleScroll"
+        @contextmenu="handleBlankContextMenu"
+    >
       <!-- PC端表格视图 -->
       <el-table
           v-if="!isMobile"
@@ -322,10 +286,20 @@
             v-for="item in fileList"
             :key="item.fs_id"
             class="mobile-file-card"
-            :class="{ 'is-folder': item.isdir === 1, 'row-located': item.path === locatedPath }"
+            :class="{
+              'is-folder': item.isdir === 1,
+              'row-located': item.path === locatedPath,
+              'is-selected': isFileSelected(item),
+            }"
             @click="handleRowClick(item)"
             @contextmenu.prevent="openContextMenu($event.clientX, $event.clientY, [item])"
         >
+          <el-checkbox
+              class="file-card-checkbox"
+              :model-value="isFileSelected(item)"
+              @click.stop
+              @change="() => toggleMobileSelect(item)"
+          />
           <div class="file-card-main">
             <el-icon :size="36" class="file-card-icon" :color="item.isdir === 1 ? '#e6a23c' : '#409eff'">
               <Folder v-if="item.isdir === 1"/>
@@ -396,12 +370,15 @@
         width="500px"
         @close="handleDialogClose"
     >
-      <el-form :model="createFolderForm" label-width="80px">
+      <!--
+        表单里只有一个输入框时，浏览器会把回车当作"隐式提交"，整页刷新（页面状态丢失 → 回到根目录），
+        所以必须 @submit.prevent；回车创建也走表单 submit（而不是 keyup.enter，后者在刷新开始后才触发）
+      -->
+      <el-form :model="createFolderForm" label-width="80px" @submit.prevent="handleCreateFolder">
         <el-form-item label="文件夹名">
           <el-input
               v-model="createFolderForm.folderName"
               placeholder="请输入文件夹名称"
-              @keyup.enter="handleCreateFolder"
               autofocus
           />
         </el-form-item>
@@ -500,7 +477,8 @@
         width="500px"
         @close="resetRenameDialog"
     >
-      <el-form label-width="80px">
+      <!-- 同新建文件夹：单输入框表单回车会整页刷新，必须 @submit.prevent，并由 submit 触发重命名 -->
+      <el-form label-width="80px" @submit.prevent="handleRenameConfirm">
         <el-form-item label="原名称">
           <el-text>{{ renameTarget?.server_filename }}</el-text>
         </el-form-item>
@@ -509,7 +487,6 @@
               v-model="renameNewName"
               placeholder="输入新名称"
               autofocus
-              @keyup.enter="handleRenameConfirm"
           />
         </el-form-item>
         <el-form-item label="所在目录">
@@ -528,6 +505,72 @@
         </span>
       </template>
     </el-dialog>
+
+    <!-- 移动端批量操作栏：吸底于底部导航上方，不占用本已拥挤的顶部工具栏 -->
+    <div
+        v-if="isMobile && selectedFiles.length > 0"
+        class="mobile-batch-bar"
+    >
+      <div class="mobile-batch-bar__meta">
+        <span class="mobile-batch-bar__count">已选 {{ selectedFiles.length }} 项</span>
+        <el-button class="mobile-batch-bar__select-all" text type="primary" size="small" @click="selectAllLoaded">全选</el-button>
+        <el-button class="mobile-batch-bar__clear" text size="small" @click="clearMobileSelection">取消</el-button>
+      </div>
+      <div class="mobile-batch-bar__actions">
+        <el-button
+            class="mobile-batch-bar__download"
+            size="small"
+            :loading="batchDownloading"
+            @click="handleBatchDownload"
+        >下载</el-button>
+        <el-button
+            class="mobile-batch-bar__copy"
+            size="small"
+            :loading="batchCopying"
+            @click="handleBatchCopy"
+        >复制</el-button>
+        <el-button
+            class="mobile-batch-bar__move"
+            size="small"
+            :loading="batchMoving"
+            @click="handleBatchMove"
+        >移动</el-button>
+        <el-button
+            class="mobile-batch-bar__share"
+            size="small"
+            @click="handleBatchShare"
+        >分享</el-button>
+        <el-button
+            class="mobile-batch-bar__delete"
+            size="small"
+            type="danger"
+            :loading="batchDeleting"
+            @click="handleBatchDelete"
+        >删除</el-button>
+        <el-dropdown
+            v-if="authStore.hasMultipleAccounts"
+            class="mobile-batch-bar__more"
+            trigger="click"
+        >
+          <el-button size="small">
+            更多
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item @click="handleBatchCrossAccount('download')">
+                <el-icon><Download /></el-icon>
+                用其他账号下载...
+              </el-dropdown-item>
+              <el-dropdown-item @click="handleBatchCrossAccount('copy')">
+                <el-icon><Switch /></el-icon>
+                复制/移动到其他账号...
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -774,6 +817,8 @@ async function loadFiles(
       fileList.value = data.list
       currentDir.value = dir
       uiPrefsStore.setLastNetdiskDir(ownerUid, dir)
+      // 与桌面端 el-table 换数据后清空勾选一致（含切目录 / 刷新 / 排序）
+      selectedFiles.value = []
     }
 
     hasMore.value = data.has_more
@@ -1111,6 +1156,8 @@ function handleDialogClose() {
 
 // 创建文件夹
 async function handleCreateFolder() {
+  // 回车与按钮可能连续触发，创建中不重复提交
+  if (creatingFolder.value) return
   const folderName = createFolderForm.value.folderName.trim()
 
   // 验证文件夹名
@@ -1185,6 +1232,27 @@ async function loadDownloadConfig() {
 // 处理表格选择变化
 function handleSelectionChange(selection: FileItem[]) {
   selectedFiles.value = selection
+}
+
+function isFileSelected(item: FileItem): boolean {
+  return selectedFiles.value.some((f) => f.fs_id === item.fs_id)
+}
+
+function toggleMobileSelect(item: FileItem) {
+  const index = selectedFiles.value.findIndex((f) => f.fs_id === item.fs_id)
+  if (index === -1) {
+    selectedFiles.value = [...selectedFiles.value, item]
+  } else {
+    selectedFiles.value = selectedFiles.value.filter((_, i) => i !== index)
+  }
+}
+
+function selectAllLoaded() {
+  selectedFiles.value = [...fileList.value]
+}
+
+function clearMobileSelection() {
+  selectedFiles.value = []
 }
 
 // 批量下载入口（工具栏）
@@ -1440,6 +1508,7 @@ async function handleSearch() {
     if (version !== fileRequestVersion) return
     fileList.value = data.list as FileItem[]
     searchHasMore.value = data.has_more
+    selectedFiles.value = []
   } catch (error: any) {
     ElMessage.error(error.message || '搜索失败')
     console.error('搜索失败:', error)
@@ -2063,7 +2132,7 @@ function resetRenameDialog() {
 }
 
 async function handleRenameConfirm() {
-  if (!renameTarget.value) return
+  if (!renameTarget.value || renameSubmitting.value) return
   if (renameNameError.value) {
     ElMessage.error(renameNameError.value)
     return
@@ -2563,12 +2632,89 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     flex-wrap: wrap;
   }
 
+  // 只有搜索框展开/处于搜索结果时才让工具栏独占一整行（搜索框在下方铺满）；
+  // 收起时保持原样，与面包屑同一行。
+  .toolbar-buttons-mobile.search-open {
+    flex-wrap: wrap;
+    width: 100%;
+    justify-content: flex-end;
+  }
+
   .search-wrapper {
-    --search-expand-width: min(200px, calc(100vw - 56px));
+    --search-expand-width: 100%;
+
+    &.expanded,
+    &.active {
+      flex: 1 0 100%;
+      width: 100%;
+      order: 1;
+      height: var(--toolbar-control-size);
+
+      .search-shell {
+        position: relative;
+        top: auto;
+        right: auto;
+        left: auto;
+        transform: none;
+        width: 100%;
+      }
+    }
   }
 
   .file-list {
     padding: 12px;
+
+    &.has-mobile-batch-bar {
+      // 两行操作栏约 108px，另留一点间距，避免最后一张卡片被挡住
+      padding-bottom: 128px;
+    }
+  }
+}
+
+.mobile-batch-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  // 底部导航栏占 56px，再叠加安全区，保证操作栏在 tabbar 之上
+  bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--el-bg-color);
+  border-top: 1px solid var(--el-border-color-lighter);
+  box-shadow: 0 -6px 18px rgba(15, 23, 42, 0.08);
+  box-sizing: border-box;
+
+  &__meta {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 4px;
+  }
+
+  &__count {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--el-text-color-primary);
+    margin-right: 4px;
+    flex-shrink: 0;
+  }
+
+  &__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+
+    :deep(.el-button) {
+      margin: 0;
+    }
+
+    :deep(.el-dropdown) {
+      flex: 0 0 auto;
+    }
   }
 }
 
@@ -2583,7 +2729,7 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 12px 12px 12px 10px;
   background: #f9f9f9;
   border-radius: 12px;
   cursor: pointer;
@@ -2604,6 +2750,28 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     &:active {
       background: #fff3d9;
     }
+  }
+
+  &.is-selected {
+    background: var(--el-color-primary-light-9);
+
+    &:active {
+      background: var(--el-color-primary-light-8);
+    }
+
+    &.is-folder {
+      background: var(--el-color-primary-light-9);
+
+      &:active {
+        background: var(--el-color-primary-light-8);
+      }
+    }
+  }
+
+  .file-card-checkbox {
+    flex-shrink: 0;
+    margin-right: 8px;
+    height: 22px;
   }
 
   .file-card-main {
@@ -2646,6 +2814,10 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     display: flex;
     align-items: center;
     gap: 4px;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 
     .meta-divider {
       color: #dcdfe6;

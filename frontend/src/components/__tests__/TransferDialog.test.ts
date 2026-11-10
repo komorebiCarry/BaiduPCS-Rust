@@ -89,13 +89,16 @@ async function mountDialog(lockKeepSync = true) {
           name: 'ShareIncludeExcludeEditor',
           props: [
             'shareUrl', 'password', 'includePaths', 'excludePatterns',
-            'excludeRegexPatterns', 'excludePaths', 'ownerUid', 'ownerLoggedIn',
+            'excludeRegexPatterns', 'includePatterns', 'includeRegexPatterns',
+            'excludePaths', 'ownerUid', 'ownerLoggedIn',
           ],
-          emits: ['update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns', 'update:excludePaths'],
+          emits: ['update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns', 'update:includePatterns', 'update:includeRegexPatterns', 'update:excludePaths'],
           template: `
             <div class="editor-stub">
               <button class="emit-regex" @click="$emit('update:excludeRegexPatterns', ['^/股票/按月归档/2025.*$'])">set-regex</button>
               <button class="emit-glob" @click="$emit('update:excludePatterns', ['*.tmp'])">set-glob</button>
+              <button class="emit-include" @click="$emit('update:includePatterns', ['*.mp4']); $emit('update:includeRegexPatterns', ['.*SE.*'])">set-include</button>
+              <button class="emit-selected-paths" @click="$emit('update:includePaths', ['/剧集/报告. ', '/剧集/报告.']); $emit('update:excludePaths', ['/剧集/广告. '])">set-paths</button>
             </div>
           `,
           setup(_props: unknown, { expose }: { expose: (e: Record<string, unknown>) => void }) {
@@ -157,6 +160,7 @@ describe('TransferDialog 订阅创建与正则排除', () => {
 
     document.body.querySelector<HTMLElement>('.emit-glob')!.click()
     document.body.querySelector<HTMLElement>('.emit-regex')!.click()
+    document.body.querySelector<HTMLElement>('.emit-include')!.click()
     await flushPromises()
     expect(shareSync.validateRules).not.toHaveBeenCalled()
 
@@ -168,9 +172,38 @@ describe('TransferDialog 订阅创建与正则排除', () => {
     const req = shareSync.createSubscription.mock.calls[0][0] as {
       exclude_patterns: string[]
       exclude_regex_patterns: string[]
+      include_patterns: string[]
+      include_regex_patterns: string[]
     }
     expect(req.exclude_patterns).toEqual(['*.tmp'])
     expect(req.exclude_regex_patterns).toEqual(['^/股票/按月归档/2025.*$'])
+    expect(req.include_patterns).toEqual(['*.mp4'])
+    expect(req.include_regex_patterns).toEqual(['.*SE.*'])
+    wrapper.unmount()
+  })
+
+  it('选中路径原样提交：文件名尾随空格不被创建请求裁掉', async () => {
+    const wrapper = await mountDialog()
+    await flushPromises()
+
+    shareUrlInput().value = 'https://pan.baidu.com/s/1y7CluAbCdEfGh'
+    shareUrlInput().dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    document.body.querySelector<HTMLElement>('.emit-selected-paths')!.click()
+    await flushPromises()
+
+    createButton().click()
+    await flushPromises()
+
+    expect(shareSync.createSubscription).toHaveBeenCalledTimes(1)
+    const req = shareSync.createSubscription.mock.calls[0][0] as {
+      include_paths: string[]
+      exclude_paths: string[]
+    }
+    // 编辑器产物必须按原字节进入请求：只有空格不同的两个文件不能被去重或 trim
+    expect(req.include_paths).toEqual(['/剧集/报告. ', '/剧集/报告.'])
+    expect(req.exclude_paths).toEqual(['/剧集/广告. '])
     wrapper.unmount()
   })
 
@@ -186,8 +219,12 @@ describe('TransferDialog 订阅创建与正则排除', () => {
 
     const req = shareSync.createSubscription.mock.calls[0][0] as {
       exclude_regex_patterns: string[]
+      include_patterns: string[]
+      include_regex_patterns: string[]
     }
     expect(req.exclude_regex_patterns).toEqual([])
+    expect(req.include_patterns).toEqual([])
+    expect(req.include_regex_patterns).toEqual([])
     wrapper.unmount()
   })
 

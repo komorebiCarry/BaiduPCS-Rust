@@ -15,6 +15,12 @@ export const useUiPrefsStore = defineStore('uiPrefs', () => {
   const rememberNetdiskPath = computed(() => configStore.config?.ui?.remember_netdisk_path ?? true)
   /** 多账号横向快捷条（默认关闭） */
   const accountQuickBar = computed(() => configStore.config?.ui?.account_quick_bar ?? false)
+  /** 「我的分享」高亮失效分享（文件已删除 / 已过期），默认开启 */
+  const highlightDeadShares = computed(() => configStore.config?.ui?.highlight_dead_shares ?? true)
+  /** 失效分享只保留「取消分享」，默认关闭 */
+  const disableDeadShareActions = computed(
+      () => configStore.config?.ui?.disable_dead_share_actions ?? false,
+  )
 
   let loadPromise: Promise<void> | null = null
 
@@ -46,6 +52,8 @@ export const useUiPrefsStore = defineStore('uiPrefs', () => {
   return {
     rememberNetdiskPath,
     accountQuickBar,
+    highlightDeadShares,
+    disableDeadShareActions,
     ensureLoaded,
     getLastNetdiskDir,
     setLastNetdiskDir,

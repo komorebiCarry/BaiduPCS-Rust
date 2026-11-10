@@ -19,14 +19,20 @@ pub const DEFAULT_WEBHOOK_BODY_TEMPLATE: &str = r#"{
   "task_id": "{{task_id}}",
   "account_uid": "{{account_uid}}",
   "time": "{{time}}",
-  "timestamp": {{timestamp}}
+  "timestamp": {{timestamp}},
+  "files": "{{files}}"
 }"#;
+
+/// 分享同步通知里默认列出的文件数
+pub const DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT: u32 = 5;
+/// 分享同步通知里最多列出的文件数
+pub const MAX_SHARE_SYNC_FILE_LIST_LIMIT: u32 = 50;
 
 /// 单次推送请求超时上限（秒）
 pub const MAX_TIMEOUT_SECS: u64 = 60;
 
 /// 消息通知配置
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationConfig {
     /// 总开关；关闭时任何事件都不推送（测试通知不受影响）
     #[serde(default)]
@@ -40,6 +46,22 @@ pub struct NotificationConfig {
     /// 触发事件开关
     #[serde(default)]
     pub events: NotificationEventToggles,
+    /// 分享同步通知里列出的文件名数量上限（新增/更新优先，其次失败；超出显示「等 N 个」）。
+    /// 0 = 不列文件名。
+    #[serde(default = "default_share_sync_file_list_limit")]
+    pub share_sync_file_list_limit: u32,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook: WebhookChannelConfig::default(),
+            gotify: GotifyChannelConfig::default(),
+            events: NotificationEventToggles::default(),
+            share_sync_file_list_limit: DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT,
+        }
+    }
 }
 
 /// 自定义请求头（`Debug` 输出会隐去值，避免鉴权头进日志）
@@ -234,6 +256,12 @@ impl NotificationConfig {
 
     /// 校验配置（保存时调用）。只校验已启用的渠道，未启用的渠道允许留空。
     pub fn validate(&self) -> Result<(), String> {
+        if self.share_sync_file_list_limit > MAX_SHARE_SYNC_FILE_LIST_LIMIT {
+            return Err(format!(
+                "分享同步通知列出的文件数需在 0-{} 之间",
+                MAX_SHARE_SYNC_FILE_LIST_LIMIT
+            ));
+        }
         if self.webhook.enabled {
             validate_http_url(&self.webhook.url).map_err(|e| format!("Webhook 地址{}", e))?;
             let method = self.webhook.method.trim().to_ascii_uppercase();
@@ -306,6 +334,10 @@ fn default_webhook_body_template() -> String {
     DEFAULT_WEBHOOK_BODY_TEMPLATE.to_string()
 }
 
+fn default_share_sync_file_list_limit() -> u32 {
+    DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT
+}
+
 fn default_timeout_secs() -> u64 {
     10
 }
@@ -326,7 +358,29 @@ mod tests {
         assert_eq!(cfg.webhook.method, "POST");
         assert_eq!(cfg.gotify.priority, 5);
         assert!(cfg.events.share_sync_link_invalid);
+        assert_eq!(cfg.share_sync_file_list_limit, 5);
+        assert_eq!(NotificationConfig::default().share_sync_file_list_limit, 5);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_share_sync_file_list_limit_range() {
+        let mut cfg = NotificationConfig {
+            share_sync_file_list_limit: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "0 = 关闭");
+        cfg.share_sync_file_list_limit = MAX_SHARE_SYNC_FILE_LIST_LIMIT;
+        assert!(cfg.validate().is_ok());
+        cfg.share_sync_file_list_limit = MAX_SHARE_SYNC_FILE_LIST_LIMIT + 1;
+        assert!(cfg.validate().is_err());
+        let back: NotificationConfig = toml::from_str("share_sync_file_list_limit = 0\n").unwrap();
+        assert_eq!(back.share_sync_file_list_limit, 0);
+    }
+
+    #[test]
+    fn test_default_body_template_lists_files() {
+        assert!(DEFAULT_WEBHOOK_BODY_TEMPLATE.contains("\"files\": \"{{files}}\""));
     }
 
     #[test]

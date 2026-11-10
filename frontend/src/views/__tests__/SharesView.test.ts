@@ -11,11 +11,17 @@ const shareApi = vi.hoisted(() => ({
   modifyShareExpire: vi.fn(),
 }))
 const mobile = vi.hoisted(() => ({ value: false }))
+const uiPrefs = vi.hoisted(() => ({ highlightDeadShares: true, disableDeadShareActions: false }))
+
+vi.mock('@/stores/uiPrefs', () => ({
+  useUiPrefsStore: () => uiPrefs,
+}))
 
 vi.mock('@/api/share', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/share')>()
   return {
     SHARE_EXPIRE_OPTIONS: actual.SHARE_EXPIRE_OPTIONS,
+    deadShareKind: actual.deadShareKind,
     getShareList: shareApi.getShareList,
     getShareDetail: vi.fn(),
     cancelShare: vi.fn(),
@@ -70,9 +76,13 @@ const ElTableColumnStub = defineComponent({
   },
 })
 
-async function mountWith(list: ShareRecord[], isMobile: boolean) {
+async function mountWith(
+  list: ShareRecord[],
+  isMobile: boolean,
+  extra: Record<string, unknown> = { total: list.length },
+) {
   mobile.value = isMobile
-  shareApi.getShareList.mockResolvedValue({ list, total: list.length, page: 1 })
+  shareApi.getShareList.mockResolvedValue({ list, page: 1, total: 0, ...extra })
   const wrapper = mount(SharesView, {
     attachTo: document.body,
     global: {
@@ -116,17 +126,155 @@ describe('SharesView 下载 / 保存次数', () => {
     wrapper.unmount()
   })
 
-  it('移动端卡片只在有值时显示下载 / 保存行', async () => {
+  it('移动端卡片：浏览 / 下载 / 保存在同一行（缺值不显示），过期时间单独一行', async () => {
     const wrapper = await mountWith(
       [record({ downloadCount: 0, transferCount: 5 }), record({ shareId: 2 })],
       true,
     )
     const cards = wrapper.findAll('.share-card')
     expect(cards).toHaveLength(2)
-    expect(cards[0].text()).toContain('下载:0 次')
-    expect(cards[0].text()).toContain('保存:5 次')
-    expect(cards[1].text()).not.toContain('下载:')
-    expect(cards[1].text()).not.toContain('保存:')
+    const stats = (i: number) => cards[i].findAll('.stats-row .stat').map((x) => x.text())
+    expect(stats(0)).toEqual(['浏览 12', '下载 0', '保存 5'])
+    expect(stats(1)).toEqual(['浏览 12'])
+    expect(cards[0].findAll('.stats-row')).toHaveLength(1)
+    expect(cards[0].find('.expire-row').text()).toContain('永久有效')
+    expect(cards[0].find('.stats-row').text()).not.toContain('永久有效')
+    wrapper.unmount()
+  })
+})
+
+describe('SharesView 分页与计数（百度不返回 total）', () => {
+  afterEach(() => {
+    document.body.innerHTML = ''
+    vi.clearAllMocks()
+  })
+
+  it('total 为 0 但列表非空时，顶部显示 count，不显示「0 条」', async () => {
+    const list = Array.from({ length: 3 }, (_, i) => record({ shareId: i + 1 }))
+    const wrapper = await mountWith(list, false, { total: 0, count: 3, has_more: false, nextpage: 0 })
+    const header = wrapper.find('.page-header').text()
+    expect(header).toContain('3 条分享记录')
+    expect(header).not.toContain('0 条')
+    // 只有一页：不显示任何分页
+    expect(wrapper.find('.pagination-wrapper').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('旧后端没有 count 时用列表长度', async () => {
+    const wrapper = await mountWith([record(), record({ shareId: 2 })], true, { total: 0 })
+    expect(wrapper.find('.page-header').text()).toContain('2 条分享记录')
+    wrapper.unmount()
+  })
+
+  it('has_more 驱动上一页 / 下一页', async () => {
+    const wrapper = await mountWith([record()], false, { total: 0, count: 50, has_more: true, nextpage: 2 })
+    const pager = wrapper.find('.simple-pager')
+    expect(pager.exists()).toBe(true)
+    expect(wrapper.find('.page-header').text()).toContain('第 1 页 · 本页 50 条')
+    expect(pager.find('.pager-prev').attributes('disabled')).toBeDefined()
+    expect(pager.find('.pager-next').attributes('disabled')).toBeUndefined()
+
+    shareApi.getShareList.mockResolvedValue({ list: [record({ shareId: 9 })], total: 0, count: 1, has_more: false, nextpage: 0, page: 2 })
+    await pager.find('.pager-next').trigger('click')
+    await flushPromises()
+    expect(shareApi.getShareList).toHaveBeenLastCalledWith(2)
+    const after = wrapper.find('.simple-pager')
+    expect(after.exists()).toBe(true)
+    expect(after.text()).toContain('第 2 页')
+    expect(after.find('.pager-next').attributes('disabled')).toBeDefined()
+    expect(after.find('.pager-prev').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('接口给了 total 时仍用完整分页条', async () => {
+    const wrapper = await mountWith([record()], false, { total: 45 })
+    expect(wrapper.find('.simple-pager').exists()).toBe(false)
+    expect(wrapper.findComponent({ name: 'ElPagination' }).exists()).toBe(true)
+    expect(wrapper.find('.page-header').text()).toContain('45 条分享记录')
+    wrapper.unmount()
+  })
+})
+
+type DeadShareVm = {
+  shareList: ShareRecord[]
+  getStatusType: (r: ShareRecord) => string
+  formatExpireTime: (r: ShareRecord) => string
+  isExpireLocked: (r: ShareRecord) => boolean
+  shareRowClass: (p: { row: ShareRecord }) => string
+}
+
+describe('SharesView 失效分享（文件已删除 / 已过期）', () => {
+  afterEach(() => {
+    document.body.innerHTML = ''
+    vi.clearAllMocks()
+    uiPrefs.highlightDeadShares = true
+    uiPrefs.disableDeadShareActions = false
+  })
+
+  // 与脱敏 fixture（backend/src/netdisk/testdata/share_record_page1.json）同构
+  const deleted = () =>
+    record({ shareId: 4, typicalPath: '分享的文件已被删除', expiredType: 1, status: 0, downloadCount: 0, transferCount: 0 })
+  const expiredByPath = () =>
+    record({ shareId: 3, typicalPath: '分享已过期', expiredType: 0, expiredTime: 0, status: 10 })
+  const expiredByType = () => record({ shareId: 5, expiredType: -1, status: 10 })
+  const normal = () => record({ shareId: 1, downloadCount: 3, transferCount: 1 })
+
+  it('状态标签显示 已删除 / 已过期，而不是 正常 / 未知', async () => {
+    const wrapper = await mountWith([normal(), deleted(), expiredByPath(), expiredByType()], true)
+    const tags = wrapper.findAll('.share-card .share-status-tag').map((t) => t.text())
+    expect(tags).toEqual(['正常', '已删除', '已过期', '已过期'])
+    const vm = wrapper.vm as unknown as DeadShareVm
+    expect(vm.getStatusType(vm.shareList[1])).toBe('danger')
+    expect(vm.getStatusType(vm.shareList[2])).toBe('warning')
+    // 已过期标记的分享视为已过期（不能改有效期）
+    expect(vm.formatExpireTime(vm.shareList[2])).toBe('已过期')
+    expect(vm.isExpireLocked(vm.shareList[2])).toBe(true)
+    // 文件已删除但仍在有效期内：默认仍可改有效期
+    expect(vm.isExpireLocked(vm.shareList[1])).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('高亮：桌面行 class 与移动端卡片 class，界面偏好关闭时不高亮', async () => {
+    const wrapper = await mountWith([normal(), deleted(), expiredByPath()], true)
+    const cards = wrapper.findAll('.share-card')
+    expect(cards[0].classes()).not.toContain('dead-share')
+    expect(cards[1].classes()).toContain('dead-share--deleted')
+    expect(cards[2].classes()).toContain('dead-share--expired')
+    const vm = wrapper.vm as unknown as DeadShareVm
+    expect(vm.shareRowClass({ row: vm.shareList[1] })).toBe('dead-share dead-share--deleted')
+    expect(vm.shareRowClass({ row: vm.shareList[0] })).toBe('')
+    wrapper.unmount()
+
+    uiPrefs.highlightDeadShares = false
+    const plain = await mountWith([deleted()], true)
+    expect(plain.find('.share-card').classes()).not.toContain('dead-share--deleted')
+    // 标签不受高亮开关影响
+    expect(plain.find('.share-status-tag').text()).toBe('已删除')
+    plain.unmount()
+  })
+
+  it('「失效分享只能取消」开启时，失效分享只保留取消按钮', async () => {
+    uiPrefs.disableDeadShareActions = true
+    const wrapper = await mountWith([normal(), deleted()], true)
+    const buttons = (i: number) =>
+      wrapper
+        .findAll('.share-card')[i]
+        .findAll('.card-actions button')
+        .map((b) => [b.text(), b.attributes('disabled') !== undefined])
+    expect(buttons(0)).toEqual([
+      ['提取码', false],
+      ['复制', false],
+      ['有效期', false],
+      ['取消', false],
+    ])
+    expect(buttons(1)).toEqual([
+      ['提取码', true],
+      ['复制', true],
+      ['有效期', true],
+      ['取消', false],
+    ])
+    const vm = wrapper.vm as unknown as DeadShareVm
+    expect(vm.isExpireLocked(vm.shareList[1])).toBe(true)
     wrapper.unmount()
   })
 })

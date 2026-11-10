@@ -172,6 +172,8 @@ impl ShareSyncPersistence {
                 failed_count INTEGER NOT NULL DEFAULT 0,
                 skipped_count INTEGER NOT NULL DEFAULT 0,
                 overwritten_count INTEGER NOT NULL DEFAULT 0,
+                excluded_count INTEGER NOT NULL DEFAULT 0,
+                excluded_truncated INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 -- run 当前阶段（scanning / diffing / executing）；结束时置 NULL。
                 -- 供 REST 轮询在 WS 断线/页面刷新后仍能显示细化状态。
@@ -233,6 +235,10 @@ impl ShareSyncPersistence {
             // 落库，REST 轮询才能兜底告诉用户「在扫描目录」而不是裸的「运行中」。
             // run 结束时置回 NULL。
             "ALTER TABLE share_sync_runs ADD COLUMN phase TEXT",
+            // 被排除规则剔除的条目数（每条分支只计最上层）与「明细是否因上限截断」。
+            // 老 run 默认 0 = 未记录，与新增前的展示一致。
+            "ALTER TABLE share_sync_runs ADD COLUMN excluded_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE share_sync_runs ADD COLUMN excluded_truncated INTEGER NOT NULL DEFAULT 0",
             // 多账号隔离：老库（含早期把 share_subscriptions 建在独立库的版本）补 owner_uid 列
             "ALTER TABLE share_subscriptions ADD COLUMN owner_uid INTEGER NOT NULL DEFAULT 0",
             // 快照归属：区分「基线快照」与「某轮 run 的候选快照」。
@@ -1008,6 +1014,100 @@ impl ShareSyncPersistence {
         Ok(())
     }
 
+    /// 通知用：取某 run 的前 `limit` 个路径（按写入顺序、多目标去重）与去重后的总数。
+    /// `failed = false` 取已落地的新增/更新（`completed` 的 added / modified），
+    /// `failed = true` 取失败项。两条带 LIMIT 的查询，走 run_id 索引。
+    pub fn run_item_paths_for_notification(
+        &self,
+        run_id: &str,
+        failed: bool,
+        limit: usize,
+    ) -> Result<(Vec<String>, usize), ShareSyncError> {
+        let cond = if failed {
+            "status = 'failed'"
+        } else {
+            "status = 'completed' AND action IN ('added', 'modified')"
+        };
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT path) FROM share_sync_run_items WHERE run_id = ?1 AND {cond}"
+            ),
+            params![run_id],
+            |r| r.get(0),
+        )?;
+        let mut paths = Vec::new();
+        if limit > 0 && total > 0 {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT path FROM share_sync_run_items WHERE run_id = ?1 AND {cond}
+                 GROUP BY path ORDER BY MIN(id) LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(params![run_id, limit as i64], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                paths.push(r?);
+            }
+        }
+        Ok((paths, total.max(0) as usize))
+    }
+
+    /// 记录本轮被排除规则剔除的条目（`action = status = excluded`，`reason` 为命中的规则），
+    /// 并把总数 / 是否截断写到 run 上。单事务批量写入。
+    ///
+    /// - 只写前 `cap` 条，超出部分只计数（`excluded_truncated = 1`）；
+    /// - `target` 固定为 [`EXCLUDED_TARGET`]：被排除的条目没有执行目标，独立的 target
+    ///   也保证不会与同一路径的真实动作（如删除缺失）共用唯一键而互相覆盖；
+    /// - 重复调用幂等（`INSERT OR IGNORE`）；
+    /// - 同一订阅只保留最近 [`EXCLUDED_DETAIL_RUNS_KEPT`] 次运行的排除明细。
+    pub fn record_excluded_items(
+        &self,
+        run_id: &str,
+        entries: &[crate::share_sync::snapshot::ExcludedEntry],
+        cap: usize,
+    ) -> Result<usize, ShareSyncError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO share_sync_run_items
+                 (run_id, path, action, target, status, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for e in entries.iter().take(cap) {
+                written += stmt.execute(params![
+                    run_id,
+                    e.path,
+                    SyncAction::Excluded.as_str(),
+                    EXCLUDED_TARGET,
+                    RunItemStatus::Excluded.as_str(),
+                    e.reason
+                ])?;
+            }
+        }
+        tx.execute(
+            "UPDATE share_sync_runs SET excluded_count = ?1, excluded_truncated = ?2 WHERE id = ?3",
+            params![entries.len() as i64, (entries.len() > cap) as i64, run_id],
+        )?;
+        // 每轮轮询都会记一遍排除明细：同一订阅只保留最近 EXCLUDED_DETAIL_RUNS_KEPT 次运行的
+        // 明细，更早的删掉（run 上的 excluded_count 保留），避免库随轮询无限增长。
+        tx.execute(
+            "DELETE FROM share_sync_run_items
+             WHERE status = ?1 AND run_id IN (
+                 SELECT id FROM share_sync_runs
+                 WHERE subscription_id = (SELECT subscription_id FROM share_sync_runs WHERE id = ?2)
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT -1 OFFSET ?3
+             )",
+            params![
+                RunItemStatus::Excluded.as_str(),
+                run_id,
+                EXCLUDED_DETAIL_RUNS_KEPT as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(written)
+    }
+
     /// 列出某订阅的运行历史（分页）
     pub fn list_runs(
         &self,
@@ -1022,7 +1122,7 @@ impl ShareSyncPersistence {
             "SELECT id, started_at, finished_at, status,
                     total_count, added_count, modified_count, removed_count,
                     unchanged_count, failed_count, skipped_count, overwritten_count, error,
-                    phase
+                    phase, excluded_count, excluded_truncated
              FROM share_sync_runs
              WHERE subscription_id = ?1
              ORDER BY started_at DESC
@@ -1044,6 +1144,8 @@ impl ShareSyncPersistence {
                 overwritten_count: row.get::<_, i64>(11)? as usize,
                 error: row.get(12)?,
                 phase: row.get(13)?,
+                excluded_count: row.get::<_, i64>(14)?.max(0) as usize,
+                excluded_truncated: row.get::<_, i64>(15)? != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -1061,7 +1163,7 @@ impl ShareSyncPersistence {
                 "SELECT id, started_at, finished_at, status,
                         total_count, added_count, modified_count, removed_count,
                         unchanged_count, failed_count, skipped_count, overwritten_count, error,
-                        phase
+                        phase, excluded_count, excluded_truncated
                  FROM share_sync_runs WHERE id = ?1",
                 params![run_id],
                 |row| {
@@ -1080,6 +1182,8 @@ impl ShareSyncPersistence {
                         overwritten_count: row.get::<_, i64>(11)? as usize,
                         error: row.get(12)?,
                         phase: row.get(13)?,
+                        excluded_count: row.get::<_, i64>(14)?.max(0) as usize,
+                        excluded_truncated: row.get::<_, i64>(15)? != 0,
                     })
                 },
             )
@@ -1146,6 +1250,8 @@ impl ShareSyncPersistence {
     }
 
     /// 按筛选条件分页列出 run_items（服务端筛选：几千条明细里直接定位失败项，不用逐页翻）。
+    ///
+    /// 被排除条目（扫描阶段先写入）排在真实动作之后，不把实际执行的明细挤到后面几页。
     pub fn list_run_items_page_filtered(
         &self,
         run_id: &str,
@@ -1163,7 +1269,7 @@ impl ShareSyncPersistence {
                     status, versioned_old_path, error, reason
              FROM share_sync_run_items
              WHERE {where_sql}
-             ORDER BY id ASC
+             ORDER BY (status = 'excluded') ASC, id ASC
              LIMIT ? OFFSET ?"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), Self::map_run_item_row)?;
@@ -1207,10 +1313,10 @@ impl ShareSyncPersistence {
 /// 运行详情「文件动作」列表的筛选条件。字段为 `None` 表示不按该维度筛选。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunItemFilter {
-    /// 精确匹配 `status`（`failed` / `completed` / `skipped` / …）；
+    /// 精确匹配 `status`（`failed` / `completed` / `skipped` / `excluded` / …）；
     /// 另有分组值 [`RUN_ITEM_STATUS_IN_PROGRESS`] = 等待 / 转存中 / 下载中 / 删除中
     pub status: Option<String>,
-    /// 精确匹配 `action`（`added` / `modified` / `removed` / `skipped`）
+    /// 精确匹配 `action`（`added` / `modified` / `removed` / `skipped` / `excluded`）
     pub action: Option<String>,
     /// 路径包含该关键字（按字面匹配，`%` / `_` 不作通配符；ASCII 不区分大小写）
     pub keyword: Option<String>,
@@ -1218,6 +1324,15 @@ pub struct RunItemFilter {
 
 /// 状态筛选的分组值：所有未到终态的 item
 pub const RUN_ITEM_STATUS_IN_PROGRESS: &str = "in_progress";
+
+/// 被排除条目的 run_item `target`（没有执行目标）
+pub const EXCLUDED_TARGET: &str = "none";
+
+/// 单轮最多逐条记录的被排除条目数；超出只计数，run 上标 `excluded_truncated`
+pub const EXCLUDED_ITEMS_CAP: usize = 500;
+
+/// 每个订阅保留排除明细的最近运行数；更早的运行只保留 `excluded_count`
+pub const EXCLUDED_DETAIL_RUNS_KEPT: usize = 20;
 
 impl RunItemFilter {
     /// 由 API 查询参数构造：空串 / `all` 视为不筛选，关键字去掉首尾空白
@@ -1306,6 +1421,12 @@ pub struct RunRecord {
     /// WS 断线重连后就没了，只靠它的话用户又会退回到裸的「运行中」。
     #[serde(default)]
     pub phase: Option<String>,
+    /// 被排除规则剔除的条目数（每条分支只计最上层；老 run 为 0）
+    #[serde(default)]
+    pub excluded_count: usize,
+    /// 被排除条目超过单轮记录上限，明细只记了前若干条
+    #[serde(default)]
+    pub excluded_truncated: bool,
 }
 
 /// run 阶段常量。字符串直接进 DB 与 API，改动需同步前端 `describeRunStatus`。
@@ -1839,6 +1960,194 @@ mod tests {
         assert_eq!(second.len(), 25);
         assert_eq!(second[0].path, "/file-100.bin");
         assert_eq!(second[24].path, "/file-124.bin");
+    }
+
+    #[test]
+    fn test_run_item_paths_for_notification() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-n", &s.id, 1000).unwrap();
+        let add = |path: &str, action: SyncAction, target: TargetKind, status: RunItemStatus| {
+            mgr.add_run_item(
+                "run-n", path, action, target, None, None, status, None, None,
+            )
+            .unwrap();
+        };
+        add(
+            "/b.mp4",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            RunItemStatus::Completed,
+        );
+        // 同一路径多目标只算一次
+        add(
+            "/b.mp4",
+            SyncAction::Added,
+            TargetKind::Local,
+            RunItemStatus::Completed,
+        );
+        add(
+            "/a.mp4",
+            SyncAction::Modified,
+            TargetKind::Netdisk,
+            RunItemStatus::Completed,
+        );
+        add(
+            "/c.mp4",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            RunItemStatus::Completed,
+        );
+        add(
+            "/gone.mp4",
+            SyncAction::Removed,
+            TargetKind::Netdisk,
+            RunItemStatus::Completed,
+        );
+        add(
+            "/skip.mp4",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            RunItemStatus::Skipped,
+        );
+        add(
+            "/bad.mp4",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            RunItemStatus::Failed,
+        );
+
+        let (paths, total) = mgr
+            .run_item_paths_for_notification("run-n", false, 2)
+            .unwrap();
+        assert_eq!(paths, vec!["/b.mp4", "/a.mp4"], "按写入顺序");
+        assert_eq!(total, 3);
+        let (paths, total) = mgr
+            .run_item_paths_for_notification("run-n", true, 5)
+            .unwrap();
+        assert_eq!((paths, total), (vec!["/bad.mp4".to_string()], 1));
+        // limit 0 只计数
+        let (paths, total) = mgr
+            .run_item_paths_for_notification("run-n", true, 0)
+            .unwrap();
+        assert_eq!((paths.len(), total), (0, 1));
+    }
+
+    #[test]
+    fn test_record_excluded_items_caps_and_summarizes() {
+        use crate::share_sync::snapshot::ExcludedEntry;
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-x", &s.id, 1000).unwrap();
+        // 同一路径的真实动作（如删除缺失）与排除记录互不覆盖
+        mgr.add_run_item(
+            "run-x",
+            "/e/0.txt",
+            SyncAction::Removed,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Completed,
+            None,
+            None,
+        )
+        .unwrap();
+        let entries: Vec<ExcludedEntry> = (0..5)
+            .map(|i| ExcludedEntry {
+                path: format!("/e/{i}.txt"),
+                is_dir: false,
+                reason: "excluded:glob:*.txt".into(),
+            })
+            .collect();
+        assert_eq!(mgr.record_excluded_items("run-x", &entries, 3).unwrap(), 3);
+        // 幂等
+        assert_eq!(mgr.record_excluded_items("run-x", &entries, 3).unwrap(), 0);
+        let run = mgr.get_run("run-x").unwrap().unwrap();
+        assert_eq!((run.excluded_count, run.excluded_truncated), (5, true));
+
+        let excluded = RunItemFilter::from_query(Some("excluded"), None, None);
+        let items = mgr
+            .list_run_items_page_filtered("run-x", &excluded, 1, 50)
+            .unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|i| i.action == "excluded"
+            && i.target == EXCLUDED_TARGET
+            && i.reason.as_deref() == Some("excluded:glob:*.txt")));
+        let removed = mgr.list_run_items("run-x").unwrap();
+        assert!(removed
+            .iter()
+            .any(|i| i.path == "/e/0.txt" && i.action == "removed"));
+        // 排除记录先写入，但「全部」列表里排在真实动作之后
+        mgr.add_run_item(
+            "run-x",
+            "/later.mp4",
+            SyncAction::Added,
+            TargetKind::Netdisk,
+            None,
+            None,
+            RunItemStatus::Completed,
+            None,
+            None,
+        )
+        .unwrap();
+        let all = mgr.list_run_items_page("run-x", 1, 50).unwrap();
+        let actions: Vec<&str> = all.iter().map(|i| i.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["removed", "added", "excluded", "excluded", "excluded"]
+        );
+        let facets = mgr.run_item_facets("run-x").unwrap();
+        assert_eq!(facets.status_counts.get("excluded"), Some(&3));
+        assert_eq!(facets.action_counts.get("excluded"), Some(&3));
+
+        // 未截断
+        mgr.start_run("run-y", &s.id, 1001).unwrap();
+        mgr.record_excluded_items("run-y", &entries[..2], 3)
+            .unwrap();
+        let run = mgr.get_run("run-y").unwrap().unwrap();
+        assert_eq!((run.excluded_count, run.excluded_truncated), (2, false));
+        // 老 run 未记录：默认 0 / false
+        mgr.start_run("run-z", &s.id, 1002).unwrap();
+        let run = mgr.get_run("run-z").unwrap().unwrap();
+        assert_eq!((run.excluded_count, run.excluded_truncated), (0, false));
+    }
+
+    #[test]
+    fn test_excluded_details_kept_for_recent_runs_only() {
+        use crate::share_sync::snapshot::ExcludedEntry;
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        let other = sub("b");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.upsert_subscription(&other).unwrap();
+        let entries = vec![ExcludedEntry {
+            path: "/x.tmp".into(),
+            is_dir: false,
+            reason: "excluded:glob:*.tmp".into(),
+        }];
+        mgr.start_run("other-0", &other.id, 1).unwrap();
+        mgr.record_excluded_items("other-0", &entries, 10).unwrap();
+        let total = EXCLUDED_DETAIL_RUNS_KEPT + 2;
+        for i in 0..total {
+            let rid = format!("run-{i}");
+            mgr.start_run(&rid, &s.id, 1000 + i as i64).unwrap();
+            mgr.record_excluded_items(&rid, &entries, 10).unwrap();
+        }
+        let excluded = RunItemFilter::from_query(Some("excluded"), None, None);
+        let count = |rid: &str| {
+            mgr.list_run_items_page_filtered(rid, &excluded, 1, 50)
+                .unwrap()
+                .len()
+        };
+        // 最早的两次运行明细被清理，计数仍在
+        assert_eq!((count("run-0"), count("run-1")), (0, 0));
+        assert_eq!(mgr.get_run("run-0").unwrap().unwrap().excluded_count, 1);
+        assert_eq!(count("run-2"), 1);
+        assert_eq!(count(&format!("run-{}", total - 1)), 1);
+        // 其它订阅不受影响
+        assert_eq!(count("other-0"), 1);
     }
 
     #[test]
@@ -2390,6 +2699,20 @@ mod tests {
         let items = mgr.list_run_items("r1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "completed");
+        // 老库补上排除统计列：老 run 读出默认值，新写入可用
+        let run = mgr.get_run("r1").unwrap().unwrap();
+        assert_eq!((run.excluded_count, run.excluded_truncated), (0, false));
+        mgr.record_excluded_items(
+            "r1",
+            &[crate::share_sync::snapshot::ExcludedEntry {
+                path: "/x.tmp".into(),
+                is_dir: false,
+                reason: "excluded:glob:*.tmp".into(),
+            }],
+            EXCLUDED_ITEMS_CAP,
+        )
+        .unwrap();
+        assert_eq!(mgr.get_run("r1").unwrap().unwrap().excluded_count, 1);
     }
 
     /// 老库（`share_snapshots` 没有 `run_id` 列）升级后，**已有快照必须继续被当成基线**。

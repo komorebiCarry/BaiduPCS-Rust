@@ -54,6 +54,7 @@
                   :rules="rules"
                   label-width="140px"
                   label-position="left"
+                  @submit.prevent
               >
                 <!-- 账号管理 -->
                 <div id="section-accounts">
@@ -125,6 +126,20 @@
                     <el-switch v-model="formData.ui!.account_quick_bar" />
                     <div class="form-tip">
                       开启后，登录多个账号时在顶部栏横向列出所有账号，点击即可切换（原头像下拉菜单保留；手机端不显示）
+                    </div>
+                  </el-form-item>
+
+                  <el-form-item label="高亮失效分享">
+                    <el-switch v-model="formData.ui!.highlight_dead_shares" />
+                    <div class="form-tip">
+                      在「我的分享」里用浅红底标出文件已被删除的分享、浅黄底标出已过期的分享
+                    </div>
+                  </el-form-item>
+
+                  <el-form-item label="失效分享只能取消">
+                    <el-switch v-model="formData.ui!.disable_dead_share_actions" />
+                    <div class="form-tip">
+                      开启后，失效分享的「提取码」「复制」「有效期」按钮置灰，只保留「取消分享」
                     </div>
                   </el-form-item>
                 </el-card>
@@ -1476,6 +1491,8 @@ async function loadConfig() {
       formData.value.ui = {
         remember_netdisk_path: formData.value.ui?.remember_netdisk_path ?? true,
         account_quick_bar: formData.value.ui?.account_quick_bar ?? false,
+        highlight_dead_shares: formData.value.ui?.highlight_dead_shares ?? true,
+        disable_dead_share_actions: formData.value.ui?.disable_dead_share_actions ?? false,
       }
     }
 

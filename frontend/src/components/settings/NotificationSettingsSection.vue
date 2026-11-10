@@ -35,6 +35,23 @@
       分享同步仅在「发现新增 / 更新的文件」时通知，没有变化的轮询不打扰；分享同步与自动备份内部产生的转存 / 下载子任务不单独通知；没有任何文件变动的自动备份轮次不通知。
     </div>
 
+    <el-form-item label="列出文件数">
+      <el-input-number
+          v-model="model.share_sync_file_list_limit"
+          class="file-list-limit"
+          :min="0"
+          :max="MAX_SHARE_SYNC_FILE_LIST_LIMIT"
+          :step="1"
+          step-strictly
+          :value-on-clear="DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT"
+          controls-position="right"
+          :disabled="!model.enabled"
+      />
+      <div class="form-tip">
+        分享同步通知里列出的文件名个数（新增 / 更新优先，其次失败的），超出部分显示「等 N 个文件」；填 0 不列文件名。Webhook 模板可用 <code class="ph">{{ wrap('files') }}</code> 单独引用。
+      </div>
+    </el-form-item>
+
     <!-- Gotify -->
     <el-divider content-position="left">Gotify</el-divider>
     <el-form-item label="启用 Gotify">
@@ -148,7 +165,9 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Bell, Delete, Plus, Promotion } from '@element-plus/icons-vue'
 import {
+  DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT,
   DEFAULT_WEBHOOK_BODY_TEMPLATE,
+  MAX_SHARE_SYNC_FILE_LIST_LIMIT,
   testNotification,
   type ChannelSendResult,
   type NotificationConfig,
@@ -194,6 +213,7 @@ const eventGroups: { label: string; items: { key: keyof NotificationEventToggles
 
 const placeholders = [
   'event', 'event_label', 'title', 'message', 'level', 'name', 'task_id', 'account_uid', 'time', 'timestamp',
+  'files',
 ]
 
 function wrap(p: string) {

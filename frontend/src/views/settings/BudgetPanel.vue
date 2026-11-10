@@ -685,7 +685,7 @@ defineExpose({ refresh: refreshSnapshot })
         </div>
       </template>
 
-      <el-form label-position="left" label-width="120px" :disabled="authStore.readonlyMode">
+      <el-form label-position="left" label-width="120px" :disabled="authStore.readonlyMode" @submit.prevent>
         <el-form-item label="下载总线程数">
           <el-radio-group v-model="machineForm.download_mode">
             <el-radio value="auto">
@@ -921,7 +921,7 @@ defineExpose({ refresh: refreshSnapshot })
 
           <!-- 自定义表单（仅 custom 模式） -->
           <div v-if="accountForms[ui.account.uid] && !accountForms[ui.account.uid].auto_apply_recommended" class="custom-form">
-            <el-form label-position="left" label-width="100px" :disabled="authStore.readonlyMode">
+            <el-form label-position="left" label-width="100px" :disabled="authStore.readonlyMode" @submit.prevent>
               <el-divider content-position="left">下载</el-divider>
               <el-form-item label="线程数">
                 <el-input-number

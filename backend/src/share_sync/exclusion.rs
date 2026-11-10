@@ -257,6 +257,20 @@ pub fn normalize_test_path(raw: &str) -> Result<String, RuleError> {
 pub struct CompiledRules {
     glob: Option<RegexSet>,
     regex: Option<RegexSet>,
+    /// 原始规则文本（与 RegexSet 下标一一对应），用于说明「命中了哪条规则」
+    glob_patterns: Vec<String>,
+    regex_patterns: Vec<String>,
+}
+
+/// 命中的单条规则：类型 + 规则原文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleHit {
+    /// 仅 [`RuleKind::Glob`] / [`RuleKind::Regex`]
+    pub kind: RuleKind,
+    /// 规则在对应列表中的 0 起下标
+    pub index: usize,
+    /// 规则原文
+    pub pattern: String,
 }
 
 impl CompiledRules {
@@ -265,7 +279,50 @@ impl CompiledRules {
         Ok(Self {
             glob: compile_glob_set(globs)?,
             regex: compile_regex_set(regexes)?,
+            glob_patterns: globs.to_vec(),
+            regex_patterns: regexes.to_vec(),
         })
+    }
+
+    /// `path` 自身命中的第一条规则（通配符优先，其次正则；同类按列表顺序）。
+    ///
+    /// 与 [`Self::matches_self`] 判定一致：后者为 true 当且仅当这里返回 `Some`。
+    pub fn first_match_self(&self, path: &str) -> Option<RuleHit> {
+        let pick = |set: &Option<RegexSet>, patterns: &[String], kind: RuleKind| {
+            let set = set.as_ref()?;
+            let index = set.matches(path).into_iter().next()?;
+            Some(RuleHit {
+                kind,
+                index,
+                pattern: patterns.get(index).cloned().unwrap_or_default(),
+            })
+        };
+        pick(&self.glob, &self.glob_patterns, RuleKind::Glob)
+            .or_else(|| pick(&self.regex, &self.regex_patterns, RuleKind::Regex))
+    }
+
+    /// `path` 自身或最近的祖先目录命中的第一条规则（与 [`Self::matches_path`] 判定一致）。
+    pub fn first_match_path(&self, path: &str) -> Option<RuleHit> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut cur = path.trim_end_matches('/');
+        if cur.is_empty() {
+            cur = "/";
+        }
+        loop {
+            if let Some(hit) = self.first_match_self(cur) {
+                return Some(hit);
+            }
+            if cur == "/" {
+                return None;
+            }
+            match cur.rfind('/') {
+                Some(0) => cur = "/",
+                Some(i) => cur = &cur[..i],
+                None => return None,
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -309,6 +366,54 @@ impl CompiledRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_match_reports_which_rule_hit() {
+        let set = CompiledRules::compile(
+            &patterns(&["*.txt", "/a/*"]),
+            &patterns(&["^/b/.*\\.mkv$", "^/c$"]),
+        )
+        .unwrap();
+        let hit = set.first_match_self("/x/readme.txt").unwrap();
+        assert_eq!(
+            (hit.kind, hit.index, hit.pattern.as_str()),
+            (RuleKind::Glob, 0, "*.txt")
+        );
+        let hit = set.first_match_self("/a/b").unwrap();
+        assert_eq!(
+            (hit.kind, hit.index, hit.pattern.as_str()),
+            (RuleKind::Glob, 1, "/a/*")
+        );
+        let hit = set.first_match_self("/b/ep1.mkv").unwrap();
+        assert_eq!((hit.kind, hit.index), (RuleKind::Regex, 0));
+        assert_eq!(hit.pattern, "^/b/.*\\.mkv$");
+        assert!(set.first_match_self("/b/ep1.mp4").is_none());
+        // 通配符与正则同时命中时取通配符
+        let hit = set.first_match_self("/a/x.txt").unwrap();
+        assert_eq!((hit.kind, hit.index), (RuleKind::Glob, 0));
+        // 祖先目录命中：报告祖先命中的规则；与 matches_path 判定一致
+        let hit = set.first_match_path("/c/deep/file.bin").unwrap();
+        assert_eq!((hit.kind, hit.pattern.as_str()), (RuleKind::Regex, "^/c$"));
+        for p in [
+            "/c/deep/file.bin",
+            "/x/readme.txt",
+            "/z/ok.bin",
+            "/",
+            "/b/ep1.mp4",
+        ] {
+            assert_eq!(
+                set.first_match_path(p).is_some(),
+                set.matches_path(p),
+                "{p}"
+            );
+            assert_eq!(
+                set.first_match_self(p).is_some(),
+                set.matches_self(p),
+                "{p}"
+            );
+        }
+        assert!(CompiledRules::default().first_match_path("/a").is_none());
+    }
 
     fn patterns(items: &[&str]) -> Vec<String> {
         items.iter().map(|p| p.to_string()).collect()

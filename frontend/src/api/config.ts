@@ -210,6 +210,10 @@ export interface UiConfig {
   remember_netdisk_path: boolean
   /** 顶部栏显示多账号横向快捷切换条，默认关闭 */
   account_quick_bar: boolean
+  /** 「我的分享」用浅色底高亮失效分享（文件已删除 / 已过期），默认开启；旧后端不返回 */
+  highlight_dead_shares?: boolean
+  /** 失效分享只保留「取消分享」操作，默认关闭；旧后端不返回 */
+  disable_dead_share_actions?: boolean
 }
 
 /// 应用配置
@@ -490,7 +494,14 @@ export interface NotificationConfig {
   webhook: WebhookChannelConfig
   gotify: GotifyChannelConfig
   events: NotificationEventToggles
+  /** 分享同步通知列出的文件名数量（新增/更新优先，其次失败；超出显示「等 N 个」）；0 = 不列；旧后端不返回 */
+  share_sync_file_list_limit?: number
 }
+
+/** 分享同步通知默认列出的文件数（与后端 DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT 一致） */
+export const DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT = 5
+/** 分享同步通知最多列出的文件数（与后端 MAX_SHARE_SYNC_FILE_LIST_LIMIT 一致） */
+export const MAX_SHARE_SYNC_FILE_LIST_LIMIT = 50
 
 /** 与后端 DEFAULT_WEBHOOK_BODY_TEMPLATE 保持一致 */
 export const DEFAULT_WEBHOOK_BODY_TEMPLATE = `{
@@ -502,7 +513,8 @@ export const DEFAULT_WEBHOOK_BODY_TEMPLATE = `{
   "task_id": "{{task_id}}",
   "account_uid": "{{account_uid}}",
   "time": "{{time}}",
-  "timestamp": {{timestamp}}
+  "timestamp": {{timestamp}},
+  "files": "{{files}}"
 }`
 
 /** 默认通知配置（与后端 Default 一致：总开关关闭、事件全开） */
@@ -535,6 +547,7 @@ export function defaultNotificationConfig(): NotificationConfig {
       backup_completed: true,
       backup_failed: true,
     },
+    share_sync_file_list_limit: DEFAULT_SHARE_SYNC_FILE_LIST_LIMIT,
   }
 }
 
@@ -546,6 +559,7 @@ export function normalizeNotificationConfig(cfg?: Partial<NotificationConfig> | 
     webhook: { ...d.webhook, ...(cfg?.webhook ?? {}), headers: [...(cfg?.webhook?.headers ?? [])] },
     gotify: { ...d.gotify, ...(cfg?.gotify ?? {}) },
     events: { ...d.events, ...(cfg?.events ?? {}) },
+    share_sync_file_list_limit: cfg?.share_sync_file_list_limit ?? d.share_sync_file_list_limit,
   }
 }
 

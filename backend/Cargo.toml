@@ -1,6 +1,6 @@
 [package]
 name = "baidu-netdisk-rust"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 rust-version = "1.87"
 
@@ -12,7 +12,7 @@ tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.21"
 
 # HTTP客户端

@@ -117,6 +117,8 @@ pub struct Notification {
     pub task_id: Option<String>,
     /// 关联账号 UID
     pub account_uid: Option<u64>,
+    /// 相关文件名列表（多行；目前仅分享同步通知填写），模板占位符 `{{files}}`
+    pub files: String,
     /// 去重键；`None` 表示不去重
     pub dedup_key: Option<String>,
     /// 生成时间
@@ -137,6 +139,7 @@ impl Notification {
             name,
             task_id: None,
             account_uid: None,
+            files: String::new(),
             dedup_key: None,
             time: chrono::Local::now(),
         }
@@ -149,6 +152,11 @@ impl Notification {
 
     pub fn with_account(mut self, uid: Option<u64>) -> Self {
         self.account_uid = uid;
+        self
+    }
+
+    pub fn with_files(mut self, files: impl Into<String>) -> Self {
+        self.files = files.into();
         self
     }
 

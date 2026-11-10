@@ -2,6 +2,15 @@
   <div class="uploads-container" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
+      <!-- 手机端：账号筛选独占一行 -->
+      <div v-if="isMobile && authStore.hasMultipleAccounts" class="toolbar-account-row">
+        <AccountFilter
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            block
+            class="account-filter-slot"
+        />
+      </div>
       <div class="header-left">
         <h2 v-if="!isMobile">上传管理</h2>
         <el-tag :type="activeCountType" size="large">
@@ -9,7 +18,7 @@
         </el-tag>
         <!-- 多账号过滤器 -->
         <AccountFilter
-            v-if="authStore.hasMultipleAccounts"
+            v-if="authStore.hasMultipleAccounts && !isMobile"
             v-model="ownerFilter"
             :counts="ownerFilterCounts"
             size="large"
@@ -17,12 +26,15 @@
         />
       </div>
       <div class="header-right">
-        <el-button @click="refreshTasks" :circle="isMobile">
+        <el-button @click="refreshTasks" :circle="isMobile" aria-label="刷新" :title="isMobile ? '刷新' : undefined">
           <el-icon><Refresh /></el-icon>
           <span v-if="!isMobile">刷新</span>
         </el-button>
         <el-dropdown @command="handleBatchCommand" trigger="click">
-          <el-button>
+          <el-button v-if="isMobile" circle aria-label="批量操作" title="批量操作">
+            <el-icon><MoreFilled /></el-icon>
+          </el-button>
+          <el-button v-else>
             批量操作
             <el-icon class="el-icon--right"><ArrowDown /></el-icon>
           </el-button>
@@ -244,6 +256,7 @@ import {
   Lock,
   ArrowDown,
   Location,
+  MoreFilled,
 } from '@element-plus/icons-vue'
 import {useIsMobile} from '@/utils/responsive'
 import {createAdaptivePoller} from '@/utils/backendHealth'
@@ -759,6 +772,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 .uploads-container {
   width: 100%;
   height: 100%;
@@ -952,14 +966,6 @@ onUnmounted(() => {
 // 移动端样式
 // =====================
 .is-mobile {
-  .toolbar {
-    padding: 12px 16px;
-
-    .header-left {
-      gap: 12px;
-    }
-  }
-
   .task-container {
     padding: 12px;
   }
@@ -1000,5 +1006,10 @@ onUnmounted(() => {
       font-size: 12px;
     }
   }
+}
+
+// 手机端工具栏：统一规则见 styles/_mobile-toolbar.scss（放在最后以覆盖上方桌面样式）
+.uploads-container.is-mobile {
+  @include mt.mobile-toolbar;
 }
 </style>

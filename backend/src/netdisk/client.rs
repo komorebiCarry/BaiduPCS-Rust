@@ -4018,8 +4018,8 @@ impl NetdiskClient {
         let status = response.status();
         let response_text = response.text().await.context("读取分享列表响应失败")?;
 
-        // 临时使用 info 级别日志查看响应内容
-        info!(
+        // 响应含全部分享链接，只在 debug 级别输出
+        debug!(
             "获取分享列表响应: status={}, body={}",
             status, response_text
         );
@@ -4029,9 +4029,9 @@ impl NetdiskClient {
 
         if list_response.is_success() {
             info!(
-                "获取分享列表成功: total={}, count={}",
-                list_response.total,
-                list_response.list.len()
+                "获取分享列表成功: count={}, nextpage={:?}",
+                list_response.page_count(),
+                list_response.nextpage
             );
         } else {
             warn!(

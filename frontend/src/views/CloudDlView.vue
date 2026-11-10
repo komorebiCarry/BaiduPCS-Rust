@@ -23,10 +23,10 @@
         </template>
         <!-- 移动端按钮 -->
         <template v-else>
-          <el-button type="primary" circle @click="showAddDialog = true">
+          <el-button type="primary" circle aria-label="添加任务" title="添加任务" @click="showAddDialog = true">
             <el-icon><Plus /></el-icon>
           </el-button>
-          <el-button circle @click="handleRefresh" :loading="isRefreshing">
+          <el-button circle aria-label="刷新" title="刷新" @click="handleRefresh" :loading="isRefreshing">
             <el-icon><Refresh /></el-icon>
           </el-button>
         </template>
@@ -212,7 +212,7 @@
         :fullscreen="isMobile"
         @close="resetAddForm"
     >
-      <el-form :model="addForm" label-width="100px" :label-position="isMobile ? 'top' : 'right'">
+      <el-form :model="addForm" label-width="100px" :label-position="isMobile ? 'top' : 'right'" @submit.prevent>
         <!--
           🔥
           CloudDl 收紧为 active-only（与 SharesView 同语义），UI 不再展示账号维度。
@@ -912,6 +912,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 .cloud-dl-view {
   height: 100%;
   display: flex;
@@ -1466,21 +1467,6 @@ onUnmounted(() => {
 // 移动端响应式调整
 // =====================
 @media (max-width: 767px) {
-  .toolbar {
-    flex-wrap: wrap;
-    gap: 12px;
-
-    .header-left {
-      width: 100%;
-      justify-content: space-between;
-    }
-
-    .header-right {
-      width: 100%;
-      justify-content: flex-end;
-    }
-  }
-
   // 移动端详情弹窗适配
   .task-detail {
     .detail-header {
@@ -1664,26 +1650,6 @@ onUnmounted(() => {
 @media (max-width: 374px) {
   .cloud-dl-view {
     padding: 10px;
-  }
-
-  .toolbar {
-    gap: 8px;
-
-    .header-left {
-      .el-tag {
-        font-size: 11px;
-        padding: 0 6px;
-      }
-    }
-
-    .header-right {
-      gap: 6px;
-
-      .el-button.is-circle {
-        width: 36px;
-        height: 36px;
-      }
-    }
   }
 
   .task-cards {
@@ -1890,5 +1856,11 @@ onUnmounted(() => {
       transform: none;
     }
   }
+}
+
+// 手机端工具栏：与下载 / 转存等页同一套规则（styles/_mobile-toolbar.scss）；
+// 页面容器已有 12px 内边距，工具栏自身不再加内边距
+.cloud-dl-view.is-mobile {
+  @include mt.mobile-toolbar($inset: 0, $padding-y: 0, $margin-bottom: 12px);
 }
 </style>

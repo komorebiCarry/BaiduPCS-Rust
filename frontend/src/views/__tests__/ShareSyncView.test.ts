@@ -59,15 +59,17 @@ vi.mock('@/utils/websocket', () => ({
 const auth = vi.hoisted(() => ({
   hasMultipleAccounts: false,
   activeUid: 1 as number | null,
-  accounts: [{ uid: 1, username: 'u', nickname: null }],
+  accounts: [{ uid: 1, username: 'u', nickname: null }] as Array<{ uid: number; username: string; nickname: string | null }>,
 }))
 
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => auth,
 }))
 
+const mobile = vi.hoisted(() => ({ value: false }))
+
 vi.mock('@/utils/responsive', () => ({
-  useIsMobile: () => ref(false),
+  useIsMobile: () => ref(mobile.value),
 }))
 
 vi.mock('@/utils/backendHealth', () => ({
@@ -111,9 +113,13 @@ function mountView() {
           name: 'ShareIncludeExcludeEditor',
           props: [
             'shareUrl', 'password', 'includePaths', 'excludePatterns',
-            'excludeRegexPatterns', 'excludePaths', 'ownerUid', 'ownerLoggedIn',
+            'excludeRegexPatterns', 'includePatterns', 'includeRegexPatterns',
+            'excludePaths', 'ownerUid', 'ownerLoggedIn',
           ],
-          emits: ['update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns', 'update:excludePaths'],
+          emits: [
+            'update:includePaths', 'update:excludePatterns', 'update:excludeRegexPatterns',
+            'update:includePatterns', 'update:includeRegexPatterns', 'update:excludePaths',
+          ],
           template: '<div class="include-exclude-editor-stub" />',
           setup(_props: unknown, { expose }: { expose: (e: Record<string, unknown>) => void }) {
             expose({ validateRules: editorStub.validateRules })
@@ -171,6 +177,7 @@ beforeEach(() => {
 
 afterEach(() => {
   document.body.innerHTML = ''
+  mobile.value = false
 })
 
 describe('ShareSyncView 订阅编辑弹窗同步目标', () => {
@@ -576,6 +583,47 @@ describe('ShareSyncView 扫描当前路径展示', () => {
   })
 })
 
+describe('ShareSyncView 排除内容文案', () => {
+  it('卡片摘要与详情都用「排除内容」措辞', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.textContent).toContain('排除内容 1 项')
+    expect(card.textContent, '不再使用「排除目录」措辞').not.toContain('排除目录')
+
+    card.click()
+    await flushPromises()
+
+    const labels = Array.from(
+        document.body.querySelectorAll<HTMLElement>('.el-descriptions__label'),
+    ).map((el) => el.textContent?.trim())
+    expect(labels).toContain('排除内容')
+    expect(labels, '详情不再使用「排除目录」措辞').not.toContain('排除目录')
+    wrapper.unmount()
+  })
+
+  it('详情标签只省略合成命名空间，其他路径原样显示', async () => {
+    api.listSubscriptions.mockResolvedValue([{
+      ...SUB,
+      include_paths: ['/sharelink1-2/A/报告 .txt', '/apps/bypy/B'],
+      exclude_paths: ['/sharelink1-2/C/广告. '],
+    }])
+    const wrapper = mountView()
+    await flushPromises()
+
+    document.body.querySelector<HTMLElement>('.config-card')!.click()
+    await flushPromises()
+
+    const tags = Array.from(document.body.querySelectorAll<HTMLElement>('.path-tags .el-tag'))
+        .map((tag) => tag.textContent?.trim())
+    expect(tags).toContain('/A/报告 .txt')
+    expect(tags).toContain('/apps/bypy/B')
+    expect(tags).toContain('/C/广告.')
+    wrapper.unmount()
+  })
+})
+
 describe('ShareSyncView 正则排除规则', () => {
   const WITH_REGEX = {
     ...SUB,
@@ -758,7 +806,8 @@ describe('ShareSyncView 跨账号目标（#179）', () => {
     await flushPromises()
 
     const card = document.body.querySelector<HTMLElement>('.config-card')!
-    expect(card.textContent).toContain('网盘(UID 2)')
+    // #183：带账号的目标写作「网盘→<账号名>」，账号不在列表时回退 UID
+    expect(card.textContent).toContain('网盘→UID:2')
     expect(card.textContent).toContain('本地(默认下载账号)')
 
     editButton(sub.name).click()
@@ -1057,6 +1106,7 @@ describe('ShareSyncView 运行详情文件动作筛选', () => {
       failed: '失败（157）',
       completed: '完成（7200）',
       skipped: '跳过（120）',
+      excluded: '已排除（0）',
       in_progress: '进行中（7）',
     })
     const action = Object.fromEntries(vm.runItemActionOptions.map((o) => [o.value, o.label]))
@@ -1066,6 +1116,7 @@ describe('ShareSyncView 运行详情文件动作筛选', () => {
       modified: '修改（400）',
       removed: '删除（0）',
       skipped: '跳过（84）',
+      excluded: '已排除（0）',
     })
     expect(vm.runItemsHeaderCount).toBe('7484')
     wrapper.unmount()
@@ -1153,5 +1204,301 @@ describe('ShareSyncView 运行详情文件动作筛选', () => {
     } finally {
       get.mockRestore()
     }
+  })
+})
+
+describe('ShareSyncView 选中路径提交保真', () => {
+  function editButtonOf(name: string): HTMLElement {
+    const card = Array.from(document.body.querySelectorAll<HTMLElement>('.config-card'))
+        .find((el) => el.textContent?.includes(name))
+    const btn = Array.from((card ?? document.body).querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '编辑')
+    expect(btn, `「${name}」应有编辑按钮`).toBeTruthy()
+    return btn!
+  }
+
+  function saveButton(): HTMLElement {
+    const btn = Array.from(document.body.querySelectorAll<HTMLElement>('button'))
+        .find((b) => b.textContent?.trim() === '保存')
+    expect(btn, '应有「保存」按钮').toBeTruthy()
+    return btn!
+  }
+
+  type EditorSub = Omit<typeof SUB, 'include_paths' | 'exclude_paths' | 'targets'> & {
+    include_paths: string[]
+    exclude_paths: string[]
+    targets: Array<Record<string, unknown>>
+  }
+
+  async function openEditor(sub: EditorSub) {
+    api.listSubscriptions.mockResolvedValue([sub])
+    api.updateSubscription.mockResolvedValue({ ...sub })
+    const wrapper = mountView()
+    await flushPromises()
+    editButtonOf(sub.name).click()
+    await flushPromises()
+    return wrapper
+  }
+
+  it('保存时按原字节保留选中路径的文件名空白', async () => {
+    const withSpaces = {
+      ...SUB,
+      include_paths: ['/剧集/报告. '],
+      exclude_paths: ['/剧集/广告. '],
+    }
+    const wrapper = await openEditor(withSpaces)
+
+    saveButton().click()
+    await flushPromises()
+
+    expect(api.updateSubscription).toHaveBeenCalledTimes(1)
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      include_paths: string[]
+      exclude_paths: string[]
+    }
+    expect(req.include_paths, '同步内容保留文件名结尾空格').toEqual(['/剧集/报告. '])
+    expect(req.exclude_paths, '排除内容保留文件名结尾空格').toEqual(['/剧集/广告. '])
+    wrapper.unmount()
+  })
+
+  it('仅结尾空格不同的两条选中路径都保留，不会被去重成一个', async () => {
+    const pair = {
+      ...SUB,
+      include_paths: ['/剧集/报告.', '/剧集/报告. '],
+      exclude_paths: [],
+    }
+    const wrapper = await openEditor(pair)
+
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as { include_paths: string[] }
+    expect(req.include_paths, '仅结尾空格不同即两个文件，不能去重').toEqual([
+      '/剧集/报告.',
+      '/剧集/报告. ',
+    ])
+    wrapper.unmount()
+  })
+
+  it('选中路径只规整分隔符，手工输入的网盘目标仍按原规则 trim', async () => {
+    const messy = {
+      ...SUB,
+      include_paths: ['/剧集//报告. //'],
+      exclude_paths: ['//剧集/广告. '],
+      targets: [
+        { kind: 'netdisk' as const, remote_path: '/我的资源', save_fs_id: 0 },
+        { kind: 'local' as const, local_path: '/tmp', mode: 'transfer_and_download' as const },
+      ],
+    }
+    const wrapper = await openEditor(messy)
+
+    const netdiskInput = document.body.querySelector<HTMLInputElement>(
+      '.subscription-dialog .target-path input',
+    )!
+    netdiskInput.value = '  /我的资源/同步  '
+    netdiskInput.dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    saveButton().click()
+    await flushPromises()
+
+    const req = api.updateSubscription.mock.calls[0][1] as {
+      include_paths: string[]
+      exclude_paths: string[]
+      targets: Array<Record<string, unknown>>
+    }
+    expect(req.include_paths, '只合并冗余斜杠，文件名空白不动').toEqual(['/剧集/报告. '])
+    expect(req.exclude_paths).toEqual(['/剧集/广告. '])
+    expect(req.targets[0].remote_path, '手工目标路径仍走 trim 归一').toBe('/我的资源/同步')
+    wrapper.unmount()
+  })
+})
+
+describe('ShareSyncView 运行详情显示命中的排除规则（#183）', () => {
+  const EXCLUDED_ITEMS = [
+    { id: 1, path: '/剧集/花絮', action: 'excluded', target: 'none', transfer_task_id: null, download_task_id: null,
+      status: 'excluded', versioned_old_path: null, error: null, reason: 'excluded:glob:花絮' },
+    { id: 2, path: '/剧集/a.txt', action: 'excluded', target: 'none', transfer_task_id: null, download_task_id: null,
+      status: 'excluded', versioned_old_path: null, error: null, reason: 'excluded:regex:\\.txt$' },
+    { id: 3, path: '/广告', action: 'excluded', target: 'none', transfer_task_id: null, download_task_id: null,
+      status: 'excluded', versioned_old_path: null, error: null, reason: 'excluded:path:/广告' },
+  ]
+  const FACETS = {
+    status_counts: { completed: 10, excluded: 3 },
+    action_counts: { added: 10, excluded: 3 },
+  }
+  const RUN = {
+    id: 'run-x', started_at: 1, finished_at: 2, status: 'completed', total_count: 10,
+    added_count: 10, modified_count: 0, removed_count: 0, unchanged_count: 0, failed_count: 0,
+    skipped_count: 0, overwritten_count: 0, error: null,
+    items: EXCLUDED_ITEMS, item_total_count: 13, item_page: 1, item_page_size: 100, item_facets: FACETS,
+  }
+
+  type Vm = {
+    openRun: (id: string) => Promise<void>
+    runItemStatusOptions: Array<{ value: string; label: string }>
+    runItemActionOptions: Array<{ value: string; label: string }>
+    describeReason: (r: unknown, c: unknown, v: string | null | undefined) => string
+    describeAction: (r: unknown, c: unknown, v: string) => string
+    describeItemStatus: (r: unknown, c: unknown, v: string) => string
+    describeTarget: (r: unknown, c: unknown, v: string) => string
+  }
+
+  async function open(run: Record<string, unknown>) {
+    api.getRun.mockReset().mockResolvedValue(structuredClone(run))
+    api.listRunItems.mockReset().mockResolvedValue({ items: [], total: 3, page: 1, page_size: 100, facets: FACETS })
+    const wrapper = mount(ShareSyncView, {
+      attachTo: document.body,
+      global: {
+        plugins: [ElementPlus],
+        stubs: {
+          AccountFilter: true, AccountBadge: true, TransferDialog: true,
+          ShareIncludeExcludeEditor: true, CronExprEditor: true, FilePickerModal: true,
+          'el-table': true, 'el-table-column': true,
+        },
+      },
+    })
+    await flushPromises()
+    const vm = wrapper.vm as unknown as Vm
+    await vm.openRun('run-x')
+    await flushPromises()
+    return { wrapper, vm }
+  }
+
+  it('已排除条目：动作 / 状态 / 目标 / 原因都汉化，原因写明命中的规则', async () => {
+    const { wrapper, vm } = await open(RUN)
+    expect(vm.describeAction(null, null, 'excluded')).toBe('已排除')
+    expect(vm.describeItemStatus(null, null, 'excluded')).toBe('已排除')
+    expect(vm.describeTarget(null, null, 'none')).toBe('—')
+    expect(vm.describeTarget(null, null, 'netdisk')).toBe('网盘')
+    expect(vm.describeTarget(null, null, 'netdisk@2002')).toBe('网盘→UID:2002')
+    expect(vm.describeReason(null, null, 'excluded:glob:花絮')).toBe('命中通配符 花絮')
+    expect(vm.describeReason(null, null, 'excluded:regex:\\.txt$')).toBe('命中正则 \\.txt$')
+    expect(vm.describeReason(null, null, 'excluded:path:/广告')).toBe('命中排除内容 /广告')
+    expect(vm.describeReason(null, null, 'excluded:glob:a:b')).toBe('命中通配符 a:b')
+    // 原有原因不受影响
+    expect(vm.describeReason(null, null, 'quota_full')).toBe('网盘空间不足')
+    wrapper.unmount()
+  })
+
+  it('筛选下拉含「已排除」，计数来自分组统计', async () => {
+    const { wrapper, vm } = await open(RUN)
+    expect(vm.runItemStatusOptions.find((o) => o.value === 'excluded')?.label).toBe('已排除（3）')
+    expect(vm.runItemActionOptions.find((o) => o.value === 'excluded')?.label).toBe('已排除（3）')
+    wrapper.unmount()
+  })
+
+  it('详情显示已排除数，点击按已排除筛选；超出上限时注明只记录了前 N 条', async () => {
+    const { wrapper } = await open({ ...RUN, excluded_count: 812, excluded_truncated: true })
+    const link = document.body.querySelector<HTMLElement>('.run-excluded-link')
+    expect(link?.textContent).toContain('812')
+    expect(document.body.querySelector('.run-excluded-truncated')?.textContent).toContain('明细只记录了前 3 条')
+    link!.click()
+    await flushPromises()
+    expect(api.listRunItems).toHaveBeenLastCalledWith('run-x', 1, 100, { status: 'excluded', action: 'all', q: '' })
+    wrapper.unmount()
+  })
+
+  it('排除明细已被清理的旧 run：只显示计数和说明，不给查看链接', async () => {
+    const { wrapper } = await open({
+      ...RUN,
+      excluded_count: 4,
+      excluded_truncated: true,
+      items: [],
+      item_facets: { status_counts: { completed: 10 }, action_counts: { added: 10 } },
+    })
+    expect(document.body.querySelector('.run-excluded-link')).toBeNull()
+    const note = document.body.querySelectorAll('.run-excluded-truncated')
+    expect(note).toHaveLength(1)
+    expect(note[0].textContent).toContain('明细已清理')
+    wrapper.unmount()
+  })
+
+  it('老 run（没有 excluded_count）不显示已排除行', async () => {
+    const { wrapper } = await open({ ...RUN, items: [], item_facets: { status_counts: { completed: 10 }, action_counts: { added: 10 } } })
+    expect(document.body.querySelector('.run-excluded-link')).toBeNull()
+    wrapper.unmount()
+  })
+})
+
+describe('ShareSyncView 所属账号与网盘账号（#183）', () => {
+  const SUB_X = {
+    ...SUB,
+    owner_uid: 1001,
+    targets: [{ kind: 'netdisk', remote_path: '/转存', save_fs_id: 0, account_uid: 2002 }],
+  }
+
+  afterEach(() => {
+    auth.hasMultipleAccounts = false
+    auth.accounts = [{ uid: 1, username: 'u', nickname: null }]
+  })
+
+  function setAccounts() {
+    auth.hasMultipleAccounts = true
+    auth.accounts = [
+      { uid: 1001, username: 'a', nickname: '账号A' },
+      { uid: 2002, username: 'b', nickname: '账号B' },
+    ]
+  }
+
+  function mountReal() {
+    // AccountBadge 用真组件，验证「所属：」前缀
+    return mount(ShareSyncView, {
+      attachTo: document.body,
+      global: {
+        plugins: [ElementPlus],
+        stubs: {
+          AccountFilter: true, TransferDialog: true, ShareIncludeExcludeEditor: true,
+          CronExprEditor: true, FilePickerModal: true,
+        },
+      },
+    })
+  }
+
+  it('订阅卡片徽章写「所属：账号A」，路径写「网盘→账号B」（找不到账号时回退 UID）', async () => {
+    setAccounts()
+    api.listSubscriptions.mockResolvedValue([SUB_X])
+    const wrapper = mountReal()
+    await flushPromises()
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    expect(card.querySelector('.task-account-badge')?.textContent).toContain('所属：账号A')
+    expect(card.textContent).toContain('网盘→账号B')
+    const vm = wrapper.vm as unknown as { describeTarget: (r: unknown, c: unknown, v: string) => string }
+    expect(vm.describeTarget(null, null, 'local@2002')).toBe('本地→账号B')
+    wrapper.unmount()
+
+    auth.accounts = [{ uid: 1001, username: 'a', nickname: '账号A' }]
+    const w2 = mountReal()
+    await flushPromises()
+    expect(document.body.querySelector('.config-card')!.textContent).toContain('网盘→UID:2002')
+    w2.unmount()
+  })
+
+  it('编辑弹窗提示网盘账号只决定转存目的地，不改所属账号', async () => {
+    setAccounts()
+    api.listSubscriptions.mockResolvedValue([SUB_X])
+    const wrapper = mountReal()
+    await flushPromises()
+    const card = document.body.querySelector<HTMLElement>('.config-card')!
+    Array.from(card.querySelectorAll<HTMLElement>('button')).find((b) => b.textContent?.trim() === '编辑')!.click()
+    await flushPromises()
+    const hint = document.body.querySelector<HTMLElement>('.subscription-dialog .owner-hint')
+    expect(hint, '应显示所属账号提示').toBeTruthy()
+    expect(hint!.textContent).toContain('只决定转存到哪个账号的网盘')
+    expect(hint!.textContent).toContain('所属：账号A')
+    wrapper.unmount()
+  })
+
+  it('移动端根节点带 is-mobile（订阅卡片头部改为上下排列）', async () => {
+    mobile.value = true
+    const wrapper = mountView()
+    await flushPromises()
+    expect(document.body.querySelector('.share-sync-view')?.classList.contains('is-mobile')).toBe(true)
+    wrapper.unmount()
+    mobile.value = false
+    const w2 = mountView()
+    await flushPromises()
+    expect(document.body.querySelector('.share-sync-view')?.classList.contains('is-mobile')).toBe(false)
+    w2.unmount()
   })
 })

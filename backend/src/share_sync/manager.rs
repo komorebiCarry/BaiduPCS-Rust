@@ -23,7 +23,8 @@ use crate::share_sync::events::{
     NoopShareSyncEventPublisher, ShareSyncEvent, ShareSyncEventPublisher,
 };
 use crate::share_sync::executor::{
-    seed_diff_summary, ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
+    seed_diff_summary, ApplyOutcome, ExecutorHooks, NetdiskRepairPlan, NetdiskTargetEntry,
+    ShareSyncExecutor,
 };
 use crate::share_sync::persistence::{
     ShareSyncPersistence, RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
@@ -148,6 +149,9 @@ pub struct ShareSyncManager {
     /// 订阅 ID → 最近一次已推送的失败通知指纹（见 [`Self::claim_failure_notification`]）。
     /// 同一故障跨轮次只推一次；干净成功后清除。仅在内存，重启后至多重推一次。
     failure_notified: DashMap<String, String>,
+    /// `订阅id:账号uid` → 最近一次完整通过的网盘目标校验（见 [`target_verify_due`]）。
+    /// 仅在内存：重启后首轮会重新校验一次。
+    target_verified: DashMap<String, TargetVerifyRecord>,
     /// 持久化层
     persistence: Arc<ShareSyncPersistence>,
     /// 配置文件路径（JSON）
@@ -341,6 +345,7 @@ impl ShareSyncManager {
             pending_resume: DashMap::new(),
             scan_handles: DashMap::new(),
             failure_notified: DashMap::new(),
+            target_verified: DashMap::new(),
             persistence,
             config_path: cfg.config_path,
             publisher: cfg
@@ -809,7 +814,9 @@ impl ShareSyncManager {
             None => "重启续跑：本批下载存在失败项".to_string(),
         };
 
-        let items = self.persistence.list_run_items(run_id).unwrap_or_default();
+        let mut items = self.persistence.list_run_items(run_id).unwrap_or_default();
+        // 被排除条目只是记录（没有执行动作），不参与收尾统计
+        items.retain(|it| it.status != RunItemStatus::Excluded.as_str());
         let mut failed = 0usize;
         let mut completed = 0usize;
         let mut skipped = 0usize;
@@ -1693,6 +1700,8 @@ impl ShareSyncManager {
             }
         };
 
+        // 手动「立即同步」（trigger_one 预建 run）强制校验网盘目标；定时轮询按节流规则。
+        let force_target_verify = given_run_id.is_some();
         let run_id = match given_run_id {
             Some(rid) => rid,
             None => {
@@ -1800,7 +1809,7 @@ impl ShareSyncManager {
             .persistence
             .update_run_phase(&run_id, RUN_PHASE_SCANNING);
 
-        let (captured, curr_snapshot) = {
+        let (captured, curr_snapshot, excluded_entries) = {
             let scan_token = scan_handle.token.clone();
             let collector_token = scan_token.clone();
             // 用 select 让取消信号与整个扫描 future 竞争，可打断请求、重试退避与限速等待。
@@ -1818,6 +1827,8 @@ impl ShareSyncManager {
                             sub.exclude_patterns.clone(),
                             sub.exclude_regex_patterns.clone(),
                             sub.exclude_paths.clone(),
+                            sub.include_patterns.clone(),
+                            sub.include_regex_patterns.clone(),
                             // 列目录抓快照与转存提交共用同一个全局风控限速器
                             self.rate_limiter.clone(),
                         )
@@ -1827,7 +1838,7 @@ impl ShareSyncManager {
                                 .with_progress(Arc::clone(&scan_sink))
                                 .with_cache(Arc::clone(&scan_cache))
                                 .with_cancel(collector_token.clone())
-                                .collect()
+                                .collect_detailed()
                                 .await
                                 .map_err(|e| ("抓取失败", e)),
                             Err(e) => Err(("抓取初始化失败", e)),
@@ -1922,20 +1933,69 @@ impl ShareSyncManager {
 
         let prev = self.persistence.latest_snapshot(id).ok().flatten();
 
-        // 3) diff
-        let mut diff = diff_snapshots(prev.as_ref(), &curr_snapshot);
-        if let Err(e) =
-            augment_diff_with_local_target_state(&sub, prev.as_ref(), &curr_snapshot, &mut diff)
-        {
-            self.fail_run(&run_id, id, owner_uid, &format!("本地目标校验失败: {}", e));
-            return Err(e);
+        // 3) diff（先只比较分享两侧快照）。目标侧缺失补传按执行腿各自校验，
+        // 避免「任一目标缺文件」把共享 diff 标成 modified 后，让已有该文件的
+        // 其它账号目标也走冲突策略（覆盖/新版本）。
+        let diff = diff_snapshots(prev.as_ref(), &curr_snapshot);
+
+        // 被排除规则剔除的条目：只记录（不执行），供运行详情说明「命中了哪条规则」。
+        // 写失败只告警，不影响本轮同步。
+        if !excluded_entries.is_empty() {
+            if let Err(e) = self.persistence.record_excluded_items(
+                &run_id,
+                &excluded_entries,
+                crate::share_sync::persistence::EXCLUDED_ITEMS_CAP,
+            ) {
+                warn!(
+                    "记录被排除条目失败（不影响同步）: run_id={}, error={}",
+                    run_id, e
+                );
+            }
         }
+        drop(excluded_entries);
+
+        // 3.1) 目标侧校验（仍在对比阶段、可取消）：按执行腿算出各自要执行的 diff，
+        //      DiffDetected 据此反映真实要处理的数量。
+        let default_download_uid = self.resolver.default_download_uid().await;
+        let legs = sub.account_legs(default_download_uid);
+        let leg_uids: Vec<u64> = legs.iter().map(|(u, _)| *u).collect();
+        let plans = match self
+            .plan_account_legs(
+                &sub,
+                prev.as_ref(),
+                &curr_snapshot,
+                &diff,
+                legs,
+                &netdisk,
+                &scan_handle,
+                force_target_verify,
+            )
+            .await
+        {
+            Ok(plans) => plans,
+            Err(e @ ShareSyncError::ScanCancelled(_)) => {
+                self.finish_cancelled_run(&run_id, id, owner_uid);
+                return Err(e);
+            }
+            Err(e) => {
+                self.fail_run(&run_id, id, owner_uid, &format!("本地目标校验失败: {}", e));
+                return Err(e);
+            }
+        };
 
         self.publisher.publish(ShareSyncEvent::DiffDetected {
             run_id: run_id.clone(),
             subscription_id: id.into(),
-            added: diff.added.iter().filter(|i| !i.is_dir).count(),
-            modified: diff.modified.iter().filter(|i| !i.new.is_dir).count(),
+            added: plans
+                .iter()
+                .map(|p| p.diff.added.iter().filter(|i| !i.is_dir).count())
+                .max()
+                .unwrap_or_else(|| diff.added.iter().filter(|i| !i.is_dir).count()),
+            modified: plans
+                .iter()
+                .map(|p| p.diff.modified.iter().filter(|i| !i.new.is_dir).count())
+                .max()
+                .unwrap_or_else(|| diff.modified.iter().filter(|i| !i.new.is_dir).count()),
             removed: diff.removed.iter().filter(|i| !i.is_dir).count(),
             owner_uid,
         });
@@ -1953,9 +2013,6 @@ impl ShareSyncManager {
         // 启动「子任务进度广播器」：run 期间约 1s 推一次 ItemProgress（走 share_sync 频道，
         // 不与自动备份 / 下载管理混淆）。run 结束后 abort。前端 WS 实时刷，REST 轮询兜底。
         // 跨账号：按目标账号分腿（所有目标都在所属账号上时只有一条腿，走原有路径）。
-        let default_download_uid = self.resolver.default_download_uid().await;
-        let legs = sub.account_legs(default_download_uid);
-        let leg_uids: Vec<u64> = legs.iter().map(|(u, _)| *u).collect();
         let progress_accounts = self.resolve_transfer_managers(owner_uid, &leg_uids).await;
         let progress_handle = {
             let publisher = Arc::clone(&self.publisher);
@@ -1968,18 +2025,31 @@ impl ShareSyncManager {
             })
         };
 
-        let single_owner_leg = legs.len() == 1 && legs[0].0 == owner_uid;
+        let single_owner_leg = plans.len() == 1 && plans[0].uid == owner_uid;
+        let verified_records: Vec<(String, String)> =
+            plans.iter().filter_map(|p| p.verified.clone()).collect();
         let outcome = if single_owner_leg {
+            let plan = &plans[0];
             let hooks = ProductionHooks {
-                netdisk,
+                netdisk: Arc::clone(&netdisk),
                 transfer,
                 captured: captured.clone(),
                 owner_uid,
                 rate_limiter: Arc::clone(&self.rate_limiter),
                 subscription_id: sub.id.clone(),
             };
-            let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks);
-            apply_diff_with_executor(&executor, &run_id, &captured, &diff, &curr_snapshot).await
+            let executor = ShareSyncExecutor::new(&sub, &self.persistence, &hooks)
+                .with_netdisk_repairs(plan.repairs.clone());
+            apply_diff_with_executor(
+                &executor,
+                &run_id,
+                &captured,
+                &plan.diff,
+                &curr_snapshot,
+                &plan.repairs,
+                &plan.existing_target_dirs,
+            )
+            .await
         } else {
             info!(
                 "share_sync_route: run_id={} subscription={} cross_account legs={:?}",
@@ -1991,11 +2061,24 @@ impl ShareSyncManager {
                 &captured,
                 &diff,
                 &curr_snapshot,
-                legs,
+                plans,
                 (netdisk, transfer),
             )
             .await
         };
+        // 本轮完全成功才记下「目标已校验」；失败则下一轮继续校验、补传。
+        if outcome.status == RunStatus::Completed && !outcome.resource_skipped {
+            let now = chrono::Utc::now().timestamp();
+            for (key, fingerprint) in verified_records {
+                self.target_verified.insert(
+                    key,
+                    TargetVerifyRecord {
+                        fingerprint,
+                        verified_at: now,
+                    },
+                );
+            }
+        }
 
         // run 结束，停止进度广播器（再补推一帧最终态，确保前端拿到 completed/failed）。
         progress_handle.abort();
@@ -2157,23 +2240,15 @@ impl ShareSyncManager {
         captured: &CapturedShare,
         diff: &ShareDiff,
         curr_snapshot: &ShareSnapshot,
-        legs: Vec<(u64, Vec<SyncTarget>)>,
+        plans: Vec<LegPlan>,
         owner_handles: (Arc<NetdiskClient>, Arc<TransferManager>),
     ) -> ApplyOutcome {
-        let leg_futures = legs.into_iter().map(|(uid, targets)| {
+        let leg_futures = plans.into_iter().map(|plan| {
             let owner_handles = owner_handles.clone();
             async move {
+                let uid = plan.uid;
                 let res = self
-                    .run_account_leg(
-                        sub,
-                        uid,
-                        targets,
-                        run_id,
-                        captured,
-                        diff,
-                        curr_snapshot,
-                        owner_handles,
-                    )
+                    .run_account_leg(sub, plan, run_id, captured, curr_snapshot, owner_handles)
                     .await;
                 if let Err(e) = &res {
                     warn!(
@@ -2203,14 +2278,13 @@ impl ShareSyncManager {
     async fn run_account_leg(
         &self,
         sub: &ShareSubscription,
-        uid: u64,
-        targets: Vec<SyncTarget>,
+        plan: LegPlan,
         run_id: &str,
         captured: &CapturedShare,
-        diff: &ShareDiff,
         curr_snapshot: &ShareSnapshot,
         owner_handles: (Arc<NetdiskClient>, Arc<TransferManager>),
     ) -> Result<ApplyOutcome, String> {
+        let uid = plan.uid;
         let (netdisk, transfer, leg_captured) = if uid == sub.owner_uid {
             (owner_handles.0, owner_handles.1, captured.clone())
         } else {
@@ -2232,6 +2306,8 @@ impl ShareSyncManager {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Arc::clone(&self.rate_limiter),
             )
             .await
@@ -2244,9 +2320,9 @@ impl ShareSyncManager {
             (netdisk, transfer, leg_captured)
         };
         let mut leg_sub = sub.clone();
-        leg_sub.targets = targets;
+        leg_sub.targets = plan.targets;
         let hooks = ProductionHooks {
-            netdisk,
+            netdisk: Arc::clone(&netdisk),
             transfer,
             captured: leg_captured.clone(),
             owner_uid: uid,
@@ -2255,8 +2331,112 @@ impl ShareSyncManager {
         };
         let executor = ShareSyncExecutor::new(&leg_sub, &self.persistence, &hooks)
             .without_run_finalize()
-            .with_item_account((uid != sub.owner_uid).then_some(uid));
-        Ok(apply_diff_with_executor(&executor, run_id, &leg_captured, diff, curr_snapshot).await)
+            .with_item_account((uid != sub.owner_uid).then_some(uid))
+            .with_netdisk_repairs(plan.repairs.clone());
+        Ok(apply_diff_with_executor(
+            &executor,
+            run_id,
+            &leg_captured,
+            &plan.diff,
+            curr_snapshot,
+            &plan.repairs,
+            &plan.existing_target_dirs,
+        )
+        .await)
+    }
+
+    /// 对比阶段：为每条执行腿做目标侧校验，算出该腿实际要执行的 diff。
+    ///
+    /// - 本地目标：每轮检查文件是否在、大小是否一致（本地 stat，开销小）；
+    /// - 网盘目标：要逐目录列举，按 [`target_verify_due`] 节流——目标变化、超过校验间隔、
+    ///   或手动「立即同步」时才列举；列举间隙检查取消，用户取消扫描时返回 `ScanCancelled`。
+    ///
+    /// 本地校验出错（分享路径不安全）时整轮失败，与原先行为一致。
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_account_legs(
+        &self,
+        sub: &ShareSubscription,
+        prev: Option<&ShareSnapshot>,
+        curr: &ShareSnapshot,
+        diff: &ShareDiff,
+        legs: Vec<(u64, Vec<SyncTarget>)>,
+        owner_netdisk: &Arc<NetdiskClient>,
+        scan_handle: &ScanHandle,
+        force_verify: bool,
+    ) -> Result<Vec<LegPlan>, ShareSyncError> {
+        let interval = target_verify_interval_secs();
+        let should_continue = || scan_handle.is_scanning();
+        let mut plans = Vec::with_capacity(legs.len());
+        for (uid, targets) in legs {
+            let mut leg_sub = sub.clone();
+            leg_sub.targets = targets.clone();
+            let mut plan = LegPlan {
+                uid,
+                targets,
+                diff: diff.clone(),
+                repairs: NetdiskRepairPlan::default(),
+                existing_target_dirs: BTreeSet::new(),
+                verified: None,
+            };
+            let local_repaired =
+                augment_diff_with_local_target_state(&leg_sub, prev, curr, &mut plan.diff)?;
+
+            if let Some(fingerprint) = netdisk_target_fingerprint(uid, &leg_sub) {
+                let key = format!("{}:{}", sub.id, uid);
+                let now = chrono::Utc::now().timestamp();
+                let due = {
+                    let record = self.target_verified.get(&key);
+                    target_verify_due(record.as_deref(), &fingerprint, now, interval, force_verify)
+                };
+                let client = if !due {
+                    None
+                } else if uid == sub.owner_uid {
+                    Some(Arc::clone(owner_netdisk))
+                } else {
+                    self.resolver.netdisk_client(uid).await
+                };
+                if let Some(client) = client {
+                    let check = verify_netdisk_targets(
+                        &leg_sub,
+                        curr,
+                        diff,
+                        client.as_ref(),
+                        self.rate_limiter.as_ref(),
+                        &should_continue,
+                    )
+                    .await?;
+                    promote_paths_to_modified(prev, curr, &mut plan.diff, &check.repair_paths());
+                    let has_local = leg_sub
+                        .targets
+                        .iter()
+                        .any(|t| matches!(t, SyncTarget::Local(_)));
+                    plan.repairs = NetdiskRepairPlan {
+                        netdisk_only_paths: if has_local {
+                            check.missing.difference(&local_repaired).cloned().collect()
+                        } else {
+                            BTreeSet::new()
+                        },
+                        keep_in_tree: check
+                            .mismatched
+                            .intersection(&local_repaired)
+                            .cloned()
+                            .collect(),
+                        conflict_paths: check.mismatched.clone(),
+                    };
+                    plan.existing_target_dirs = check.existing_dirs.clone();
+                    if check.list_errors == 0 {
+                        plan.verified = Some((key, fingerprint));
+                    }
+                } else if !due {
+                    debug!(
+                        "share-sync: 网盘目标近期已校验且未变化，本轮跳过目标列举: subscription={} uid={}",
+                        sub.id, uid
+                    );
+                }
+            }
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     /// 清掉某订阅名下没人驱动的内部转存/下载任务（孤儿残留）。
@@ -2380,6 +2560,16 @@ impl ShareSyncManager {
             }
             lines.push("该问题恢复前不再重复提醒".to_string());
         }
+        // 确定要推送后才查文件名（两条带 LIMIT 的轻量查询，走 run_id 索引）；
+        // 没有 run（如链接失效）就没有文件可列
+        let files = match run_id {
+            Some(rid) => self.notification_file_lines(rid),
+            None => Vec::new(),
+        };
+        if !files.is_empty() {
+            lines.push("文件：".to_string());
+            lines.extend(files.iter().cloned());
+        }
         let targets = describe_targets_for_notification(sub);
         if !targets.is_empty() {
             lines.push(format!("同步目标：{}", targets));
@@ -2391,11 +2581,32 @@ impl ShareSyncManager {
         let mut n =
             crate::notification::Notification::new(kind, Some(sub.name.clone()), lines.join("\n"))
                 .with_task_id(sub.id.clone())
-                .with_account(Some(sub.owner_uid));
+                .with_account(Some(sub.owner_uid))
+                .with_files(files.join("\n"));
         if dedup {
             n = n.with_dedup_key(format!("{}:{}", kind.as_str(), run_id.unwrap_or(&sub.id)));
         }
         crate::notification::notify(n);
+    }
+
+    /// 通知里列出的文件名行：新增/更新（已落地）优先，其次失败；共列
+    /// `share_sync_file_list_limit` 个，超出追加「等 N 个文件」。上限为 0 时返回空。
+    fn notification_file_lines(&self, run_id: &str) -> Vec<String> {
+        let limit = crate::notification::current_config().share_sync_file_list_limit as usize;
+        if limit == 0 {
+            return Vec::new();
+        }
+        let query = |failed: bool, n: usize| {
+            self.persistence
+                .run_item_paths_for_notification(run_id, failed, n)
+                .unwrap_or_else(|e| {
+                    warn!("读取通知文件列表失败: run_id={}, error={}", run_id, e);
+                    (Vec::new(), 0)
+                })
+        };
+        let (changed, changed_total) = query(false, limit);
+        let (failed, failed_total) = query(true, limit.saturating_sub(changed.len()));
+        format_notification_file_lines(&changed, &failed, changed_total + failed_total)
     }
 
     /// 记录本次要推送的失败指纹；与该订阅上次已推送的相同则返回 false（不推）。
@@ -2615,9 +2826,14 @@ fn should_advance_snapshot_baseline(status: RunStatus) -> bool {
 /// 快照下的**全部子文件**都属于本次变动集(added∪modified)时,才补成整目录转存;否则保留
 /// placeholder,让 tree 回退到逐文件提交,只下变动的那几个文件。首次同步/全新子目录的
 /// 目录项本就在 diff.added 里,不受此判据影响,仍走整目录高效转存。
+///
+/// `existing_target_dirs`：网盘目标校验确认**已存在**的目录（分享侧路径）。往目标已有
+/// 的目录上整目录转存会撞「已存在」而被当成完成，里面缺的文件补不上，因此遇到这些
+/// 目录即停止向上提升（其祖先必然也存在）。
 fn execution_diff_with_directory_ancestors(
     diff: &ShareDiff,
     curr: &ShareSnapshot,
+    existing_target_dirs: &BTreeSet<String>,
 ) -> (ShareDiff, usize) {
     let curr_index = curr.index_by_path();
     let mut existing_paths: BTreeSet<String> = diff
@@ -2645,6 +2861,9 @@ fn execution_diff_with_directory_ancestors(
     for path in action_paths {
         let mut current = parent_netdisk_dir(&path);
         while current != "/" {
+            if existing_target_dirs.contains(&current) {
+                break;
+            }
             if existing_paths.insert(current.clone()) {
                 if let Some(item) = curr_index.get(&current).filter(|item| item.is_dir) {
                     // 仅当整目录子文件全部变动时才整体转存,避免重下未变动文件。
@@ -2794,10 +3013,10 @@ fn no_progress_but_queued<'a>(
 
 /// run_item 是否已到终态（不会再变）。
 ///
-/// 对应 [`RunItemStatus`] 里的 `Completed` / `Failed` / `Skipped`；
+/// 对应 [`RunItemStatus`] 里的 `Completed` / `Failed` / `Skipped` / `Excluded`（只记录不执行）；
 /// `Pending` / `Transferring` / `Downloading` / `Deleting` 都还在途中。
 fn is_terminal_run_item_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "skipped")
+    matches!(status, "completed" | "failed" | "skipped" | "excluded")
 }
 
 /// 文件夹是否「还有活没做完，但一个都没在跑」。
@@ -3546,6 +3765,116 @@ async fn broadcast_subtask_progress_once(
     .await;
 }
 
+/// 一条执行腿在对比阶段算好的执行计划
+struct LegPlan {
+    uid: u64,
+    targets: Vec<SyncTarget>,
+    /// 分享侧 diff + 本腿目标侧需补传的未变化文件
+    diff: ShareDiff,
+    /// 网盘目标侧的补传计划（逐个替换 / 只转网盘）
+    repairs: NetdiskRepairPlan,
+    /// 网盘目标上确认已存在的目录（分享侧路径），不得整目录转存
+    existing_target_dirs: BTreeSet<String>,
+    /// 本轮完整列举过网盘目标：`(订阅id:uid, 目标指纹)`，run 成功后记账
+    verified: Option<(String, String)>,
+}
+
+/// 最近一次完整通过的网盘目标校验
+#[derive(Debug, Clone)]
+struct TargetVerifyRecord {
+    fingerprint: String,
+    verified_at: i64,
+}
+
+/// 网盘目标校验的默认间隔：分享侧没变化时，至多每 24 小时列举一次目标目录。
+const DEFAULT_TARGET_VERIFY_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// 校验间隔（秒）。`BAIDUPCS_SHARE_SYNC_TARGET_VERIFY_SECS` 可覆盖，`0` = 每轮都校验。
+fn target_verify_interval_secs() -> i64 {
+    std::env::var("BAIDUPCS_SHARE_SYNC_TARGET_VERIFY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(DEFAULT_TARGET_VERIFY_INTERVAL_SECS)
+}
+
+/// 执行腿网盘目标的指纹：账号 + 目标目录 + 生效冲突策略。任何一项变化都要重新校验。
+/// 没有网盘目标时返回 `None`。
+fn netdisk_target_fingerprint(uid: u64, leg_sub: &ShareSubscription) -> Option<String> {
+    let mut parts: Vec<String> = leg_sub
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            SyncTarget::Netdisk(t) => Some(format!(
+                "{}|{}|{}",
+                uid,
+                normalize_netdisk_path(&t.remote_path),
+                target
+                    .effective_conflict_strategy(leg_sub.conflict_strategy)
+                    .as_str()
+            )),
+            SyncTarget::Local(_) => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    parts.sort();
+    Some(parts.join(";"))
+}
+
+/// 本轮是否需要列举网盘目标：手动触发、从未校验（含重启后）、目标指纹变化、
+/// 超过校验间隔（或时钟回拨）时需要。
+fn target_verify_due(
+    record: Option<&TargetVerifyRecord>,
+    fingerprint: &str,
+    now: i64,
+    interval_secs: i64,
+    force: bool,
+) -> bool {
+    if force || interval_secs == 0 {
+        return true;
+    }
+    match record {
+        None => true,
+        Some(r) => {
+            r.fingerprint != fingerprint
+                || now < r.verified_at
+                || now - r.verified_at >= interval_secs
+        }
+    }
+}
+
+/// tree 入口的执行 diff：补上可整目录转存的祖先目录。
+///
+/// 网盘目标上需按冲突策略替换、或只转存到网盘的文件不参与整目录提升（前者目录必然
+/// 已存在；后者不能被并进「网盘+本地」合并腿的整目录转存），由执行器单独处理；
+/// 算完祖先后再放回，计数不变。
+fn tree_execution_diff(
+    diff: &ShareDiff,
+    curr_snapshot: &ShareSnapshot,
+    repairs: &NetdiskRepairPlan,
+    existing_target_dirs: &BTreeSet<String>,
+) -> (ShareDiff, usize) {
+    let held_back = |m: &ShareModifiedItem| {
+        repairs.conflict_paths.contains(&m.new.path)
+            || repairs.netdisk_only_paths.contains(&m.new.path)
+    };
+    let mut base = diff.clone();
+    base.modified.retain(|m| !held_back(m));
+    let (mut execution_diff, added_dir_ancestors) =
+        execution_diff_with_directory_ancestors(&base, curr_snapshot, existing_target_dirs);
+    if base.modified.len() != diff.modified.len() {
+        execution_diff
+            .modified
+            .extend(diff.modified.iter().filter(|m| held_back(m)).cloned());
+        execution_diff
+            .modified
+            .sort_by(|a, b| a.old.path.cmp(&b.old.path));
+    }
+    (execution_diff, added_dir_ancestors)
+}
+
 /// 用给定执行器把 diff 应用到目标（tree 入口 / 旧单文件入口二选一）
 async fn apply_diff_with_executor(
     executor: &ShareSyncExecutor<'_>,
@@ -3553,6 +3882,8 @@ async fn apply_diff_with_executor(
     captured: &CapturedShare,
     diff: &ShareDiff,
     curr_snapshot: &ShareSnapshot,
+    repairs: &NetdiskRepairPlan,
+    existing_target_dirs: &BTreeSet<String>,
 ) -> ApplyOutcome {
     // v2 阶段 3:默认走 tree 入口(顶层节点整体提交,目录 fs_id 直传);
     // 仅当显式 BAIDUPCS_DIR_TRANSFER_ENABLED=0/false 时退回老的单文件路径。
@@ -3563,7 +3894,7 @@ async fn apply_diff_with_executor(
         .unwrap_or(true);
     if dir_transfer_enabled {
         let (execution_diff, added_dir_ancestors) =
-            execution_diff_with_directory_ancestors(diff, curr_snapshot);
+            tree_execution_diff(diff, curr_snapshot, repairs, existing_target_dirs);
         if added_dir_ancestors > 0 {
             info!(
                 "share_sync_tree_prepare: run_id={} added_dir_ancestors={}",
@@ -3581,9 +3912,23 @@ async fn apply_diff_with_executor(
     }
 }
 
+/// 用某腿的计数覆盖合并结果中的 added/modified/unchanged（取最大需处理数、最小未变化数）。
+fn overlay_leg_repair_counts(summary: &mut DiffSummary, leg: &DiffSummary) {
+    // 测试里构造的空 summary（全 0）不得把分享侧的 unchanged 压成 0。
+    if leg.total == 0 && leg.added == 0 && leg.modified == 0 && leg.unchanged == 0 {
+        return;
+    }
+    summary.added = summary.added.max(leg.added);
+    summary.modified = summary.modified.max(leg.modified);
+    summary.unchanged = summary.unchanged.min(leg.unchanged);
+    summary.total = summary.added + summary.modified + summary.removed + summary.unchanged;
+}
+
 /// 合并跨账号各执行腿的结果为一个 run 结果。
 ///
-/// - 新增 / 修改 / 删除 / 未变化等计数取自 diff（各腿相同，只算一次）；
+/// - 新增 / 修改 / 删除 / 未变化等计数默认取自分享侧 diff（各腿相同，只算一次）；
+///   若某腿因目标缺失补传而提高了 added/modified（并降低 unchanged），取各腿的
+///   最大需处理数与最小未变化数，避免「新目标已转存」仍显示整轮一致跳过；
 /// - 失败 / 跳过 / 覆盖数按腿累加；
 /// - 任一腿部分失败或整腿失败（账号未登录、访问分享失败）→ `CompletedWithErrors`，
 ///   整腿失败时把本轮待执行的文件数计入失败数；所有腿都整体失败 → `Failed`；
@@ -3610,6 +3955,7 @@ fn merge_account_leg_outcomes(
                 if o.status != RunStatus::Failed {
                     all_failed = false;
                 }
+                overlay_leg_repair_counts(&mut summary, &o.diff_summary);
                 summary.failed += o.diff_summary.failed;
                 summary.skipped += o.diff_summary.skipped;
                 summary.overwritten += o.diff_summary.overwritten;
@@ -3742,6 +4088,28 @@ async fn is_waiting_for_download_slot(tm: &TransferManager, subscription_id: &st
     }
 
     no_progress_but_queued(statuses.iter())
+}
+
+/// 把通知文件列表格式化成正文行：`· 文件名`，失败的标「（失败）」；
+/// `total` 超过列出的数量时追加「等 N 个文件」（N 为总数）。
+fn format_notification_file_lines(
+    changed: &[String],
+    failed: &[String],
+    total: usize,
+) -> Vec<String> {
+    fn file_name(path: &str) -> &str {
+        let p = path.trim_end_matches('/');
+        p.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or(p)
+    }
+    let mut lines: Vec<String> = changed
+        .iter()
+        .map(|p| format!("· {}", file_name(p)))
+        .chain(failed.iter().map(|p| format!("· {}（失败）", file_name(p))))
+        .collect();
+    if !lines.is_empty() && total > lines.len() {
+        lines.push(format!("等 {} 个文件", total));
+    }
+    lines
 }
 
 /// 通知正文里的同步目标描述，如 `网盘 /a；本地 /data/b`
@@ -4626,12 +4994,408 @@ fn is_netdisk_not_found_error(msg: &str) -> bool {
         || msg.contains("文件不存在")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetdiskListedFile {
+    path: String,
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+/// `Ok(None)`：目录不存在；`Ok(Some)`：列举成功；`Err`：列举失败，该目录保守跳过、不批量补传。
+type NetdiskDirListing = Result<Option<Vec<NetdiskListedFile>>, String>;
+
+fn action_paths_from_diff(diff: &ShareDiff) -> BTreeSet<String> {
+    diff.added
+        .iter()
+        .map(|item| item.path.clone())
+        .chain(diff.modified.iter().map(|item| item.new.path.clone()))
+        .chain(diff.removed.iter().map(|item| item.path.clone()))
+        .collect()
+}
+
+fn promote_unchanged_to_modified(
+    prev_map: &BTreeMap<String, &ShareSnapshotItem>,
+    item: &ShareSnapshotItem,
+    diff: &mut ShareDiff,
+    action_paths: &mut BTreeSet<String>,
+) {
+    let old = prev_map
+        .get(&item.path)
+        .map(|item| (*item).clone())
+        .unwrap_or_else(|| item.clone());
+    diff.modified.push(ShareModifiedItem {
+        old,
+        new: item.clone(),
+    });
+    action_paths.insert(item.path.clone());
+    diff.unchanged_count = diff.unchanged_count.saturating_sub(1);
+}
+
+/// 网盘目标上与分享文件同名的条目在目录列举结果里的状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetdiskEntryState {
+    /// 大小一致的同名文件
+    Matching,
+    /// 同名文件但大小不一致
+    SizeMismatch,
+    /// 同名目录（无法用文件替换）
+    DirConflict,
+    /// 没有同名条目
+    Missing,
+}
+
+fn netdisk_listing_entry_state(
+    entries: &[NetdiskListedFile],
+    dest: &str,
+    expected_size: u64,
+) -> NetdiskEntryState {
+    let name = basename_netdisk_path(dest);
+    let same_name: Vec<&NetdiskListedFile> = entries
+        .iter()
+        .filter(|entry| entry.path == dest || entry.name == name)
+        .collect();
+    if same_name
+        .iter()
+        .any(|entry| !entry.is_dir && entry.size == expected_size)
+    {
+        NetdiskEntryState::Matching
+    } else if same_name.iter().any(|entry| !entry.is_dir) {
+        NetdiskEntryState::SizeMismatch
+    } else if !same_name.is_empty() {
+        NetdiskEntryState::DirConflict
+    } else {
+        NetdiskEntryState::Missing
+    }
+}
+
+/// 网盘目标校验（单条执行腿）的结果
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct NetdiskTargetCheck {
+    /// 目标上缺失的未变化文件（可直接转存：不会与已有文件冲突）
+    missing: BTreeSet<String>,
+    /// 目标上有同名文件但大小不一致（需按冲突策略逐个替换；策略为「跳过」时不纳入）
+    mismatched: BTreeSet<String>,
+    /// 目标上确认存在的目录（分享侧路径）。这些目录不得再被整目录转存。
+    existing_dirs: BTreeSet<String>,
+    /// 列举失败的目录数（>0 时本轮校验不算完整）
+    list_errors: usize,
+    /// 目标上同名路径是目录的文件数（只告警，不补传，避免每轮失败）
+    dir_conflicts: usize,
+}
+
+impl NetdiskTargetCheck {
+    fn repair_paths(&self) -> BTreeSet<String> {
+        self.missing.union(&self.mismatched).cloned().collect()
+    }
+}
+
+/// 按目录列举结果，找出本执行腿网盘目标上缺失或大小不一致的「未变化」文件。
+fn check_netdisk_listings(
+    sub: &ShareSubscription,
+    curr: &ShareSnapshot,
+    diff: &ShareDiff,
+    listings: &BTreeMap<String, NetdiskDirListing>,
+) -> NetdiskTargetCheck {
+    let mut check = NetdiskTargetCheck::default();
+    let targets: Vec<(&crate::share_sync::config::NetdiskTarget, ConflictStrategy)> = sub
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            SyncTarget::Netdisk(t) => {
+                Some((t, target.effective_conflict_strategy(sub.conflict_strategy)))
+            }
+            SyncTarget::Local(_) => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        return check;
+    }
+    check.list_errors = listings.values().filter(|l| l.is_err()).count();
+    for (t, _) in &targets {
+        let root = normalize_netdisk_path(&t.remote_path);
+        for (dir, listing) in listings {
+            if !matches!(listing, Ok(Some(_))) {
+                continue;
+            }
+            let rel = if *dir == root {
+                ""
+            } else if let Some(rel) = dir.strip_prefix(&format!("{}/", root.trim_end_matches('/')))
+            {
+                rel
+            } else {
+                continue;
+            };
+            let mut share_dir = format!("/{}", rel);
+            while share_dir != "/" && check.existing_dirs.insert(share_dir.clone()) {
+                share_dir = parent_netdisk_dir(&share_dir);
+            }
+        }
+    }
+
+    let action_paths = action_paths_from_diff(diff);
+    for item in curr.items.iter().filter(|item| !item.is_dir) {
+        if action_paths.contains(&item.path) {
+            continue;
+        }
+        let mut missing = false;
+        let mut mismatched = false;
+        for (t, strategy) in &targets {
+            let dest = join_netdisk_path(&t.remote_path, item.path.trim_start_matches('/'));
+            let parent = parent_netdisk_dir(&dest);
+            match listings.get(&parent) {
+                None | Some(Err(_)) => {}
+                Some(Ok(None)) => missing = true,
+                Some(Ok(Some(entries))) => {
+                    match netdisk_listing_entry_state(entries, &dest, item.size) {
+                        NetdiskEntryState::Matching => {}
+                        NetdiskEntryState::Missing => missing = true,
+                        // 「跳过」策略本来就不会替换已有文件，纳入只会每轮白跑一遍
+                        NetdiskEntryState::SizeMismatch => {
+                            if *strategy != ConflictStrategy::Skip {
+                                mismatched = true;
+                            }
+                        }
+                        NetdiskEntryState::DirConflict => {
+                            check.dir_conflicts += 1;
+                            warn!(
+                                "share-sync: 网盘目标同名路径是目录，无法补传该文件，请手动处理: subscription={} path={}",
+                                sub.id, dest
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if mismatched {
+            check.mismatched.insert(item.path.clone());
+        } else if missing {
+            check.missing.insert(item.path.clone());
+        }
+    }
+    check
+}
+
+/// 把给定路径的「未变化」文件提升为 modified（已在 diff 里的跳过）。返回提升数。
+fn promote_paths_to_modified(
+    prev: Option<&ShareSnapshot>,
+    curr: &ShareSnapshot,
+    diff: &mut ShareDiff,
+    paths: &BTreeSet<String>,
+) -> usize {
+    if paths.is_empty() {
+        return 0;
+    }
+    let prev_map = prev.map(|snap| snap.index_by_path()).unwrap_or_default();
+    let mut action_paths = action_paths_from_diff(diff);
+    let mut promoted = 0usize;
+    for item in curr.items.iter().filter(|item| !item.is_dir) {
+        if !paths.contains(&item.path) || action_paths.contains(&item.path) {
+            continue;
+        }
+        promote_unchanged_to_modified(&prev_map, item, diff, &mut action_paths);
+        promoted += 1;
+    }
+    if promoted > 0 {
+        diff.modified.sort_by(|a, b| a.old.path.cmp(&b.old.path));
+    }
+    promoted
+}
+
+/// 测试用：校验 + 提升一步完成
+#[cfg(test)]
+fn augment_diff_with_netdisk_listings(
+    sub: &ShareSubscription,
+    prev: Option<&ShareSnapshot>,
+    curr: &ShareSnapshot,
+    diff: &mut ShareDiff,
+    listings: &BTreeMap<String, NetdiskDirListing>,
+) -> NetdiskTargetCheck {
+    let check = check_netdisk_listings(sub, curr, diff, listings);
+    promote_paths_to_modified(prev, curr, diff, &check.repair_paths());
+    check
+}
+
+fn collect_netdisk_parent_dirs(
+    sub: &ShareSubscription,
+    curr: &ShareSnapshot,
+    diff: &ShareDiff,
+) -> BTreeSet<String> {
+    let action_paths = action_paths_from_diff(diff);
+    let mut parents = BTreeSet::new();
+    for target in &sub.targets {
+        let SyncTarget::Netdisk(t) = target else {
+            continue;
+        };
+        for item in curr.items.iter().filter(|item| !item.is_dir) {
+            if action_paths.contains(&item.path) {
+                continue;
+            }
+            let dest = join_netdisk_path(&t.remote_path, item.path.trim_start_matches('/'));
+            parents.insert(parent_netdisk_dir(&dest));
+        }
+    }
+    parents
+}
+
+async fn list_netdisk_dir_entries(
+    client: &NetdiskClient,
+    dir: &str,
+    rate_limiter: &crate::share_sync::rate_limit::QuotaLimiter,
+) -> NetdiskDirListing {
+    let dir = normalize_netdisk_path(dir);
+    let mut page = 1u32;
+    let page_size = 1000u32;
+    let mut entries = Vec::new();
+    loop {
+        rate_limiter.acquire().await;
+        let resp = match client.get_file_list(&dir, page, page_size).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = e.to_string();
+                if is_netdisk_not_found_error(&msg) {
+                    return Ok(None);
+                }
+                return Err(msg);
+            }
+        };
+        let batch_len = resp.list.len();
+        for f in resp.list {
+            entries.push(NetdiskListedFile {
+                path: normalize_netdisk_path(&f.path),
+                name: f.server_filename,
+                is_dir: f.isdir == 1,
+                size: f.size,
+            });
+        }
+        if batch_len < page_size as usize {
+            return Ok(Some(entries));
+        }
+        page += 1;
+        if page > 10_000 {
+            return Err(format!("列举网盘目标分页超过安全上限: parent={}", dir));
+        }
+    }
+}
+
+/// 从已列举的祖先目录推断 `dir` 是否必然不存在：最近的已知祖先不存在，或其列举结果里
+/// 没有通往 `dir` 的子目录，就不必再发请求。无法推断时返回 `None`。
+fn infer_missing_from_ancestors(
+    dir: &str,
+    listings: &BTreeMap<String, NetdiskDirListing>,
+) -> Option<NetdiskDirListing> {
+    let mut child = dir.to_string();
+    let mut current = parent_netdisk_dir(dir);
+    loop {
+        if let Some(listing) = listings.get(&current) {
+            return match listing {
+                Ok(None) => Some(Ok(None)),
+                Ok(Some(entries)) => {
+                    let name = basename_netdisk_path(&child);
+                    let has_dir = entries
+                        .iter()
+                        .any(|e| e.is_dir && (e.path == child || e.name == name));
+                    (!has_dir).then_some(Ok(None))
+                }
+                Err(_) => None,
+            };
+        }
+        if current == "/" {
+            return None;
+        }
+        child = current.clone();
+        current = parent_netdisk_dir(&current);
+    }
+}
+
+/// 逐个列举待校验的父目录（先列目标根目录以便短路），已知祖先缺失的直接推断为缺失。
+/// `should_continue` 返回 false（用户取消扫描）时立即中止。
+async fn list_netdisk_parent_dirs<F, Fut>(
+    parents: BTreeSet<String>,
+    roots: BTreeSet<String>,
+    mut list: F,
+    should_continue: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<BTreeMap<String, NetdiskDirListing>, ShareSyncError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = NetdiskDirListing>,
+{
+    let mut listings: BTreeMap<String, NetdiskDirListing> = BTreeMap::new();
+    if parents.is_empty() {
+        return Ok(listings);
+    }
+    let mut dirs = parents;
+    // 只有一个父目录时直接列它即可；多个时先列根目录，缺失的一级子目录可整枝短路。
+    if dirs.len() > 1 {
+        dirs.extend(roots);
+    }
+    // BTreeSet 字典序保证祖先先于后代
+    for dir in dirs {
+        if let Some(inferred) = infer_missing_from_ancestors(&dir, &listings) {
+            listings.insert(dir, inferred);
+            continue;
+        }
+        if !should_continue() {
+            return Err(ShareSyncError::ScanCancelled("用户取消扫描".into()));
+        }
+        let listed = list(dir.clone()).await;
+        listings.insert(dir, listed);
+    }
+    Ok(listings)
+}
+
+/// 列举本执行腿的网盘目标，找出需要补传的未变化文件
+async fn verify_netdisk_targets(
+    sub: &ShareSubscription,
+    curr: &ShareSnapshot,
+    share_diff: &ShareDiff,
+    client: &NetdiskClient,
+    rate_limiter: &crate::share_sync::rate_limit::QuotaLimiter,
+    should_continue: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<NetdiskTargetCheck, ShareSyncError> {
+    let parents = collect_netdisk_parent_dirs(sub, curr, share_diff);
+    let roots: BTreeSet<String> = sub
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            SyncTarget::Netdisk(t) => Some(normalize_netdisk_path(&t.remote_path)),
+            SyncTarget::Local(_) => None,
+        })
+        .collect();
+    let listings = list_netdisk_parent_dirs(
+        parents,
+        roots,
+        |dir| async move { list_netdisk_dir_entries(client, &dir, rate_limiter).await },
+        should_continue,
+    )
+    .await?;
+    for (dir, listed) in &listings {
+        if let Err(msg) = listed {
+            warn!(
+                "share-sync: 列举网盘目标目录失败，该目录下未变化文件本轮不补传（避免误批量转存）: subscription={} dir={} error={}",
+                sub.id, dir, msg
+            );
+        }
+    }
+    let check = check_netdisk_listings(sub, curr, share_diff, &listings);
+    if !check.missing.is_empty() || !check.mismatched.is_empty() {
+        info!(
+            "share-sync: 网盘目标校验发现缺失 {} 个、大小不一致 {} 个文件，已纳入 modified diff: subscription={} listed_dirs={}",
+            check.missing.len(),
+            check.mismatched.len(),
+            sub.id,
+            listings.len()
+        );
+    }
+    Ok(check)
+}
+
 fn augment_diff_with_local_target_state(
     sub: &ShareSubscription,
     prev: Option<&ShareSnapshot>,
     curr: &ShareSnapshot,
     diff: &mut ShareDiff,
-) -> Result<(), ShareSyncError> {
+) -> Result<BTreeSet<String>, ShareSyncError> {
     let local_roots: Vec<&Path> = sub
         .targets
         .iter()
@@ -4641,7 +5405,7 @@ fn augment_diff_with_local_target_state(
         })
         .collect();
     if local_roots.is_empty() {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
 
     let prev_map = prev.map(|snap| snap.index_by_path()).unwrap_or_default();
@@ -4653,7 +5417,7 @@ fn augment_diff_with_local_target_state(
         .chain(diff.removed.iter().map(|item| item.path.clone()))
         .collect();
 
-    let mut repaired = 0usize;
+    let mut repaired_paths: BTreeSet<String> = BTreeSet::new();
     for item in curr.items.iter().filter(|item| !item.is_dir) {
         if action_paths.contains(&item.path) {
             continue;
@@ -4682,9 +5446,10 @@ fn augment_diff_with_local_target_state(
         });
         action_paths.insert(item.path.clone());
         diff.unchanged_count = diff.unchanged_count.saturating_sub(1);
-        repaired += 1;
+        repaired_paths.insert(item.path.clone());
     }
 
+    let repaired = repaired_paths.len();
     if repaired > 0 {
         diff.modified.sort_by(|a, b| a.old.path.cmp(&b.old.path));
         info!(
@@ -4693,7 +5458,7 @@ fn augment_diff_with_local_target_state(
         );
     }
 
-    Ok(())
+    Ok(repaired_paths)
 }
 
 #[cfg(test)]
@@ -5406,7 +6171,7 @@ mod tests {
             ],
         );
         let diff = diff_snapshots(None, &curr); // prev=None → 全部 added（含目录项 /d）
-        let (out, _added) = execution_diff_with_directory_ancestors(&diff, &curr);
+        let (out, _added) = execution_diff_with_directory_ancestors(&diff, &curr, &BTreeSet::new());
         // /d 已在 added 里（目录项），整目录转存可用。
         assert!(out.added.iter().any(|i| i.path == "/d" && i.is_dir));
     }
@@ -5436,7 +6201,7 @@ mod tests {
         assert_eq!(diff.added.len(), 1);
         assert_eq!(diff.added[0].path, "/d/c");
 
-        let (out, added) = execution_diff_with_directory_ancestors(&diff, &curr);
+        let (out, added) = execution_diff_with_directory_ancestors(&diff, &curr, &BTreeSet::new());
         // 不补 /d（含未变动文件），added 集合里不应出现目录 /d。
         assert_eq!(added, 0, "含未变动文件的目录不应被补成整目录转存");
         assert!(!out.added.iter().any(|i| i.path == "/d"));
@@ -5555,6 +6320,279 @@ mod tests {
         assert_eq!(diff.unchanged_count, 0);
     }
 
+    /// 审查 A1：目标目录已存在、只缺其中的文件时，不得把该目录提升为整目录转存
+    /// （百度会返回「已存在」而被当成完成，缺的文件永远补不上）；缺失文件按文件级补传。
+    #[test]
+    fn test_netdisk_missing_file_in_existing_dir_is_not_promoted_to_dir_transfer() {
+        let sub = netdisk_sub("/backup");
+        let d = ShareSnapshotItem::new("/dir", "dir", 10, 0, true);
+        let b = ShareSnapshotItem::new("/dir/b.csv", "b.csv", 11, 4, false);
+        let prev = ShareSnapshot::with_items(&sub.id, vec![d.clone(), b.clone()]);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![d, b]);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert("/backup/dir".into(), Ok(Some(vec![])));
+        let check =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings);
+        assert!(check.missing.contains("/dir/b.csv"));
+        assert!(check.existing_dirs.contains("/dir"));
+
+        let (exec, added) =
+            execution_diff_with_directory_ancestors(&diff, &curr, &check.existing_dirs);
+        assert_eq!(added, 0, "已存在的目标目录被整目录转存: {:?}", exec.added);
+        assert!(exec.modified.iter().any(|m| m.new.path == "/dir/b.csv"));
+    }
+
+    /// 逐个替换 / 只转网盘的文件不参与整目录提升，但仍留在执行 diff 里（计数不变）
+    #[test]
+    fn test_tree_execution_diff_holds_back_repair_items_from_dir_promotion() {
+        let sub = netdisk_sub("/backup");
+        let d = ShareSnapshotItem::new("/d", "d", 10, 0, true);
+        let x = ShareSnapshotItem::new("/d/x", "x", 11, 1, false);
+        let y = ShareSnapshotItem::new("/d/y", "y", 12, 1, false);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![d, x.clone(), y.clone()]);
+        let diff = ShareDiff {
+            added: vec![],
+            removed: vec![],
+            modified: vec![
+                ShareModifiedItem {
+                    old: x.clone(),
+                    new: x,
+                },
+                ShareModifiedItem {
+                    old: y.clone(),
+                    new: y,
+                },
+            ],
+            unchanged_count: 0,
+        };
+        let (_, promoted) = tree_execution_diff(
+            &diff,
+            &curr,
+            &NetdiskRepairPlan::default(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(promoted, 1, "对照：不保留时 /d 会被整目录提升");
+
+        let repairs = NetdiskRepairPlan {
+            conflict_paths: BTreeSet::from(["/d/x".to_string()]),
+            netdisk_only_paths: BTreeSet::from(["/d/y".to_string()]),
+            ..Default::default()
+        };
+        let (exec, promoted) = tree_execution_diff(&diff, &curr, &repairs, &BTreeSet::new());
+        assert_eq!(promoted, 0);
+        assert!(exec.added.is_empty());
+        let paths: Vec<&str> = exec.modified.iter().map(|m| m.new.path.as_str()).collect();
+        assert_eq!(paths, vec!["/d/x", "/d/y"]);
+    }
+
+    /// 目标上整个目录都不存在时仍可整目录转存（新目标的高效路径不变）
+    #[test]
+    fn test_netdisk_missing_dir_still_allows_dir_transfer() {
+        let sub = netdisk_sub("/backup");
+        let d = ShareSnapshotItem::new("/dir", "dir", 10, 0, true);
+        let b = ShareSnapshotItem::new("/dir/b.csv", "b.csv", 11, 4, false);
+        let a = ShareSnapshotItem::new("/a.csv", "a.csv", 12, 1, false);
+        let prev = ShareSnapshot::with_items(&sub.id, vec![a.clone(), d.clone(), b.clone()]);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![a, d, b]);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert(
+            "/backup".into(),
+            Ok(Some(vec![listed_file("/backup/a.csv", 1)])),
+        );
+        listings.insert("/backup/dir".into(), Ok(None));
+        let check =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings);
+        assert_eq!(check.missing, BTreeSet::from(["/dir/b.csv".to_string()]));
+        assert!(!check.existing_dirs.contains("/dir"));
+        let (exec, added) =
+            execution_diff_with_directory_ancestors(&diff, &curr, &check.existing_dirs);
+        assert_eq!(added, 1);
+        assert!(exec.added.iter().any(|i| i.path == "/dir"));
+    }
+
+    /// 审查 A2：大小不一致的同名文件进 `mismatched`（交给执行器按冲突策略逐个替换），
+    /// 与纯缺失分开；「跳过」策略下不纳入（避免每轮白跑）；同名目录只告警不纳入。
+    #[test]
+    fn test_netdisk_check_classifies_mismatch_skip_and_dir_conflict() {
+        let mut sub = netdisk_sub("/backup");
+        let items = vec![
+            ShareSnapshotItem::new("/a.csv", "a.csv", 1, 4, false),
+            ShareSnapshotItem::new("/b.csv", "b.csv", 2, 4, false),
+            ShareSnapshotItem::new("/c.csv", "c.csv", 3, 4, false),
+        ];
+        let prev = ShareSnapshot::with_items(&sub.id, items.clone());
+        let curr = ShareSnapshot::with_items(&sub.id, items);
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let mut c_dir = listed_file("/backup/c.csv", 0);
+        c_dir.is_dir = true;
+        let mut listings = BTreeMap::new();
+        listings.insert(
+            "/backup".into(),
+            Ok(Some(vec![listed_file("/backup/a.csv", 3), c_dir])),
+        );
+
+        let check = check_netdisk_listings(&sub, &curr, &diff, &listings);
+        assert_eq!(check.mismatched, BTreeSet::from(["/a.csv".to_string()]));
+        assert_eq!(check.missing, BTreeSet::from(["/b.csv".to_string()]));
+        assert_eq!(check.dir_conflicts, 1);
+
+        sub.conflict_strategy = ConflictStrategy::Skip;
+        let check = check_netdisk_listings(&sub, &curr, &diff, &listings);
+        assert!(check.mismatched.is_empty(), "跳过策略不应纳入大小不一致项");
+        assert_eq!(check.missing, BTreeSet::from(["/b.csv".to_string()]));
+    }
+
+    /// 审查 A3：目标根目录缺失时整枝短路，只发一次列举请求
+    #[test]
+    fn test_list_netdisk_parent_dirs_short_circuits_missing_root() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let parents = BTreeSet::from([
+            "/backup/a".to_string(),
+            "/backup/a/b".to_string(),
+            "/backup/c".to_string(),
+        ]);
+        let listings = futures::executor::block_on(list_netdisk_parent_dirs(
+            parents,
+            BTreeSet::from(["/backup".to_string()]),
+            |dir| {
+                calls.lock().unwrap().push(dir);
+                async { Ok(None) }
+            },
+            &|| true,
+        ))
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["/backup".to_string()]);
+        assert_eq!(listings.len(), 4);
+        assert!(listings.values().all(|l| matches!(l, Ok(None))));
+    }
+
+    /// 祖先已列举且不含该子目录时推断缺失；存在的子目录照常列举
+    #[test]
+    fn test_list_netdisk_parent_dirs_infers_missing_child_dirs() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let mut sub_a = listed_file("/backup/a", 0);
+        sub_a.is_dir = true;
+        let parents = BTreeSet::from([
+            "/backup/a".to_string(),
+            "/backup/x".to_string(),
+            "/backup/x/y".to_string(),
+        ]);
+        let listings = futures::executor::block_on(list_netdisk_parent_dirs(
+            parents,
+            BTreeSet::from(["/backup".to_string()]),
+            |dir| {
+                calls.lock().unwrap().push(dir.clone());
+                let root_entries = vec![sub_a.clone()];
+                async move {
+                    if dir == "/backup" {
+                        Ok(Some(root_entries))
+                    } else {
+                        Ok(Some(vec![]))
+                    }
+                }
+            },
+            &|| true,
+        ))
+        .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["/backup".to_string(), "/backup/a".to_string()]
+        );
+        assert!(matches!(listings.get("/backup/x"), Some(Ok(None))));
+        assert!(matches!(listings.get("/backup/x/y"), Some(Ok(None))));
+    }
+
+    /// 列举失败的祖先不能用来推断缺失（保守：照常列举后代）
+    #[test]
+    fn test_list_netdisk_parent_dirs_error_ancestor_does_not_infer() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let parents = BTreeSet::from(["/backup/a".to_string(), "/backup/b".to_string()]);
+        let listings = futures::executor::block_on(list_netdisk_parent_dirs(
+            parents,
+            BTreeSet::from(["/backup".to_string()]),
+            |dir| {
+                calls.lock().unwrap().push(dir.clone());
+                async move {
+                    if dir == "/backup" {
+                        Err("HTTP 429".to_string())
+                    } else {
+                        Ok(Some(vec![]))
+                    }
+                }
+            },
+            &|| true,
+        ))
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert!(matches!(listings.get("/backup/a"), Some(Ok(Some(_)))));
+    }
+
+    /// 用户取消扫描后不再发出列举请求
+    #[test]
+    fn test_list_netdisk_parent_dirs_stops_when_cancelled() {
+        let calls = std::sync::Mutex::new(0usize);
+        let scanning = std::sync::atomic::AtomicBool::new(true);
+        let parents = BTreeSet::from(["/backup/a".to_string(), "/backup/b".to_string()]);
+        let res = futures::executor::block_on(list_netdisk_parent_dirs(
+            parents,
+            BTreeSet::new(),
+            |_dir| {
+                *calls.lock().unwrap() += 1;
+                // 第一次列举期间用户点了取消
+                scanning.store(false, Ordering::SeqCst);
+                async { Ok(Some(vec![])) }
+            },
+            &|| scanning.load(Ordering::SeqCst),
+        ));
+        assert!(matches!(res, Err(ShareSyncError::ScanCancelled(_))));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_target_verify_due_rules() {
+        let rec = TargetVerifyRecord {
+            fingerprint: "fp".into(),
+            verified_at: 1_000,
+        };
+        let day = DEFAULT_TARGET_VERIFY_INTERVAL_SECS;
+        // 从未校验（含重启后）
+        assert!(target_verify_due(None, "fp", 1_000, day, false));
+        // 近期已校验、目标未变 → 跳过
+        assert!(!target_verify_due(Some(&rec), "fp", 1_000 + 60, day, false));
+        // 目标变化
+        assert!(target_verify_due(Some(&rec), "fp2", 1_000 + 60, day, false));
+        // 超过间隔
+        assert!(target_verify_due(Some(&rec), "fp", 1_000 + day, day, false));
+        // 时钟回拨
+        assert!(target_verify_due(Some(&rec), "fp", 999, day, false));
+        // 手动触发 / 间隔为 0
+        assert!(target_verify_due(Some(&rec), "fp", 1_000 + 60, day, true));
+        assert!(target_verify_due(Some(&rec), "fp", 1_000 + 60, 0, false));
+    }
+
+    #[test]
+    fn test_netdisk_target_fingerprint_tracks_path_account_and_strategy() {
+        let sub = netdisk_sub("/backup");
+        let base = netdisk_target_fingerprint(1, &sub).unwrap();
+        assert_eq!(
+            netdisk_target_fingerprint(1, &netdisk_sub("/backup/")).unwrap(),
+            base
+        );
+        assert_ne!(netdisk_target_fingerprint(2, &sub).unwrap(), base);
+        assert_ne!(
+            netdisk_target_fingerprint(1, &netdisk_sub("/other")).unwrap(),
+            base
+        );
+        let mut skip = sub.clone();
+        skip.conflict_strategy = ConflictStrategy::Skip;
+        assert_ne!(netdisk_target_fingerprint(1, &skip).unwrap(), base);
+        let mut local_only = sub.clone();
+        local_only.targets.clear();
+        assert!(netdisk_target_fingerprint(1, &local_only).is_none());
+    }
+
     #[test]
     fn test_netdisk_only_target_does_not_use_local_filesystem_diff() {
         let sub = ShareSubscription::new(
@@ -5577,6 +6615,178 @@ mod tests {
 
         assert!(diff.modified.is_empty());
         assert_eq!(diff.unchanged_count, 1);
+    }
+
+    fn netdisk_sub(remote: &str) -> ShareSubscription {
+        ShareSubscription::new(
+            "netdisk".into(),
+            "https://pan.baidu.com/s/1y7CluAbCdEfGh".into(),
+            vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: remote.into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+                account_uid: None,
+            })],
+        )
+    }
+
+    fn listed_file(path: &str, size: u64) -> NetdiskListedFile {
+        NetdiskListedFile {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            is_dir: false,
+            size,
+        }
+    }
+
+    #[test]
+    fn test_netdisk_missing_file_is_promoted_to_modified_diff() {
+        let sub = netdisk_sub("/backup");
+        let items = vec![
+            ShareSnapshotItem::new("/a.csv", "a.csv", 1, 3, false),
+            ShareSnapshotItem::new("/b.csv", "b.csv", 2, 4, false),
+        ];
+        let prev = ShareSnapshot::with_items(&sub.id, items.clone());
+        let curr = ShareSnapshot::with_items(&sub.id, items);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert(
+            "/backup".into(),
+            Ok(Some(vec![listed_file("/backup/a.csv", 3)])),
+        );
+
+        let repaired =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings)
+                .repair_paths()
+                .len();
+
+        assert_eq!(repaired, 1);
+        assert_eq!(diff.modified.len(), 1);
+        assert_eq!(diff.modified[0].new.path, "/b.csv");
+        assert_eq!(diff.unchanged_count, 1);
+    }
+
+    #[test]
+    fn test_netdisk_present_file_stays_unchanged() {
+        let sub = netdisk_sub("/backup");
+        let item = ShareSnapshotItem::new("/a.csv", "a.csv", 1, 4, false);
+        let prev = ShareSnapshot::with_items(&sub.id, vec![item.clone()]);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![item]);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert(
+            "/backup".into(),
+            Ok(Some(vec![listed_file("/backup/a.csv", 4)])),
+        );
+
+        let repaired =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings)
+                .repair_paths()
+                .len();
+
+        assert_eq!(repaired, 0);
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.unchanged_count, 1);
+    }
+
+    #[test]
+    fn test_netdisk_size_mismatch_is_promoted() {
+        let sub = netdisk_sub("/backup");
+        let item = ShareSnapshotItem::new("/nested/a.csv", "a.csv", 1, 4, false);
+        let prev = ShareSnapshot::with_items(&sub.id, vec![item.clone()]);
+        let curr = ShareSnapshot::with_items(&sub.id, vec![item]);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert(
+            "/backup/nested".into(),
+            Ok(Some(vec![listed_file("/backup/nested/a.csv", 3)])),
+        );
+
+        let repaired =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings)
+                .repair_paths()
+                .len();
+
+        assert_eq!(repaired, 1);
+        assert_eq!(diff.modified[0].new.path, "/nested/a.csv");
+        assert_eq!(diff.unchanged_count, 0);
+    }
+
+    #[test]
+    fn test_netdisk_missing_directory_promotes_all_like_new_target() {
+        let sub = netdisk_sub("/new-target");
+        let items = vec![
+            ShareSnapshotItem::new("/a.csv", "a.csv", 1, 3, false),
+            ShareSnapshotItem::new("/dir/b.csv", "b.csv", 2, 4, false),
+        ];
+        let prev = ShareSnapshot::with_items(&sub.id, items.clone());
+        let curr = ShareSnapshot::with_items(&sub.id, items);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert("/new-target".into(), Ok(None));
+        listings.insert("/new-target/dir".into(), Ok(None));
+
+        let repaired =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings)
+                .repair_paths()
+                .len();
+
+        assert_eq!(repaired, 2);
+        assert_eq!(diff.unchanged_count, 0);
+        let paths: Vec<&str> = diff.modified.iter().map(|m| m.new.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a.csv", "/dir/b.csv"]);
+    }
+
+    #[test]
+    fn test_netdisk_list_error_does_not_mass_retransfer() {
+        let sub = netdisk_sub("/backup");
+        let items = vec![
+            ShareSnapshotItem::new("/a.csv", "a.csv", 1, 3, false),
+            ShareSnapshotItem::new("/b.csv", "b.csv", 2, 4, false),
+        ];
+        let prev = ShareSnapshot::with_items(&sub.id, items.clone());
+        let curr = ShareSnapshot::with_items(&sub.id, items);
+        let mut diff = diff_snapshots(Some(&prev), &curr);
+        let mut listings = BTreeMap::new();
+        listings.insert("/backup".into(), Err("HTTP 429".into()));
+
+        let repaired =
+            augment_diff_with_netdisk_listings(&sub, Some(&prev), &curr, &mut diff, &listings)
+                .repair_paths()
+                .len();
+
+        assert_eq!(repaired, 0);
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.unchanged_count, 2);
+    }
+
+    #[test]
+    fn test_overlay_leg_repair_counts_uses_max_modified() {
+        let mut summary = DiffSummary {
+            added: 0,
+            modified: 0,
+            removed: 0,
+            unchanged: 10,
+            total: 10,
+            failed: 0,
+            skipped: 0,
+            overwritten: 0,
+        };
+        overlay_leg_repair_counts(
+            &mut summary,
+            &DiffSummary {
+                added: 0,
+                modified: 3,
+                unchanged: 7,
+                total: 10,
+                ..DiffSummary::default()
+            },
+        );
+        assert_eq!(summary.modified, 3);
+        assert_eq!(summary.unchanged, 7);
+        assert_eq!(summary.total, 10);
+        overlay_leg_repair_counts(&mut summary, &DiffSummary::default());
+        assert_eq!(summary.unchanged, 7, "空 summary 不得压掉未变化计数");
     }
 
     #[tokio::test]
@@ -5716,6 +6926,20 @@ mod tests {
         // 删除订阅一并清掉
         m.delete_subscription(&s.id).await.unwrap();
         assert!(m.failure_notified.get(&s.id).is_none());
+    }
+
+    #[test]
+    fn test_format_notification_file_lines() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(format_notification_file_lines(&[], &[], 0).is_empty());
+        assert_eq!(
+            format_notification_file_lines(&v(&["/剧集/S01/1.mp4", "/2.mp4"]), &v(&["/坏.mkv"]), 3),
+            v(&["· 1.mp4", "· 2.mp4", "· 坏.mkv（失败）"])
+        );
+        assert_eq!(
+            format_notification_file_lines(&v(&["/a/", "/b"]), &[], 12),
+            v(&["· a", "· b", "等 12 个文件"])
+        );
     }
 
     /// 离线构造某账号的转存管理器（共享同一个全局 FolderDownloadManager）

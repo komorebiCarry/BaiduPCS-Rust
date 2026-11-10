@@ -220,6 +220,12 @@ pub async fn update_subscription(
     if let Some(v) = req.exclude_regex_patterns {
         new_sub.exclude_regex_patterns = v;
     }
+    if let Some(v) = req.include_patterns {
+        new_sub.include_patterns = v;
+    }
+    if let Some(v) = req.include_regex_patterns {
+        new_sub.include_regex_patterns = v;
+    }
     if let Some(v) = req.exclude_paths {
         new_sub.exclude_paths = v;
     }
@@ -371,9 +377,9 @@ pub struct RunsQuery {
 pub struct RunItemsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
-    /// 按状态筛选（`failed` / `completed` / `skipped` / `in_progress` …；空或 `all` = 不筛选）
+    /// 按状态筛选（`failed` / `completed` / `skipped` / `excluded` / `in_progress` …；空或 `all` = 不筛选）
     pub status: Option<String>,
-    /// 按动作筛选（`added` / `modified` / `removed` / `skipped`；空或 `all` = 不筛选）
+    /// 按动作筛选（`added` / `modified` / `removed` / `skipped` / `excluded`；空或 `all` = 不筛选）
     pub action: Option<String>,
     /// 路径关键字（字面包含匹配）
     pub q: Option<String>,

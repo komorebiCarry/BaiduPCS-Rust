@@ -100,6 +100,8 @@ pub enum SyncAction {
     Modified,
     Removed,
     Skipped,
+    /// 被订阅的排除规则剔除（只记录，不执行）
+    Excluded,
 }
 
 impl SyncAction {
@@ -110,6 +112,7 @@ impl SyncAction {
             SyncAction::Modified => "modified",
             SyncAction::Removed => "removed",
             SyncAction::Skipped => "skipped",
+            SyncAction::Excluded => "excluded",
         }
     }
 }
@@ -138,6 +141,8 @@ pub enum RunItemStatus {
     Failed,
     /// 跳过（策略 Skip / delete_missing=false）
     Skipped,
+    /// 被排除规则剔除（终态，只记录不执行；`reason` 说明命中的规则）
+    Excluded,
 }
 
 impl std::fmt::Display for RunItemStatus {
@@ -157,6 +162,7 @@ impl RunItemStatus {
             RunItemStatus::Completed => "completed",
             RunItemStatus::Failed => "failed",
             RunItemStatus::Skipped => "skipped",
+            RunItemStatus::Excluded => "excluded",
         }
     }
 }
@@ -354,6 +360,7 @@ mod tests {
             (SyncAction::Modified, "modified"),
             (SyncAction::Removed, "removed"),
             (SyncAction::Skipped, "skipped"),
+            (SyncAction::Excluded, "excluded"),
         ] {
             assert_eq!(value.as_str(), expected);
             assert_enum_str(value, expected);
@@ -367,6 +374,7 @@ mod tests {
             (RunItemStatus::Completed, "completed"),
             (RunItemStatus::Failed, "failed"),
             (RunItemStatus::Skipped, "skipped"),
+            (RunItemStatus::Excluded, "excluded"),
         ] {
             assert_eq!(value.as_str(), expected);
             assert_enum_str(value, expected);

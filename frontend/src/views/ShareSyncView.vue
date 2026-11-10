@@ -1,11 +1,21 @@
 <template>
-  <div class="share-sync-view">
+  <div class="share-sync-view" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏（与其他页面一致） -->
     <div class="toolbar">
+      <!-- 手机端：账号筛选独占一行 -->
+      <div v-if="isMobile && authStore.hasMultipleAccounts" class="toolbar-account-row">
+        <AccountFilter
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            :total-count="subscriptions.length"
+            block
+            class="account-filter-slot"
+        />
+      </div>
       <div class="header-left">
         <h2 v-if="!isMobile">分享同步</h2>
         <AccountFilter
-            v-if="authStore.hasMultipleAccounts"
+            v-if="authStore.hasMultipleAccounts && !isMobile"
             v-model="ownerFilter"
             :counts="ownerFilterCounts"
             :total-count="subscriptions.length"
@@ -42,7 +52,7 @@
               <div class="config-title">
                 <el-icon :size="18" class="direction-icon"><Link /></el-icon>
                 <span class="config-name">{{ s.name }}</span>
-                <AccountBadge :owner-uid="s.owner_uid" size="small" class="task-account-badge" />
+                <AccountBadge :owner-uid="s.owner_uid" size="small" name-prefix="所属：" class="task-account-badge" />
                 <el-tag :type="s.enabled ? 'success' : 'info'" size="small">{{ s.enabled ? '已启用' : '已停用' }}</el-tag>
                 <el-tooltip
                     v-if="s.link_invalid"
@@ -63,11 +73,17 @@
                 <template v-if="s.exclude_patterns.length">
                   <span class="dot">·</span><span>排除通配符 {{ s.exclude_patterns.length }} 条</span>
                 </template>
+                <template v-if="(s.include_patterns?.length ?? 0) > 0">
+                  <span class="dot">·</span><span>包含通配符 {{ s.include_patterns!.length }} 条</span>
+                </template>
+                <template v-if="(s.include_regex_patterns?.length ?? 0) > 0">
+                  <span class="dot">·</span><span>包含正则 {{ s.include_regex_patterns!.length }} 条</span>
+                </template>
                 <template v-if="(s.exclude_regex_patterns?.length ?? 0) > 0">
                   <span class="dot">·</span><span>排除正则 {{ s.exclude_regex_patterns!.length }} 条</span>
                 </template>
                 <template v-if="s.exclude_paths?.length">
-                  <span class="dot">·</span><span>排除目录 {{ s.exclude_paths.length }} 个</span>
+                  <span class="dot">·</span><span>排除内容 {{ s.exclude_paths.length }} 项</span>
                 </template>
                 <template v-if="s.delete_missing">
                   <span class="dot">·</span><span class="danger-text">删除缺失</span>
@@ -262,10 +278,16 @@
             运行历史<span v-if="runs.length > 0">（{{ runs.length }}）</span>
           </el-button>
         </div>
-        <el-descriptions :column="1" border>
+        <!-- 手机端改为上下排列：标签独占一行横排，内容占满宽度，避免标签被挤成一列竖字 -->
+        <el-descriptions
+            :column="1"
+            border
+            :direction="isMobile ? 'vertical' : 'horizontal'"
+            class="subscription-detail"
+        >
           <el-descriptions-item label="名称">{{ selected.name }}</el-descriptions-item>
           <el-descriptions-item label="分享链接">
-            <el-link type="primary" :href="selected.share_url" target="_blank" :underline="false">
+            <el-link class="detail-share-link" type="primary" :href="selected.share_url" target="_blank" :underline="false">
               {{ selected.share_url }}
             </el-link>
           </el-descriptions-item>
@@ -276,10 +298,10 @@
           </el-descriptions-item>
           <el-descriptions-item label="目标">
             <div v-for="(t, i) in selected.targets" :key="i" class="target-line">
-              <el-tag :type="t.kind === 'netdisk' ? 'success' : 'warning'" size="small">
-                {{ t.kind === 'netdisk' ? '网盘' : '本地' }}
+              <el-tag :type="t.kind === 'netdisk' ? 'success' : 'warning'" size="small" class="target-kind-tag">
+                {{ describeSyncTarget(t, selected.targets, selected.owner_uid) }}
               </el-tag>
-              <span style="margin-left: 6px">
+              <span class="target-path-text">
                 {{ t.kind === 'netdisk' ? t.remote_path : t.local_path }}
               </span>
             </div>
@@ -292,10 +314,34 @@
                   size="small"
                   type="info"
               >
-                {{ p }}
+                {{ formatSharePathForDisplay(p) }}
               </el-tag>
             </div>
             <span v-else>同步整个分享</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="包含规则">
+            <div
+                v-if="(selected.include_patterns?.length ?? 0) > 0 || (selected.include_regex_patterns?.length ?? 0) > 0"
+                class="path-tags"
+            >
+              <el-tag
+                  v-for="(p, i) in (selected.include_patterns ?? [])"
+                  :key="`incp-${i}`"
+                  size="small"
+                  type="success"
+              >
+                {{ p }}
+              </el-tag>
+              <el-tag
+                  v-for="(p, i) in (selected.include_regex_patterns ?? [])"
+                  :key="`incr-${i}`"
+                  size="small"
+                  type="success"
+              >
+                <span class="rule-kind">正则</span>{{ p }}
+              </el-tag>
+            </div>
+            <span v-else>无（不额外限制）</span>
           </el-descriptions-item>
           <el-descriptions-item label="排除规则">
             <div
@@ -321,7 +367,7 @@
             </div>
             <span v-else>无</span>
           </el-descriptions-item>
-          <el-descriptions-item label="排除目录">
+          <el-descriptions-item label="排除内容">
             <div v-if="(selected.exclude_paths?.length ?? 0) > 0" class="path-tags">
               <el-tag
                   v-for="(p, i) in selected.exclude_paths"
@@ -329,7 +375,7 @@
                   size="small"
                   type="warning"
               >
-                {{ p }}
+                {{ formatSharePathForDisplay(p) }}
               </el-tag>
             </div>
             <span v-else>无</span>
@@ -357,7 +403,7 @@
         width="640px"
         @close="resetForm"
     >
-      <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef">
+      <el-form :model="form" label-width="100px" :rules="formRules" ref="formRef" @submit.prevent>
         <el-form-item label="名称" prop="name">
           <el-input v-model="form.name" placeholder="如：剧集合集同步" />
         </el-form-item>
@@ -377,11 +423,13 @@
               v-model:include-paths="form.include_paths"
               v-model:exclude-patterns="form.exclude_patterns"
               v-model:exclude-regex-patterns="form.exclude_regex_patterns"
+              v-model:include-patterns="form.include_patterns"
+              v-model:include-regex-patterns="form.include_regex_patterns"
               v-model:exclude-paths="form.exclude_paths"
           />
         </el-form-item>
         <el-form-item label="冲突策略">
-          <el-radio-group v-model="form.conflict_strategy">
+          <el-radio-group v-model="form.conflict_strategy" class="conflict-mode-group">
             <el-radio-button value="overwrite">覆盖式</el-radio-button>
             <el-radio-button value="versioned">新版本式</el-radio-button>
             <el-radio-button value="skip">跳过</el-radio-button>
@@ -411,6 +459,11 @@
                   class="target-account-select"
                   aria-label="网盘目标账号"
               />
+            </div>
+            <div v-if="showTargetAccountControls && netdiskEnabled" class="sync-mode-hint owner-hint">
+              「网盘账号」只决定转存到哪个账号的网盘，不会改变订阅的所属账号<template
+                  v-if="selected"
+              >（所属：{{ ownerName(selected.owner_uid) }}）</template>。
             </div>
 
             <!-- 多账号归集：同一订阅额外转存到其他账号的网盘（每个账号最多 1 个网盘目标） -->
@@ -511,7 +564,7 @@
         </el-form-item>
         <el-form-item v-if="form.poll_config.mode === 'interval'" label="间隔（秒）">
           <el-input-number v-model="form.poll_config.interval_secs" :min="600" :max="86400" :step="300" />
-          <span style="margin-left: 8px; color: #909399; font-size: 12px">最少 600 秒（10 分钟）</span>
+          <span class="form-inline-tip">最少 600 秒（10 分钟）</span>
         </el-form-item>
         <el-form-item v-if="form.poll_config.mode === 'scheduled'" label="时刻">
           <el-time-picker
@@ -526,7 +579,7 @@
         </el-form-item>
         <el-form-item label="删除缺失">
           <el-switch v-model="form.delete_missing" />
-          <span style="margin-left: 8px; color: #909399; font-size: 12px">分享者删除文件时同步删除目标副本</span>
+          <span class="form-inline-tip">分享者删除文件时同步删除目标副本</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -562,6 +615,26 @@
                 @click="filterRunItemsByStatus('failed')"
             >{{ currentRun.failed_count }}（只看失败）</el-link>
             <template v-else>{{ currentRun.failed_count }}</template>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="(currentRun.excluded_count ?? 0) > 0" label="已排除">
+            <template v-if="runExcludedDetailsPruned">
+              {{ currentRun.excluded_count }}
+              <span class="run-excluded-truncated run-excluded-pruned">
+                明细已清理（只保留最近 20 次运行）
+              </span>
+            </template>
+            <el-link
+                v-else
+                type="info"
+                class="run-excluded-link"
+                @click="filterRunItemsByStatus('excluded')"
+            >{{ currentRun.excluded_count }}（查看命中规则）</el-link>
+            <span
+                v-if="currentRun.excluded_truncated && !runExcludedDetailsPruned"
+                class="run-excluded-truncated"
+            >
+              明细只记录了前 {{ runExcludedRecordedCount }} 条
+            </span>
           </el-descriptions-item>
           <el-descriptions-item label="错误" v-if="currentRun.error">
             <span style="color: #f56c6c">{{ currentRun.error }}</span>
@@ -622,7 +695,7 @@
           <el-table-column prop="action" label="动作" width="80" :formatter="describeAction" />
           <el-table-column prop="target" label="目标" width="120" :formatter="describeTarget" />
           <el-table-column prop="status" label="状态" width="100" :formatter="describeItemStatus" />
-          <el-table-column prop="reason" label="跳过原因" width="120" :formatter="describeReason" />
+          <el-table-column prop="reason" label="原因" width="160" :formatter="describeReason" />
           <el-table-column prop="error" label="错误" />
         </el-table>
         <el-pagination
@@ -691,6 +764,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AxiosError } from 'axios'
 import { useAuthStore } from '@/stores/auth'
+import { useOwnerName } from '@/composables/useOwnerName'
 import { useIsMobile } from '@/utils/responsive'
 import AccountFilter from '@/components/AccountFilter.vue'
 import AccountBadge from '@/components/AccountBadge.vue'
@@ -721,6 +795,7 @@ import {
 } from '@/api/shareSync'
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import { createAdaptivePoller } from '@/utils/backendHealth'
+import { formatSharePathForDisplay } from '@/utils/shareSelection'
 
 const subscriptions = ref<ShareSubscription[]>([])
 const selected = ref<ShareSubscription | null>(null)
@@ -729,6 +804,7 @@ const isMobile = useIsMobile()
 
 // 多账号：账号过滤（null=全部账号）
 const authStore = useAuthStore()
+const { ownerName } = useOwnerName()
 const ownerFilter = ref<number | null>(null)
 
 // 按账号过滤后的订阅列表（与 transfer/autobackup 一致：null 显示全部）
@@ -777,6 +853,19 @@ const runItemsAllCount = computed(() => {
   return run.item_total_count
 })
 
+// 被排除条目实际记录到明细里的条数（超过上限时只记录一部分）
+const runExcludedRecordedCount = computed(
+    () => currentRun.value?.item_facets?.status_counts?.excluded ?? 0,
+)
+
+// 有排除计数但明细已被清理（后端每个订阅只保留最近 20 次运行的排除明细）
+const runExcludedDetailsPruned = computed(
+    () =>
+        (currentRun.value?.excluded_count ?? 0) > 0
+        && currentRun.value?.item_facets != null
+        && runExcludedRecordedCount.value === 0,
+)
+
 const runItemsHeaderCount = computed(() => {
   const run = currentRun.value
   if (!run) return ''
@@ -800,6 +889,7 @@ const runItemStatusOptions = computed(() => {
     { value: 'failed', label: withCount('失败', pick('failed')) },
     { value: 'completed', label: withCount('完成', pick('completed')) },
     { value: 'skipped', label: withCount('跳过', pick('skipped')) },
+    { value: 'excluded', label: withCount('已排除', pick('excluded')) },
     { value: 'in_progress', label: withCount('进行中', inProgress) },
   ]
 })
@@ -809,7 +899,7 @@ const runItemActionOptions = computed(() => {
   const pick = (k: string) => (counts ? counts[k] ?? 0 : undefined)
   return [
     { value: 'all', label: withCount('全部动作', counts ? runItemsAllCount.value : undefined) },
-    ...['added', 'modified', 'removed', 'skipped'].map((k) => ({
+    ...['added', 'modified', 'removed', 'skipped', 'excluded'].map((k) => ({
       value: k,
       label: withCount(ACTION_LABELS[k] ?? k, pick(k)),
     })),
@@ -1375,6 +1465,8 @@ const defaultForm = (): {
   include_paths: string[]
   exclude_patterns: string[]
   exclude_regex_patterns: string[]
+  include_patterns: string[]
+  include_regex_patterns: string[]
   exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
@@ -1387,6 +1479,8 @@ const defaultForm = (): {
   include_paths: [],
   exclude_patterns: [],
   exclude_regex_patterns: [],
+  include_patterns: [],
+  include_regex_patterns: [],
   exclude_paths: [],
   targets: [createDefaultTarget()],
   conflict_strategy: 'overwrite',
@@ -1547,6 +1641,8 @@ function openEdit(s?: ShareSubscription) {
     include_paths: [...selected.value.include_paths],
     exclude_patterns: [...selected.value.exclude_patterns],
     exclude_regex_patterns: [...(selected.value.exclude_regex_patterns ?? [])],
+    include_patterns: [...(selected.value.include_patterns ?? [])],
+    include_regex_patterns: [...(selected.value.include_regex_patterns ?? [])],
     exclude_paths: [...(selected.value.exclude_paths ?? [])],
     targets: [] as SyncTarget[],
     conflict_strategy: selected.value.conflict_strategy,
@@ -1616,6 +1712,8 @@ async function saveForm() {
         include_paths: form.value.include_paths,
         exclude_patterns: form.value.exclude_patterns,
         exclude_regex_patterns: form.value.exclude_regex_patterns,
+        include_patterns: form.value.include_patterns,
+        include_regex_patterns: form.value.include_regex_patterns,
         exclude_paths: form.value.exclude_paths,
         targets: submitTargets(),
         conflict_strategy: form.value.conflict_strategy,
@@ -1736,6 +1834,21 @@ function normalizePath(v: string): string {
   return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
 }
 
+/**
+ * 选中的同步 / 排除路径提交前归一：只规整分隔符，文件名里的空白（含结尾空格）
+ * 原样保留 —— 否则「报告. 」会被存成「报告.」，选中与排除都会串到同名文件上。
+ * 手工输入的网盘 / 本地目标路径仍走 normalizePath（需要 trim）。
+ */
+function normalizeSelectedPath(v: string): string {
+  if (!v.trim()) return ''
+  const lead = /^\s*/.exec(v)?.[0] ?? ''
+  const rest = lead.length > 0 && v.charAt(lead.length) === '/' ? v.slice(lead.length) : v
+  const collapsed = rest.replace(/\/+/g, '/')
+  const prefixed = collapsed.startsWith('/') ? collapsed : `/${collapsed}`
+  if (prefixed.length === 1) return '/'
+  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
+}
+
 function normalizeRemotePath(v: string): string {
   return normalizePath(v) || '/'
 }
@@ -1743,7 +1856,7 @@ function normalizeRemotePath(v: string): string {
 function buildSanitizedPayload() {
   const includeSet = new Set<string>()
   for (const p of form.value.include_paths) {
-    const n = normalizePath(p)
+    const n = normalizeSelectedPath(p)
     if (n) {
       includeSet.add(n)
     }
@@ -1762,9 +1875,23 @@ function buildSanitizedPayload() {
       regexSet.add(n)
     }
   }
+  const includePatternSet = new Set<string>()
+  for (const p of form.value.include_patterns) {
+    const n = p.trim()
+    if (n) {
+      includePatternSet.add(n)
+    }
+  }
+  const includeRegexSet = new Set<string>()
+  for (const p of form.value.include_regex_patterns) {
+    const n = p.trim()
+    if (n && !includeRegexSet.has(n)) {
+      includeRegexSet.add(n)
+    }
+  }
   const excludePathSet = new Set<string>()
   for (const p of form.value.exclude_paths) {
-    const n = normalizePath(p)
+    const n = normalizeSelectedPath(p)
     if (n) {
       excludePathSet.add(n)
     }
@@ -1772,6 +1899,8 @@ function buildSanitizedPayload() {
   form.value.include_paths = Array.from(includeSet)
   form.value.exclude_patterns = Array.from(excludeSet)
   form.value.exclude_regex_patterns = Array.from(regexSet)
+  form.value.include_patterns = Array.from(includePatternSet)
+  form.value.include_regex_patterns = Array.from(includeRegexSet)
   form.value.exclude_paths = Array.from(excludePathSet)
 
   // 额外归集网盘目标单独归一化（保持表单模型不变，校验失败时界面状态不丢）
@@ -2028,19 +2157,29 @@ function describeInterval(p: PollConfig): string {
   return '已禁用'
 }
 
-function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
-  // 只标注落在其他账号上的目标（缺省 / 0 / 等于所属账号都是所属账号）
+/**
+ * 单个同步目标的简短标签。
+ *
+ * 落在其他账号上的目标标注账号昵称（找不到时回退 UID），如「网盘→账号B」；
+ * 缺省 / 0 / 等于所属账号都算所属账号。同一订阅有多个网盘目标时，所属账号自己的网盘
+ * 目标也写明「网盘→所属账号」，否则多个目标都只显示「网盘」无法区分。
+ */
+function describeSyncTarget(t: SyncTarget, targets: SyncTarget[], ownerUid?: number | null): string {
   const other = (uid: number | null | undefined) =>
     typeof uid === 'number' && uid > 0 && uid !== ownerUid ? uid : null
-  return targets.map(t => {
-    if (t.kind === 'netdisk') {
-      const uid = other(t.account_uid)
-      return uid !== null ? `网盘(UID ${uid})` : '网盘'
-    }
-    if (t.use_default_download_account) return '本地(默认下载账号)'
-    const uid = other(t.download_uid)
-    return uid !== null ? `本地(UID ${uid})` : '本地'
-  }).join(' + ')
+  if (t.kind === 'netdisk') {
+    const uid = other(t.account_uid)
+    if (uid !== null) return `网盘→${ownerName(uid)}`
+    const netdiskCount = targets.filter(x => x.kind === 'netdisk').length
+    return netdiskCount > 1 && typeof ownerUid === 'number' ? `网盘→${ownerName(ownerUid)}` : '网盘'
+  }
+  if (t.use_default_download_account) return '本地(默认下载账号)'
+  const uid = other(t.download_uid)
+  return uid !== null ? `本地→${ownerName(uid)}` : '本地'
+}
+
+function describeTargets(targets: SyncTarget[], ownerUid?: number | null): string {
+  return targets.map(t => describeSyncTarget(t, targets, ownerUid)).join(' + ')
 }
 
 function describeStrategy(s: ConflictStrategy): string {
@@ -2089,11 +2228,14 @@ const ACTION_LABELS: Record<string, string> = {
   modified: '修改',
   removed: '删除',
   skipped: '跳过',
+  excluded: '已排除',
 }
 const TARGET_LABELS: Record<string, string> = {
   netdisk: '网盘',
   local: '本地',
   netdisk_and_local: '网盘+本地',
+  // 被排除的条目没有执行目标
+  none: '—',
 }
 const ITEM_STATUS_LABELS: Record<string, string> = {
   pending: '等待',
@@ -2103,6 +2245,7 @@ const ITEM_STATUS_LABELS: Record<string, string> = {
   completed: '完成',
   failed: '失败',
   skipped: '跳过',
+  excluded: '已排除',
 }
 const REASON_LABELS: Record<string, string> = {
   quota_full: '网盘空间不足',
@@ -2114,16 +2257,25 @@ function describeAction(_r: unknown, _c: unknown, v: string): string {
   return ACTION_LABELS[v] ?? v
 }
 function describeTarget(_r: unknown, _c: unknown, v: string): string {
-  // 跨账号执行腿的动作记为 `netdisk@<uid>` / `local@<uid>`（所属账号不带后缀）
+  // 跨账号执行腿的动作记为 `netdisk@<uid>` / `local@<uid>`（所属账号不带后缀）；
+  // 与订阅卡片一致写作「网盘→账号名」，账号不在列表时回退 UID
   const m = /^(.+)@(\d+)$/.exec(v || '')
-  if (m) return `${TARGET_LABELS[m[1]] ?? m[1]}(UID ${m[2]})`
+  if (m) return `${TARGET_LABELS[m[1]] ?? m[1]}→${ownerName(Number(m[2]))}`
   return TARGET_LABELS[v] ?? v
 }
 function describeItemStatus(_r: unknown, _c: unknown, v: string): string {
   return ITEM_STATUS_LABELS[v] ?? v
 }
+// 被排除规则命中：后端记为 `excluded:<path|glob|regex>:<规则原文>`
+const EXCLUDED_REASON_KINDS: Record<string, string> = {
+  path: '排除内容',
+  glob: '通配符',
+  regex: '正则',
+}
 function describeReason(_r: unknown, _c: unknown, v: string | null | undefined): string {
   if (!v) return '—'
+  const m = /^excluded:(path|glob|regex):([\s\S]*)$/.exec(v)
+  if (m) return `命中${EXCLUDED_REASON_KINDS[m[1]]} ${m[2]}`
   return REASON_LABELS[v] ?? v
 }
 
@@ -2488,6 +2640,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 .share-sync-view {
   width: 100%;
   height: 100%;
@@ -2585,11 +2738,30 @@ onUnmounted(() => {
   .dot { color: #c0c4cc; }
   .danger-text { color: #f56c6c; }
 }
+.run-excluded-truncated {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
 .config-actions {
   display: flex;
   gap: 8px;
   flex-shrink: 0;
   flex-wrap: wrap;
+}
+// 窄屏：标题区占满整行，操作按钮换到标题下方，避免把标题挤成一列竖字
+.share-sync-view.is-mobile {
+  .config-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .config-actions {
+    flex-shrink: 1;
+    width: 100%;
+    row-gap: 8px;
+    .el-button + .el-button { margin-left: 0; }
+  }
 }
 
 // 进行中子任务（内联）
@@ -2756,11 +2928,68 @@ onUnmounted(() => {
   margin-bottom: 8px;
 }
 
-.target-line { margin: 4px 0; }
+.target-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 4px 0;
+}
+.target-kind-tag {
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+.target-path-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 24px;
+  word-break: break-all;
+}
+// 订阅详情：长链接 / 长路径在任意宽度下断行，不撑破弹窗
+.subscription-detail {
+  :deep(.el-descriptions__content) {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+  }
+  :deep(.el-descriptions__label) {
+    white-space: nowrap;
+  }
+  .detail-share-link {
+    display: inline;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    :deep(.el-link__inner) {
+      display: inline;
+      word-break: break-all;
+    }
+  }
+}
 .target-form-row { display: flex; align-items: center; margin-bottom: 8px; }
 .target-tip { margin-left: 8px; font-size: 12px; color: #909399; }
+// 表单项内跟在控件后的灰色说明；手机端独占一行并与控件左对齐（折行时不再缩进 8px）
+.form-inline-tip { margin-left: 8px; color: #909399; font-size: 12px; }
+@media (max-width: 767px) {
+  .form-inline-tip {
+    display: block;
+    flex: 0 0 100%;
+    margin-left: 0;
+    line-height: 1.5;
+    margin-top: 4px;
+  }
+}
 
 // 订阅编辑弹窗：头部与底部固定，只有表单主体滚动；四周至少保留 16px 视口边距。
+// 手机端：覆盖全局 mobile.scss 的 `margin: 5vh auto`，保持垂直居中，避免 5vh + (100dvh - 32px) 超出视口；
+// 页脚加分隔线，主体滚动时内容在分隔线处截断，不会被按钮区“压住”。
+@media (max-width: 767px) {
+  :deep(.subscription-dialog) {
+    margin: auto !important;
+
+    .el-dialog__footer {
+      border-top: 1px solid var(--el-border-color-lighter);
+    }
+  }
+}
+
 :deep(.subscription-dialog) {
   display: flex;
   flex-direction: column;
@@ -2828,6 +3057,67 @@ onUnmounted(() => {
   .target-account-select { width: 220px; }
 }
 
+// 手机端：账号选择不再固定 220px + 48px 缩进（窄屏会撑出弹窗），改为占满可用宽度；
+// 目录输入框独占一行，各目标行统一上下排列
+@media (max-width: 767px) {
+  .sync-mode-editor {
+    .target-account-row {
+      padding-left: 0;
+    }
+
+    .target-account-select {
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+    }
+
+    .extra-netdisk-row .target-switch {
+      flex: 1 1 100%;
+      min-width: 0;
+    }
+
+    .target-path {
+      flex: 1 1 100%;
+    }
+
+    // 表单内容区继承 32px 行高，多行提示会显得很松散
+    .sync-mode-hint {
+      line-height: 1.5;
+    }
+  }
+
+  // 冲突策略（3 项）/ 轮询方式（4 项）：窄屏折行时分段按钮左边框缺失、首尾错位，
+  // 改为等宽网格，每个选项完整边框，整齐对齐内容区左右边界
+  .conflict-mode-group,
+  .poll-mode-group {
+    display: grid;
+    gap: 6px;
+    width: 100%;
+
+    :deep(.el-radio-button__inner) {
+      width: 100%;
+      padding-left: 6px;
+      padding-right: 6px;
+      border-left: var(--el-border);
+      border-radius: var(--el-border-radius-base);
+      box-shadow: none;
+    }
+
+    // 选中态去掉 Element Plus 用来拼接相邻按钮的左侧 1px 阴影（网格有间距，会多出一条线）
+    :deep(.el-radio-button.is-active .el-radio-button__original-radio:not(:disabled) + .el-radio-button__inner) {
+      box-shadow: none;
+    }
+  }
+
+  .conflict-mode-group {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .poll-mode-group {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .run-item { cursor: pointer; &:hover { color: #409eff; } }
 .run-stats { font-size: 12px; color: #909399; margin-top: 2px; }
 
@@ -2881,4 +3171,14 @@ onUnmounted(() => {
 .tree-node { display: inline-flex; align-items: center; gap: 4px; }
 .tree-size { margin-left: 6px; color: #909399; font-size: 11px; }
 .poll-mode-group { flex-wrap: wrap; }
+
+// 手机端工具栏：统一规则见 styles/_mobile-toolbar.scss（放在最后以覆盖上方桌面样式）
+.share-sync-view.is-mobile {
+  @include mt.mobile-toolbar;
+
+  .ss-content {
+    padding-left: mt.$mobile-inset;
+    padding-right: mt.$mobile-inset;
+  }
+}
 </style>

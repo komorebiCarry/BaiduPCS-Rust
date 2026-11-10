@@ -11,7 +11,7 @@
               content="订阅所属账号未登录，请先登录该账号再预览目录树"
               placement="top"
           >
-            <span>
+            <span class="browse-action">
               <el-button
                   size="small"
                   :icon="FolderOpened"
@@ -43,27 +43,91 @@
             :key="p + i"
             closable
             @close="removeInclude(i)"
-        >{{ p }}</el-tag>
+        >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
-      <p v-if="showIncludeHelp" class="field-help">
-        不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。
-      </p>
+      <p v-if="showIncludeHelp" class="field-help">{{ INCLUDE_HELP_TEXT }}</p>
       <div v-if="ownerLoggedIn === false" class="owner-offline-hint">
         订阅所属账号未登录，目录树预览不可用，请先登录该账号
       </div>
     </div>
 
-    <!-- 排除目录（exclude_paths）：精确目录排除 -->
+    <!-- 包含规则（include_patterns 通配符 / include_regex_patterns 正则） -->
     <div class="field-block">
       <div class="field-header">
-        <span class="field-label">排除目录</span>
+        <span class="field-label">包含规则</span>
+        <div class="path-actions">
+          <el-button
+              size="small"
+              text
+              type="primary"
+              :aria-expanded="showIncludeRuleHelp"
+              aria-label="包含规则使用说明"
+              @click="showIncludeRuleHelp = !showIncludeRuleHelp"
+          >
+            使用说明
+            <el-icon class="help-caret" aria-hidden="true">
+              <ArrowUp v-if="showIncludeRuleHelp" />
+              <ArrowDown v-else />
+            </el-icon>
+          </el-button>
+        </div>
+      </div>
+      <div v-if="includePatternList.length > 0 || includeRegexList.length > 0" class="path-tags">
+        <el-tag
+            v-for="(p, i) in includePatternList"
+            :key="'inc-glob-' + p + i"
+            closable
+            type="success"
+            @close="removeIncludePattern(i)"
+        >{{ p }}</el-tag>
+        <el-tag
+            v-for="(p, i) in includeRegexList"
+            :key="'inc-regex-' + p + i"
+            closable
+            type="success"
+            @close="removeIncludeRegex(i)"
+        ><span class="rule-kind">正则</span>{{ p }}</el-tag>
+      </div>
+      <div class="exclude-input-row">
+        <div class="rule-input-group">
+          <el-select
+              v-model="includeRuleKind"
+              class="rule-kind-select"
+              size="small"
+              aria-label="新增包含规则类型"
+          >
+            <el-option label="通配符" value="glob" />
+            <el-option label="正则表达式" value="regex" :disabled="!regexSupported" />
+          </el-select>
+          <el-input
+              v-model="includeInput"
+              class="exclude-input"
+              type="textarea"
+              :autosize="{ minRows: 1, maxRows: 4 }"
+              resize="none"
+              size="small"
+              :placeholder="includeRuleKind === 'regex' ? '输入正则，每行一条' : '输入规则，每行一条'"
+              :aria-label="includeRuleKind === 'regex' ? '输入正则包含规则' : '输入通配符包含规则'"
+              @keydown.enter="onIncludeEnter"
+          />
+        </div>
+        <el-button size="small" plain type="primary" :loading="includeValidating" @click="addIncludeRule">添加</el-button>
+      </div>
+      <p v-if="includeRuleError" class="rule-error" role="alert">{{ includeRuleError }}</p>
+      <ExcludeRuleHelp v-if="showIncludeRuleHelp" :kind="includeRuleKind" mode="include" />
+    </div>
+
+    <!-- 排除内容（exclude_paths）：精确排除文件或目录 -->
+    <div class="field-block">
+      <div class="field-header">
+        <span class="field-label">排除内容</span>
         <div class="path-actions">
           <el-tooltip
               :disabled="ownerLoggedIn !== false"
               content="订阅所属账号未登录，请先登录该账号再预览目录树"
               placement="top"
           >
-            <span>
+            <span class="browse-action">
               <el-button
                   size="small"
                   :icon="FolderOpened"
@@ -78,7 +142,7 @@
               text
               type="primary"
               :aria-expanded="showExcludeFolderHelp"
-              aria-label="排除目录使用说明"
+              aria-label="排除内容使用说明"
               @click="showExcludeFolderHelp = !showExcludeFolderHelp"
           >
             使用说明
@@ -96,10 +160,10 @@
             closable
             type="warning"
             @close="removeExcludePath(i)"
-        >{{ p }}</el-tag>
+        >{{ formatSharePathForDisplay(p) }}</el-tag>
       </div>
       <p v-if="showExcludeFolderHelp" class="field-help">
-        所选目录及其全部内容均不扫描、不参与同步。
+        选择文件只排除该文件；选择目录则连同其中全部内容一起排除，均不参与同步。
       </p>
     </div>
 
@@ -224,27 +288,45 @@
       </div>
     </div>
 
-    <!-- 从分享选择子路径：复用转存同款 ShareFileSelector -->
+    <!-- 从分享选择内容：复用转存同款 ShareFileSelector（路径选择模式） -->
     <el-dialog
         v-model="pickerVisible"
-        :title="pickerMode === 'exclude' ? '从分享中选择要排除的目录' : '从分享中选择要同步的子路径'"
+        :title="pickerMode === 'exclude' ? '从分享中选择要排除的内容' : '从分享中选择要同步的内容'"
         width="680px"
         :close-on-click-modal="false"
+        destroy-on-close
         append-to-body
     >
+      <el-alert
+          v-if="followLostNotice"
+          class="follow-lost-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="followLostNotice.title"
+      >
+        <template #default>
+          <span class="follow-lost-desc">{{ followLostNotice.description }}</span>
+        </template>
+      </el-alert>
       <ShareFileSelector
+          :key="pickerKey"
           :files="previewFiles"
           :loading="previewing"
           :share-info="previewShareInfo"
           :share-url="shareUrl"
           :share-password="password || undefined"
-          :folder-only="pickerMode === 'exclude'"
-          @update:selected-files="onSelectedFiles"
+          path-selection
+          :initial-selected-paths="pickerInitialPaths"
+          :empty-selection-means-all="pickerMode === 'include'"
+          @update:selected-paths="onSelectedPaths"
+          @update:selection-ready="onSelectionReady"
+          @update:follow-lost-dirs="onFollowLostDirs"
       />
       <template #footer>
-        <span class="picker-hint">已选 {{ pendingSelected.length }} 项</span>
+        <span class="picker-hint">{{ pickerHint }}</span>
         <el-button @click="pickerVisible = false">取消</el-button>
-        <el-button type="primary" @click="confirmPicker">确定</el-button>
+        <el-button type="primary" :disabled="!selectionReady" @click="confirmPicker">确定</el-button>
       </template>
     </el-dialog>
   </div>
@@ -271,6 +353,7 @@ import {
   parseRuleInput,
   type ExcludeRuleKind as RuleKind,
 } from '@/utils/excludeRules'
+import { formatSharePathForDisplay } from '@/utils/shareSelection'
 import {
   previewShareFiles,
   type SharedFileInfo,
@@ -284,7 +367,11 @@ const props = defineProps<{
   excludePatterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；缺省按空处理 */
   excludeRegexPatterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 包含通配符；缺省按空处理（不额外限制） */
+  includePatterns?: string[]
+  /** 包含正则（Rust 语法，整条路径匹配）；缺省按空处理 */
+  includeRegexPatterns?: string[]
+  /** 精确排除的文件或目录路径（相对分享根） */
   excludePaths: string[]
   // 订阅所属账号：编辑订阅时传订阅自己的 owner_uid，预览目录树按该账号路由 client
   // （不传则后端回退当前 active 账号——转存对话框创建场景 owner=active）
@@ -298,6 +385,8 @@ const emit = defineEmits<{
   'update:includePaths': [value: string[]]
   'update:excludePatterns': [value: string[]]
   'update:excludeRegexPatterns': [value: string[]]
+  'update:includePatterns': [value: string[]]
+  'update:includeRegexPatterns': [value: string[]]
   'update:excludePaths': [value: string[]]
 }>()
 
@@ -305,6 +394,8 @@ const router = useRouter()
 const excludeInput = ref('')
 
 const regexPatterns = computed<string[]>(() => props.excludeRegexPatterns ?? [])
+const includePatternList = computed<string[]>(() => props.includePatterns ?? [])
+const includeRegexList = computed<string[]>(() => props.includeRegexPatterns ?? [])
 const activeRuleList = computed<string[]>(() =>
     ruleKind.value === 'regex' ? regexPatterns.value : props.excludePatterns,
 )
@@ -321,20 +412,21 @@ const validating = ref(false)
 
 // 分享文件选择器（与转存对话框同款体验）
 const pickerVisible = ref(false)
-// 选择器用途：同步子路径 / 排除目录（后者只允许选文件夹）
+// 选择器用途：同步内容 / 排除内容（两者都按路径选择，文件与目录都可选）
 const pickerMode = ref<'include' | 'exclude'>('include')
 const previewing = ref(false)
 const previewFiles = ref<SharedFileInfo[]>([])
 const previewShareInfo = ref<PreviewShareInfo | null>(null)
-const pendingSelected = ref<SharedFileInfo[]>([])
-
-function normalizePath(v: string): string {
-  const s = v.trim().replace(/\/+/g, '/')
-  if (!s) return ''
-  const prefixed = s.startsWith('/') ? s : `/${s}`
-  if (prefixed.length === 1) return '/'
-  return prefixed.endsWith('/') ? prefixed.slice(0, -1) : prefixed
-}
+/** 打开时的已存路径快照：只作初始种子，不随待确认状态变化 */
+const pickerInitialPaths = ref<string[]>([])
+/** 选择器当前待确认的路径 */
+const pendingPaths = ref<string[]>([])
+/** 选择器是否可以确认（清空同步内容时为 false） */
+const selectionReady = ref(true)
+/** 选择器会话代号：预览响应回来时会话已变则丢弃，避免改动已重开的对话框 */
+let pickerSession = 0
+/** 选择器实例代号：每次打开都换新实例，保证回到的是已存内容而非上次的临时改动 */
+const pickerKey = ref(0)
 
 function removeInclude(i: number) {
   const next = [...props.includePaths]
@@ -350,8 +442,14 @@ function removeExcludePath(i: number) {
 
 // 各字段的使用说明展开态（彼此独立，默认全部折叠）
 const showIncludeHelp = ref(false)
+const showIncludeRuleHelp = ref(false)
 const showExcludeFolderHelp = ref(false)
 const showExcludeHelp = ref(false)
+
+const includeInput = ref('')
+const includeRuleKind = ref<RuleKind>('glob')
+const includeRuleError = ref<string | null>(null)
+const includeValidating = ref(false)
 
 // ==================== 规则新增（后端权威校验） ====================
 
@@ -639,18 +737,111 @@ function goManagePresets() {
  * 供父组件在保存前调用：存在正则规则时必须由后端确认整份配置合法。
  * 后端不可用 / 校验失败都返回不通过，绝不静默当作成功。
  */
+function includeCandidateLists(kind: RuleKind, incoming: string[]) {
+  const globs = kind === 'glob'
+      ? mergeRules(includePatternList.value, incoming)
+      : [...includePatternList.value]
+  const regexes = kind === 'regex'
+      ? mergeRules(includeRegexList.value, incoming)
+      : [...includeRegexList.value]
+  return { globs, regexes }
+}
+
+async function commitIncludeRules(kind: RuleKind, incoming: string[]) {
+  if (includeValidating.value || incoming.length === 0) return
+  const inputSnapshot = includeInput.value
+  const globsSnapshot = [...includePatternList.value]
+  const regexesSnapshot = [...includeRegexList.value]
+  const { globs, regexes } = includeCandidateLists(kind, incoming)
+  const changed = kind === 'glob'
+      ? globs.length !== globsSnapshot.length
+      : regexes.length !== regexesSnapshot.length
+  if (!changed) {
+    if (includeInput.value === inputSnapshot) includeInput.value = ''
+    return
+  }
+  if (regexes.length > 0) {
+    includeValidating.value = true
+    try {
+      const resp = await validateExcludeRules({
+        exclude_patterns: globs,
+        exclude_regex_patterns: regexes,
+      })
+      if (includeInput.value !== inputSnapshot || includeRuleKind.value !== kind) return
+      if (!resp.valid) {
+        const baseLength = kind === 'glob' ? globsSnapshot.length : regexesSnapshot.length
+        includeRuleError.value = resp.errors.length
+            ? describeRuleErrorFrom(resp.errors[0], kind, baseLength)
+            : '包含规则校验失败'
+        return
+      }
+    } catch (e) {
+      if (includeInput.value === inputSnapshot && includeRuleKind.value === kind) {
+        includeRuleError.value = validationUnavailable(e).replace('排除规则', '包含规则')
+      }
+      return
+    } finally {
+      includeValidating.value = false
+    }
+  }
+  includeRuleError.value = null
+  if (kind === 'glob') emit('update:includePatterns', globs)
+  else emit('update:includeRegexPatterns', regexes)
+  if (includeInput.value === inputSnapshot) includeInput.value = ''
+}
+
+function addIncludeRule() {
+  void commitIncludeRules(includeRuleKind.value, parseRuleInput(includeInput.value))
+}
+
+function onIncludeEnter(e: Event) {
+  const ke = e as KeyboardEvent
+  if (ke.isComposing) return
+  ke.preventDefault()
+  addIncludeRule()
+}
+
+function removeIncludePattern(i: number) {
+  const next = [...includePatternList.value]
+  next.splice(i, 1)
+  includeRuleError.value = null
+  emit('update:includePatterns', next)
+}
+
+function removeIncludeRegex(i: number) {
+  const next = [...includeRegexList.value]
+  next.splice(i, 1)
+  includeRuleError.value = null
+  emit('update:includeRegexPatterns', next)
+}
+
 async function validateRules(): Promise<{ ok: boolean; message?: string }> {
-  const regexes = [...regexPatterns.value]
-  if (regexes.length === 0) return { ok: true }
+  const excludeRegexes = [...regexPatterns.value]
+  const includeRegexes = [...includeRegexList.value]
+  if (excludeRegexes.length === 0 && includeRegexes.length === 0) return { ok: true }
   try {
-    const resp = await validateExcludeRules({
-      exclude_patterns: [...props.excludePatterns],
-      exclude_regex_patterns: regexes,
-    })
-    if (!resp.valid) {
-      return {
-        ok: false,
-        message: resp.errors.length ? describeRuleError(resp.errors[0]) : '排除规则校验失败',
+    if (excludeRegexes.length > 0) {
+      const resp = await validateExcludeRules({
+        exclude_patterns: [...props.excludePatterns],
+        exclude_regex_patterns: excludeRegexes,
+      })
+      if (!resp.valid) {
+        return {
+          ok: false,
+          message: resp.errors.length ? describeRuleError(resp.errors[0]) : '排除规则校验失败',
+        }
+      }
+    }
+    if (includeRegexes.length > 0) {
+      const resp = await validateExcludeRules({
+        exclude_patterns: [...includePatternList.value],
+        exclude_regex_patterns: includeRegexes,
+      })
+      if (!resp.valid) {
+        return {
+          ok: false,
+          message: resp.errors.length ? describeRuleError(resp.errors[0]) : '包含规则校验失败',
+        }
       }
     }
     return { ok: true }
@@ -665,16 +856,18 @@ defineExpose({ validateRules })
 
 async function loadPickerFiles() {
   previewing.value = true
+  const session = ++pickerSession
   try {
     const resp = await previewShareFiles({
       share_url: props.shareUrl.trim(),
       password: props.password || undefined,
     })
+    if (session !== pickerSession) return
     previewFiles.value = resp.files || []
     previewShareInfo.value = resp.share_info ?? null
-    pendingSelected.value = []
     pickerVisible.value = true
   } catch (e) {
+    if (session !== pickerSession) return
     const ax = e as AxiosError<{ message?: string; error?: string }>
     ElMessage.error(
         ax?.response?.data?.message ||
@@ -683,7 +876,7 @@ async function loadPickerFiles() {
         '加载分享文件失败',
     )
   } finally {
-    previewing.value = false
+    if (session === pickerSession) previewing.value = false
   }
 }
 
@@ -697,6 +890,12 @@ async function openPicker() {
     return
   }
   pickerMode.value = 'include'
+  // 打开时快照已存路径：选择器以它为初始种子，待确认状态不参与
+  pickerInitialPaths.value = [...props.includePaths]
+  pendingPaths.value = [...props.includePaths]
+  selectionReady.value = true
+  pickerKey.value += 1
+  followLostDirs.value = []
   await loadPickerFiles()
 }
 
@@ -710,46 +909,84 @@ async function openExcludePicker() {
     return
   }
   pickerMode.value = 'exclude'
+  pickerInitialPaths.value = [...props.excludePaths]
+  pendingPaths.value = [...props.excludePaths]
+  selectionReady.value = true
+  pickerKey.value += 1
+  followLostDirs.value = []
   await loadPickerFiles()
 }
 
-function onSelectedFiles(files: SharedFileInfo[]) {
-  pendingSelected.value = files
+function onSelectedPaths(paths: string[]) {
+  pendingPaths.value = [...paths]
 }
 
-function confirmPicker() {
-  const selectedPaths = pendingSelected.value
-      .map((f) => normalizePath(f.path))
-      .filter((p) => p.length > 0)
+function onSelectionReady(ready: boolean) {
+  selectionReady.value = ready
+}
+
+// 中文文案之间不能有模板换行带来的空格，因此拼接成一段
+const INCLUDE_HELP_TEXT = [
+  '不选则同步整个分享。选择文件夹会包含其全部内容及后续新增内容；选择文件则只同步该文件。',
+  '在已整体选中的文件夹（或整个分享）里取消个别项目，会把它改为逐项选择，之后新增的内容不再自动同步；',
+  '只想跳过个别内容时，建议保留整体选择，改用「排除内容」。',
+].join('')
+
+/** 本次选择中被拆成逐项选择、且尚未重新整体勾选的目录（'' = 整个分享） */
+const followLostDirs = ref<string[]>([])
+
+function onFollowLostDirs(dirs: string[]) {
+  followLostDirs.value = [...dirs]
+}
+
+/** 最多列 3 个位置，其余折叠为「等 N 处」 */
+function describeFollowLostDirs(dirs: string[]): string {
+  const names = dirs.map((d) => (d === '' ? '整个分享' : `「${formatSharePathForDisplay(d)}」`))
+  if (names.length <= 3) return names.join('、')
+  return `${names.slice(0, 3).join('、')} 等 ${names.length} 处`
+}
+
+/**
+ * 取消整体选中目录里的个别项目后的提示：该目录被拆成逐项选择，之后新增的内容不会
+ * 再被自动同步 / 排除。目录被重新整体勾选后提示自动消失；不弹窗、不打断操作。
+ */
+const followLostNotice = computed<{ title: string; description: string } | null>(() => {
+  const dirs = followLostDirs.value
+  if (dirs.length === 0) return null
+  const where = describeFollowLostDirs(dirs)
   if (pickerMode.value === 'exclude') {
-    // 精确排除：合并去重；祖先目录已覆盖的后代不必单独保留
-    const merged: string[] = []
-    const seen = new Set<string>()
-    for (const p of [...props.excludePaths, ...selectedPaths]) {
-      if (seen.has(p)) continue
-      seen.add(p)
-      merged.push(p)
+    return {
+      title: `${where}已改为逐项排除`,
+      description: '这些目录之后新增的内容不会再被自动排除。如需继续整体排除，请重新勾选该目录。',
     }
-    const trimmed = merged.filter(
-        (p) => !merged.some((a) => a !== p && p.startsWith(`${a}/`)),
-    )
-    emit('update:excludePaths', trimmed)
-    pickerVisible.value = false
+  }
+  return {
+    title: `${where}已改为逐项选择`,
+    description: '这些位置之后新增的内容将不再自动同步。如果只是想跳过个别内容、并让目录继续自动包含新内容，'
+        + '请点「取消」放弃本次修改，保留整体选择，改用「排除内容」排除不需要的项目。',
+  }
+})
+
+/** 选择器底部提示：整体分享、清空待确认或已选条目数 */
+const pickerHint = computed(() => {
+  if (!selectionReady.value) return '请选择要同步的内容'
+  if (pickerMode.value === 'include' && pendingPaths.value.length === 0) return '整个分享'
+  return `已选 ${pendingPaths.value.length} 项`
+})
+
+/**
+ * 确认后**替换**对应模型：选择器给出的就是最终路径集合，不再与旧路径合并，
+ * 避免已删除的排除项被旧数据合并回来。取消 / 关闭不写任何模型。
+ */
+function confirmPicker() {
+  if (!selectionReady.value) return
+  const paths = [...pendingPaths.value]
+  pickerVisible.value = false
+  if (pickerMode.value === 'exclude') {
+    emit('update:excludePaths', paths)
     return
   }
-  // 与已有路径合并去重；勾选目录即代表整棵子树，裁剪掉被祖先覆盖的冗余后代
-  const merged: string[] = []
-  const seen = new Set<string>()
-  for (const p of [...props.includePaths, ...selectedPaths]) {
-    if (seen.has(p)) continue
-    seen.add(p)
-    merged.push(p)
-  }
-  const trimmed = merged.filter(
-      (p) => !merged.some((a) => a !== p && p.startsWith(`${a}/`)),
-  )
-  emit('update:includePaths', trimmed)
-  pickerVisible.value = false
+  emit('update:includePaths', paths)
 }
 </script>
 
@@ -887,6 +1124,14 @@ function confirmPicker() {
   color: var(--el-text-color-primary);
 }
 
+.follow-lost-alert {
+  margin-bottom: 10px;
+}
+
+.follow-lost-desc {
+  line-height: 1.5;
+}
+
 .picker-hint {
   margin-right: auto;
   font-size: 12px;
@@ -952,4 +1197,92 @@ function confirmPicker() {
   user-select: none;
 }
 
+
+// ===== 手机端（与全局 mobile.scss 断点一致）=====
+// 头部统一：「使用说明」等文字按钮始终在标题行右端；「从分享浏览」独占下一行并撑满，
+// 各字段块位置一致。规则输入：类型下拉独占一行，输入框与「添加」同一行等高（32px）。
+@media (max-width: 767px) {
+  .field-header {
+    gap: 6px 8px;
+    min-height: 24px;
+  }
+
+  // 让操作按钮直接参与 .field-header 的弹性布局，便于分别安排位置
+  .path-actions {
+    display: contents;
+  }
+
+  .path-actions > .el-button {
+    margin-left: 0;
+  }
+
+  .path-actions > .el-button.is-text {
+    padding-left: 4px;
+    padding-right: 0;
+  }
+
+  // 第一个文字按钮推到行尾，多个文字按钮（测试规则 + 使用说明）依次靠右
+  .path-actions > .el-button.is-text:first-of-type {
+    margin-left: auto;
+  }
+
+  .browse-action {
+    order: 10;
+    flex: 0 0 100%;
+    display: flex;
+
+    :deep(.el-button) {
+      flex: 1 1 auto;
+      height: 32px;
+    }
+  }
+
+  .exclude-input-row {
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .rule-input-group {
+    display: contents;
+  }
+
+  .rule-kind-select {
+    flex: 0 0 100%;
+    width: 100%;
+  }
+
+  .rule-kind-select :deep(.el-select__wrapper) {
+    min-height: 32px;
+  }
+
+  .exclude-input {
+    flex: 1 1 0;
+  }
+
+  // 单行时 5 + 20 + 5 + 边框 = 32px，与下拉 / 按钮同高；autosize 按同一样式计算多行高度
+  .exclude-input :deep(.el-textarea__inner) {
+    padding-top: 5px;
+    padding-bottom: 5px;
+    line-height: 20px;
+    // autosize 以行内样式写入单行高度，这里保证单行时不矮于下拉与按钮
+    min-height: 32px !important;
+  }
+
+  .exclude-input-row > .el-button {
+    flex: 0 0 auto;
+    height: 32px;
+    min-height: 32px;
+  }
+
+  // 「存为常用 / 管理常用规则」文字按钮与内容区左缘对齐
+  .preset-row {
+    gap: 4px 16px;
+  }
+
+  .preset-row > .el-button.is-text {
+    margin-left: 0;
+    padding-left: 0;
+    padding-right: 0;
+  }
+}
 </style>

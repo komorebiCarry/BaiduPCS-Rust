@@ -77,7 +77,11 @@ export interface ShareSubscription {
   exclude_patterns: string[]
   /** 排除正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根）；命中的目录连同其中全部内容一起排除 */
+  /** 包含通配符；任意包含规则非空时文件须至少命中一条。旧响应可能缺该字段 */
+  include_patterns?: string[]
+  /** 包含正则（Rust 语法，整条路径匹配）；旧响应可能缺该字段 */
+  include_regex_patterns?: string[]
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths: string[]
   targets: SyncTarget[]
   conflict_strategy: ConflictStrategy
@@ -104,7 +108,9 @@ export interface CreateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 排除正则（Rust 语法，整条路径匹配） */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  include_patterns?: string[]
+  include_regex_patterns?: string[]
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets: SyncTarget[]
   conflict_strategy?: ConflictStrategy
@@ -122,7 +128,11 @@ export interface UpdateShareSubscriptionRequest {
   exclude_patterns?: string[]
   /** 缺省 = 保留已存正则；显式 [] = 清空 */
   exclude_regex_patterns?: string[]
-  /** 精确排除的目录路径（相对分享根） */
+  /** 缺省 = 保留已存包含通配符；显式 [] = 清空 */
+  include_patterns?: string[]
+  /** 缺省 = 保留已存包含正则；显式 [] = 清空 */
+  include_regex_patterns?: string[]
+  /** 精确排除的文件或目录路径（相对分享根）；文件只排除自身，目录连同全部内容排除 */
   exclude_paths?: string[]
   targets?: SyncTarget[]
   conflict_strategy?: ConflictStrategy
@@ -156,6 +166,10 @@ export interface RunRecord {
   error: string | null
   /** 运行中 run 的当前阶段；老后端不返回该字段时为 undefined */
   phase?: RunPhase | string | null
+  /** 被排除规则剔除的条目数（每条分支只计最上层）；老后端 / 老 run 为 undefined / 0 */
+  excluded_count?: number
+  /** 被排除条目超过单轮记录上限，明细只记录了一部分 */
+  excluded_truncated?: boolean
 }
 
 export interface RunItemRecord {
@@ -187,6 +201,10 @@ export interface RunDetail {
   error: string | null
   /** 运行中 run 的当前阶段（后端 RunDetailDto 用 serde flatten 透传 RunRecord 的字段） */
   phase?: RunPhase | string | null
+  /** 同 RunRecord.excluded_count */
+  excluded_count?: number
+  /** 同 RunRecord.excluded_truncated */
+  excluded_truncated?: boolean
   items: RunItemRecord[]
   /** 符合筛选条件的条数（未筛选时 = 全部条数） */
   item_total_count: number
@@ -561,7 +579,7 @@ export async function getExcludeRuleCapabilities(): Promise<ExcludeRuleCapabilit
 /**
  * 校验排除规则，可选对一条相对分享根路径试匹配。
  *
- * 只覆盖请求里的两份规则列表（不含同步范围与精确排除目录）；规则非法时
+ * 只覆盖请求里的两份规则列表（不含同步范围与精确排除内容）；规则非法时
  * `valid:false` 且后端不会执行匹配。
  */
 export async function validateExcludeRules(

@@ -12,9 +12,10 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::{task_tracker::TaskTrackerToken, TaskTracker};
 use tracing::{debug, error, info, warn};
 
 /// 🔥 并发环境变化事件
@@ -328,6 +329,8 @@ pub struct ChunkScheduler {
     /// 活跃任务列表（task_id -> TaskScheduleInfo）
     /// 线程安全：使用 RwLock 保护，读多写少场景
     active_tasks: Arc<RwLock<HashMap<String, TaskScheduleInfo>>>,
+    /// Independent of active_tasks: removed/requeued tasks can still have exiting workers.
+    worker_trackers: Arc<StdMutex<HashMap<String, TaskTracker>>>,
     /// 最大全局线程数（动态可调整）
     max_global_threads: Arc<AtomicUsize>,
     /// 当前活跃的分片线程数
@@ -420,6 +423,7 @@ impl ChunkScheduler {
 
         let scheduler = Self {
             active_tasks: Arc::new(RwLock::new(HashMap::new())),
+            worker_trackers: Arc::new(StdMutex::new(HashMap::new())),
             max_global_threads: Arc::new(AtomicUsize::new(max_global_threads)),
             active_chunk_count: Arc::new(AtomicUsize::new(0)),
             slot_pool: Arc::new(ChunkSlotPool::new(max_global_threads)),
@@ -585,8 +589,9 @@ impl ChunkScheduler {
 
     /// 注册任务到调度器
     ///
-    /// 将任务添加到活跃任务列表，不再限制并发数（由任务槽控制）
-    pub async fn register_task(&self, mut task_info: TaskScheduleInfo) -> Result<()> {
+    /// 将任务添加到活跃任务列表，不再限制并发数（由任务槽控制）。
+    /// Returns false for a cancelled/deleting generation, not a successful admission.
+    pub async fn register_task(&self, mut task_info: TaskScheduleInfo) -> Result<bool> {
         let task_id = task_info.task_id.clone();
 
         // 🔥 在任何分片开始写入前建立累计字节基线。
@@ -613,17 +618,24 @@ impl ChunkScheduler {
         }
 
         // 添加到活跃任务列表（不再检查并发上限，由任务槽控制）
-        self.active_tasks
-            .write()
-            .await
-            .insert(task_id.clone(), task_info);
+        {
+            let mut tasks = self.active_tasks.write().await;
+            // Serialize admission with cancel_task: a preparation that finishes
+            // after deletion must not register a cancelled generation.
+            if task_info.cancellation_token.is_cancelled()
+                || task_info.task.lock().await.deletion_token.is_cancelled()
+            {
+                return Ok(false);
+            }
+            tasks.insert(task_id.clone(), task_info);
+        }
 
         let active_count = self.active_tasks.read().await.len();
         info!(
             "任务 {} 已注册到调度器 (当前活跃任务数: {})",
             task_id, active_count
         );
-        Ok(())
+        Ok(true)
     }
 
     /// 取消任务
@@ -631,6 +643,56 @@ impl ChunkScheduler {
         if let Some(task_info) = self.active_tasks.write().await.remove(task_id) {
             task_info.cancellation_token.cancel();
             info!("任务 {} 已从调度器移除并取消", task_id);
+        }
+    }
+
+    /// Admit a worker before spawning it. The registry lock serializes admission
+    /// with closing, including a scheduler that already cloned TaskScheduleInfo.
+    /// The returned guard must live until all file IO and callbacks have finished.
+    pub(super) fn track_worker(
+        &self,
+        task_id: &str,
+        token: &CancellationToken,
+    ) -> Option<TaskTrackerToken> {
+        Self::track_worker_in(&self.worker_trackers, task_id, token)
+    }
+
+    fn track_worker_in(
+        trackers: &StdMutex<HashMap<String, TaskTracker>>,
+        task_id: &str,
+        token: &CancellationToken,
+    ) -> Option<TaskTrackerToken> {
+        let mut trackers = trackers.lock().unwrap();
+        if token.is_cancelled() {
+            return None;
+        }
+        // Bound bookkeeping to running workers (plus closed groups being joined).
+        trackers.retain(|_, tracker| !tracker.is_empty() || tracker.is_closed());
+        let tracker = trackers.entry(task_id.to_string()).or_default();
+        if tracker.is_closed() {
+            return None;
+        }
+        Some(tracker.token())
+    }
+
+    /// Delete protocol: first cancel the manager's preparation token, then call
+    /// this barrier, and only then remove files. Never hold task/registry locks
+    /// while waiting, and do not abort workers with pending tokio::fs operations.
+    pub(super) async fn cancel_task_and_wait(&self, task_id: &str) {
+        self.cancel_task(task_id).await;
+        let tracker = {
+            let mut trackers = self.worker_trackers.lock().unwrap();
+            let tracker = trackers.entry(task_id.to_string()).or_default();
+            tracker.close();
+            tracker.clone()
+        };
+        tracker.wait().await;
+        let mut trackers = self.worker_trackers.lock().unwrap();
+        if trackers
+            .get(task_id)
+            .is_some_and(|current| TaskTracker::ptr_eq(current, &tracker))
+        {
+            trackers.remove(task_id);
         }
     }
 
@@ -661,6 +723,7 @@ impl ChunkScheduler {
     /// - 所有字段都是 Arc 包装，引用计数安全
     fn start_scheduling(&self) {
         let active_tasks = self.active_tasks.clone();
+        let worker_trackers = self.worker_trackers.clone();
         let max_global_threads = self.max_global_threads.clone();
         // 🔍 诊断用：活跃任务数理应 <= max_concurrent_tasks（任务槽上限）。
         // 若超出，说明有任务绕过了 task_slot_pool 直接进入活跃集合（见下方告警）。
@@ -876,6 +939,22 @@ impl ChunkScheduler {
 
                     match next_chunk_index {
                         Some(chunk_index) => {
+                            let Some(worker_guard) = Self::track_worker_in(
+                                &worker_trackers,
+                                task_id,
+                                &task_info.cancellation_token,
+                            ) else {
+                                task_info
+                                    .chunk_manager
+                                    .lock()
+                                    .await
+                                    .unmark_downloading(chunk_index);
+                                consecutive_empty_rounds += 1;
+                                if consecutive_empty_rounds >= task_count {
+                                    break;
+                                }
+                                continue;
+                            };
                             // 原子增加活跃计数
                             active_chunk_count.fetch_add(1, Ordering::SeqCst);
                             task_info.active_chunk_count.fetch_add(1, Ordering::SeqCst);
@@ -892,6 +971,7 @@ impl ChunkScheduler {
                             );
 
                             Self::spawn_chunk_download(
+                                worker_guard,
                                 chunk_index,
                                 task_info.clone(),
                                 active_tasks.clone(),
@@ -995,6 +1075,19 @@ impl ChunkScheduler {
 
                             // 检查是否所有分片都完成且没有活跃下载
                             if task_info.active_chunk_count.load(Ordering::SeqCst) == 0 {
+                                // Finalization can rename/write the same output too. Admit
+                                // it before cancelling the normal completion token.
+                                let Some(finalize_guard) = Self::track_worker_in(
+                                    &worker_trackers,
+                                    task_id,
+                                    &task_info.cancellation_token,
+                                ) else {
+                                    consecutive_empty_rounds += 1;
+                                    if consecutive_empty_rounds >= task_count {
+                                        break;
+                                    }
+                                    continue;
+                                };
                                 // 🔥 防重复 spawn：收尾/解密协程对同一任务只允许 spawn 一次。
                                 //   闭合"所有分片完成 → spawn 收尾协程"窗口里任务被重排
                                 //   （auto_requeue/resume）后再次进入调度器、第二次 spawn 收尾
@@ -1035,9 +1128,16 @@ impl ChunkScheduler {
                                 let decrypt_semaphore_clone = decrypt_semaphore.clone();
 
                                 tokio::spawn(async move {
+                                    let _finalize_guard = finalize_guard;
                                     // 🔥 获取解密信号量（注入后的机器级单例）
                                     let sem_arc = decrypt_semaphore_clone.read().await.clone();
-                                    let _permit = sem_arc.acquire_owned().await.unwrap();
+                                    let deletion_token =
+                                        task_info_clone.task.lock().await.deletion_token.clone();
+                                    let _permit = tokio::select! {
+                                        biased;
+                                        _ = deletion_token.cancelled() => return,
+                                        permit = sem_arc.acquire_owned() => permit.unwrap(),
+                                    };
                                     debug!("任务 {} 获取解密信号量，开始解密流程", task_id_clone);
 
                                     // 🔥 R20: 快照本次解密协程的 epoch，用于在
@@ -1049,6 +1149,9 @@ impl ChunkScheduler {
                                     //   见 DownloadTask::decrypt_epoch 的字段文档。
                                     let my_epoch = {
                                         let t = task_info_clone.task.lock().await;
+                                        if t.deletion_token.is_cancelled() {
+                                            return;
+                                        }
                                         t.decrypt_epoch
                                     };
 
@@ -1118,6 +1221,7 @@ impl ChunkScheduler {
     /// * `waiting_queue_trigger` - 等待队列触发器（失败时也要通知排队任务启动）
     #[allow(clippy::too_many_arguments)]
     fn spawn_chunk_download(
+        worker_guard: TaskTrackerToken,
         chunk_index: usize,
         task_info: TaskScheduleInfo,
         // 🔥 以下 4 个参数在重构后仅在"任务完成路径"被调用，单分片失败不再触发整任务失败
@@ -1138,6 +1242,7 @@ impl ChunkScheduler {
         owner_uid_holder: Arc<StdRwLock<crate::auth::Uid>>,
     ) {
         tokio::spawn(async move {
+            let _worker_guard = worker_guard;
             let task_id = task_info.task_id.clone();
 
             // 🔥 SAFETY: cross-account chunk
@@ -1200,36 +1305,38 @@ impl ChunkScheduler {
             //   3. 任务级 active 计数归零
             // 否则该分片会永远卡在 downloading=true、active_count 永不归零，任务永久卡死，
             // 同时绕过 BudgetScheduler 直接走本地 `slot_pool.acquire()` 是结构性破口。
-            let _budget_permit: crate::downloader::budget_scheduler::ChunkPermit =
-                match budget_scheduler
-                    .acquire_chunk_permit(
-                        task_uid,
-                        crate::downloader::budget_scheduler::BudgetKind::Download,
-                    )
-                    .await
-                {
-                    Some(p) => p,
-                    None => {
+            let _budget_permit: crate::downloader::budget_scheduler::ChunkPermit = match tokio::select! {
+                biased;
+                _ = task_info.cancellation_token.cancelled() => None,
+                permit = budget_scheduler.acquire_chunk_permit(
+                    task_uid,
+                    crate::downloader::budget_scheduler::BudgetKind::Download,
+                ) => permit,
+            } {
+                Some(p) => p,
+                None => {
+                    if !task_info.cancellation_token.is_cancelled() {
                         error!(
                         "budget_account_missing: BudgetScheduler 启用但 task uid={} 未注册（download）；\
                          跳过此分片调度。生命周期入口（登录/seed）应在调度前保证账号已注册。",
                         task_uid.raw()
                     );
-
-                        // 回滚已预占的状态（与上传侧对称）：
-                        // 1) chunk 取消 downloading 标记
-                        {
-                            let mut mgr = task_info.chunk_manager.lock().await;
-                            mgr.unmark_downloading(chunk_index);
-                        }
-                        // 2) 全局 active 计数归零
-                        global_active_count.fetch_sub(1, Ordering::SeqCst);
-                        // 3) 任务级 active 计数归零
-                        task_info.active_chunk_count.fetch_sub(1, Ordering::SeqCst);
-
-                        return;
                     }
-                };
+
+                    // 回滚已预占的状态（与上传侧对称）：
+                    // 1) chunk 取消 downloading 标记
+                    {
+                        let mut mgr = task_info.chunk_manager.lock().await;
+                        mgr.unmark_downloading(chunk_index);
+                    }
+                    // 2) 全局 active 计数归零
+                    global_active_count.fetch_sub(1, Ordering::SeqCst);
+                    // 3) 任务级 active 计数归零
+                    task_info.active_chunk_count.fetch_sub(1, Ordering::SeqCst);
+
+                    return;
+                }
+            };
 
             // 从槽位池获取一个槽位ID
             let slot_id = slot_pool.acquire();
@@ -1600,9 +1707,7 @@ impl ChunkScheduler {
             let mut t = task_info.task.lock().await;
             let owner_uid_raw = t.owner_uid.raw();
 
-            let outcome = if t.status == crate::downloader::TaskStatus::Paused
-                || t.decrypt_epoch != my_epoch
-            {
+            let outcome = if t.finalize_is_stale(my_epoch) {
                 CompletionOutcome::Stale
             } else if let Err(ref e) = decrypt_result {
                 // 🔥 文案修正：明文文件根本不走解密，收尾阶段只有 finalize（rename）。
@@ -1891,6 +1996,9 @@ impl ChunkScheduler {
         // 🔥 同时取出 owner_uid 用于事件
         let (local_path, task_id, group_id, is_backup, owner_uid_raw) = {
             let task = task_info.task.lock().await;
+            if task.finalize_is_stale(my_epoch) {
+                return Ok(());
+            }
             (
                 task.local_path.clone(),
                 task.id.clone(),
@@ -2028,11 +2136,12 @@ impl ChunkScheduler {
         info!("🔐 任务 {} 检测到加密文件，开始解密...", task_id);
 
         // 3. 更新任务状态为解密中
-        {
-            let mut task = task_info.task.lock().await;
-            task.is_encrypted = true;
-            task.mark_decrypting();
+        let mut decrypting_task = task_info.task.lock().await;
+        if decrypting_task.finalize_is_stale(my_epoch) {
+            return Ok(());
         }
+        decrypting_task.is_encrypted = true;
+        decrypting_task.mark_decrypting();
 
         // 4. 发送状态变更事件
         if is_backup {
@@ -2061,6 +2170,8 @@ impl ChunkScheduler {
                 );
             }
         }
+
+        drop(decrypting_task);
 
         // 5. 生成解密后的文件路径（优先使用映射表中的原始文件名）
         //
@@ -2119,7 +2230,8 @@ impl ChunkScheduler {
         //         硬检查（见 7.5）。
         {
             let t = task_info.task.lock().await;
-            if t.status == crate::downloader::TaskStatus::Paused {
+            if t.status == crate::downloader::TaskStatus::Paused || t.deletion_token.is_cancelled()
+            {
                 info!(
                     "任务 {} 解密预检：已被外部暂停，跳过 spawn_blocking 与后续收尾",
                     task_id
@@ -2148,15 +2260,17 @@ impl ChunkScheduler {
         let attempt_decrypted_path_for_decrypt = attempt_decrypted_path.clone();
         let filename_clone = filename.clone();
 
-        let _decrypt_result = tokio::task::spawn_blocking(move || {
-            encryption_service.decrypt_file_with_progress(
+        let deletion_token = task_info.task.lock().await.deletion_token.clone();
+        let decrypt_result = tokio::task::spawn_blocking(move || {
+            encryption_service.decrypt_file_with_progress_cancellable(
                 &local_path_for_decrypt,
                 &attempt_decrypted_path_for_decrypt,
                 move |processed, total| {
                     let progress = (processed as f64 / total as f64) * 100.0;
 
-                    // 🔥 进度回调内 Paused / epoch 短路：spawn_blocking 内部的 CPU 解密
-                    //    无法被强制中断（依赖第三方解密库实现），但用户在解密期间暂停
+                    // Paused/epoch suppress old progress; deletion additionally
+                    // stops CPU decryption at the next encrypted-chunk boundary.
+                    //    用户在解密期间暂停
                     //    文件夹（或快速恢复后启动新协程使本协程 epoch 失效）后，
                     //    我们应避免继续推送 DecryptProgress 事件误导前端进度条
                     //    （前端会持续看到 Paused 任务的进度仍在跳动；或新协程的进度
@@ -2164,17 +2278,16 @@ impl ChunkScheduler {
                     //    同样把 update_decrypt_progress 也跳过，避免 task 字段被无意义更新。
                     //
                     //    用 try_lock 而不是 lock：进度回调高频触发，避免阻塞解密计算。
-                    //    try_lock 失败时保守地按"未暂停"处理，下一次回调通常能拿到锁纠正；
-                    //    最坏情况是少数几次进度事件多发出去，不会破坏正确性。
-                    if let Ok(mut task) = task_clone.try_lock() {
-                        if task.status == crate::downloader::TaskStatus::Paused
-                            || task.decrypt_epoch != my_epoch
-                        {
-                            // 已暂停或已过期：不更新进度、不发事件，让 CPU 计算无声地跑完
-                            return;
-                        }
-                        task.update_decrypt_progress(progress);
+                    //    try_lock 失败时跳过本帧，避免删除期间锁竞争后仍发送进度。
+                    let Ok(mut task) = task_clone.try_lock() else {
+                        return;
+                    };
+                    if task.finalize_is_stale(my_epoch) {
+                        return;
                     }
+                    task.update_decrypt_progress(progress);
+                    // Keep the lock through synchronous event publication so
+                    // deletion cannot claim this task before a late progress frame.
 
                     // 发送解密进度事件
                     if is_backup {
@@ -2207,10 +2320,18 @@ impl ChunkScheduler {
                         }
                     }
                 },
+                move || deletion_token.is_cancelled(),
             )
         })
         .await
-        .map_err(|e| anyhow::anyhow!("解密任务执行失败: {}", e))??;
+        .map_err(|e| anyhow::anyhow!("解密任务执行失败: {}", e))
+        .and_then(|result| result);
+        if let Err(error) = decrypt_result {
+            // The blocking writer has exited; only now is removing its partial
+            // attempt safe. In particular cancellation must not leak this file.
+            let _ = tokio::fs::remove_file(&attempt_decrypted_path).await;
+            return Err(error);
+        }
 
         // 🔥 7.5 spawn_blocking 后的硬检查：删除加密文件 / 改 local_path / 持久化
         //         三大破坏性操作前的最后防线，同时校验 Paused 与 epoch。
@@ -2253,7 +2374,7 @@ impl ChunkScheduler {
         {
             let t = task_info.task.lock().await;
             let is_paused = t.status == crate::downloader::TaskStatus::Paused;
-            let is_stale = t.decrypt_epoch != my_epoch;
+            let is_stale = t.decrypt_epoch != my_epoch || t.deletion_token.is_cancelled();
             let current_epoch = t.decrypt_epoch;
             drop(t);
 
@@ -2386,7 +2507,7 @@ impl ChunkScheduler {
         {
             let mut task = task_info.task.lock().await;
             let is_paused = task.status == crate::downloader::TaskStatus::Paused;
-            let is_stale = task.decrypt_epoch != my_epoch;
+            let is_stale = task.decrypt_epoch != my_epoch || task.deletion_token.is_cancelled();
             let current_epoch = task.decrypt_epoch;
 
             if is_paused || is_stale {
@@ -2617,6 +2738,112 @@ impl ChunkScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn issue192_schedule_info(
+        task: Arc<Mutex<DownloadTask>>,
+        token: CancellationToken,
+    ) -> TaskScheduleInfo {
+        let t = task.lock().await;
+        let mut chunks =
+            crate::downloader::ChunkManager::new(t.total_size, t.total_size, t.owner_uid);
+        chunks.mark_completed(0);
+        TaskScheduleInfo {
+            task_id: t.id.clone(),
+            task: task.clone(),
+            chunk_manager: Arc::new(Mutex::new(chunks)),
+            speed_calc: Arc::new(Mutex::new(
+                crate::downloader::SpeedCalculator::with_default_window(),
+            )),
+            client: Arc::new(std::sync::RwLock::new(reqwest::Client::new())),
+            cookie: String::new(),
+            referer: None,
+            url_health: Arc::new(Mutex::new(UrlHealthManager::new(vec![], vec![]))),
+            output_path: PathBuf::from(format!("{}.downloading", t.local_path.display())),
+            chunk_size: t.total_size,
+            total_size: t.total_size,
+            cancellation_token: token,
+            active_chunk_count: Arc::new(AtomicUsize::new(0)),
+            consecutive_chunk_failures: Arc::new(AtomicU32::new(0)),
+            max_concurrent_chunks: 1,
+            persistence_manager: None,
+            ws_manager: None,
+            progress_throttler: Arc::new(ProgressThrottler::default()),
+            folder_progress_tx: None,
+            backup_notification_tx: None,
+            slot_id: None,
+            is_borrowed_slot: false,
+            task_slot_pool: None,
+            encryption_service: None,
+            snapshot_manager: None,
+            encryption_config_store: None,
+            manager_tasks: Some(Arc::new(RwLock::new(HashMap::new()))),
+            max_retries: 1,
+            fallback_mgr: None,
+            slot_touch_throttler: Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                Arc::new(crate::task_slot_pool::TaskSlotPool::new(1)),
+                t.id.clone(),
+            )),
+            requeue_tx: None,
+            http11_trigger: None,
+            folder_manager: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_issue192_deleted_finalizer_cannot_complete_or_remove_task() {
+        for fresh_epoch_snapshot in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut t = DownloadTask::new(
+                1,
+                "/test".into(),
+                dir.path().join("test"),
+                4,
+                crate::auth::Uid::default(),
+            );
+            t.mark_downloading();
+            let original_epoch = t.decrypt_epoch;
+            t.request_delete();
+            // A queued finalizer can snapshot after delete; the dedicated intent
+            // must still suppress it even though the epoch would match.
+            let epoch = if fresh_epoch_snapshot {
+                t.decrypt_epoch
+            } else {
+                original_epoch
+            };
+            let id = t.id.clone();
+            let task = Arc::new(Mutex::new(t));
+            let info = issue192_schedule_info(task.clone(), CancellationToken::new()).await;
+            info.manager_tasks
+                .as_ref()
+                .unwrap()
+                .write()
+                .await
+                .insert(id.clone(), task.clone());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            ChunkScheduler::handle_task_completion(
+                &id,
+                &info,
+                Ok(()),
+                epoch,
+                &Arc::new(RwLock::new(None)),
+                &Arc::new(RwLock::new(Some(tx))),
+                &Arc::new(RwLock::new(None)),
+            )
+            .await;
+            assert_eq!(
+                task.lock().await.status,
+                crate::downloader::TaskStatus::Downloading
+            );
+            assert!(info
+                .manager_tasks
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .contains_key(&id));
+            assert!(rx.try_recv().is_err());
+        }
+    }
 
     /// 任务数变化的判定边界
     ///

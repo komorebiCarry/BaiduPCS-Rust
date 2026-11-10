@@ -643,7 +643,10 @@ watch(
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 16px 20px;
+    gap: 8px;
+    // 与菜单项相同的水平内边距（el-menu-item 默认 20px）
+    padding: 12px 20px;
+    box-sizing: border-box;
     border-top: 1px solid rgba(255, 255, 255, 0.1);
     background: rgba(0, 0, 0, 0.1);
 
@@ -651,11 +654,16 @@ watch(
       display: flex;
       align-items: center;
       gap: 12px;
+      min-width: 0;
+      flex: 1 1 auto;
       cursor: pointer;
 
       .drawer-username {
         color: white;
         font-size: 14px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
     }
 
@@ -663,6 +671,7 @@ watch(
       display: flex;
       flex-direction: column;
       gap: 8px;
+      flex-shrink: 0;
     }
   }
 }
@@ -818,7 +827,23 @@ watch(
     .header-left {
       h3 {
         font-size: 16px;
+        white-space: nowrap;
       }
+    }
+
+    // 窄屏 + 长昵称时账号切换器会压到页面标题上：右侧允许收缩，昵称按视口宽度省略
+    .header-right {
+      margin-left: 8px;
+    }
+
+    .account-switcher-slot {
+      flex: 0 1 auto;
+      min-width: 0;
+    }
+
+    .account-switcher-slot :deep(.account-switcher__name) {
+      // 不超过桌面端的 120px，窄屏按视口宽度收缩
+      max-width: min(120px, 30vw);
     }
   }
 }

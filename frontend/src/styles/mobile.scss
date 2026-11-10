@@ -46,6 +46,9 @@ $mobile-breakpoint: 767px;
       .el-form-item__label {
         width: 100% !important;
         text-align: left !important;
+        // Element Plus 2.x 标签是 flex 容器（label-right 时 justify-content: flex-end），
+        // 只设 text-align 无效，必须同时改主轴对齐才能真正靠左
+        justify-content: flex-start !important;
         padding-right: 0;
         padding-bottom: 8px;
       }

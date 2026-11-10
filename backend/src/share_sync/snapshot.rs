@@ -73,6 +73,19 @@ impl ShareSnapshotItem {
     }
 }
 
+/// run_item `reason` 的「被排除规则命中」前缀（后接 `path:` / `glob:` / `regex:` + 规则原文）
+pub const EXCLUDED_REASON_PREFIX: &str = "excluded:";
+
+/// 抓取阶段被排除规则剔除的条目（只记每条分支最上层的那个）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedEntry {
+    /// 相对分享根的路径
+    pub path: String,
+    pub is_dir: bool,
+    /// run_item `reason`，见 [`ExclusionRules::explain`]
+    pub reason: String,
+}
+
 /// 一次抓取的完整快照
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareSnapshot {
@@ -266,6 +279,8 @@ pub struct SnapshotCollector<'a> {
     include_index: BTreeSet<String>,
     /// 排除规则（精确目录路径 + glob 模式）
     exclusions: ExclusionRules,
+    /// 包含规则（通配符 + 正则）。空 = 不额外限制；非空时文件须至少命中一条。
+    inclusions: CompiledRules,
     /// 取消令牌：触发后立即中断扫描
     cancel: Option<CancellationToken>,
     /// v2 阶段 6 补全:列目录抓快照同样走全局风控限速器。
@@ -304,11 +319,16 @@ impl<'a> SnapshotCollector<'a> {
         exclude_patterns: Vec<String>,
         exclude_regex_patterns: Vec<String>,
         exclude_paths: Vec<String>,
+        include_patterns: Vec<String>,
+        include_regex_patterns: Vec<String>,
         rate_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self, ShareSyncError> {
         let compiled_exclusions =
             ExclusionRules::compile(exclude_paths, &exclude_patterns, &exclude_regex_patterns)
                 .map_err(|e| ShareSyncError::ConfigError(e.to_string()))?;
+        let compiled_inclusions =
+            CompiledRules::compile(&include_patterns, &include_regex_patterns)
+                .map_err(|e| ShareSyncError::ConfigError(format!("包含规则：{e}")))?;
 
         let mut share_link = client
             .parse_share_link(share_url)
@@ -368,6 +388,7 @@ impl<'a> SnapshotCollector<'a> {
             include_paths,
             include_index,
             exclusions,
+            inclusions: compiled_inclusions,
             cancel: None,
             rate_limiter,
             progress: None,
@@ -413,7 +434,15 @@ impl<'a> SnapshotCollector<'a> {
     /// 抓取完整快照
     ///
     /// 流程：root list → BFS 遍历所有子目录 → 合并去重 → 过滤
-    pub async fn collect(mut self) -> Result<(CapturedShare, ShareSnapshot), ShareSyncError> {
+    pub async fn collect(self) -> Result<(CapturedShare, ShareSnapshot), ShareSyncError> {
+        self.collect_detailed().await.map(|(c, s, _)| (c, s))
+    }
+
+    /// 同 [`Self::collect`]，另外返回被排除规则剔除的条目（每条分支只记最上层，
+    /// 按 path 排序；数量不设上限，由调用方决定记录多少）。
+    pub async fn collect_detailed(
+        mut self,
+    ) -> Result<(CapturedShare, ShareSnapshot, Vec<ExcludedEntry>), ShareSyncError> {
         let page_size: u32 = 100;
 
         // Step 1: root（同样带单请求级退避重试，避免整棵树因根列表一次抖动就重来）
@@ -626,11 +655,12 @@ impl<'a> SnapshotCollector<'a> {
         }
 
         // Step 3: 过滤 + 标记（抽成自由函数，见 `filter_and_mark_pruned` 注释）
-        let filtered = filter_and_mark_pruned(
+        let (filtered, excluded) = filter_and_mark_pruned_with(
             all_items,
             &self.include_paths,
             &self.include_index,
             &self.exclusions,
+            &self.inclusions,
         );
 
         let captured = CapturedShare {
@@ -647,7 +677,7 @@ impl<'a> SnapshotCollector<'a> {
             /*subscription_id*/ "", // 由调用方在 manager 处填
             filtered,
         );
-        Ok((captured, snap))
+        Ok((captured, snap, excluded))
     }
 
     /// 触发一次扫描进度回调（无回调时零开销）。节流由回调实现方负责。
@@ -814,16 +844,17 @@ pub fn cancelled_error(cancel: Option<&CancellationToken>) -> Result<(), ShareSy
     Ok(())
 }
 
-/// 排除规则集合：精确目录路径（`exclude_paths`）+ glob / 正则模式。
+/// 排除规则集合：精确路径（`exclude_paths`，文件或目录）+ glob / 正则模式。
 ///
 /// 三类规则的语义：
-/// - **精确路径**：命中的目录连同其中全部内容一起排除，且扫描时不再列举该目录。
+/// - **精确路径**：命中的**文件**只排除自身；命中的**目录**连同其中全部内容一起排除，
+///   且扫描时不再列举该目录。
 /// - **glob / 正则**：路径命中即排除；**目录**命中时其整棵子树一起排除。
 ///
 /// 精确路径的匹配是**边界感知**的：`/a/b` 不会误伤同层的 `/a/bc`。
 #[derive(Debug, Default, Clone)]
 pub struct ExclusionRules {
-    /// 精确排除的目录路径（相对分享根）
+    /// 精确排除的文件或目录路径（相对分享根）
     exact_paths: BTreeSet<String>,
     /// 预编译的 glob + 正则规则
     rules: CompiledRules,
@@ -872,7 +903,9 @@ impl ExclusionRules {
         self.exact_hit(dir) || self.pattern_hit(dir)
     }
 
-    /// 该条目是否应被排除
+    /// 该条目是否应被排除。
+    ///
+    /// 精确路径命中**文件**时只排除该文件本身；命中**目录**时整棵子树都不再出现。
     pub fn excludes_item(&self, path: &str, is_dir: bool) -> bool {
         if is_dir {
             return self.excludes_dir(path);
@@ -880,10 +913,33 @@ impl ExclusionRules {
         self.exact_hit(path) || self.pattern_hit(path)
     }
 
+    /// 说明 `path` 为什么被排除：返回 run_item `reason`（`excluded:path:<目录>` /
+    /// `excluded:glob:<规则>` / `excluded:regex:<规则>`）；未被排除时返回 `None`。
+    ///
+    /// 判定顺序与 [`Self::excludes_item`] 一致（精确目录优先，其次通配符、正则）。
+    /// 文件与目录的判定相同（`excludes_dir` 与文件分支都是「自身或祖先命中」）。
+    pub fn explain(&self, path: &str) -> Option<String> {
+        if let Some(p) = self
+            .exact_paths
+            .iter()
+            .find(|p| is_path_ancestor_or_self(path, p))
+        {
+            return Some(format!("{}path:{}", EXCLUDED_REASON_PREFIX, p));
+        }
+        let hit = self.rules.first_match_path(path)?;
+        Some(format!(
+            "{}{}:{}",
+            EXCLUDED_REASON_PREFIX,
+            hit.kind.as_str(),
+            hit.pattern
+        ))
+    }
+
     /// 把精确排除路径归一到「相对分享根」命名空间（与快照条目 path 对齐）。
     ///
     /// 用户挑的可能是分享内绝对路径或 sharelink 合成路径；不归一时非根分享
-    /// （分享根是某个目录）的排除规则匹配不到任何条目。
+    /// （分享根是某个目录）的排除规则匹配不到任何条目。sharelink 合成前缀会被剥离，
+    /// 因此 `sharelink0-<id>` 与真实 uk 两种写法命中同一份内容。
     fn remap_exact_paths(&mut self, share_root: &str) {
         if self.exact_paths.is_empty() {
             return;
@@ -942,12 +998,14 @@ pub fn normalize_share_path(raw_path: &str, name: &str, share_root: &str) -> Str
         raw.trim_start_matches('/').to_string()
     };
 
-    let fallback = if name.trim().is_empty() {
+    // 文件名里的空白同样是内容（如结尾空格），不能当作格式噪声 trim 掉；
+    // 只有真正缺失的名字才回退到 raw 的最后一段。
+    let fallback = if name.is_empty() {
         raw.rsplit('/').next().unwrap_or("").to_string()
     } else {
-        name.trim().to_string()
+        name.to_string()
     };
-    let candidate = if relative.trim().is_empty() {
+    let candidate = if relative.is_empty() {
         fallback
     } else {
         relative
@@ -956,15 +1014,26 @@ pub fn normalize_share_path(raw_path: &str, name: &str, share_root: &str) -> Str
     normalize_snapshot_path(candidate).unwrap_or_else(|| "/".to_string())
 }
 
+/// 只规整分隔符冗余（反斜杠、重复斜杠、首尾斜杠），**不裁剪文件名里的空白**。
+///
+/// 根分隔符之前的空白只算分隔符填充，不属于任何文件名；分隔符之后的空白属于
+/// 文件名本身（如结尾空格），必须逐字节保留，否则「报告. 」会与「报告.」归一成
+/// 同一路径，来源与排除都会串到同名文件上。
 fn normalize_snapshot_path(path: String) -> Option<String> {
-    let trimmed = path.trim().replace('\\', "/");
-    if trimmed.is_empty() {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty() {
         return None;
     }
-    let prefixed = if trimmed.starts_with('/') {
-        trimmed
+    let trimmed_start = normalized.trim_start();
+    let normalized = if trimmed_start.starts_with('/') {
+        trimmed_start.to_string()
     } else {
-        format!("/{}", trimmed)
+        normalized
+    };
+    let prefixed = if normalized.starts_with('/') {
+        normalized
+    } else {
+        format!("/{}", normalized)
     };
     let mut collapsed = String::with_capacity(prefixed.len());
     let mut prev_slash = false;
@@ -1103,41 +1172,30 @@ fn dir_allowed_with(
     // include 目录下一层就截断：深层内容从未被扫描，exclude 过滤与
     // subtree_pruned 标记都无从发生，后续整目录 fs_id 直传会让百度服务端
     // 把被排除的深层内容原样递归复制回来。
-    // `item_allowed_with` / `dir_needs_more_pages` 均有同款后代判断，三者语义须一致。
+    // `item_included_with` / `dir_needs_more_pages` 均有同款后代判断，三者语义须一致。
     include_paths
         .iter()
         .any(|inc| is_path_ancestor_or_self(dir, inc))
 }
 
-/// 单条目 include/exclude 准入判断（原 `SnapshotCollector::item_allowed`）。
+/// 单条目 include 准入判断（原 `SnapshotCollector::item_allowed` 的 include 部分；
+/// exclude 部分在 `filter_and_mark_pruned` 里单独判断，以便记录命中的规则）。
+/// item.path 是某个 include_path 自身/祖先（索引命中）或后代即收录。
 /// 做成自由函数是为了让 `filter_and_mark_pruned` 可以脱离 collector（不依赖
 /// 网络客户端）被单元测试直接驱动。
-fn item_allowed_with(
+fn item_included_with(
     include_paths: &BTreeSet<String>,
     include_index: &BTreeSet<String>,
-    exclusions: &ExclusionRules,
     item: &ShareSnapshotItem,
 ) -> bool {
-    // 1) include 过滤：item.path 是某个 include_path 自身/祖先（索引命中）或后代
-    if !include_paths.is_empty() && !include_index.contains(&item.path) {
-        // 二级检查：item.path 是否是某个 include_path 的后代（include 选了目录，
-        // 它下面的所有文件/子目录都应被收录）
-        let mut allowed = false;
-        for inc in include_paths {
-            if is_path_ancestor_or_self(&item.path, inc) {
-                allowed = true;
-                break;
-            }
-        }
-        if !allowed {
-            return false;
-        }
+    if include_paths.is_empty() || include_index.contains(&item.path) {
+        return true;
     }
-    // 2) exclude 过滤：精确目录排除（连同整棵子树）或 glob 命中
-    if exclusions.excludes_item(&item.path, item.is_dir) {
-        return false;
-    }
-    true
+    // 二级检查：item.path 是否是某个 include_path 的后代（include 选了目录，
+    // 它下面的所有文件/子目录都应被收录）
+    include_paths
+        .iter()
+        .any(|inc| is_path_ancestor_or_self(&item.path, inc))
 }
 
 /// 抓取 Step 3：应用 include/exclude 过滤，并给「有后代被剔除」的存活目录打
@@ -1150,26 +1208,87 @@ fn item_allowed_with(
 ///
 /// 抽成自由函数：`collect()` 依赖真实网络客户端无法单测，而这段过滤/标记逻辑
 /// 恰是 issue #128（多层级过滤失效）的回归高发区，必须可以被直接测试。
+///
+/// 第二个返回值是**被排除规则剔除**（include 范围内）的条目：每条分支只保留最上层
+/// （被排除目录下的后代不再重复记录），按 path 排序。不在 include 范围内的条目
+/// 不属于「被规则排除」，不记录。
+#[cfg(test)]
 fn filter_and_mark_pruned(
     all_items: Vec<ShareSnapshotItem>,
     include_paths: &BTreeSet<String>,
     include_index: &BTreeSet<String>,
     exclusions: &ExclusionRules,
-) -> Vec<ShareSnapshotItem> {
+) -> (Vec<ShareSnapshotItem>, Vec<ExcludedEntry>) {
+    filter_and_mark_pruned_with(
+        all_items,
+        include_paths,
+        include_index,
+        exclusions,
+        &CompiledRules::default(),
+    )
+}
+
+/// 文件必须命中至少一条包含规则（空规则 = 不限制）。
+/// 目录始终放行：名称未命中时仍要继续遍历，以便找到其中匹配的文件；
+/// 目录规则命中时，其下文件通过 `matches_path`（自身或祖先）一并收录。
+fn item_matches_include_rules(inclusions: &CompiledRules, item: &ShareSnapshotItem) -> bool {
+    if inclusions.is_empty() || item.is_dir {
+        return true;
+    }
+    inclusions.matches_path(&item.path)
+}
+
+fn filter_and_mark_pruned_with(
+    all_items: Vec<ShareSnapshotItem>,
+    include_paths: &BTreeSet<String>,
+    include_index: &BTreeSet<String>,
+    exclusions: &ExclusionRules,
+    inclusions: &CompiledRules,
+) -> (Vec<ShareSnapshotItem>, Vec<ExcludedEntry>) {
     let mut pruned_ancestors: BTreeSet<String> = BTreeSet::new();
+    let mut excluded: Vec<ExcludedEntry> = Vec::new();
     let mut filtered: Vec<ShareSnapshotItem> = all_items
         .into_iter()
         .filter(|it| {
-            if item_allowed_with(include_paths, include_index, exclusions, it) {
-                true
-            } else {
-                for anc in ancestor_dirs(&it.path) {
-                    pruned_ancestors.insert(anc);
-                }
-                false
+            let included = item_included_with(include_paths, include_index, it)
+                && item_matches_include_rules(inclusions, it);
+            if included && !exclusions.excludes_item(&it.path, it.is_dir) {
+                return true;
             }
+            if included {
+                if let Some(reason) = exclusions.explain(&it.path) {
+                    excluded.push(ExcludedEntry {
+                        path: it.path.clone(),
+                        is_dir: it.is_dir,
+                        reason,
+                    });
+                }
+            }
+            for anc in ancestor_dirs(&it.path) {
+                pruned_ancestors.insert(anc);
+            }
+            false
         })
         .collect();
+    let excluded = topmost_excluded(excluded);
+
+    // 包含规则非空时，目录只是为了找文件才放行：既未命中包含规则、下面也没有存活文件的
+    // 目录（空目录、只剩空子目录或文件全被过滤）不应进快照，否则会被当成干净目录整目录
+    // 转存，在目标端建出一堆空目录。被丢弃目录的祖先照常标记 subtree_pruned。
+    if !inclusions.is_empty() {
+        let mut file_ancestors: BTreeSet<String> = BTreeSet::new();
+        for it in filtered.iter().filter(|it| !it.is_dir) {
+            file_ancestors.extend(ancestor_dirs(&it.path));
+        }
+        filtered.retain(|it| {
+            if !it.is_dir || file_ancestors.contains(&it.path) || inclusions.matches_path(&it.path)
+            {
+                return true;
+            }
+            pruned_ancestors.extend(ancestor_dirs(&it.path));
+            false
+        });
+    }
 
     // 给存活下来的、且有后代被剔除的目录条目打标。
     if !pruned_ancestors.is_empty() {
@@ -1182,7 +1301,28 @@ fn filter_and_mark_pruned(
 
     // 排序（path 字典序）
     filtered.sort_by(|a, b| a.path.cmp(&b.path));
-    filtered
+    (filtered, excluded)
+}
+
+/// 只保留每条分支最上层的被排除条目：祖先目录已被记录的后代丢弃；同路径去重。
+fn topmost_excluded(mut entries: Vec<ExcludedEntry>) -> Vec<ExcludedEntry> {
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then(b.is_dir.cmp(&a.is_dir)));
+    let mut kept_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        if !seen.insert(e.path.clone()) {
+            continue;
+        }
+        if ancestor_dirs(&e.path).iter().any(|a| kept_dirs.contains(a)) {
+            continue;
+        }
+        if e.is_dir {
+            kept_dirs.insert(e.path.clone());
+        }
+        out.push(e);
+    }
+    out
 }
 
 /// 把一批 list 结果并入抓取状态：去重推入快照、记录命中的 include 文件、
@@ -1266,6 +1406,14 @@ mod tests {
     /// 无任何排除规则的快捷构造
     fn no_exclusions() -> ExclusionRules {
         ExclusionRules::default()
+    }
+
+    fn include_rules(globs: &[&str], regexes: &[&str]) -> CompiledRules {
+        CompiledRules::compile(
+            &globs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &regexes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .expect("测试包含规则应可编译")
     }
 
     /// 精确目录排除 + glob / 正则排除的组合
@@ -1467,7 +1615,7 @@ mod tests {
             ),
         ];
 
-        let out = filter_and_mark_pruned(
+        let (out, _) = filter_and_mark_pruned(
             all_items,
             &includes,
             &index,
@@ -1903,7 +2051,7 @@ mod tests {
             item("/股票/按月归档/2026-10/月报.csv", 4, 100),
         ];
 
-        let out = filter_and_mark_pruned(all_items, &includes, &index, &rules);
+        let (out, _) = filter_and_mark_pruned(all_items, &includes, &index, &rules);
         let by_path: BTreeMap<&str, &ShareSnapshotItem> =
             out.iter().map(|i| (i.path.as_str(), i)).collect();
 
@@ -1983,7 +2131,135 @@ mod tests {
             normalize_snapshot_path("   /bar//".to_string()),
             Some("/bar".to_string())
         );
+        assert_eq!(
+            normalize_snapshot_path("/剧集/报告. ".to_string()),
+            Some("/剧集/报告. ".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("/剧集//报告. //".to_string()),
+            Some("/剧集/报告. ".to_string())
+        );
         assert_eq!(normalize_snapshot_path("".to_string()), None);
+    }
+
+    /// 文件名空白是内容而不是格式噪声：只有分隔符冗余被规整，尾随空格必须原样保留，
+    /// 否则「报告. 」与「报告.」会归一成同一路径，来源与排除都会串到同名文件上。
+    #[test]
+    fn test_normalize_snapshot_path_preserves_filename_whitespace() {
+        assert_ne!(
+            normalize_snapshot_path("/剧集/报告. ".to_string()),
+            normalize_snapshot_path("/剧集/报告.".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("/剧集/报告.  ".to_string()),
+            Some("/剧集/报告.  ".to_string())
+        );
+        assert_eq!(
+            normalize_snapshot_path("/剧集/第 1 集.mp4".to_string()),
+            Some("/剧集/第 1 集.mp4".to_string())
+        );
+        // 根分隔符之前的空白只算分隔符填充，不进文件名
+        assert_eq!(
+            normalize_snapshot_path("  /剧集/报告. ".to_string()),
+            Some("/剧集/报告. ".to_string())
+        );
+    }
+
+    /// `normalize_share_path` 不能把空白文件名当成「名字缺失」去回退或 trim。
+    #[test]
+    fn test_normalize_share_path_preserves_name_whitespace() {
+        assert_eq!(
+            normalize_share_path("/剧集/报告. ", "报告. ", "/"),
+            "/剧集/报告. "
+        );
+        assert_eq!(
+            normalize_share_path("/剧集/报告.", "报告.", "/"),
+            "/剧集/报告."
+        );
+        // 空白名字不是空名字：不回退到 raw 末段，也不被裁掉
+        assert_eq!(normalize_share_path("/", " ", "/"), "/ ");
+        // 空名字仍回退到 raw 的最后一段，空路径仍回退到根
+        assert_eq!(normalize_share_path("/剧集/报告. ", "", "/剧集"), "/报告. ");
+        assert_eq!(normalize_share_path("", "", "/"), "/");
+    }
+
+    /// 精确排除必须区分尾随空格：只排除被选中的那一个字面名，不牵连同名兄弟。
+    #[test]
+    fn test_exact_exclusion_distinguishes_trailing_space_filename() {
+        let rules = ExclusionRules::compile(vec!["/剧集/报告. ".to_string()], &[], &[])
+            .expect("精确排除编译不应失败");
+        assert!(rules.excludes_item("/剧集/报告. ", false));
+        assert!(
+            !rules.excludes_item("/剧集/报告.", false),
+            "无空格同名文件不得被连带排除"
+        );
+        assert!(
+            !rules.excludes_item("/剧集/报告.  ", false),
+            "空格数不同的文件不得被连带排除"
+        );
+    }
+
+    /// 深层目录里显式排除一个尾随空格文件：仅该文件消失，兄弟存活，祖先标 pruned。
+    #[test]
+    fn test_trailing_space_file_exclusion_prunes_only_itself() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            dir_item("/剧集/子目录", 2),
+            item("/剧集/子目录/报告. ", 21, 100),
+            item("/剧集/子目录/报告.", 22, 100),
+            item("/剧集/子目录/报告.  ", 23, 100),
+            item("/剧集/子目录/其他.txt", 24, 100),
+        ];
+
+        let (out, _) = filter_and_mark_pruned(
+            all_items,
+            &includes,
+            &index,
+            &exclusions(&["/剧集/子目录/报告. "], &[]),
+        );
+        let by_path: BTreeMap<&str, &ShareSnapshotItem> =
+            out.iter().map(|i| (i.path.as_str(), i)).collect();
+
+        assert!(
+            !by_path.contains_key("/剧集/子目录/报告. "),
+            "被排除的尾随空格文件不得存活"
+        );
+        assert!(
+            by_path.contains_key("/剧集/子目录/报告."),
+            "无空格同名文件必须存活"
+        );
+        assert!(
+            by_path.contains_key("/剧集/子目录/报告.  "),
+            "空格数不同的文件必须存活"
+        );
+        assert!(by_path.contains_key("/剧集/子目录/其他.txt"));
+        assert!(
+            by_path.get("/剧集/子目录").unwrap().subtree_pruned,
+            "父目录必须标 subtree_pruned"
+        );
+        assert!(
+            by_path.get("/剧集").unwrap().subtree_pruned,
+            "祖先目录同样必须标 subtree_pruned"
+        );
+    }
+
+    /// 选中一个尾随空格文件作为 include：只采集该条目，不把同名无空格文件带进来。
+    #[test]
+    fn test_include_path_with_trailing_space_matches_only_that_item() {
+        let includes: BTreeSet<String> = ["/剧集/报告. ".to_string()].into_iter().collect();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            item("/剧集/报告. ", 21, 100),
+            item("/剧集/报告.", 22, 100),
+            item("/剧集/其他.txt", 23, 100),
+        ];
+
+        let (out, _) = filter_and_mark_pruned(all_items, &includes, &index, &no_exclusions());
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["/剧集", "/剧集/报告. "]);
     }
 
     // ========== 精确目录排除 / glob 子树排除 ==========
@@ -2054,6 +2330,56 @@ mod tests {
         assert!(!rules.excludes_item("/剧集/S01x.mp4", false));
     }
 
+    /// 精确排除**文件**时只排除该文件本身：同目录兄弟文件与各级目录都不受影响。
+    #[test]
+    fn test_exact_excluded_file_excludes_only_itself() {
+        let rules = exclusions(&["/剧集/S01/第1集.mp4"], &[]);
+        assert!(rules.excludes_item("/剧集/S01/第1集.mp4", false));
+        assert!(
+            !rules.excludes_item("/剧集/S01/第2集.mp4", false),
+            "兄弟文件不得被连带排除"
+        );
+        assert!(!rules.excludes_dir("/剧集/S01"), "上级目录不得被剪掉");
+        assert!(!rules.excludes_dir("/剧集"));
+    }
+
+    /// 精确排除文件后：文件从快照消失、兄弟文件存活，父目录必须标 subtree_pruned
+    /// —— 否则转存阶段会把父目录当作单个 fs_id 整体直传，把被排除的文件原样带过去。
+    #[test]
+    fn test_exact_excluded_file_absent_and_sibling_survives() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            dir_item("/剧集/S01", 2),
+            item("/剧集/S01/第1集.mp4", 21, 100),
+            item("/剧集/S01/第2集.mp4", 22, 100),
+        ];
+
+        let (out, _) = filter_and_mark_pruned(
+            all_items,
+            &includes,
+            &index,
+            &exclusions(&["/剧集/S01/第1集.mp4"], &[]),
+        );
+        let by_path: BTreeMap<&str, &ShareSnapshotItem> =
+            out.iter().map(|i| (i.path.as_str(), i)).collect();
+
+        assert!(
+            !by_path.contains_key("/剧集/S01/第1集.mp4"),
+            "被排除的文件不得存活"
+        );
+        assert!(
+            by_path.contains_key("/剧集/S01/第2集.mp4"),
+            "兄弟文件必须存活"
+        );
+        assert!(by_path.contains_key("/剧集/S01"), "父目录必须存活");
+        assert!(
+            by_path.get("/剧集/S01").unwrap().subtree_pruned,
+            "父目录必须标 subtree_pruned，禁止整目录直传"
+        );
+    }
+
     /// 被排除目录及其后代不得出现在快照里，且**存活的祖先目录必须标 subtree_pruned** ——
     /// 否则转存阶段会把祖先目录当作单个 fs_id 整体直传，把被排除的内容原样带过去。
     #[test]
@@ -2068,7 +2394,7 @@ mod tests {
             item("/剧集/S02/第2集.mp4", 31, 100),
         ];
 
-        let out = filter_and_mark_pruned(
+        let (out, _) = filter_and_mark_pruned(
             all_items,
             &includes,
             &index,
@@ -2091,6 +2417,52 @@ mod tests {
         );
     }
 
+    /// 被排除的条目带上命中的规则，且每条分支只记最上层；include 范围外的不算「被排除」。
+    #[test]
+    fn test_excluded_entries_report_rule_and_keep_topmost_only() {
+        let mut includes = BTreeSet::new();
+        includes.insert("/剧集".to_string());
+        let index = build_include_index(&includes);
+        let rules = ExclusionRules::new(
+            ["/剧集/花絮".to_string()].into_iter().collect(),
+            CompiledRules::compile(&["*.txt".to_string()], &["^/剧集/S0[2-9]$".to_string()])
+                .unwrap(),
+        );
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            dir_item("/剧集/S01", 2),
+            item("/剧集/S01/第1集.mp4", 21, 100),
+            item("/剧集/S01/说明.txt", 22, 1),
+            dir_item("/剧集/S02", 3),
+            // 被排除目录的后代（缓存/历史数据里可能出现）：不重复记录
+            item("/剧集/S02/第1集.mp4", 31, 100),
+            dir_item("/剧集/花絮", 4),
+            item("/剧集/花絮/a.txt", 41, 1),
+            // include 范围外：不是被排除规则剔除的
+            item("/其它/readme.txt", 51, 1),
+        ];
+        let (out, excluded) = filter_and_mark_pruned(all_items, &includes, &index, &rules);
+        assert!(out.iter().any(|i| i.path == "/剧集/S01/第1集.mp4"));
+        let got: Vec<(&str, bool, &str)> = excluded
+            .iter()
+            .map(|e| (e.path.as_str(), e.is_dir, e.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/剧集/S01/说明.txt", false, "excluded:glob:*.txt"),
+                ("/剧集/S02", true, "excluded:regex:^/剧集/S0[2-9]$"),
+                ("/剧集/花絮", true, "excluded:path:/剧集/花絮"),
+            ]
+        );
+        assert!(no_exclusions().explain("/a").is_none());
+        // 后代条目的说明指向祖先命中的规则
+        assert_eq!(
+            rules.explain("/剧集/S03/x.mp4").as_deref(),
+            Some("excluded:regex:^/剧集/S0[2-9]$")
+        );
+    }
+
     /// glob 命中的**目录**排除整棵子树。
     #[test]
     fn test_glob_matched_dir_excludes_whole_subtree() {
@@ -2108,7 +2480,7 @@ mod tests {
             item("/剧集/S01/第1集/a.mp4", 31, 100),
             dir_item("/剧集/S02", 4),
         ];
-        let out = filter_and_mark_pruned(all_items, &includes, &index, &rules);
+        let (out, _) = filter_and_mark_pruned(all_items, &includes, &index, &rules);
         let by_path: BTreeMap<&str, &ShareSnapshotItem> =
             out.iter().map(|i| (i.path.as_str(), i)).collect();
         assert!(!by_path.contains_key("/剧集/S01"));
@@ -2127,6 +2499,31 @@ mod tests {
         assert!(!rules.excludes_dir("/scan_test"));
     }
 
+    /// sharelink 合成前缀的排除路径同样归一到分享根命名空间：`sharelink0-<id>` 与
+    /// 真实 uk 两种写法命中同一份内容（前端按别名回填，语义必须一致）。
+    #[test]
+    fn test_exclude_paths_alias_remapped_to_share_root() {
+        for alias in [
+            "/sharelink0-6168417644/scan_test/广告",
+            "/sharelink1100862997704-6168417644/scan_test/广告",
+        ] {
+            let mut rules = exclusions(&[alias], &[]);
+            rules.remap_exact_paths("/13/a测试上传1");
+            assert!(
+                rules.excludes_dir("/scan_test/广告"),
+                "别名写法未命中: {alias}"
+            );
+            assert!(
+                rules.excludes_item("/scan_test/广告/贴片.mp4", false),
+                "别名写法未覆盖后代: {alias}"
+            );
+            assert!(
+                !rules.excludes_dir("/scan_test"),
+                "别名写法误伤上级: {alias}"
+            );
+        }
+    }
+
     /// 取消令牌被触发后，扫描立刻返回「已取消」而不是继续跑。
     #[test]
     fn test_check_cancelled_reports_cancelled() {
@@ -2143,5 +2540,173 @@ mod tests {
         // 取消不是可重试错误，也不算链接失效
         assert!(!err.should_retry());
         assert!(!err.is_link_invalid());
+    }
+
+    #[test]
+    fn test_include_patterns_keep_matching_files_and_directories() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/翻-忍", 1),
+            dir_item("/翻-忍/160-", 2),
+            item("/翻-忍/160-/198.mp4", 3, 100),
+            item("/翻-忍/160-/197.mp4", 4, 100),
+            item("/翻-忍/160-/readme.txt", 5, 10),
+            item("/other/SE01.mp4", 6, 50),
+        ];
+        let (out, excluded) = filter_and_mark_pruned_with(
+            all_items,
+            &includes,
+            &index,
+            &no_exclusions(),
+            &include_rules(&["*.mp4"], &[]),
+        );
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"/翻-忍"));
+        assert!(paths.contains(&"/翻-忍/160-"));
+        assert!(paths.contains(&"/翻-忍/160-/198.mp4"));
+        assert!(paths.contains(&"/翻-忍/160-/197.mp4"));
+        assert!(paths.contains(&"/other/SE01.mp4"));
+        assert!(!paths.contains(&"/翻-忍/160-/readme.txt"));
+        assert!(
+            excluded.is_empty(),
+            "未匹配包含规则不算排除规则命中: {excluded:?}"
+        );
+        assert!(out
+            .iter()
+            .any(|i| i.path == "/翻-忍/160-" && i.subtree_pruned));
+    }
+
+    #[test]
+    fn test_include_regex_and_exclude_applied_after() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/剧集", 1),
+            item("/剧集/SE01.mp4", 2, 100),
+            item("/剧集/SE02.mp4", 3, 100),
+            item("/剧集/SE02.nfo", 4, 1),
+            item("/剧集/preview.jpg", 5, 20),
+        ];
+        let exclusions = ExclusionRules::compile(Vec::new(), &["*.nfo".to_string()], &[]).unwrap();
+        let (out, excluded) = filter_and_mark_pruned_with(
+            all_items,
+            &includes,
+            &index,
+            &exclusions,
+            &include_rules(&[], &[r".*SE.*"]),
+        );
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"/剧集"));
+        assert!(paths.contains(&"/剧集/SE01.mp4"));
+        assert!(paths.contains(&"/剧集/SE02.mp4"));
+        assert!(!paths.contains(&"/剧集/preview.jpg"));
+        assert!(!paths.contains(&"/剧集/SE02.nfo"));
+        // preview.jpg 未命中包含规则，静默丢弃；SE02.nfo 命中包含后再被排除规则记下。
+        assert!(!excluded.iter().any(|e| e.path == "/剧集/preview.jpg"));
+        assert!(excluded.iter().any(|e| e.path == "/剧集/SE02.nfo"));
+    }
+
+    #[test]
+    fn test_include_directory_rule_includes_subtree() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/翻-忍", 1),
+            dir_item("/翻-忍/160-", 2),
+            item("/翻-忍/160-/198.mp4", 3, 100),
+            item("/翻-忍/1-100/001.mp4", 4, 100),
+        ];
+        let (out, _) = filter_and_mark_pruned_with(
+            all_items,
+            &includes,
+            &index,
+            &no_exclusions(),
+            &include_rules(&["/翻-忍/160-"], &[]),
+        );
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"/翻-忍/160-/198.mp4"));
+        assert!(!paths.contains(&"/翻-忍/1-100/001.mp4"));
+    }
+
+    /// 包含规则下，未命中规则且无存活文件的目录（空目录、空目录链、文件全被过滤）
+    /// 不进快照，避免被整目录转存成空目录；被丢弃目录的祖先打 subtree_pruned。
+    #[test]
+    fn test_include_rules_drop_dirs_without_surviving_files() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![
+            dir_item("/empty", 1),
+            dir_item("/e2", 2),
+            dir_item("/e2/e3", 3),
+            dir_item("/docs", 4),
+            item("/docs/a.txt", 5, 1),
+            dir_item("/show", 6),
+            dir_item("/show/extras", 7),
+            item("/show/ep1.mp4", 8, 1),
+        ];
+        let (out, excluded) = filter_and_mark_pruned_with(
+            all_items,
+            &includes,
+            &index,
+            &no_exclusions(),
+            &include_rules(&["*.mp4"], &[]),
+        );
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["/show", "/show/ep1.mp4"]);
+        assert!(
+            excluded.is_empty(),
+            "包含规则未命中不记为排除: {excluded:?}"
+        );
+        // /show/extras 被丢弃，/show 不能再被当作干净目录整目录转存
+        assert!(out.iter().any(|i| i.path == "/show" && i.subtree_pruned));
+    }
+
+    /// 目录本身命中包含规则时，即使是空目录也保留（用户明确要了这个目录）。
+    #[test]
+    fn test_include_rules_keep_matching_empty_dir() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![dir_item("/字幕", 1), dir_item("/其他", 2)];
+        let (out, _) = filter_and_mark_pruned_with(
+            all_items,
+            &includes,
+            &index,
+            &no_exclusions(),
+            &include_rules(&["/字幕"], &[]),
+        );
+        let paths: Vec<&str> = out.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, vec!["/字幕"]);
+        assert!(!out[0].subtree_pruned);
+    }
+
+    /// 没有包含规则时空目录照旧保留（不改变原有行为）。
+    #[test]
+    fn test_no_include_rules_keep_empty_dirs() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let (out, _) = filter_and_mark_pruned_with(
+            vec![dir_item("/empty", 1)],
+            &includes,
+            &index,
+            &no_exclusions(),
+            &CompiledRules::default(),
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_include_rules_do_not_filter() {
+        let includes = BTreeSet::new();
+        let index = build_include_index(&includes);
+        let all_items = vec![item("/a.txt", 1, 1), item("/b.mp4", 2, 2)];
+        let (out, _) = filter_and_mark_pruned_with(
+            all_items,
+            &includes,
+            &index,
+            &no_exclusions(),
+            &CompiledRules::default(),
+        );
+        assert_eq!(out.len(), 2);
     }
 }

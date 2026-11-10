@@ -2,6 +2,15 @@
   <div class="transfers-container" :class="{ 'is-mobile': isMobile }">
     <!-- 顶部工具栏 -->
     <div class="toolbar">
+      <!-- 手机端：账号筛选独占一行 -->
+      <div v-if="isMobile && authStore.hasMultipleAccounts" class="toolbar-account-row">
+        <AccountFilter
+            v-model="ownerFilter"
+            :counts="ownerFilterCounts"
+            block
+            class="account-filter-slot"
+        />
+      </div>
       <div class="header-left">
         <h2 v-if="!isMobile">转存管理</h2>
         <el-tag :type="activeCountType" size="large">
@@ -9,7 +18,7 @@
         </el-tag>
         <!-- 多账号过滤器 -->
         <AccountFilter
-            v-if="authStore.hasMultipleAccounts"
+            v-if="authStore.hasMultipleAccounts && !isMobile"
             v-model="ownerFilter"
             :counts="ownerFilterCounts"
             size="large"
@@ -38,18 +47,33 @@
           </el-button>
         </template>
         <template v-else>
-          <el-button type="primary" circle @click="showTransferDialog = true">
+          <el-button type="primary" circle aria-label="新建转存" title="新建转存" @click="showTransferDialog = true">
             <el-icon><Share /></el-icon>
           </el-button>
-          <el-button type="success" circle @click="showShareDirectDialog = true">
+          <el-button type="success" circle aria-label="分享直下" title="分享直下" @click="showShareDirectDialog = true">
             <el-icon><Download /></el-icon>
           </el-button>
-          <el-button circle @click="refreshTasks">
+          <el-button circle aria-label="刷新" title="刷新" @click="refreshTasks">
             <el-icon><Refresh /></el-icon>
           </el-button>
-          <el-button circle @click="handleClearCompleted" :disabled="completedCount === 0">
-            <el-icon><Delete /></el-icon>
-          </el-button>
+          <!-- 清除类操作收进带文字的「更多」菜单：手机上与桌面一样可清除已完成 / 失败任务 -->
+          <el-dropdown trigger="click" @command="handleMobileMoreCommand">
+            <el-button circle aria-label="更多操作" title="更多操作">
+              <el-icon><MoreFilled /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="clearCompleted" :disabled="completedCount === 0">
+                  <el-icon><Delete /></el-icon>
+                  清除已完成 ({{ completedCount }})
+                </el-dropdown-item>
+                <el-dropdown-item command="clearFailed" :disabled="failedCount === 0">
+                  <el-icon><CircleClose /></el-icon>
+                  清除失败 ({{ failedCount }})
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </template>
       </div>
     </div>
@@ -224,6 +248,7 @@ import {
   Folder,
   Document,
   Download,
+  MoreFilled,
 } from '@element-plus/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useIsMobile } from '@/utils/responsive'
@@ -451,6 +476,12 @@ async function handleDelete(task: TransferTask) {
   }
 }
 
+// 手机端「更多」菜单命令分发
+function handleMobileMoreCommand(command: string) {
+  if (command === 'clearCompleted') handleClearCompleted()
+  else if (command === 'clearFailed') handleClearFailed()
+}
+
 // 清除已完成
 async function handleClearCompleted() {
   try {
@@ -661,6 +692,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 .transfers-container {
   width: 100%;
   height: 100%;
@@ -876,14 +908,6 @@ onUnmounted(() => {
 // 移动端样式
 // =====================
 .is-mobile {
-  .toolbar {
-    padding: 12px 16px;
-
-    .header-left {
-      gap: 12px;
-    }
-  }
-
   .task-container {
     padding: 12px;
   }
@@ -928,5 +952,10 @@ onUnmounted(() => {
       font-size: 12px;
     }
   }
+}
+
+// 手机端工具栏：统一规则见 styles/_mobile-toolbar.scss（放在最后以覆盖上方桌面样式）
+.transfers-container.is-mobile {
+  @include mt.mobile-toolbar;
 }
 </style>

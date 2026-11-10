@@ -26,7 +26,7 @@
       </div>
 
       <!-- 分享配置表单 -->
-      <el-form v-if="!shareResult" label-position="top" class="share-form">
+      <el-form v-if="!shareResult" label-position="top" class="share-form" @submit.prevent>
         <el-form-item label="有效期">
           <el-radio-group v-model="form.period" class="period-radio-group">
             <el-radio-button :value="0">永久</el-radio-button>
@@ -106,7 +106,7 @@
     </div>
 
     <!-- 分享配置表单 - PC端 -->
-    <el-form v-if="!shareResult" label-width="80px" class="share-form-pc">
+    <el-form v-if="!shareResult" label-width="80px" class="share-form-pc" @submit.prevent>
       <el-form-item label="有效期">
         <el-select v-model="form.period" style="width: 100%">
           <el-option label="永久" :value="0" />
@@ -481,6 +481,10 @@ watch(() => form.value.pwd, () => {
   flex-direction: column;
   gap: 12px;
   margin-top: 20px;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
 }
 
 /* =====================

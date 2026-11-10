@@ -5,7 +5,7 @@
       <div class="header-left">
         <h2 v-if="!isMobile">我的分享</h2>
         <el-tag :type="activeCountType" size="large">
-          {{ total }} 条分享记录
+          {{ headerCountText }}
         </el-tag>
       </div>
       <div class="header-right">
@@ -48,7 +48,7 @@
         </template>
         <!-- 移动端按钮 -->
         <template v-else>
-          <el-button circle @click="refreshList" :loading="loading">
+          <el-button circle aria-label="刷新" title="刷新" @click="refreshList" :loading="loading">
             <el-icon><Refresh /></el-icon>
           </el-button>
           <el-dropdown
@@ -57,7 +57,7 @@
               trigger="click"
               @command="handleBatchExpire"
           >
-            <el-button circle :loading="batchExpireUpdating" aria-label="批量修改有效期">
+            <el-button circle :loading="batchExpireUpdating" aria-label="批量修改有效期" title="批量修改有效期">
               <el-icon><Timer /></el-icon>
             </el-button>
             <template #dropdown>
@@ -76,6 +76,8 @@
               v-if="selectedIds.length > 0"
               circle
               type="danger"
+              aria-label="批量取消分享"
+              title="批量取消分享"
               @click="handleBatchCancel"
           >
             <el-icon><Delete /></el-icon>
@@ -91,6 +93,7 @@
         v-loading="loading"
         @selection-change="handleSelectionChange"
         class="share-table"
+        :row-class-name="shareRowClass"
     >
       <el-table-column type="selection" width="50" />
       <el-table-column label="文件" prop="typicalPath" min-width="200">
@@ -114,8 +117,8 @@
       </el-table-column>
       <el-table-column label="状态" width="100" align="center">
         <template #default="{ row }">
-          <el-tag :type="getStatusType(row.status)" size="small">
-            {{ getStatusText(row.status) }}
+          <el-tag :type="getStatusType(row)" size="small" class="share-status-tag">
+            {{ getStatusText(row) }}
           </el-tag>
         </template>
       </el-table-column>
@@ -126,10 +129,22 @@
       </el-table-column>
       <el-table-column label="操作" width="360" fixed="right">
         <template #default="{ row }">
-          <el-button size="small" @click="handleGetDetail(row)" :icon="Key">
+          <el-button
+              size="small"
+              @click="handleGetDetail(row)"
+              :icon="Key"
+              :disabled="isDeadActionLocked(row)"
+              :title="deadActionTitle(row)"
+          >
             提取码
           </el-button>
-          <el-button size="small" @click="handleCopyLink(row)" :icon="Link">
+          <el-button
+              size="small"
+              @click="handleCopyLink(row)"
+              :icon="Link"
+              :disabled="isDeadActionLocked(row)"
+              :title="deadActionTitle(row)"
+          >
             复制
           </el-button>
           <el-dropdown
@@ -143,7 +158,7 @@
                 :icon="Timer"
                 :disabled="isExpireLocked(row)"
                 :loading="expireUpdatingIds.includes(row.shareId)"
-                :title="isExpired(row) ? '已过期的分享不能修改有效期' : '修改有效期'"
+                :title="expireButtonTitle(row)"
             >
               有效期
             </el-button>
@@ -172,7 +187,7 @@
           v-for="item in shareList"
           :key="item.shareId"
           class="share-card"
-          :class="{ selected: selectedIds.includes(item.shareId) }"
+          :class="[{ selected: selectedIds.includes(item.shareId) }, deadShareClass(item)]"
       >
         <div class="card-header" @click="toggleSelect(item.shareId)">
           <el-checkbox
@@ -181,8 +196,8 @@
               @change="() => toggleSelect(item.shareId)"
           />
           <span class="file-name">{{ getFileName(item.typicalPath) }}</span>
-          <el-tag size="small" :type="getStatusType(item.status)">
-            {{ getStatusText(item.status) }}
+          <el-tag size="small" :type="getStatusType(item)" class="share-status-tag">
+            {{ getStatusText(item) }}
           </el-tag>
         </div>
 
@@ -191,27 +206,34 @@
             <span class="label">链接:</span>
             <span class="value link-text">{{ item.shortlink }}</span>
           </div>
-          <div class="info-row">
-            <span class="label">浏览:</span>
-            <span class="value">{{ item.viewCount }} 次</span>
+          <!-- 浏览 / 下载 / 保存合并一行（接口没返回的计数不显示） -->
+          <div class="info-row stats-row">
+            <span class="label">统计:</span>
+            <span class="value stats-value">
+              <span class="stat">浏览 {{ item.viewCount }}</span>
+              <span v-if="item.downloadCount != null" class="stat">下载 {{ item.downloadCount }}</span>
+              <span v-if="item.transferCount != null" class="stat">保存 {{ item.transferCount }}</span>
+            </span>
           </div>
-          <div v-if="item.downloadCount != null" class="info-row">
-            <span class="label">下载:</span>
-            <span class="value">{{ item.downloadCount }} 次</span>
-          </div>
-          <div v-if="item.transferCount != null" class="info-row">
-            <span class="label">保存:</span>
-            <span class="value">{{ item.transferCount }} 次</span>
-          </div>
-          <div class="info-row">
+          <div class="info-row expire-row">
             <span class="label">过期:</span>
             <span class="value">{{ formatExpireTime(item) }}</span>
           </div>
         </div>
 
         <div class="card-actions" @click.stop>
-          <el-button size="small" :icon="Key" @click="handleGetDetail(item)">提取码</el-button>
-          <el-button size="small" :icon="Link" @click="handleCopyLink(item)">复制</el-button>
+          <el-button
+              size="small"
+              :icon="Key"
+              :disabled="isDeadActionLocked(item)"
+              @click="handleGetDetail(item)"
+          >提取码</el-button>
+          <el-button
+              size="small"
+              :icon="Link"
+              :disabled="isDeadActionLocked(item)"
+              @click="handleCopyLink(item)"
+          >复制</el-button>
           <el-dropdown
               class="row-expire-dropdown"
               trigger="click"
@@ -246,7 +268,8 @@
       <el-empty v-if="shareList.length === 0 && !loading" description="暂无分享记录" />
     </div>
 
-    <!-- 分页 -->
+    <!-- 分页：百度 /share/record 不返回总数，用 nextpage（has_more）翻页；
+         万一接口给了 total 才用完整分页条 -->
     <div class="pagination-wrapper" v-if="total > 0">
       <el-pagination
           v-model:current-page="currentPage"
@@ -255,6 +278,25 @@
           :layout="isMobile ? 'prev, pager, next' : 'total, prev, pager, next'"
           @current-change="handlePageChange"
       />
+    </div>
+    <div class="pagination-wrapper simple-pager" v-else-if="currentPage > 1 || hasMore">
+      <el-button
+          size="small"
+          class="pager-prev"
+          :disabled="currentPage <= 1 || loading"
+          @click="handlePageChange(currentPage - 1)"
+      >
+        上一页
+      </el-button>
+      <span class="pager-text">第 {{ currentPage }} 页</span>
+      <el-button
+          size="small"
+          class="pager-next"
+          :disabled="!hasMore || loading"
+          @click="handlePageChange(currentPage + 1)"
+      >
+        下一页
+      </el-button>
     </div>
 
     <!-- 分享详情弹窗 - 移动端底部抽屉 -->
@@ -314,7 +356,9 @@ import {
   Timer,
 } from '@element-plus/icons-vue'
 import { useIsMobile } from '@/utils/responsive'
+import { useUiPrefsStore } from '@/stores/uiPrefs'
 import {
+  deadShareKind,
   getShareList,
   getShareDetail,
   cancelShare,
@@ -328,6 +372,7 @@ import {
 
 // 响应式检测
 const isMobile = useIsMobile()
+const uiPrefs = useUiPrefsStore()
 
 // 状态
 const loading = ref(false)
@@ -335,7 +380,10 @@ const shareList = ref<ShareRecord[]>([])
 // 下载 / 保存次数：百度接口返回了才显示对应列（不返回时不臆造为 0）
 const showDownloadCount = computed(() => shareList.value.some((r) => r.downloadCount != null))
 const showTransferCount = computed(() => shareList.value.some((r) => r.transferCount != null))
+// 百度 /share/record 不返回 total（恒为 0），本页条数看 count，翻页看 has_more（nextpage）
 const total = ref(0)
+const pageCount = ref(0)
+const hasMore = ref(false)
 
 // 请求版本号 — 切账号 / 切页 时丢弃旧请求回包
 //
@@ -361,9 +409,47 @@ const currentShareRecord = ref<ShareRecord | null>(null)
 
 // 计算属性
 const activeCountType = computed(() => {
-  if (total.value === 0) return 'info'
+  if (total.value === 0 && shareList.value.length === 0) return 'info'
   return 'success'
 })
+
+// 顶部计数：有 total 用 total；否则用本页条数（count / 列表长度），不再显示「0 条」。
+// 有多页时注明「本页」，避免把本页条数误读成总数
+const headerCountText = computed(() => {
+  if (total.value > 0) return `${total.value} 条分享记录`
+  const n = pageCount.value || shareList.value.length
+  if (currentPage.value > 1 || hasMore.value) return `第 ${currentPage.value} 页 · 本页 ${n} 条`
+  return `${n} 条分享记录`
+})
+
+// ---------- 失效分享（文件已删除 / 已过期） ----------
+
+// 表格行 / 卡片的高亮 class（界面偏好可关闭）
+function deadShareClass(record: ShareRecord): string {
+  if (!uiPrefs.highlightDeadShares) return ''
+  const kind = deadShareKind(record)
+  return kind ? `dead-share dead-share--${kind}` : ''
+}
+
+function shareRowClass({ row }: { row: ShareRecord }): string {
+  return deadShareClass(row)
+}
+
+// 界面偏好开启时，失效分享只保留「取消分享」
+function isDeadActionLocked(record: ShareRecord): boolean {
+  return uiPrefs.disableDeadShareActions && deadShareKind(record) !== null
+}
+
+function deadActionTitle(record: ShareRecord): string | undefined {
+  if (!isDeadActionLocked(record)) return undefined
+  return deadShareKind(record) === 'deleted' ? '分享的文件已被删除，只能取消分享' : '分享已过期，只能取消分享'
+}
+
+function expireButtonTitle(record: ShareRecord): string {
+  if (isExpired(record)) return '已过期的分享不能修改有效期'
+  if (isDeadActionLocked(record)) return '分享的文件已被删除，只能取消分享'
+  return '修改有效期'
+}
 
 // 获取文件名
 function getFileName(path: string): string {
@@ -372,9 +458,12 @@ function getFileName(path: string): string {
   return parts[parts.length - 1] || path
 }
 
-// 获取状态类型
-function getStatusType(status: number): 'success' | 'danger' | 'warning' | 'info' {
-  switch (status) {
+// 获取状态类型（失效分享优先：百度对它们的 status 是 0 / 10 等，不能直接映射）
+function getStatusType(record: ShareRecord): 'success' | 'danger' | 'warning' | 'info' {
+  const kind = deadShareKind(record)
+  if (kind === 'deleted') return 'danger'
+  if (kind === 'expired') return 'warning'
+  switch (record.status) {
     case 0:
       return 'success'
     case 1:
@@ -385,8 +474,11 @@ function getStatusType(status: number): 'success' | 'danger' | 'warning' | 'info
 }
 
 // 获取状态文本
-function getStatusText(status: number): string {
-  switch (status) {
+function getStatusText(record: ShareRecord): string {
+  const kind = deadShareKind(record)
+  if (kind === 'deleted') return '已删除'
+  if (kind === 'expired') return '已过期'
+  switch (record.status) {
     case 0:
       return '正常'
     case 1:
@@ -399,8 +491,10 @@ function getStatusText(status: number): string {
 }
 
 // 格式化过期时间
+// 后端已把百度的 expiredTime（剩余秒数）换算成过期时间点（优先 lastExpireTime），
+// 这里的 expiredTime 是 Unix 秒级时间戳；0 = 永久（或已过期）
 function formatExpireTime(record: ShareRecord): string {
-  if (record.expiredType === -1) {
+  if (deadShareKind(record) === 'expired') {
     return '已过期'
   }
 
@@ -429,7 +523,7 @@ function formatExpireTime(record: ShareRecord): string {
 
 // 是否已过期（与 formatExpireTime 判定一致）
 function isExpired(record: ShareRecord): boolean {
-  if (record.expiredType === -1) return true
+  if (deadShareKind(record) === 'expired') return true
   const ts = record.expiredTime
   if (!ts) return false
   const ms = ts > 10000000000 ? ts : ts * 1000
@@ -437,8 +531,14 @@ function isExpired(record: ShareRecord): boolean {
 }
 
 // 网页端同样不允许修改已过期分享的有效期；修改中也锁住
+// 界面偏好「失效分享只保留取消」开启时，文件已删除的分享同样锁住
 function isExpireLocked(record: ShareRecord): boolean {
-  return isExpired(record) || expireUpdatingIds.value.includes(record.shareId) || batchExpireUpdating.value
+  return (
+    isExpired(record) ||
+    isDeadActionLocked(record) ||
+    expireUpdatingIds.value.includes(record.shareId) ||
+    batchExpireUpdating.value
+  )
 }
 
 function expireLabel(days: ShareExpireDays): string {
@@ -495,20 +595,28 @@ async function handleModifyExpire(record: ShareRecord, days: ShareExpireDays) {
 // 批量修改有效期（跳过已过期的分享，与网页端一致）
 async function handleBatchExpire(days: ShareExpireDays) {
   if (selectedIds.value.length === 0 || batchExpireUpdating.value) return
-  // 只跳过当前列表里能确认已过期的；不在当前页的选中项交给后端（失败会逐条返回原因）
+  // 只跳过当前列表里能确认已过期（或按界面偏好锁定的失效分享）的；
+  // 不在当前页的选中项交给后端（失败会逐条返回原因）
+  let skippedLocked = 0
   const targets = selectedIds.value.filter((id) => {
     const row = shareList.value.find((item) => item.shareId === id)
-    return !row || !isExpired(row)
+    if (!row || isExpired(row)) return !row
+    if (isDeadActionLocked(row)) {
+      skippedLocked++
+      return false
+    }
+    return true
   })
   const skipped = selectedIds.value.length - targets.length
+  const skippedWhat = skippedLocked > 0 ? '已过期或文件已删除' : '已过期'
   if (targets.length === 0) {
-    ElMessage.warning('选中的分享都已过期，无法修改有效期')
+    ElMessage.warning(`选中的分享都${skippedWhat}，无法修改有效期`)
     return
   }
   try {
     await ElMessageBox.confirm(
         `确定把选中的 ${targets.length} 个分享的有效期改为「${expireLabel(days)}」吗？` +
-        (skipped > 0 ? `（已跳过 ${skipped} 个已过期的分享）` : ''),
+        (skipped > 0 ? `（已跳过 ${skipped} 个${skippedWhat}的分享）` : ''),
         '批量修改有效期',
         { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
     )
@@ -554,7 +662,9 @@ async function refreshList() {
       return
     }
     shareList.value = data.list
-    total.value = data.total
+    total.value = data.total || 0
+    pageCount.value = data.count ?? data.list.length
+    hasMore.value = data.has_more ?? false
   } catch (error: any) {
     if (version !== shareListRequestVersion) return
     console.error('获取分享列表失败:', error)
@@ -589,6 +699,7 @@ function toggleSelect(shareId: number) {
 
 // 获取分享详情
 async function handleGetDetail(record: ShareRecord) {
+  if (isDeadActionLocked(record)) return
   // 详情请求版本号防御
   const version = ++shareDetailRequestVersion
   try {
@@ -606,6 +717,7 @@ async function handleGetDetail(record: ShareRecord) {
 
 // 复制链接
 async function handleCopyLink(record: ShareRecord) {
+  if (isDeadActionLocked(record)) return
   try {
     await navigator.clipboard.writeText(record.shortlink)
     ElMessage.success('链接已复制到剪贴板')
@@ -710,6 +822,9 @@ function handleActiveChanged() {
   shareDetailRequestVersion++ // 丢弃旧账号详情请求回包
   shareList.value = []
   total.value = 0
+  pageCount.value = 0
+  hasMore.value = false
+  currentPage.value = 1
   detailVisible.value = false
   currentShareRecord.value = null
   currentDetail.value = null
@@ -730,6 +845,7 @@ onBeforeUnmount(() => {
 
 
 <style scoped lang="scss">
+@use '@/styles/mobile-toolbar' as mt;
 /* =====================
    容器样式
    ===================== */
@@ -851,32 +967,84 @@ onBeforeUnmount(() => {
   .link-text {
     color: var(--el-color-primary);
   }
+
+  .stats-value {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: 12px;
+  }
 }
 
+/* =====================
+   失效分享高亮（界面偏好「高亮失效分享」）
+   用 Element Plus 颜色变量：浅色 / 暗色主题下都是低饱和底色
+   ===================== */
+.share-table :deep(.el-table__row.dead-share--deleted) > td.el-table__cell {
+  background-color: var(--el-color-danger-light-9);
+}
+
+.share-table :deep(.el-table__row.dead-share--expired) > td.el-table__cell {
+  background-color: var(--el-color-warning-light-9);
+}
+
+.share-table :deep(.el-table__row.dead-share--deleted .file-name) {
+  color: var(--el-color-danger);
+}
+
+.share-table :deep(.el-table__row.dead-share--expired .file-name) {
+  color: var(--el-color-warning-dark-2);
+}
+
+.share-card.dead-share--deleted {
+  background: var(--el-color-danger-light-9);
+  border-left: 3px solid var(--el-color-danger-light-5);
+
+  .card-header .file-name {
+    color: var(--el-color-danger);
+  }
+}
+
+.share-card.dead-share--expired {
+  background: var(--el-color-warning-light-9);
+  border-left: 3px solid var(--el-color-warning-light-5);
+
+  .card-header .file-name {
+    color: var(--el-color-warning-dark-2);
+  }
+}
+
+/* 四个操作等宽网格、统一 8px 间距，不再叠加 Element Plus 相邻按钮的 12px 外边距，
+   窄屏（< 360px）改两列，按钮始终不超出卡片 */
 .card-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--el-border-color-lighter);
 
   .el-button {
-    flex: 1;
+    width: 100%;
+    min-width: 0;
     min-height: 44px; /* 触摸友好的最小高度 */
+    margin-left: 0;
+    padding-left: 6px;
+    padding-right: 6px;
   }
 
-  /* 下拉包裹的按钮与相邻按钮保持和原来一致的间距（gap + Element Plus 的 12px） */
   .row-expire-dropdown {
-    flex: 1;
-    margin-left: 12px;
+    display: flex;
+    min-width: 0;
 
     .el-button {
       width: 100%;
     }
   }
+}
 
-  .row-expire-dropdown + .el-button {
-    margin-left: 12px;
+@media (max-width: 359px) {
+  .card-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -887,6 +1055,16 @@ onBeforeUnmount(() => {
   padding: 16px 0;
   display: flex;
   justify-content: center;
+}
+
+.simple-pager {
+  align-items: center;
+  gap: 12px;
+
+  .pager-text {
+    font-size: 13px;
+    color: var(--el-text-color-regular);
+  }
 }
 
 /* =====================
@@ -923,6 +1101,10 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 12px;
   margin-top: 24px;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
 }
 
 .block-btn {
@@ -964,19 +1146,10 @@ onBeforeUnmount(() => {
 /* =====================
    移动端响应式
    ===================== */
-@media (max-width: 768px) {
-  .page-header {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .header-left {
-    justify-content: space-between;
-  }
-
-  .header-right {
-    justify-content: flex-end;
-  }
+// 手机端工具栏：与下载 / 转存等页同一套规则（styles/_mobile-toolbar.scss）；
+// 页面容器已有 12px 内边距，工具栏自身不再加内边距
+.shares-container.is-mobile {
+  @include mt.mobile-toolbar($inset: 0, $padding-y: 0, $margin-bottom: 12px);
 }
 
 /* =====================

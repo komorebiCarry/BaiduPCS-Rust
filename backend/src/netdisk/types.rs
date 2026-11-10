@@ -658,10 +658,10 @@ pub struct ShareRecord {
     #[serde(rename = "vCnt", default)]
     pub view_count: i32,
 
-    /// 下载次数（`dCnt`，百度分享体系里与 `vCnt` 同组的计数字段，见分享页 / 公开分享列表响应）
+    /// 下载次数（`dCnt`）
     ///
-    /// BaiduPCS-Go / BaiduPCS-Py 均未解析，`/share/record` 是否返回无公开文档；
-    /// 响应里没有时为 `None`，前端不显示，不会臆造为 0。
+    /// 实测 `/share/record` 每条记录都会返回（可能为 0）；仍按可选解析：响应里没有时
+    /// 为 `None`，前端不显示，不会臆造为 0。
     #[serde(rename = "dCnt", default, deserialize_with = "de_opt_count")]
     pub download_count: Option<i64>,
 
@@ -739,8 +739,19 @@ pub struct ShareListResponse {
     pub list: Vec<ShareRecord>,
 
     /// 总数
+    ///
+    /// 实测 `/share/record` 并**不返回** `total`（恒为默认 0），分页须看 `nextpage`，
+    /// 本页条数看 `count`。保留该字段仅为兼容可能返回它的响应。
     #[serde(default)]
     pub total: u32,
+
+    /// 本页条数（实测字段 `count`）
+    #[serde(default, deserialize_with = "de_opt_count")]
+    pub count: Option<i64>,
+
+    /// 下一页页码（实测字段 `nextpage`；0 = 没有下一页）
+    #[serde(default, deserialize_with = "de_opt_count")]
+    pub nextpage: Option<i64>,
 
     /// 错误信息
     #[serde(default)]
@@ -751,6 +762,16 @@ impl ShareListResponse {
     /// 是否成功
     pub fn is_success(&self) -> bool {
         self.errno == 0
+    }
+
+    /// 是否还有下一页（`nextpage` > 0）
+    pub fn has_more(&self) -> bool {
+        self.nextpage.unwrap_or(0) > 0
+    }
+
+    /// 本页条数：优先用 `count`，缺失时取 `list.len()`
+    pub fn page_count(&self) -> usize {
+        self.count.map(|c| c as usize).unwrap_or(self.list.len())
     }
 }
 
@@ -1286,6 +1307,58 @@ mod tests {
 
     fn record(json: &str) -> ShareRecord {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// 脱敏后的真实 `/share/record` 响应结构（shareId / 链接均为假值）
+    const SHARE_RECORD_FIXTURE: &str = include_str!("testdata/share_record_page1.json");
+
+    #[test]
+    fn share_list_response_parses_real_structure() {
+        let resp: ShareListResponse = serde_json::from_str(SHARE_RECORD_FIXTURE).unwrap();
+        assert!(resp.is_success());
+        assert_eq!(resp.total, 0, "真实响应没有 total");
+        assert_eq!(resp.count, Some(4));
+        assert_eq!(resp.page_count(), 4);
+        assert_eq!(resp.nextpage, Some(0));
+        assert!(!resp.has_more());
+        assert_eq!(resp.list.len(), 4);
+
+        let [timed, forever, expired, deleted] = &resp.list[..] else {
+            panic!("fixture 应有 4 条");
+        };
+        // expiredTime = 剩余秒数；lastExpireTime = 过期时间点
+        assert!(!timed.is_expired());
+        assert_eq!(timed.expire_at(1_761_000_000), 1_764_592_000);
+        assert_eq!(timed.expire_at(0), timed.last_expire_time);
+        assert_eq!(
+            (timed.view_count, timed.download_count, timed.transfer_count),
+            (12, Some(3), Some(1))
+        );
+        assert!(forever.is_permanent());
+        assert_eq!(forever.download_count, Some(0), "dCnt=0 也要保留");
+        assert!(expired.is_expired());
+        assert_eq!(expired.status, 10);
+        assert_eq!(expired.expire_at(1_761_000_000), 0);
+        assert_eq!(expired.typical_path, "分享已过期");
+        assert_eq!(deleted.typical_path, "分享的文件已被删除");
+        assert!(deleted.is_permanent() && deleted.is_active());
+    }
+
+    #[test]
+    fn share_list_response_nextpage_and_count_fallbacks() {
+        let more: ShareListResponse =
+            serde_json::from_str(r#"{"errno":0,"list":[],"count":50,"nextpage":2}"#).unwrap();
+        assert!(more.has_more());
+        assert_eq!(more.page_count(), 50);
+        let text: ShareListResponse =
+            serde_json::from_str(r#"{"errno":0,"list":[],"nextpage":"3"}"#).unwrap();
+        assert!(text.has_more());
+        let legacy: ShareListResponse = serde_json::from_str(
+            r#"{"errno":0,"list":[{"shareId":1,"status":0,"public":0}],"total":1}"#,
+        )
+        .unwrap();
+        assert!(!legacy.has_more());
+        assert_eq!((legacy.count, legacy.page_count()), (None, 1));
     }
 
     #[test]
