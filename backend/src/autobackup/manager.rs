@@ -12,7 +12,10 @@ use super::scheduler::{
     TaskController, TriggerSource,
 };
 use super::task::*;
-use super::validation::{validate_for_create, validate_for_execute, validate_for_update};
+use super::validation::{
+    normalize_local_path, normalize_remote_path, validate_for_create, validate_for_execute,
+    validate_for_update,
+};
 use super::watcher::{FileChangeEvent, FileWatcher};
 use crate::autobackup::TransferTaskStatus;
 use crate::common::{ProxyConfig, ProxyFallbackManager};
@@ -104,6 +107,11 @@ pub struct AutoBackupManager {
     aggregated_rx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<ChangeEvent>>>>,
     /// 任务控制器（每个配置一个，用于防止并发执行和触发合并）
     task_controllers: Arc<DashMap<String, Arc<TaskController>>>,
+    /// 串行化配置的创建 / 更新 / 删除：校验、写入、落盘、重建文件监听整段互斥，避免：
+    /// - 并发启停交错，导致配置已禁用但监听仍在运行；
+    /// - 更新在删除之后才挂上监听，给已删除的配置留下幽灵监听；
+    /// - 两个新建请求同时通过路径冲突校验，插入一对冲突配置。
+    config_update_lock: Arc<tokio::sync::Mutex<()>>,
     /// 聚合器任务句柄（用于 shutdown 时取消）
     aggregator_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     /// 扫描缓存管理器（增量扫描用）
@@ -256,6 +264,7 @@ impl AutoBackupManager {
             client_pool: Arc::new(RwLock::new(None)),
             aggregated_rx,
             task_controllers: Arc::new(DashMap::new()),
+            config_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             aggregator_handle,
             scan_cache_manager,
             proxy_config: Arc::new(RwLock::new(None)),
@@ -598,6 +607,8 @@ impl AutoBackupManager {
 
     /// 创建备份配置
     pub async fn create_config(&self, request: CreateBackupConfigRequest) -> Result<BackupConfig> {
+        // 与更新、删除串行：冲突校验与插入之间不能插入另一个新建
+        let _update_guard = self.config_update_lock.lock().await;
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
 
@@ -689,103 +700,133 @@ impl AutoBackupManager {
     }
 
     /// 更新备份配置
+    ///
+    /// 保留配置 ID 及其全部备份记录（去重记录、快照、同步状态），不会清空基线：
+    /// - 目录、方向、加密、账号决定"同步的是谁"，创建后不可修改，需换目录请新建配置；
+    /// - 名称、启用状态随时可改；
+    /// - 监听/轮询/过滤/冲突策略等执行策略，只在没有备份执行（含排队、暂停）时才允许修改，
+    ///   避免执行中的任务前后混用新旧策略。
+    ///
+    /// 与创建、删除共用 `config_update_lock`，同一时刻只处理一个配置变更。
     pub async fn update_config(
         &self,
         id: &str,
-        request: UpdateBackupConfigRequest,
+        mut request: UpdateBackupConfigRequest,
     ) -> Result<BackupConfig> {
-        let mut config = self
-            .configs
-            .get_mut(id)
+        let _update_guard = self.config_update_lock.lock().await;
+
+        // 先在快照上完成全部校验：不持有 configs 的写锁去遍历 configs（同分片会自锁），
+        // 也不让 DashMap 的锁跨越 await
+        let current = self
+            .get_config(id)
             .ok_or_else(|| anyhow!("配置不存在: {}", id))?;
 
-        // 验证：encrypt_enabled 创建后不可修改（硬性约束 1.5.3）
-        // 注意：UpdateBackupConfigRequest 中不包含 encrypt_enabled 字段，这是设计决策
-        // 如果尝试通过其他方式修改，这里会拦截
-
-        // 🔥 冲突校验：防止更新后产生同方向重复任务或上传/下载闭环
-        // 构建更新后的路径用于校验
-        let updated_local_path = request
-            .local_path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.local_path.clone());
-        let updated_remote_path = request
-            .remote_path
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| config.remote_path.clone());
-
-        // 获取所有现存配置用于校验
-        let existing_configs: Vec<BackupConfig> = self.configs.iter().map(|c| c.clone()).collect();
-        let conflict_result = validate_for_update(
-            id,
-            &updated_local_path,
-            &updated_remote_path,
-            config.direction, // direction 不可更新，使用原值
-            &existing_configs,
-        );
-        if conflict_result.has_conflict {
-            return Err(anyhow!(conflict_result
-                .error_message
-                .unwrap_or_else(|| "配置冲突".to_string())));
-        }
-
-        // 停止旧的服务
-        self.stop_config_services(id).await?;
-
-        // 更新字段
-        if let Some(name) = request.name {
-            config.name = name;
-        }
-        if let Some(local_path) = request.local_path {
-            config.local_path = PathBuf::from(local_path);
-        }
-        if let Some(remote_path) = request.remote_path {
-            config.remote_path = remote_path;
-        }
-        if let Some(watch_config) = request.watch_config {
-            // 验证下载备份不能启用监听
-            if config.direction == BackupDirection::Download && watch_config.enabled {
-                return Err(anyhow!("下载备份不支持文件监听"));
+        if let Some(name) = request.name.as_mut() {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("配置名称不能为空"));
             }
-            config.watch_config = watch_config;
-        }
-        if let Some(poll_config) = request.poll_config {
-            config.poll_config = poll_config;
-        }
-        if let Some(filter_config) = request.filter_config {
-            config.filter_config = filter_config;
-        }
-        if let Some(enabled) = request.enabled {
-            config.enabled = enabled;
+            *name = trimmed.to_string();
         }
 
-        // 更新冲突策略字段
-        if let Some(upload_strategy) = request.upload_conflict_strategy {
-            config.upload_conflict_strategy = Some(upload_strategy);
+        // encrypt_enabled / direction / owner_uid 不在请求里，天然不可修改
+        if let Some(ref local_path) = request.local_path {
+            if normalize_local_path(Path::new(local_path))
+                != normalize_local_path(&current.local_path)
+            {
+                return Err(anyhow!(
+                    "备份配置创建后不可修改本地目录，如需更换目录请新建备份配置"
+                ));
+            }
         }
-        if let Some(download_strategy) = request.download_conflict_strategy {
-            config.download_conflict_strategy = Some(download_strategy);
+        if let Some(ref remote_path) = request.remote_path {
+            if normalize_remote_path(remote_path) != normalize_remote_path(&current.remote_path) {
+                return Err(anyhow!(
+                    "备份配置创建后不可修改网盘目录，如需更换目录请新建备份配置"
+                ));
+            }
         }
-        if let Some(sync_strategy) = request.sync_conflict_strategy {
-            config.sync_conflict_strategy = Some(sync_strategy);
-        }
-        if let Some(sync_init) = request.sync_init_mode {
-            config.sync_init_mode = Some(sync_init);
+        if current.direction == BackupDirection::Download
+            && request.watch_config.as_ref().is_some_and(|w| w.enabled)
+        {
+            return Err(anyhow!("下载备份不支持文件监听"));
         }
 
-        config.updated_at = Utc::now();
+        let watch_changed =
+            value_changed(request.watch_config.as_ref(), Some(&current.watch_config));
+        let enabled_changed = request.enabled.is_some_and(|e| e != current.enabled);
+        let changes_strategy = watch_changed
+            || value_changed(request.poll_config.as_ref(), Some(&current.poll_config))
+            || value_changed(request.filter_config.as_ref(), Some(&current.filter_config))
+            || value_changed(
+                request.upload_conflict_strategy.as_ref(),
+                current.upload_conflict_strategy.as_ref(),
+            )
+            || value_changed(
+                request.download_conflict_strategy.as_ref(),
+                current.download_conflict_strategy.as_ref(),
+            )
+            || value_changed(
+                request.sync_conflict_strategy.as_ref(),
+                current.sync_conflict_strategy.as_ref(),
+            )
+            || value_changed(
+                request.sync_init_mode.as_ref(),
+                current.sync_init_mode.as_ref(),
+            );
+        if changes_strategy && self.has_backup_in_progress(id) {
+            return Err(anyhow!(
+                "该配置有备份正在执行（或已暂停），请等待完成或先取消后再修改"
+            ));
+        }
 
-        let updated_config = config.clone();
-        drop(config);
+        // 🔥 冲突校验：防止产生同方向重复任务或上传/下载闭环。目录与方向不可修改，
+        // 只有"由禁用改为启用"才可能引入新冲突；禁用、改名、改策略不做校验，
+        // 否则历史遗留的冲突配置连禁用止损都做不到
+        if request.enabled == Some(true) && !current.enabled {
+            let existing_configs: Vec<BackupConfig> =
+                self.configs.iter().map(|c| c.clone()).collect();
+            let conflict_result = validate_for_update(
+                id,
+                &current.local_path,
+                &current.remote_path,
+                current.direction,
+                &existing_configs,
+            );
+            if conflict_result.has_conflict {
+                return Err(anyhow!(conflict_result
+                    .error_message
+                    .unwrap_or_else(|| "配置冲突".to_string())));
+            }
+        }
 
-        // 保存配置
-        self.save_configs().await?;
+        let updated_config = {
+            let mut config = self
+                .configs
+                .get_mut(id)
+                .ok_or_else(|| anyhow!("配置不存在: {}", id))?;
+            apply_config_update(&mut config, &request);
+            config.updated_at = Utc::now();
+            config.clone()
+        };
 
-        // 重新启动服务
-        if updated_config.enabled {
-            self.start_config_services(&updated_config).await?;
+        if let Err(e) = self.save_configs().await {
+            // 落盘失败：只回滚本次改动的字段（执行引擎可能同时写了 needs_full_sync 等字段，
+            // 不能整条覆盖），内存与磁盘保持一致；文件监听尚未改动，无需恢复
+            if let Some(mut config) = self.configs.get_mut(id) {
+                revert_config_update(&mut config, &request, &current);
+            }
+            return Err(e.context("保存备份配置失败"));
+        }
+
+        // 只在启用状态或监听配置变化时重建文件监听，避免改名/改策略时无谓中断监听
+        if enabled_changed || watch_changed {
+            if let Err(e) = self.stop_config_services(id).await {
+                tracing::warn!("停止配置 {} 的文件监听失败: {}", id, e);
+            }
+            if updated_config.enabled {
+                self.start_config_services(&updated_config).await?;
+            }
         }
 
         tracing::info!(
@@ -796,8 +837,32 @@ impl AutoBackupManager {
         Ok(updated_config)
     }
 
+    /// 配置是否有备份在执行：扫描/传输中，或有排队、暂停的任务（恢复后会继续按配置执行）
+    fn has_backup_in_progress(&self, config_id: &str) -> bool {
+        if self
+            .task_controllers
+            .get(config_id)
+            .is_some_and(|c| c.is_running())
+        {
+            return true;
+        }
+        self.tasks.iter().any(|t| {
+            t.config_id == config_id
+                && matches!(
+                    t.status,
+                    BackupTaskStatus::Queued
+                        | BackupTaskStatus::Preparing
+                        | BackupTaskStatus::Transferring
+                        | BackupTaskStatus::Paused
+                )
+        })
+    }
+
     /// 删除备份配置
     pub async fn delete_config(&self, id: &str) -> Result<()> {
+        // 与创建、更新串行：避免并发的更新在删除完成后重新挂上文件监听
+        let _update_guard = self.config_update_lock.lock().await;
+
         // 停止服务
         self.stop_config_services(id).await?;
 
@@ -11760,4 +11825,507 @@ pub struct ShutdownResult {
     pub cleaned_temp_files: usize,
     /// 错误信息（如果有）
     pub errors: Vec<String>,
+}
+
+/// 把更新请求中携带的字段写入配置（不含 updated_at）
+fn apply_config_update(config: &mut BackupConfig, request: &UpdateBackupConfigRequest) {
+    if let Some(ref name) = request.name {
+        config.name = name.clone();
+    }
+    if let Some(ref watch_config) = request.watch_config {
+        config.watch_config = watch_config.clone();
+    }
+    if let Some(ref poll_config) = request.poll_config {
+        config.poll_config = poll_config.clone();
+    }
+    if let Some(ref filter_config) = request.filter_config {
+        config.filter_config = filter_config.clone();
+    }
+    if let Some(enabled) = request.enabled {
+        config.enabled = enabled;
+    }
+    if let Some(strategy) = request.upload_conflict_strategy {
+        config.upload_conflict_strategy = Some(strategy);
+    }
+    if let Some(strategy) = request.download_conflict_strategy {
+        config.download_conflict_strategy = Some(strategy);
+    }
+    if let Some(strategy) = request.sync_conflict_strategy {
+        config.sync_conflict_strategy = Some(strategy);
+    }
+    if let Some(mode) = request.sync_init_mode {
+        config.sync_init_mode = Some(mode);
+    }
+}
+
+/// 撤销 [`apply_config_update`]：只把请求中携带的字段恢复为 `previous` 的值
+fn revert_config_update(
+    config: &mut BackupConfig,
+    request: &UpdateBackupConfigRequest,
+    previous: &BackupConfig,
+) {
+    if request.name.is_some() {
+        config.name = previous.name.clone();
+    }
+    if request.watch_config.is_some() {
+        config.watch_config = previous.watch_config.clone();
+    }
+    if request.poll_config.is_some() {
+        config.poll_config = previous.poll_config.clone();
+    }
+    if request.filter_config.is_some() {
+        config.filter_config = previous.filter_config.clone();
+    }
+    if request.enabled.is_some() {
+        config.enabled = previous.enabled;
+    }
+    if request.upload_conflict_strategy.is_some() {
+        config.upload_conflict_strategy = previous.upload_conflict_strategy;
+    }
+    if request.download_conflict_strategy.is_some() {
+        config.download_conflict_strategy = previous.download_conflict_strategy;
+    }
+    if request.sync_conflict_strategy.is_some() {
+        config.sync_conflict_strategy = previous.sync_conflict_strategy;
+    }
+    if request.sync_init_mode.is_some() {
+        config.sync_init_mode = previous.sync_init_mode;
+    }
+    config.updated_at = previous.updated_at;
+}
+
+/// 请求是否携带了与当前值不同的新值（策略类型未实现 PartialEq，按序列化结果比较）
+fn value_changed<T: serde::Serialize>(new: Option<&T>, current: Option<&T>) -> bool {
+    match new {
+        None => false,
+        Some(new) => {
+            serde_json::to_value(new).ok() != current.and_then(|c| serde_json::to_value(c).ok())
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_config_tests {
+    use super::*;
+    use crate::autobackup::config::{FilterConfig, PollConfig, WatchConfig};
+
+    async fn test_manager(dir: &std::path::Path) -> AutoBackupManager {
+        let db = dir.join("backup.db");
+        let record_manager = Arc::new(BackupRecordManager::new(&db).unwrap());
+        let snapshot_manager = Arc::new(crate::encryption::snapshot::SnapshotManager::new(
+            record_manager.clone(),
+        ));
+        AutoBackupManager::new(
+            dir.join("autobackup.json"),
+            db,
+            dir.join("tmp"),
+            record_manager,
+            snapshot_manager,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn test_config(id: &str, direction: BackupDirection) -> BackupConfig {
+        BackupConfig {
+            id: id.to_string(),
+            name: "cfg".to_string(),
+            local_path: PathBuf::from(format!("/local/{id}")),
+            remote_path: format!("/remote/{id}"),
+            direction,
+            watch_config: WatchConfig::default(),
+            poll_config: PollConfig::default(),
+            filter_config: FilterConfig::default(),
+            encrypt_enabled: false,
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            needs_full_sync: false,
+            owner_uid: Some(1),
+            enabled: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn empty_request() -> UpdateBackupConfigRequest {
+        UpdateBackupConfigRequest {
+            name: None,
+            local_path: None,
+            remote_path: None,
+            watch_config: None,
+            poll_config: None,
+            filter_config: None,
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            enabled: None,
+        }
+    }
+
+    fn task_with_status(config_id: &str, status: BackupTaskStatus) -> BackupTask {
+        BackupTask {
+            id: format!("task-{config_id}"),
+            config_id: config_id.to_string(),
+            status,
+            sub_phase: None,
+            trigger_type: TriggerType::Manual,
+            pending_files: Vec::new(),
+            completed_count: 0,
+            failed_count: 0,
+            skipped_count: 0,
+            total_count: 0,
+            transferred_bytes: 0,
+            total_bytes: 0,
+            scan_progress: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            pending_upload_task_ids: Default::default(),
+            pending_download_task_ids: Default::default(),
+            transfer_task_map: Default::default(),
+            owner_uid: None,
+        }
+    }
+
+    /// 在独立线程里跑 update_config：DashMap 自锁会同步阻塞线程本身，
+    /// 同线程上的 tokio timeout 根本没机会触发，只能靠外部线程计时
+    async fn update_with_deadline(
+        manager: Arc<AutoBackupManager>,
+        id: &'static str,
+        request: UpdateBackupConfigRequest,
+    ) -> Result<BackupConfig> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.block_on(manager.update_config(id, request)));
+        });
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("update_config 卡死（持有 configs 写锁时又遍历 configs）")
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 启用/禁用开关和改名都走 update_config：不能因持有写锁再遍历同一张表而卡死
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_update_config_does_not_deadlock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(test_manager(dir.path()).await);
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+
+        let mut request = empty_request();
+        request.name = Some("renamed".into());
+        request.enabled = Some(true);
+        let updated = update_with_deadline(manager.clone(), "c1", request)
+            .await
+            .unwrap();
+        assert_eq!(updated.id, "c1");
+        assert_eq!(updated.name, "renamed");
+        assert!(updated.enabled);
+    }
+
+    /// 目录决定同步身份：创建后不可修改（仅写法不同的等价目录放行），被拒请求不得部分生效
+    #[tokio::test]
+    async fn test_update_config_rejects_directory_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path()).await;
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+
+        let mut request = empty_request();
+        request.remote_path = Some("/remote/other".into());
+        request.name = Some("renamed".into());
+        assert!(manager.update_config("c1", request).await.is_err());
+
+        let mut request = empty_request();
+        request.local_path = Some("/local/other".into());
+        assert!(manager.update_config("c1", request).await.is_err());
+
+        let cfg = manager.get_config("c1").unwrap();
+        assert_eq!(cfg.name, "cfg", "被拒绝的请求不得部分生效");
+        assert_eq!(cfg.remote_path, "/remote/c1");
+        assert_eq!(cfg.local_path, PathBuf::from("/local/c1"));
+
+        let mut request = empty_request();
+        request.remote_path = Some("/remote/c1/".into());
+        request.local_path = Some("/local/c1".into());
+        request.name = Some("renamed".into());
+        let updated = manager.update_config("c1", request).await.unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.remote_path, "/remote/c1");
+    }
+
+    /// 备份执行中（含排队、暂停）不允许改执行策略，避免新旧策略混用；
+    /// 改名、启停与原样回传的策略字段不受影响
+    #[tokio::test]
+    async fn test_update_config_rejects_strategy_change_while_backup_in_progress() {
+        use crate::uploader::UploadConflictStrategy;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path()).await;
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+
+        for status in [
+            BackupTaskStatus::Queued,
+            BackupTaskStatus::Preparing,
+            BackupTaskStatus::Transferring,
+            BackupTaskStatus::Paused,
+        ] {
+            manager
+                .tasks
+                .insert("t1".into(), task_with_status("c1", status));
+            let mut request = empty_request();
+            request.upload_conflict_strategy = Some(UploadConflictStrategy::Overwrite);
+            let err = manager.update_config("c1", request).await.unwrap_err();
+            assert!(err.to_string().contains("正在执行"), "{status:?}: {err}");
+        }
+        assert_eq!(
+            manager.get_config("c1").unwrap().upload_conflict_strategy,
+            None
+        );
+
+        // 编辑框整表提交时，未改动的策略字段原样回传，不应被拦截
+        let current = manager.get_config("c1").unwrap();
+        let mut request = empty_request();
+        request.name = Some("renamed".into());
+        request.enabled = Some(false);
+        request.watch_config = Some(current.watch_config.clone());
+        request.filter_config = Some(current.filter_config.clone());
+        let updated = manager.update_config("c1", request).await.unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert!(!updated.enabled);
+
+        // 任务结束后可以修改策略，配置 ID 不变、不新建配置
+        manager.tasks.insert(
+            "t1".into(),
+            task_with_status("c1", BackupTaskStatus::Completed),
+        );
+        let mut request = empty_request();
+        request.upload_conflict_strategy = Some(UploadConflictStrategy::AutoRename);
+        let updated = manager.update_config("c1", request).await.unwrap();
+        assert_eq!(updated.id, "c1");
+        assert_eq!(
+            updated.upload_conflict_strategy,
+            Some(UploadConflictStrategy::AutoRename)
+        );
+        assert_eq!(manager.configs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_config_rejects_watch_for_download() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path()).await;
+        manager
+            .configs
+            .insert("d1".into(), test_config("d1", BackupDirection::Download));
+        let mut request = empty_request();
+        request.watch_config = Some(WatchConfig {
+            enabled: true,
+            ..WatchConfig::default()
+        });
+        assert!(manager.update_config("d1", request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_config_rejects_blank_name_and_trims() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path()).await;
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+
+        let mut request = empty_request();
+        request.name = Some("   ".into());
+        assert!(manager.update_config("c1", request).await.is_err());
+        assert_eq!(manager.get_config("c1").unwrap().name, "cfg");
+
+        let mut request = empty_request();
+        request.name = Some("  文档  ".into());
+        let updated = manager.update_config("c1", request).await.unwrap();
+        assert_eq!(updated.name, "文档");
+    }
+
+    /// 历史遗留的冲突配置：禁用（止损）、改名必须放行；只有重新启用才做冲突校验
+    #[tokio::test]
+    async fn test_update_config_conflict_check_only_when_enabling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(dir.path()).await;
+        let mut a = test_config("a", BackupDirection::Upload);
+        a.enabled = true;
+        let mut b = test_config("b", BackupDirection::Upload);
+        b.local_path = a.local_path.clone();
+        b.remote_path = a.remote_path.clone();
+        b.enabled = true;
+        manager.configs.insert("a".into(), a);
+        manager.configs.insert("b".into(), b);
+
+        let mut request = empty_request();
+        request.name = Some("renamed".into());
+        manager.update_config("b", request).await.unwrap();
+
+        let mut request = empty_request();
+        request.enabled = Some(false);
+        let disabled = manager.update_config("b", request).await.unwrap();
+        assert!(!disabled.enabled, "冲突配置必须能被禁用");
+
+        let mut request = empty_request();
+        request.enabled = Some(true);
+        assert!(manager.update_config("b", request).await.is_err());
+        assert!(!manager.get_config("b").unwrap().enabled);
+    }
+
+    /// 落盘失败：内存中的本次改动回滚，其余字段（如执行引擎写入的 needs_full_sync）不受影响
+    #[tokio::test]
+    async fn test_update_config_rolls_back_on_save_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manager = test_manager(dir.path()).await;
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+        // 配置文件路径指向一个目录：原子写入必然失败
+        let blocker = dir.path().join("blocker");
+        std::fs::create_dir_all(&blocker).unwrap();
+        manager.config_path = blocker;
+
+        // 模拟执行引擎在更新期间写入的字段
+        manager.configs.get_mut("c1").unwrap().needs_full_sync = true;
+
+        let mut request = empty_request();
+        request.name = Some("renamed".into());
+        request.upload_conflict_strategy = Some(crate::uploader::UploadConflictStrategy::Overwrite);
+        assert!(manager.update_config("c1", request).await.is_err());
+
+        let cfg = manager.get_config("c1").unwrap();
+        assert_eq!(cfg.name, "cfg");
+        assert_eq!(cfg.upload_conflict_strategy, None);
+        assert!(cfg.needs_full_sync);
+    }
+
+    fn create_request(local: &str, remote: &str) -> CreateBackupConfigRequest {
+        CreateBackupConfigRequest {
+            name: "new".into(),
+            local_path: local.into(),
+            remote_path: remote.into(),
+            direction: BackupDirection::Upload,
+            watch_config: WatchConfig {
+                enabled: false,
+                ..WatchConfig::default()
+            },
+            poll_config: PollConfig::default(),
+            filter_config: FilterConfig::default(),
+            encrypt_enabled: false,
+            upload_conflict_strategy: None,
+            download_conflict_strategy: None,
+            sync_conflict_strategy: None,
+            sync_init_mode: None,
+            uid: Some(1),
+        }
+    }
+
+    /// 两个冲突的新建请求并发：只能有一个通过冲突校验
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_conflicting_creates_only_one_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(test_manager(dir.path()).await);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .create_config(create_request("/local/same", "/remote/same"))
+                        .await
+                })
+            })
+            .collect();
+        let mut ok = 0;
+        for h in handles {
+            if h.await.unwrap().is_ok() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 1);
+        assert_eq!(manager.configs.len(), 1);
+    }
+
+    /// 删除与启用并发：删除完成后配置不得复活，也不卡死
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_delete_and_enable_leaves_config_deleted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(test_manager(dir.path()).await);
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+
+        let enable = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                let mut request = empty_request();
+                request.enabled = Some(true);
+                manager.update_config("c1", request).await
+            }
+        });
+        let delete = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.delete_config("c1").await }
+        });
+        let (enable, delete) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            (enable.await.unwrap(), delete.await.unwrap())
+        })
+        .await
+        .expect("并发删除与启用卡死");
+        delete.unwrap();
+        // 启用要么先完成，要么因配置已删除而失败；无论哪种，最终配置都已删除
+        let _ = enable;
+        assert!(manager.get_config("c1").is_none());
+        let saved: Vec<BackupConfig> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("autobackup.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    /// 并发启停：更新串行执行，最终内存状态与落盘状态一致
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_update_config_concurrent_toggles_stay_consistent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(test_manager(dir.path()).await);
+        manager
+            .configs
+            .insert("c1".into(), test_config("c1", BackupDirection::Upload));
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    let mut request = empty_request();
+                    request.enabled = Some(i % 2 == 0);
+                    manager.update_config("c1", request).await
+                })
+            })
+            .collect();
+        for h in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(10), h)
+                .await
+                .expect("并发更新卡死")
+                .unwrap()
+                .unwrap();
+        }
+
+        let saved: Vec<BackupConfig> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("autobackup.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved[0].enabled, manager.get_config("c1").unwrap().enabled);
+    }
 }

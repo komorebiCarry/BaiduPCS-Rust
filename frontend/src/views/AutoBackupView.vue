@@ -5,7 +5,7 @@ import {
   Plus, VideoPlay, VideoPause, Delete, Key,
   Upload, Download, Sort,
   Warning, CircleCheck, Loading, Refresh,
-  FolderOpened, Clock, InfoFilled
+  FolderOpened, Clock, InfoFilled, Edit
 } from '@element-plus/icons-vue'
 import {
   listBackupConfigs, createBackupConfig, updateBackupConfig, deleteBackupConfig,
@@ -14,7 +14,7 @@ import {
   getManagerStatus,
   listFileTasks,
   type BackupConfig, type BackupTask, type EncryptionStatus, type ManagerStatus,
-  type CreateBackupConfigRequest, type BackupFileTask,
+  type CreateBackupConfigRequest, type UpdateBackupConfigRequest, type BackupFileTask,
   type SyncConflictStrategy, type SyncInitMode
 } from '@/api/autobackup'
 import { getConfig } from '@/api/config'
@@ -254,6 +254,101 @@ async function handleToggleConfig(config: BackupConfig) {
     }
   } catch (e: any) {
     error.value = e.message || '更新配置失败'
+  }
+}
+
+// ==================== 编辑配置 ====================
+// 只能改名称和冲突策略：目录、方向、加密、归属账号决定同步身份，创建后不可修改；
+// 保留配置 ID 与全部备份记录，不会像删除重建那样丢失基线
+
+const showEditDialog = ref(false)
+const editingConfig = ref<BackupConfig | null>(null)
+const savingEdit = ref(false)
+const editForm = ref<{
+  name: string
+  upload_conflict_strategy?: UploadConflictStrategy
+  download_conflict_strategy?: DownloadConflictStrategy
+  sync_conflict_strategy?: SyncConflictStrategy
+}>({ name: '' })
+
+const directionLabels: Record<string, string> = {
+  upload: '上传备份（本地 → 云端）',
+  download: '下载备份（云端 → 本地）',
+  sync: '双向同步（本地 ⇄ 云端）',
+}
+const syncInitModeLabels: Record<string, string> = {
+  auto_detect: '自动检测',
+  adopt_both_sides: '采纳现状',
+}
+
+// 策略字段为空时后端实际生效的兜底值（与 BackupConfig::effective_*_strategy 一致），
+// 并不会跟随系统设置
+function effectiveUploadStrategy(config: BackupConfig): UploadConflictStrategy {
+  return config.upload_conflict_strategy ?? 'smart_dedup'
+}
+function effectiveDownloadStrategy(config: BackupConfig): DownloadConflictStrategy {
+  return config.download_conflict_strategy ?? 'overwrite'
+}
+function effectiveSyncStrategy(config: BackupConfig): SyncConflictStrategy {
+  return config.sync_conflict_strategy ?? 'newer_wins'
+}
+
+function handleOpenEditDialog(config: BackupConfig) {
+  editingConfig.value = config
+  editForm.value = {
+    name: config.name,
+    upload_conflict_strategy: effectiveUploadStrategy(config),
+    download_conflict_strategy: effectiveDownloadStrategy(config),
+    sync_conflict_strategy: effectiveSyncStrategy(config),
+  }
+  showEditDialog.value = true
+}
+
+async function handleSaveEdit() {
+  const config = editingConfig.value
+  if (!config) return
+  const form = editForm.value
+  const name = form.name.trim()
+  if (!name) {
+    ElMessage.warning('配置名称不能为空')
+    return
+  }
+
+  // 只提交改动过的字段：与生效值（而非可能为空的原始字段）比对，未改动的策略不提交，
+  // 这样备份执行中只改名称不会被后端的策略修改拦截
+  const payload: UpdateBackupConfigRequest = {}
+  if (name !== config.name) payload.name = name
+  if (config.direction === 'upload' && form.upload_conflict_strategy
+      && form.upload_conflict_strategy !== effectiveUploadStrategy(config)) {
+    payload.upload_conflict_strategy = form.upload_conflict_strategy
+  }
+  if (config.direction === 'download' && form.download_conflict_strategy
+      && form.download_conflict_strategy !== effectiveDownloadStrategy(config)) {
+    payload.download_conflict_strategy = form.download_conflict_strategy
+  }
+  if (config.direction === 'sync' && form.sync_conflict_strategy
+      && form.sync_conflict_strategy !== effectiveSyncStrategy(config)) {
+    payload.sync_conflict_strategy = form.sync_conflict_strategy
+  }
+  if (Object.keys(payload).length === 0) {
+    showEditDialog.value = false
+    return
+  }
+
+  savingEdit.value = true
+  try {
+    const updated = await updateBackupConfig(config.id, payload)
+    const index = configs.value.findIndex(c => c.id === config.id)
+    if (index !== -1) {
+      configs.value[index] = updated
+    }
+    showEditDialog.value = false
+    ElMessage.success('配置已保存')
+  } catch (e: any) {
+    // 保持对话框打开，例如"有备份正在执行"时可等待完成后重试
+    ElMessage.error(e.message || '保存配置失败')
+  } finally {
+    savingEdit.value = false
   }
 }
 
@@ -1030,6 +1125,10 @@ watch(hasActiveTask, () => {
                 <el-icon v-else><VideoPlay /></el-icon>
                 {{ config.enabled ? '禁用' : '启用' }}
               </el-button>
+              <el-button size="small" @click.stop="handleOpenEditDialog(config)">
+                <el-icon><Edit /></el-icon>
+                编辑
+              </el-button>
               <el-button size="small" type="danger" @click.stop="handleDeleteConfig(config.id)">
                 <el-icon><Delete /></el-icon>
                 删除
@@ -1352,6 +1451,69 @@ watch(hasActiveTask, () => {
       <template #footer>
         <el-button @click="showCreateDialog = false">取消</el-button>
         <el-button type="primary" @click="handleCreateConfig">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 编辑配置对话框 -->
+    <el-dialog v-model="showEditDialog" title="编辑备份配置" width="500px" :close-on-click-modal="false">
+      <el-form v-if="editingConfig" label-position="top" @submit.prevent>
+        <el-form-item label="配置名称">
+          <el-input v-model="editForm.name" maxlength="100" />
+        </el-form-item>
+        <el-form-item label="本地路径">
+          <el-input :model-value="editingConfig.local_path" disabled />
+        </el-form-item>
+        <el-form-item label="远程路径（百度网盘）">
+          <el-input :model-value="editingConfig.remote_path" disabled />
+        </el-form-item>
+        <el-form-item label="备份方向">
+          <el-input :model-value="directionLabels[editingConfig.direction] || editingConfig.direction" disabled />
+        </el-form-item>
+
+        <el-form-item v-if="editingConfig.direction === 'upload'" label="上传冲突策略">
+          <el-select v-model="editForm.upload_conflict_strategy" style="width: 100%">
+            <el-option value="smart_dedup" label="智能去重" />
+            <el-option value="auto_rename" label="自动重命名" />
+            <el-option value="overwrite" label="覆盖（危险操作）" />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="editingConfig.direction === 'download'" label="下载冲突策略">
+          <el-select v-model="editForm.download_conflict_strategy" style="width: 100%">
+            <el-option value="overwrite" label="覆盖" />
+            <el-option value="skip" label="跳过" />
+            <el-option value="auto_rename" label="自动重命名" />
+          </el-select>
+        </el-form-item>
+        <template v-if="editingConfig.direction === 'sync'">
+          <el-form-item label="同步冲突策略">
+            <el-select v-model="editForm.sync_conflict_strategy" style="width: 100%">
+              <el-option value="newer_wins" label="新版本优先" />
+              <el-option value="local_wins" label="本地优先" />
+              <el-option value="remote_wins" label="云端优先" />
+              <el-option value="skip" label="跳过冲突" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="首次同步模式">
+            <el-input
+                :model-value="syncInitModeLabels[editingConfig.sync_init_mode || 'auto_detect']"
+                disabled
+            />
+          </el-form-item>
+        </template>
+        <el-form-item v-if="editingConfig.direction === 'upload'" label="加密">
+          <el-input :model-value="editingConfig.encrypt_enabled ? '已启用' : '未启用'" disabled />
+        </el-form-item>
+
+        <el-alert type="info" :closable="false" show-icon>
+          <template #title>
+            目录、备份方向、加密与归属账号在创建后不可修改，如需更换请新建备份配置。
+            修改冲突策略会保留已有备份记录，有备份正在执行或暂停时需等待完成或先取消。
+          </template>
+        </el-alert>
+      </el-form>
+      <template #footer>
+        <el-button @click="showEditDialog = false">取消</el-button>
+        <el-button type="primary" :loading="savingEdit" @click="handleSaveEdit">保存</el-button>
       </template>
     </el-dialog>
 
