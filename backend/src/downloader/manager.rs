@@ -7414,6 +7414,15 @@ impl DownloadManager {
         info!("下载管理器已设置文件夹进度通知发送器");
     }
 
+    /// 测试用：直接把任务放进任务表（不启动、不持久化）
+    #[cfg(test)]
+    pub(crate) async fn insert_task_for_test(&self, task: DownloadTask) {
+        self.tasks
+            .write()
+            .await
+            .insert(task.id.clone(), Arc::new(Mutex::new(task)));
+    }
+
     /// 根据 group_id 获取任务列表
     pub async fn get_tasks_by_group(&self, group_id: &str) -> Vec<DownloadTask> {
         let tasks = self.tasks.read().await;
