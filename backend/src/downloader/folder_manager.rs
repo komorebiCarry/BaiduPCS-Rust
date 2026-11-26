@@ -6026,10 +6026,7 @@ impl FolderDownloadManager {
                     tokio::fs::rename(&src_path, &dst_path).await?;
                 }
             } else {
-                // 移动文件（如果目标存在则覆盖）
-                if dst_path.exists() {
-                    tokio::fs::remove_file(&dst_path).await?;
-                }
+                // 移动文件（目标存在时由 rename 原子覆盖，不先删目标，失败时目标保持完好）
                 tokio::fs::rename(&src_path, &dst_path).await?;
             }
         }

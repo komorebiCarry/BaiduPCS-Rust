@@ -62,6 +62,58 @@ const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 /// 避免未完成的文件被文件监听器误触发上传
 pub const DOWNLOADING_EXTENSION: &str = ".downloading";
 
+/// 普通文件的大小；不存在或不是普通文件时为 None
+fn regular_file_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+}
+
+/// 任务专属下载临时文件：`<目标>.<任务标识>.downloading`
+///
+/// 与目标同目录（同一文件系统，保证完成时 rename 原子替换），并带任务标识，
+/// 删除任务时只清理能确认归属于本任务的临时文件。
+///
+/// 文件名超过 255 字节（常见文件系统的单个文件名上限）时截短原文件名部分，
+/// 结果仍由 (目标路径, 任务 ID) 唯一确定。
+pub fn build_download_temp_path(final_path: &Path, task_id: &str) -> PathBuf {
+    const MAX_FILE_NAME_BYTES: usize = 255;
+
+    let tag: String = task_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let tag = if tag.is_empty() {
+        "task".to_string()
+    } else {
+        tag
+    };
+    let suffix = format!(".{}{}", tag, DOWNLOADING_EXTENSION);
+    let name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let budget = MAX_FILE_NAME_BYTES.saturating_sub(suffix.len());
+    let mut end = name.len().min(budget);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    final_path.with_file_name(format!("{}{}", &name[..end], suffix))
+}
+
+/// 旧版本的下载临时文件：`<目标>.downloading`
+///
+/// 旧版本会把已存在的正式文件直接改名成这个路径再覆盖写入，因此它可能是
+/// 用户原文件的副本，归属无法确认，除断点续传接管外一律不删除。
+pub fn build_legacy_download_temp_path(final_path: &Path) -> PathBuf {
+    let mut temp = final_path.as_os_str().to_os_string();
+    temp.push(DOWNLOADING_EXTENSION);
+    PathBuf::from(temp)
+}
+
 /// 🔥 HTTP/2 降级冷却时长（秒）
 ///
 /// 一旦累计满足降级条件（连续 3 次零字节失败，不要求是 HTTP/2 frame error），
@@ -1539,8 +1591,9 @@ impl DownloadEngine {
         u64,                          // 分片大小
         Arc<Mutex<ChunkManager>>,     // 分片管理器
         Arc<Mutex<SpeedCalculator>>,  // 速度计算器
+        bool,                         // 临时文件是否沿用已有数据（false 时须丢弃断点进度）
     )> {
-        let (fs_id, remote_path, local_path, total_size, owner_uid) = {
+        let (fs_id, remote_path, local_path, total_size, owner_uid, task_id, has_resume_progress) = {
             let t = task.lock().await;
             if cancellation_token.is_cancelled() || t.deletion_token.is_cancelled() {
                 anyhow::bail!("任务已被取消");
@@ -1551,6 +1604,8 @@ impl DownloadEngine {
                 t.local_path.clone(),
                 t.total_size,
                 t.owner_uid,
+                t.id.clone(),
+                t.downloaded_size > 0,
             )
         };
 
@@ -1764,8 +1819,14 @@ impl DownloadEngine {
             _ => (total_size, chunk_size),
         };
 
-        let output_path = self
-            .prepare_download_output_path(&local_path, total_size, &cancellation_token)
+        let (output_path, output_reused) = self
+            .prepare_download_output_path(
+                &local_path,
+                &task_id,
+                total_size,
+                has_resume_progress,
+                &cancellation_token,
+            )
             .await
             .context("准备本地文件失败")?;
 
@@ -1783,6 +1844,15 @@ impl DownloadEngine {
             if cancellation_token.is_cancelled() || t.deletion_token.is_cancelled() {
                 anyhow::bail!("任务已被取消");
             }
+            if !output_reused && t.downloaded_size > 0 {
+                warn!(
+                    "任务 {} 的下载临时文件不可续传，断点进度作废，从头下载: {:?}",
+                    t.id, output_path
+                );
+                t.downloaded_size = 0;
+            }
+            // 新一轮下载写入新的临时文件，上一轮的收尾标记作废
+            t.output_finalized = false;
             t.mark_downloading();
         }
 
@@ -1800,6 +1870,7 @@ impl DownloadEngine {
             chunk_size,
             chunk_manager,
             speed_calc,
+            output_reused,
         ))
     }
 
@@ -2053,8 +2124,16 @@ impl DownloadEngine {
             10, // 10分钟刷新间隔
         );
 
-        let temp_path = self
-            .prepare_download_output_path(local_path, total_size, &cancellation_token)
+        // 独立下载模式不恢复断点进度，临时文件即使存在也会被完整重写
+        let task_id = { task.lock().await.id.clone() };
+        let (temp_path, _) = self
+            .prepare_download_output_path(
+                local_path,
+                &task_id,
+                total_size,
+                false,
+                &cancellation_token,
+            )
             .await
             .context("准备本地文件失败")?;
 
@@ -3098,13 +3177,24 @@ impl DownloadEngine {
         Ok(())
     }
 
+    /// 准备任务专属的下载临时文件
+    ///
+    /// 正式文件 `final_path` 在下载期间绝不改名、截断或删除：新内容只写入
+    /// 与目标同目录的任务专属临时文件，校验通过后再由收尾逻辑原子 rename 替换。
+    ///
+    /// `has_resume_progress` 表示任务带着断点进度进来。返回值第二项为
+    /// `output_reused`：临时文件是否沿用了已有数据。为 false 时调用方必须丢弃
+    /// 断点进度，否则已完成分片会对应到全新（全零）的文件区域。
     async fn prepare_download_output_path(
         &self,
         final_path: &Path,
+        task_id: &str,
         size: u64,
+        has_resume_progress: bool,
         cancellation_token: &CancellationToken,
-    ) -> Result<PathBuf> {
-        let temp_path = Self::build_download_temp_path(final_path);
+    ) -> Result<(PathBuf, bool)> {
+        let temp_path = build_download_temp_path(final_path, task_id);
+        let output_reused;
 
         {
             let _guard = self.fs_lock.lock().await;
@@ -3114,14 +3204,42 @@ impl DownloadEngine {
                 anyhow::bail!("任务已被取消");
             }
 
-            if !temp_path.exists() && final_path.exists() {
-                tokio::fs::rename(final_path, &temp_path)
-                    .await
-                    .context("迁移旧格式下载文件失败")?;
-                info!(
-                    "检测到旧格式下载文件，已迁移为临时文件: {:?} -> {:?}",
-                    final_path, temp_path
-                );
+            // prepare_file 首次创建临时文件时就 set_len(size)，完好的临时文件大小必然等于
+            // size；大小不符说明被截断/改动过，沿用断点进度会让已完成分片落在补零区域
+            let temp_len = regular_file_len(&temp_path);
+            if temp_len == Some(size) {
+                output_reused = true;
+            } else {
+                if let Some(len) = temp_len {
+                    warn!(
+                        "下载临时文件大小异常（{} bytes，期望 {} bytes），断点进度作废: {:?}",
+                        len, size, temp_path
+                    );
+                }
+                let legacy_path = build_legacy_download_temp_path(final_path);
+                let legacy_len = regular_file_len(&legacy_path);
+                if temp_len.is_none() && has_resume_progress && legacy_len == Some(size) {
+                    // 旧版本按 `<目标>.downloading` 命名临时文件；任务带断点进度时
+                    // 这份文件承载着它的已下载数据，接管（改名，不复制不删除）以续传。
+                    tokio::fs::rename(&legacy_path, &temp_path)
+                        .await
+                        .context("接管旧版下载临时文件失败")?;
+                    warn!(
+                        "接管旧版下载临时文件以续传: {:?} -> {:?}",
+                        legacy_path, temp_path
+                    );
+                    output_reused = true;
+                } else {
+                    if legacy_len.is_some() {
+                        // 无法确认归属（可能是旧版本把原文件改名而来），或大小不符无法续传，
+                        // 保持原样
+                        warn!(
+                            "检测到旧版遗留的下载临时文件，无法接管续传，保持不动: {:?}",
+                            legacy_path
+                        );
+                    }
+                    output_reused = false;
+                }
             }
         }
 
@@ -3129,13 +3247,7 @@ impl DownloadEngine {
             .await
             .context("准备下载输出文件失败")?;
 
-        Ok(temp_path)
-    }
-
-    fn build_download_temp_path(final_path: &Path) -> PathBuf {
-        let mut temp = final_path.as_os_str().to_os_string();
-        temp.push(DOWNLOADING_EXTENSION);
-        PathBuf::from(temp)
+        Ok((temp_path, output_reused))
     }
 
     /// 校验文件大小
@@ -4227,5 +4339,196 @@ mod tests {
         assert!(is_server_throttled_error(&e2));
         let e3 = anyhow::anyhow!("network timeout");
         assert!(!is_server_throttled_error(&e3));
+    }
+    // ==================== 覆盖下载：旧文件安全 ====================
+
+    fn overwrite_test_engine() -> DownloadEngine {
+        DownloadEngine::new(create_mock_user_auth())
+    }
+
+    /// 长文件名：临时文件名不得超过 255 字节，且仍按任务区分
+    #[test]
+    fn test_temp_path_truncates_long_file_name() {
+        let name = format!("{}.mkv", "长".repeat(80)); // 244 字节
+        let final_path = Path::new("/data").join(&name);
+        let a = build_download_temp_path(&final_path, "0f1e2d3c-aaaa");
+        let b = build_download_temp_path(&final_path, "9a8b7c6d-aaaa");
+        let a_name = a.file_name().unwrap().to_str().unwrap();
+        assert!(a_name.len() <= 255, "len={}", a_name.len());
+        assert!(a_name.ends_with(".0f1e2d3c.downloading"));
+        assert_ne!(a, b);
+        assert_eq!(a, build_download_temp_path(&final_path, "0f1e2d3c-aaaa"));
+        assert_eq!(a.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_temp_path_is_task_scoped_in_same_dir() {
+        let final_path = Path::new("/data/movie.mkv");
+        let a = build_download_temp_path(final_path, "0f1e2d3c-aaaa-bbbb");
+        let b = build_download_temp_path(final_path, "9a8b7c6d-aaaa-bbbb");
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), final_path.parent());
+        assert!(a.to_string_lossy().ends_with(DOWNLOADING_EXTENSION));
+        assert_ne!(a, build_legacy_download_temp_path(final_path));
+    }
+
+    /// 远端文件更小：准备阶段不得截断、改名或删除原文件
+    #[tokio::test]
+    async fn test_prepare_output_keeps_existing_final_file_intact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("big.bin");
+        let original = vec![7u8; 4096];
+        tokio::fs::write(&final_path, &original).await.unwrap();
+
+        let engine = overwrite_test_engine();
+        let (temp, reused) = engine
+            .prepare_download_output_path(
+                &final_path,
+                "task-1",
+                16,
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(temp, final_path);
+        assert!(!reused);
+        assert_eq!(tokio::fs::metadata(&temp).await.unwrap().len(), 16);
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), original);
+        assert!(!build_legacy_download_temp_path(&final_path).exists());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_output_reuses_own_temp_for_resume() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("resume.bin");
+        let temp = build_download_temp_path(&final_path, "task-2");
+        tokio::fs::write(&temp, b"partial-data").await.unwrap();
+
+        let engine = overwrite_test_engine();
+        let (path, reused) = engine
+            .prepare_download_output_path(
+                &final_path,
+                "task-2",
+                12,
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(path, temp);
+        assert!(reused);
+        assert_eq!(tokio::fs::read(&temp).await.unwrap(), b"partial-data");
+    }
+
+    /// 旧版遗留临时文件归属无法确认（可能是原文件改名而来）：无断点进度时不动它
+    #[tokio::test]
+    async fn test_prepare_output_leaves_unowned_legacy_temp_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("legacy.bin");
+        let legacy = build_legacy_download_temp_path(&final_path);
+        tokio::fs::write(&legacy, b"maybe-user-original")
+            .await
+            .unwrap();
+
+        let engine = overwrite_test_engine();
+        let (path, reused) = engine
+            .prepare_download_output_path(
+                &final_path,
+                "task-3",
+                4,
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(path, legacy);
+        assert!(!reused);
+        assert_eq!(
+            tokio::fs::read(&legacy).await.unwrap(),
+            b"maybe-user-original"
+        );
+    }
+
+    /// 升级前已在下载的任务带断点进度：接管旧版临时文件续传
+    #[tokio::test]
+    async fn test_prepare_output_adopts_legacy_temp_with_resume_progress() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("upgrade.bin");
+        tokio::fs::write(&final_path, b"old-complete")
+            .await
+            .unwrap();
+        let legacy = build_legacy_download_temp_path(&final_path);
+        tokio::fs::write(&legacy, b"progress").await.unwrap();
+
+        let engine = overwrite_test_engine();
+        let (path, reused) = engine
+            .prepare_download_output_path(&final_path, "task-4", 8, true, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(reused);
+        assert_eq!(path, build_download_temp_path(&final_path, "task-4"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"progress");
+        assert!(!legacy.exists());
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"old-complete");
+    }
+
+    /// 临时文件被截断（大小与期望不符）：不能沿用，否则断点里的已完成分片会落在补零区
+    #[tokio::test]
+    async fn test_prepare_output_rejects_truncated_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("truncated.bin");
+        let temp = build_download_temp_path(&final_path, "task-6");
+        tokio::fs::write(&temp, b"").await.unwrap();
+
+        let engine = overwrite_test_engine();
+        let (path, reused) = engine
+            .prepare_download_output_path(&final_path, "task-6", 8, true, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(path, temp);
+        assert!(!reused, "大小不符的临时文件不得视为可续传");
+        assert_eq!(tokio::fs::metadata(&temp).await.unwrap().len(), 8);
+    }
+
+    /// 旧版临时文件大小不符：不接管（保持原样），按从头下载处理
+    #[tokio::test]
+    async fn test_prepare_output_does_not_adopt_truncated_legacy_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("legacy-short.bin");
+        let legacy = build_legacy_download_temp_path(&final_path);
+        tokio::fs::write(&legacy, b"shrt").await.unwrap();
+
+        let engine = overwrite_test_engine();
+        let (path, reused) = engine
+            .prepare_download_output_path(&final_path, "task-7", 8, true, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(!reused);
+        assert_eq!(path, build_download_temp_path(&final_path, "task-7"));
+        assert_eq!(tokio::fs::read(&legacy).await.unwrap(), b"shrt");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_output_cancelled_keeps_final_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("cancel.bin");
+        tokio::fs::write(&final_path, b"keep-me").await.unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let engine = overwrite_test_engine();
+        assert!(engine
+            .prepare_download_output_path(&final_path, "task-5", 2, false, &token)
+            .await
+            .is_err());
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"keep-me");
+        assert!(!build_download_temp_path(&final_path, "task-5").exists());
     }
 }

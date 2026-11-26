@@ -236,6 +236,16 @@ pub struct DownloadTask {
     /// （重启不会有遗留协程）。
     #[serde(skip)]
     pub finalize_spawned: bool,
+    /// 本轮下载产物已由收尾协程 rename 到正式路径
+    ///
+    /// 在 `finalize_download_output` 持任务锁的同一段内与 rename 一起置位：
+    /// - 重复的收尾协程见此标记直接按已完成返回（双 finalize 幂等，不再靠 mtime 推测）；
+    /// - 删除任务时据此（或 Decrypting）确认正式路径上的加密中间文件是本任务产物。
+    ///
+    /// 每轮重新准备下载（`prepare_for_scheduling` 标记下载中）时复位。
+    /// 仅 `#[serde(skip)]`：重启后从 false 开始，只会少认、不会误认。
+    #[serde(skip)]
+    pub output_finalized: bool,
 }
 
 impl DownloadTask {
@@ -291,6 +301,7 @@ impl DownloadTask {
             decrypt_committed: false,
             // 🔥 收尾/解密协程已 spawn 标记初始化
             finalize_spawned: false,
+            output_finalized: false,
         }
     }
 

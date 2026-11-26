@@ -1903,49 +1903,23 @@ impl ChunkScheduler {
     }
 
     /// 下载完成后：校验临时文件大小 → 重命名为最终路径
-    ///
-    /// 兼容旧任务：如果 output_path == local_path（旧任务直接写最终文件），仅做大小校验
     async fn finalize_download_output(task_info: &TaskScheduleInfo) -> Result<()> {
-        let final_path = {
-            let task = task_info.task.lock().await;
-            task.local_path.clone()
-        };
-
-        // 旧任务兼容：output_path 等于 final_path 时，只做大小校验
-        if task_info.output_path == final_path {
-            let metadata = tokio::fs::metadata(&final_path)
-                .await
-                .context("获取最终文件元数据失败")?;
-            if metadata.len() != task_info.total_size {
-                anyhow::bail!(
-                    "文件大小不匹配: 实际 {} bytes, 期望 {} bytes (路径: {:?})",
-                    metadata.len(),
-                    task_info.total_size,
-                    final_path
-                );
-            }
+        // 全程持任务锁：重复的收尾协程在此串行，后到者必然看到先到者置位的
+        // output_finalized，不存在"已 rename、未置位"的可见窗口
+        let mut task = task_info.task.lock().await;
+        if task.output_finalized {
+            // 同一任务的另一个收尾协程已完成 rename（双 finalize race），按已完成处理
+            info!(
+                "任务 {} 的下载产物已收尾，跳过重复收尾: {:?}",
+                task.id, task.local_path
+            );
             return Ok(());
         }
+        let final_path = task.local_path.clone();
 
-        // 新任务：校验临时文件大小
-        let metadata = match tokio::fs::metadata(&task_info.output_path).await {
-            Ok(m) => m,
-            Err(e) => {
-                // 🔥 幂等：临时文件已不存在，但最终文件已就位且大小正确 →
-                // 说明同一任务的另一个收尾协程已经完成 rename（双 finalize race），
-                // 按"已完成"处理而不是报「获取临时下载文件元数据失败」误标失败。
-                if let Ok(final_meta) = tokio::fs::metadata(&final_path).await {
-                    if final_meta.len() == task_info.total_size {
-                        info!(
-                            "临时文件已不存在但最终文件已就位且大小正确，判定为已完成（幂等收尾）: {:?}",
-                            final_path
-                        );
-                        return Ok(());
-                    }
-                }
-                return Err(e).context("获取临时下载文件元数据失败");
-            }
-        };
+        let metadata = tokio::fs::metadata(&task_info.output_path)
+            .await
+            .context("获取临时下载文件元数据失败")?;
         if metadata.len() != task_info.total_size {
             anyhow::bail!(
                 "临时下载文件大小不匹配: 实际 {} bytes, 期望 {} bytes (路径: {:?})",
@@ -1955,17 +1929,12 @@ impl ChunkScheduler {
             );
         }
 
-        // 如果最终路径已存在（异常残留），先删除
-        if final_path.exists() {
-            tokio::fs::remove_file(&final_path)
-                .await
-                .context("清理旧的最终文件失败")?;
-            warn!("检测到已存在的最终文件，已先删除再重命名: {:?}", final_path);
-        }
-
+        // 同目录 rename 原子替换已有的正式文件（Windows 下为 MOVEFILE_REPLACE_EXISTING）。
+        // 不能先删旧文件：rename 一旦失败，旧文件就没有了。
         tokio::fs::rename(&task_info.output_path, &final_path)
             .await
             .context("重命名临时下载文件失败")?;
+        task.output_finalized = true;
         info!(
             "✅ 临时文件已重命名: {:?} -> {:?}",
             task_info.output_path, final_path
@@ -2405,28 +2374,13 @@ impl ChunkScheduler {
             }
         }
 
-        // 🔥 7.7 R21+R24: 通过所有 stale check，把 attempt rename 到 final decrypted_path
+        // 🔥 7.7 R21: 通过所有 stale check，把 attempt rename 到 final decrypted_path
         //
         // R21：rename 是单 fs 操作（同目录同盘），原子性较好。
         //
-        // 🔥 R24: rename 之前主动尝试删除可能残留的旧 final（恢复路径自我修复）
-        //
-        //   场景：上一轮"暂停 → R23 stale 清理失败"留下的旧 final 文件。
-        //   `tokio::fs::rename`（即 `std::fs::rename`）在 Windows 上对已存在
-        //   目标文件的行为是 platform-dependent 的——较旧的 Rust 版本会直接
-        //   失败（`ERROR_ALREADY_EXISTS`）。
-        //
-        //   主动删除 + rename 不是单一原子操作，但本轮的并发隔离已经由 R20
-        //   epoch 机制 + R21 attempt-scoped 路径完整覆盖：
-        //     - 物理上不可能有其他协程在"主动删 final → rename"的微秒级窗口
-        //       内 rename 上来（详见 R23 安全性分析）。
-        //     - 主动删除失败时（旧 final 不存在，最常见）忽略错误继续 rename。
-        //     - 主动删除成功但旧 final 因 OS 占用持续无法删除时，rename 仍会
-        //       失败 → handle_task_completion 走 Failed 分支，用户能看到错误。
-        //
-        //   这一步对正常路径（首次解密、final 不存在）无副作用：remove_file
-        //   返回 NotFound，被 `let _ =` 静默忽略，rename 直接成功。
-        let _ = tokio::fs::remove_file(&decrypted_path).await;
+        // rename 直接原子替换已存在的 final（`std::fs::rename` 在 Windows 上使用
+        // MOVEFILE_REPLACE_EXISTING）。不先删旧 final：decrypted_path 可能是用户
+        // 已有的同名文件，rename 失败时必须保持其完好。
         if let Err(e) = tokio::fs::rename(&attempt_decrypted_path, &decrypted_path).await {
             // rename 失败时清理 attempt 残留（避免磁盘垃圾），返回错误让上层按解密失败处理
             let _ = tokio::fs::remove_file(&attempt_decrypted_path).await;
@@ -2454,7 +2408,7 @@ impl ChunkScheduler {
         //
         //   1. 这里在同一锁段内做：
         //      - 最后一次 stale check（status=Paused 或 epoch≠my）
-        //        → **R23**: stale 时**必须删 final**（详见下方安全性分析），
+        //        → stale 时保留 final（见下方说明），
         //          return Ok(())
         //      - 通过时：
         //        - 置位 `task.decrypt_committed = true`（"这个任务已经过原子提交，
@@ -2474,35 +2428,18 @@ impl ChunkScheduler {
         //
         // 三种 race 边界完整闭合：
         //   a. cancel 在 7.8 锁段之前：committed 还是 false，cancel 正常翻 Paused +
-        //      invalidate_decrypt_epoch；7.8 锁内看到 stale，return Ok()，删 final。
+        //      invalidate_decrypt_epoch；7.8 锁内看到 stale，return Ok()，保留 final。
         //   b. cancel 在 7.8 锁段之后：committed 已是 true，cancel 跳过任务。
         //      本协程无中断完成 step 8 / 10 / 11。
         //   c. cancel 与 7.8 锁段竞争：锁是顺序化的，要么 a 要么 b。
         //
-        // 🔥 R23: stale 分支为何必须删 final（推翻 R22 注释里的"不动 final"建议）
+        // 🔥 stale 分支保留 final，不删除
         //
-        // 平台问题：`tokio::fs::rename` 调用 `std::fs::rename`，在 Windows 上对
-        // 已存在目标文件的行为是 platform-dependent 的——较旧的 Rust 版本会直接
-        // 失败（`ERROR_ALREADY_EXISTS`）。如果 stale 分支保留 final，下一次用户
-        // 恢复任务时新协程仍生成同一 `decrypted_path`，最后跑到 7.7 rename 时会
-        // 在 Windows 上稳定失败，整个解密流程卡死。
-        //
-        // 安全性分析（删 final 不会破坏其他协程）：
-        // - 7.7 rename 已经把 attempt → final，本协程是这个 final 的拥有者。
-        // - 其他协程要把它们自己的 attempt rename 到同一 final，必须先经过
-        //   完整的 finalize_download_output → step 1-7 → spawn_blocking CPU 解密
-        //   （秒级到分钟级）→ 7.5 stale check → 7.7 rename。
-        // - 而本协程从 7.7 rename 完成到 7.8 lock 是**微秒级**窗口（rename 是单
-        //   系统调用，lock 是 tokio Mutex 异步原语）。
-        // - 物理上不可能有其他协程在这微秒级窗口里完成自己的完整流程并 rename
-        //   覆盖 final——除非新协程在 cancel 之前就已经存在并跑到 7.7，但
-        //   "新协程"的定义就是 cancel 之后才 spawn 的，时序上不可能。
-        // - 所以 7.8 stale 分支删 final = 删自己刚 rename 上去的文件，与其他
-        //   协程隔离。
-        //
-        // 这与 R21 的 7.5 stale 分支（"不删共享 final"）是不同语境：7.5 阶段
-        // 本协程还没 rename，final 是别人留的，删别人的会破坏并发；7.8 阶段
-        // final 是本协程刚放的，删自己的是清理职责。
+        // 7.7 rename 后 decrypted_path 上是本协程完整解密出的新文件，它已经原子替换了
+        // 用户原有的同名文件（如有）。此时再删 final，新旧两份内容都会丢失。
+        // 早先删除 final 的理由是"Windows 上 rename 无法覆盖已存在目标"，但
+        // `std::fs::rename` 在 Windows 上使用 MOVEFILE_REPLACE_EXISTING，恢复后新协程
+        // 的 7.7 rename 可以直接覆盖这个 final，因此保留它是安全的。
         let original_size_for_completion = original_size;
         {
             let mut task = task_info.task.lock().await;
@@ -2514,43 +2451,13 @@ impl ChunkScheduler {
                 drop(task);
                 if is_stale {
                     info!(
-                        "任务 {} rename 后发现本协程 epoch={} 已过期（当前={}）；\
-                         删除本协程刚 rename 上去的 final {:?} 让恢复路径清洁",
+                        "任务 {} rename 后发现本协程 epoch={} 已过期（当前={}）；保留已解密的 final {:?}，不改任务状态",
                         task_id, my_epoch, current_epoch, decrypted_path
                     );
                 } else {
                     info!(
-                        "任务 {} rename 后发现已被外部暂停；\
-                         删除本协程刚 rename 上去的 final {:?} 让恢复时新协程能 rename 成功",
+                        "任务 {} rename 后发现已被外部暂停；保留已解密的 final {:?}，恢复时新协程会重新解密并原子覆盖",
                         task_id, decrypted_path
-                    );
-                }
-                // 🔥 R23: 删本协程刚 rename 上去的 final，避免下次恢复时
-                //         新协程的 7.7 rename 在 Windows 上失败。
-                //         加密文件未删（step 8 还没执行），用户恢复后新协程会
-                //         重新解密 → 新 attempt → rename 到不存在的 final → 成功。
-                //
-                // 🔥 R24: 删除失败提升为 warn 级别（不再是 debug 静默吞掉）
-                //
-                // 删除失败可能场景：杀毒软件扫描占用 / Windows Search 索引锁 /
-                // 用户在文件管理器里预览 / 其它进程持有句柄。在这些情况下：
-                //   - Unix：下次 rename 会原子覆盖（rename(2) 即使目标存在也能替换）
-                //   - Windows：下次 rename 可能仍因 final 存在而失败
-                //
-                // 配套防线（R24）：新协程 7.7 rename 之前会主动尝试删除可能残留
-                // 的旧 final 做"恢复路径自我修复"。即使本次 stale 清理失败，
-                // 只要恢复时 OS 占用已释放，自我修复仍能让 rename 成功。
-                //
-                // 这里用 warn 而非 error/Failed：
-                //   - 不直接让任务进 Failed（用户体感"暂停操作让任务失败"反直觉）
-                //   - 但日志可见，运维能在监控里发现"暂停后清理 final 失败"的模式
-                //   - 真正不可恢复时由 R24 自我修复路径或 handle_task_completion 走 Failed
-                if let Err(e) = tokio::fs::remove_file(&decrypted_path).await {
-                    warn!(
-                        "stale 分支删除 final 失败：{:?}（路径: {:?}）。\
-                         残留 final 可能导致 Windows 下次恢复时 rename 失败；\
-                         R24 在新协程 rename 之前会主动尝试再次删除做自我修复。",
-                        e, decrypted_path
                     );
                 }
                 return Ok(());
@@ -2758,7 +2665,7 @@ mod tests {
             cookie: String::new(),
             referer: None,
             url_health: Arc::new(Mutex::new(UrlHealthManager::new(vec![], vec![]))),
-            output_path: PathBuf::from(format!("{}.downloading", t.local_path.display())),
+            output_path: crate::downloader::engine::build_download_temp_path(&t.local_path, &t.id),
             chunk_size: t.total_size,
             total_size: t.total_size,
             cancellation_token: token,
@@ -2947,5 +2854,118 @@ mod tests {
         let mut got = vec![s1, s2, s3];
         got.sort();
         assert_eq!(got, vec![1, 2, 3]);
+    }
+    /// 临时文件不见了、正式路径上是同大小的旧文件（哪怕刚刚写入、与任务创建同一秒）：
+    /// 本任务未收尾过，不能当成"另一个收尾协程已完成"，必须报错
+    #[tokio::test]
+    async fn test_finalize_rejects_preexisting_same_size_file_without_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("same-size.bin");
+        tokio::fs::write(&final_path, b"old!").await.unwrap();
+        let task = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/same-size.bin".into(),
+            final_path.clone(),
+            4,
+            crate::auth::Uid::default(),
+        )));
+        let info = issue192_schedule_info(task, CancellationToken::new()).await;
+        assert!(!info.output_path.exists());
+
+        assert!(ChunkScheduler::finalize_download_output(&info)
+            .await
+            .is_err());
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"old!");
+    }
+
+    /// 双 finalize：另一个收尾协程已把本任务产物 rename 到位，按已完成处理
+    #[tokio::test]
+    async fn test_finalize_idempotent_when_output_already_renamed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("renamed.bin");
+        let task = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/renamed.bin".into(),
+            final_path.clone(),
+            4,
+            crate::auth::Uid::default(),
+        )));
+        let info = issue192_schedule_info(task.clone(), CancellationToken::new()).await;
+        tokio::fs::write(&info.output_path, b"new!").await.unwrap();
+        ChunkScheduler::finalize_download_output(&info)
+            .await
+            .unwrap();
+        assert!(task.lock().await.output_finalized);
+
+        ChunkScheduler::finalize_download_output(&info)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"new!");
+    }
+
+    /// 两个收尾协程并发：都应成功，产物只 rename 一次
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_finalize_concurrent_double_finalize_both_succeed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("race.bin");
+        let task = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/race.bin".into(),
+            final_path.clone(),
+            4,
+            crate::auth::Uid::default(),
+        )));
+        let info = Arc::new(issue192_schedule_info(task, CancellationToken::new()).await);
+        tokio::fs::write(&info.output_path, b"new!").await.unwrap();
+
+        let (a, b) = tokio::join!(
+            tokio::spawn({
+                let info = info.clone();
+                async move { ChunkScheduler::finalize_download_output(&info).await }
+            }),
+            tokio::spawn({
+                let info = info.clone();
+                async move { ChunkScheduler::finalize_download_output(&info).await }
+            }),
+        );
+        a.unwrap().unwrap();
+        b.unwrap().unwrap();
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"new!");
+    }
+
+    /// 收尾：临时文件校验失败时旧文件完好；校验通过后原子替换旧文件
+    #[tokio::test]
+    async fn test_finalize_replaces_old_file_only_after_verification() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let final_path = dir.path().join("target.bin");
+        tokio::fs::write(&final_path, b"old-version-content")
+            .await
+            .unwrap();
+        let task = Arc::new(Mutex::new(DownloadTask::new(
+            1,
+            "/target.bin".into(),
+            final_path.clone(),
+            4,
+            crate::auth::Uid::default(),
+        )));
+        let info = issue192_schedule_info(task, CancellationToken::new()).await;
+
+        // 临时文件不完整：校验失败，旧文件保持原样
+        tokio::fs::write(&info.output_path, b"ne").await.unwrap();
+        assert!(ChunkScheduler::finalize_download_output(&info)
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(&final_path).await.unwrap(),
+            b"old-version-content"
+        );
+
+        // 临时文件完整：替换旧文件，临时文件消失
+        tokio::fs::write(&info.output_path, b"new!").await.unwrap();
+        ChunkScheduler::finalize_download_output(&info)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"new!");
+        assert!(!info.output_path.exists());
     }
 }

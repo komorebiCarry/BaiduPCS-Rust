@@ -73,6 +73,79 @@ async fn folder_subtask_slot_priority(
     }
 }
 
+/// 删除下载任务时清理本地文件
+///
+/// - 正式文件：仅在任务确认已完成且 `delete_file=true` 时删除。未完成任务从不写
+///   正式路径，该路径上的文件只可能是用户原有文件（覆盖下载场景），绝不删除；
+///   状态未知（进行中任务的元数据不带 status）按未完成处理。
+///   例外是加密下载的中间文件 `<uuid>.<加密扩展名>`：收尾时由本任务 rename 到正式路径、
+///   解密提交前留在那里。仅当调用方确认它是本任务产物（见 [`owns_encrypted_intermediate`]）
+///   时才一并清理——只看文件名会误删用户原有的同名文件。
+/// - 临时文件：删本任务专属的 `<目标>.<任务标识>.downloading`。旧版本
+///   `<目标>.downloading` 可能是原文件改名而来，只有任务带断点进度（恢复时会接管
+///   它续传，见 `prepare_download_output_path`）才视为本任务数据清理，否则不动。
+///
+/// 正式文件删除失败时仍继续清理临时文件，最后再返回该错误；调用方不得因此跳过
+/// 持久化清理与删除事件。
+async fn cleanup_deleted_task_files(
+    task_id: &str,
+    local_path: &std::path::Path,
+    status_completed: Option<bool>,
+    has_resume_progress: bool,
+    delete_file: bool,
+    owns_encrypted_intermediate: bool,
+) -> Result<()> {
+    let completed = status_completed == Some(true);
+    let encrypted_intermediate = !completed
+        && owns_encrypted_intermediate
+        && local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(crate::encryption::EncryptionService::is_encrypted_filename);
+
+    let mut final_result = Ok(());
+    if ((completed && delete_file) || encrypted_intermediate) && local_path.exists() {
+        match tokio::fs::remove_file(local_path).await {
+            Ok(()) => info!("已删除本地文件: {:?}", local_path),
+            Err(e) => {
+                final_result = Err(anyhow::Error::new(e)
+                    .context(format!("删除本地文件失败: {}", local_path.display())));
+            }
+        }
+    }
+
+    let mut temp_paths = vec![crate::downloader::engine::build_download_temp_path(
+        local_path, task_id,
+    )];
+    if !completed && has_resume_progress {
+        temp_paths.push(crate::downloader::engine::build_legacy_download_temp_path(
+            local_path,
+        ));
+    }
+    for temp_path in temp_paths {
+        if temp_path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+                warn!("清理下载临时文件失败: {:?} - {}", temp_path, e);
+            } else {
+                info!("已清理下载临时文件: {:?}", temp_path);
+            }
+        }
+    }
+    final_result
+}
+
+/// 正式路径上的加密中间文件是否确为本任务产物：收尾协程先 rename 再进入 Decrypting，
+/// 所以 Decrypting 或已收尾（含解密失败、解密中被暂停）都说明文件是本任务放上去的
+fn owns_encrypted_intermediate(task: &DownloadTask) -> bool {
+    task.is_encrypted && (task.status == TaskStatus::Decrypting || task.output_finalized)
+}
+
+/// 删除任务时的"已完成"判定：解密已原子提交（正式路径已换成解密产物）也算完成，
+/// 否则恰在此刻删除任务会把解密出的文件当作他人文件留下
+fn task_output_completed(task: &DownloadTask) -> bool {
+    task.status == TaskStatus::Completed || task.decrypt_committed
+}
+
 /// 🔥 自动退回队列请求（scheduler → manager 消息）
 ///
 /// scheduler 不能直接调 `manager.auto_requeue_task`（manager 在 scheduler
@@ -2091,6 +2164,7 @@ impl DownloadManager {
                     chunk_size,
                     chunk_manager,
                     speed_calc,
+                    output_reused,
                 )) => {
                     // 获取文件总大小、远程路径和 fs_id
                     // 🔥 同时读取 is_borrowed_slot / uses_folder_fixed_slot，用于下方 prepare 后 touch 的 owner 判定
@@ -2275,6 +2349,12 @@ impl DownloadManager {
                                     fm.drop_pending_file_after_persist(gid, fs_id).await;
                                 }
                             }
+                        }
+
+                        // 临时文件是新建的：断点进度对应的数据已不存在，作废后从头下载，
+                        // 否则已完成分片会对应到全新文件里的空洞
+                        if !output_reused {
+                            pm.lock().await.reset_download_progress(&id_clone);
                         }
 
                         // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
@@ -2628,6 +2708,7 @@ impl DownloadManager {
                     chunk_size,
                     chunk_manager,
                     speed_calc,
+                    output_reused,
                 )) => {
                     // 获取文件总大小、远程路径和 fs_id（用于探测恢复链接和速度异常检测）
                     // 🔥 同时读取 is_borrowed_slot / uses_folder_fixed_slot，用于下方 prepare 后 touch 的 owner 判定
@@ -2811,6 +2892,12 @@ impl DownloadManager {
                                 "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={}, transfer_task_id={:?}, owner_uid={})",
                                 task_id_clone, total_chunks, is_backup, transfer_task_id, task_owner_uid.raw()
                             );
+                        }
+
+                        // 临时文件是新建的：断点进度对应的数据已不存在，作废后从头下载，
+                        // 否则已完成分片会对应到全新文件里的空洞
+                        if !output_reused {
+                            pm.lock().await.reset_download_progress(&task_id_clone);
                         }
 
                         // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
@@ -5454,6 +5541,9 @@ impl DownloadManager {
         self.final_delete_sweep(task_id, group_id.as_deref()).await;
         let mut local_path = None;
         let mut status_completed = None;
+        let mut has_resume_progress = false;
+        // 只能从持久化记录找到任务时不认领加密中间文件（元数据不带加密标记）：宁可少删
+        let mut owns_intermediate = false;
 
         // 🔥 活跃计数 -1（删除活跃任务）
         if was_active && removed_task.is_some() {
@@ -5463,7 +5553,9 @@ impl DownloadManager {
         if let Some(task) = removed_task {
             let t = task.lock().await;
             local_path = Some(t.local_path.clone());
-            status_completed = Some(t.status == TaskStatus::Completed);
+            status_completed = Some(task_output_completed(&t));
+            has_resume_progress = t.downloaded_size > 0;
+            owns_intermediate = owns_encrypted_intermediate(&t);
             info!("删除下载任务（内存中）: {}", task_id);
             drop(t);
         } else {
@@ -5501,35 +5593,23 @@ impl DownloadManager {
             }
         }
 
-        // 决定是否删除本地文件
-        // 1. 对于未完成的任务（包括无法确认状态的情况），自动删除临时文件
-        // 2. 对于已完成的任务，根据 delete_file 参数决定
-        let should_delete = match status_completed {
-            Some(true) => delete_file,
-            Some(false) => true,
-            None => delete_file,
-        };
-
+        // 任务已移出任务表：文件删除失败也要继续清理持久化、发删除事件，
+        // 否则重启后任务会从 WAL/元数据复活，前端与备份状态机也会失步。错误留到最后返回。
+        let mut file_cleanup_result = Ok(());
         if let Some(path) = local_path {
-            if should_delete && path.exists() {
-                tokio::fs::remove_file(&path)
-                    .await
-                    .context("删除本地文件失败")?;
-                info!("已删除本地文件: {:?}", path);
-            }
-
-            // 同时清理可能残留的 .downloading 临时文件
-            let temp_path = PathBuf::from(format!(
-                "{}{}",
-                path.display(),
-                crate::downloader::engine::DOWNLOADING_EXTENSION
-            ));
-            if temp_path.exists() {
-                if let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                    warn!("清理 .downloading 临时文件失败: {:?} - {}", temp_path, e);
-                } else {
-                    info!("已清理 .downloading 临时文件: {:?}", temp_path);
-                }
+            let has_resume_progress =
+                has_resume_progress || self.has_persisted_progress(task_id).await;
+            file_cleanup_result = cleanup_deleted_task_files(
+                task_id,
+                &path,
+                status_completed,
+                has_resume_progress,
+                delete_file,
+                owns_intermediate,
+            )
+            .await;
+            if let Err(ref e) = file_cleanup_result {
+                warn!("删除任务 {} 时清理本地文件失败: {:#}", task_id, e);
             }
         }
 
@@ -5578,7 +5658,7 @@ impl DownloadManager {
         // 尝试启动等待队列中的任务
         self.try_start_waiting_tasks().await;
 
-        Ok(())
+        file_cleanup_result.context("任务已删除，但本地文件删除失败")
     }
 
     /// 批量删除下载任务（用于自动备份取消等场景）
@@ -5710,6 +5790,8 @@ impl DownloadManager {
         self.final_delete_sweep(task_id, group_id.as_deref()).await;
         let mut local_path = None;
         let mut status_completed = None;
+        let mut has_resume_progress = false;
+        let mut owns_intermediate = false;
 
         if was_active && removed_task.is_some() {
             self.dec_active();
@@ -5718,7 +5800,9 @@ impl DownloadManager {
         if let Some(task) = removed_task {
             let t = task.lock().await;
             local_path = Some(t.local_path.clone());
-            status_completed = Some(t.status == TaskStatus::Completed);
+            status_completed = Some(task_output_completed(&t));
+            has_resume_progress = t.downloaded_size > 0;
+            owns_intermediate = owns_encrypted_intermediate(&t);
             drop(t);
         } else if let Some(ref pm) = self.persistence_manager {
             let pm = pm.lock().await;
@@ -5733,26 +5817,20 @@ impl DownloadManager {
             }
         }
 
-        // 决定是否删除本地文件
-        let should_delete = match status_completed {
-            Some(true) => delete_file,
-            Some(false) => true,
-            None => delete_file,
-        };
-
         if let Some(path) = local_path {
-            if should_delete && path.exists() {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-
-            // 同时清理可能残留的 .downloading 临时文件
-            let temp_path = PathBuf::from(format!(
-                "{}{}",
-                path.display(),
-                crate::downloader::engine::DOWNLOADING_EXTENSION
-            ));
-            if temp_path.exists() {
-                let _ = tokio::fs::remove_file(&temp_path).await;
+            let has_resume_progress =
+                has_resume_progress || self.has_persisted_progress(task_id).await;
+            if let Err(e) = cleanup_deleted_task_files(
+                task_id,
+                &path,
+                status_completed,
+                has_resume_progress,
+                delete_file,
+                owns_intermediate,
+            )
+            .await
+            {
+                warn!("批量删除任务 {} 时清理本地文件失败: {}", task_id, e);
             }
         }
 
@@ -6490,6 +6568,7 @@ impl DownloadManager {
             decrypt_committed: false,
             // 🔥 收尾/解密协程已 spawn 标记（历史任务无遗留协程，从 false 开始）
             finalize_spawned: false,
+            output_finalized: false,
         })
     }
 
@@ -6573,32 +6652,68 @@ impl DownloadManager {
 
     /// 清除失败的任务
     pub async fn clear_failed(&self) -> usize {
-        let mut tasks = self.tasks.write().await;
-        let mut to_remove = Vec::new();
+        let count = self.clear_failed_matching(|_| true).await;
+        info!("清除了 {} 个失败的任务", count);
+        count
+    }
 
-        for (id, task) in tasks.iter() {
-            let t = task.lock().await;
-            if t.status == TaskStatus::Failed {
-                to_remove.push((id.clone(), t.local_path.clone()));
+    /// 从任务表移除匹配的失败任务，再在锁外清理其临时文件与持久化记录
+    ///
+    /// 失败任务未写过正式路径，正式路径上的文件属于用户，不动。持久化记录必须
+    /// 一并清除，否则重启后任务会从 WAL / 元数据恢复回来。
+    async fn clear_failed_matching(&self, matches: impl Fn(&DownloadTask) -> bool) -> usize {
+        let removed = {
+            let mut tasks = self.tasks.write().await;
+            let mut removed = Vec::new();
+            for (id, task) in tasks.iter() {
+                let t = task.lock().await;
+                if t.status == TaskStatus::Failed && matches(&t) {
+                    removed.push((
+                        id.clone(),
+                        t.local_path.clone(),
+                        t.downloaded_size > 0,
+                        owns_encrypted_intermediate(&t),
+                    ));
+                }
             }
-        }
+            for (id, _, _, _) in &removed {
+                tasks.remove(id);
+            }
+            removed
+        };
 
-        let count = to_remove.len();
-        for (id, local_path) in to_remove {
-            tasks.remove(&id);
-
-            // 删除失败任务的临时文件
-            if local_path.exists() {
-                if let Err(e) = std::fs::remove_file(&local_path) {
-                    warn!("删除失败任务的临时文件失败: {:?}, 错误: {}", local_path, e);
-                } else {
-                    info!("已删除失败任务的临时文件: {:?}", local_path);
+        for (id, local_path, has_resume_progress, owns_intermediate) in &removed {
+            let has_resume_progress = *has_resume_progress || self.has_persisted_progress(id).await;
+            if let Err(e) = cleanup_deleted_task_files(
+                id,
+                local_path,
+                Some(false),
+                has_resume_progress,
+                false,
+                *owns_intermediate,
+            )
+            .await
+            {
+                warn!("清除失败任务 {} 的本地临时文件失败: {}", id, e);
+            }
+            if let Some(ref pm) = self.persistence_manager {
+                if let Err(e) = pm.lock().await.on_task_deleted(id) {
+                    warn!("清除失败任务 {} 的持久化记录失败: {}", id, e);
                 }
             }
         }
+        removed.len()
+    }
 
-        info!("清除了 {} 个失败的任务", count);
-        count
+    /// 任务在持久化层是否记录了断点进度（已完成分片或分片内进度）
+    async fn has_persisted_progress(&self, task_id: &str) -> bool {
+        let Some(ref pm) = self.persistence_manager else {
+            return false;
+        };
+        let pm = pm.lock().await;
+        pm.get_completed_chunks(task_id)
+            .is_some_and(|chunks| !chunks.is_empty())
+            || pm.get_partial_progress(task_id).is_some()
     }
 
     // ==================== 批量操作方法 ====================
@@ -7016,29 +7131,7 @@ impl DownloadManager {
 
     /// 清除指定账号下失败的任务
     pub async fn clear_failed_for_uid(&self, uid: crate::auth::Uid) -> usize {
-        let mut tasks = self.tasks.write().await;
-        let mut to_remove = Vec::new();
-
-        for (id, task) in tasks.iter() {
-            let t = task.lock().await;
-            if t.owner_uid == uid && t.status == TaskStatus::Failed {
-                to_remove.push((id.clone(), t.local_path.clone()));
-            }
-        }
-
-        let count = to_remove.len();
-        for (id, local_path) in to_remove {
-            tasks.remove(&id);
-
-            if local_path.exists() {
-                if let Err(e) = std::fs::remove_file(&local_path) {
-                    warn!("删除失败任务的临时文件失败: {:?}, 错误: {}", local_path, e);
-                } else {
-                    info!("已删除失败任务的临时文件: {:?}", local_path);
-                }
-            }
-        }
-
+        let count = self.clear_failed_matching(|t| t.owner_uid == uid).await;
         info!("清除了 {} 个失败的任务（owner_uid={}）", count, uid.raw());
         count
     }
@@ -8249,7 +8342,7 @@ mod tests {
             cookie: String::new(),
             referer: None,
             url_health: Arc::new(Mutex::new(UrlHealthManager::new(vec![], vec![]))),
-            output_path: PathBuf::from(format!("{}.downloading", t.local_path.display())),
+            output_path: crate::downloader::engine::build_download_temp_path(&t.local_path, &t.id),
             chunk_size: t.total_size,
             total_size: t.total_size,
             cancellation_token: token,
@@ -8300,12 +8393,12 @@ mod tests {
                 )
                 .unwrap();
                 let path = dir.path().join("queued.bin");
-                let temporary = PathBuf::from(format!("{}.downloading", path.display()));
-                tokio::fs::write(&temporary, b"data").await.unwrap();
                 let mut t =
                     DownloadTask::new(1, "/queued.bin".into(), path.clone(), 4, Uid::default());
                 t.mark_downloading();
                 let id = t.id.clone();
+                let temporary = crate::downloader::engine::build_download_temp_path(&path, &id);
+                tokio::fs::write(&temporary, b"data").await.unwrap();
                 let task = Arc::new(Mutex::new(t));
                 manager.tasks.write().await.insert(id.clone(), task.clone());
                 manager.inc_active();
@@ -8934,11 +9027,12 @@ mod tests {
                     .unwrap(),
             );
             let path = dir.path().join("late.bin");
-            let temp_path = PathBuf::from(format!("{}.downloading", path.display()));
-            tokio::fs::write(&temp_path, b"old progress").await.unwrap();
-            let mut task = DownloadTask::new(1, "/late.bin".into(), path, 4, Uid::default());
+            let mut task =
+                DownloadTask::new(1, "/late.bin".into(), path.clone(), 4, Uid::default());
             task.status = TaskStatus::Paused;
             let id = task.id.clone();
+            let temp_path = crate::downloader::engine::build_download_temp_path(&path, &id);
+            tokio::fs::write(&temp_path, b"old progress").await.unwrap();
             manager
                 .tasks
                 .write()
@@ -9016,13 +9110,13 @@ mod tests {
                 .await
                 .unwrap();
             let path = dir.path().join("complete.bin");
-            let temp_path = PathBuf::from(format!("{}.downloading", path.display()));
-            tokio::fs::write(&path, b"final").await.unwrap();
-            tokio::fs::write(&temp_path, b"stale").await.unwrap();
             let mut task =
                 DownloadTask::new(1, "/complete.bin".into(), path.clone(), 5, Uid::default());
             task.status = TaskStatus::Completed;
             let id = task.id.clone();
+            let temp_path = crate::downloader::engine::build_download_temp_path(&path, &id);
+            tokio::fs::write(&path, b"final").await.unwrap();
+            tokio::fs::write(&temp_path, b"stale").await.unwrap();
             manager
                 .tasks
                 .write()
@@ -9036,6 +9130,244 @@ mod tests {
             assert_eq!(tokio::fs::read(path).await.unwrap(), b"final");
             assert!(!temp_path.exists());
         }
+    }
+
+    /// 覆盖下载任务在排队 / 暂停 / 失败时被删除：无论 delete_file 取值，
+    /// 正式路径上的原文件都必须保留，只清理本任务的临时文件
+    #[tokio::test]
+    async fn test_delete_unfinished_overwrite_task_preserves_original_file() {
+        for status in [TaskStatus::Pending, TaskStatus::Paused, TaskStatus::Failed] {
+            for batch in [false, true] {
+                for delete_file in [false, true] {
+                    let dir = TempDir::new().unwrap();
+                    let manager =
+                        DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+                            .await
+                            .unwrap();
+                    let path = dir.path().join("original.bin");
+                    tokio::fs::write(&path, b"user-original").await.unwrap();
+                    let mut task = DownloadTask::new(
+                        1,
+                        "/original.bin".into(),
+                        path.clone(),
+                        4,
+                        Uid::default(),
+                    );
+                    task.status = status.clone();
+                    let id = task.id.clone();
+                    let own_temp = crate::downloader::engine::build_download_temp_path(&path, &id);
+                    tokio::fs::write(&own_temp, b"new-").await.unwrap();
+                    let legacy = crate::downloader::engine::build_legacy_download_temp_path(&path);
+                    tokio::fs::write(&legacy, b"legacy").await.unwrap();
+                    manager
+                        .tasks
+                        .write()
+                        .await
+                        .insert(id.clone(), Arc::new(Mutex::new(task)));
+
+                    if batch {
+                        assert_eq!(manager.batch_delete_tasks(&[id], delete_file).await, (1, 0));
+                    } else {
+                        manager.delete_task(&id, delete_file).await.unwrap();
+                    }
+
+                    assert_eq!(
+                        tokio::fs::read(&path).await.unwrap(),
+                        b"user-original",
+                        "status={status:?} batch={batch} delete_file={delete_file}"
+                    );
+                    assert!(!own_temp.exists());
+                    assert_eq!(tokio::fs::read(&legacy).await.unwrap(), b"legacy");
+                }
+            }
+        }
+    }
+
+    /// 带断点进度的未完成任务：旧版临时文件会在恢复时被接管，删除任务时一并清理；
+    /// 正式路径上的原文件仍然保留
+    #[tokio::test]
+    async fn test_delete_task_with_progress_removes_adoptable_legacy_temp() {
+        for batch in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let path = dir.path().join("upgrade.bin");
+            tokio::fs::write(&path, b"user-original").await.unwrap();
+            let legacy = crate::downloader::engine::build_legacy_download_temp_path(&path);
+            tokio::fs::write(&legacy, b"legacy-progress").await.unwrap();
+            let mut task =
+                DownloadTask::new(1, "/upgrade.bin".into(), path.clone(), 16, Uid::default());
+            task.status = TaskStatus::Paused;
+            task.downloaded_size = 8;
+            let id = task.id.clone();
+            manager
+                .tasks
+                .write()
+                .await
+                .insert(id.clone(), Arc::new(Mutex::new(task)));
+
+            if batch {
+                assert_eq!(manager.batch_delete_tasks(&[id], false).await, (1, 0));
+            } else {
+                manager.delete_task(&id, false).await.unwrap();
+            }
+
+            assert!(!legacy.exists());
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), b"user-original");
+        }
+    }
+
+    /// 加密下载在下载完成、解密提交前被删除：`<uuid>.dat` 中间文件是本任务产物，
+    /// 即使 delete_file=false 也要清理，不能遗留在磁盘上
+    #[tokio::test]
+    async fn test_delete_unfinished_encrypted_task_removes_intermediate() {
+        // (状态, 是否已收尾)：Decrypting 必然已收尾；暂停/失败要靠 output_finalized 认领
+        for (status, finalized) in [
+            (TaskStatus::Decrypting, false),
+            (TaskStatus::Paused, true),
+            (TaskStatus::Failed, true),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let path = dir.path().join(format!(
+                "{}{}",
+                uuid::Uuid::new_v4(),
+                crate::encryption::ENCRYPTED_FILE_EXTENSION
+            ));
+            tokio::fs::write(&path, b"ciphertext").await.unwrap();
+            let mut task =
+                DownloadTask::new(1, "/enc.dat".into(), path.clone(), 10, Uid::default());
+            task.status = status.clone();
+            task.is_encrypted = true;
+            task.output_finalized = finalized;
+            let id = task.id.clone();
+            manager
+                .tasks
+                .write()
+                .await
+                .insert(id.clone(), Arc::new(Mutex::new(task)));
+
+            manager.delete_task(&id, false).await.unwrap();
+
+            assert!(!path.exists(), "status={status:?}");
+        }
+    }
+
+    /// 正式路径上已有用户自己的 `<uuid>.dat`，任务还没收尾（没写过正式路径）：
+    /// 不论任务是否加密，删除任务都不得碰它
+    #[tokio::test]
+    async fn test_delete_task_keeps_user_file_with_encrypted_name() {
+        for (status, is_encrypted) in [
+            (TaskStatus::Pending, true),
+            (TaskStatus::Downloading, true),
+            (TaskStatus::Paused, true),
+            (TaskStatus::Failed, true),
+            (TaskStatus::Paused, false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+                .await
+                .unwrap();
+            let path = dir.path().join(format!(
+                "{}{}",
+                uuid::Uuid::new_v4(),
+                crate::encryption::ENCRYPTED_FILE_EXTENSION
+            ));
+            tokio::fs::write(&path, b"user-own").await.unwrap();
+            let mut task =
+                DownloadTask::new(1, "/enc.dat".into(), path.clone(), 10, Uid::default());
+            task.status = status.clone();
+            task.is_encrypted = is_encrypted;
+            let id = task.id.clone();
+            manager
+                .tasks
+                .write()
+                .await
+                .insert(id.clone(), Arc::new(Mutex::new(task)));
+
+            manager.delete_task(&id, false).await.unwrap();
+
+            assert_eq!(
+                tokio::fs::read(&path).await.unwrap(),
+                b"user-own",
+                "status={status:?} is_encrypted={is_encrypted}"
+            );
+        }
+    }
+
+    /// 正式文件删不掉（被占用等）：任务照样移除、临时文件照样清理，最后返回错误
+    #[tokio::test]
+    async fn test_delete_task_continues_cleanup_when_file_removal_fails() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        // 目录无法被 remove_file 删除，用它模拟删除失败
+        let path = dir.path().join("locked.bin");
+        std::fs::create_dir(&path).unwrap();
+        let mut task = DownloadTask::new(1, "/locked.bin".into(), path.clone(), 4, Uid::default());
+        task.status = TaskStatus::Completed;
+        let id = task.id.clone();
+        let own_temp = crate::downloader::engine::build_download_temp_path(&path, &id);
+        tokio::fs::write(&own_temp, b"tmp").await.unwrap();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(task)));
+
+        let err = manager.delete_task(&id, true).await.unwrap_err();
+
+        assert!(format!("{err:#}").contains("任务已删除"), "{err:#}");
+        assert!(manager.get_task(&id).await.is_none());
+        assert!(!own_temp.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_completed_task_with_delete_file_removes_file() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let path = dir.path().join("done.bin");
+        tokio::fs::write(&path, b"done").await.unwrap();
+        let mut task = DownloadTask::new(1, "/done.bin".into(), path.clone(), 4, Uid::default());
+        task.status = TaskStatus::Completed;
+        let id = task.id.clone();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(task)));
+        manager.delete_task(&id, true).await.unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_clear_failed_preserves_original_file() {
+        let dir = TempDir::new().unwrap();
+        let manager = DownloadManager::new(create_mock_user_auth(), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let path = dir.path().join("failed.bin");
+        tokio::fs::write(&path, b"user-original").await.unwrap();
+        let mut task = DownloadTask::new(1, "/failed.bin".into(), path.clone(), 4, Uid::default());
+        task.status = TaskStatus::Failed;
+        let id = task.id.clone();
+        let own_temp = crate::downloader::engine::build_download_temp_path(&path, &id);
+        tokio::fs::write(&own_temp, b"part").await.unwrap();
+        manager
+            .tasks
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(Mutex::new(task)));
+
+        assert_eq!(manager.clear_failed().await, 1);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"user-original");
+        assert!(!own_temp.exists());
     }
 
     #[tokio::test]
