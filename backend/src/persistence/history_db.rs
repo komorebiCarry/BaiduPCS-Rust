@@ -4,7 +4,7 @@
 //! - task_history: 文件任务历史
 //! - folder_history: 文件夹历史
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
@@ -1152,6 +1152,34 @@ impl HistoryDbManager {
         Ok(result)
     }
 
+    /// 按 group_id 查询已成功完成的子任务落盘的本地路径（去重）
+    ///
+    /// 用于"取消文件夹下载并删除文件"：只删除本次文件夹下载产生的文件，而不是把
+    /// 整个本地目录连同用户原有文件一起删掉。已完成子任务归档后不在活跃任务表里，
+    /// 只能从这里拿到它们的本地路径（加密文件为解密后的路径）。
+    pub fn get_completed_local_paths_by_group(&self, group_id: &str) -> Result<Vec<PathBuf>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT local_path FROM task_history \
+             WHERE group_id = ?1 AND task_type = 'download' AND status = 'completed' \
+             AND local_path IS NOT NULL AND local_path != ''",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| row.get::<_, String>(0))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            match row {
+                Ok(path) => result.push(PathBuf::from(path)),
+                Err(e) => warn!("读取已完成子任务本地路径失败: {}", e),
+            }
+        }
+        Ok(result)
+    }
+
     /// 按 group_id 删除任务
     pub fn remove_tasks_by_group(&self, group_id: &str) -> Result<usize> {
         let conn = self
@@ -2179,6 +2207,69 @@ mod tests {
             ]
         );
         assert!(db.get_completed_files_by_group("none").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_completed_local_paths_by_group() {
+        let dir = TempDir::new().unwrap();
+        let db = HistoryDbManager::new(&dir.path().join("h.db")).unwrap();
+
+        let sub = |id: &str, group: &str, local: &str, ok: bool| {
+            let mut m = TaskMetadata::new_download(
+                id.into(),
+                1,
+                format!("/r/{}", id),
+                local.into(),
+                10,
+                10,
+                1,
+                None,
+                None,
+            );
+            m.set_group_info(Some(group.into()), Some("/r".into()), Some(id.into()));
+            if ok {
+                m.mark_completed();
+            } else {
+                m.mark_failed();
+            }
+            m
+        };
+        // 同 group_id 的上传任务：local_path 是用户的源文件，绝不能被当成下载产物返回
+        let mut upload = TaskMetadata::new_upload(
+            "u-1".into(),
+            "/l/source.mp4".into(),
+            "/r/source.mp4".into(),
+            10,
+            10,
+            1,
+            None,
+            None,
+        );
+        upload.set_group_info(Some("f-1".into()), Some("/r".into()), Some("u-1".into()));
+        upload.mark_completed();
+        // 模拟 local_path 列也有值：要靠 task_type 过滤，而不是碰巧该列为空
+        upload.local_path = Some("/l/source.mp4".into());
+        for m in [
+            sub("t-1", "f-1", "/l/a.mp4", true),
+            sub("t-2", "f-1", "/l/a.mp4", true),
+            sub("t-3", "f-1", "/l/sub/b.mp4", true),
+            sub("t-4", "f-1", "/l/c.mp4", false),
+            sub("t-5", "f-2", "/l/d.mp4", true),
+            upload,
+        ] {
+            db.add_task_to_history(&m).unwrap();
+        }
+
+        let mut paths = db.get_completed_local_paths_by_group("f-1").unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/l/a.mp4"), PathBuf::from("/l/sub/b.mp4")]
+        );
+        assert!(db
+            .get_completed_local_paths_by_group("none")
+            .unwrap()
+            .is_empty());
     }
 
     /// 菜单进度统计用的轻量查询：已完成、非备份，按类型区分，并标出是否属于文件夹

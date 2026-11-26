@@ -7,8 +7,8 @@ use crate::netdisk::{ClientPool, NetdiskClient};
 use crate::server::events::{DownloadEvent, FolderEvent, TaskEvent};
 use crate::server::websocket::WebSocketManager;
 use anyhow::{anyhow, Context, Result};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -268,6 +268,110 @@ async fn persist_folder_state(
                 .insert(folder_id.to_string());
         }
     }
+}
+
+/// 路径是否确实位于 `root` 之内（拒绝含 `..` 的路径，防止越界删除）
+fn path_is_inside(root: &Path, path: &Path) -> bool {
+    path.starts_with(root)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// 文件夹根目录是否由本次下载按网盘文件夹名创建，从而允许在清空后删除
+///
+/// 下载网盘根目录 `/` 时文件夹名为空，`local_root` 就是下载目录本身；加密文件夹
+/// 还原名称时目录名也与网盘名不同。这些情况下根目录不是本次下载"自己的"，绝不删除。
+fn folder_root_is_own(local_root: &Path, remote_root: &str) -> bool {
+    let name = remote_root
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    !name.is_empty() && local_root.file_name() == Some(std::ffi::OsStr::new(name))
+}
+
+/// 从每个已删除文件所在目录起向上逐级删除空目录，止于 `root`
+///
+/// 只用 `remove_dir`，目录非空时必然失败，因此不会删除任何文件。候选目录只来自
+/// 本次确实删掉了文件的目录及其祖先，与本次删除无关的目录（包括用户原有的空目录）
+/// 不会被处理。`root_removable=false` 时根目录本身保留。
+fn remove_emptied_dirs(root: &Path, removed_files: &[PathBuf], root_removable: bool) {
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for file in removed_files {
+        let Some(parent) = file.parent() else {
+            continue;
+        };
+        for dir in parent.ancestors() {
+            if !path_is_inside(root, dir) || (dir == root && !root_removable) {
+                break;
+            }
+            dirs.insert(dir.to_path_buf());
+            if dir == root {
+                break;
+            }
+        }
+    }
+    // Path 按组件排序，父目录总排在子目录之前：倒序即"深的先删"
+    for dir in dirs.iter().rev() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// 补删子任务专属临时文件（删除任务时可能因句柄未释放而失败），返回补删成功的路径
+fn retry_remove_temp_files(temp_files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for path in temp_files {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                info!("补删下载临时文件: {:?}", path);
+                removed.push(path.clone());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("补删下载临时文件失败: {:?}, 错误: {}", path, e),
+        }
+    }
+    removed
+}
+
+/// 取消文件夹下载并删除文件的磁盘收尾（在 spawn_blocking 中执行）
+///
+/// 1. 补删残留的子任务临时文件；
+/// 2. `existed_before` 中删除任务后已不存在的，即为子任务实际删掉的文件；
+/// 3. 删除已归档的已完成子任务文件；
+/// 4. 沿以上实际删除的文件清理变空的目录。
+///
+/// 返回删除的归档文件数。
+fn remove_folder_outputs_blocking(
+    root: &Path,
+    archived: &[PathBuf],
+    existed_before: Vec<PathBuf>,
+    temp_files: &[PathBuf],
+    root_removable: bool,
+) -> usize {
+    let mut removed = retry_remove_temp_files(temp_files);
+    removed.extend(existed_before.into_iter().filter(|p| !p.exists()));
+
+    let mut archived_removed = 0usize;
+    for path in archived {
+        if !path_is_inside(root, path) {
+            warn!(
+                "跳过不在文件夹目录内的历史文件: {:?} (root={:?})",
+                path, root
+            );
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                archived_removed += 1;
+                removed.push(path.clone());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("删除文件夹下载的文件失败: {:?}, 错误: {}", path, e),
+        }
+    }
+    remove_emptied_dirs(root, &removed, root_removable);
+    archived_removed
 }
 
 impl FolderDownloadManager {
@@ -3978,7 +4082,7 @@ impl FolderDownloadManager {
         // 🔥 关键：先更新文件夹状态并清空 pending_files，阻止 task_completed_listener 补充新任务
         // 这必须在删除任务之前执行，避免竞态条件
         // 🔥 同时取出 folder.owner_uid 用于路由 download_manager
-        let (local_root, folder_owner_uid_for_routing) = {
+        let (local_root, folder_owner_uid_for_routing, remote_root) = {
             let mut folders = self.folders.write().await;
             if let Some(folder) = folders.get_mut(folder_id) {
                 folder.mark_cancelled();
@@ -3988,9 +4092,13 @@ impl FolderDownloadManager {
                     folder.name,
                     folder.pending_files.len()
                 );
-                (Some(folder.local_root.clone()), Some(folder.owner_uid))
+                (
+                    Some(folder.local_root.clone()),
+                    Some(folder.owner_uid),
+                    folder.remote_root.clone(),
+                )
             } else {
-                (None, None)
+                (None, None, String::new())
             }
         };
 
@@ -4014,9 +4122,38 @@ impl FolderDownloadManager {
         //   - 触发 cancellation_token（通知分片停止）
         //   - 从调度器移除
         //   - 从 tasks HashMap 移除
-        //   - 删除临时文件（如果 delete_files=true）
+        //   - 已完成子任务按 delete_files 删除正式文件；未完成子任务只删自己的临时文件，
+        //     正式路径上的用户原文件保留
+        //   删除文件时，先记下各子任务名下存在的文件：删除后仍存在的即被保留（如用户原文件），
+        //   不存在的才算本次删掉的，后续只沿这些文件所在目录清理空目录。
+        //   文件系统检查放到阻塞线程池，避免大文件夹/网络盘上阻塞异步运行时。
+        let temp_files: Vec<PathBuf> = tasks
+            .iter()
+            .map(|t| crate::downloader::engine::build_download_temp_path(&t.local_path, &t.id))
+            .collect();
+        let existed_before: Vec<PathBuf> = if delete_files {
+            let candidates: Vec<PathBuf> = tasks
+                .iter()
+                .flat_map(|t| {
+                    [
+                        t.local_path.clone(),
+                        crate::downloader::engine::build_legacy_download_temp_path(&t.local_path),
+                    ]
+                })
+                .chain(temp_files.iter().cloned())
+                .collect();
+            tokio::task::spawn_blocking(move || {
+                candidates.into_iter().filter(|p| p.exists()).collect()
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         for task in tasks {
-            let _ = download_manager.delete_task(&task.id, delete_files).await;
+            if let Err(e) = download_manager.delete_task(&task.id, delete_files).await {
+                warn!("删除文件夹子任务 {} 失败: {:#}", task.id, e);
+            }
         }
         info!("所有子任务已删除，等待分片物理释放...");
 
@@ -4033,20 +4170,29 @@ impl FolderDownloadManager {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         info!("分片物理释放完成");
 
-        // 4. 如果需要删除文件，删除整个文件夹目录
-        if delete_files {
-            if let Some(root_path) = local_root {
-                info!("准备删除文件夹目录: {:?}", root_path);
-                if root_path.exists() {
-                    match tokio::fs::remove_dir_all(&root_path).await {
-                        Ok(_) => info!("已删除文件夹目录: {:?}", root_path),
-                        Err(e) => error!("删除文件夹目录失败: {:?}, 错误: {}", root_path, e),
-                    }
-                } else {
-                    warn!("文件夹目录不存在: {:?}", root_path);
+        // 4. 删除文件：只删本次文件夹下载产生的文件，不删整个目录。
+        //    本地目录里可能有用户自己的文件（同名目录事先已存在、下载期间放入、
+        //    跳过策略未下载的文件），整目录 remove_dir_all 会把它们一起永久删除。
+        //    不删文件时也补删一遍子任务临时文件：它们只属于本任务，删除任务时可能因
+        //    句柄尚未释放而失败。
+        match (delete_files, local_root) {
+            (true, Some(root_path)) => {
+                let root_removable = folder_root_is_own(&root_path, &remote_root);
+                self.delete_folder_download_outputs(
+                    folder_id,
+                    &root_path,
+                    existed_before,
+                    temp_files,
+                    root_removable,
+                )
+                .await;
+            }
+            (delete, _) => {
+                if delete {
+                    warn!("local_root 为空，无法删除文件夹下载的文件");
                 }
-            } else {
-                warn!("local_root 为空，无法删除文件夹目录");
+                let _ =
+                    tokio::task::spawn_blocking(move || retry_remove_temp_files(&temp_files)).await;
             }
         }
 
@@ -4076,6 +4222,60 @@ impl FolderDownloadManager {
         .await;
 
         Ok(())
+    }
+
+    /// 删除一次文件夹下载产生的文件
+    ///
+    /// 活跃子任务已由 `delete_task` 处理（`existed_before` 为删除前其名下存在的文件，
+    /// `temp_files` 为其专属临时文件，残留的会补删）；这里补删已归档（历史库）的
+    /// 已完成子任务文件，再清理因此变空的目录。
+    /// 历史记录不可用时只删活跃子任务的文件：宁可少删，也不误删用户文件。
+    async fn delete_folder_download_outputs(
+        &self,
+        folder_id: &str,
+        root: &Path,
+        existed_before: Vec<PathBuf>,
+        temp_files: Vec<PathBuf>,
+        root_removable: bool,
+    ) {
+        let archived = {
+            let pm_opt = self.persistence_manager.read().await.clone();
+            match pm_opt {
+                Some(pm) => {
+                    let pm_guard = pm.lock().await;
+                    match pm_guard.history_db() {
+                        Some(db) => match db.get_completed_local_paths_by_group(folder_id) {
+                            Ok(paths) => paths,
+                            Err(e) => {
+                                warn!("查询文件夹 {} 已完成子任务文件失败: {}", folder_id, e);
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    }
+                }
+                None => Vec::new(),
+            }
+        };
+
+        let root_owned = root.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            remove_folder_outputs_blocking(
+                &root_owned,
+                &archived,
+                existed_before,
+                &temp_files,
+                root_removable,
+            )
+        })
+        .await
+        {
+            Ok(n) => info!(
+                "已删除文件夹 {} 下载的 {} 个已归档文件，并清理空目录: {:?}",
+                folder_id, n, root
+            ),
+            Err(e) => warn!("删除文件夹 {} 下载的文件失败: {}", folder_id, e),
+        }
     }
 
     /// 🔥 取消并清理某个转存任务派生出的全部文件夹下载（tree 模式整目录转存+自动下载）。
@@ -6026,10 +6226,7 @@ impl FolderDownloadManager {
                     tokio::fs::rename(&src_path, &dst_path).await?;
                 }
             } else {
-                // 移动文件（如果目标存在则覆盖）
-                if dst_path.exists() {
-                    tokio::fs::remove_file(&dst_path).await?;
-                }
+                // 移动文件（目标存在时由 rename 原子覆盖，不先删目标，失败时目标保持完好）
                 tokio::fs::rename(&src_path, &dst_path).await?;
             }
         }
@@ -6178,6 +6375,175 @@ mod tests {
         let fm = FolderDownloadManager::new(tmp.path().to_path_buf());
         fm.set_download_manager(dm).await;
         (fm, tmp)
+    }
+
+    #[test]
+    fn test_remove_emptied_dirs_only_touches_emptied_ancestors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join("keep_nonempty")).unwrap();
+        std::fs::write(root.join("keep_nonempty/user.txt"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("user_empty_dir")).unwrap();
+
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        remove_emptied_dirs(
+            &root,
+            &[
+                root.join("a/b/gone.bin"),
+                root.join("keep_nonempty/gone.bin"),
+                // root 之外的路径不得被处理
+                tmp.path().join("outside/x.bin"),
+                root.join("../outside/y.bin"),
+            ],
+            true,
+        );
+        assert!(tmp.path().join("outside").exists());
+
+        assert!(!root.join("a").exists(), "因删除而变空的目录应被清理");
+        assert!(root.join("keep_nonempty/user.txt").exists());
+        assert!(
+            root.join("user_empty_dir").exists(),
+            "与本次下载无关的空目录不动"
+        );
+        assert!(root.exists(), "root 下还有用户内容，必须保留");
+    }
+
+    /// 删除任务时没删掉的临时文件（句柄未释放）在收尾补删，补删后变空的目录一并清理；
+    /// 删除前存在、删除后消失的文件也算本次删除
+    #[test]
+    fn test_folder_outputs_retry_leftover_temp_and_clean_its_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("photos");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let leftover = root.join("a/x.bin.0f1e2d3c.downloading");
+        std::fs::write(&leftover, b"part").unwrap();
+        let gone_by_task = root.join("b/y.bin");
+
+        remove_folder_outputs_blocking(
+            &root,
+            &[],
+            vec![gone_by_task],
+            &[leftover.clone(), root.join("a/missing.downloading")],
+            false,
+        );
+
+        assert!(!leftover.exists());
+        assert!(!root.join("a").exists(), "补删临时文件后变空的目录应清理");
+        assert!(!root.join("b").exists(), "子任务删掉文件后变空的目录应清理");
+        assert!(root.exists());
+    }
+
+    /// 根目录：只有本次按网盘文件夹名创建的才在清空后删除；
+    /// 下载网盘根目录 `/` 时 local_root 就是下载目录本身，绝不能删
+    #[test]
+    fn test_folder_root_removal_requires_own_named_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let download_dir = tmp.path().join("downloads");
+        assert!(folder_root_is_own(&download_dir.join("photos"), "/photos"));
+        assert!(folder_root_is_own(
+            &download_dir.join("photos"),
+            "/a/photos/"
+        ));
+        assert!(!folder_root_is_own(&download_dir.join(""), "/"));
+        assert!(!folder_root_is_own(
+            &download_dir.join("还原名"),
+            "/a/BPR_enc"
+        ));
+
+        std::fs::create_dir_all(download_dir.join("sub")).unwrap();
+        remove_emptied_dirs(&download_dir, &[download_dir.join("sub/x.bin")], false);
+        assert!(!download_dir.join("sub").exists());
+        assert!(download_dir.exists(), "下载目录本身不能被删除");
+
+        let own = tmp.path().join("photos");
+        std::fs::create_dir_all(own.join("sub")).unwrap();
+        remove_emptied_dirs(&own, &[own.join("sub/x.bin")], true);
+        assert!(!own.exists(), "本次下载创建的根目录清空后应删除");
+    }
+
+    /// 取消文件夹下载并删除文件：只删本次下载产生的文件，目录里用户原有的文件、
+    /// 被覆盖下载但尚未完成的原文件都必须保留（不能再 remove_dir_all 整个目录）
+    #[tokio::test]
+    async fn test_cancel_folder_with_delete_files_keeps_user_files() {
+        let (fm, tmp) = fm_with_download_manager().await;
+        let pm_config = crate::config::PersistenceConfig {
+            db_path: tmp.path().join("history.db").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let pm = Arc::new(tokio::sync::Mutex::new(PersistenceManager::new(
+            pm_config,
+            tmp.path(),
+        )));
+        fm.set_persistence_manager(pm.clone()).await;
+
+        let root = tmp.path().join("photos");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("mine")).unwrap();
+        std::fs::write(root.join("user_own.txt"), b"user").unwrap();
+        std::fs::write(root.join("mine/notes.txt"), b"user").unwrap();
+        std::fs::write(root.join("overwrite.bin"), b"user-original").unwrap();
+        std::fs::write(root.join("sub/archived.bin"), b"downloaded").unwrap();
+
+        let folder = FolderDownload::new("/photos".into(), root.clone());
+        let folder_id = folder.id.clone();
+        fm.folders.write().await.insert(folder_id.clone(), folder);
+
+        // 已归档的已完成子任务
+        let mut meta = crate::persistence::TaskMetadata::new_download(
+            "archived-1".into(),
+            1,
+            "/photos/sub/archived.bin".into(),
+            root.join("sub/archived.bin"),
+            10,
+            10,
+            1,
+            None,
+            None,
+        );
+        meta.set_group_info(
+            Some(folder_id.clone()),
+            Some("/photos".into()),
+            Some("sub/archived.bin".into()),
+        );
+        meta.mark_completed();
+        pm.lock()
+            .await
+            .history_db()
+            .expect("测试需要历史数据库")
+            .add_task_to_history(&meta)
+            .unwrap();
+
+        // 仍在内存里的覆盖下载子任务（已暂停，正式路径上是用户原文件）
+        let dm = fm.download_manager_for(Uid::default()).await.unwrap();
+        let mut task = DownloadTask::new(
+            2,
+            "/photos/overwrite.bin".into(),
+            root.join("overwrite.bin"),
+            16,
+            Uid::default(),
+        );
+        task.status = TaskStatus::Paused;
+        task.group_id = Some(folder_id.clone());
+        let own_temp =
+            crate::downloader::engine::build_download_temp_path(&task.local_path, &task.id);
+        std::fs::write(&own_temp, b"part").unwrap();
+        dm.insert_task_for_test(task).await;
+
+        fm.cancel_folder(&folder_id, true).await.unwrap();
+
+        assert!(
+            !root.join("sub").exists(),
+            "已完成的下载文件及其空目录应删除"
+        );
+        assert!(!own_temp.exists());
+        assert_eq!(
+            std::fs::read(root.join("overwrite.bin")).unwrap(),
+            b"user-original"
+        );
+        assert!(root.join("user_own.txt").exists());
+        assert!(root.join("mine/notes.txt").exists());
     }
 
     /// 回收借调位时，必须先释放**没人用**的那些，且绝不能碰正在用的
